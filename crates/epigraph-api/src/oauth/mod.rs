@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod providers;
 pub mod register;
 pub mod revoke;
+pub mod scopes;
 pub mod token;
 
 pub use authorize::{authorize_endpoint, AuthorizeQuery};

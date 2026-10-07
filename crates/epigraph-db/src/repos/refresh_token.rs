@@ -21,10 +21,16 @@ pub struct RefreshTokenRow {
 pub struct RefreshTokenRepository;
 
 /// What [`RefreshTokenRepository::check`] found for a presented token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshCheck {
-    /// Live and unexpired.
-    Valid { id: Uuid, client_id: Uuid },
+    /// Live and unexpired. `scopes` are the scopes the token was minted with
+    /// (the consent, or its rotation's narrowing): the ceiling of anything the
+    /// refresh grant may issue from it (RFC 6749 section 6).
+    Valid {
+        id: Uuid,
+        client_id: Uuid,
+        scopes: Vec<String>,
+    },
     /// Spent by its own rotation less than 30 seconds ago: a benign
     /// concurrent refresh. Refused like [`Self::Invalid`], and the family
     /// stays live (migration 118's grace window).
@@ -95,6 +101,23 @@ impl RefreshTokenRepository {
         Ok(row.0)
     }
 
+    /// The rotation family of one refresh token: `COALESCE(family_id, id)`
+    /// (migration 118; a NULL `family_id` reads as the row's own id, so a row
+    /// that opened its chain is its own family). Rotation inserts the
+    /// successor in the presented token's family, so this is also the family
+    /// of the token a refresh is about to issue. `None` if no such row.
+    ///
+    /// Reads only `id` and `family_id`, both in 118's column grant to the
+    /// application role.
+    #[instrument(skip(pool))]
+    pub async fn family_of(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, DbError> {
+        sqlx::query_scalar("SELECT COALESCE(family_id, id) FROM refresh_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
+    }
+
     /// Read a live row by hash, `token_hash` included. Since migration 118 the
     /// application role cannot read `token_hash`, so this runs only on a
     /// privileged connection; no request path calls it (the refresh grant uses
@@ -123,19 +146,39 @@ impl RefreshTokenRepository {
     /// `security_events` row before answering [`RefreshCheck::Reuse`].
     /// Anything else (unknown, expired, revoked for another reason) is
     /// [`RefreshCheck::Invalid`].
+    ///
+    /// A `valid` token's stored `scopes` are joined in by id rather than
+    /// returned by the definer, so the definer's `RETURNS TABLE` (and its
+    /// grants) is unchanged. The application role reads `scopes` and `id`
+    /// (118's column grant withholds only `token_hash`), `refresh_tokens` has
+    /// no row policy, and that role holds no UPDATE on it, so the scopes cannot
+    /// change between this read and the rotation. A `valid` row whose scopes
+    /// do not come back is refused as [`RefreshCheck::Invalid`]: it is never
+    /// read as "no ceiling".
     #[instrument(skip(pool, token_hash))]
     pub async fn check(pool: &PgPool, token_hash: &[u8]) -> Result<RefreshCheck, DbError> {
-        let (outcome, id, client_id): (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
-            "SELECT outcome, token_id, client_id FROM public.epigraph_refresh_token_check($1)",
+        let (outcome, id, client_id, scopes): (
+            String,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Vec<String>>,
+        ) = sqlx::query_as(
+            "SELECT c.outcome, c.token_id, c.client_id, t.scopes \
+               FROM public.epigraph_refresh_token_check($1) c \
+               LEFT JOIN public.refresh_tokens t ON t.id = c.token_id",
         )
         .bind(token_hash)
         .fetch_one(pool)
         .await
         .map_err(|e| DbError::QueryFailed { source: e })?;
-        Ok(match (outcome.as_str(), id, client_id) {
-            ("valid", Some(id), Some(client_id)) => RefreshCheck::Valid { id, client_id },
-            ("grace", _, _) => RefreshCheck::Grace,
-            ("reuse", _, _) => RefreshCheck::Reuse,
+        Ok(match (outcome.as_str(), id, client_id, scopes) {
+            ("valid", Some(id), Some(client_id), Some(scopes)) => RefreshCheck::Valid {
+                id,
+                client_id,
+                scopes,
+            },
+            ("grace", ..) => RefreshCheck::Grace,
+            ("reuse", ..) => RefreshCheck::Reuse,
             _ => RefreshCheck::Invalid,
         })
     }
@@ -148,10 +191,12 @@ impl RefreshTokenRepository {
     /// spent by a rotation inside the grace window and get
     /// [`RefreshRotateOutcome::Grace`], and the winner's successor stays live.
     ///
-    /// The successor's scopes are the client's current `granted_scopes` and its
-    /// expiry is `expires_at` capped at the client type's refresh TTL, both
-    /// decided inside the definer: a caller can shorten a chain, never widen or
-    /// lengthen it.
+    /// The successor's scopes are the presented token's scopes narrowed to the
+    /// client's current `granted_scopes`, in the presented token's order
+    /// (migration 140; 118 gave it the whole grant, which widened a narrowed
+    /// consent at its first refresh). Its expiry is `expires_at` capped at the
+    /// client type's refresh TTL. Both are decided inside the definer: a
+    /// caller can shorten a chain, never widen or lengthen it.
     #[instrument(skip(pool, old_hash, new_hash))]
     pub async fn rotate(
         pool: &PgPool,

@@ -28,6 +28,7 @@ pub enum EmbedError {
 }
 
 /// A provider that turns text into a fixed-dimensional f32 vector.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// Embed a single text string, returning a vector of `dimensions()` floats.

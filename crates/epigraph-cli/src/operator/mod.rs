@@ -35,6 +35,32 @@
 //!   into its operator's group, through `reown-claims`' guarded batches (see
 //!   [`reown_linked`]).
 //!
+//! And the platform roles (migration 123; see [`custodian`]):
+//!
+//! * `grant-role` / `end-role-assignment` / `list-role-assignments` — grant a
+//!   registered human `role:platform-custodian` (or `role:auditor`) for an
+//!   explicit window, end an assignment, and list them. Every change is
+//!   audited by the table's own trigger.
+//! * `custodial-supersede` — revise a platform-corpus claim on the custodian's
+//!   authority: the act, its edge migration and a `platform.custodial_act`
+//!   audit row naming the assignment, in one transaction.
+//!
+//! And a registered human's passkeys (migration 124; see [`passkey`]):
+//!
+//! * `passkey-enroll` — open a 15-minute enrollment ticket for a registered
+//!   human and print its ceremony path, which the human completes on the
+//!   device that holds the authenticator.
+//! * `list-passkeys` / `revoke-passkey` — list them, and the audited
+//!   break-glass revoke (which also ends every live elevation that passkey
+//!   confirmed).
+//! * `end-elevation` — end one live elevation session now, or every un-ended
+//!   session of a person, any person's (migration 125's privileged end;
+//!   audited with the required `--reason`); `list-elevations` — find them.
+//! * `verify-confirmations` — re-verify every stored passkey confirmation
+//!   (elevation tickets, admin acts) offline against its passkey's public key,
+//!   the rp id and the origin, and record each that does not verify as a
+//!   `platform.confirmation_unverified` row (see [`confirmations`]).
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -42,6 +68,13 @@
 //!   remove ONE admin-only scope on a HUMAN's own OAuth client, in both
 //!   `allowed_scopes` and `granted_scopes`, with one `security_events` row per
 //!   `--apply` (see [`client_scope`]).
+//!
+//! And the admin-scope arming switch (migration 128; see [`admin_scopes`]):
+//!
+//! * `arm-admin-scopes` / `disarm-admin-scopes --reason TEXT [--apply]` — turn
+//!   enforcement of the admin-only scopes on or off, audited by the switch's
+//!   own trigger. Armed, every mint strips them and every path that hands
+//!   scopes out refuses them; an admin act then needs an elevation.
 //!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
@@ -71,14 +104,19 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod admin_scopes;
 pub mod arm;
 pub mod bind;
 pub mod client_scope;
+pub mod confirmations;
+pub mod custodian;
+pub mod elevation;
 pub mod hide;
 pub mod human;
 pub mod legacy;
 pub mod link;
 pub mod manifest;
+pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
 pub mod reverse;

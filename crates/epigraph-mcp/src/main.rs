@@ -524,16 +524,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ScopedPool::connect_with_options` exists for exactly this (PR-15 added it
     // so the job pool could keep its own sizing). `statement_timeout: None`
     // matches `create_pool`, which set none.
-    let scoped = epigraph_db::ScopedPool::connect_with_options(
-        &cli.database_url,
-        guc_mode,
-        epigraph_db::ScopedPoolOptions {
-            max_connections: 10,
-            acquire_timeout: std::time::Duration::from_secs(5),
-            statement_timeout: None,
-        },
-    )
-    .await?;
+    let pool_options = epigraph_db::ScopedPoolOptions {
+        max_connections: 10,
+        acquire_timeout: std::time::Duration::from_secs(5),
+        statement_timeout: None,
+    };
+    // The HTTP transport RECORDS every elevated tool call (`call_tool`'s
+    // per-access recorder, elevation plan EL-8), so its pool declares the
+    // recorder, migration 125's second key. stdio never elevates (it carries
+    // no token) and keeps the non-declaring pool.
+    let scoped = if cli.listen.is_some() {
+        epigraph_db::ScopedPool::connect_recording_elevated_access(
+            &cli.database_url,
+            guc_mode,
+            pool_options,
+        )
+        .await?
+    } else {
+        epigraph_db::ScopedPool::connect_with_options(&cli.database_url, guc_mode, pool_options)
+            .await?
+    };
     // The §0.5 boot probe, same as `epigraph-api/src/bin/server.rs`. Behind a
     // transaction-mode pooler a session-scoped `set_config` silently vanishes
     // between statements, so every policy collapses and the write path's
@@ -567,8 +577,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
     );
     // Operator binding (migration 122): the valve and the arming state, once
-    // at boot. Non-fatal; the trigger enforces whatever this reports.
-    epigraph_db::operator_binding::log_boot_state(&pool, "epigraph-mcp").await;
+    // at boot, and a REFUSAL TO START on a privileged DSN of an armed database
+    // (operator ruling OQ-7 (b)), on every transport: agents never elevate.
+    // To stderr, like the D9 refusal: on stdio, stdout is the JSON-RPC stream.
+    if let Err(refusal) =
+        epigraph_db::operator_binding::check_request_unit_boot(&pool, "epigraph-mcp").await
+    {
+        eprintln!("ERROR: {refusal}");
+        std::process::exit(1);
+    }
+    // And for as long as it serves, on every transport: a unit started before
+    // the database was armed exits once a re-read finds it serving an armed
+    // database on a privileged DSN (review R2-OQ-COR-1).
+    epigraph_db::operator_binding::spawn_request_unit_watch(pool.clone(), "epigraph-mcp");
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for
@@ -736,7 +757,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             federation,
             llm_identity.clone(),
         )
-        .with_scoped_pool(scoped.clone());
+        .with_scoped_pool(scoped.clone())
+        .with_connector_elevation(connector_elevation_from_env())
+        // The ceremony page's public origin, for the URL `sudo` returns
+        // (elevation plan EL-11): the API's own variable. Unset, `sudo`
+        // refuses.
+        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok());
         let template = if identity_declared {
             template
         } else {
@@ -831,11 +857,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let router = if let Some(secret) = cli.jwt_secret.as_deref() {
             use epigraph_auth::JwtConfig;
-            use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
+            use epigraph_mcp::auth::{
+                bearer_auth_middleware, DbAccessTokenRevocation, McpAuthState,
+            };
 
             let state = McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
                 resource_metadata_url: cli.resource_metadata_url.clone(),
+                // The denylist `/oauth/revoke` writes on the HTTP API, read on
+                // this process's pool (migration 141).
+                revocation: Arc::new(DbAccessTokenRevocation::new(pool.clone())),
             };
             router.layer(axum::middleware::from_fn_with_state(
                 state,
@@ -1303,6 +1334,61 @@ mod signer_selection_tests {
                 !msg.contains("'g'"),
                 "the error must not name the bad char: {msg}"
             );
+        }
+    }
+}
+
+/// `EPIGRAPH_MCP_CONNECTOR_ELEVATION`: whether an HTTP token with no elevation
+/// claim may resolve ELEVATED through a connector-mode session on its refresh
+/// family (elevation plan EL-6, MCP `sudo`). ONLY the exact value `on`
+/// (case-insensitive, trimmed) enables it; unset, empty, a typo or anything
+/// else leaves it OFF, the operator ruling until plan EQ-7 (the connector's
+/// family scope) is decided. The CLI elevate path (a token carrying `elv`) is
+/// unaffected.
+fn connector_elevation_from_env() -> bool {
+    let on = connector_elevation_switch(
+        std::env::var("EPIGRAPH_MCP_CONNECTOR_ELEVATION")
+            .ok()
+            .as_deref(),
+    );
+    if on {
+        tracing::warn!(
+            "EPIGRAPH_MCP_CONNECTOR_ELEVATION=on: connector-mode elevation is ENABLED; every \
+             request on an elevated refresh family resolves elevated"
+        );
+    }
+    on
+}
+
+/// The switch's parse, apart from the environment: only `on`.
+fn connector_elevation_switch(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on"))
+}
+
+#[cfg(test)]
+mod connector_elevation_switch_tests {
+    use super::connector_elevation_switch;
+
+    /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
+    /// and a typo all leave connector-mode elevation off (operator ruling,
+    /// plan EQ-7). Mutation caught: accepting any non-empty value.
+    #[test]
+    fn only_on_switches_connector_elevation_on() {
+        for off in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("1"),
+            Some("yes"),
+            Some("onn"),
+        ] {
+            assert!(
+                !connector_elevation_switch(off),
+                "{off:?} must leave it off"
+            );
+        }
+        for on in [Some("on"), Some(" ON "), Some("On")] {
+            assert!(connector_elevation_switch(on), "{on:?}");
         }
     }
 }

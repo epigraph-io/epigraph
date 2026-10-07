@@ -46,6 +46,10 @@ fn human_token(agent: Uuid) -> AuthContext {
         client_type: ClientType::Human,
         scopes: vec!["claims:read".into(), "claims:write".into()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 

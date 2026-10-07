@@ -42,14 +42,17 @@ Do NOT:
   that bypasses the canonical resolution-claim trail.
 
 **Enforcement (issue #374).** `resolved` is the one label with retirement
-semantics, so `update_labels` and `patch_claim` apply `resolve_backlog_item`'s
+semantics, so `update_labels`, `patch_claim` and `update_with_evidence`'s
+`labels` merge (drain U004) apply `resolve_backlog_item`'s
 `require_owner_or_admin` check when a call adds or removes it, on EVERY
 transport (the stdio half closed in batch H-b). Ownership is the claim's
 author, or an agent linked to the same operator as the author (stdio;
 migration 107's operator arms, which is what makes a model-bumped fleet agent
 able to retire its predecessor's items), or the author's operator (HTTP).
 Over HTTP a `claims:admin` token also passes; its write into a group the admin
-cannot write goes through the audited admin path (batch H-b, D2). Over HTTP the
+cannot write goes through the audited admin path (batch H-b, D2) on
+`update_labels` / `patch_claim`; `update_with_evidence` has no admin path and
+refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's

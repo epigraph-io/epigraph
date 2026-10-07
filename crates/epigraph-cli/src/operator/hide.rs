@@ -384,6 +384,14 @@ pub const RLS_DISABLED: &str = "ROW LEVEL SECURITY DISABLED on evidence";
 /// and a clean-looking preview would be a lie: stage-3 review measured a dry
 /// run with no warning after `DISABLE ROW LEVEL SECURITY`).
 ///
+/// Migration 126's `evidence_elevated_read` is not a reason, but ONLY in its
+/// exact 126 form: `TO epigraph_app`, `USING ((SELECT epigraph_is_elevated()))`.
+/// It admits rows to an ELEVATED session alone (a live, passkey-confirmed,
+/// read-only custodial session of a role holder), never to an ordinary
+/// application session, so the hide still holds for every reader it was
+/// chosen against. Any other body under that name is reported like any other
+/// extra policy.
+///
 /// # Errors
 /// The catalog read fails.
 pub async fn extra_evidence_policies(conn: &mut PgConnection) -> anyhow::Result<Vec<String>> {
@@ -392,6 +400,11 @@ pub async fn extra_evidence_policies(conn: &mut PgConnection) -> anyhow::Result<
           WHERE schemaname = 'public' AND tablename = 'evidence' \
             AND permissive = 'PERMISSIVE' AND cmd IN ('ALL', 'SELECT') \
             AND policyname <> 'evidence_tenancy' \
+            AND NOT (policyname = 'evidence_elevated_read' \
+                     AND cmd = 'SELECT' \
+                     AND roles = ARRAY['epigraph_app']::name[] \
+                     AND qual = '( SELECT epigraph_is_elevated() AS epigraph_is_elevated)' \
+                     AND with_check IS NULL) \
           ORDER BY 1",
     )
     .fetch_all(&mut *conn)

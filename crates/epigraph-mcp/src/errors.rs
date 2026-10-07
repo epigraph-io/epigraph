@@ -121,6 +121,12 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
             message: Cow::from(e.to_string()),
             data: None,
         },
+        // An elevated request asked to write (elevation plan EL-6).
+        e @ epigraph_db::DbError::ElevatedReadOnly => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(e.to_string()),
+            data: None,
+        },
         other => internal_error(other),
     }
 }
@@ -217,6 +223,15 @@ mod tests {
         });
         assert_eq!(scope.code, ErrorCode::INVALID_REQUEST);
         assert!(scope.message.contains("OPL02"), "{}", scope.message);
+
+        // An elevated request asking to write (EL-6): a denial, not a fault.
+        let elevated = db_caller_error(epigraph_db::DbError::ElevatedReadOnly);
+        assert_eq!(elevated.code, ErrorCode::INVALID_REQUEST);
+        assert!(
+            elevated.message.contains("ELEVATED READ-ONLY"),
+            "{}",
+            elevated.message
+        );
     }
 
     /// The executor wraps the refusal in `IngestExecutorError::Repository`; the
