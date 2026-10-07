@@ -266,9 +266,11 @@ pub fn compute_cdst_section(
 /// `relationship` to `source_interval`.  The obstruction components are:
 /// - `interval_inconsistency` / `conflict_component`: for `contradicts` / frame-
 ///   evidence / neutral, the symmetric Bel/Pl distance (Hausdorff); for
-///   `supports` (Positive), the directional floor *shortfall* — only the target
-///   sitting below the corroborated `expected` floor on bel/pl counts, so over-
-///   support is benign corroboration and contributes 0 to both fields and to H¹.
+///   `supports` (Positive), the directional floor *shortfall*
+///   `max(0, expected.bel − target.bel)` — only the target's bel sitting below
+///   the corroborated `expected` bel floor counts (plausibility is neither a
+///   floor nor a ceiling), so over-support is benign corroboration and
+///   contributes 0 to both fields and to H¹.
 /// - `open_world_component`: |source_ow − expected_ow|
 /// - `ignorance_component`: |width_target − width_expected|
 pub fn compute_cdst_edge_inconsistency(
@@ -637,7 +639,8 @@ mod tests {
         // scan re-observed it forever. AFTER the fix the Positive arm is
         // directional on BOTH fields and only the (here zero) UNDER-support
         // shortfall counts:
-        //   below = (0.40-0.98).max(0).max((0.68-1.0).max(0)) = 0.0.
+        //   below = (0.40-0.98).max(0) = 0.0
+        // (pl is not a floor; b3476233).
         let src_id = Uuid::new_v4();
         let tgt_id = Uuid::new_v4();
         let weak_source = EpistemicInterval::new(0.50, 0.60, 0.0);
