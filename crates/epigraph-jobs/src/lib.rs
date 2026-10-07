@@ -381,6 +381,7 @@ impl JobError {
 ///
 /// Handlers are stateless and should be idempotent - processing the same
 /// job multiple times should produce the same result.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     /// Execute the job and return a result.
@@ -429,6 +430,7 @@ pub trait JobHandler: Send + Sync {
 /// Trait for job queue implementations.
 ///
 /// Queues are responsible for persisting jobs and providing them to workers.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait JobQueue: Send + Sync {
     /// Enqueue a new job.
@@ -957,6 +959,7 @@ impl JobHandler for TruthPropagationHandler {
 /// CORRECT:  Evidence -> Truth -> Reputation
 /// WRONG:    Reputation -> Truth
 /// ```
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait PropagationService: Send + Sync {
     /// Get a claim by its ID.
@@ -1528,6 +1531,7 @@ pub enum EmbeddingJobError {
 /// The trait combines claim lookup and embedding operations because
 /// the job handler needs both. Implementations can internally use
 /// separate repositories for claims and embeddings.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait EmbeddingJobService: Send + Sync {
     /// Get the text content of a claim by ID.
@@ -1877,6 +1881,7 @@ impl ClaimOutcomeData {
 ///
 /// This service provides OUTPUTS only (reputation scores derived from claims).
 /// It must NEVER be called during truth calculation for a claim.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait ReputationJobService: Send + Sync {
     /// Get all claim outcomes for an agent.
@@ -2187,6 +2192,7 @@ pub enum HttpError {
 /// contract by construction (it builds from [`egress::pinned_client`], the same
 /// function the API's delivery dispatcher uses). The trait stays open so tests
 /// can inject mocks; a new production implementation is a review red flag.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     /// Send an HTTP POST request to a vetted target.
@@ -2293,6 +2299,7 @@ impl HttpClient for PinnedHttpClient {
 /// Trait for webhook configuration repository.
 ///
 /// This trait enables dependency injection for testing with mock repositories.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait WebhookRepository: Send + Sync {
     /// Retrieve a webhook configuration by ID.
@@ -2956,6 +2963,7 @@ impl CleanupStats {
 ///
 /// However, since `PostgreSQL` uses ON DELETE CASCADE for evidence and traces,
 /// deleting claims will automatically cascade to dependent evidence and traces.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait CleanupRepository: Send + Sync {
     /// Get IDs of claims older than the specified cutoff date.

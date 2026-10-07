@@ -243,12 +243,10 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
 /// Strip SQL comments (`--` to end of line, and `/* … */`) and collapse string
 /// literals, so `;` inside either does not count as a statement terminator.
 ///
-/// **Known limitation:** `$$`-quoted bodies are NOT handled. Correct for
-/// 063–066, which contain no `DO` block, and the lint only runs over
-/// `-- no-transaction` files — which by the rule in `migrations/README.md` hold
-/// index statements only. The first `-- no-transaction` file to contain a `DO`
-/// block will be mis-counted and this lint will fire spuriously; teach the
-/// scanner about dollar quoting at that point rather than deleting the lint.
+/// Dollar-quoted bodies (`$$ … $$`, `$tag$ … $tag$`) are kept as ONE opaque
+/// `$$` token, so the `;` inside a `DO` block does not count as a statement
+/// terminator. Migration 126 is the first `-- no-transaction` file with `DO`
+/// blocks; before it the scanner did not need this.
 fn strip_sql_noise(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
@@ -264,6 +262,30 @@ fn strip_sql_noise(src: &str) -> String {
                 i += 1;
             }
             i = (i + 2).min(b.len());
+        } else if b[i] == b'$' {
+            // A dollar-quote opener is `$` + an optional identifier + `$`.
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' {
+                let tag = &src[i..=j];
+                let body_start = j + 1;
+                match src[body_start..].find(tag) {
+                    Some(end) => {
+                        out.push_str("$$");
+                        i = body_start + end + tag.len();
+                    }
+                    // Unterminated: keep the rest opaque too.
+                    None => {
+                        out.push_str("$$");
+                        i = b.len();
+                    }
+                }
+            } else {
+                out.push('$');
+                i += 1;
+            }
         } else if b[i] == b'\'' {
             // A single-quoted literal. '' is an escaped quote.
             i += 1;
@@ -310,6 +332,12 @@ fn no_transaction_files_contain_exactly_one_statement() {
             continue;
         }
         checked += 1;
+        // The second safe shape, checked by
+        // `a_policy_arm_no_transaction_file_commits_each_table` below.
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if POLICY_ARM_MIGRATIONS.contains(&name.as_ref()) {
+            continue;
+        }
 
         let stripped = strip_sql_noise(&src);
         let statements: Vec<&str> = stripped
@@ -344,12 +372,109 @@ fn no_transaction_files_contain_exactly_one_statement() {
 
     assert_eq!(
         checked,
-        INDEX_MIGRATIONS.len(),
-        "expected exactly {} `-- no-transaction` migrations (063-066, 073); found {checked}. \
-         Adding one is fine — add it to INDEX_MIGRATIONS so its index validity is \
-         checked too.",
-        INDEX_MIGRATIONS.len()
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len(),
+        "expected exactly {} `-- no-transaction` migrations (063-066, 073, 126); found \
+         {checked}. Adding one is fine — add it to INDEX_MIGRATIONS so its index validity \
+         is checked too, or to POLICY_ARM_MIGRATIONS if it has that shape.",
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len()
     );
+}
+
+/// The `-- no-transaction` files that are NOT index files: per-table policy
+/// DDL committed one table at a time (migration 126, the elevated arms).
+const POLICY_ARM_MIGRATIONS: &[&str] = &["126_elevated_arms.sql"];
+
+/// The second safe `-- no-transaction` shape: per-table policy DDL, each table
+/// committed on its own.
+///
+/// sqlx sends the file as ONE simple query, which PostgreSQL runs as one
+/// IMPLICIT transaction block, so a multi-statement file without `COMMIT;` is
+/// a single transaction after all: every table's ACCESS EXCLUSIVE lock would be
+/// held until the end, and a lock timeout on the last table would roll back
+/// the first. Measured on the 5433 cluster before 126 was written: with a
+/// `COMMIT;` after each `DO` block, a later table's lock timeout left the
+/// earlier tables' policies in place; without it, it rolled all of them back.
+/// (`CREATE INDEX CONCURRENTLY` refuses even the implicit block, which is why
+/// the index files stay one statement each.)
+///
+/// So each listed file must be, statement for statement: `DO $$ … $$`, then
+/// `COMMIT`, repeated; every `DO` body sets a TRANSACTION-LOCAL lock timeout
+/// (`set_config('lock_timeout', …, true)`; a plain `SET` would outlive the
+/// file on the migrator's connection), and drops each policy (`IF EXISTS`)
+/// before it creates it, so a rerun after a lock timeout resumes.
+///
+/// Verified to fail with one `COMMIT;` removed, with one block's lock timeout
+/// made session-wide (`false`), and with one `DROP POLICY IF EXISTS` removed.
+#[test]
+fn a_policy_arm_no_transaction_file_commits_each_table() {
+    for name in POLICY_ARM_MIGRATIONS {
+        let path = migrations_dir().join(name);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            src.starts_with("-- no-transaction"),
+            "{name} is listed as a policy-arm `-- no-transaction` file but does not start with \
+             the marker"
+        );
+        let stripped = strip_sql_noise(&src);
+        let statements: Vec<String> = stripped
+            .split(';')
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            statements.len() >= 2 && statements.len().is_multiple_of(2),
+            "{name}: expected DO/COMMIT pairs, found {} statements",
+            statements.len()
+        );
+        for (k, pair) in statements.chunks(2).enumerate() {
+            assert!(
+                pair[0].starts_with("DO $$"),
+                "{name}: statement {} is not a DO block: {}",
+                2 * k + 1,
+                pair[0]
+            );
+            assert_eq!(
+                pair[1],
+                "COMMIT",
+                "{name}: DO block {} is not followed by its own COMMIT, so it would share \
+                 one implicit transaction (and its locks) with the next",
+                k + 1
+            );
+        }
+
+        // The DO bodies, read from the source (the scanner made them opaque).
+        let bodies: Vec<&str> = src.split("DO $$").skip(1).collect();
+        assert_eq!(
+            bodies.len(),
+            statements.len() / 2,
+            "{name}: every DO block must open with `DO $$`"
+        );
+        for (k, body) in bodies.iter().enumerate() {
+            let body = body.split("$$").next().unwrap_or_default();
+            assert!(
+                body.contains("set_config('lock_timeout', '3s', true)"),
+                "{name}: DO block {} does not bound its lock wait with a transaction-local \
+                 lock_timeout",
+                k + 1
+            );
+            let creates = body.matches("CREATE POLICY ").count();
+            let drops = body.matches("DROP POLICY IF EXISTS ").count();
+            assert!(
+                creates > 0 && creates == drops,
+                "{name}: DO block {} creates {creates} policies but drops-if-exists {drops}; \
+                 every CREATE needs its DROP so a rerun resumes",
+                k + 1
+            );
+            for create in body.split("CREATE POLICY ").skip(1) {
+                let policy = create.split_whitespace().next().unwrap_or_default();
+                assert!(
+                    body.contains(&format!("DROP POLICY IF EXISTS {policy} ON")),
+                    "{name}: policy {policy} is created without being dropped first"
+                );
+            }
+        }
+    }
 }
 
 /// The lint's own instrument, tested. A statement scanner that silently returned
@@ -370,6 +495,26 @@ fn the_statement_scanner_is_not_vacuous() {
     );
     assert_eq!(
         strip_sql_noise("SELECT 1; SELECT 2;").matches(';').count(),
+        2
+    );
+    // Dollar quoting: a DO body's semicolons are not statement terminators,
+    // tagged quotes included, and a positional parameter is not a quote.
+    assert_eq!(
+        strip_sql_noise("DO $$ BEGIN PERFORM 1; PERFORM 2; END $$; COMMIT;")
+            .matches(';')
+            .count(),
+        2
+    );
+    assert_eq!(
+        strip_sql_noise("DO $x$ BEGIN PERFORM '$$;'; END $x$; COMMIT;")
+            .matches(';')
+            .count(),
+        2
+    );
+    assert_eq!(
+        strip_sql_noise("SELECT $1; SELECT $2;")
+            .matches(';')
+            .count(),
         2
     );
 }

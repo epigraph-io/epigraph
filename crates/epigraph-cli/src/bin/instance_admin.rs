@@ -1,7 +1,16 @@
-//! `epigraph-instance-admin` — grant, revoke and list the D4 privatization
-//! authority.
+//! `epigraph-instance-admin` — check and list the D4 privatization authority.
 //!
-//! # This binary is the ONLY writer of `instance_admins`
+//! # Since migration 123 this binary writes nothing
+//!
+//! Instance administration is `role:platform-custodian`, held by a registered
+//! human through a timestamped assignment, and `instance_admins` is frozen for
+//! every role. `grant` and `revoke` therefore refuse (exit 1) before connecting
+//! and name their replacements, `epigraph-operator grant-role` and
+//! `epigraph-operator end-role-assignment`; `check` answers from the role (the
+//! same predicate the request path uses); `list` prints the legacy rows, which
+//! confer nothing.
+//!
+//! # It was the ONLY writer of `instance_admins` (083 to 122)
 //!
 //! Migration 083 revokes INSERT, UPDATE and DELETE on that table from
 //! `epigraph_app`, and the INSERT and UPDATE policies it installs have
@@ -47,7 +56,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Grant instance administrator to an agent.
+    /// REMOVED (migration 123): refuses and names `epigraph-operator grant-role`.
     Grant {
         /// The agent receiving the authority.
         #[arg(long)]
@@ -59,12 +68,14 @@ enum Command {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Revoke a live grant. Never deletes the row.
+    /// REMOVED (migration 123): refuses and names
+    /// `epigraph-operator end-role-assignment`.
     Revoke {
         #[arg(long)]
         agent_id: Uuid,
     },
-    /// List grants.
+    /// List the legacy `instance_admins` rows (read-only since 123; they
+    /// confer nothing).
     List {
         /// Include revoked grants.
         #[arg(long)]
@@ -91,6 +102,32 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Refused before any connection: the table is frozen (CUS05), and an
+    // operator running a pre-123 playbook gets the replacement verb, not a
+    // database error.
+    match &cli.command {
+        Command::Grant { agent_id, .. } => {
+            eprintln!(
+                "epigraph-instance-admin grant was removed in migration 123: instance \
+                 administration is role:platform-custodian, held by a registered human. Run \
+                 `epigraph-operator grant-role --role role:platform-custodian --holder {agent_id} \
+                 (--valid-to <RFC3339> | --open-ended) --reason <text> [--granted-by <live \
+                 custodian>] --apply` on the maintenance DSN. Nothing was changed."
+            );
+            std::process::exit(1);
+        }
+        Command::Revoke { agent_id } => {
+            eprintln!(
+                "epigraph-instance-admin revoke was removed in migration 123. List the holder's \
+                 assignments with `epigraph-operator list-role-assignments` and end one with \
+                 `epigraph-operator end-role-assignment --assignment <id> --reason <text> \
+                 --apply`. ({agent_id}: nothing was changed.)"
+            );
+            std::process::exit(1);
+        }
+        Command::List { .. } | Command::Check { .. } => {}
+    }
+
     let maint = epigraph_cli::MaintenancePool::connect("epigraph-instance-admin")
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -99,33 +136,16 @@ async fn main() -> anyhow::Result<()> {
     use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 
     match cli.command {
-        Command::Grant {
-            agent_id,
-            granted_by,
-            note,
-        } => {
-            let row = InstanceAdminRepository::grant(&pool, agent_id, granted_by, note.as_deref())
-                .await?;
-            println!(
-                "granted instance:admin to {} at {} (granted_by={:?})",
-                row.agent_id, row.granted_at, row.granted_by
-            );
-        }
-        Command::Revoke { agent_id } => {
-            let revoked = InstanceAdminRepository::revoke(&pool, agent_id).await?;
-            if revoked {
-                println!("revoked instance:admin from {agent_id}");
-            } else {
-                // Not an error: the end state the operator asked for holds. A
-                // non-zero exit here would make a re-run of a completed
-                // playbook step look like a failure.
-                println!("{agent_id} held no live grant; nothing to revoke");
-            }
-        }
+        Command::Grant { .. } | Command::Revoke { .. } => unreachable!("refused above"),
         Command::List { include_revoked } => {
             let rows = InstanceAdminRepository::list(&pool, include_revoked).await?;
+            println!(
+                "legacy instance_admins rows (read-only since migration 123; they confer \
+                 nothing). Holders of role:platform-custodian: epigraph-operator \
+                 list-role-assignments"
+            );
             if rows.is_empty() {
-                println!("no instance administrators");
+                println!("no legacy rows");
             }
             for r in rows {
                 println!(

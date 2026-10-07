@@ -36,7 +36,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture as fixture;
 
-use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 use epigraph_db::repos::privatization::{
     ClosureDirection, ClosureRequest, NewPlan, PrivatizationRepository, SelectedClaim,
     SelectionError, SelectionRefusal, UnfilteredSelection, MAX_NODE_CAP, MAX_TRAVERSAL_DEPTH,
@@ -125,10 +124,8 @@ async fn an_instance_admin_who_does_not_administer_the_target_group_reads_no_pla
 
     // A second instance admin, with no membership of the target group at all.
     let (outsider, _own_group) = fixture::seed_agent_with_group(&pool, "pp-outsider").await;
-    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, outsider, None, Some("outsider"))
-        .await
-        .expect("grant the outsider instance admin");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    fixture::make_custodian(&pool, outsider).await;
 
     let mut conn = stamped_admin_conn(&pool, outsider).await;
 
@@ -578,10 +575,8 @@ impl World {
             .await
             .expect("link the successor");
 
-        let maint = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
-        InstanceAdminRepository::grant(&maint, actor, None, Some("plan-policies"))
-            .await
-            .expect("grant the actor instance admin");
+        // Since 123: a role:platform-custodian assignment of a registered human.
+        fixture::make_custodian(pool, actor).await;
 
         Self {
             actor,

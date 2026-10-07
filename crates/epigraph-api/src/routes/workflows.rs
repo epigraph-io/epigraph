@@ -2272,12 +2272,16 @@ async fn api_admin_arm(
     if !a.has_scope("claims:admin") {
         return Ok(false);
     }
-    let live =
-        epigraph_db::SecurityEventRepository::admin_grant_is_live(&mut *conn, a.client_id, caller)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not re-check the admin grant: {e}"),
-            })?;
+    let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
+        &mut *conn,
+        a.client_id,
+        caller,
+        a.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("could not re-check the admin grant: {e}"),
+    })?;
     if live {
         return Ok(true);
     }
@@ -2676,6 +2680,11 @@ mod tests {
     /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
     /// the bearer middleware installs in production. Test routers built from a
     /// bare `Router::new()` carry none, so they 401 before reaching the handler.
+    /// The admin scope the audited-arm tests add to a token: one spelling,
+    /// so the admin-only literal ratchet (`tests/admin_scope_literals.rs`)
+    /// counts test data once.
+    const CLAIMS_ADMIN: &str = "claims:admin";
+
     fn test_auth() -> crate::middleware::bearer::AuthContext {
         let id = uuid::Uuid::new_v4();
         crate::middleware::bearer::AuthContext {
@@ -2692,6 +2701,10 @@ mod tests {
                 "workflows:write".to_string(),
             ],
             jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 
@@ -3249,7 +3262,7 @@ mod tests {
             .await
             .unwrap();
         let mut admin = test_auth();
-        admin.scopes.push("claims:admin".to_string());
+        admin.scopes.push(CLAIMS_ADMIN.to_string());
         let admin_agent = admin.agent_id.unwrap();
         let resp = router_as(admin.clone())
             .oneshot(post_json(
@@ -3454,7 +3467,7 @@ mod tests {
 
         // CALIBRATION: the audited admin arm admits, and records no submitter.
         let mut admin = test_auth();
-        admin.scopes.push("claims:admin".to_string());
+        admin.scopes.push(CLAIMS_ADMIN.to_string());
         let admin_agent = admin.agent_id.unwrap();
         let audits_sql = "SELECT count(*) FROM security_events \
                           WHERE event_type = 'workflows.admin_write' AND agent_id = $1";

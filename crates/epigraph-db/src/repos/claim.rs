@@ -1509,13 +1509,23 @@ impl ClaimRepository {
     ///
     /// # Cycle safety
     ///
-    /// Both recursive terms are capped at depth 100. `mark_duplicate` refuses
-    /// only when the *duplicate* is already superseded, so `A.supersedes = B`
-    /// followed by `B.supersedes = A` is accepted and forms a cycle. Without
-    /// the cap the CTE never terminates: it pins one backend at 100% CPU
-    /// building an unbounded tuplestore that spills to disk, and the request
-    /// pool sets no `statement_timeout` to stop it. 100 is far above any real
-    /// supersession depth.
+    /// `mark_duplicate` refuses only when the *duplicate* is already
+    /// superseded, so `A.supersedes = B` followed by `B.supersedes = A` is
+    /// accepted and forms a cycle; a self-supersede `A.supersedes = A` is the
+    /// degenerate case. Two guards, for two different failures:
+    ///
+    /// * **`CYCLE id SET … USING …` on both recursive CTEs** makes each version
+    ///   appear exactly once. Postgres still emits the row that revisits an id
+    ///   (flagged `*_is_cycle`) but does not expand it, so the flag is filtered
+    ///   in `root` and in the final SELECT. Without it a cycle is walked until
+    ///   the depth cap: a self-loop came back as the same row 101 times and
+    ///   X↔Y as 101 alternating rows, and from X the root was X itself rather
+    ///   than Y, the deepest non-revisited ancestor. Requires PostgreSQL 14+.
+    /// * **Both recursive terms stay capped at depth 100.** The cycle guard
+    ///   does not bound a long ACYCLIC chain; the cap does. Without any bound a
+    ///   cycle pins one backend at 100% CPU building an unbounded tuplestore
+    ///   that spills to disk, and the request pool sets no `statement_timeout`
+    ///   to stop it. 100 is far above any real supersession depth.
     ///
     /// # Why one statement and not a loop
     ///
@@ -1551,7 +1561,22 @@ impl ClaimRepository {
                 FROM claims p
                 JOIN up ON p.id = up.supersedes
                 WHERE up.up_depth < 100 /* {VISIBILITY:p} */
-            ),
+            -- CYCLE, not merely the depth bound. `mark_duplicate` writes
+            -- `dup.supersedes = canonical` with no cycle check, so X<->Y and
+            -- X->X loops are writable through the repo (how many exist in prod
+            -- data was never counted). `up_depth < 100` stops the walk
+            -- running forever, but it does NOT stop it EMITTING: MEASURED on a
+            -- database migrated 001->head, a self-supersedes loop came back as
+            -- the same row 101 times and an X<->Y pair as 101 alternating rows,
+            -- which `GET /claims/:id/history` served verbatim (~50x response
+            -- amplification). `CYCLE ... SET ... USING ...` still EMITS the row
+            -- that revisits an id, flagged, but stops expanding it; so the flag
+            -- is filtered in BOTH consumers -- `root` below (or the revisited
+            -- start claim would be picked as the deepest ancestor) and the
+            -- final SELECT. The depth bound stays as a second guard. Both
+            -- recursive terms keep their visibility splices, so this costs no
+            -- tenancy filtering.
+            ) CYCLE id SET up_is_cycle USING up_path,
             -- The DEEPEST VISIBLE ancestor, not the true root. `up` already
             -- stops at the first link the viewer cannot see, so requiring
             -- `supersedes IS NULL` here would return nothing whenever a
@@ -1560,7 +1585,7 @@ impl ClaimRepository {
             -- deepest row IS the `supersedes IS NULL` root, so this is the
             -- same answer for the fully-visible case.
             root AS (
-                SELECT id FROM up ORDER BY up_depth DESC LIMIT 1
+                SELECT id FROM up WHERE NOT up_is_cycle ORDER BY up_depth DESC LIMIT 1
             ),
             chain AS (
                 SELECT r0.id,
@@ -1582,7 +1607,7 @@ impl ClaimRepository {
                 FROM claims n
                 JOIN chain ON n.supersedes = chain.id
                 WHERE chain.depth < 100 /* {VISIBILITY:n} */
-            )
+            ) CYCLE id SET chain_is_cycle USING chain_path
             SELECT chain.id,
                    chain.content,
                    chain.truth_value,
@@ -1597,6 +1622,7 @@ impl ClaimRepository {
                        LIMIT 1
                    ) AS superseded_by
             FROM chain
+            WHERE NOT chain_is_cycle
             ORDER BY chain.depth, chain.id
             "#,
             2,
@@ -1638,12 +1664,42 @@ impl ClaimRepository {
     /// endpoint, because the self-audit was scoped to files the PR touched and
     /// `search.rs` was not one of them.
     ///
+    /// # The scan is served by the HNSW index
+    ///
+    /// The statement orders by the raw cosine distance, `c.embedding <=> q.vec`,
+    /// because that is the only form pgvector's HNSW index can serve. It used to
+    /// order by the derived `similarity` column (`1 - distance`), which the
+    /// index cannot match, so every call computed the distance to every
+    /// embedded claim and sorted them all: on prod (~348k embedded claims,
+    /// 1536-d) that ran past 30 s and timed out every Explorer search, against
+    /// 92 ms on the index. `1 - d` is strictly decreasing in `d`, so ascending
+    /// distance is the same order as descending similarity.
+    ///
+    /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
+    /// default 40), and the scope predicates (`claim_type`, the dates,
+    /// `agent_id`, the visibility splice, `min_similarity`) are applied AFTER
+    /// it. So the query runs in a short transaction that first sets, `is_local`:
+    ///
+    ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
+    ///    until `LIMIT $7` matching rows are found, in exact distance order.
+    ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
+    ///    covers an unscoped `limit`.
+    ///
+    /// The transaction is ROLLED BACK, not committed: on a caller's own
+    /// transaction `begin()` opens a savepoint, and releasing it would carry the
+    /// `SET LOCAL` values into the caller's later HNSW reads. This is the same
+    /// arrangement as the hybrid recall dense leg. `hnsw.max_scan_tuples` stays
+    /// at its default (20,000), so a scope rarer than about `limit / 20,000` of
+    /// the embedded claims can still return fewer than `limit` rows.
+    ///
+    /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`); prod runs 0.8.2.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(executor, viewer, embedding))]
-    pub async fn semantic_search_flat<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn semantic_search_flat<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         min_similarity: f64,
@@ -1652,7 +1708,10 @@ impl ClaimRepository {
         created_before: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<Uuid>,
         limit: i64,
-    ) -> Result<Vec<SemanticFlatHit>, DbError> {
+    ) -> Result<Vec<SemanticFlatHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let sql = viewer.splice(
             r#"
             WITH query_vec AS (
@@ -1677,7 +1736,7 @@ impl ClaimRepository {
               AND ($5::timestamptz IS NULL OR c.created_at <= $5)
               AND ($6::uuid IS NULL OR c.agent_id = $6)
               /* {VISIBILITY:c} */
-            ORDER BY similarity DESC
+            ORDER BY c.embedding <=> q.vec
             LIMIT $7
             "#,
             8,
@@ -1693,7 +1752,20 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+
+        // See "The scan is served by the HNSW index" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+
+        Ok(rows)
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.
@@ -4566,6 +4638,11 @@ impl ClaimRepository {
     ///
     /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
     /// monotonic progress through the backlog across scheduled runs.
+    ///
+    /// Every returned row is current by the `WHERE` clause, so `claim_from_row`'s
+    /// `is_current = true` default is already true here; `supersedes` is NOT
+    /// (a current claim that replaced another carries a non-null link), so it
+    /// is projected and post-fixed — the `claim_from_row` rule in `CLAUDE.md`.
     pub async fn list_undecomposed<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -4581,6 +4658,7 @@ impl ClaimRepository {
             trace_id: Option<Uuid>,
             created_at: chrono::DateTime<chrono::Utc>,
             updated_at: chrono::DateTime<chrono::Utc>,
+            supersedes: Option<Uuid>,
         }
 
         let limit = limit.clamp(1, 1000);
@@ -4593,7 +4671,7 @@ impl ClaimRepository {
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                   c.created_at, c.updated_at
+                   c.created_at, c.updated_at, c.supersedes
             FROM claims c
             WHERE COALESCE(c.is_current, true) = true
               AND length(c.content) > 10
@@ -4622,7 +4700,7 @@ impl ClaimRepository {
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -4630,7 +4708,9 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
         Ok(claims)
     }

@@ -362,8 +362,9 @@ authenticated principal is not the author, only when that WRITER is bound too
 (see "Who is checked" below; the supersede exceptions, restating a retired
 claim, are under "A linked agent writes only where its own operator
 writes"). `claims.agent_id` of an existing claim is changed
-only by a privileged session or an instance-admin principal (`OPL02` for
-anyone else), and is then checked like an insert. Bound means:
+only by a privileged session (since migration 123, not by a platform-custodian
+principal on an application session either: "The custodian role" below),
+`OPL02` for anyone else, and is then checked like an insert. Bound means:
 
 * (a) a **human operator**: an agent with a live row in the maintenance-only
   registry `human_operators` whose recorded OAuth client (the one client the
@@ -416,14 +417,23 @@ request's viewer) whenever it differs from the author: that writer must be
 bound (`OPL01`), must write the owner group (`OPL02`, below), and may name as
 author only a bound agent of its OWN human (`OPL01` / `OPL02` otherwise). The
 one exception is the author a supersede INHERITS, which is exactly what the
-supersede act writes: a new row naming `supersedes` whose predecessor carries
-the same author, is owned by the same group, is already retired (the act
-retires it first, in the same transaction), and has no other current
-successor. That author may be a retired agent of the writer's own human, so a
-human can supersede its own legacy author's claims, once per claim and in the
-claim's own group; a fresh claim never names a retired identity, however
-`supersedes` is posed (at a current claim, at a claim in another group, or as
-a second successor). Nor can an existing claim's lineage be laundered: once
+supersede act writes: a new row naming `supersedes` whose predecessor is a
+DIFFERENT claim that carries the same author, is owned by the same group, is
+already retired (the act retires it first, in the same transaction), and has
+no other current successor; and, on an application session, that predecessor
+has never been restated by that author before, current or retired (migration
+123: before it, "no other CURRENT successor" alone re-admitted a predecessor
+whose successor had been retired, so retire-and-restate doubled the current
+claims under the identity each round). That author may be a retired agent of
+the writer's own human, so a human can supersede its own legacy author's
+claims, once per claim, ever, and in the claim's own group; a fresh claim
+never names a retired identity, however `supersedes` is posed (at a current
+claim, at a claim in another group, as a second successor, at an
+already-restated claim, or at the claim itself). A privileged session keeps
+the "no other current successor" rule, so a custodial revision of a canonical
+claim that retired duplicates point at still works. No claim names ITSELF in
+`supersedes`: a statement that sets it to the row's own id is refused
+(`OPL02`) on every session, armed or not (migration 123). Nor can an existing claim's lineage be laundered: once
 armed, an application session may not clear `claims.supersedes`, nor re-point
 it on a claim that stays current (`OPL02`); setting it on a claim that had
 none, and re-pointing it while retiring the claim in the same statement (the
@@ -455,16 +465,19 @@ path a human is scoped like everyone). The
 same rule guards the membership door: a `writer`/`admin` row for a live-linked
 agent is refused unless its operator writes that group, so another human
 cannot enrol my agent to write evidence, edges or beliefs in their group. Both
-refusals are SQLSTATE **`OPL02`**. Only admin access crosses groups: a
-privileged (maintenance) session and a session whose principal is a live
-instance admin are exempt from `OPL02`. Neither is exempt from `OPL01`,
-except for a supersede, whose successor inherits a retired predecessor's author
-and group. The privileged session's supersede is admitted whatever that
-author's binding, retired-linked or unlinked (the platform corpus's edit path,
-"Existing rows"). An instance-admin principal's supersede of another author's
-claim is admitted when that author is a RETIRED identity of any human, and
-refused `OPL01` when the author is unlinked. An instance admin writing as
-itself is never relieved of its own binding. A consequence: an
+refusals are SQLSTATE **`OPL02`**. Only a privileged (maintenance) session
+crosses groups and humans. Since migration 123 (operator ruling OQ-1 (b)) a
+session whose principal holds `role:platform-custodian` is relieved of
+nothing on an application session: the principal is a stamp the application
+role sets, and holding the role is not using it. A custodial write is made on
+the maintenance DSN with `epigraph-operator custodial-supersede`, which
+records a `platform.custodial_act` against the actor's live assignment. The
+privileged session is not relieved of `OPL01` either, except for a supersede,
+whose successor inherits a retired predecessor's author and group: that
+supersede is admitted whatever the author's binding, retired-linked or
+unlinked (the platform corpus's edit path, "Existing rows"). A re-open of a
+claim, and any change of an existing claim's lineage, on an application
+session is checked exactly as that session's insert would be. A consequence: an
 agent whose membership in its operator's group was REVOKED writes nothing (its
 default declaration falls back to its own personal group, which `OPL02`
 refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
@@ -495,9 +508,10 @@ the follow-up that lets them ingest workflows.
 **Scope: claim INSERTs.** The trigger governs claim INSERTs, changes of
 `claims.agent_id`, the clearing or re-pointing of an existing
 `claims.supersedes` (above), and a claim becoming current again
-(`is_current` false to true), which a non-exempt session's trigger checks as
-an INSERT of that row. The inherited-author rules therefore hold across
-statements: retiring a successor, adding a second one and re-opening the
+(`is_current` false to true), which the trigger checks as an INSERT of that
+row on every session but a privileged one (a custodian principal included,
+since migration 123; before it the instance-admin exemption skipped the
+check). The inherited-author rules therefore hold across statements: retiring a successor, adding a second one and re-opening the
 first, or re-pointing a successor while retiring it and then re-opening it,
 meets the same refusal as the one-statement form. No repository or route
 re-opens a claim. Every other claim UPDATE (content, truth value, labels,
@@ -555,7 +569,18 @@ The census lists every agent that authored claims in the last `--recent-days`
 `--allow-unbound-writers` records that stopping them is the decision. Arming is
 **one-way**: there is no disarm function, and the maintenance role holds no
 UPDATE or DELETE on `operator_binding_arming`. The api and mcp servers log at
-boot whether the database is armed.
+boot whether the database is armed, and REFUSE TO START (exit 1, `ERROR:
+refusing to start: ...` on stderr) when their DSN is privileged
+(`epigraph_bypass()` is true) on an armed database, whatever the valve says:
+on such a DSN the trigger checks the author column alone and relieves the
+cross-human scope (operator ruling OQ-7 (b)). `epigraph-mcp` refuses on every
+transport, stdio included. An unarmed database is not refused at boot, but a
+unit keeps re-reading its posture while it serves
+(`EPIGRAPH_REQUEST_UNIT_RECHECK_SECS`, 30 s by default, clamped to 1..300 s)
+and exits 1 (`ERROR: stopping: ...`) once it finds itself on a privileged DSN
+of an armed database, so arming under a running privileged unit stops it. A
+failed re-read is a WARN and the unit keeps serving; only the boot read fails
+closed.
 
 The only runtime relief is per process:
 `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`. It is read once at boot, logs a WARN
@@ -584,7 +609,8 @@ application role itself, which is how `ScopedPool` stamps a request, and
 tenancy row security trusts the same stamp. A holder of the APPLICATION DSN
 that issues raw SQL can therefore stamp any identity it knows the id of (agent
 and human ids are not secrets: they author ordinary claims): a bound agent, a
-human, or a live instance admin, and with the last be exempt from `OPL02`. The
+human, or a platform custodian (since migration 123 the last gains it
+nothing: no application session is relieved of `OPL02`). The
 binding constrains the code paths that stamp from an authenticated viewer; it
 is not a defence against a process that holds the application DSN and
 misbehaves (a compromised request unit, or any agent container given that
@@ -626,7 +652,11 @@ before arming.
   `--exclude-agents-file` ids, and agents that authored a claim within
   `--quiet-days` (30; they may still be running and want a live link), and
   agents holding write authority in a group the operator does not write
-  (`foreign_write_authority`: they act in someone else's group). `--operator`
+  (`foreign_write_authority`: they act in someone else's group), and, from
+  migration 123, principals still holding an un-ended, un-lapsed role
+  assignment (`role_holder`: typically a departed holder whose registration
+  was revoked; end the assignment with `end-role-assignment` and re-run, which
+  links it then). `--operator`
   is always explicit, and a run ties EVERY untied candidate to that one operator
   (there is no include list): with many humans, scope each run with
   `--exclude-agents-file` listing every agent that is not that human's (a later
@@ -674,28 +704,29 @@ before arming.
   author's own personal group.
 * **World-owned claims once armed.** Nobody holds a writer row in the world
   group, so once armed a NEW claim owned by it (a supersede's successor
-  inherits the world owner) is written only by a privileged session or an
-  instance-admin principal; everyone else, a human included, is refused
+  inherits the world owner) is written only by a privileged session or a
+  platform-custodian principal; everyone else, a human included, is refused
   `OPL02`. Under `--legacy-owner platform` the retired-linked and unlinked
   authors' rows STAY world-owned (the platform corpus), to be revised only by
   an elevated act. A privileged (maintenance) session's supersede of such a
   claim carries its predecessor's author whatever that author's binding (the
-  successor restates the one retired claim, in the world group); an
-  instance-admin PRINCIPAL supersedes a retired-linked author's claim but not
-  an unlinked author's (`OPL01`: an admin stamp is a value an application
+  successor restates the one retired claim, in the world group); a
+  custodian PRINCIPAL supersedes a retired-linked author's claim but not
+  an unlinked author's (`OPL01`: a principal stamp is a value an application
   session sets, so it is not relieved of the binding). With the valve closed,
   a fresh claim naming such an author is refused (`OPL01`) on every session,
   maintenance included. The valve relieves that `OPL01` wherever it is set: a
-  privileged session or an instance-admin principal with the valve open can
+  privileged session or a custodian principal with the valve open can
   mint a fresh world-owned claim under a legacy identity, and only `OPL02`
   (the cross-human scope) still holds for everyone else. So keep the valve
-  out of maintenance units, and keep valve windows short. No operator command
-  performs that custodial supersede yet, and a hand-written retire plus INSERT
-  is not one. The act also writes the `supersedes` edge from the successor to
-  its predecessor, moves the predecessor's strengthening edges to the
-  successor (weakening ones stay), and leaves the successor's embedding to the
-  embedding backfill. `ClaimRepository::supersede_conn` does all of this on a
-  privileged connection. The "human supersedes its own
+  out of maintenance units, and keep valve windows short. The custodial
+  supersede is `epigraph-operator custodial-supersede` (migration 123; "The
+  custodian role" below), and a hand-written retire plus INSERT is not one.
+  The act also writes the `supersedes` edge from the successor to its
+  predecessor, moves the predecessor's strengthening edges to the successor
+  (weakening ones stay), records a `platform.custodial_act` naming the
+  custodian's assignment, and leaves the successor's embedding to the
+  embedding backfill. The "human supersedes its own
   legacy author's claim" admission applies to rows in the human's own group.
   Revising the corpus IN PLACE (an UPDATE of content, truth value, labels, or
   retiring a claim) is not governed by the binding trigger ("Scope" above;
@@ -719,6 +750,212 @@ before arming.
   personal group, and the author's human holds no writer row there, so the act
   is refused `OPL02`, like a fresh claim into that group. Revise those claims
   on a maintenance DSN, or move them before arming.
+
+## The custodian role (migration 123)
+
+**Instance administration is a role, not a flag on an agent.**
+`role:platform-custodian` is held by a REGISTERED HUMAN operator through a
+timestamped assignment (`role_assignments`: holder, `valid_from`,
+`valid_to`, the granting custodian, the database login that wrote it, a
+reason, and an end stamp). It replaces `instance_admins` as the source of
+admin authority: `epigraph_is_instance_admin` keeps its name, signature and
+subject binding and answers "holds role:platform-custodian now", so every
+policy that asked it (privatization, the security-event read arm) switched at
+once. It no longer relieves `OPL02`: 122's `epigraph_operator_scope_exempt()`
+is re-bodied to the privileged session alone (operator ruling OQ-1 (b)), so
+the role confers no write authority on an application session. `role:auditor`
+reads the platform audit trail and confers nothing else.
+
+* **Agents never hold a role** (`CUS01`): the holder must be a registered human
+  (`epigraph_is_human_operator`) that is not itself linked to a human as an
+  agent (live or retired), re-checked at read time, so revoking the human's
+  registration or suspending its recorded OAuth client ends its authority at
+  once. A HOLDER is never linked as an agent: a new `operator_links` row for a
+  principal with a live or not-yet-begun assignment is refused `CUS01`, so its
+  holding ends through `end-role-assignment` (audited) before the link. A
+  grant and a link of one principal running at once see each other: both
+  guards take the link writes' advisory lock before they read, so the second
+  is refused once the first commits. That holds under READ COMMITTED (the
+  default) and SERIALIZABLE (a serialization failure); REPEATABLE READ is
+  refused on both sides (`CUS06`), because its snapshot predates the wait.
+* **Append-only** (`CUS02`): an assignment is never edited or deleted; its only
+  change is its end (`revoked_at` stamped now, by the revoking login, with
+  why), and an ended assignment is final. Nothing is back-dated, and the
+  provenance columns (`granted_via`, `created_at`) are the database's, never
+  the writer's.
+* **The grantor rule** (`CUS03`): once any live custodian exists, every grant
+  names a live custodian as its grantor, and a holder never extends its own
+  assignment while another holder exists. The first grant (no live custodian)
+  is the only one without a grantor.
+* **Written only on a maintenance DSN**: `epigraph-operator grant-role`,
+  `end-role-assignment`, `list-role-assignments`. The application role reads
+  only its own assignments. `epigraph-instance-admin grant|revoke` refuse and
+  name these.
+* **Audited**: every grant and end and every custodial act is one
+  `security_events` row whose type starts with `platform.` (any case) and
+  whose details name the assignment. No application session writes a
+  `platform.` row, and no row is ever edited, deleted or back-dated. The
+  trail is NOT proof against a holder of the maintenance DSN: `granted_by`
+  and an act's actor are UUIDs that login supplies, checked for a live
+  custodian. Since migration 130, once the acting custodian holds a live
+  passkey the write must name a PASSKEY-CONFIRMED admin act whose canonical
+  arguments are exactly the write's (`ELV10` otherwise; see "Elevation"
+  below); before any passkey exists the write is a bootstrap act, audited
+  `confirmation = 'none'`.
+  A holder of `role:auditor` (or the custodian role) reads the trail through
+  `epigraph_platform_audit(since, limit)`.
+* **Custodial acts**: privatization plan writes (create, approve, abort,
+  apply, revert) and `epigraph-operator custodial-supersede` each record a
+  `platform.custodial_act` against the actor's LIVE assignment in the act's
+  own transaction (`CUS04`, and nothing written, otherwise).
+* **OCCUPIES is a projection**: each assignment also appears in the graph as
+  an `OCCUPIES` edge from the holder to the role's node, with the
+  assignment's window in the edge's `valid_from` / `valid_to`. It is never
+  read for authority (a ratchet test fails if a policy, function or Rust
+  source reads it), and, like the governance graph's other OCCUPIES edges,
+  it is world-readable: who holds the custodian role is public. An edge of
+  the same shape can be written by any writer of the world group, so a
+  governance reader joins it to `role_assignments` on
+  `properties->>'assignment_id'` before treating it as a holder.
+* **`instance_admins` is frozen**: no new row and no edit on any role, except
+  a `revoked_at` stamp on the row of a principal holding no live custodian
+  assignment (an old `revoke` of a live custodian fails `CUS05`), which ending
+  a holder's last custodian assignment, or revoking the human, writes into
+  the holder's legacy row (so a rollback that
+  restores 083's body resurrects nobody). Migration 123 carried each LIVE row
+  of a registered human into an assignment from its `granted_at`, and skipped
+  every other live row loudly, naming why (an agent, a human linked as an
+  agent, a human whose client is not active).
+
+The role confers no WRITE authority on an application session: every custodial
+write is a maintenance act. Its standing READ authority (083's
+`security_events_read` arm, the privatization plan, item and audit reads, and
+the privatization routes' gate, all keyed on the session's stamped principal,
+which any holder of the application DSN sets) follows the admin-scope switch
+since migration 129: UNARMED it is as described here; ARMED it needs a live
+elevation. Activating the role per session, per-act confirmation and audited
+reads are the next section.
+
+## Elevation: time-boxed, passkey-confirmed READ for custodians (migrations 124-132)
+
+**What it is.** A holder of an elevating role (today `role:platform-custodian`)
+may, for at most 15 minutes, READ rows of groups it is not a member of. It is
+"sudo READ": nothing is written through an elevation except the audit trail
+and an admin-act proposal. Every elevated access is recorded where the people
+whose rows were read can see it. Migration 132 opens it (125's recorder gate);
+before 132 no session is ever live.
+
+**Who may elevate** (operator ruling D2). Only a REGISTERED HUMAN, not linked
+as any human's agent, holding a LIVE assignment of an elevating role, with a
+live passkey (WebAuthn with user verification, ruling D5), on a live refresh
+family of its own human OAuth client. Agents never elevate (they hold no
+role, `CUS01`); `instance_admins` and standing flags never qualify. All of
+this is re-checked by the database on EVERY statement, so revoking the
+assignment, the registration, the client, the family or the confirming
+passkey ends the elevation at once.
+
+**How.**
+
+* Passkeys are enrolled on a maintenance-DSN ticket
+  (`epigraph-operator passkey-enroll`), completed by the person at
+  `/elevate/enroll/<id>` on their own device. A later passkey of a holder
+  needs a confirmed `passkey.register` act. The relying party requires a
+  verified attestation on a configured allowlist; the test and development
+  flag that accepts software (`none` / self) attestation,
+  `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION`, is REFUSED by the API on a
+  database armed for operator binding, at boot and while running.
+* The CLI / console path (the one served by default): `POST
+  /api/v1/elevation/tickets {reason}` with the person's own token opens a
+  ticket; the person confirms it with their passkey at `/elevate/<ticket>`
+  (only their own passkeys are offered; another person's passkey on the
+  ticket is REFUSED and audited); the client then redeems the ticket at
+  `/oauth/token` (`urn:epigraph:grant:elevate`) for ONE token: at most the
+  session's lifetime, no refresh token, the client's scopes minus every
+  admin-only one plus `platform:admin`, naming the session (`elv`).
+* MCP `sudo` / `unsudo` (connector mode) exist but `sudo` is served only with
+  `EPIGRAPH_MCP_CONNECTOR_ELEVATION` on, which is OFF by default (see the
+  limits). `unsudo`, `POST /api/v1/elevation/end` and `epigraph-operator
+  end-elevation` end a session early.
+
+**What an elevated request may do.** Read: 126's per-table read arms admit
+every row to a live elevated session on the application role; the request's
+own query fragment is always-true for an elevated viewer, so the database
+decides. Write: nothing. The API refuses every non-GET request from a token
+carrying an elevation claim (a named allowlist of read-only POSTs aside, and
+the one act-proposal route); the MCP transport refuses every non-read tool
+and every federated tool to an elevated request; the database's RESTRICTIVE
+policies refuse INSERT, UPDATE and DELETE on every armed table; a pool
+connection is scrubbed of the elevation on release; a task detached from an
+elevated request runs as the person's ordinary viewer.
+
+**Who sees that it happened.** Every elevated request (REST response or MCP
+tool result) is recorded in `elevated_access` BEFORE the response leaves; if
+the record cannot be written the response is withheld. A row names the
+session, the person, the reason, the surface, the ids and filters (never
+content), the row count, and the GROUPS whose non-public rows the response
+named; an admin member of such a group reads the row through its row policy,
+and a holder of `role:auditor` or an elevated custodian reads all rows through
+a definer reader. Attribution is by the ids the response contains, so it errs
+toward the subject: a group id merely mentioned (a public row's owner, a
+not-found error naming an id) attributes that group, and an aggregate with no
+row ids is recorded with no group. No API route or MCP tool shows a subject
+their rows yet: they are readable on the database through the policy.
+
+**Operator-hidden (pinned) evidence** is readable to an elevated session that
+reads the claims it is for or against, and every such read is recorded for
+the evidence row's owning group. This is an INTERIM operator ruling ("for
+now"); a later one may restore hiding.
+
+**Admin acts** (migrations 130 and 131). An elevated person PROPOSES an act
+(`POST /api/v1/admin/acts`, or MCP `propose_admin_act` listed only to an
+elevated request): `role.grant`, `role.end`, `claim.custodial_supersede`, or
+`passkey.register`, with its arguments stored in a canonical form and digested.
+The same person CONFIRMS that act with their passkey at `/elevate/act/<id>`;
+the WebAuthn challenge commits to the act's id, its stored digest and a stored
+nonce, so a page cannot show one act while another is confirmed. The
+maintenance CLI then EXECUTES it (`epigraph-operator grant-role |
+end-role-assignment | custodial-supersede | passkey-enroll ... --act <id>`),
+recomputing the digest from its own flags and consuming the act in the same
+transaction; the audit row carries `confirmation = passkey`, the act id and
+the elevation id. The database's guards enforce this for direct maintenance
+statements too (`ELV10`): once the acting custodian holds a passkey, a
+custodial write without a confirmed act is refused. `revoke-passkey` is the
+break-glass back to the bootstrap path.
+
+**Admin-only scopes** (`claims:admin`, `clients:admin`, `groups:admin`, ...)
+pass through one mint chokepoint and one check chokepoint behind a switch that
+ships UNARMED. Armed, no grant mints them, a standing one counts for nothing
+on an unelevated request, and an elevated request holds the admin READ
+scopes; arming is an operator step (`docs/deploy.md`).
+
+**The honest limits, stated rather than left to be found.**
+
+* **Tokens are HS256 until the EdDSA token work.** A holder of the token
+  secret can forge an elevation claim and a family; the database still
+  requires a live session bound to that principal and family, but the forger
+  can ride a LIVE elevation of the person's family while it lasts.
+* **Forged confirmations are DETECTABLE, not preventable.** The database
+  cannot verify a WebAuthn signature, so a holder of the application DSN can
+  record a confirmation through the confirm definers, and a holder of the
+  maintenance DSN can write the rows directly. `epigraph-operator
+  verify-confirmations` re-verifies every stored confirmation offline (the
+  signature against the stored public key, the act binding, a replayed
+  evidence object, a session no confirmed ticket opened) and records each
+  finding. It does not detect: an assertion phished from the person's real
+  passkey over a challenge the forger chose; a maintenance holder editing or
+  deleting the ceremony rows or the trail (the append-only guards bind every
+  login a superuser has not disabled); a signature counter going back across
+  confirmations.
+* **Connector-mode family scope is unmeasured.** An MCP `sudo` elevates the
+  calling token's refresh family; whether a connector shares one family
+  across chats is not measured, so connector mode stays OFF and the CLI path
+  is the served one.
+* **MCP reads are not widened.** The MCP read tools read on the server's own
+  unstamped pool, so an elevated MCP request reads no more than before; its
+  calls are still recorded (attributed when the answer names a row). The REST
+  surface is widened.
+* **Lockdown, group-held assignments, a two-person rule and signed audit
+  events are out of scope** for this stack.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

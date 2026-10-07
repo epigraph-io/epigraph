@@ -821,7 +821,9 @@ async fn app_readable_inner(
     sqlx::query(
         "SELECT set_config('epigraph.group_ids', '', true), \
                 set_config('epigraph.writable_group_ids', '', true), \
-                set_config('epigraph.principal_id', '', true)",
+                set_config('epigraph.principal_id', '', true), \
+                set_config('epigraph.elevation_id', '', true), \
+                set_config('epigraph.family_id', '', true)",
     )
     .execute(&mut *conn)
     .await?;

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey"]
 genai = ["db"]
 
 [[bin]]
@@ -247,6 +247,10 @@ epigraph-ingest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 epigraph-db = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+# `epigraph-operator verify-confirmations` (elevation plan EL-13): re-verifies
+# every stored passkey assertion offline. Links OpenSSL (webauthn-rs-core);
+# only behind `db`, which every operator verb already needs.
+epigraph-passkey = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -281,6 +285,20 @@ http-body-util = "0.1"
 # same pin epigraph-api/Cargo.toml already uses for its OAuth provider tests,
 # so this adds no new dependency version to the lockfile.
 wiremock = "0.6"
+# `tests/operator_admin_act_cli.rs`'s end-to-end act (elevation plan EL-12b):
+# the real API router proposes and confirms an act with the test
+# authenticator shared with `epigraph-passkey`'s tests (`#[path]` to its
+# `tests/support/soft_authenticator.rs`, written on OpenSSL and ciborium), and
+# the real `epigraph-operator` binary executes it. Dev-only, all already in
+# the lockfile: no normal build of this crate links them.
+epigraph-passkey = { workspace = true }
+epigraph-auth = { workspace = true }
+# test-support: the application-role ScopedPool that declares the per-access
+# recorder (the router the end-to-end act runs on elevates only on one).
+epigraph-db = { workspace = true, features = ["test-support"] }
+openssl = "0.10"
+ciborium = "0.2"
+url = "2"
 
 [lints]
 workspace = true

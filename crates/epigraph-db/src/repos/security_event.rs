@@ -131,13 +131,33 @@ impl SecurityEventRepository {
     /// so the token mint can update it), so the application login reads it
     /// directly; nothing here needs a viewer.
     ///
+    /// # Once the admin-scope switch is armed (elevation plan EL-10)
+    ///
+    /// `armed` is the request's admin-scope posture (the caller's
+    /// `AuthContext::admin_scopes`, read by its auth layer; never read here, on
+    /// the caller's transaction, where a database without migration 128 would
+    /// abort it). ARMED, a standing `claims:admin` grant is no longer admin
+    /// authority: the predicate becomes "this connection is ELEVATED"
+    /// (`epigraph_is_elevated()`, a live elevation session of this principal
+    /// on the stamped family, re-checked by the database). A write
+    /// transaction is never stamped elevated (an elevated viewer gets no write
+    /// transaction), so armed, the audited admin WRITE paths are closed: they
+    /// are maintenance-CLI-only (plan EQ-5). Unarmed: the grant, as before.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the SELECT fails.
     pub async fn admin_grant_is_live<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         client_id: Uuid,
         agent_id: Uuid,
+        armed: bool,
     ) -> Result<bool, DbError> {
+        if armed {
+            let elevated: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+                .fetch_one(executor)
+                .await?;
+            return Ok(elevated);
+        }
         let live: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM oauth_clients c \
                              WHERE c.id = $1 AND c.agent_id = $2 AND c.status = 'active' \

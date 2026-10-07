@@ -192,6 +192,7 @@ async fn admin_arm(
         &mut *conn,
         auth.client_id,
         caller_agent,
+        auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
     )
     .await
     .map_err(|e| {
