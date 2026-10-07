@@ -178,6 +178,25 @@ def update_theme(conn, theme_id, label, description):
     conn.commit()
 
 
+def is_placeholder_label(label):
+    """True when `label` is not a real LLM-written name and should be (re)labelled.
+
+    Heuristic from V2: a short label is taken as already named unless it is a
+    generated placeholder. Placeholders are `auto-NN` (theme_cluster),
+    `cluster-NN` (the cluster_labels fallback that project_to_themes copies
+    onto a theme, and split_theme's `cluster-split-...` parts), and long or
+    definitional strings (the semicolon-joined nearest-claim excerpts).
+    """
+    return (
+        not label
+        or label.startswith("auto-")
+        or label.startswith("cluster-")
+        or len(label) >= 60
+        or "is defined as" in label
+        or "defined as:" in label
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
@@ -215,17 +234,7 @@ def main():
 
     for i, theme in enumerate(themes):
         current = theme["current_label"]
-        # Heuristic from V2: skip themes whose label is already short and
-        # doesn't look like a placeholder ("auto-XX" stays in scope because
-        # it's < 60 chars but lacks "defined as" — explicit fix below).
-        is_placeholder = (
-            not current
-            or current.startswith("auto-")
-            or len(current) >= 60
-            or "is defined as" in current
-            or "defined as:" in current
-        )
-        if not args.relabel_all and not is_placeholder:
+        if not args.relabel_all and not is_placeholder_label(current):
             print(
                 f"\nTheme {i+1}/{len(themes)}: SKIP (already labeled: {current})",
                 file=sys.stderr,
