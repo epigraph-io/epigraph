@@ -339,6 +339,15 @@ pub struct GetProvenanceParams {
                        `content_truncated: true` and the original `content_chars`."
     )]
     pub max_content_chars: Option<usize>,
+
+    #[schemars(
+        description = "Budget for the whole response, in characters of compact JSON. \
+                       Default 40000, clamped to 10000..=500000. Claims are admitted \
+                       nearest-first with their evidence (at most 10 per claim) and \
+                       traces until the next would overrun it; the bundle then reports \
+                       `budget_exhausted: true` and `truncated: true`."
+    )]
+    pub max_output_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

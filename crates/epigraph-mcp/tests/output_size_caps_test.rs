@@ -84,6 +84,7 @@ async fn get_provenance_bounds_nodes_and_content_by_default(pool: PgPool) {
             max_depth: None,
             max_nodes: None,
             max_content_chars: None,
+            max_output_chars: None,
         },
     )
     .await
@@ -180,6 +181,10 @@ async fn get_provenance_bounds_nodes_and_content_by_default(pool: PgPool) {
             max_depth: Some(1),
             max_nodes: Some(PARENTS + 1),
             max_content_chars: Some(CONTENT_CHARS + 10),
+            // 81 x ~2.1K of claim text is ~175K; the default 40K output
+            // budget would (correctly) cut it, so this arm widens that cap
+            // too. Within the 500K ceiling.
+            max_output_chars: Some(400_000),
         },
     )
     .await
@@ -207,6 +212,288 @@ async fn get_provenance_bounds_nodes_and_content_by_default(pool: PgPool) {
             );
         }
     }
+}
+
+/// The default `DEFAULT_MAX_OUTPUT_CHARS` total budget in `tools/provenance.rs`.
+const EXPECTED_DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
+/// The `MAX_EVIDENCE_PER_CLAIM` cap in `tools/provenance.rs`.
+const EXPECTED_MAX_EVIDENCE_PER_CLAIM: usize = 10;
+
+/// The shape that still failed in prod AFTER the node and content caps landed
+/// (backlog `31c10a5a`, re-measured 2026-10-04): `get_provenance` on
+/// `07d46bc3…` with defaults errored at 83,074 characters, of which 50 claim
+/// entities were only ~36K. The other ~35K were 151 evidence entities and 36
+/// trace entities, which carry no content field and had NO count cap, plus
+/// pretty-printing. The node x content product does not bound that.
+///
+/// This lineage reproduces it: 80 parents x 2,000 chars as above, but every
+/// claim also carries evidence rows and a reasoning trace, and the target
+/// carries more evidence than one claim may emit.
+///
+/// Asserted on the defaults-only call (compiles against pre-fix code):
+/// 1. the whole response fits the default total budget;
+/// 2. every reference the bundle emits resolves to an entity in it
+///    (#397 finding: `parent_ids` named claims the node cap had dropped);
+/// 3. the target's evidence is capped per claim and says so;
+/// 4. the bundle says it was cut.
+///
+/// Failures are collected and reported together so one red run shows every
+/// independent way the pre-fix bundle is wrong.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
+    const PARENTS: usize = 80;
+    const CONTENT_CHARS: usize = 2_000;
+    const EVIDENCE_PER_PARENT: usize = 6;
+    const TARGET_EVIDENCE: usize = 25;
+
+    let agent = seed_agent(&pool).await;
+    let target = seed_claim(&pool, agent, &format!("9999{}", "T".repeat(CONTENT_CHARS))).await;
+    for _ in 0..TARGET_EVIDENCE {
+        seed_evidence(&pool, target).await;
+    }
+    let target_trace = seed_trace(&pool, target).await;
+    let mut parents = Vec::new();
+    let mut parent_traces = std::collections::HashMap::new();
+    for i in 0..PARENTS {
+        let parent = seed_claim(
+            &pool,
+            agent,
+            &format!("{i:04}{}", "P".repeat(CONTENT_CHARS)),
+        )
+        .await;
+        seed_claim_edge(&pool, parent, target).await;
+        for _ in 0..EVIDENCE_PER_PARENT {
+            seed_evidence(&pool, parent).await;
+        }
+        parent_traces.insert(parent, seed_trace(&pool, parent).await);
+        parents.push(parent);
+    }
+
+    // Trace DAG: the target's trace cites every parent's trace and one trace
+    // OUTSIDE the lineage (on an unrelated claim). `get_lineage` reads
+    // `trace_parents` for the traces named by `claims.trace_id`, unscoped
+    // and unfiltered, so the bundle sees all 81. The node cap and the budget
+    // drop most parents, and the outside trace is never in the lineage: the
+    // emitted list must be pruned to traces the bundle contains.
+    let outsider = seed_claim(&pool, agent, "unrelated claim").await;
+    let outside_trace = seed_trace(&pool, outsider).await;
+    set_claim_trace(&pool, target, target_trace).await;
+    seed_trace_parent(&pool, target_trace, outside_trace).await;
+    for t in parent_traces.values() {
+        seed_trace_parent(&pool, target_trace, *t).await;
+    }
+
+    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let raw = raw_text(
+        &get_provenance(
+            &server,
+            &viewer,
+            GetProvenanceParams {
+                claim_id: target.to_string(),
+                max_depth: None,
+                max_nodes: None,
+                max_content_chars: None,
+                max_output_chars: None,
+            },
+        )
+        .await
+        .expect("get_provenance must succeed, not error out on size"),
+    );
+    let bundle: Value = serde_json::from_str(&raw).expect("bundle is JSON");
+    let entities = bundle["entities"].as_array().expect("entities array");
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // ---- (1) total size ----
+    if raw.len() > EXPECTED_DEFAULT_MAX_OUTPUT_CHARS {
+        failures.push(format!(
+            "total output {} chars exceeds the default budget {EXPECTED_DEFAULT_MAX_OUTPUT_CHARS} \
+             ({} entities)",
+            raw.len(),
+            entities.len()
+        ));
+    }
+
+    // ---- (2) reference closure ----
+    let ids: std::collections::HashSet<&str> =
+        entities.iter().filter_map(|e| e["@id"].as_str()).collect();
+    let mut dangling: Vec<String> = Vec::new();
+    let mut check = |field: &str, v: &Value| {
+        if let Some(s) = v.as_str() {
+            if !ids.contains(s) {
+                dangling.push(format!("{field} -> {s}"));
+            }
+        }
+    };
+    check("root_claim", &bundle["root_claim"]);
+    for v in bundle["topological_order"].as_array().into_iter().flatten() {
+        check("topological_order", v);
+    }
+    for e in entities {
+        check("claim_id", &e["claim_id"]);
+        for field in ["parent_ids", "evidence_ids", "parent_trace_ids"] {
+            for v in e[field].as_array().into_iter().flatten() {
+                check(field, v);
+            }
+        }
+    }
+    if !dangling.is_empty() {
+        failures.push(format!(
+            "{} emitted references resolve to no entity in the bundle, e.g. {:?}",
+            dangling.len(),
+            &dangling[..dangling.len().min(3)]
+        ));
+    }
+
+    // ---- (3) per-claim evidence cap on the target ----
+    let target_ref = format!("claim:{target}");
+    let target_entity = entities.iter().find(|e| e["@id"] == target_ref.as_str());
+    match target_entity {
+        None => failures.push("the target claim must always be emitted".into()),
+        Some(t) => {
+            let emitted_for_target = entities
+                .iter()
+                .filter(|e| {
+                    e["@type"] == "prov:Entity"
+                        && e["claim_id"] == target_ref.as_str()
+                        && e["@id"]
+                            .as_str()
+                            .is_some_and(|i| i.starts_with("evidence:"))
+                })
+                .count();
+            if emitted_for_target != EXPECTED_MAX_EVIDENCE_PER_CLAIM
+                || t["evidence_count"] != TARGET_EVIDENCE
+                || t["evidence_truncated"] != Value::Bool(true)
+            {
+                failures.push(format!(
+                    "target evidence must be capped at {EXPECTED_MAX_EVIDENCE_PER_CLAIM} entities \
+                     and report evidence_count={TARGET_EVIDENCE}, evidence_truncated=true; got \
+                     {emitted_for_target} entities, evidence_count={}, evidence_truncated={}",
+                    t["evidence_count"], t["evidence_truncated"]
+                ));
+            }
+        }
+    }
+
+    // ---- (4) the cut is reported ----
+    if bundle["truncated"] != Value::Bool(true) {
+        failures.push(format!(
+            "truncated must be true, got {}",
+            bundle["truncated"]
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "evidence-dense lineage, defaults only:\n  - {}",
+        failures.join("\n  - ")
+    );
+
+    // The budget must still leave a useful bundle, nearest ancestors first.
+    let claim_entities = entities
+        .iter()
+        .filter(|e| e["@id"].as_str().is_some_and(|i| i.starts_with("claim:")))
+        .count();
+    assert!(
+        claim_entities > 5,
+        "the budget must not collapse the bundle to the target alone: {claim_entities}"
+    );
+    assert_eq!(bundle["claim_node_count"], Value::from(claim_entities));
+    assert_eq!(
+        bundle["budget_exhausted"],
+        Value::Bool(true),
+        "{}",
+        bundle["limits"]
+    );
+
+    assert_eq!(
+        bundle["limits"]["max_output_chars"],
+        Value::from(EXPECTED_DEFAULT_MAX_OUTPUT_CHARS),
+        "the defaults-only call must echo the default budget"
+    );
+
+    // The trace DAG survives, pruned to what was emitted: the target trace
+    // names exactly the traces of the parent claims the bundle kept. This is
+    // the non-vacuous half of check (2): without it an empty list passes.
+    let target_trace_entity = entities
+        .iter()
+        .find(|e| e["@id"] == format!("trace:{target_trace}").as_str())
+        .expect("the target's trace must be emitted");
+    let mut got: Vec<&str> = target_trace_entity["parent_trace_ids"]
+        .as_array()
+        .expect("parent_trace_ids array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<String> = entities
+        .iter()
+        .filter_map(|e| e["@id"].as_str()?.strip_prefix("claim:"))
+        .filter_map(|c| c.parse::<Uuid>().ok())
+        .filter_map(|c| parent_traces.get(&c))
+        .map(|t| format!("trace:{t}"))
+        .collect();
+    want.sort_unstable();
+    assert!(
+        !want.is_empty(),
+        "at least one parent claim (and its trace) must be emitted"
+    );
+    assert_eq!(
+        got, want,
+        "target trace's parent_trace_ids must be exactly the emitted parents' traces"
+    );
+    assert!(
+        !got.contains(&format!("trace:{outside_trace}").as_str()),
+        "a trace outside the lineage must not be referenced"
+    );
+
+    // ---- Control: a lineage inside every budget is NOT reported as cut ----
+    // One parent alone: itself, 6 evidence rows, 1 trace. Proves `truncated`,
+    // `budget_exhausted` and `evidence_truncated` are not hardcoded.
+    let small: Value = serde_json::from_str(&raw_text(
+        &get_provenance(
+            &server,
+            &viewer,
+            GetProvenanceParams {
+                claim_id: parents[0].to_string(),
+                max_depth: None,
+                max_nodes: None,
+                max_content_chars: None,
+                max_output_chars: None,
+            },
+        )
+        .await
+        .expect("get_provenance on a single parent"),
+    ))
+    .expect("bundle is JSON");
+    let small_entities = small["entities"].as_array().unwrap();
+    assert_eq!(
+        small_entities
+            .iter()
+            .filter(|e| e["@id"]
+                .as_str()
+                .is_some_and(|i| i.starts_with("evidence:")))
+            .count(),
+        EVIDENCE_PER_PARENT,
+        "every evidence row of a small lineage must come back: {small}"
+    );
+    assert_eq!(
+        small_entities
+            .iter()
+            .filter(|e| e["@type"] == "prov:Activity")
+            .count(),
+        1,
+        "the trace must come back: {small}"
+    );
+    assert_eq!(small["truncated"], Value::Bool(false), "{small}");
+    assert_eq!(small["budget_exhausted"], Value::Bool(false), "{small}");
+    assert_eq!(
+        small_entities[0]["evidence_truncated"],
+        Value::Bool(false),
+        "{small}"
+    );
 }
 
 /// NEGATIVE CASE for the bundle-level `truncated` flag.
@@ -241,6 +528,7 @@ async fn get_provenance_reports_untruncated_when_the_lineage_fits(pool: PgPool) 
             max_depth: None,
             max_nodes: None,
             max_content_chars: None,
+            max_output_chars: None,
         },
     )
     .await
@@ -542,6 +830,56 @@ async fn seed_claim_edge(pool: &PgPool, ancestor: Uuid, descendant: Uuid) {
     .execute(pool)
     .await
     .expect("seed claim edge");
+}
+
+/// An evidence row attached to `claim_id` (shape from `source_strength_tests.rs`).
+async fn seed_evidence(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, content_hash, evidence_type, claim_id) \
+         VALUES ($1, $2, 'testimony', $3)",
+    )
+    .bind(id)
+    .bind(id.as_bytes().repeat(2))
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+    id
+}
+
+/// A reasoning trace for `claim_id`; `get_lineage` selects traces by
+/// `reasoning_traces.claim_id`.
+async fn seed_trace(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, confidence, explanation) \
+         VALUES ($1, 'deductive', 0.9, 'provenance size probe') RETURNING id",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed reasoning trace")
+}
+
+/// Point `claims.trace_id` at `trace_id`. `get_lineage` reads `trace_parents`
+/// only for traces named by `claims.trace_id`.
+async fn set_claim_trace(pool: &PgPool, claim_id: Uuid, trace_id: Uuid) {
+    sqlx::query("UPDATE claims SET trace_id = $2 WHERE id = $1")
+        .bind(claim_id)
+        .bind(trace_id)
+        .execute(pool)
+        .await
+        .expect("set claims.trace_id");
+}
+
+/// A `trace_parents` edge: `trace_id` depends on `parent_id`.
+async fn seed_trace_parent(pool: &PgPool, trace_id: Uuid, parent_id: Uuid) {
+    sqlx::query("INSERT INTO trace_parents (trace_id, parent_id) VALUES ($1, $2)")
+        .bind(trace_id)
+        .bind(parent_id)
+        .execute(pool)
+        .await
+        .expect("seed trace parent");
 }
 
 async fn seed_paper(pool: &PgPool, doi: &str) -> Uuid {
