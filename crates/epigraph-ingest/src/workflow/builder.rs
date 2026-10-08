@@ -31,6 +31,38 @@ pub const CONTENT_HASH_SCOPE_KEY: &str = "content_hash_scope";
 /// digest is scoped to the workflow's `canonical_name`.
 pub const CONTENT_HASH_SCOPE_CANONICAL_NAME: &str = "canonical_name";
 
+/// Re-derive a [`CONTENT_HASH_SCOPE_CANONICAL_NAME`]-scoped digest and compare
+/// it with the stored one.
+///
+/// `candidate_canonical_names` are the `canonical_name`s of the workflows that
+/// EXECUTE the row (its `executes` edges) — a recovered seed, not a guessed
+/// one: every writer of a marked row (`build_ingest_plan` through the
+/// executor's `executes` loop, and `epigraph_ingest_executor::add_step`) links
+/// the row to its own workflow in the same transaction that writes it.
+///
+/// - `Some(true)`: some candidate reproduces the stored digest. Sound for ANY
+///   candidate, because matching `compound_content_hash(blake3(content), name)`
+///   requires the body to be a blake3 preimage of what was stored.
+/// - `Some(false)`: there is at least one candidate and none reproduces it —
+///   the body no longer matches what its workflow wrote (tampering signal).
+/// - `None`: no candidate, so the seed is unrecoverable and nothing is decided.
+#[must_use]
+pub fn canonical_name_scoped_hash_matches<'a>(
+    content: &str,
+    stored: &[u8; 32],
+    candidate_canonical_names: impl IntoIterator<Item = &'a str>,
+) -> Option<bool> {
+    let plain = content_hash(content);
+    let mut any_candidate = false;
+    for name in candidate_canonical_names {
+        any_candidate = true;
+        if compound_content_hash(&plain, name) == *stored {
+            return Some(true);
+        }
+    }
+    any_candidate.then_some(false)
+}
+
 /// Walk a `WorkflowExtraction` tree and produce a flat list of operations.
 ///
 /// The result includes a `workflow` source-node id (deterministic from

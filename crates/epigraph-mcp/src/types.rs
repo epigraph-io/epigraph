@@ -1309,9 +1309,12 @@ pub enum HashCheck {
     /// signal** — the body was mutated without rewriting the hash.
     Mismatch,
     /// The stored digest is not a function of the body alone, so comparing them
-    /// decides nothing. Reported for document- and workflow-scoped compound
-    /// rows, detected via
-    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`.
+    /// decides nothing. Reported for document-scoped compound rows (detected
+    /// via `epigraph_ingest::document::stored_content_hash_is_seed_scoped`),
+    /// and for a canonical_name-scoped WORKFLOW row only when no executing
+    /// workflow is visible to recover its seed from — a workflow row whose
+    /// seed is recovered is re-derived and reported [`Self::Match`] or
+    /// [`Self::Mismatch`].
     ///
     /// **Undecided, not clean.** Content-hash verification cannot rule tampering
     /// in *or* out here: the artifact seed that went into the stored digest is
