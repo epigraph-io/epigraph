@@ -6,6 +6,7 @@ pub mod introspect;
 pub mod jwt;
 pub mod metadata;
 pub mod providers;
+pub mod redirect;
 pub mod register;
 pub mod revoke;
 pub mod scopes;
