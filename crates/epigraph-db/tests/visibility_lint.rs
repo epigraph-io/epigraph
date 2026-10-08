@@ -1679,6 +1679,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
+        "current_decision",
+        "READ of one `match_candidates` row's status and verdict, a table with no tenancy \
+         columns to filter on, after a conditional decide matched no row (refusal message; lost \
+         decision vs re-scored verdict); the caller already read the same row by id \
+         (`MatchCandidateRepo::get`).",
+    ),
+    (
+        "match_candidate.rs",
         "require_privileged",
         "Reads no table and filters nothing: it asks the session one boolean, \
          `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
@@ -1753,6 +1761,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          id. Its dedup probe is the write-path read `create_or_get` documents (it must see an \
          existing edge whoever asks, or the get half becomes a duplicate create); the INSERT is \
          authorised by edges_tenancy's WITH CHECK on the stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_conn",
+        "WRITE. `create_symmetric_if_absent` on a caller's connection, so a matcher promotion \
+         writes its edge on the same transaction as the candidate's status flip \
+         (`MatchCandidateRepo::promote_if_pending`); the pool form delegates here. One \
+         INSERT ... WHERE NOT EXISTS (any-state dedup), authorised by edges_tenancy's WITH CHECK.",
     ),
     (
         "edge.rs",
