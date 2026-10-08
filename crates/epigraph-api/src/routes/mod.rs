@@ -56,6 +56,7 @@ pub mod events;
 pub mod experiment_loop;
 #[cfg(feature = "db")]
 pub mod experiments;
+pub mod extensions;
 #[cfg(feature = "db")]
 pub mod gaps;
 #[cfg(feature = "db")]
