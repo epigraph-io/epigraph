@@ -948,6 +948,6 @@ git commit -m "test(api): reserve /api/v1/ext and pin the extension mount above 
 
 **Files:** none new.
 
-- [ ] **Step 1: Run the repository's ci-local gate on the branch head.** It runs the branch's own `ci.yml` steps, including fmt, clippy `-D warnings`, the workspace tests, and the no-db build check. Fix anything it reports in the task that owns the code, with its own commit.
+- [ ] **Step 1: Run the steps of `.github/workflows/ci.yml` on the branch head** (fmt, clippy `-D warnings`, the workspace tests, the no-db build check). Fix anything it reports in the task that owns the code, with its own commit.
 - [ ] **Step 2: Ask the operator before pushing.** On approval, push `plan/router-extension-seam`, renaming the branch to `feat/router-extension-seam` first if preferred, and open a PR against `main`. The PR body links #481 and summarises the Design decisions table (what changed from the proposal and why) and the inherits / does-not-inherit list. Do not merge.
 - [ ] **Step 3: After the PR is open, offer to draft a comment on #481** for the operator to post. It explains the prefix and layer-placement changes relative to the proposed patch, and that the 26-line patch was not applied as-is.
