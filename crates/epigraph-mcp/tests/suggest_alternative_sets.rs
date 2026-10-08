@@ -316,3 +316,86 @@ async fn surface_reconsiderations_skips_when_gap_too_small(pool: PgPool) {
         "gap below min_pair_strength must not surface reconsideration, got {candidates:?}"
     );
 }
+
+// ── Duplicate edges must not multiply candidates ─────────────────────────────
+//
+// The scan joins `contr` over BOTH orientations and `s1`/`s2` over every
+// `supports` row, so each duplicate edge used to emit the same
+// `(claim_a, claim_b, target_claim)` once more. Two shapes reach prod:
+// a `contradicts` filed in both directions (written before link_epistemic
+// collapsed them, or by any directional writer), and a multi-emitted
+// `supports` (migration 018 makes `supports` a verb-edge that accumulates per
+// submission). Either one must still yield ONE candidate per pair.
+
+async fn suggest_for_target(pool: &PgPool, target: Uuid) -> Vec<serde_json::Value> {
+    let server = build_test_server(pool.clone());
+    let result = suggest_alternative_sets(
+        &server,
+        &viewerfx::public_viewer(pool).await,
+        SuggestAlternativeSetsParams {
+            target_claim_id: Some(target.to_string()),
+            min_pair_strength: 0.0,
+            exclude_settled: true,
+            surface_reconsiderations: false,
+        },
+    )
+    .await
+    .expect("tool call ok");
+    first_text(&result)["candidates"]
+        .as_array()
+        .expect("`candidates` must be a JSON array")
+        .clone()
+}
+
+fn candidate_pair(cand: &serde_json::Value) -> BTreeSet<Uuid> {
+    [
+        Uuid::parse_str(cand["claim_a"].as_str().unwrap()).unwrap(),
+        Uuid::parse_str(cand["claim_b"].as_str().unwrap()).unwrap(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn suggest_returns_one_candidate_when_contradicts_is_filed_both_ways(pool: PgPool) {
+    let target = seed_claim(&pool, "Target", 0.5).await;
+    let a1 = seed_claim(&pool, "A1", 0.7).await;
+    let a2 = seed_claim(&pool, "A2", 0.6).await;
+
+    insert_claim_edge(&pool, a1, target, "supports").await;
+    insert_claim_edge(&pool, a2, target, "supports").await;
+    insert_claim_edge(&pool, a1, a2, "contradicts").await;
+    // The same disagreement, filed the other way round.
+    insert_claim_edge(&pool, a2, a1, "contradicts").await;
+
+    let candidates = suggest_for_target(&pool, target).await;
+    assert_eq!(
+        candidates.len(),
+        1,
+        "a contradicts pair stored in both orientations is ONE alternative-set \
+         candidate, got {candidates:?}"
+    );
+    assert_eq!(candidate_pair(&candidates[0]), BTreeSet::from([a1, a2]));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn suggest_returns_one_candidate_when_supports_is_multi_emitted(pool: PgPool) {
+    let target = seed_claim(&pool, "Target", 0.5).await;
+    let a1 = seed_claim(&pool, "A1", 0.7).await;
+    let a2 = seed_claim(&pool, "A2", 0.6).await;
+
+    // A1 supports the target twice (two submissions of the same verb-edge).
+    insert_claim_edge(&pool, a1, target, "supports").await;
+    insert_claim_edge(&pool, a1, target, "supports").await;
+    insert_claim_edge(&pool, a2, target, "supports").await;
+    insert_claim_edge(&pool, a1, a2, "contradicts").await;
+
+    let candidates = suggest_for_target(&pool, target).await;
+    assert_eq!(
+        candidates.len(),
+        1,
+        "a multi-emitted supports edge must not duplicate the candidate, got \
+         {candidates:?}"
+    );
+    assert_eq!(candidate_pair(&candidates[0]), BTreeSet::from([a1, a2]));
+}

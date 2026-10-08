@@ -595,6 +595,97 @@ mod tests {
         })));
     }
 
+    /// The workflow subset is RE-DERIVABLE from the executing workflow's
+    /// `canonical_name`, over the real builder's output: every row the narrower
+    /// predicate selects reproduces its stored digest from the right name even
+    /// when listed after a wrong one, reports `Some(false)` once its body
+    /// changes, and is undecided (`None`) with no candidate at all. Document
+    /// rows are never in the subset — their seed is not recoverable.
+    #[test]
+    fn canonical_name_scoped_rows_rederive_from_the_executing_workflow() {
+        use crate::document::{
+            stored_content_hash_is_canonical_name_scoped, stored_content_hash_is_seed_scoped,
+        };
+        use crate::workflow::builder::canonical_name_scoped_hash_matches;
+
+        let name = "rederive-guard-wf";
+        let wf: crate::workflow::WorkflowExtraction = serde_json::from_value(serde_json::json!({
+            "source": {"canonical_name": name, "goal": "G", "generation": 0, "authors": []},
+            "thesis": "T",
+            "phases": [{"title": "P", "summary": "S",
+                        "steps": [{"compound": "C", "operations": ["op"], "confidence": 0.8}]}]
+        }))
+        .unwrap();
+        let plan = crate::workflow::build_ingest_plan(&wf);
+
+        let mut scoped = 0_usize;
+        for c in &plan.claims {
+            if !stored_content_hash_is_canonical_name_scoped(&c.properties) {
+                assert_eq!(
+                    c.level, 3,
+                    "only atoms fall outside the subset: {:?}",
+                    c.properties
+                );
+                continue;
+            }
+            scoped += 1;
+            assert!(stored_content_hash_is_seed_scoped(&c.properties));
+            assert_eq!(
+                canonical_name_scoped_hash_matches(&c.content, &c.content_hash, [name]),
+                Some(true),
+                "intact level-{} row must re-derive from its own canonical_name",
+                c.level
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &c.content,
+                    &c.content_hash,
+                    ["another-workflow", name]
+                ),
+                Some(true),
+                "a wrong candidate listed first must not hide the right one"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &format!("{} (tampered)", c.content),
+                    &c.content_hash,
+                    [name]
+                ),
+                Some(false),
+                "an altered body must not re-derive the stored digest"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &c.content,
+                    &c.content_hash,
+                    ["another-workflow"]
+                ),
+                Some(false),
+                "another workflow's name is not this row's seed"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(&c.content, &c.content_hash, []),
+                None,
+                "no executing workflow: the seed is unrecoverable, so undecided"
+            );
+        }
+        assert_eq!(
+            scoped, 3,
+            "thesis, phase and step rows are canonical_name-scoped"
+        );
+
+        // Neither document rows nor unmarked legacy workflow rows are in the subset.
+        for props in [
+            serde_json::json!({"level": 1, "source_type": "Paper"}),
+            serde_json::json!({"level": 1, "source_type": "workflow", "kind": "workflow_step"}),
+        ] {
+            assert!(
+                !stored_content_hash_is_canonical_name_scoped(&props),
+                "{props}"
+            );
+        }
+    }
+
     #[test]
     fn test_normalize_claim_path() {
         use crate::builder::normalize_claim_path;
