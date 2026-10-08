@@ -46,7 +46,6 @@
 //! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes | holds no `Viewer` (an `AuthContext` only) |
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
-//! | cross_source.rs | decide_candidate (promote) | claim -> claim (matcher) | yes | OPERATOR CONFIRMATION: the MCP `decide_match_candidate` promote writes the same matcher edge on its unstamped pool, so stamping the HTTP side alone would split the matcher edges' owner by surface; the matcher retirement path deletes them administratively either way |
 //! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
 //! | crud.rs | create_reasoning_trace | claim -> trace HAS_TRACE | no |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
@@ -81,7 +80,16 @@
 //!
 //! An edge INSERT inside another repo function that a raw-pool handler reaches
 //! (for example `ClaimRepository`, `AnalysisRepository`, `WorkflowRepository`,
-//! `SemanticLinkRepository` writing edges of their own) is not counted here. The
+//! `SemanticLinkRepository` writing edges of their own) is not counted here.
+//! That now includes `cross_source.rs::decide_candidate`'s promote, which left
+//! this register in U012 WITHOUT being stamped: its matcher edge (claim -> claim,
+//! in D8 scope) is written inside `MatchCandidateRepo::promote_if_pending`, on
+//! the same transaction as the candidate's status flip, still on the raw pool
+//! the repo was built from. Its disposition is unchanged (OPERATOR
+//! CONFIRMATION: the MCP `decide_match_candidate` promote writes the same matcher
+//! edge on its unstamped pool, so stamping the HTTP side alone would split the
+//! matcher edges' owner by surface; the matcher retirement path retracts them
+//! administratively either way). The
 //! raw-pool handler that reaches it is in `no_unscoped_pool.rs`'s per-file
 //! register, which is where its stamping is tracked.
 //!
@@ -120,15 +128,18 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // 6 before the W12b revise, which stamped `share_skill`'s and
     // `forget_convention`'s in-scope edge statements.
     ("conventions.rs", 4),
-    ("cross_source.rs", 1),
+    // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
+    // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
+    // "What this file does NOT see").
     ("crud.rs", 2),
     ("perspective.rs", 1),
     ("provenance.rs", 4),
     ("spans.rs", 3),
 ];
 
-/// The total the register may never exceed.
-const HIGH_WATER: usize = 28;
+/// The total the register may never exceed. 28 before U012 (`cross_source.rs`
+/// left the register; see its note in [`UNSTAMPED`]).
+const HIGH_WATER: usize = 27;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

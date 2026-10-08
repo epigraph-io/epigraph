@@ -339,6 +339,15 @@ pub struct GetProvenanceParams {
                        `content_truncated: true` and the original `content_chars`."
     )]
     pub max_content_chars: Option<usize>,
+
+    #[schemars(
+        description = "Budget for the whole response, in characters of compact JSON. \
+                       Default 40000, clamped to 10000..=500000. Claims are admitted \
+                       nearest-first with their evidence (at most 10 per claim) and \
+                       traces until the next would overrun it; the bundle then reports \
+                       `budget_exhausted: true` and `truncated: true`."
+    )]
+    pub max_output_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2317,7 +2326,13 @@ pub struct TraverseEdge {
 pub struct TraverseResponse {
     pub start_id: String,
     pub nodes: Vec<TraverseNode>,
+    /// Only edges whose source AND target are in `nodes`.
     pub edges: Vec<TraverseEdge>,
+    /// Edges the walk followed (relationship filter already applied) that are
+    /// not in `edges` because an endpoint was not returned: the node `limit`
+    /// was reached, or `min_truth` dropped it. Always present, 0 when nothing
+    /// was left out (backlog cdd8d097).
+    pub edges_omitted: usize,
     pub depth_reached: i32,
 }
 

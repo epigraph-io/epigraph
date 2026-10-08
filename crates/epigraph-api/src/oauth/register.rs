@@ -76,15 +76,16 @@ pub async fn register_endpoint(
     // Enforce the redirect-host allowlist FIRST, before any client_id generation or
     // DB access, so an abusive registration is rejected DB-free (and so the negative
     // test needs no database). This closes the open-redirect / open-registration gap
-    // flagged in recon: any redirect_uri whose host is not claude.ai/claude.com is
-    // refused regardless of client_type.
+    // flagged in recon: a redirect_uri that is neither a hosted MCP client's callback
+    // (claude.ai/claude.com) nor an RFC 8252 loopback listener (native clients such as
+    // OpenAI Codex) is refused regardless of client_type. See `oauth::redirect`.
     if let Some(uris) = req.redirect_uris.as_deref() {
         for u in uris {
-            let host_ok =
-                u.starts_with("https://claude.ai/") || u.starts_with("https://claude.com/");
-            if !host_ok {
+            if crate::oauth::redirect::classify(u).is_none() {
                 return Err(ApiError::BadRequest {
-                    message: "redirect_uri host must be claude.ai or claude.com".to_string(),
+                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, or a \
+                              loopback http://127.0.0.1 or http://[::1] callback"
+                        .to_string(),
                 });
             }
         }

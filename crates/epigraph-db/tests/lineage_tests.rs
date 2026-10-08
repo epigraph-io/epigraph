@@ -914,6 +914,64 @@ async fn test_lineage_max_nodes_keeps_target_and_nearest_ancestors(pool: PgPool)
     );
 }
 
+/// Test: a `max_nodes` cut prunes `parent_ids` to the kept claims
+///
+/// **Evidence**: #397 review finding (arch, HIGH) on `get_lineage_conn`:
+/// `LineageClaim.parent_ids` was built from the UNTRIMMED parent map, and the
+/// `max_nodes` trim only retained `claims`/`evidence`/`traces`. Every kept
+/// claim whose parent fell outside the cut kept a reference to a claim that is
+/// no longer in `claims`. `get_provenance` passes `Some(max_nodes)` by
+/// default, so its bundles emitted `claim:` ids absent from `entities`.
+/// **Reasoning**: an id in `parent_ids` must resolve to a key of `claims`;
+/// otherwise a consumer building edges from it emits an edge to a node the
+/// response does not contain. The untrimmed control proves the prune drops
+/// only the cut references, not the real ones.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_max_nodes_prunes_parent_ids_to_kept_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // chain[0] -> chain[1] -> chain[2] -> chain[3] -> chain[4] (leaf)
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf_id = *chain.last().unwrap();
+
+    // ---- Control: untrimmed, every parent link is present and resolves ----
+    let full = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, None)
+        .await
+        .expect("Failed to query lineage");
+    assert!(!full.truncated);
+    for i in 1..5 {
+        assert_eq!(
+            full.claims[&chain[i]].parent_ids,
+            vec![chain[i - 1]],
+            "untrimmed lineage must keep the real parent link of chain[{i}]"
+        );
+    }
+
+    // ---- Trimmed to 3 nodes: chain[2], chain[3], chain[4] are kept ----
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, leaf_id, None, Some(3))
+        .await
+        .expect("Failed to query lineage");
+    assert!(lineage.truncated, "the cap must actually cut this lineage");
+    assert_eq!(lineage.claims.len(), 3);
+
+    for c in lineage.claims.values() {
+        for p in &c.parent_ids {
+            assert!(
+                lineage.claims.contains_key(p),
+                "claim {} lists parent {p}, which max_nodes dropped from `claims`: \
+                 a dangling reference",
+                c.id
+            );
+        }
+    }
+    // The prune must not over-reach: links between two KEPT claims survive.
+    assert_eq!(lineage.claims[&chain[4]].parent_ids, vec![chain[3]]);
+    assert_eq!(lineage.claims[&chain[3]].parent_ids, vec![chain[2]]);
+    assert!(
+        lineage.claims[&chain[2]].parent_ids.is_empty(),
+        "chain[2]'s only parent (chain[1]) was cut, so it must list none"
+    );
+}
+
 /// Test: `max_nodes` set to `None` never truncates and leaves `truncated` false
 ///
 /// **Evidence**: Same 5-claim chain queried without a node cap returns all

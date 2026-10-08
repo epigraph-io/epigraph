@@ -744,6 +744,30 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_symmetric_if_absent_conn(&mut conn, a, b, relationship, properties).await
+    }
+
+    /// [`Self::create_symmetric_if_absent`] on a connection the caller owns,
+    /// so a matcher promotion can write its edge on the SAME transaction as
+    /// the candidate's status flip (`MatchCandidateRepo::promote_if_pending`).
+    /// The pool-taking function above delegates here, so there is one INSERT.
+    ///
+    /// Same any-state dedup as the pool form (no `EDGE_IN_FORCE` clause): a
+    /// matcher promotion over a pair whose matcher edge was retracted stays a
+    /// dedup hit. Do not swap in [`Self::create_symmetric_if_absent_returning_conn`],
+    /// which matches rows in force only (migration 120).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, properties))]
+    pub async fn create_symmetric_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -760,7 +784,7 @@ impl EdgeRepository {
         .bind(b)
         .bind(relationship)
         .bind(Json(properties))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(result.rows_affected() > 0)
