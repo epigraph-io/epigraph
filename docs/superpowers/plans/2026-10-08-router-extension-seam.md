@@ -4,7 +4,7 @@
 
 **Goal:** Let a program that embeds `epigraph-api` as a library mount its own HTTP routes inside the kernel's authenticated router, under a reserved `/api/v1/ext/<name>` prefix, without forking `create_router`.
 
-**Architecture:** A new `routes/extensions.rs` defines `RouterExtension` (a validated name plus an axum `Router<AppState>`) and a `mount_all` helper that nests each extension at `/api/v1/ext/<name>`. `create_router` becomes a one-line delegate to a new `create_router_with_extensions(state, Vec<RouterExtension>)`. In both cfg variants, `mount_all` is called inside the existing statement that adds the auth layers, so extension routes sit under the elevated-access recorder (db variant) and the bearer layer, as well as the outer body-limit and rate-limit layers. An embedder that has its own state type passes it through `RouterExtension::with_state`, which uses axum 0.7's `Router::with_state::<AppState>` to turn its router into a `Router<AppState>`.
+**Architecture:** A new `routes/extensions.rs` defines `RouterExtension` (a validated name plus an axum `Router<AppState>`) and a `mount_all` helper. It binds each extension to the kernel state and mounts it with `nest_service` at `/api/v1/ext/<name>`, so the whole prefix is one set of ordinary routes, the extension's own fallback included. `create_router` becomes a one-line delegate to a new `create_router_with_extensions(state, Vec<RouterExtension>)`. In both cfg variants, `mount_all` is called inside the existing statement that adds the auth layers, so extension routes sit under the elevated-access recorder (db variant) and the bearer layer, as well as the outer body-limit and rate-limit layers. An embedder that has its own state type passes it through `RouterExtension::with_state`, which uses axum 0.7's `Router::with_state::<AppState>` to turn its router into a `Router<AppState>`.
 
 **Tech Stack:** Rust, axum 0.7.9, tower 0.5 (`ServiceExt::oneshot`), sqlx 0.8 `#[sqlx::test]`, `epigraph-auth` JWT minting.
 
@@ -16,13 +16,14 @@
 |---|---|---|
 | `extra_routes: Router<AppState>` merged into `protected` at any path | `Vec<RouterExtension>`, each nested at `/api/v1/ext/<name>` | A route added to the kernel later can no longer collide with an embedder's route, which would make the embedder's server panic at startup after an upgrade. Each extension gets one namespace and can't take over kernel paths. |
 | Merge placed before "the auth middleware stack" | Mount inside the third `let protected = …` statement, before `.route_layer(record_elevated_access)` and `.layer(bearer_auth_middleware)` | In axum, `route_layer` and `layer` only wrap routes that already exist. If the mount came after them, extension routes would have no bearer authentication and no elevated-write refusal. |
-| `protected.merge(extra_routes)` in `routes/mod.rs` | `extensions::mount_all(protected, extensions)`; the `.nest(` calls live in `extensions.rs` | `tests/public_router_allowlist.rs::the_final_router_merges_only_protected_public_and_oauth` requires the `.merge(` calls in `routes/mod.rs` to be exactly `protected, public, oauth` twice. `protected_paths` requires exactly six `let protected = ` statements. Both lints read the raw file text, comments included. |
+| `protected.merge(extra_routes)` in `routes/mod.rs` | `extensions::mount_all(protected, extensions, &state)`; the `nest_service` calls live in `extensions.rs` | `tests/public_router_allowlist.rs::the_final_router_merges_only_protected_public_and_oauth` requires the `.merge(` calls in `routes/mod.rs` to be exactly `protected, public, oauth` twice. `protected_paths` requires exactly six `let protected = ` statements. Both lints read the raw file text, comments included. |
 | Kernel state only | `RouterExtension::new` (kernel state) **and** `RouterExtension::with_state` (the embedder's own state) | A separate service with its own state type, such as episcience's `ElnState`, could not use the seam otherwise. |
+| (merge, so routes are nested route-by-route) | `nest_service(path, ext.router.with_state(state))` | In axum 0.7.9, `Router::nest` moves a nested router's custom fallback into the outer `fallback_router` (`routing/mod.rs::nest`: `this.fallback_router.nest(path, fallback_router)`), and `route_layer` does not wrap `fallback_router` (`routing/mod.rs::route_layer`: `fallback_router: this.fallback_router`). An elevated write to an unmatched path under the prefix would therefore reach the extension's fallback without passing the per-access recorder. `nest_service` registers `prefix`, `prefix/` and `prefix/*tail` as ordinary routes (`path_router.rs::nest_service`), which `route_layer` and `layer` both wrap, and the extension's fallback runs inside them. The cost: the recorder sees the matched route as the prefix wildcard, not the extension's own route pattern. It still logs the concrete request path (`record_elevated_access`: `bounded(request.uri().path(), …)`). |
 
 **What extension routes inherit:**
 - bearer authentication, including the revocation check (missing or invalid token → 401 with an RFC 6750 challenge);
 - `AuthContext` in request extensions;
-- refusal of elevated writes, plus elevated-access recording (db variant);
+- refusal of elevated writes, plus elevated-access recording (db variant), on every path under the prefix, the extension's fallback included. Recorded at prefix granularity: the surface is `<METHOD> /api/v1/ext/<name>/*…`, and the concrete path is logged alongside it;
 - `DefaultBodyLimit(max_request_size)`;
 - the rate limiter.
 
@@ -51,8 +52,12 @@
 
 ## Review Focus
 
-1. **An extension router with its own `.fallback()` or a catch-all.** A request with no credentials to an unmatched path under its prefix must still get 401, not the extension's fallback body. Pinned in Task 2 (`fallback_under_prefix_is_still_behind_bearer`). How axum 0.7.9 nests a fallback is pinned there rather than assumed.
-2. **An elevated token writing through an extension route with a path parameter.** It must be refused with `ELEVATED READ-ONLY` (not 401, not 200). The refusal must see the full nested matched path. Pinned in Task 2 (`elevated_post_to_extension_is_refused_as_read_only`).
+1. **An extension router with its own `.fallback()`.** Two cases, both pinned in Task 2:
+   - A request with no credentials to an unmatched path under the prefix must get 401, not the fallback body (`fallback_under_prefix_is_still_behind_bearer`).
+   - An elevated POST to that unmatched path must get `ELEVATED READ-ONLY`, not reach the fallback (`elevated_post_to_extension_fallback_is_refused`).
+
+   With plain `nest`, the second case fails: see the Design decisions row on `nest_service`.
+2. **An elevated token writing through an extension route with a path parameter.** It must be refused with `ELEVATED READ-ONLY` (not 401, not 200), and the handler must not run. Pinned in Task 2 (`elevated_post_to_extension_is_refused_as_read_only`).
 3. **An oversized body sent to an extension.** It must get 413 before the handler runs. Pinned in Task 2 (`oversized_body_to_extension_is_413`).
 4. **Bad extension names** (`""`, `"Eln"`, `"eln/x"`, `".."`, `"-x"`, a 33-byte name). Each must be rejected when the extension is constructed, with a typed error. Pinned in Task 1.
 5. **Two extensions with the same name.** Startup must panic with a message naming the extension, not silently let one replace the other. Pinned in Task 1 (`duplicate_names_panic_with_the_name`).
@@ -63,7 +68,7 @@
 
 | File | Responsibility |
 |---|---|
-| `crates/epigraph-api/src/routes/extensions.rs` (create) | `EXTENSION_PREFIX`, `ExtensionNameError`, `RouterExtension` (`new`, `with_state`, `name`, `mount_path`), `pub(crate) fn mount_all`. Not cfg-gated. Holds unit tests for name validation and duplicates. |
+| `crates/epigraph-api/src/routes/extensions.rs` (create) | `EXTENSION_PREFIX`, `ExtensionNameError`, `RouterExtension` (`new`, `with_state`, `name`, `mount_path`), `fn assert_unique_names`, `pub(crate) fn mount_all`. Not cfg-gated. Holds unit tests for name validation and duplicates. |
 | `crates/epigraph-api/src/routes/mod.rs` (modify) | Declare `pub mod extensions;`. In both variants, split `create_router` into a delegate plus `create_router_with_extensions`, and call `extensions::mount_all` at the head of the auth-layer statement. |
 | `crates/epigraph-api/src/lib.rs` (modify) | Re-export the new public items. |
 | `crates/epigraph-api/tests/router_extension_seam.rs` (create) | DB-backed behaviour tests through the real router. |
@@ -87,7 +92,8 @@
   - `RouterExtension::with_state<S: Clone + Send + Sync + 'static>(name: &str, router: Router<S>, state: S) -> Result<RouterExtension, ExtensionNameError>`
   - `RouterExtension::name(&self) -> &str`
   - `RouterExtension::mount_path(&self) -> String`
-  - `pub(crate) fn mount_all(protected: Router<AppState>, extensions: Vec<RouterExtension>) -> Router<AppState>`
+  - `fn assert_unique_names(extensions: &[RouterExtension])` (panics on a duplicate; needs no state, so it is unit-testable in the db build, where `AppState::new` does not exist)
+  - `pub(crate) fn mount_all(protected: Router<AppState>, extensions: Vec<RouterExtension>, state: &AppState) -> Router<AppState>`
 
 - [ ] **Step 1: Write the file with the tests first and `todo!()` bodies**
 
@@ -198,19 +204,31 @@ fn validate_name(name: &str) -> Result<(), ExtensionNameError> {
     todo!()
 }
 
-/// Nest every extension into `protected` at its mount path.
+/// Panic if two extensions share a name. A second registration under one
+/// prefix is a startup bug in the embedder, and refusing it loudly is the
+/// contract axum applies to an overlapping route.
+fn assert_unique_names(extensions: &[RouterExtension]) {
+    todo!()
+}
+
+/// Mount every extension into `protected` at its mount path, bound to `state`.
 ///
 /// Called by `create_router_with_extensions` at the head of the statement that
-/// applies the authenticated router's layers, so the nested routes are wrapped
-/// by them.
+/// applies the authenticated router's layers, so the mounted routes are
+/// wrapped by them.
+///
+/// `nest_service`, not `nest`: axum 0.7's `nest` moves a nested router's custom
+/// fallback into the outer router's fallback, which `route_layer` (the
+/// per-access recorder) does not wrap. `nest_service` registers the prefix
+/// and everything under it as ordinary routes, so the extension's fallback
+/// runs inside both layers too.
 ///
 /// # Panics
-/// When two extensions share a name. A second registration under one prefix
-/// is a startup bug in the embedder, and refusing it loudly is the same
-/// contract axum applies to an overlapping route.
+/// When two extensions share a name.
 pub(crate) fn mount_all(
     protected: Router<AppState>,
     extensions: Vec<RouterExtension>,
+    state: &AppState,
 ) -> Router<AppState> {
     todo!()
 }
@@ -275,8 +293,16 @@ mod tests {
     #[should_panic(expected = "router extension \"eln\" is registered twice")]
     fn duplicate_names_panic_with_the_name() {
         let a = RouterExtension::new("eln", Router::new()).unwrap();
+        let other = RouterExtension::new("other", Router::new()).unwrap();
         let b = RouterExtension::new("eln", Router::new()).unwrap();
-        let _ = mount_all(Router::new(), vec![a, b]);
+        assert_unique_names(&[a, other, b]);
+    }
+
+    #[test]
+    fn distinct_names_pass_the_uniqueness_check() {
+        let a = RouterExtension::new("eln", Router::new()).unwrap();
+        let b = RouterExtension::new("eln-2", Router::new()).unwrap();
+        assert_unique_names(&[a, b]);
     }
 }
 ```
@@ -294,7 +320,7 @@ Expected: FAIL. Every test panics with `not yet implemented`, from the `todo!()`
 
 - [ ] **Step 3: Implement**
 
-Replace the four `todo!()` bodies:
+Replace the five `todo!()` bodies:
 
 ```rust
     pub fn new(name: &str, router: Router<AppState>) -> Result<Self, ExtensionNameError> {
@@ -332,29 +358,40 @@ fn validate_name(name: &str) -> Result<(), ExtensionNameError> {
 ```
 
 ```rust
-pub(crate) fn mount_all(
-    protected: Router<AppState>,
-    extensions: Vec<RouterExtension>,
-) -> Router<AppState> {
+fn assert_unique_names(extensions: &[RouterExtension]) {
     let mut seen = std::collections::BTreeSet::new();
-    extensions.into_iter().fold(protected, |router, ext| {
+    for ext in extensions {
         assert!(
-            seen.insert(ext.name.clone()),
+            seen.insert(ext.name.as_str()),
             "router extension {:?} is registered twice; each name mounts exactly one prefix",
             ext.name
         );
+    }
+}
+```
+
+```rust
+pub(crate) fn mount_all(
+    protected: Router<AppState>,
+    extensions: Vec<RouterExtension>,
+    state: &AppState,
+) -> Router<AppState> {
+    assert_unique_names(&extensions);
+    extensions.into_iter().fold(protected, |router, ext| {
         let path = ext.mount_path();
-        router.nest(&path, ext.router)
+        router.nest_service(&path, ext.router.with_state(state.clone()))
     })
 }
 ```
+
+`ext.router.with_state(state.clone())` yields a `Router<()>`, which is a `Service<Request, Error = Infallible>`. For a `with_state` extension, whose handlers are already bound to their own state, this call only gives the router the unit state type and never exposes `AppState` to those handlers.
 
 The rejection test uses `"e\u{301}"` (a combining accent, which is multi-byte). Checking bytes rather than chars makes any non-ASCII byte fail `rest_ok`, so it is rejected.
 
 - [ ] **Step 4: Run the tests and see them pass**
 
 Run: `cargo test -p epigraph-api --lib routes::extensions`
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
 Run: `cargo check -p epigraph-api --no-default-features --locked`
 Expected: no *new* errors. `extensions.rs` uses nothing db-only. If the command fails on `main` before this change, record the baseline error count first and compare against it.
@@ -374,7 +411,7 @@ git commit -m "feat(api): define RouterExtension, a named router bound for /api/
 - Duplicate names panic at startup, matching axum's overlapping-route contract
 
 **Verification:**
-- cargo test -p epigraph-api --lib routes::extensions: 5 pass (valid/invalid names, with_state, mount path, duplicate panic)
+- cargo test -p epigraph-api --lib routes::extensions: 6 pass (valid/invalid names, with_state, mount path, duplicate panic, distinct names)
 - cargo check -p epigraph-api --no-default-features --locked: no new errors"
 ```
 
@@ -385,6 +422,7 @@ git commit -m "feat(api): define RouterExtension, a named router bound for /api/
 **Files:**
 - Modify: `crates/epigraph-api/src/routes/mod.rs`. There are two `pub fn create_router(state: AppState) -> Router {` items, the `#[cfg(feature = "db")]` one and the `#[cfg(not(feature = "db"))]` one. In each, change the statement that begins `let protected = protected` and contains `bearer_auth_middleware`.
 - Modify: `crates/epigraph-api/src/lib.rs` (the `pub use routes::create_router;` line)
+- Modify: `CLAUDE.md` (repo root; add a section after "Adding MCP tools — `epigraph-tools` is not the extension point")
 - Create: `crates/epigraph-api/tests/router_extension_seam.rs`
 
 **Interfaces:**
@@ -599,6 +637,20 @@ async fn fallback_under_prefix_is_still_behind_bearer(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
     assert!(!body.contains("extension fallback"), "fallback served anonymously: {body}");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn elevated_post_to_extension_fallback_is_refused(pool: PgPool) {
+    let (router, state) = app(&pool);
+    let elevated = token(&state, Uuid::new_v4(), &["claims:write"], Some(Uuid::new_v4()));
+    let (status, body, _) =
+        send(&router, "POST", "/api/v1/ext/demo/no-such-route", Some(&elevated), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(body.contains("ELEVATED READ-ONLY"), "not the recorder's refusal: {body}");
+    assert!(
+        !body.contains("extension fallback"),
+        "elevated write reached the extension's fallback past the recorder: {body}"
+    );
+}
 ```
 
 - [ ] **Step 2: Run it and see it fail**
@@ -635,7 +687,7 @@ pub fn create_router_with_extensions(
 The existing body follows unchanged, except for one statement. Find the statement in this variant that begins `let protected = protected` and is followed by `.route_layer(middleware::from_fn_with_state(` and `crate::middleware::elevated_access::record_elevated_access`. Change only its first line, so it reads:
 
 ```rust
-    let protected = extensions::mount_all(protected, extensions)
+    let protected = extensions::mount_all(protected, extensions, &state)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::elevated_access::record_elevated_access,
@@ -659,7 +711,7 @@ Add this line to the comment block directly above that statement. It must not co
 Do the same at the `#[cfg(not(feature = "db"))]` `pub fn create_router(state: AppState) -> Router {` line, with both new items carrying `#[cfg(not(feature = "db"))]` and the same doc text, except that "the per-access recorder" is omitted, since this variant has none. Then replace that variant's statement `let protected = protected.layer(middleware::from_fn_with_state(` (the four-line statement that applies `bearer_auth_middleware`) with the chained form used in the db variant:
 
 ```rust
-    let protected = extensions::mount_all(protected, extensions)
+    let protected = extensions::mount_all(protected, extensions, &state)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             bearer_auth_middleware,
@@ -679,47 +731,67 @@ pub use routes::extensions::{ExtensionNameError, RouterExtension, EXTENSION_PREF
 pub use routes::{create_router, create_router_with_extensions};
 ```
 
+In the repo-root `CLAUDE.md`, directly after the "Adding MCP tools" section, add:
+
+```markdown
+## Adding HTTP routes from a downstream product
+
+The MCP surface is extended by federation (above). The REST surface is
+extended in-process: an embedder that runs `epigraph-api` as a library passes
+`RouterExtension`s to `create_router_with_extensions`, and each is mounted at
+`/api/v1/ext/<name>` inside the authenticated router (bearer, per-access
+recorder, body limit, rate limit). Scope checks and tenancy are the
+extension's own job; see `crates/epigraph-api/src/routes/extensions.rs`.
+Never register a first-party route under `/api/v1/ext`
+(`tests/router_extension_seam_lint.rs` fails if you do).
+```
+
 - [ ] **Step 6: Run the tests and see them pass**
 
 Run: `DATABASE_URL=<test-postgres-url> cargo test -p epigraph-api --test router_extension_seam`
-Expected: PASS, 7 tests.
+Expected: PASS, 8 tests.
 
-If `fallback_under_prefix_is_still_behind_bearer` fails, axum 0.7.9 nested the fallback outside `layer`. That is a real defect, not a test to relax. Make `mount_all` refuse an extension router that carries a custom fallback, by documenting a `# Panics` and removing `.fallback` from the test router. Record that behaviour in the module doc.
+If either fallback test fails, a layer does not wrap the extension's fallback. That is a real defect, not a test to relax. Check that `mount_all` uses `nest_service`, not `nest` (see the Design decisions row).
 
 - [ ] **Step 7: Mutation check (the tests must fail when the seam is misplaced)**
 
-Temporarily move the db-variant mount below the layers. Turn the statement back into `let protected = protected` and, in the final assembly, change `.merge(protected)` to `.merge(extensions::mount_all(protected, extensions))`. Run the test file again.
-Expected: `extension_without_a_token_is_401_with_a_bearer_challenge`, `elevated_post_to_extension_is_refused_as_read_only` and `fallback_under_prefix_is_still_behind_bearer` FAIL. Revert with `git checkout -- crates/epigraph-api/src/routes/mod.rs`, then re-apply Steps 3 and 4 if the checkout dropped them. Simplest is to commit Steps 3–5 to a WIP commit before mutating, then `git reset --hard` to it. Run the tests again: PASS.
+Temporarily move the db-variant mount below the layers. Turn the statement back into `let protected = protected` and, in the final assembly, change `.merge(protected)` to `.merge(extensions::mount_all(protected, extensions, &state))`. Run the test file again.
+Expected: `extension_without_a_token_is_401_with_a_bearer_challenge`, `elevated_post_to_extension_is_refused_as_read_only`, `elevated_post_to_extension_fallback_is_refused` and `fallback_under_prefix_is_still_behind_bearer` FAIL. Revert with `git checkout -- crates/epigraph-api/src/routes/mod.rs`, then re-apply Steps 3 and 4 if the checkout dropped them. Simplest is to commit Steps 3–5 to a WIP commit before mutating, then `git reset --hard` to it. Run the tests again: PASS.
 
-- [ ] **Step 8: Run the source lints this edit could disturb**
+Second mutation, the reason for `nest_service`: in `extensions.rs::mount_all`, change `router.nest_service(&path, ext.router.with_state(state.clone()))` to `router.nest(&path, ext.router)`. Run the test file again.
+Expected: `elevated_post_to_extension_fallback_is_refused` FAILS, because the elevated POST reaches the fallback. The other seven still pass. Revert.
 
-Run:
+- [ ] **Step 8: Run every suite that reads route source**
+
+Many test binaries scan `routes/mod.rs` or `src/routes/` as text. They include `public_router_allowlist`, `viewer_route_table_lint`, `no_bypass_in_handlers`, `elevation_ceremony`, `evidence_list_route_test` and `lint_text` in this crate, and `no_unscoped_pool`, `visibility_lint` and `write_gate_lint` in `epigraph-db`. Run the whole packages rather than a hand-picked list:
+
 ```
-DATABASE_URL=<test-postgres-url> cargo test -p epigraph-api \
-  --test public_router_allowlist --test viewer_route_table_lint \
-  --test openapi_paths_test --test handler_audit_tests --test no_bypass_in_handlers
+DATABASE_URL=<test-postgres-url> cargo test -p epigraph-api
+DATABASE_URL=<test-postgres-url> cargo test -p epigraph-db
 cargo check -p epigraph-api --no-default-features --locked
 ```
-Expected: all pass, and the no-db check shows no new errors. In particular, `the_final_router_merges_only_protected_public_and_oauth` and `protected_paths` must still see the same `.merge(` list and six `let protected = ` statements.
+
+Expected: all pass, and the no-db check shows no new errors. In particular, `the_final_router_merges_only_protected_public_and_oauth` and `protected_paths` must still see the same `.merge(` list and the same `let protected = ` count as `main`.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/epigraph-api/src/routes/mod.rs crates/epigraph-api/src/lib.rs crates/epigraph-api/tests/router_extension_seam.rs
+git add crates/epigraph-api/src/routes/mod.rs crates/epigraph-api/src/lib.rs crates/epigraph-api/tests/router_extension_seam.rs CLAUDE.md
 git commit -m "feat(api): mount embedder routes under the authenticated router's layers
 
 **Evidence:**
 - Issue #481; its patch no longer applies to main and placed the merge relative to a deleted signature layer
 
 **Reasoning:**
-- create_router_with_extensions nests each RouterExtension at /api/v1/ext/<name> inside the statement that applies route_layer(record_elevated_access) and layer(bearer_auth_middleware); axum wraps only routes that exist when those calls run
+- create_router_with_extensions mounts each RouterExtension (nest_service, bound to AppState) at /api/v1/ext/<name> inside the statement that applies route_layer(record_elevated_access) and layer(bearer_auth_middleware); axum wraps only routes that exist when those calls run
 - mount_all keeps .merge( and 'let protected = ' counts unchanged, so the public-router lints still hold
 - create_router delegates with no extensions, so existing callers are unchanged
 
 **Verification:**
-- tests/router_extension_seam.rs: 7 pass (401 + challenge, own/kernel state, scope 403/200, elevated POST refused, 413, fallback behind bearer)
-- Mutation: mounting after the layers fails the 401, elevated-refusal and fallback tests
-- public_router_allowlist, viewer_route_table_lint, openapi_paths_test, handler_audit_tests, no_bypass_in_handlers pass; no-db check adds no errors"
+- tests/router_extension_seam.rs: 8 pass (401 + challenge, own/kernel state, scope 403/200, elevated POST refused on a route and on the fallback, 413, fallback behind bearer)
+- nest_service rather than nest: axum 0.7.9 moves a nested custom fallback outside route_layer, so an elevated write to an unmatched extension path would skip the recorder
+- Mutations: mounting after the layers fails the 401, elevated-refusal and fallback tests; nest instead of nest_service fails the elevated-fallback test
+- cargo test -p epigraph-api and -p epigraph-db (whole packages) pass; no-db check adds no errors"
 ```
 
 ---
@@ -744,7 +816,7 @@ This lint is the only check on the not(db) variant's placement: CI type-checks t
 //!    `.nest(` in `routes/mod.rs` may register at or under it, or a kernel
 //!    upgrade could collide with an embedder's routes.
 //! 2. In BOTH create_router variants, `extensions::mount_all(protected,
-//!    extensions)` heads the statement that applies `bearer_auth_middleware`
+//!    extensions, &state)` heads the statement that applies `bearer_auth_middleware`
 //!    (and, in the db variant, `record_elevated_access`). axum layers wrap only
 //!    routes that already exist, so a mount anywhere else is unauthenticated.
 //!    `tests/router_extension_seam.rs` proves this at runtime for the db
@@ -752,7 +824,7 @@ This lint is the only check on the not(db) variant's placement: CI type-checks t
 
 const ROUTES_MOD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/mod.rs");
 /// Matched against [`compact`] source, so rustfmt's line breaks cannot hide it.
-const MOUNT: &str = "letprotected=extensions::mount_all(protected,extensions)";
+const MOUNT: &str = "letprotected=extensions::mount_all(protected,extensions,&state)";
 
 fn source() -> String {
     std::fs::read_to_string(ROUTES_MOD).unwrap_or_else(|e| panic!("cannot read {ROUTES_MOD}: {e}"))
@@ -847,7 +919,7 @@ fn create_router_delegates_with_no_extensions_in_both_variants() {
 Run: `cargo test -p epigraph-api --test router_extension_seam_lint`
 Expected: PASS, 3 tests. No database needed.
 
-Mutation: in the not(db) variant, move `extensions::mount_all(protected, extensions)` out of the layer statement, into a `let protected = extensions::mount_all(protected, extensions);` just after it. Run again.
+Mutation: in the not(db) variant, move `extensions::mount_all(protected, extensions, &state)` out of the layer statement, into a `let protected = extensions::mount_all(protected, extensions, &state);` just after it. Run again.
 Expected: `both_variants_mount_extensions_at_the_head_of_the_auth_layer_statement` FAILS, because the second statement does not apply `bearer_auth_middleware`. `public_router_allowlist::protected_paths` also fails on the seventh `let protected = `. Revert.
 
 Mutation: add `.route("/api/v1/ext/x", get(health::health_check))` to the db `protected` chain. Run again.
