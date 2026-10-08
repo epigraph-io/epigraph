@@ -35,7 +35,7 @@ precomputed embedding-similarity snapshot from
 `epigraph-gui/public/semantic-dedup.json`.
 
 **Retracts** duplicates — `supersedes = canonical`, `is_current = false`,
-`embedding = NULL`, the same columns the canonical Rust path
+`embedding = NULL`, `embedding_3072 = NULL`, the same columns the canonical Rust path
 `ClaimRepository::mark_duplicate_with_repair` writes — and additionally marks
 them with the `deduped` label and a `deduped_into` property pointer, so the
 GUI's collapse-equivalents view stays coherent and any hard-delete sweep can

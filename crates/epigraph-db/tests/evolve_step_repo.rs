@@ -116,18 +116,23 @@ async fn evolve_step_supersedes_nulls_parent_embedding(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let parent = seed_claim(&pool, agent, "parent step", 0.7).await;
 
-    // Plant a stub embedding on the parent before superseding it.
-    let stub = {
-        let mut v = vec!["0.0"; 1536];
+    // Plant a stub vector in BOTH ANN columns on the parent before superseding
+    // it: `chk_deprecated_no_embedding` (migration 144) covers both, and recall
+    // at centroid_dim=3072 reads `embedding_3072` with no is_current filter.
+    let stub = |dim: usize| {
+        let mut v = vec!["0.0"; dim];
         v[0] = "0.1";
         format!("[{}]", v.join(","))
     };
-    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-        .bind(stub.as_str())
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE claims SET embedding = $1::vector, embedding_3072 = $2::vector WHERE id = $3",
+    )
+    .bind(stub(1536))
+    .bind(stub(3072))
+    .bind(parent)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     ClaimRepository::evolve_step(
         &pool,
@@ -141,16 +146,21 @@ async fn evolve_step_supersedes_nulls_parent_embedding(pool: PgPool) {
     .await
     .unwrap();
 
-    let parent_has_embedding: bool =
-        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
-            .bind(parent)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (parent_has_embedding, parent_has_embedding_3072): (bool, bool) = sqlx::query_as(
+        "SELECT embedding IS NOT NULL, embedding_3072 IS NOT NULL FROM claims WHERE id = $1",
+    )
+    .bind(parent)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     assert!(
         !parent_has_embedding,
         "parent {parent} embedding must be NULL after evolve_step(supersedes)"
+    );
+    assert!(
+        !parent_has_embedding_3072,
+        "parent {parent} embedding_3072 must be NULL after evolve_step(supersedes)"
     );
 }
 

@@ -71,6 +71,7 @@ def seeded(db):
     created_claims: list[str] = []
     agent_id = str(uuid.uuid4())
     vec = "[" + ",".join(["0.01"] * 1536) + "]"
+    vec_3072 = "[" + ",".join(["0.01"] * 3072) + "]"
 
     with db.cursor() as cur:
         cur.execute("SELECT id FROM groups LIMIT 1")
@@ -90,10 +91,12 @@ def seeded(db):
             cid = str(uuid.uuid4())
             cur.execute(
                 "INSERT INTO claims "
-                "(id, content, content_hash, agent_id, owner_group_id, visibility, embedding) "
-                "VALUES (%s::uuid, %s, %s, %s::uuid, %s, 'public', %s::vector)",
+                "(id, content, content_hash, agent_id, owner_group_id, visibility, embedding, "
+                " embedding_3072) "
+                "VALUES (%s::uuid, %s, %s, %s::uuid, %s, 'public', %s::vector, %s::vector)",
                 # `claims_content_hash_length` wants a 32-byte BLAKE3 digest.
-                (cid, text, psycopg2.Binary(os.urandom(32)), agent_id, group_id, vec),
+                (cid, text, psycopg2.Binary(os.urandom(32)), agent_id, group_id, vec,
+                 vec_3072),
             )
             created_claims.append(cid)
             return cid
@@ -103,11 +106,11 @@ def seeded(db):
         prior = mk("An unrelated prior canonical")
         already = mk("PEG brush spring constant is 21 pN/nm (third restatement)")
         # `already` is ALREADY superseded by `prior`: the script must not
-        # re-point it. Nulling the embedding keeps chk_deprecated_no_embedding
-        # satisfied.
+        # re-point it. Nulling both embeddings keeps chk_deprecated_no_embedding
+        # (both columns since migration 144) satisfied.
         cur.execute(
-            "UPDATE claims SET supersedes = %s::uuid, is_current = false, embedding = NULL "
-            "WHERE id = %s::uuid",
+            "UPDATE claims SET supersedes = %s::uuid, is_current = false, embedding = NULL, "
+            "embedding_3072 = NULL WHERE id = %s::uuid",
             (prior, already),
         )
     db.commit()
@@ -176,18 +179,22 @@ def test_executed_dedup_removes_the_duplicate_from_recall(db, seeded, tmp_path):
 
     with db.cursor() as cur:
         cur.execute(
-            "SELECT supersedes::text, is_current, embedding IS NULL, "
+            "SELECT supersedes::text, is_current, embedding IS NULL, embedding_3072 IS NULL, "
             "'deduped' = ANY(labels), properties->>'deduped_into' "
             "FROM claims WHERE id = %s::uuid",
             (dup,),
         )
-        supersedes, is_current, emb_null, labelled, deduped_into = cur.fetchone()
+        (supersedes, is_current, emb_null, emb_3072_null, labelled,
+         deduped_into) = cur.fetchone()
 
     # Lineage, not just visibility: `supersedes` is what makes the retraction
     # reversible and is what mark_duplicate_with_repair writes.
     assert supersedes == canonical
     assert is_current is False
     assert emb_null is True
+    # Recall at centroid_dim=3072 reads `embedding_3072` with no is_current
+    # filter, so the retraction must null it too (as mark_duplicate_act does).
+    assert emb_3072_null is True
     # The pre-existing soft-mark contract is preserved, not replaced — the GUI's
     # collapse view and every label-aware reader still work.
     assert labelled is True
