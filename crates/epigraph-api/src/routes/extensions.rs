@@ -82,7 +82,11 @@ impl RouterExtension {
     ///
     /// # Errors
     /// As [`RouterExtension::new`].
-    pub fn with_state<S>(name: &str, router: Router<S>, state: S) -> Result<Self, ExtensionNameError>
+    pub fn with_state<S>(
+        name: &str,
+        router: Router<S>,
+        state: S,
+    ) -> Result<Self, ExtensionNameError>
     where
         S: Clone + Send + Sync + 'static,
     {
@@ -178,11 +182,17 @@ mod tests {
         let cases: [(&str, ExtensionNameError); 7] = [
             ("", ExtensionNameError::Empty),
             ("Eln", ExtensionNameError::InvalidCharacters("Eln".into())),
-            ("eln/x", ExtensionNameError::InvalidCharacters("eln/x".into())),
+            (
+                "eln/x",
+                ExtensionNameError::InvalidCharacters("eln/x".into()),
+            ),
             ("..", ExtensionNameError::InvalidCharacters("..".into())),
             ("-x", ExtensionNameError::InvalidCharacters("-x".into())),
             ("1x", ExtensionNameError::InvalidCharacters("1x".into())),
-            ("e\u{301}", ExtensionNameError::InvalidCharacters("e\u{301}".into())),
+            (
+                "e\u{301}",
+                ExtensionNameError::InvalidCharacters("e\u{301}".into()),
+            ),
         ];
         for (name, want) in cases {
             assert_eq!(
