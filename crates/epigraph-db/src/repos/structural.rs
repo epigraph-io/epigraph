@@ -219,6 +219,30 @@ pub const COARSE_EDGE_TYPES: &[&str] = &[
     "MIRROR_NARRATIVE",
 ];
 
+/// Fold `edge_counts` rows keyed by STORED spelling into one row per
+/// [`COARSE_EDGE_TYPES`] entry, ordered by count descending (name ascending on
+/// a tie).
+///
+/// The statement filters on every spelling of a case-folded coarse type, so a
+/// row can be `supports` as well as `SUPPORTS`; both are one coarse type and
+/// must be one bucket. Merging before the route's Laplace noise keeps the
+/// per-edge sensitivity at 1: every edge still lands in exactly one bucket.
+/// Only a case-folded relationship is renamed; any other row keeps its stored
+/// name, so this never merges two relationships that differ only in case.
+fn merge_into_coarse_buckets(rows: Vec<(String, i64)>) -> Vec<(String, i64)> {
+    let mut buckets: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (rel, n) in rows {
+        let key = epigraph_core::edge::relationships::relationship_spellings(&rel)
+            .into_iter()
+            .find(|s| COARSE_EDGE_TYPES.contains(&s.as_str()))
+            .unwrap_or(rel);
+        *buckets.entry(key).or_insert(0) += n;
+    }
+    let mut out: Vec<(String, i64)> = buckets.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// One visible owned claim's Dempster-Shafer interval:
 /// `(belief, plausibility, pignistic_prob)`.
 ///
@@ -296,8 +320,14 @@ impl StructuralRepository {
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(String, i64)>, DbError> {
-        let coarse_types: Vec<String> =
-            COARSE_EDGE_TYPES.iter().map(|s| (*s).to_string()).collect();
+        // A case-folded coarse type (`SUPPORTS`, `CONTRADICTS`) is stored in
+        // two spellings, so the filter binds both; any other coarse type binds
+        // only itself, which keeps e.g. lower-case `relates_to` (a different
+        // relationship from `RELATES_TO`) out of this privacy-filtered set.
+        let coarse_types: Vec<String> = COARSE_EDGE_TYPES
+            .iter()
+            .flat_map(|s| epigraph_core::edge::relationships::relationship_spellings(s))
+            .collect();
         // $1 = owner_id, $2 = coarse relationship names, so the viewer's group
         // array binds at $3. This is the only statement in the module with two
         // pre-existing binds.
@@ -331,7 +361,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+        Ok(merge_into_coarse_buckets(q.fetch_all(executor).await?))
     }
 
     /// One row per visible owned node, carrying that node's degree counted over

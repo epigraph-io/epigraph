@@ -1908,12 +1908,12 @@ pub async fn fetch_batched_context(
                 SELECT e.source_id AS paragraph_id, e.target_id AS neighbor_id,
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
-                WHERE e.source_id = ANY($1) AND e.relationship = 'CORROBORATES'
+                WHERE e.source_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
                 UNION ALL
                 SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
-                WHERE e.target_id = ANY($1) AND e.relationship = 'CORROBORATES'
+                WHERE e.target_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
             ),
             joined AS (
                 SELECT

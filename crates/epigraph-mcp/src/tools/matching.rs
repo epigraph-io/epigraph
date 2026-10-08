@@ -81,8 +81,12 @@ pub async fn find_cross_source_matches(
         .map_err(internal_error)?;
     let candidates_out: Vec<CandidateOut> = candidates.into_iter().map(row_to_out).collect();
 
-    // Pull CORROBORATES edges incident on the claim — already-promoted matches.
-    // The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
+    // Pull corroborates edges incident on the claim, in either stored spelling.
+    // These are not only already-promoted matches: the matcher's rows carry
+    // `properties.source = 'cross_source_matcher'`, while agent-asserted
+    // corroborations (HTTP edge route `CORROBORATES`, MCP `link_epistemic`
+    // `corroborates`) carry no such marker. Read `properties` to tell them
+    // apart. The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
     // (PR-09): it was inline here and byte-identical inline in
     // `routes/cross_source.rs`, and neither copy filtered.
     let edges = repo

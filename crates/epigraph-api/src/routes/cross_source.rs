@@ -1,8 +1,10 @@
 //! GET /api/v1/claims/:id/cross_source_matches (T20).
 //!
 //! Returns two arrays for the given claim:
-//! - `corroborates`: claim→claim edges with relationship `CORROBORATES`, either
-//!   direction.
+//! - `corroborates`: claim→claim edges with relationship `CORROBORATES` or
+//!   `corroborates`, either direction. These include agent-asserted
+//!   corroborations as well as matcher promotions; only the matcher's carry
+//!   `properties.source = 'cross_source_matcher'`.
 //! - `pending`: `match_candidates` rows in `status = 'pending'`. Promoted /
 //!   rejected rows are intentionally omitted — the UI surface for those is
 //!   either the CORROBORATES edge itself or admin tooling.
