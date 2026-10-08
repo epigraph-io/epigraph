@@ -564,7 +564,10 @@ pub struct CreateEdgeRequest {
     /// id without inserting a duplicate. Idempotent for drainer / outbox-style
     /// retry use cases. Defaults to false (raw INSERT semantics; per
     /// migration 018 every relationship may multi-emit by default, so
-    /// callers needing dedup must opt in via this flag).
+    /// callers needing dedup must opt in via this flag). Exception: symmetric
+    /// claim/claim relationships
+    /// (`epigraph_core::edge::relationships::is_symmetric_claim_relationship`)
+    /// always dedup on the UNORDERED in-force pair, whatever this flag says.
     #[serde(default)]
     pub if_not_exists: bool,
 }
@@ -735,7 +738,11 @@ pub async fn create_edge(
 
     // Branch on if_not_exists: drainer / outbox callers opt in to
     // (source_id, target_id, relationship) idempotency; the default path
-    // preserves the post-migration-018 multi-emit semantics.
+    // preserves the post-migration-018 multi-emit semantics. Exception:
+    // symmetric claim/claim relationships
+    // (`epigraph_core::edge::relationships::is_symmetric_claim_relationship`)
+    // always dedup on the unordered in-force pair, whatever `if_not_exists`
+    // says (the first arm below).
     //
     // For the if_not_exists path, the repo returns `was_created=false` on
     // a dedup hit. We then SKIP all post-create side effects (provenance,
@@ -756,7 +763,33 @@ pub async fn create_edge(
             ApiError::from(e)
         }
     };
-    let (edge_row, was_created) = if request.if_not_exists {
+    // Symmetric claim/claim relationships (`CONTRADICTS`, `CORROBORATES`) are
+    // ONE fact about an unordered pair, so they dedup on that pair in BOTH
+    // directions, whatever `if_not_exists` says — the noun-edge case migration
+    // 018 leaves to application code, and the same contract as the MCP twin
+    // `link_epistemic`. Without it each call order wrote its own in-force row,
+    // factor and edge-keyed BBA, double-counting one disagreement. Gated on
+    // claim/claim: migration 090's header records that this route admits
+    // `CORROBORATES` between other entity types, where nothing establishes
+    // symmetry. On a reverse dedup hit `edge_row` is the stored row, whose
+    // orientation is the reverse of the request's.
+    let symmetric_claim_pair =
+        epigraph_core::edge::relationships::is_symmetric_claim_relationship(&request.relationship)
+            && request.source_type == "claim"
+            && request.target_type == "claim";
+    let (edge_row, was_created) = if symmetric_claim_pair {
+        EdgeRepository::create_symmetric_if_absent_row_conn(
+            &mut tx,
+            request.source_id,
+            request.target_id,
+            &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
+        )
+        .await
+        .map_err(refused)?
+    } else if request.if_not_exists {
         EdgeRepository::create_if_not_exists_conn(
             &mut tx,
             request.source_id,
@@ -850,16 +883,21 @@ pub async fn create_edge(
     // `RestrictionKind::Neutral` on non-epistemic relationships, so the
     // wrapper handles all 13 epistemic types (supports/corroborates/
     // contradicts/refutes/refines/...) instead of just the 4 evidentials.
+    //
+    // The wire follows the STORED row, not the request: the BBA is keyed on
+    // `edge_id` and encodes "source's interval restricts target", and on a
+    // symmetric reverse dedup hit the stored orientation is the opposite of
+    // the request's (as `link_epistemic`'s `wire_source` / `wire_target`).
     if let Err(e) = trigger_edge_ds_recomputation(
         pool,
         &viewer,
         was_created,
         edge_id,
-        request.source_id,
-        request.target_id,
-        &request.source_type,
-        &request.target_type,
-        &request.relationship,
+        edge_row.source_id,
+        edge_row.target_id,
+        &edge_row.source_type,
+        &edge_row.target_type,
+        &edge_row.relationship,
     )
     .await
     {
@@ -3366,6 +3404,380 @@ mod db_tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── Symmetric claim/claim relationships dedup on the UNORDERED pair ──
+    //
+    // `CONTRADICTS` / `CORROBORATES` between two claims are one fact about a
+    // pair, not a per-submission event. `POST /edges` is the HTTP twin of MCP
+    // `link_epistemic`, which already collapses both call orders onto one row;
+    // before this, the REST route wrote each order as its own in-force row
+    // (with its own factor and its own edge-keyed BBA), so one disagreement
+    // was counted twice by DS / BP. The controls below pin the boundary of the
+    // change: directional relationships and non-claim endpoints keep the
+    // directional semantics.
+
+    /// POST a JSON body to `/api/v1/edges`; return the status and parsed body.
+    async fn post_edge(router: &Router, body: Body) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, parse_body(resp).await)
+    }
+
+    /// In-force rows over the UNORDERED pair `{a, b}` with `relationship`.
+    async fn unordered_pair_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
+               AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
+               AND relationship = $3 \
+               AND (valid_to IS NULL OR valid_to > now())",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn body_id(body: &serde_json::Value, field: &str) -> Uuid {
+        Uuid::parse_str(
+            body[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("response has no `{field}`: {body}")),
+        )
+        .unwrap()
+    }
+
+    /// Every in-force or retired row over the UNORDERED pair `{a, b}` with
+    /// `relationship` — the retired ones included, so a test can tell "the old
+    /// row survived and a new one was written" from "the old row was reused".
+    async fn unordered_pair_count_all(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
+               AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
+               AND relationship = $3",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The stored `(properties, valid_from, valid_to)` of edge `id`.
+    async fn stored_edge_fields(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (
+        serde_json::Value,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        sqlx::query_as("SELECT properties, valid_from, valid_to FROM edges WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A timestamp field of a response body, parsed (the serializer may write
+    /// `+00:00` where the request wrote `Z`, so strings are not compared).
+    fn body_ts(body: &serde_json::Value, field: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        body[field].as_str().map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap_or_else(|e| panic!("`{field}` is not RFC 3339 ({e}): {body}"))
+                .with_timezone(&chrono::Utc)
+        })
+    }
+
+    fn ts(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Shared body of the reverse-direction tests: `A <relationship> B`, then
+    /// `B <relationship> A`, both with the given `if_not_exists`.
+    async fn assert_reverse_symmetric_collapses(
+        pool: PgPool,
+        relationship: &str,
+        if_not_exists: bool,
+    ) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, &format!("symmetric {relationship} A")).await;
+        let b = seed_claim(&pool, agent_id, &format!("symmetric {relationship} B")).await;
+
+        let state = test_state(pool.clone()).await;
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
+
+        let (s1, body1) =
+            post_edge(&router, create_edge_body(a, b, relationship, if_not_exists)).await;
+        assert_eq!(s1, StatusCode::CREATED, "first POST creates: {body1}");
+        let id1 = body_id(&body1, "id");
+
+        let (s2, body2) =
+            post_edge(&router, create_edge_body(b, a, relationship, if_not_exists)).await;
+
+        assert_eq!(
+            unordered_pair_count(&pool, a, b, relationship).await,
+            1,
+            "`B {relationship} A` after `A {relationship} B` (if_not_exists={if_not_exists}) \
+             is the same fact and must not write a second in-force row; \
+             second response was {s2} {body2}"
+        );
+        assert_eq!(
+            body_id(&body2, "id"),
+            id1,
+            "the reverse POST must return the existing edge"
+        );
+        assert_eq!(
+            (body_id(&body2, "source_id"), body_id(&body2, "target_id")),
+            (a, b),
+            "the response reports the STORED orientation (A -> B), not the request's"
+        );
+        assert_eq!(s2, StatusCode::OK, "a dedup hit is 200, not 201");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reverse_direction_returns_existing_edge(pool: PgPool) {
+        assert_reverse_symmetric_collapses(pool, "CONTRADICTS", true).await;
+    }
+
+    /// Option A: the symmetric dedup does not depend on `if_not_exists`. The
+    /// default (multi-emit) path is for verb-edges; a contradiction between two
+    /// claims is a noun-fact, and the MCP twin is always idempotent.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reverse_direction_dedups_without_if_not_exists(pool: PgPool) {
+        assert_reverse_symmetric_collapses(pool, "CONTRADICTS", false).await;
+    }
+
+    /// `CORROBORATES` is the other symmetric relationship REST admits; filed in
+    /// both orders it is likewise one row, reported in the stored orientation.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_corroborates_reverse_direction_collapses(pool: PgPool) {
+        assert_reverse_symmetric_collapses(pool, "CORROBORATES", false).await;
+    }
+
+    /// Option A covers the SAME direction too: `A CONTRADICTS B` filed twice
+    /// without `if_not_exists` is one disagreement, not two (before, the
+    /// second POST was 201 with a second in-force row).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_same_direction_repost_returns_stored_edge(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "same-direction A").await;
+        let b = seed_claim(&pool, agent_id, "same-direction B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let (s2, body2) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+
+        assert_eq!(
+            unordered_pair_count(&pool, a, b, "CONTRADICTS").await,
+            1,
+            "a same-direction re-POST must not add a row; second response {s2} {body2}"
+        );
+        assert_eq!(s2, StatusCode::OK, "a dedup hit is 200, not 201: {body2}");
+        assert_eq!(body_id(&body2, "id"), body_id(&body1, "id"));
+    }
+
+    /// The dedup is IN FORCE only: once `A CONTRADICTS B` is retired, a
+    /// `B CONTRADICTS A` is a new disagreement and a new row (in its own
+    /// orientation), not a silent 200 on the retired edge.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reasserted_after_retirement_is_a_new_edge(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "retired-then-reasserted A").await;
+        let b = seed_claim(&pool, agent_id, "retired-then-reasserted B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let id1 = body_id(&body1, "id");
+
+        // Retire it through the route (an hour in the past, so the test does
+        // not hinge on clock skew between this process and the database).
+        let retire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/edges/{id1}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": chrono::Utc::now() - chrono::Duration::hours(1),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retire.status(), StatusCode::OK, "PATCH valid_to retires");
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 0);
+
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "CONTRADICTS", false)).await;
+        assert_eq!(
+            s2,
+            StatusCode::CREATED,
+            "a re-assertion after retirement is a new edge, not a dedup hit on the \
+             retired one: {body2}"
+        );
+        let id2 = body_id(&body2, "id");
+        assert_ne!(id2, id1, "the retired edge must not be returned");
+        assert_eq!(
+            (body_id(&body2, "source_id"), body_id(&body2, "target_id")),
+            (b, a),
+            "the new edge is stored in the request's orientation"
+        );
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 1);
+        assert_eq!(
+            unordered_pair_count_all(&pool, a, b, "CONTRADICTS").await,
+            2,
+            "the retired row survives beside the new one"
+        );
+    }
+
+    /// The symmetric arm writes its own INSERT, so it must persist the
+    /// request's `properties` / `valid_from` / `valid_to` like the other arms;
+    /// and on a reverse dedup hit it answers with the STORED values, not the
+    /// second request's.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_persists_properties_and_validity_window(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "windowed A").await;
+        let b = seed_claim(&pool, agent_id, "windowed B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let body = |src: Uuid, tgt: Uuid, props: serde_json::Value, from: &str, to: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": src,
+                    "target_id": tgt,
+                    "source_type": "claim",
+                    "target_type": "claim",
+                    "relationship": "CONTRADICTS",
+                    "properties": props,
+                    "valid_from": from,
+                    "valid_to": to,
+                }))
+                .unwrap(),
+            )
+        };
+        let props1 = serde_json::json!({"note": "first", "weight": 0.7});
+        let (from1, to1) = ("2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
+
+        let (s1, body1) = post_edge(&router, body(a, b, props1.clone(), from1, to1)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let id1 = body_id(&body1, "id");
+        assert_eq!(
+            body1["properties"], props1,
+            "response carries the properties"
+        );
+        assert_eq!(body_ts(&body1, "valid_from"), Some(ts(from1)));
+        assert_eq!(body_ts(&body1, "valid_to"), Some(ts(to1)));
+        assert_eq!(
+            stored_edge_fields(&pool, id1).await,
+            (props1.clone(), Some(ts(from1)), Some(ts(to1))),
+            "the stored row carries the request's properties and validity window"
+        );
+
+        // Reverse re-POST with a different (valid) payload: the stored values
+        // win, and nothing is written.
+        let (s2, body2) = post_edge(
+            &router,
+            body(
+                b,
+                a,
+                serde_json::json!({"note": "second"}),
+                "2026-02-01T00:00:00Z",
+                "2098-01-01T00:00:00Z",
+            ),
+        )
+        .await;
+        assert_eq!(s2, StatusCode::OK, "{body2}");
+        assert_eq!(body_id(&body2, "id"), id1);
+        assert_eq!(
+            body2["properties"], props1,
+            "dedup hit reports STORED properties"
+        );
+        assert_eq!(body_ts(&body2, "valid_from"), Some(ts(from1)));
+        assert_eq!(body_ts(&body2, "valid_to"), Some(ts(to1)));
+        assert_eq!(
+            stored_edge_fields(&pool, id1).await,
+            (props1, Some(ts(from1)), Some(ts(to1))),
+            "a dedup hit must not rewrite the stored row"
+        );
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 1);
+    }
+
+    /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
+    /// supports A), so the two orders are two distinct facts and two rows.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_directional_reverse_direction_stays_two_rows(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "directional A").await;
+        let b = seed_claim(&pool, agent_id, "directional B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "SUPPORTS", true)).await;
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "SUPPORTS", true)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        assert_eq!(s2, StatusCode::CREATED, "{body2}");
+        assert_ne!(body_id(&body1, "id"), body_id(&body2, "id"));
+        assert_eq!(unordered_pair_count(&pool, a, b, "SUPPORTS").await, 2);
+    }
+
+    /// Control on the claim/claim gate: migration 090's header records that
+    /// `POST /edges` admits `CORROBORATES` between other entity types, where
+    /// nothing has established the relationship is symmetric. An agent/claim
+    /// `CORROBORATES` filed in both orders therefore stays two rows.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_relationship_off_claim_pair_stays_directional(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "claim endpoint").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let typed = |src: Uuid, src_type: &str, tgt: Uuid, tgt_type: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": src,
+                    "target_id": tgt,
+                    "source_type": src_type,
+                    "target_type": tgt_type,
+                    "relationship": "CORROBORATES",
+                    "if_not_exists": true,
+                }))
+                .unwrap(),
+            )
+        };
+        let (s1, body1) = post_edge(&router, typed(agent_id, "agent", claim, "claim")).await;
+        let (s2, body2) = post_edge(&router, typed(claim, "claim", agent_id, "agent")).await;
+        // Both must be real creations; a 4xx here would make the count below
+        // pass for the wrong reason.
+        assert_eq!(s1, StatusCode::CREATED, "agent -> claim: {body1}");
+        assert_eq!(s2, StatusCode::CREATED, "claim -> agent: {body2}");
+        assert_ne!(body_id(&body1, "id"), body_id(&body2, "id"));
+        assert_eq!(
+            unordered_pair_count(&pool, agent_id, claim, "CORROBORATES").await,
+            2
+        );
     }
 
     /// 0.B — GET /edges combines source_id, target_id, and relationship

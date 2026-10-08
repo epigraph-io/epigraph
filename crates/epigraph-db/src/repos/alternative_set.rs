@@ -92,10 +92,19 @@ impl AlternativeSetRepository {
         // `labels_a` / `bp_a` would have been computed from rows the viewer
         // cannot see. `visibility_lint.rs` cannot check marker PLACEMENT — this
         // comment is the human half of that check.
+        //
+        // `SELECT DISTINCT` in the CTE: the `contr` join matches BOTH
+        // orientations and `s1` / `s2` match every `supports` row, so a
+        // contradicts filed both ways or a multi-emitted `supports` (018) used
+        // to repeat the same (claim_a, claim_b, target_claim) once per
+        // duplicate edge. Every projected column is a function of
+        // (s1.source_id, s2.source_id, s1.target_id), so DISTINCT collapses
+        // exactly those duplicates. It sits here rather than in Rust so the
+        // outer `LIMIT` counts distinct pairs.
         let sql = viewer.splice(
             r#"
         WITH base AS (
-            SELECT
+            SELECT DISTINCT
                 LEAST(s1.source_id, s2.source_id)    AS claim_a,
                 GREATEST(s1.source_id, s2.source_id) AS claim_b,
                 s1.target_id                         AS target_claim,
