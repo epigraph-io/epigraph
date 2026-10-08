@@ -216,6 +216,10 @@ mod tests {
             RouterExtension::with_state("Bad", Router::<Own>::new(), Own).err(),
             Some(ExtensionNameError::InvalidCharacters("Bad".into()))
         );
+        let ext = RouterExtension::with_state("eln", Router::<Own>::new(), Own)
+            .expect("a legal name must still construct through with_state");
+        assert_eq!(ext.name(), "eln");
+        assert_eq!(ext.mount_path(), "/api/v1/ext/eln");
     }
 
     #[test]
