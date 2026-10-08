@@ -6,9 +6,14 @@ use uuid::Uuid;
 
 /// Edge relationships that define structural connectivity for component
 /// detection. Order does not matter; the union-find is symmetric.
+///
+/// Corroboration is listed in both stored spellings: the cross-source matcher
+/// writes `CORROBORATES`, MCP `link_epistemic` writes `corroborates`
+/// (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`).
 pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &[
     "decomposes_to",
     "CORROBORATES",
+    "corroborates",
     "same_as",
     "same_source",
     "continues_argument",

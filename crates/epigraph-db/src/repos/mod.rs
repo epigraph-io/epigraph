@@ -146,7 +146,9 @@ pub use graph_view::{
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
 pub use mass_function::MassFunctionRepository;
-pub use match_candidate::{MatchCandidateRepo, MatchCandidateRow, RetiredEdge, RetirementOutcome};
+pub use match_candidate::{
+    DecideOutcome, MatchCandidateRepo, MatchCandidateRow, RetiredEdge, RetirementOutcome,
+};
 pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,

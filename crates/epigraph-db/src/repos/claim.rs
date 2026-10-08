@@ -62,6 +62,13 @@ const EMBEDDABLE_POPULATION: &str = "COALESCE(is_current, true) = true \
          SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
      )";
 
+/// `hnsw.ef_search` for a hybrid dense leg of `candidate_pool` rows: the pool
+/// itself, clamped to pgvector's default (40) below and its maximum (1000)
+/// above. See [`ClaimRepository::search_hybrid_scoped_since_in_theme`].
+fn hnsw_ef_search_for_pool(candidate_pool: i64) -> i64 {
+    candidate_pool.clamp(40, 1000)
+}
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -1040,7 +1047,7 @@ impl ClaimRepository {
                   WHERE e.target_id = c.id
                     AND e.target_type = 'claim'
                     AND e.source_type IN ('paper', 'evidence', 'analysis')
-                    AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                    AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                     /* {EDGE_VISIBILITY:e} */
               )
               /* {VISIBILITY:c} */
@@ -2039,8 +2046,9 @@ impl ClaimRepository {
                                  THEN e.target_id ELSE e.source_id END
                 WHERE (e.source_id = ANY($2) OR e.target_id = ANY($2))
                   AND e.source_type = 'claim' AND e.target_type = 'claim'
-                  AND e.relationship IN ('CORROBORATES', 'supports', 'refines',
-                                         'continues_argument', 'contradicts')
+                  AND e.relationship IN ('CORROBORATES', 'corroborates', 'supports',
+                                         'refines', 'continues_argument',
+                                         'contradicts')
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{embedding_col} <=> $1::vector
                 LIMIT 50
@@ -2978,8 +2986,8 @@ impl ClaimRepository {
     /// belief recomputation touches without changing its content, so an
     /// `updated_at` window would report the whole recomputed corpus as new.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_hybrid_scoped_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn search_hybrid_scoped_since<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         query_text: &str,
@@ -2989,7 +2997,10 @@ impl ClaimRepository {
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<HybridHit>, DbError> {
+    ) -> Result<Vec<HybridHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         Self::search_hybrid_scoped_since_in_theme(
             executor,
             viewer,
@@ -3048,8 +3059,8 @@ impl ClaimRepository {
     /// executions, and across them two things are still arbitrary:
     ///
     ///  - which rows of a tie group enter the pool when `candidate_pool`
-    ///    truncates it (needs a tie group straddling the 200th candidate at
-    ///    `HYBRID_CANDIDATE_POOL = 200`); and
+    ///    truncates it (needs a tie group straddling the 50th candidate at
+    ///    `HYBRID_CANDIDATE_POOL = 50`); and
     ///  - the `row_number()` ranks assigned inside a tie group, which feed
     ///    `rrf_score`, so two executions could in principle score a tied group
     ///    differently and reorder it.
@@ -3060,9 +3071,53 @@ impl ClaimRepository {
     /// change; neither is introduced by it. Closing them properly means an
     /// explicit deterministic key inside each leg, which is the ranking change
     /// described above.
+    ///
+    /// ## The dense leg runs with pgvector's iterative HNSW scan (fdd8e494)
+    ///
+    /// The `dense` CTE is served by `idx_claims_embedding_hnsw`, and an HNSW
+    /// index scan yields at most `hnsw.ef_search` rows (pgvector default 40)
+    /// unless iterative scanning is on. Every scope predicate in the CTE —
+    /// `labels @>`, `agent_id`, `since`, `theme_id` and the visibility splice —
+    /// is applied AFTER that scan, so a scope rare among the ~40 nearest
+    /// neighbours returned 0–2 dense rows (prod: `recall(tags=['backlog'])`
+    /// matched one row via dense), and even unscoped recall could not fill a
+    /// `candidate_pool` above 40. So the query runs in a short transaction that
+    /// first sets, `is_local`:
+    ///
+    ///  - `hnsw.iterative_scan = strict_order` — keep scanning past
+    ///    `ef_search` until `LIMIT $3` scope-matching rows are found.
+    ///    `strict_order`, not `relaxed_order`: the scan's output stays exactly
+    ///    distance-ordered, so the `LIMIT $3` cut and the `row_number()` ranks
+    ///    behave as before and the paging argument above still holds.
+    ///  - `hnsw.ef_search = clamp(candidate_pool, 40, 1000)` — the first
+    ///    batch is already the whole pool for an unscoped query.
+    ///
+    /// The transaction is ROLLED BACK, not committed. On a caller's own
+    /// transaction `begin()` opens a savepoint, and `RELEASE SAVEPOINT` would
+    /// carry the `SET LOCAL` values up into the caller's transaction, where
+    /// they would perturb any later HNSW read (e.g. the ef_search-tuned
+    /// `THEME_COVERAGE_PROBE_K` probe). `ROLLBACK TO SAVEPOINT` reverts them;
+    /// for a read-only statement the two are otherwise equivalent.
+    ///
+    /// Residual: the iterative scan still stops at `hnsw.max_scan_tuples`
+    /// (default 20,000) or at its memory budget (`hnsw.scan_mem_multiplier` x
+    /// `work_mem`), whichever comes first; neither is changed here. A scope
+    /// whose share of embedded current claims is below about
+    /// `candidate_pool / 20,000` (0.25% at a pool of 50) can still under-fill
+    /// the dense leg.
+    ///
+    /// Requires pgvector >= 0.8.0, the release that added
+    /// `hnsw.iterative_scan`; check the deployed extension version before
+    /// shipping. On an older extension the call is unsupported, and how it
+    /// misbehaves depends on the backend: where the `vector` library is
+    /// already loaded, pgvector has reserved the `hnsw.` GUC prefix and the
+    /// `set_config` is expected to fail the whole call; on a fresh pooled
+    /// backend the unknown name may be accepted as a placeholder and then
+    /// discarded (with a WARNING) when the library loads, so the query runs
+    /// silently without iterative scan.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_hybrid_scoped_since_in_theme<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn search_hybrid_scoped_since_in_theme<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         query_text: &str,
@@ -3074,7 +3129,10 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
         theme_id: Option<Uuid>,
-    ) -> Result<Vec<HybridHit>, DbError> {
+    ) -> Result<Vec<HybridHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -3139,7 +3197,18 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $11
         }
-        let rows = q.fetch_all(executor).await?;
+
+        // See "The dense leg runs with pgvector's iterative HNSW scan" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(hnsw_ef_search_for_pool(candidate_pool).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
 
         Ok(rows)
     }
@@ -5985,7 +6054,7 @@ impl ClaimRepository {
     ///
     /// Grounded evidence means at least one of:
     /// - `paper  --asserts-->          claim`
-    /// - `evidence --SUPPORTS-->       claim`
+    /// - `evidence --SUPPORTS-->       claim` (either spelling, `SUPPORTS` or `supports`)
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
     pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
@@ -6000,7 +6069,7 @@ impl ClaimRepository {
                 WHERE target_id = $1
                   AND target_type = 'claim'
                   AND source_type IN ('paper', 'evidence', 'analysis')
-                  AND relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                  AND relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                   /* {EDGE_VISIBILITY:edges} */
             )
             "#,

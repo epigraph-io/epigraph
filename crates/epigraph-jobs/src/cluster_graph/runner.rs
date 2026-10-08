@@ -9,7 +9,13 @@ use super::louvain::{louvain, LouvainInput};
 
 /// Edge relationship strings considered "epistemic" for clustering. Governance
 /// edges (OCCUPIES, GOVERNED_BY, HAS_ROLE) are excluded by NOT being listed.
-pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &["SUPPORTS", "CONTRADICTS"];
+///
+/// Both stored spellings of each relationship are listed: the HTTP route and DS
+/// writers store `SUPPORTS` / `CONTRADICTS`, MCP `link_epistemic` stores
+/// `supports` / `contradicts`, and they are the same relationship
+/// (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`).
+pub const EPISTEMIC_RELATIONSHIPS: &[&str] =
+    &["SUPPORTS", "supports", "CONTRADICTS", "contradicts"];
 
 #[derive(Debug)]
 pub struct RunConfig {
