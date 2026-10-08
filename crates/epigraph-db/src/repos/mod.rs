@@ -171,8 +171,8 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit,
-    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    ExecutedClaim, HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

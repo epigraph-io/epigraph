@@ -8219,6 +8219,32 @@ impl ClaimRepository {
         Ok(result.rows_affected())
     }
 
+    /// [`Self::deprecate_claim`] (same `SET` list, so both ANN columns are
+    /// nulled in the same statement, CLAUDE.md "Cleanup paths"), restricted to
+    /// a row that is still current, so `rows_affected` means "this call retired
+    /// it". `deprecate_workflow` reports only claims whose state changed
+    /// (U017; backlog fe874d2a): a re-run must report nothing.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the statement fails, including a `42501` refusal
+    /// by `claims_tenancy`'s `WITH CHECK` on a session that may not write it.
+    pub async fn deprecate_claim_if_current<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: ClaimId,
+    ) -> Result<u64, DbError> {
+        let uuid: Uuid = id.into();
+        let result = sqlx::query(
+            "UPDATE claims \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                 embedding_3072 = NULL, updated_at = NOW() \
+             WHERE id = $1 AND is_current",
+        )
+        .bind(uuid)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Update labels on a claim by adding and/or removing labels atomically.
     ///
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,

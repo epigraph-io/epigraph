@@ -842,7 +842,7 @@ pub struct ReportWorkflowOutcomeParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
     #[schemars(
-        description = "UUID of the workflow to deprecate. A hierarchical workflows-table id deprecates only that workflows row, not its thesis or step claims (see the tool description)."
+        description = "UUID of the workflow to deprecate: a flat workflow claim id, or a hierarchical workflows-table id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return). A hierarchical id retires the workflow with the thesis, phase and step claims no other live workflow executes (see the tool description). An id that is neither is an error."
     )]
     pub workflow_id: String,
 
@@ -2271,7 +2271,15 @@ pub struct ReportWorkflowOutcomeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DeprecateWorkflowResponse {
+    /// Workflow ids (a flat workflow claim or a hierarchical `workflows` row)
+    /// whose state this call changed. An id already deprecated is not listed.
     pub deprecated_ids: Vec<String>,
+    /// Thesis, phase and step claims of a hierarchical workflow that this call
+    /// retired (`is_current = false`, embeddings nulled).
+    pub retired_claim_ids: Vec<String>,
+    /// Claims of a deprecated hierarchical workflow that were KEPT because
+    /// another live workflow still executes them.
+    pub kept_shared_claim_ids: Vec<String>,
     pub reason: String,
 }
 
