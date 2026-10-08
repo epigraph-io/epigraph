@@ -46,6 +46,7 @@ pub mod crud;
 pub mod edges;
 #[cfg(feature = "db")]
 pub mod ego;
+#[cfg(feature = "db")]
 pub mod elevate;
 #[cfg(feature = "db")]
 pub mod elevation;
