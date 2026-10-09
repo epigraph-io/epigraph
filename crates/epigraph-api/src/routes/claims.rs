@@ -3356,8 +3356,8 @@ mod db_tests {
         // to exist as a real agent for the refusal to be observable. Using
         // `ensure_for_client` here would also add an unregistered call site
         // to `crates/epigraph-db/tests/personal_group_mint_ratchet.rs`'s
-        // scan (it can mint a personal group), which the task's global
-        // constraints require to stay unchanged.
+        // scan, which requires every call site that can reach the
+        // personal-group mint to be registered with a justification.
         let viewer = epigraph_db::visibility::Viewer::resolve(&pool, client_id)
             .await
             .expect("resolve viewer");

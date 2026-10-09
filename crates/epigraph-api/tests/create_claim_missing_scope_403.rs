@@ -1,5 +1,5 @@
 #![cfg(feature = "db")]
-//! Review finding (Task 1 fix round 1): `create_claim_core`'s scope check
+//! `create_claim_core`'s scope check
 //! (`crates/epigraph-api/src/routes/claims.rs`, `if let Some(auth) = auth_ctx
 //! { check_scopes(auth, &["claims:write"])? }`) was not exercised by any test
 //! in the create-claim guard suite — all 13 named tests mint a token holding
@@ -7,11 +7,11 @@
 //! 403 before anything is written.
 //!
 //! The 403 alone would not pin the cause: `ApiError::Forbidden` is also
-//! raised elsewhere on this path (e.g. `require_claim_act_authority`'s
-//! `ClaimNotWritable`), so this test also asserts the body names
-//! `claims:write`, and runs a same-body positive control with a
-//! `claims:write` token to prove the content itself was writable and only
-//! the scope blocked it.
+//! raised later on this same write path by migration 122's trigger refusal
+//! (OPL01/OPL02, unrelated to scopes — see `crates/epigraph-api/src/errors.rs`),
+//! so this test also asserts the body names `claims:write`, and runs a
+//! same-body positive control with a `claims:write` token to prove the
+//! content itself was writable and only the scope blocked it.
 
 use sqlx::postgres::PgPoolOptions;
 mod common;
@@ -51,8 +51,8 @@ async fn claims_read_only_token_is_403_on_create_with_zero_rows_written() {
     );
     assert!(
         text.contains("claims:write"),
-        "the 403 must name the missing scope (claims:write), not an unrelated \
-         Forbidden raised later on this path: {text}"
+        "the 403 must name the missing scope (claims:write), not the OPL01/OPL02 \
+         trigger refusal that can also raise Forbidden later on this path: {text}"
     );
 
     let count: i64 =
