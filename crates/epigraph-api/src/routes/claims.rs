@@ -390,14 +390,33 @@ pub async fn create_claim(
     State(state): State<AppState>,
     // Still `Option<Extension<..>>` rather than a required extractor: PR-07
     // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
-    // across all 39 sites at once. Until then the handler rejects `None`
-    // explicitly below rather than falling open, which is the behavioural half
-    // of that change without the mechanical half.
+    // across all 39 sites at once. Until then `create_claim_core` rejects
+    // `None` explicitly rather than falling open.
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
+    create_claim_core(
+        &state,
+        &viewer,
+        auth_ctx.as_ref().map(|axum::Extension(a)| a),
+        request,
+    )
+    .await
+    .map(Json)
+}
+
+/// The body of `POST /api/v1/claims`, shared with `POST /api/v1/claims/batch`
+/// (one call per item) so the two cannot drift. Opens and commits its own
+/// transaction.
+#[cfg(feature = "db")]
+pub(crate) async fn create_claim_core(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth_ctx: Option<&crate::middleware::bearer::AuthContext>,
+    request: CreateClaimRequest,
+) -> Result<ClaimResponse, ApiError> {
     // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    if let Some(auth) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
     }
 
@@ -449,8 +468,7 @@ pub async fn create_claim(
         // SECURITY: Use ONLY authenticated identity for membership check, never request body
         // Prefer agent_id, fall back to client_id (sub) for human clients
         let caller_agent_id = auth_ctx
-            .as_ref()
-            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)))
+            .and_then(|ctx| ctx.agent_id.or(Some(ctx.client_id)))
             .ok_or_else(|| ApiError::Forbidden {
                 reason: "Authentication required to create encrypted claims".to_string(),
             })?;
@@ -529,7 +547,7 @@ pub async fn create_claim(
     // 500 in all three cases: no credential, a credential with no principal,
     // and a credential naming a principal that does not exist are all "re-mint
     // your token", which is what RFC 6750 `invalid_token` means.
-    let Some(axum::Extension(ctx)) = &auth_ctx else {
+    let Some(ctx) = auth_ctx else {
         return Err(ApiError::Unauthorized {
             reason: "authentication required to create a claim".to_string(),
         });
@@ -606,7 +624,7 @@ pub async fn create_claim(
     // caller must be bound and may name only an author of its own human. On
     // the raw pool the trigger saw no principal at all (and, once armed, now
     // refuses the write outright rather than checking the body's author).
-    let mut tx = state.begin_claim_write(&viewer, "create_claim").await?;
+    let mut tx = state.begin_claim_write(viewer, "create_claim").await?;
 
     // ── Tenancy declaration (PR-16) ──
     //
@@ -675,7 +693,7 @@ pub async fn create_claim(
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, &viewer, &claim, decl).await?
+        ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl).await?
     } else {
         // The (content_hash, agent_id) UNIQUE constraint that create_strict's
         // 409-on-duplicate contract relied on was dropped (migration 107), so
@@ -694,7 +712,7 @@ pub async fn create_claim(
         };
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
-            &viewer,
+            viewer,
             content_hash.as_slice(),
             agent_uuid,
         )
@@ -941,7 +959,7 @@ pub async fn create_claim(
     response.was_created = was_created;
 
     // Record provenance chain of custody when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    if let Some(auth) = auth_ctx {
         // Content hash for provenance: BLAKE3 of claim content
         let content_hash = blake3::hash(request.content.as_bytes());
         // Provenance signature placeholder (agent did not sign this request body via Ed25519)
@@ -967,7 +985,7 @@ pub async fn create_claim(
         }
     }
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Create a new claim (placeholder - no database)
