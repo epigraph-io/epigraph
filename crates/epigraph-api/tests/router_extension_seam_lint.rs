@@ -77,9 +77,23 @@ fn both_variants_mount_extensions_at_the_head_of_the_auth_layer_statement() {
     for (variant, &start) in ["db", "not(db)"].iter().zip(&starts) {
         // The layer statements contain no `;` before their end.
         let stmt = &src[start..start + src[start..].find(';').expect("statement end")];
+        // Anchored on the preceding comma (as `from_fn_with_state(state.clone(),
+        // bearer_auth_middleware` always has) so this cannot be satisfied by
+        // `optional_bearer_auth_middleware` (imported alongside it, and used
+        // elsewhere in this file): that identifier's own leading `_` sits
+        // where the comma would need to be, so the anchored substring never
+        // matches inside it. A bare `contains("bearer_auth_middleware")`
+        // would match either identifier, silently downgrading the mount to
+        // optional auth. The explicit negative assertion below is kept as a
+        // second, independent guard with its own failure message.
         assert!(
-            stmt.contains("bearer_auth_middleware"),
+            stmt.contains(",bearer_auth_middleware"),
             "{variant}: the mount statement does not apply bearer_auth_middleware:\n{stmt}"
+        );
+        assert!(
+            !stmt.contains("optional_bearer_auth_middleware"),
+            "{variant}: the mount statement applies optional_bearer_auth_middleware, \
+             which accepts unauthenticated requests:\n{stmt}"
         );
         if *variant == "db" {
             assert!(
