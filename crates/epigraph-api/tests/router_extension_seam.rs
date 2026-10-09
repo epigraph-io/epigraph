@@ -1,3 +1,4 @@
+#![cfg(feature = "db")]
 //! The router extension seam, through the real router: an embedder's routes
 //! sit under the authenticated router's layers, whatever state they carry.
 //!
@@ -162,6 +163,24 @@ async fn kernel_state_extension_reads_app_state(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn kernel_state_extension_without_a_token_is_401(pool: PgPool) {
+    let (router, _) = app(&pool);
+    let (status, body, challenge) =
+        send(&router, "GET", "/api/v1/ext/kstate/limit", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert!(
+        challenge
+            .as_deref()
+            .is_some_and(|c| c.starts_with("Bearer")),
+        "missing RFC 6750 challenge: {challenge:?}"
+    );
+    assert!(
+        !body.contains(&BODY_LIMIT.to_string()),
+        "handler ran without a token: {body}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn own_state_extension_can_enforce_a_kernel_scope(pool: PgPool) {
     let (router, state) = app(&pool);
     let reader = token(&state, Uuid::new_v4(), &["claims:read"], None);
@@ -175,6 +194,10 @@ async fn own_state_extension_can_enforce_a_kernel_scope(pool: PgPool) {
     )
     .await;
     assert_eq!(denied, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(
+        body.contains("Missing required scope: claims:write"),
+        "not RequireScopeWrite's own rejection: {body}"
+    );
     let (allowed, body, _) = send(
         &router,
         "GET",
@@ -270,5 +293,50 @@ async fn elevated_post_to_extension_fallback_is_refused(pool: PgPool) {
     assert!(
         !body.contains("extension fallback"),
         "elevated write reached the extension's fallback past the recorder: {body}"
+    );
+}
+
+/// `create_router_with_extensions`'s own documented panic ("# Panics when two
+/// extensions share a name"), exercised through the public entry point rather
+/// than `extensions::assert_unique_names` directly.
+///
+/// `#[sqlx::test]` provisions a real, migrated database per test and its
+/// macro-generated wrapper is itself async; `#[should_panic]` does not compose
+/// with that. Nothing here needs a live database at all — `create_router_with_
+/// extensions` panics before it would ever touch one — so this is a plain
+/// `#[test]`. `PgPool::connect_lazy` only parses the DSN and defers any real
+/// connection, but constructing the pool still asserts a Tokio context exists,
+/// so a bare current-thread runtime is entered for just that call (mirrors
+/// `middleware::bearer`'s and `routes::webhooks`'s own `connect_lazy`-against-
+/// an-unreachable-DSN tests).
+#[test]
+fn create_router_with_extensions_panics_on_duplicate_names() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime to enter for connect_lazy");
+    let _guard = rt.enter();
+    let pool = PgPool::connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+        .expect("connect_lazy only parses the DSN; it never connects");
+    let state = AppState::with_db(pool, ApiConfig::default());
+
+    let a = RouterExtension::new("demo", Router::new()).expect("valid name");
+    let b = RouterExtension::new("demo", Router::new()).expect("valid name");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        create_router_with_extensions(state, vec![a, b])
+    }));
+
+    let payload = result.expect_err("two extensions named \"demo\" must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        message.contains("registered twice"),
+        "not assert_unique_names's own refusal — axum's nest_service conflict \
+         panic (should the uniqueness check ever be skipped) reads \
+         differently and must not satisfy this assertion: {message}"
     );
 }
