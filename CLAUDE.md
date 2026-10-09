@@ -31,7 +31,10 @@ extended in-process: an embedder that runs `epigraph-api` as a library passes
 `/api/v1/ext/<name>` inside the authenticated router (bearer, per-access
 recorder, body limit, rate limit). The recorder logs an extension access
 under its raw request path, not a route template (`nest_service` leaves no
-`MatchedPath`). Scope checks and tenancy are the extension's own job; see
+`MatchedPath`). The recorder refuses an elevated token by method only
+(anything but GET, HEAD and OPTIONS), so an extension handler must never write
+on GET, HEAD or OPTIONS, including in `.fallback()` and `any()`. Scope checks
+and tenancy are the extension's own job; see
 `crates/epigraph-api/src/routes/extensions.rs`.
 Never register a first-party route under `/api/v1/ext`
 (`tests/router_extension_seam_lint.rs` fails if you do).

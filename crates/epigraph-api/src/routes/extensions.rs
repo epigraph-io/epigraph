@@ -16,14 +16,27 @@
 //!   expired or revoked token is refused 401 before the handler runs;
 //! * the caller's `AuthContext` in the request extensions;
 //! * (db builds) the per-access recorder: a token carrying an elevation claim
-//!   may not write through an extension (`ELEVATED READ-ONLY`), and its reads
-//!   are recorded, under the raw request path rather than a route template
-//!   (`mount_all`'s doc says why);
+//!   is refused (`ELEVATED READ-ONLY`) any method but `GET`, `HEAD` and
+//!   `OPTIONS`, and its reads are recorded, under the raw request path rather
+//!   than a route template (`mount_all`'s doc says why). The refusal is keyed
+//!   on the method, not on what the handler does: it keeps an elevated token
+//!   from writing only if the extension never writes on those three methods
+//!   (see "Read-only methods" below). `ELEVATED_NON_GET_ALLOWLIST` names
+//!   first-party route templates, and an extension's raw request path never
+//!   matches one, so an extension `POST` that only reads is refused for an
+//!   elevated token too: fail-closed, by design;
 //! * the request body limit (`ApiConfig::max_request_size`) and the rate
 //!   limiter.
 //!
 //! # What it does NOT inherit — the embedder owns these
 //!
+//! * **Read-only methods.** An elevated token's `GET`, `HEAD` and `OPTIONS`
+//!   requests reach the extension's handlers (recorded, not refused), on every
+//!   path under the mount, unmatched ones included. A handler must never write
+//!   on `GET`, `HEAD` or `OPTIONS`. That includes a `.fallback()` handler and
+//!   an `any()` route, which answer every method, and a `get()` route, which
+//!   also answers `HEAD`. First-party routes rest on reviewed method routers;
+//!   nothing in this crate reviews an extension's.
 //! * **Scopes.** Authentication is not authorization. Check scopes in the
 //!   handler: `crate::middleware::check_scopes`, or a
 //!   `crate::middleware::bearer::RequireScope*` extractor (generic over state).
