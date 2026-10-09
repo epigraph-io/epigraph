@@ -1369,7 +1369,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
-         NULL) for the NAMED agent; 122 section 5 records the one bit it adds (human-ness).",
+         'client_allowlist' (migration 149) / NULL) for the NAMED agent; 122 section 5 records \
+         the one bit it adds (human-ness), and 149 one more (allowlisted-ness).",
     ),
     (
         "agent.rs",
