@@ -1481,6 +1481,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_definer_bypass()`), i.e. the maintenance session or one of 123's definers.",
         ),
         (
+            "security_events_system_agent_privileged",
+            "operator.system_agent",
+            "148's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 21) <> \
+             'operator.system_agent'`) says WHICH rows the restriction applies to, and grants \
+             nothing. A restrictive policy is AND-ed with the permissive `security_events_append`, \
+             so every other row still needs 077's attribution arms; an `operator.system_agent*` \
+             row needs one of the two session arms beside it (`epigraph_bypass()` / \
+             `epigraph_definer_bypass()`), i.e. the maintenance session or 148's audit trigger.",
+        ),
+        (
             "security_events_cascade_privileged",
             "cascade.",
             "117's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 8) <> \
