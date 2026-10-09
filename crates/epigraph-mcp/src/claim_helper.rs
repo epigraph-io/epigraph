@@ -216,7 +216,8 @@ pub async fn begin_author_stamped_tx<'p>(
 }
 
 /// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
-/// **`workflow-ingest-system`** agent's viewer — *not* from `server.agent_id()`.
+/// **workflow-ingest system agent's** viewer (the agent migration 148's
+/// `system_agents` registry names) — *not* from `server.agent_id()`.
 ///
 /// # Why this is a second entry point rather than a call to the one above
 ///

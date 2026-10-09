@@ -1840,7 +1840,8 @@ pub async fn ingest_workflow(
 // ── Internal helpers ──
 
 /// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
-/// **`workflow-ingest-system`** agent's viewer.
+/// **workflow-ingest system agent's** viewer (the agent migration 148's
+/// `system_agents` registry names; see `get_or_create_system_agent`).
 ///
 /// The HTTP twin of `epigraph-mcp`'s
 /// `claim_helper::begin_system_ingest_stamped_tx`, and identical in substance:
@@ -1991,7 +1992,7 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
 /// `system_agent_id` from the executor result.
-/// Stamped from the `workflow-ingest-system` agent's viewer, like the plan walk
+/// Stamped from the workflow-ingest system agent's viewer, like the plan walk
 /// it follows: the `claim_frames` / `mass_functions` / cached-belief rows it
 /// writes are claim-derived, so migrations 074/070 fill their tenancy from the
 /// ingest's own claims and the `WITH CHECK` asks about the SYSTEM agent's group.
@@ -2589,8 +2590,10 @@ mod tests {
             .with_state(state)
     }
 
-    /// Insert a system agent (mirrors `get_or_create_system_agent` but without
-    /// going through the public API) and return its id.
+    /// Find or insert an agent holding the all-zero key, straight into `agents`,
+    /// to stand in as a system author for these unit tests. It is NOT the
+    /// registered workflow-ingest agent and never goes through
+    /// `get_or_create_system_agent` (migration 148's registry).
     async fn ensure_system_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![0u8; 32];
         // Try existing first

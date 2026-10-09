@@ -505,6 +505,31 @@ system agent is live-linked to one human, another human's callers are refused
 rather than writing into that human's group; a per-operator system identity is
 the follow-up that lets them ingest workflows.
 
+### System agents (migration 148)
+
+Which agent IS that shared system agent is recorded, not derived. Migration
+148's `system_agents` maps a role (`workflow-ingest`) to an agent; it is written
+only by a maintenance session (`epigraph-operator register-system-agent`),
+audited (`operator.system_agent_registered`) and immutable. Both resolvers
+(the executor's `get_or_create_system_agent`, which the REST policy route
+delegates to) read it first:
+
+* a registered row wins, always: no key lookup, no create;
+* no row on an ARMED database refuses before writing anything (the session
+  valve does not change that: it relieves the binding only);
+* no row on an unarmed database keeps the pre-148 behaviour (look the agent up
+  by the key derived from the public constant `"workflow-ingest-system"`,
+  create it on a miss), so fresh installs and test databases need nothing.
+
+Registration records the agent's key at that moment, and the `agents` table
+then refuses that key to any other agent, on every path and every role. So
+the order is: register (its own committed transaction) BEFORE rotating the
+system agent's key, then live-link it, then arm. A document, a workflow or a
+provenance request can never name the system identity as an author: the
+legacy key, and any author that resolves to a registered system agent, is
+skipped by ingest and refused (400) by `POST /api/v1/claims/:id/provenance`
+and `POST /api/v1/agents`.
+
 **Scope: claim INSERTs.** The trigger governs claim INSERTs, changes of
 `claims.agent_id`, the clearing or re-pointing of an existing
 `claims.supersedes` (above), and a claim becoming current again
