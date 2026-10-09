@@ -115,6 +115,9 @@ const CLOSED: &[&str] = &[
     "_sqlx_migrations",
     "agent_capabilities",
     "agent_keys",
+    // Migration 149: an authority table (which client's agent writes for which
+    // human), written only through maintenance definers.
+    "author_binding_clients",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
@@ -135,6 +138,9 @@ const CLOSED: &[&str] = &[
 /// table-level one.
 const NO_WRITE: &[&str] = &[
     "agent_capabilities",
+    // Migration 149: written only through maintenance definers; the
+    // application role holds SELECT only.
+    "author_binding_clients",
     "authorization_votes",
     "authorizers",
     "entity_merge_candidates",

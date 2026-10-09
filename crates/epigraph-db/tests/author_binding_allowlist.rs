@@ -1740,3 +1740,192 @@ async fn an_operator_of_agents_and_a_system_agent_are_never_allowlisted(pool: Pg
         .expect("rows");
     assert_eq!(rows, 0);
 }
+
+// =====================================================================
+// T8 / T9: the rollback and the registers.
+// =====================================================================
+
+/// The catalog facts 149 could leave behind, by name: relations, functions
+/// (body and owner), policies, triggers and constraints in `public` (the
+/// `admin_scope_enforcement.rs::catalog` query), plus the ACL of the two
+/// functions 149 re-bodies, because `CREATE OR REPLACE` keeps an ACL that an
+/// undo could leave different.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'acl ' || p.proname || ' ' || coalesce(p.proacl::text, '') \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+            AND p.proname IN ('epigraph_author_binding', 'epigraph_human_of') \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'con ' || c.relname || '.' || k.conname \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+fn read_repo(rel: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+/// `docs/runbooks/149-undo.sql`, applied twice to a database that went
+/// pre-149 -> 149 and allowed one client, returns its catalog (relations,
+/// function bodies, owners and the re-bodied functions' ACLs, policies,
+/// triggers, constraints) to the pre-149 one, so the two binding reads are
+/// 122's again byte for byte, and records the removal as exactly one
+/// `platform.author_binding_allowlist_dropped` event naming the one live
+/// allowance it ended.
+///
+/// Verified to fail: the undo dropping the helper before restoring the bodies
+/// (the undo errors); a non-122 body restored (catalog differs).
+#[sqlx::test(migrations = false)]
+async fn the_149_rollback_returns_the_catalog_and_records_the_dropped_allowances(pool: PgPool) {
+    migrate(&pool, &up_to_below(149)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &MIGRATOR).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 149 changed the catalog"
+    );
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let s = service(&pool, "service-s").await;
+    allow(&pool, s.id, h, "test").await.expect("allow");
+
+    let undo = read_repo("docs/runbooks/149-undo.sql");
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not pre-149's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let dropped: Vec<(Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT (details->>'live_allowances')::bigint, details->>'reason' FROM security_events \
+          WHERE event_type = 'platform.author_binding_allowlist_dropped'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(
+        dropped,
+        vec![(Some(1), Some("149-undo".to_string()))],
+        "one dropped event across two runs, naming the one live allowance"
+    );
+}
+
+/// Every function 149 creates is a SECURITY DEFINER; each new one is on
+/// `epigraph-tenancy-backfill verify`'s ownership list at 149 (the two
+/// re-bodied reads stay registered at 122); each non-app definer is on its
+/// grant register as not app-callable; and `docs/runbooks/149-undo.sql`
+/// restores the two re-bodied reads and drops everything else.
+///
+/// Verified to fail: a `(..., 149)` register entry removed -> named here.
+#[test]
+fn every_149_object_is_registered() {
+    let migration = read_repo("migrations/149_author_binding_allowlist.sql");
+    let backfill = read_repo("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = read_repo("docs/runbooks/149-undo.sql");
+
+    let marker = "CREATE OR REPLACE FUNCTION public.";
+    let mut definers = Vec::new();
+    let mut all = Vec::new();
+    let mut rest = migration.as_str();
+    while let Some(i) = rest.find(marker) {
+        let after = &rest[i + marker.len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name.clone());
+        }
+        all.push(name);
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    all.sort();
+    assert_eq!(
+        definers.len(),
+        10,
+        "CALIBRATION: 149 creates or re-bodies 10 SECURITY DEFINER functions: {definers:?}"
+    );
+    assert_eq!(definers, all, "every function 149 creates is a definer");
+
+    let rebodied = ["epigraph_author_binding", "epigraph_human_of"];
+    let new: Vec<&String> = all
+        .iter()
+        .filter(|n| !rebodied.contains(&n.as_str()))
+        .collect();
+    assert_eq!(new.len(), 8, "8 new functions: {new:?}");
+    let missing: Vec<&&String> = new
+        .iter()
+        .filter(|n| !backfill.contains(&format!("(\"{n}\", 149)")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "149 definers missing from tenancy_backfill.rs's ownership list at 149: {missing:?}"
+    );
+    for n in rebodied {
+        assert!(
+            backfill.contains(&format!("(\"{n}\", 122)")),
+            "{n} must stay registered at 122"
+        );
+        assert!(
+            undo.contains(&format!("CREATE OR REPLACE FUNCTION public.{n}(")),
+            "149-undo.sql must restore {n}"
+        );
+    }
+    for callable in [
+        "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
+        "public.epigraph_revoke_author_binding_client(uuid, text)",
+        "public.epigraph_allowlisted_operator(uuid)",
+    ] {
+        assert!(
+            backfill.contains(&format!("\"{callable}\",\n            false,")),
+            "{callable} must be on tenancy_backfill.rs's grant register as not app-callable"
+        );
+    }
+    let undropped: Vec<&&String> = new
+        .iter()
+        .filter(|n| !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")))
+        .collect();
+    assert!(
+        undropped.is_empty(),
+        "149-undo.sql does not drop: {undropped:?}"
+    );
+    assert!(
+        undo.contains("DROP TABLE IF EXISTS public.author_binding_clients;"),
+        "149-undo.sql does not drop the registry"
+    );
+}

@@ -1196,7 +1196,12 @@ restart.
   `system_agents` read is SOFT (`to_regclass` in plpgsql), so this file applies
   and reads correctly with or without the system-agent registry, in either
   undo order. Sets `lock_timeout = '3s'`. Behaviour in
-  `epigraph-db/tests/author_binding_allowlist.rs`. Checked before claiming: no
+  `epigraph-db/tests/author_binding_allowlist.rs`; owners and grants pinned by
+  `schema_contract.rs::migration_149_author_binding_allowlist_definers_are_owned_and_granted`,
+  `app_role_table_lockdown.rs` (`CLOSED` and `NO_WRITE`) and
+  `tenancy_backfill.rs` (8 definers at 149, 3 grant entries). Undo:
+  `docs/runbooks/149-undo.sql` (restores 122's two bodies first; records one
+  `platform.author_binding_allowlist_dropped` event). Checked before claiming: no
   open PR branch and no remote branch carries a `149`. **Deploy order:** with
   (or before) the binaries that call its definers or compare its label (the
   operator CLI, the MCP signer gate); an older binary is harmless while the
