@@ -1176,6 +1176,35 @@ restart.
   security. Undo is in the file's header. **Applied to throwaway databases
   only, NOT to any deployed database.**
 
+- **149**: public `author_binding_allowlist` — a third way for a writing agent
+  to be bound (122): the agent of an OAuth client NAMED on the
+  maintenance-only registry `author_binding_clients`, bound to the registered
+  human operator its row names, while every read-time condition holds (row
+  not revoked; client `active`, `service` or `agent`, still on its pinned
+  agent and that agent's only non-revoked client; the agent neither human,
+  linked, an operator of agents nor a registered system agent; the operator a
+  live registered human that is not itself linked). Read only by
+  `epigraph_author_binding` (a third label, `client_allowlist`) and
+  `epigraph_human_of`, both re-bodied (`CREATE OR REPLACE`, same signature,
+  owner and ACL re-asserted); no 122/123 check body changes, and nothing on the
+  token, bearer, viewer or webhook path reads the registry, so the client's
+  agent keeps minting and is never "operated". Written only through two
+  maintenance-only audited definers (`platform.` events); guard triggers hold a
+  direct write to the same rules, the only change is a final revoke, and no
+  session deletes a row. A new operator link of an allowlisted agent is
+  refused while its client is not revoked. No row is seeded. The
+  `system_agents` read is SOFT (`to_regclass` in plpgsql), so this file applies
+  and reads correctly with or without the system-agent registry, in either
+  undo order. Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/author_binding_allowlist.rs`. Checked before claiming: no
+  open PR branch and no remote branch carries a `149`. **Deploy order:** with
+  (or before) the binaries that call its definers or compare its label (the
+  operator CLI, the MCP signer gate); an older binary is harmless while the
+  registry is empty. Rows are added only after the binaries and before the
+  database is armed. Merge after the system-agent registry (148), or sqlx
+  applies a later-merged 148 after 149. **Applied to throwaway databases only,
+  NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
