@@ -30,6 +30,11 @@
 - Closing the authorship gap above.
 - Running items in parallel or batching the INSERTs. Correctness and parity come first. Per-item embedding calls run sequentially, as in MCP batch.
 - Any change to MCP `batch_submit_claims`.
+- Rate-limit amplification and request latency.
+  - The rate limiter (`security/rate_limit.rs`) counts requests, not items, so where it is enabled a batch multiplies one agent's write and embedding throughput by up to 100.
+  - `create_claim_core` awaits the embedding call inline after each commit, so a 100-item public batch makes about 100 sequential provider round-trips, roughly 30–100 s. There is no server-side request timeout.
+  
+  Both are accepted for parity with MCP `batch_submit_claims`. They are named here so a reviewer weighs them rather than discovering them.
 
 ## Global Constraints
 
@@ -40,6 +45,7 @@
   
   `routes/batch.rs` must contain no `state.db_pool` and no `default_decl_for_author`.
 - `create_claim`'s public signature is unchanged. `tests/claim_routes_bind_the_caller.rs` calls it directly as `create_claim(ViewerExtractor(viewer), State(state), Some(Extension(ctx)), Json(req))`.
+- `create_claim_core` opens and commits its own transaction (`state.begin_claim_write`). It must never be called inside an outer transaction, so a failing item, including a migration-122 trigger refusal (`OPL01`/`OPL02` → 403), rolls back only that item.
 - `MAX_BATCH_SIZE` stays 100. The per-item content cap stays 65,536 bytes.
 - Existing response fields `created`, `failed`, `results[].index`, `results[].claim_id` and `results[].error` keep their names and meanings.
 - `cargo check -p epigraph-api --no-default-features --locked` must still compile (CI step "No-db build check").
@@ -53,6 +59,8 @@
 3. **A failing item in the middle:** the items before and after it still persist. Pinned by `persists_each_valid_item_attributed_to_the_caller`, which checks that rows exist for items 0 and 2 (Task 3).
 4. **A legacy client body `{content, truth_value}`:** it keeps working, now attributed to the caller with the caller's key. Pinned by the same test, which asserts `agent_id`, `public_key` and `truth_value` (Task 3).
 5. **An agentless token or a token without `claims:write`:** the whole request is refused before any row is written. Pinned by `missing_scope_is_403_and_writes_nothing` and `agentless_token_is_401_and_writes_nothing` (Task 3).
+6. **Behaviour under an armed operator binding (prod after kernel stage S2-B):** an item naming an author the caller may not write as is refused alone with 403 `OPL0…`, and the items around it persist in the caller's group. This is the only case where a database trigger aborts an item partway through a batch. Pinned by `batch_create_claims_refuses_a_foreign_author_per_item` (Task 3).
+7. **A non-public item (`privacy_tier: "fully_private"`):** it persists with no embedding in either vector column, while a public item in the same batch is embedded. Batch must not become a way to embed sealed content; `sealed_with_embedding > 0` is a page-the-on-call condition. Pinned by `a_private_item_persists_without_an_embedding_while_a_public_one_is_embedded` (Task 3).
 
 ---
 
@@ -64,6 +72,7 @@
 | `crates/epigraph-api/src/routes/batch.rs` | Gate the existing request/item types and handler with `cfg(not(feature = "db"))`. Add the db `BatchClaimRequest`, `batch_item_to_create_request` (with unit tests) and the db `batch_create_claims`. Add `existing`, `was_created` and `status` to the response types. |
 | `crates/epigraph-api/tests/batch_claims_persist.rs` (create) | HTTP tests through `spawn_app`. |
 | `crates/epigraph-api/tests/batch_publish_test.rs` | Drive the new handler signature. Same two assertions (imports work, no event published). |
+| `crates/epigraph-api/tests/claim_routes_bind_the_caller.rs` | One armed-binding test for the batch route, reusing that file's fixtures. |
 | `docs/deploy.md`, `scripts/e2e/README.md`, `CLAUDE.md` | Operator note, remove batch from the "succeeds while writing nothing" list, and add batch to the embed-on-insert write paths. |
 
 ---
@@ -281,6 +290,7 @@ Expected: 6 passed, and the no-db check compiles.
 - Modify: `crates/epigraph-api/src/routes/batch.rs`
 - Create: `crates/epigraph-api/tests/batch_claims_persist.rs`
 - Modify: `crates/epigraph-api/tests/batch_publish_test.rs`
+- Modify: `crates/epigraph-api/tests/claim_routes_bind_the_caller.rs` (append one test)
 
 **Interfaces:**
 - Consumes: `create_claim_core` (Task 1) and `batch_item_to_create_request` (Task 2).
@@ -499,6 +509,53 @@ async fn agentless_token_is_401_and_writes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embedded() {
+    // A live (mock) embedder, so "no embedding" on the private item is a
+    // decision and not an absent embedder: the public item is the control.
+    let db = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new().max_connections(2).connect(&db).await.unwrap();
+    let agent = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app_with_mock_embedding(&db).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client_for_agent(
+        &pool,
+        &["claims:write", "groups:write"],
+        agent,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let group: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/groups"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": uniq("grp"),
+            "group_public_key": hex::encode(blake3::hash(b"batch477").as_bytes())
+        }))
+        .send().await.unwrap().json().await.unwrap();
+    let group_id = group["group_id"].as_str().expect("group created (epoch 0 active)").to_string();
+
+    let public_content = uniq("public");
+    let body: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/claims/batch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"claims": [
+            {"content": public_content},
+            {"content": uniq("private"), "privacy_tier": "fully_private", "group_id": group_id,
+             "encrypted_content": "Y2lwaGVydGV4dA==", "encryption_epoch": 0}
+        ]}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["created"], 2, "{body}");
+    for (i, want_embedded) in [(0usize, true), (1, false)] {
+        let id: Uuid = id_at(&body, i).expect("id").parse().unwrap();
+        let (has_embedding, has_3072): (bool, bool) = sqlx::query_as(
+            "SELECT embedding IS NOT NULL, embedding_3072 IS NOT NULL FROM claims WHERE id = $1",
+        )
+        .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(has_embedding, want_embedded, "slot {i}: {body}");
+        assert!(!has_3072, "slot {i}: create_claim never writes embedding_3072");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn over_max_batch_size_is_400() {
     let f = fixture(&["claims:write"]).await;
     let items: Vec<_> = (0..101).map(|i| serde_json::json!({"content": format!("{} {i}", uniq("big"))})).collect();
@@ -697,20 +754,73 @@ let response = epigraph_api::routes::batch::batch_create_claims(
 
 Make the test's content strings unique per run (append a `Uuid`), because the import now writes real rows. Keep `assert_eq!(response.0.created, 2)`, `failed == 1`, the two-ids check, and `history_size() == 0`. Add: both returned ids name rows in `claims`. Keep `the_event_bus_history_counts_what_is_published` unchanged. Add `mod common;` only if you use its seed helper; otherwise inline the agent INSERT (`INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')`).
 
+- [ ] **Step 6b: Add the armed-binding test.** Append to `crates/epigraph-api/tests/claim_routes_bind_the_caller.rs`. It reuses that file's fixtures: `seed_human_operator`, `install_orphan_policy_and_arm`, `app_role_state`, `token`, `body_text` and `claims_with_content`.
+
+```rust
+/// Issue #477: `POST /api/v1/claims/batch` writes each item through
+/// `create_claim_core` on its own stamped transaction. Under an armed operator
+/// binding, an item naming an author the caller may not write as is refused
+/// ALONE (403 OPL0x); the items around it persist in the caller's group. This is
+/// the one place a trigger refusal lands mid-batch, so it is what proves the
+/// per-item transactions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_create_claims_refuses_a_foreign_author_per_item(pool: PgPool) {
+    let (a, a_group) = seed_human_operator(&pool, "human-a").await;
+    let (b, _) = seed_human_operator(&pool, "human-b").await;
+    install_orphan_policy_and_arm(&pool).await;
+    let state = app_role_state(&pool).await;
+
+    let first = format!("batch by A, first {}", Uuid::new_v4());
+    let foreign = format!("batch by A naming human B {}", Uuid::new_v4());
+    let last = format!("batch by A, last {}", Uuid::new_v4());
+    let viewer = Viewer::resolve(&pool, a).await.expect("viewer");
+    let req: epigraph_api::routes::batch::BatchClaimRequest =
+        serde_json::from_value(serde_json::json!({"claims": [
+            {"content": first, "initial_truth": 0.6},
+            {"content": foreign, "agent_id": b, "initial_truth": 0.6},
+            {"content": last, "initial_truth": 0.6}
+        ]}))
+        .expect("request");
+    let resp = epigraph_api::routes::batch::batch_create_claims(
+        ViewerExtractor(viewer),
+        State(state),
+        Some(Extension(token(a, ClientType::Human))),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_text(resp).await;
+    assert_eq!(status, StatusCode::OK, "a refused item is a partial success: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["created"], 2, "{body}");
+    assert_eq!(v["failed"], 1, "{body}");
+    assert_eq!(v["results"][1]["status"], 403, "{body}");
+    assert!(
+        v["results"][1]["error"].as_str().unwrap_or_default().contains("OPL0"),
+        "the trigger's refusal reaches the slot: {body}"
+    );
+    assert!(claims_with_content(&pool, &foreign).await.is_empty(), "nothing written for slot 1");
+    assert_eq!(claims_with_content(&pool, &first).await, vec![(a, a_group)], "slot 0: A's claim, A's group");
+    assert_eq!(claims_with_content(&pool, &last).await, vec![(a, a_group)], "slot 2 after the refusal");
+}
+```
+
+If `claims_with_content` or `seed_human_operator` has a different shape than this test assumes, read it and adapt the call, not the assertion.
+
 - [ ] **Step 7: Run:**
 
 ```
-cargo test -p epigraph-api --locked --test batch_claims_persist --test batch_publish_test -- --test-threads=1
+cargo test -p epigraph-api --locked --test batch_claims_persist --test batch_publish_test --test claim_routes_bind_the_caller -- --test-threads=1
 cargo test -p epigraph-api --locked --lib item_decoding_tests
 cargo test -p epigraph-db --locked --test no_unscoped_pool --test personal_group_mint_ratchet
 cargo test -p epigraph-api --locked --test public_router_allowlist --test viewer_route_table_lint --test no_bypass_in_handlers --test handler_audit_tests -- --test-threads=1
 cargo check -p epigraph-api --no-default-features --locked
 ```
-Expected: 9 + 2 + 6 tests pass, the ratchets are unchanged, the route lints pass, and the no-db check compiles.
+Expected: 10 batch_claims_persist + 2 batch_publish_test + every claim_routes_bind_the_caller test (the new one included) + 6 unit tests pass, the ratchets are unchanged, the route lints pass, and the no-db check compiles.
 
 - [ ] **Step 8: Mutation checks.** Stage the change with `git add`, mutate, run, then restore with `git checkout -- <path>` and `touch` the file.
   1. In the db `batch_create_claims`, replace the `create_claim_core` call with `Err(ApiError::InternalError { message: "x".into() })`.
-     Expected: every `batch_claims_persist` test except the 401, 403 and 400 ones FAILS.
+     Expected: every `batch_claims_persist` test except the 401, 403 and 400 ones FAILS. `batch_publish_test`'s import test (its "both ids name rows" check) and `batch_create_claims_refuses_a_foreign_author_per_item` also fail.
   2. In `batch_item_to_create_request`, delete the `or_insert_with(...)` line.
      Expected: `persists_each_valid_item_attributed_to_the_caller` FAILS with a missing-field error, and the unit test `a_legacy_item_gets_the_callers_agent_and_its_truth_value` fails.
   3. In the db handler, change `existing += 1` to `created += 1`.
@@ -751,6 +861,16 @@ transaction. Before this change the route returned ids that named no row.
 - The request now needs an authenticated agent with `claims:write`, the same
   as the single route.
 - Still no `ClaimSubmitted` event, the same as `POST /api/v1/claims`.
+- Once operator binding is armed (migration 122), the database checks each
+  item as it checks a single claim. An item naming an author the caller may
+  not write as, and any item from an unbound caller, is refused in its own
+  slot with 403 (`OPL01`/`OPL02`), and the other items are unaffected.
+- Allowlisted service clients writing under an armed binding must send
+  `group_id`. The default owner, the client's own personal group, is not
+  a group its operator writes, so it is refused with `OPL02`. Fleet agents
+  can't call this route over HTTP, because their token mint is refused.
+- A batch embeds its items one after another, so a large public batch can
+  take tens of seconds. The rate limiter counts the request, not its items.
 
 Clients that relied on the old behaviour see real rows, and the response ids
 now name them.
