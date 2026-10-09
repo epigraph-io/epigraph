@@ -1954,27 +1954,25 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
     Ok(tx)
 }
 
+/// The workflow-ingest system agent, for `routes/policies.rs::create_challenge`.
+///
+/// Delegates to [`epigraph_ingest_executor::get_or_create_system_agent`], the
+/// ONE resolver (migration 148: the registered agent, a refusal on an armed
+/// database with no registration, the public-constant key only on an unarmed
+/// unregistered one). A second copy of the key lookup here would keep policy
+/// challenges on the pre-148 rule while workflow ingest moved, and after a key
+/// rotation it would try to re-create the public-constant identity
+/// (`system_agent_single_resolver.rs` pins that this body holds no such copy).
 #[cfg(feature = "db")]
 pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
-    let (_did, pub_key_bytes) =
-        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
-    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+    let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+    epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
-        })?
-    {
-        Ok(a.id.as_uuid())
-    } else {
-        let agent =
-            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
-        let created = epigraph_db::AgentRepository::create(pool, &agent)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })?;
-        Ok(created.id.as_uuid())
-    }
+        })
 }
 
 #[cfg(feature = "db")]
