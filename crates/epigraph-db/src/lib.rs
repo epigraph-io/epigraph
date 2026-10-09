@@ -79,6 +79,7 @@ pub use pool::{
     ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
     MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
+pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};

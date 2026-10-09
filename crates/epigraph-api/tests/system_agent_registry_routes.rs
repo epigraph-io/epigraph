@@ -274,3 +274,206 @@ async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing
     assert_eq!(count(&pool, "claims").await, claims);
     assert_eq!(count(&pool, "agents").await, agents);
 }
+
+// ── Author names and caller-supplied keys never reach a system agent ────────
+
+const RESERVED_AUTHOR: &str = "Workflow-Ingest-System.";
+
+/// A superuser `AppState`: `set_provenance` and `create_agent` run on the raw
+/// pool, and no tenancy question is asked here.
+fn superuser_state(pool: &PgPool) -> AppState {
+    AppState::with_db(pool.clone(), ApiConfig::default())
+}
+
+async fn provenance(
+    state: &AppState,
+    claim: Uuid,
+    authors: serde_json::Value,
+) -> (StatusCode, String) {
+    let req: epigraph_api::routes::provenance::ProvenanceRequest =
+        serde_json::from_value(serde_json::json!({ "authors": authors })).expect("request");
+    let r = epigraph_api::routes::provenance::set_provenance(
+        State(state.clone()),
+        axum::extract::Path(claim),
+        Json(req),
+    )
+    .await;
+    body_text(r.into_response()).await
+}
+
+async fn provenance_edges(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship IN ('ATTRIBUTED_TO', 'AUTHORED') \
+           AND (source_id = $1 OR target_id = $1)",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("provenance edges")
+}
+
+async fn agents_with_key(pool: &PgPool, key: &[u8; 32]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(pool)
+        .await
+        .expect("agents by key")
+}
+
+fn name_key(name: &str) -> [u8; 32] {
+    epigraph_crypto::did_key::did_key_for_author(None, name).1
+}
+
+/// `POST /api/v1/claims/:id/provenance` refuses (400, `field = authors`) a
+/// request naming the system identity, from a PRE-PASS: the handler writes each
+/// author's edges as it goes on the raw pool, so an in-loop refusal would have
+/// committed the authors before it. Run in both states (S holds K; S rotated).
+/// Kills: an in-loop guard (Ada's edges and agent would exist); a guard keyed
+/// on `orcid.is_some()` (the empty-ORCID request would pass); the guard
+/// missing (state (a) adopts S, state (b) mints a K holder or 500s).
+#[sqlx::test(migrations = "../../migrations")]
+async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
+    let s = legacy_system_agent_registered(&pool).await;
+    let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
+    let state = superuser_state(&pool);
+    let ada = serde_json::json!({ "name": "Ada Lovelace", "position": 0 });
+
+    for rotated in [false, true] {
+        if rotated {
+            rotate(&pool, s).await;
+        }
+        let claim = viewer_fixture::seed_public_claim(
+            &pool,
+            owner,
+            &format!("provenance target {rotated} {}", Uuid::new_v4()),
+        )
+        .await;
+
+        let (status, body) = provenance(
+            &state,
+            claim,
+            serde_json::json!([ada, { "name": RESERVED_AUTHOR, "position": 1 }]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "rotated={rotated} (i): {body}"
+        );
+        assert!(body.contains("authors"), "names the field: {body}");
+        assert_eq!(
+            provenance_edges(&pool, claim).await,
+            0,
+            "rotated={rotated}: no partial write"
+        );
+        assert_eq!(
+            agents_with_key(&pool, &name_key("Ada Lovelace")).await,
+            0,
+            "rotated={rotated}: the first author was not created either"
+        );
+
+        let (status, body) = provenance(
+            &state,
+            claim,
+            serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "" }]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "rotated={rotated} (ii) empty ORCID: {body}"
+        );
+
+        let (status, body) = provenance(
+            &state,
+            claim,
+            serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "0000-0002-1825-0097" }]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rotated={rotated} (iii) control: a real ORCID derives from the ORCID: {body}"
+        );
+        if rotated {
+            assert_eq!(k_holders(&pool).await, 0, "no K holder minted");
+        }
+    }
+}
+
+/// An author whose name-derived key is the CURRENT key of the registered agent
+/// (registered under a name-derived key, not the legacy one) is refused too.
+/// Kills: the registered-agent check missing from the pre-pass.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provenance_refuses_an_author_resolving_to_the_registered_agent(pool: PgPool) {
+    let n: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'Some Name') RETURNING id",
+    )
+    .bind(name_key("Some Name").as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("an agent keyed by a name");
+    assert!(register_system_agent(&pool, n).await);
+    let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, owner, "provenance target N").await;
+    let (status, body) = provenance(
+        &superuser_state(&pool),
+        claim,
+        serde_json::json!([{ "name": "Ada Lovelace" }, { "name": "Some Name" }]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(provenance_edges(&pool, claim).await, 0);
+}
+
+/// `POST /api/v1/agents` refuses (400, `field = public_key`) the legacy
+/// public-constant key, with and without a registration, before any insert
+/// and before any OAuth client is provisioned. Without the refusal,
+/// `create_or_get` would mint a K holder (unregistered) or hand back the
+/// system agent itself (registered, a find-hit).
+#[sqlx::test(migrations = "../../migrations")]
+async fn post_agents_refuses_a_reserved_key(pool: PgPool) {
+    let state = superuser_state(&pool);
+    let k_hex = hex::encode(SystemAgentRole::WorkflowIngest.legacy_public_key());
+    let (caller, _) = seed_agent_with_group(&pool, "agents-writer").await;
+    let mut auth = token(caller, ClientType::Service);
+    auth.scopes = vec!["agents:write".to_string()];
+
+    for registered in [false, true] {
+        if registered {
+            legacy_system_agent_registered(&pool).await;
+        }
+        let (agents, clients) = (
+            count(&pool, "agents").await,
+            count(&pool, "oauth_clients").await,
+        );
+        let req: epigraph_api::routes::agents::CreateAgentRequest =
+            serde_json::from_value(serde_json::json!({
+                "public_key": k_hex, "display_name": "workflow-ingest-system"
+            }))
+            .expect("request");
+        let r = epigraph_api::routes::agents::create_agent(
+            State(state.clone()),
+            Some(Extension(auth.clone())),
+            Json(req),
+        )
+        .await;
+        let (status, body) = body_text(r.into_response()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "registered={registered}: {body}"
+        );
+        assert!(body.contains("public_key"), "names the field: {body}");
+        assert_eq!(
+            count(&pool, "agents").await,
+            agents,
+            "registered={registered}"
+        );
+        assert_eq!(
+            count(&pool, "oauth_clients").await,
+            clients,
+            "registered={registered}"
+        );
+    }
+}

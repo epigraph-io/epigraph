@@ -567,3 +567,352 @@ async fn mcp_add_step_after_rotation_mints_nothing(pool: PgPool) {
     assert_eq!(author_of(&pool, &added).await.0, s);
     assert_eq!(k_holders(&pool).await, 0);
 }
+
+// ── 4.4: author-NAME paths never adopt or mint a system agent ──────────────
+//
+// Each runs in two states: (a) S registered while holding the public-constant
+// key K, and (b) after S's key rotation. The reserved author is
+// "Workflow-Ingest-System." (case AND punctuation): a lowercase+trim string
+// guard misses it, but `normalize_author_name` strips the `.`, so it derives K.
+// Kills, per path: the guard missing (state (a) adopts S as an author; state
+// (b) tries to mint a K holder, which the `agents` guard refuses, failing the
+// whole ingest); a weak string compare (the punctuation variant passes); the
+// guard placed after the key lookup (state (a) adopts S).
+
+const RESERVED_AUTHOR: &str = "Workflow-Ingest-System.";
+
+fn name_key(name: &str) -> [u8; 32] {
+    epigraph_crypto::did_key::did_key_for_author(None, name).1
+}
+
+async fn agent_with_key(pool: &PgPool, key: &[u8; 32]) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_optional(pool)
+        .await
+        .expect("agent by key")
+}
+
+/// Edges (any relationship) whose SOURCE is the agent `agent`.
+async fn edges_from(pool: &PgPool, agent: Uuid, relationship: Option<&str>) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'agent' \
+           AND ($2::text IS NULL OR relationship = $2)",
+    )
+    .bind(agent)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("edges from agent")
+}
+
+/// Edges from ANY agent holding K (a re-minted clone included).
+async fn edges_from_k_holders(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges e JOIN agents a ON a.id = e.source_id \
+          WHERE e.source_type = 'agent' AND a.public_key = $1",
+    )
+    .bind(legacy_key().as_slice())
+    .fetch_one(pool)
+    .await
+    .expect("edges from K holders")
+}
+
+fn workflow_extraction(
+    canonical: &str,
+    authors: &[&str],
+) -> epigraph_ingest::workflow::WorkflowExtraction {
+    use epigraph_ingest::common::schema::{AuthorEntry, ThesisDerivation};
+    use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
+    epigraph_ingest::workflow::WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: canonical.to_string(),
+            goal: format!("author guard goal {canonical}"),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: authors
+                .iter()
+                .map(|n| AuthorEntry {
+                    name: (*n).to_string(),
+                    affiliations: vec![],
+                    roles: vec![],
+                })
+                .collect(),
+            expected_outcome: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+        },
+        thesis: Some(format!("author guard thesis {canonical}")),
+        thesis_derivation: ThesisDerivation::TopDown,
+        phases: vec![Phase {
+            title: "Phase".to_string(),
+            summary: format!("author guard phase {canonical}"),
+            steps: vec![Step {
+                compound: format!("author guard step {canonical}"),
+                rationale: "probe".to_string(),
+                operations: vec![format!("author guard op {canonical}")],
+                generality: vec![2],
+                confidence: 0.9,
+                evidence_type: None,
+            }],
+        }],
+        relationships: vec![],
+    }
+}
+
+async fn ingest_workflow_authors(pool: &PgPool, authors: &[&str]) {
+    let extraction = workflow_extraction(&format!("author-guard-{}", Uuid::new_v4()), authors);
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, &plan, &extraction)
+        .await
+        .expect("the workflow ingest succeeds with a reserved author present");
+}
+
+/// A server on the superuser pool built from a ScopedPool (the document walk
+/// needs one; the stamp is inert on a superuser, and no tenancy question is
+/// asked here), as `ingest_document_smoke.rs` builds one.
+async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(pool).await;
+    let signer = epigraph_crypto::AgentSigner::generate();
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+}
+
+fn document(
+    authors: &[&str],
+    source_text: Option<&str>,
+) -> epigraph_ingest::schema::DocumentExtraction {
+    let tag = Uuid::new_v4();
+    serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": format!("Author guard paper {tag}"),
+            "doi": format!("10.1234/author-guard-{tag}"),
+            "source_type": "Paper",
+            "authors": authors.iter().map(|n| serde_json::json!({
+                "name": n, "affiliations": [], "roles": ["author"]
+            })).collect::<Vec<_>>()
+        },
+        "source_text": source_text,
+        "thesis": format!("Author guard thesis {tag}"),
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "Intro",
+            "paragraphs": [{
+                "text": format!("Author guard paragraph {tag}"),
+                "atoms": [format!("Author guard atom {tag}")],
+                "generality": [3],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": []
+    }))
+    .expect("document extraction")
+}
+
+#[derive(Clone, Copy)]
+enum DocPath {
+    Full,
+    Spine,
+}
+
+async fn ingest_document_authors(
+    pool: &PgPool,
+    path: DocPath,
+    authors: &[&str],
+    text: Option<&str>,
+) {
+    let server = superuser_server(pool).await;
+    let viewer = fixture::public_viewer(pool).await;
+    let extraction = document(authors, text);
+    let r = match path {
+        DocPath::Full => {
+            epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
+                .await
+        }
+        DocPath::Spine => {
+            epigraph_mcp::tools::ingestion::do_ingest_document_spine(
+                &server,
+                &viewer,
+                &extraction,
+                None,
+            )
+            .await
+        }
+    };
+    r.map_err(|e| e.message.to_string())
+        .expect("the document ingest succeeds with a reserved author present");
+}
+
+/// The two states: returns S. `rotated` = state (b).
+async fn reserved_state(pool: &PgPool, rotated: bool) -> Uuid {
+    let s = legacy_system_agent_registered(pool).await;
+    if rotated {
+        rotate(pool, s).await;
+    }
+    s
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn workflow_ingest_skips_an_author_naming_the_system_identity(pool: PgPool) {
+    let s = reserved_state(&pool, false).await;
+    for state in ["(a) S holds K", "(b) S rotated"] {
+        if state.starts_with("(b)") {
+            rotate(&pool, s).await;
+        }
+        ingest_workflow_authors(&pool, &["Ada Lovelace", RESERVED_AUTHOR]).await;
+        let ada = agent_with_key(&pool, &name_key("Ada Lovelace"))
+            .await
+            .expect("control: the Ada agent exists");
+        assert!(
+            edges_from(&pool, ada, None).await > 0,
+            "{state}: control edge from Ada"
+        );
+        assert_eq!(
+            edges_from(&pool, s, None).await,
+            0,
+            "{state}: no author edge from S"
+        );
+        assert_eq!(edges_from_k_holders(&pool).await, 0, "{state}");
+        let expected_holders = if state.starts_with("(a)") { 1 } else { 0 };
+        assert_eq!(
+            k_holders(&pool).await,
+            expected_holders,
+            "{state}: K holders"
+        );
+    }
+}
+
+async fn document_skips_reserved(pool: PgPool, path: DocPath) {
+    let s = reserved_state(&pool, false).await;
+    for state in ["(a) S holds K", "(b) S rotated"] {
+        if state.starts_with("(b)") {
+            rotate(&pool, s).await;
+        }
+        let ada_before = match agent_with_key(&pool, &name_key("Ada Lovelace")).await {
+            Some(a) => edges_from(&pool, a, Some("authored")).await,
+            None => 0,
+        };
+        ingest_document_authors(&pool, path, &["Ada Lovelace", RESERVED_AUTHOR], None).await;
+        let ada = agent_with_key(&pool, &name_key("Ada Lovelace"))
+            .await
+            .expect("control: the Ada agent exists");
+        assert_eq!(
+            edges_from(&pool, ada, Some("authored")).await,
+            ada_before + 1,
+            "{state}: control: Ada authored the new paper"
+        );
+        assert_eq!(
+            edges_from(&pool, s, Some("authored")).await,
+            0,
+            "{state}: S authored nothing"
+        );
+        assert_eq!(edges_from_k_holders(&pool).await, 0, "{state}");
+        if state.starts_with("(b)") {
+            assert_eq!(k_holders(&pool).await, 0, "{state}: no K holder minted");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_skips_an_author_naming_the_system_identity(pool: PgPool) {
+    document_skips_reserved(pool, DocPath::Full).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_spine_skips_an_author_naming_the_system_identity(pool: PgPool) {
+    document_skips_reserved(pool, DocPath::Spine).await;
+}
+
+/// The byline fallback (a Paper with `authors: []`) runs the same guard. The
+/// byline parser only emits 2-4 whitespace-separated tokens, and
+/// `normalize_author_name` maps whitespace to `_`, so no byline name can derive
+/// the legacy key; what a byline CAN name is an agent that is REGISTERED under
+/// a name-derived key. So the registered agent here is the one keyed by
+/// "Grace Hopper", and the byline names it beside a control author. Kills: the
+/// registered-agent check missing on the byline path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_byline_fallback_skips_the_system_identity(pool: PgPool) {
+    let n: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'Grace Hopper') RETURNING id",
+    )
+    .bind(name_key("Grace Hopper").as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("an agent keyed by a person's name");
+    assert!(fixture::register_system_agent(&pool, n).await);
+    let text = "Author Guard Byline Paper\n\nAda Lovelace, Grace Hopper\n\nAbstract\nBody.\n";
+    assert_eq!(
+        epigraph_ingest::document::byline::parse_byline_authors(text).len(),
+        2,
+        "CALIBRATION: the byline parses to two authors"
+    );
+    ingest_document_authors(&pool, DocPath::Full, &[], Some(text)).await;
+    let ada = agent_with_key(&pool, &name_key("Ada Lovelace"))
+        .await
+        .expect("control: the byline path ran and created the Ada agent");
+    assert_eq!(edges_from(&pool, ada, Some("authored")).await, 1, "control");
+    assert_eq!(
+        edges_from(&pool, n, Some("authored")).await,
+        0,
+        "N authored nothing"
+    );
+}
+
+/// An author whose name resolves to the REGISTERED agent through a key that is
+/// not the legacy one (an agent registered under a name-derived key) is never
+/// adopted. Kills: the second check (registered-id set) missing, since the
+/// first check (legacy key) passes "Some Name".
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool) {
+    let n: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'Some Name') RETURNING id",
+    )
+    .bind(name_key("Some Name").as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("an agent keyed by a name");
+    assert!(fixture::register_system_agent(&pool, n).await);
+
+    ingest_workflow_authors(&pool, &["Ada Lovelace", "Some Name"]).await;
+    let ada = agent_with_key(&pool, &name_key("Ada Lovelace"))
+        .await
+        .expect("control: the Ada agent exists");
+    assert!(
+        edges_from(&pool, ada, None).await > 0,
+        "workflow: control edge from Ada"
+    );
+    assert_eq!(
+        edges_from(&pool, n, None).await,
+        0,
+        "workflow: no author edge from N"
+    );
+
+    let server = superuser_server(&pool).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let result = epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &document(&["Ada Lovelace", "Some Name"], None),
+        None,
+    )
+    .await
+    .map_err(|e| e.message.to_string())
+    .expect("document ingest");
+    assert_eq!(
+        edges_from(&pool, ada, Some("authored")).await,
+        1,
+        "document: control: Ada authored the paper"
+    );
+    assert_eq!(
+        edges_from(&pool, n, Some("authored")).await,
+        0,
+        "document: N authored nothing"
+    );
+    let body = serde_json::to_string(&result).expect("result json");
+    assert!(
+        !body.contains(&n.to_string()),
+        "N is not among the response's authors: {body}"
+    );
+}
