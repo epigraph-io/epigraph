@@ -61,7 +61,7 @@
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, client_scope, confirmations, custodian, elevation, hide, human,
-    legacy, link, passkey, reown, reown_linked, reverse,
+    legacy, link, passkey, reown, reown_linked, reverse, system_agent,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -287,6 +287,29 @@ enum Command {
         /// Commit. Without it, the call and its audit row roll back.
         #[arg(long)]
         apply: bool,
+    },
+    /// Register the agent that IS a system role (migration 148), e.g. the
+    /// workflow-ingest system agent. IMMUTABLE once applied: no revoke, no
+    /// re-point. Register BEFORE rotating the agent's key and BEFORE arming.
+    RegisterSystemAgent {
+        /// The role (`workflow-ingest`).
+        #[arg(long)]
+        role: String,
+        /// The agent id that is that role's system agent.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on the registry row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+        /// Apply although the agent's current key is NOT the role's legacy
+        /// public-constant key (an agent that never held it). Without it,
+        /// `--apply` refuses such an agent: the registration would protect the
+        /// new key and leave the legacy one free to be re-created.
+        #[arg(long)]
+        key_not_legacy_ok: bool,
     },
     /// Revoke a human operator's registration. Final for that row: every agent
     /// live-linked to the human stops authoring (OPL01).
@@ -587,6 +610,13 @@ async fn main_inner() -> anyhow::Result<i32> {
             anyhow::bail!("--batch-size must be at least 1");
         }
     }
+    // The role vocabulary, before any connection: a typo is refused by this
+    // tool with the valid values, not by the table's CHECK.
+    let system_role = if let Command::RegisterSystemAgent { role, .. } = &cli.command {
+        Some(system_agent::parse_role(role)?)
+    } else {
+        None
+    };
     let db = operator::connect().await?;
     eprintln!(
         "epigraph-operator: connected as {} (member of epigraph_maintenance)",
@@ -902,6 +932,42 @@ async fn main_inner() -> anyhow::Result<i32> {
                     "REGISTERED"
                 } else {
                     "ALREADY-REGISTERED"
+                }
+            );
+            if !apply {
+                println!("DRY RUN: the registration and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::RegisterSystemAgent {
+            role: _,
+            agent,
+            reason,
+            apply,
+            key_not_legacy_ok,
+        } => {
+            let role = system_role.expect("parsed above for this command");
+            let Some(identity) = system_agent::identity(&mut conn, role, agent).await? else {
+                anyhow::bail!("agent {agent} does not exist; nothing was registered");
+            };
+            for line in system_agent::describe_identity(&identity) {
+                println!("{line}");
+            }
+            let outcome = system_agent::register(
+                &mut conn,
+                role,
+                &identity,
+                &reason,
+                apply,
+                key_not_legacy_ok,
+            )
+            .await?;
+            println!(
+                "{}{}\trole={role}\tagent={agent}",
+                if apply { "" } else { "WOULD BE " },
+                match outcome {
+                    system_agent::Outcome::Registered => "REGISTERED",
+                    system_agent::Outcome::AlreadyRegistered => "ALREADY-REGISTERED",
                 }
             );
             if !apply {

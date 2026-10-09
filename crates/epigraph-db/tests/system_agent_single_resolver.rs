@@ -12,8 +12,9 @@
 //!
 //! 1. the quoted literal `"workflow-ingest-system"` appears in non-test source
 //!    under `crates/*/src` ONLY in `epigraph-db/src/repos/system_agent.rs`;
-//! 2. `legacy_public_key(` is called only by that module and the executor's
-//!    one resolver (its unarmed, unregistered fallback);
+//! 2. `legacy_public_key(` is called only by that module, the executor's one
+//!    resolver (its unarmed, unregistered fallback) and the operator CLI's
+//!    identity line;
 //! 3. `epigraph-api`'s `routes/workflows.rs::get_or_create_system_agent` holds
 //!    no `get_by_public_key` and no `did_key_for_author`: it delegates.
 //!
@@ -32,6 +33,7 @@ const LITERAL_HOME: &str = "epigraph-db/src/repos/system_agent.rs";
 
 /// The only callers of `legacy_public_key(`.
 const LEGACY_KEY_CALLERS: &[&str] = &[
+    "epigraph-cli/src/operator/system_agent.rs",
     "epigraph-db/src/repos/system_agent.rs",
     "epigraph-ingest-executor/src/system_agent.rs",
 ];
@@ -166,9 +168,9 @@ fn only_the_resolver_and_its_tools_derive_the_legacy_key() {
     assert_eq!(
         found, want,
         "`legacy_public_key(` is called from an unexpected file. The legacy key is a fallback \
-         of the one resolver on an unarmed, unregistered database and a reserved-author check \
-         (`is_reserved_author_key`); anything else re-derives the system identity from a \
-         public constant."
+         of the one resolver on an unarmed, unregistered database, a reserved-author check \
+         (`is_reserved_author_key`) and the CLI's identity line; anything else re-derives the \
+         system identity from a public constant."
     );
 }
 
