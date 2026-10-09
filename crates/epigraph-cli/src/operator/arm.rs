@@ -4,10 +4,26 @@
 //! Arming is one-way (no disarm function; the maintenance role holds no UPDATE
 //! or DELETE on the arming record), so this command first reports who would be
 //! refused: every agent that authored a claim in the last `--recent-days` days
-//! and is NOT bound (neither a human operator nor the holder of a live link).
-//! Any such agent is a live writer the moment enforcement starts refusing, so
-//! `--apply` REFUSES while the list is non-empty, unless
-//! `--allow-unbound-writers` says the operator has decided those writers stop.
+//! and is NOT bound (a human operator, a live link, or an allowlisted client's
+//! agent, migration 149). Any such agent is a live writer the moment
+//! enforcement starts refusing, so `--apply` REFUSES while the list is
+//! non-empty, unless `--allow-unbound-writers` says the operator has decided
+//! those writers stop.
+//!
+//! A second list covers the allowlist (migration 149): an allowlisted agent is
+//! bound, but only into groups its operator writes, so its recent claims in
+//! any OTHER group (its own personal group, typically) would be refused OPL02
+//! once armed. Those are listed OUT-OF-SCOPE, and `--apply` refuses on them
+//! under the same override. The list is restricted to `client_allowlist`
+//! authors, so with an empty allowlist the report is exactly what it was
+//! before 149.
+//!
+//! LIMIT: `claims` records the AUTHOR and the owner group, not the writing
+//! principal, so the census sees writer scope only where the author was also
+//! the writer. A row authored by an allowlisted agent but written by another
+//! principal can be listed although it was admitted (conservative; the
+//! override exists), and a write BY an allowlisted agent under another author
+//! is invisible to both lists.
 //!
 //! A dry run (the default) prints the report and arms nothing.
 
@@ -22,9 +38,14 @@ pub struct ArmReport {
     pub already: Option<(chrono::DateTime<chrono::Utc>, String)>,
     /// `(agent, claims in the window)` for every unbound recent writer.
     pub unbound_writers: Vec<(Uuid, i64)>,
+    /// `(agent, owner group, claims in the window)` for every allowlisted
+    /// (migration 149) recent author whose claims sit in a group its operator
+    /// does not write.
+    pub out_of_scope_writers: Vec<(Uuid, Option<Uuid>, i64)>,
     /// This run armed the database.
     pub armed_now: bool,
-    /// `--apply` was refused because of `unbound_writers` (nothing armed).
+    /// `--apply` was refused because of `unbound_writers` or
+    /// `out_of_scope_writers` (nothing armed).
     pub refused: bool,
 }
 
@@ -49,6 +70,33 @@ pub async fn unbound_recent_writers(
     .await?)
 }
 
+/// The allowlist census (migration 149): allowlisted agents that authored
+/// claims in the last `days` days in a group their operator does not write,
+/// per group.
+///
+/// # Errors
+/// The read fails (e.g. migration 149 is not applied, which leaves the label
+/// unknown and the list empty, or 122 is not).
+pub async fn out_of_scope_allowlisted_writers(
+    conn: &mut PgConnection,
+    days: i32,
+) -> anyhow::Result<Vec<(Uuid, Option<Uuid>, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT c.agent_id, c.owner_group_id, count(*)::bigint \
+           FROM claims c \
+          WHERE c.created_at > now() - make_interval(days => $1) \
+          GROUP BY c.agent_id, c.owner_group_id \
+         HAVING public.epigraph_author_binding(c.agent_id) = $2 \
+            AND NOT COALESCE(public.epigraph_operator_writes_group( \
+                      public.epigraph_human_of(c.agent_id, false), c.owner_group_id), false) \
+          ORDER BY 3 DESC, 1, 2",
+    )
+    .bind(days)
+    .bind(epigraph_db::CLIENT_ALLOWLIST_BINDING)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
 /// Report, and under `apply` arm. With unbound recent writers and no
 /// `allow_unbound`, `apply` arms nothing and sets [`ArmReport::refused`].
 ///
@@ -68,15 +116,19 @@ pub async fn run(
             .fetch_optional(&mut *conn)
             .await?;
     let unbound_writers = unbound_recent_writers(conn, days).await?;
+    let out_of_scope_writers = out_of_scope_allowlisted_writers(conn, days).await?;
     let mut report = ArmReport {
         already,
         unbound_writers,
+        out_of_scope_writers,
         ..Default::default()
     };
     if !apply || report.already.is_some() {
         return Ok(report);
     }
-    if !report.unbound_writers.is_empty() && !allow_unbound {
+    if (!report.unbound_writers.is_empty() || !report.out_of_scope_writers.is_empty())
+        && !allow_unbound
+    {
         report.refused = true;
         return Ok(report);
     }
@@ -101,14 +153,40 @@ pub fn describe(r: &ArmReport, days: i32, apply: bool) -> Vec<String> {
     for (agent, n) in &r.unbound_writers {
         out.push(format!("UNBOUND\t{agent}\t{n} claim(s)"));
     }
-    if r.refused {
+    // Printed only when non-empty: with an empty allowlist the report is
+    // byte-identical to the one before migration 149.
+    if !r.out_of_scope_writers.is_empty() {
         out.push(format!(
-            "REFUSED\t{} agent(s) above authored claims in the last {days} day(s) and are NOT \
+            "OUT-OF-SCOPE-RECENT-WRITERS\t{}\t(window: {days} day(s))",
+            r.out_of_scope_writers.len()
+        ));
+        for (agent, group, n) in &r.out_of_scope_writers {
+            let group = group.map_or_else(|| "-".to_string(), |g| g.to_string());
+            out.push(format!("OUT-OF-SCOPE\t{agent}\t{group}\t{n} claim(s)"));
+        }
+    }
+    if r.refused && !r.out_of_scope_writers.is_empty() {
+        out.push(format!(
+            "REFUSED-OUT-OF-SCOPE\t{} allowlisted agent/group pair(s) above authored claims in \
+             the last {days} day(s) in a group their operator does not write; arming would \
+             refuse every such write (OPL02). Write into a group the operator writes, revoke the \
+             allowance (epigraph-operator revoke-author-binding-client), or pass \
+             --allow-unbound-writers if stopping them is the decision. Nothing was armed.",
+            r.out_of_scope_writers.len()
+        ));
+    }
+    if r.refused {
+        // Today's line, unchanged, and only for the unbound list; a refusal on
+        // the out-of-scope list alone has its own line above.
+        if !r.unbound_writers.is_empty() {
+            out.push(format!(
+                "REFUSED\t{} agent(s) above authored claims in the last {days} day(s) and are NOT \
              bound to a human operator; arming would refuse every one of their writes from now \
              on. Link them (epigraph-operator link), or pass --allow-unbound-writers if stopping \
              them is the decision. Nothing was armed.",
-            r.unbound_writers.len()
-        ));
+                r.unbound_writers.len()
+            ));
+        }
     } else if r.armed_now {
         out.push("ARMED\toperator binding is now enforced on this database".to_string());
     } else if !apply && r.already.is_none() {

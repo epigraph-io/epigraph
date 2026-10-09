@@ -60,8 +60,8 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, client_scope, confirmations, custodian, elevation, hide, human,
-    legacy, link, passkey, reown, reown_linked, reverse,
+    self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
+    elevation, hide, human, legacy, link, passkey, reown, reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -294,6 +294,43 @@ enum Command {
         /// The human's agent id.
         #[arg(long)]
         agent: Uuid,
+        /// Recorded on the row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Allow ONE service or agent OAuth client's agent to write as a bound
+    /// agent of a registered human operator (migration 149's author-binding
+    /// allowlist), without linking it: the client keeps its HTTP token. The
+    /// client must be active, have minted at least once, and be its agent's
+    /// only non-revoked client. Exits 3 when the allowance is recorded but
+    /// does not bind (ALLOWED-BUT-INEFFECTIVE).
+    AllowAuthorBindingClient {
+        /// The OAuth client (`oauth_clients.id`, a `service` or `agent` client).
+        #[arg(long)]
+        client: Uuid,
+        /// The registered human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Recorded on the registry row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Also revoke every writer/admin row the client's agent holds in a
+        /// group its operator does not write (listed as FOREIGN-WRITE either way).
+        #[arg(long)]
+        revoke_foreign_writes: bool,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Revoke a client's author-binding allowance. Final for that client:
+    /// mint a new client to allow again.
+    RevokeAuthorBindingClient {
+        /// The OAuth client (`oauth_clients.id`).
+        #[arg(long)]
+        client: Uuid,
         /// Recorded on the row and in the audit row.
         #[arg(long)]
         reason: String,
@@ -919,6 +956,40 @@ async fn main_inner() -> anyhow::Result<i32> {
                 "{}{}\tagent={agent}",
                 if apply { "" } else { "WOULD BE " },
                 if now { "REVOKED" } else { "NOT-REGISTERED" }
+            );
+            if !apply {
+                println!("DRY RUN: the revocation and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::AllowAuthorBindingClient {
+            client,
+            operator: op,
+            reason,
+            revoke_foreign_writes,
+            apply,
+        } => {
+            let outcome =
+                binding_client::allow(&mut conn, client, op, &reason, revoke_foreign_writes, apply)
+                    .await?;
+            for line in binding_client::describe(&outcome, apply) {
+                println!("{line}");
+            }
+            if !apply {
+                println!("DRY RUN: the allowance and its audit row were rolled back.");
+            }
+            Ok(if outcome.effective() { 0 } else { 3 })
+        }
+        Command::RevokeAuthorBindingClient {
+            client,
+            reason,
+            apply,
+        } => {
+            let now = binding_client::revoke(&mut conn, client, &reason, apply).await?;
+            println!(
+                "{}{}\tclient={client}",
+                if apply { "" } else { "WOULD BE " },
+                if now { "REVOKED" } else { "NOT-ALLOWED" }
             );
             if !apply {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");

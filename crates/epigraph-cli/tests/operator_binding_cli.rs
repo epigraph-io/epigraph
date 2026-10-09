@@ -1131,3 +1131,407 @@ async fn link_records_the_llm_provenance_of_a_row_the_process_created(pool: PgPo
     assert_eq!(src.as_deref(), Some("mcp-llm-agent"));
     assert_eq!(link_row(&pool, agent).await, Some((human, false)));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// allow-author-binding-client / revoke-author-binding-client (migration 149)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An OAuth client of `client_type` for `agent`, ACTIVE; returns its
+/// `oauth_clients.id`. A service client carries the legal fields its CHECK
+/// requires; an agent client is owned by a fresh human client.
+async fn client_for(pool: &PgPool, agent: Uuid, client_type: &str) -> Uuid {
+    let owner: Option<Uuid> = if client_type == "agent" {
+        Some(
+            sqlx::query_scalar(
+                "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                            status) \
+                 VALUES ($1, 'owner', 'human', ARRAY['claims:read'], 'active') RETURNING id",
+            )
+            .bind(format!("owner-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("owner client"),
+        )
+    } else {
+        None
+    };
+    sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, status, \
+                                    agent_id, owner_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'allowlist cli client', $2, ARRAY['claims:write'], 'active', $3, $4, \
+                 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("allowlist-cli-{}", Uuid::new_v4()))
+    .bind(client_type)
+    .bind(agent)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("client")
+}
+
+/// `(live rows, allowed events)` for `client`.
+async fn allowance_state(pool: &PgPool, client: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM author_binding_clients \
+                  WHERE client_id = $1 AND revoked_at IS NULL), \
+                (SELECT count(*) FROM security_events \
+                  WHERE event_type = 'platform.author_binding_client_allowed' \
+                    AND details->>'client_id' = $1::text)",
+    )
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("allowance state")
+}
+
+/// The allow command: a dry run writes nothing; `--apply` records one row and
+/// one audit event and prints the client, the pinned agent, the operator and
+/// the binding the agent now has; the writer rows the agent holds in groups
+/// its operator does not write are listed, and revoked on request in the same
+/// transaction; a re-run on a dead allowance (client suspended) says
+/// ALLOWED-BUT-INEFFECTIVE and exits non-zero; an agent-type client is warned
+/// about its private key; a human-type client is refused with nothing
+/// written; the revoke is a dry run first, then final.
+///
+/// Verified to fail: the dry run committing (rows after the dry run); the
+/// effective-binding check removed from the binary (the suspended re-run
+/// exits 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "other-human").await;
+    make_human(&pool, other).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    // S holds a writer row in another human's group.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(other_group)
+    .bind(s)
+    .execute(&pool)
+    .await
+    .expect("foreign writer row");
+    let (client_s, human_s) = (client.to_string(), human.to_string());
+    let args = [
+        "allow-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--operator",
+        human_s.as_str(),
+        "--reason",
+        "the host writes for this human",
+    ];
+
+    let dry = run_op(&pool, &args).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("WOULD BE ALLOWED\t"), "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!("group={other_group}")),
+        "the foreign writer row is listed: {}",
+        dry.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client).await,
+        (0, 0),
+        "a dry run writes nothing"
+    );
+
+    let mut apply = args.to_vec();
+    apply.push("--apply");
+    let applied = run_op(&pool, &apply).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    for fragment in [
+        "ALLOWED\t".to_string(),
+        format!("client={client}"),
+        "type=service".to_string(),
+        format!("agent={s}"),
+        format!("operator={human}"),
+        "binding=client_allowlist".to_string(),
+        format!("FOREIGN-WRITE\tagent={s}\tgroup={other_group}"),
+    ] {
+        assert!(
+            applied.stdout.contains(&fragment),
+            "{fragment}: {}",
+            applied.show()
+        );
+    }
+    assert!(!applied.stdout.contains("WOULD BE"), "{}", applied.show());
+    assert!(
+        !applied.stdout.contains("WARNING"),
+        "a service client: {}",
+        applied.show()
+    );
+    assert_eq!(allowance_state(&pool, client).await, (1, 1));
+
+    // On request, the foreign writer row is revoked (same transaction).
+    let mut revoke_foreign = apply.clone();
+    revoke_foreign.push("--revoke-foreign-writes");
+    let rf = run_op(&pool, &revoke_foreign).await;
+    assert_eq!(rf.code, 0, "{}", rf.show());
+    assert!(rf.stdout.contains("ALREADY-ALLOWED\t"), "{}", rf.show());
+    let live_foreign: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(other_group)
+    .bind(s)
+    .fetch_one(&pool)
+    .await
+    .expect("foreign rows");
+    assert_eq!(live_foreign, 0, "{}", rf.show());
+    assert_eq!(
+        allowance_state(&pool, client).await,
+        (1, 1),
+        "no second allowance"
+    );
+
+    // A dead allowance is not reported as fine.
+    let (s2, _) = fixture::seed_agent_with_group(&pool, "service-2").await;
+    let client2 = client_for(&pool, s2, "service").await;
+    let client2_s = client2.to_string();
+    let args2 = [
+        "allow-author-binding-client",
+        "--client",
+        client2_s.as_str(),
+        "--operator",
+        human_s.as_str(),
+        "--reason",
+        "second",
+        "--apply",
+    ];
+    assert_eq!(run_op(&pool, &args2).await.code, 0);
+    sqlx::query("UPDATE oauth_clients SET status = 'suspended' WHERE id = $1")
+        .bind(client2)
+        .execute(&pool)
+        .await
+        .expect("suspend");
+    let dead = run_op(&pool, &args2).await;
+    assert_ne!(dead.code, 0, "{}", dead.show());
+    assert!(
+        dead.stdout.contains("ALLOWED-BUT-INEFFECTIVE\t") && dead.stdout.contains("binding=-"),
+        "{}",
+        dead.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client2).await,
+        (1, 1),
+        "nothing new written"
+    );
+
+    // An agent-type client: the private-key warning.
+    let (a, _) = fixture::seed_agent_with_group(&pool, "agent-typed").await;
+    let agent_client = client_for(&pool, a, "agent").await;
+    let agent_client_s = agent_client.to_string();
+    let warned = run_op(
+        &pool,
+        &[
+            "allow-author-binding-client",
+            "--client",
+            agent_client_s.as_str(),
+            "--operator",
+            human_s.as_str(),
+            "--reason",
+            "x",
+        ],
+    )
+    .await;
+    assert_eq!(warned.code, 0, "{}", warned.show());
+    assert!(
+        warned.stdout.contains("WARNING") && warned.stdout.contains("private key"),
+        "{}",
+        warned.show()
+    );
+
+    // A human-type client: refused, nothing written.
+    let (h2, _) = fixture::seed_agent_with_group(&pool, "human-typed").await;
+    let human_client = client_for(&pool, h2, "human").await;
+    let human_client_s = human_client.to_string();
+    let refused = run_op(
+        &pool,
+        &[
+            "allow-author-binding-client",
+            "--client",
+            human_client_s.as_str(),
+            "--operator",
+            human_s.as_str(),
+            "--reason",
+            "x",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(refused.code, 0, "{}", refused.show());
+    assert_eq!(allowance_state(&pool, human_client).await, (0, 0));
+
+    // Revoke: dry run, then final.
+    let revoke = [
+        "revoke-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--reason",
+        "incident",
+    ];
+    let dry_revoke = run_op(&pool, &revoke).await;
+    assert_eq!(dry_revoke.code, 0, "{}", dry_revoke.show());
+    assert!(
+        dry_revoke.stdout.contains("WOULD BE REVOKED"),
+        "{}",
+        dry_revoke.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client).await.0,
+        1,
+        "a dry revoke changes nothing"
+    );
+    let mut revoke_apply = revoke.to_vec();
+    revoke_apply.push("--apply");
+    let revoked = run_op(&pool, &revoke_apply).await;
+    assert_eq!(revoked.code, 0, "{}", revoked.show());
+    assert!(
+        revoked.stdout.contains("REVOKED\t") && !revoked.stdout.contains("WOULD BE"),
+        "{}",
+        revoked.show()
+    );
+    assert_eq!(allowance_state(&pool, client).await.0, 0);
+    let binding: Option<String> = sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("binding");
+    assert_eq!(binding, None, "the revoke unbinds");
+}
+
+/// Allow `client` for `operator` on the harness (superuser) pool through the
+/// maintenance definer.
+async fn allow_direct(pool: &PgPool, client: Uuid, operator: Uuid) {
+    sqlx::query("SELECT * FROM public.epigraph_allow_author_binding_client($1, $2, 'test')")
+        .bind(client)
+        .bind(operator)
+        .execute(pool)
+        .await
+        .expect("allow");
+}
+
+/// The arm census sees an allowlisted AUTHOR whose recent claims sit in a
+/// group its operator does not write: before the allowance it is UNBOUND;
+/// after it, it is not UNBOUND but OUT-OF-SCOPE, and `--apply` refuses
+/// (REFUSED-OUT-OF-SCOPE, nothing armed) unless `--allow-unbound-writers`.
+///
+/// Verified to fail: the out-of-scope list not read by the `--apply` gate
+/// (the plain `--apply` arms).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_lists_an_allowlisted_author_outside_its_operators_groups(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    insert_claim(&pool, s, s_group).await.expect("S as itself");
+
+    let before = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        before.stdout.contains(&format!("UNBOUND\t{s}\t1 claim(s)")),
+        "CALIBRATION: {}",
+        before.show()
+    );
+    allow_direct(&pool, client, human).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&format!("UNBOUND\t{s}")),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout
+            .contains(&format!("OUT-OF-SCOPE\t{s}\t{s_group}\t1 claim(s)")),
+        "{}",
+        dry.show()
+    );
+    let refused = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stdout.contains("REFUSED-OUT-OF-SCOPE"),
+        "{}",
+        refused.show()
+    );
+    assert!(!armed(&pool).await, "a refused --apply must not arm");
+    let forced = run_op(
+        &pool,
+        &["arm-operator-binding", "--apply", "--allow-unbound-writers"],
+    )
+    .await;
+    assert_eq!(forced.code, 0, "{}", forced.show());
+    assert!(armed(&pool).await);
+}
+
+/// An allowlisted author whose recent claims all sit in its operator's group
+/// is in neither list, and `--apply` arms without an override.
+///
+/// Verified to fail: the census rewritten to read links only (S listed
+/// UNBOUND, `--apply` refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_passes_an_allowlisted_author_inside_its_operators_groups(pool: PgPool) {
+    let (human, human_group) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    insert_claim(&pool, s, human_group)
+        .await
+        .expect("S in its operator's group");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(!dry.stdout.contains(&s.to_string()), "{}", dry.show());
+    assert!(!dry.stdout.contains("OUT-OF-SCOPE"), "{}", dry.show());
+    let applied = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(armed(&pool).await, "{}", applied.show());
+}
+
+/// With an EMPTY allowlist the census output gains nothing: a live-linked
+/// agent whose recent claims sit outside its operator's groups is not listed
+/// OUT-OF-SCOPE (that gap predates the allowlist and is left alone), and the
+/// refusal is today's REFUSED line only.
+///
+/// Verified to fail: the out-of-scope list widened past the
+/// `client_allowlist` label (L is listed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_output_is_unchanged_with_an_empty_allowlist(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (l, l_group) = fixture::seed_agent_with_group(&pool, "linked").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    let (_, foreign_group) = fixture::seed_agent_with_group(&pool, "foreign").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, l, human)
+            .await
+            .expect("l -> human");
+    }
+    let _ = l_group;
+    insert_claim(&pool, l, foreign_group)
+        .await
+        .expect("L outside its operator's groups");
+    insert_claim(&pool, u, u_group).await.expect("U");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        dry.stdout.contains(&format!("UNBOUND\t{u}\t1 claim(s)")),
+        "CALIBRATION: {}",
+        dry.show()
+    );
+    assert!(!dry.stdout.contains("OUT-OF-SCOPE"), "{}", dry.show());
+    let refused = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(refused.stdout.contains("REFUSED\t"), "{}", refused.show());
+    assert!(
+        !refused.stdout.contains("REFUSED-OUT-OF-SCOPE"),
+        "{}",
+        refused.show()
+    );
+}
