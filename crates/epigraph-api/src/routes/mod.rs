@@ -56,6 +56,7 @@ pub mod events;
 pub mod experiment_loop;
 #[cfg(feature = "db")]
 pub mod experiments;
+pub mod extensions;
 #[cfg(feature = "db")]
 pub mod gaps;
 #[cfg(feature = "db")]
@@ -300,6 +301,23 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
 /// rate limiter is configured in `AppState`.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Vec::new())
+}
+
+/// [`create_router`] with embedder routes nested inside the authenticated
+/// router, at `/api/v1/ext/<name>` each. They are mounted before the
+/// authenticated router's layers, so they inherit bearer authentication, the
+/// per-access recorder, the body limit and the rate limiter. They do not
+/// inherit scope checks or tenancy; see [`extensions`] for that contract.
+/// Passing no extensions is exactly [`create_router`].
+///
+/// # Panics
+/// When two extensions share a name.
+#[cfg(feature = "db")]
+pub fn create_router_with_extensions(
+    state: AppState,
+    extensions: Vec<extensions::RouterExtension>,
+) -> Router {
     // Write operations. Read operations are appended below by the PR-03
     // inversion; the two halves are separate only because of the order the
     // chain was written in, not because they differ in authority.
@@ -1009,7 +1027,10 @@ pub fn create_router(state: AppState) -> Router {
     // the response is withheld; `ViewerExtractor` refuses an elevated viewer to
     // a request this layer does not wrap. A token without an elevation claim
     // passes straight through.
-    let protected = protected
+    // Embedder extensions (`extensions::mount_all`) are nested HERE, before
+    // either layer: `route_layer` and `layer` wrap only routes that already
+    // exist, so a mount below them would be unauthenticated.
+    let protected = extensions::mount_all(protected, extensions, &state)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::elevated_access::record_elevated_access,
@@ -1175,6 +1196,23 @@ pub fn create_router(state: AppState) -> Router {
 /// rate limiter is configured in `AppState`.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Vec::new())
+}
+
+/// [`create_router`] with embedder routes nested inside the authenticated
+/// router, at `/api/v1/ext/<name>` each. They are mounted before the
+/// authenticated router's layers, so they inherit bearer authentication, the
+/// body limit and the rate limiter. They do not inherit scope checks or
+/// tenancy; see [`extensions`] for that contract. Passing no extensions is
+/// exactly [`create_router`].
+///
+/// # Panics
+/// When two extensions share a name.
+#[cfg(not(feature = "db"))]
+pub fn create_router_with_extensions(
+    state: AppState,
+    extensions: Vec<extensions::RouterExtension>,
+) -> Router {
     // Protected write operations
     let protected = Router::new()
         // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
@@ -1556,10 +1594,12 @@ pub fn create_router(state: AppState) -> Router {
     // been deleted. `require_packet_signatures` survives under its new name and
     // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
     // a different mechanism at a different layer.
-    let protected = protected.layer(middleware::from_fn_with_state(
-        state.clone(),
-        bearer_auth_middleware,
-    ));
+    // Embedder extensions (`extensions::mount_all`) are nested HERE, before
+    // the bearer layer: `layer` wraps only routes that already exist, so a
+    // mount below it would be unauthenticated.
+    let protected = extensions::mount_all(protected, extensions, &state).layer(
+        middleware::from_fn_with_state(state.clone(), bearer_auth_middleware),
+    );
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
