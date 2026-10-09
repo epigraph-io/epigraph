@@ -512,7 +512,11 @@ If a column type differs from the tuple a test reads (for example `truth_value` 
 - [ ] **Step 2: Run:** `cargo test -p epigraph-api --locked --test batch_claims_persist -- --test-threads=1`
 Expected: FAIL. Every test either sees ids that name no row (today's handler writes only the in-memory store) or misses the `existing`, `status` and `was_created` fields.
 
-- [ ] **Step 3: Gate the in-memory path on not(db).** In `batch.rs`, add `#[cfg(not(feature = "db"))]` to the existing `BatchClaimRequest`, `BatchClaimItem`, `batch_create_claims` and `validate_batch_item` items, plus any import only they use. Leave their bodies and the existing not(db) test module untouched, except for the struct-literal updates in Step 4.
+- [ ] **Step 3: Gate the in-memory path on not(db).** In `batch.rs`, add `#[cfg(not(feature = "db"))]` to the existing `BatchClaimRequest`, `BatchClaimItem`, `batch_create_claims` and `validate_batch_item` items, and to what only they use in a db build. Otherwise `clippy -D warnings` fails on dead code in the db build:
+  - `const DEFAULT_TRUTH_VALUE`;
+  - `use epigraph_core::{AgentId, Claim, TruthValue};`.
+
+  `MAX_BATCH_SIZE` and `MAX_CLAIM_CONTENT_LENGTH` stay un-gated, because both handlers use them. Before gating, confirm nothing else uses these items in a db build: `git grep -n -E 'BatchClaimItem|validate_batch_item|routes::batch::' -- crates`. The only expected hits are `batch.rs` itself, `routes/mod.rs` (route registration), `routes/negative_tests.rs` (a not(db) test module) and `tests/batch_publish_test.rs` (rewritten in Step 6). Leave their bodies and the existing not(db) test module untouched, except for the struct-literal updates in Step 4.
 
 - [ ] **Step 4: Extend the response types (both builds):**
 
@@ -762,4 +766,20 @@ Every remaining hit must describe the new behaviour or be explicitly historical,
 
 ## Related backlog
 
-The results of the EpiGraph backlog sweep are listed in this section. Retire items only after the PR merges, with `resolve_backlog_item`, and only with the operator's go-ahead.
+An exhaustive sweep of the EpiGraph `backlog` label found **no backlog claim about the REST batch route**. That covered 986 claims, current and retired. It searched for the route path, the handler and type names, `claim_store`, the synthetic agent, and the issue number. The route's defects are tracked only in this repository and on GitHub:
+
+- **GitHub:** issue #477, and its follow-up comment that the route persists nothing.
+- **Repo tracking:**
+  - `docs/tenancy/progress.json` finding `F-PR10-unknown-claim-id-delivers`: the publish half is closed; "make it persist" is deferred, and this plan does it.
+  - `docs/deploy.md` §1d: the publish removal.
+  - `scripts/e2e/README.md` item 6: batch is listed as a "succeeds while writing nothing" shape. Task 4 removes it.
+
+Adjacent EpiGraph backlog, about the MCP tool `batch_submit_claims` rather than the REST route:
+
+| Claim | State | Relation to this plan |
+|---|---|---|
+| `73657204` — `batch_submit_claims` lacks `submit_claim`'s fields (G15) | open, not labelled resolved | Fixed by PR #513 (merged 2026-09-26, "batch_submit_claims parity (Batch G-b)"). The backlog item was never retired; retire it with `resolve_backlog_item`, citing #513. |
+| `f6c1a668` — after G15 deploys, update stored workflows that say "submit in parallel with submit_claim" | open, `blocked-on:73657204` | Unblocked once #513 is in production. Independent of this plan. |
+| `32c62901`, `daf7db58` — `batch_submit_claims` "unknown methodology" | resolved | None. |
+
+Retire or file EpiGraph backlog items only with the operator's go-ahead, and retire items this plan closes only after its PR merges.
