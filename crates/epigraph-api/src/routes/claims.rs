@@ -3328,4 +3328,101 @@ mod db_tests {
         .unwrap();
         assert_eq!(count, 0, "no provenance row committed");
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // TEST 13: create_claim_core's own scope check, called directly
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Pins the scope check at the TOP of `create_claim_core`, independent of
+    /// the `create_claim` HTTP handler that wraps it.
+    ///
+    /// `tests/create_claim_missing_scope_403.rs` proves the same refusal over
+    /// HTTP, but that alone cannot distinguish "the check lives in
+    /// `create_claim_core`" from "the check moved into the `create_claim`
+    /// handler" — every HTTP request still goes through the handler either
+    /// way. This test calls `create_claim_core` directly, bypassing
+    /// `create_claim` entirely, so it fails if the check is hoisted out of
+    /// the core and left only in the handler (every other caller of the core,
+    /// including a future batch-item path, would then write unchecked).
+    #[tokio::test]
+    async fn test_create_claim_core_missing_scope_403() {
+        let pool = test_pool_or_skip!();
+        let client_id = Uuid::new_v4();
+
+        // No `oauth_clients` row and no `AgentRepository::ensure_for_client`
+        // call needed: `create_claim_core`'s scope check is the FIRST
+        // statement in the function body, before any FK-checked write or
+        // agent/personal-group provisioning, so this principal never needs
+        // to exist as a real agent for the refusal to be observable. Using
+        // `ensure_for_client` here would also add an unregistered call site
+        // to `crates/epigraph-db/tests/personal_group_mint_ratchet.rs`'s
+        // scan (it can mint a personal group), which the task's global
+        // constraints require to stay unchanged.
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, client_id)
+            .await
+            .expect("resolve viewer");
+
+        // Auth is present but lacks claims:write, exactly like
+        // `test_patch_missing_scope_403` above.
+        let auth = AuthContext {
+            client_id,
+            agent_id: Some(client_id),
+            owner_id: Some(client_id),
+            client_type: ClientType::Service,
+            scopes: vec!["claims:read".to_string()],
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        };
+
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        );
+
+        let content = format!("create_claim_core direct scope probe {}", Uuid::new_v4());
+        let request = CreateClaimRequest {
+            content: content.clone(),
+            agent_id: client_id,
+            trace_id: None,
+            initial_truth: None,
+            content_hash: None,
+            properties: None,
+            evidence_id: None,
+            privacy_tier: None,
+            group_id: None,
+            encrypted_content: None,
+            encryption_epoch: None,
+            labels: vec![],
+            if_not_exists: false,
+        };
+
+        let result = create_claim_core(&state, &viewer, Some(&auth), request).await;
+        match result {
+            Err(ApiError::Forbidden { reason }) => {
+                assert!(
+                    reason.contains("claims:write"),
+                    "the refusal must name the missing scope: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Err(ApiError::Forbidden {{ .. }}) naming claims:write, got {other:?}"
+            ),
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no row may land when create_claim_core's own scope check refuses the call"
+        );
+    }
 }
