@@ -17,7 +17,8 @@
 //! * the caller's `AuthContext` in the request extensions;
 //! * (db builds) the per-access recorder: a token carrying an elevation claim
 //!   may not write through an extension (`ELEVATED READ-ONLY`), and its reads
-//!   are recorded;
+//!   are recorded, under the raw request path rather than a route template
+//!   (`mount_all`'s doc says why);
 //! * the request body limit (`ApiConfig::max_request_size`) and the rate
 //!   limiter.
 //!
@@ -148,6 +149,18 @@ fn assert_unique_names(extensions: &[RouterExtension]) {
 /// per-access recorder) does not wrap. `nest_service` registers the prefix
 /// and everything under it as ordinary routes, so the extension's fallback
 /// runs inside both layers too.
+///
+/// The cost is in the audit record. Below the mount path, a request matches
+/// the wildcard route `nest_service` registers, for which axum 0.7.9 inserts
+/// `MatchedNestedPath`, not `MatchedPath`, so `record_elevated_access` finds
+/// no route template and falls back to the raw request path (at the mount
+/// path itself the template is that path, which comes to the same thing).
+/// An elevated access through an extension is therefore
+/// recorded with the surface `<METHOD> <request path>`: the concrete path,
+/// ids included, not a template such as `GET /api/v1/claims/:id` (the query
+/// string goes in the args, not the surface). Such surfaces do not group by
+/// route and have unbounded cardinality; an auditor groups extension accesses
+/// by the mount prefix instead.
 ///
 /// # Panics
 /// When two extensions share a name.
