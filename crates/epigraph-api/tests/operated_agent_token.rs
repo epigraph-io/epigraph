@@ -669,3 +669,260 @@ async fn an_operated_agent_cannot_mint_through_an_external_provider(pool: PgPool
         "the refusal must say why and name the operator: {body}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Migration 149: the author-binding allowlist binds an OAuth client's agent to
+// a human WITHOUT making it operated. Every mint arm keys on the link record
+// alone, so an allowlisted client keeps minting and keeps its viewer, and an
+// operated agent is still refused whether or not it is allowlisted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `service` OAuth client with a known secret, active, `agent_id` NULL until
+/// its first mint (`identity_provisioning.rs`'s fixture). Returns
+/// `(row id, client_id, secret)`.
+async fn service_client(pool: &PgPool, name: &str) -> (Uuid, String, String) {
+    let secret_bytes: [u8; 32] = *blake3::hash(name.as_bytes()).as_bytes();
+    let secret = hex::encode(secret_bytes);
+    let hash = blake3::hash(&secret_bytes);
+    let client_id = format!("epigraph_{}", hex::encode(&secret_bytes[..16]));
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, client_type, \
+                                    allowed_scopes, granted_scopes, status, agent_id, \
+                                    legal_entity_name, legal_contact_email) \
+         VALUES ($1, $2, $3, 'service', $4, $4, 'active', NULL, $3, 'ops@example.test') \
+         RETURNING id",
+    )
+    .bind(&client_id)
+    .bind(hash.as_bytes().as_slice())
+    .bind(name)
+    .bind(vec!["claims:read".to_string()])
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    (row, client_id, secret)
+}
+
+async fn secret_grant(pool: &PgPool, client_id: &str, secret: &str) -> (StatusCode, Value) {
+    post_token(
+        AppState::with_db(pool.clone(), config()),
+        json!({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": secret,
+        }),
+    )
+    .await
+}
+
+/// The `oauth_clients.id` of the client whose `client_id` is `client_id`.
+async fn client_row(pool: &PgPool, client_id: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM oauth_clients WHERE client_id = $1")
+        .bind(client_id)
+        .fetch_one(pool)
+        .await
+        .expect("client row")
+}
+
+/// The maintenance role allows `client` (row id) for `operator`.
+async fn allow(pool: &PgPool, client: Uuid, operator: Uuid) {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_allow_author_binding_client($1, $2, 'test')")
+            .bind(client)
+            .bind(operator)
+            .execute(&mut *conn)
+            .await
+            .expect("allow");
+        (conn, ())
+    })
+    .await;
+}
+
+async fn binding_of(pool: &PgPool, agent: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("binding")
+}
+
+async fn agent_of_client(pool: &PgPool, client: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client)
+        .fetch_one(pool)
+        .await
+        .expect("client agent")
+}
+
+/// `GET /api/v1/evidence` with `access`: `(status, body)`. Passing the viewer
+/// extractor shows as the handler's own "scoped connection" 500 on this
+/// harness (see `a_token_minted_before_the_link_is_refused_by_the_viewer`).
+async fn evidence_read(pool: &PgPool, access: &str) -> (StatusCode, String) {
+    let resp = create_router(AppState::with_db(pool.clone(), config()))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/evidence")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn access_of(what: &str, status: StatusCode, body: &Value) -> String {
+    assert_eq!(status, StatusCode::OK, "{what}: the grant mints: {body}");
+    body["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{what}: an access token: {body}"))
+        .to_string()
+}
+
+fn assert_viewer(what: &str, (status, body): (StatusCode, String)) {
+    assert!(
+        status != StatusCode::FORBIDDEN
+            && status != StatusCode::UNAUTHORIZED
+            && body.contains("scoped connection"),
+        "{what}: the token must pass the viewer extractor: {status} {body}"
+    );
+}
+
+/// An allowlisted client keeps minting on every grant arm (an agent client's
+/// Ed25519 assertion, a service client's secret, and the refresh grant) and
+/// its token keeps a viewer: the allowlist binds the agent, it does not make
+/// it operated.
+///
+/// Verified to fail: `refuse_operated_agent` (or the bearer) keyed on
+/// `epigraph_author_binding IS NOT NULL` -> 403 on every arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowlisted_client_still_mints_and_keeps_its_viewer(pool: PgPool) {
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
+
+    // (a) agent client, Ed25519 assertion.
+    let key = SigningKey::from_bytes(&[0x51; 32]);
+    let (agent, client_id) = agent_with_active_client(&pool, &key).await;
+    allow(&pool, client_row(&pool, &client_id).await, operator).await;
+    assert_eq!(
+        binding_of(&pool, agent).await.as_deref(),
+        Some("client_allowlist")
+    );
+    let (status, body) = assertion_grant(&pool, &client_id, &key).await;
+    let access = access_of("(a) assertion", status, &body);
+    assert_viewer("(a) assertion", evidence_read(&pool, &access).await);
+
+    // (b) service client, client_secret: minted once first (the allowance
+    // needs the client's agent, which the first mint provisions).
+    let (row, service_id, secret) = service_client(&pool, "allowlisted-service").await;
+    let (status, body) = secret_grant(&pool, &service_id, &secret).await;
+    access_of("PREMISE: the first service mint", status, &body);
+    let service_agent = agent_of_client(&pool, row).await;
+    allow(&pool, row, operator).await;
+    assert_eq!(
+        binding_of(&pool, service_agent).await.as_deref(),
+        Some("client_allowlist")
+    );
+    let (status, body) = secret_grant(&pool, &service_id, &secret).await;
+    let access = access_of("(b) client_secret", status, &body);
+    assert_viewer("(b) client_secret", evidence_read(&pool, &access).await);
+
+    // (c) the refresh grant, from (b)'s refresh token.
+    let refresh = body["refresh_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PREMISE: the service mint issues a refresh token: {body}"))
+        .to_string();
+    let (status, body) = refresh_grant(&pool, &refresh).await;
+    let access = access_of("(c) refresh", status, &body);
+    assert_viewer("(c) refresh", evidence_read(&pool, &access).await);
+}
+
+/// Plant an `operator_links` row for `agent` past 107/122/149's guards
+/// (replica mode skips user triggers), with real ids.
+async fn plant_link(pool: &PgPool, agent: Uuid, operator: Uuid, group: Uuid, retired: bool) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id, retired) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(agent)
+    .bind(operator)
+    .bind(group)
+    .bind(retired)
+    .execute(&mut *tx)
+    .await
+    .expect("plant a link");
+    tx.commit().await.expect("commit");
+}
+
+/// The allowlist never lets an OPERATED agent mint: an allowlisted client
+/// whose agent then holds a link (live to another human, or retired to its
+/// own operator) is refused on every grant arm, naming the operator, and its
+/// binding is the link's, never `client_allowlist`.
+///
+/// Verified to fail: an allowlist exemption in `refuse_operated_agent` -> 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_on_the_allowlist_still_cannot_mint(pool: PgPool) {
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (other, other_group) = fixture::seed_human_operator(&pool, "other").await;
+
+    for (i, (retired, link_to, link_group)) in [
+        (false, other, other_group),
+        (true, operator, operator_group),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_binding = if retired { None } else { Some("live_link") };
+        let what = if retired { "retired" } else { "live" };
+
+        // (a) agent client.
+        let seed = u8::try_from(0x61 + i).expect("seed");
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let (agent, client_id) = agent_with_active_client(&pool, &key).await;
+        allow(&pool, client_row(&pool, &client_id).await, operator).await;
+        plant_link(&pool, agent, link_to, link_group, retired).await;
+        assert_eq!(
+            binding_of(&pool, agent).await.as_deref(),
+            expected_binding,
+            "{what}"
+        );
+        let (status, body) = assertion_grant(&pool, &client_id, &key).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "(a) {what}: {body}");
+        assert!(
+            body.to_string().contains(&link_to.to_string()),
+            "(a) {what}: {body}"
+        );
+
+        // (b) service client and (c) its refresh token, minted before the link.
+        let (row, service_id, secret) =
+            service_client(&pool, &format!("operated-allowlisted-{what}")).await;
+        let (status, body) = secret_grant(&pool, &service_id, &secret).await;
+        access_of("PREMISE: the first service mint", status, &body);
+        let refresh = body["refresh_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PREMISE: a refresh token: {body}"))
+            .to_string();
+        let service_agent = agent_of_client(&pool, row).await;
+        allow(&pool, row, operator).await;
+        plant_link(&pool, service_agent, link_to, link_group, retired).await;
+        assert_eq!(
+            binding_of(&pool, service_agent).await.as_deref(),
+            expected_binding,
+            "{what}"
+        );
+        let (status, body) = secret_grant(&pool, &service_id, &secret).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "(b) {what}: {body}");
+        assert!(
+            body.to_string().contains(&link_to.to_string()),
+            "(b) {what}: {body}"
+        );
+        let (status, body) = refresh_grant(&pool, &refresh).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "(c) {what}: {body}");
+    }
+}
