@@ -247,6 +247,11 @@ pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
 /// creates no membership, but a writer row that predates the retire, or one a
 /// concurrent roster write added, would otherwise ride the token onto HTTP.
 ///
+/// The author-binding allowlist (migration 149) is deliberately NOT consulted:
+/// an allowlisted client's agent is bound to a human, not operated, so it
+/// keeps minting; and an allowlisted agent that also holds a link record is
+/// refused here like any other.
+///
 /// # Errors
 /// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
 /// check itself fails (fail closed — no token on an unanswered question).
