@@ -44,12 +44,7 @@ async fn state() -> epigraph_api::AppState {
         .connect(&url)
         .await
         .expect("connect test pool");
-    let state = epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default());
-    state
-        .load_entity_type_cache()
-        .await
-        .expect("load the entity-type cache");
-    state
+    epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default())
 }
 
 /// Insert a system agent the same way `tests/common::seed_system_agent` does,
