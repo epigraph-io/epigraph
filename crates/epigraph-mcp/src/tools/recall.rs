@@ -122,8 +122,11 @@ pub struct RecallWithContextParams {
     pub corroborates_limit: Option<u32>,
     /// Max epistemic-edge neighbours returned **per relationship** per hit
     /// (supports / refutes / contradicts / specializes / elaborates / cites).
-    /// Default 4. Per-relationship rather than per-hit so a claim with many
-    /// `supports` edges cannot crowd out its single `refutes`.
+    /// Default 4, minimum 1 (0 is raised to 1). Per-relationship rather than
+    /// per-hit so a claim with many `supports` edges cannot crowd out its single
+    /// `refutes`. The floor keeps `epistemic_edges_total` honest: the total rides
+    /// on the returned rows, so a cap of 0 would report `total: 0,
+    /// truncated: false` for a hit that has visible neighbours.
     pub epistemic_limit: Option<u32>,
     pub neighbor_paragraphs_limit: Option<u32>,
     /// When `true`, run the diverse retrieval pipeline before structural
@@ -706,7 +709,7 @@ pub async fn recall_with_context(
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
     let corroborates_limit = params.corroborates_limit.unwrap_or(4);
-    let epistemic_limit = params.epistemic_limit.unwrap_or(4);
+    let epistemic_limit = params.epistemic_limit.unwrap_or(4).max(1);
     let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
@@ -2508,7 +2511,7 @@ pub mod __test_only {
         let min_truth = params.min_truth.unwrap_or(0.3);
         let siblings_limit = params.siblings_limit.unwrap_or(8);
         let corroborates_limit = params.corroborates_limit.unwrap_or(4);
-        let epistemic_limit = params.epistemic_limit.unwrap_or(4);
+        let epistemic_limit = params.epistemic_limit.unwrap_or(4).max(1);
         let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
         // Mirror the real entry: resolve + existence-check the lens up front so
         // integration tests exercise the same validation path.

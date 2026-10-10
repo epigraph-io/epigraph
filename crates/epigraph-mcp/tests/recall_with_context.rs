@@ -1872,6 +1872,25 @@ async fn recall_with_context_epistemic_edges_cap_per_relationship(pool: PgPool) 
         "total counts every visible epistemic neighbour, not the returned page"
     );
     assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(true));
+
+    // epistemic_limit=0 is raised to 1. The total is carried on the returned
+    // rows, so a literal cap of 0 returned no rows and reported `total: 0,
+    // truncated: false` for a hit with four visible neighbours.
+    let mut params = diverse_params(false, None, None, 10);
+    params.epistemic_limit = Some(0);
+    let row = recall_row_for(&pool, params, &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+    assert_eq!(
+        row["epistemic_edges_total"],
+        serde_json::json!(4),
+        "epistemic_limit=0 must not hide the total; got row {row}"
+    );
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(true));
+    assert_eq!(
+        edges.len(),
+        2,
+        "epistemic_limit=0 is floored to 1 per relationship; got {edges:?}"
+    );
 }
 
 /// The tool description is the only place a caller learns the field exists.
