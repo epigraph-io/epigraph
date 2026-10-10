@@ -74,6 +74,38 @@ pub struct BatchClaimResult {
     pub error: Option<String>,
 }
 
+/// Turn one batch item into the request `POST /api/v1/claims` takes.
+///
+/// A batch item IS a `CreateClaimRequest` with two conveniences, so a field
+/// added to that type later reaches batch with no change here:
+///
+/// * `agent_id` defaults to the caller's own agent when the item omits it.
+///   An item that names one keeps it, with exactly the single route's
+///   semantics (recorded as the author; the key and the owning group still
+///   come from the token).
+/// * `truth_value`, this route's original key, is accepted as
+///   `initial_truth`. Giving both is refused rather than guessed.
+///
+/// # Errors
+/// A human-readable reason, reported in the item's result slot.
+pub fn batch_item_to_create_request(
+    mut item: serde_json::Value,
+    caller_agent_id: uuid::Uuid,
+) -> Result<crate::routes::claims::CreateClaimRequest, String> {
+    let obj = item
+        .as_object_mut()
+        .ok_or_else(|| "each batch item must be a JSON object".to_string())?;
+    if let Some(truth) = obj.remove("truth_value") {
+        if obj.contains_key("initial_truth") {
+            return Err("give either truth_value or initial_truth, not both".to_string());
+        }
+        obj.insert("initial_truth".to_string(), truth);
+    }
+    obj.entry("agent_id")
+        .or_insert_with(|| serde_json::Value::String(caller_agent_id.to_string()));
+    serde_json::from_value(item).map_err(|e| format!("invalid batch item: {e}"))
+}
+
 // =============================================================================
 // HANDLERS
 // =============================================================================
@@ -909,5 +941,87 @@ mod tests {
             0,
             "Oversized batch rejection must not store any claims"
         );
+    }
+}
+
+#[cfg(test)]
+mod item_decoding_tests {
+    use super::batch_item_to_create_request;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_legacy_item_gets_the_callers_agent_and_its_truth_value() {
+        let caller = Uuid::new_v4();
+        let req = batch_item_to_create_request(json!({"content": "c", "truth_value": 0.6}), caller)
+            .expect("legacy shape decodes");
+        assert_eq!(req.agent_id, caller);
+        assert_eq!(req.initial_truth, Some(0.6));
+        assert_eq!(req.content, "c");
+        assert!(!req.if_not_exists);
+    }
+
+    #[test]
+    fn an_explicit_agent_and_every_single_claim_field_pass_through() {
+        let caller = Uuid::new_v4();
+        let named = Uuid::new_v4();
+        let trace = Uuid::new_v4();
+        let req = batch_item_to_create_request(
+            json!({
+                "content": "c", "agent_id": named, "initial_truth": 0.7, "trace_id": trace,
+                "properties": {"source_uri": "doi:10.1/x", "page": 3},
+                "labels": ["a", "b"], "if_not_exists": true
+            }),
+            caller,
+        )
+        .expect("full shape decodes");
+        assert_eq!(req.agent_id, named, "an item that names an author keeps it");
+        assert_eq!(req.initial_truth, Some(0.7));
+        assert_eq!(req.trace_id, Some(trace));
+        assert_eq!(
+            req.properties,
+            Some(json!({"source_uri": "doi:10.1/x", "page": 3}))
+        );
+        assert_eq!(req.labels, vec!["a".to_string(), "b".to_string()]);
+        assert!(req.if_not_exists);
+    }
+
+    #[test]
+    fn both_truth_keys_is_refused() {
+        let err = batch_item_to_create_request(
+            json!({"content": "c", "truth_value": 0.6, "initial_truth": 0.6}),
+            Uuid::new_v4(),
+        )
+        .err()
+        .expect("ambiguous truth is an error");
+        assert!(
+            err.contains("truth_value") && err.contains("initial_truth"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_item_is_refused() {
+        let err = batch_item_to_create_request(json!("just a string"), Uuid::new_v4())
+            .err()
+            .expect("non-object is an error");
+        assert!(err.contains("JSON object"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_content_is_refused_by_the_shared_request_type() {
+        let err = batch_item_to_create_request(json!({"truth_value": 0.5}), Uuid::new_v4())
+            .err()
+            .expect("content is required by CreateClaimRequest");
+        assert!(err.contains("content"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_agent_id_is_refused_not_replaced() {
+        let caller = Uuid::new_v4();
+        let err = batch_item_to_create_request(json!({"content": "c", "agent_id": "nope"}), caller)
+            .err()
+            .expect("a present-but-invalid agent_id must not fall back to the caller");
+        assert!(err.contains("invalid batch item"), "{err}");
     }
 }
