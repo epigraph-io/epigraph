@@ -1767,6 +1767,9 @@ async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
     let supported = seed_neighbour_claim(&pool, agent, "a claim epi para supports", 0.6).await;
     seed_claim_edge(&pool, refuter, para, "refutes").await; // incoming, from para's view
     seed_claim_edge(&pool, para, supported, "supports").await; // outgoing
+                                                               // A second hit in the same cluster with NO epistemic edges at all.
+    let bare =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "bare para", &pgvec, None).await;
 
     let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
     let edges = epistemic_edges_of(&row);
@@ -1793,6 +1796,30 @@ async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
     );
     assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
     assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(false));
+
+    // Stable shape (scope OQ2): a hit with no visible epistemic neighbours still
+    // CARRIES the three keys, so an empty list reads "none visible" rather than
+    // "not computed". `skip_serializing_if = "Vec::is_empty"` would drop them.
+    let bare_row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, bare).await;
+    let bare_obj = bare_row.as_object().expect("hit is a JSON object");
+    for key in [
+        "epistemic_edges",
+        "epistemic_edges_total",
+        "epistemic_edges_truncated",
+    ] {
+        assert!(
+            bare_obj.contains_key(key),
+            "a hit with no epistemic neighbours must still carry `{key}` (always \
+             serialized, like `corroborates`); hit keys were: {:?}",
+            bare_obj.keys().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(bare_row["epistemic_edges"], serde_json::json!([]));
+    assert_eq!(bare_row["epistemic_edges_total"], serde_json::json!(0));
+    assert_eq!(
+        bare_row["epistemic_edges_truncated"],
+        serde_json::json!(false)
+    );
 }
 
 /// `epistemic_limit` caps PER RELATIONSHIP, keeps the strongest neighbour of
