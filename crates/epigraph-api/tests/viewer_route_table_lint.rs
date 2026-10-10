@@ -195,7 +195,19 @@ use std::path::{Path, PathBuf};
 /// the assertion so it dodges the scanner, which is the same laundering this
 /// register exists to prevent. The handler-read register below is UNCHANGED —
 /// that is the number "do not raise it" is about, and the one a leak would move.
-const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3), ("submit.rs", 1)];
+///
+/// **`claims.rs` 3 -> 4, on the `submit.rs` precedent above, and it is a
+/// `#[cfg(test)]` read-back, not a new handler read.**
+///
+/// `test_create_claim_core_missing_scope_403` (issue #477) calls
+/// `create_claim_core` directly with a token lacking `claims:write` and asserts
+/// the refusal leaves no row. Its statement is
+/// `SELECT COUNT(*) FROM claims WHERE content = $1` inside
+/// `#[cfg(all(test, feature = "db"))] mod db_tests` — a scalar count that
+/// projects no content. Registered rather than rewritten to dodge the scanner,
+/// for the reason the `submit.rs` note gives. The handler-read register below
+/// is again UNCHANGED.
+const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs", 1)];
 
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
