@@ -931,7 +931,14 @@ transaction; the audit row carries `confirmation = passkey`, the act id and
 the elevation id. The database's guards enforce this for direct maintenance
 statements too (`ELV10`): once the acting custodian holds a passkey, a
 custodial write without a confirmed act is refused. `revoke-passkey` is the
-break-glass back to the bootstrap path.
+break-glass back to the bootstrap path, and it is not itself an act kind: a
+holder of the maintenance DSN can return a custodian to the bootstrap path at
+will (revoke their passkeys, then grant, end, supersede or enroll with no
+act, each recorded `confirmation = 'none'`). That sequence is AUDITED
+(`platform.passkey_revoked`, then the `none` rows) but not flagged:
+`verify-confirmations` reads only confirmed tickets and acts and the sessions
+they opened. Review the trail for a revoke followed by unconfirmed custodial
+writes.
 
 **Admin-only scopes** (`claims:admin`, `clients:admin`, `groups:admin`, ...)
 pass through one mint chokepoint and one check chokepoint behind a switch that
