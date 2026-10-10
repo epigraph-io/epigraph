@@ -13,13 +13,21 @@
 -- WHAT IT DOES
 --   1. Refuses if a policy still reads `epigraph_is_elevated()`; lists (NOTICE)
 --      how many tickets and sessions it drops, live sessions included.
---   2. Drops the five end triggers on 123's / 122's / 118's / 001's / 124's
+--   2. Copies EVERY ticket and session into `security_events`, one
+--      `platform.elevation_ticket_archived` / `platform.elevation_session_archived`
+--      event each (the whole row as `details`, less a ticket's
+--      `redeem_secret_hash`, plus `archived_by`): a ticket's assertion
+--      evidence and ceremony state, and the sessions they opened, are what the
+--      offline verifier re-checks, and an undo must not erase them (130-undo
+--      and 127-undo archive theirs for the same reason).
+--   3. Drops the five end triggers on 123's / 122's / 118's / 001's / 124's
 --      tables (role_assignments, human_operators, refresh_tokens,
 --      oauth_clients, person_authenticators; their tables stay exactly as
 --      those migrations left them), both tables, and every 125 function.
 --
--- WHAT IT LEAVES: the `platform.elevat*` rows in `security_events` (history),
--- and 125's `_sqlx_migrations` row. Re-introducing elevation is a NEW
+-- WHAT IT LEAVES: the `platform.elevat*` rows in `security_events` (history,
+-- the archived tickets and sessions included), and 125's `_sqlx_migrations`
+-- row. A second run archives nothing (the tables are gone). Re-introducing elevation is a NEW
 -- migration, never a re-run of 125.
 -- ===================================================================
 BEGIN;
@@ -47,6 +55,37 @@ BEGIN
     END IF;
     RAISE NOTICE '125-undo: dropping % ticket(s) and % session(s) (% live)',
                  v_tickets, v_sessions, v_live;
+END $$;
+
+-- The tickets and sessions, archived.
+DO $$
+DECLARE
+    v_tickets  bigint := 0;
+    v_sessions bigint := 0;
+BEGIN
+    IF to_regclass('public.elevation_tickets') IS NOT NULL THEN
+        EXECUTE $q$
+            INSERT INTO public.security_events (event_type, agent_id, success, details)
+            SELECT 'platform.elevation_ticket_archived', t.person_agent_id, true,
+                   (to_jsonb(t) - 'redeem_secret_hash')
+                       || jsonb_build_object('archived_by', '125-undo')
+              FROM public.elevation_tickets t
+             ORDER BY t.created_at, t.id
+        $q$;
+        GET DIAGNOSTICS v_tickets = ROW_COUNT;
+    END IF;
+    IF to_regclass('public.elevation_sessions') IS NOT NULL THEN
+        EXECUTE $q$
+            INSERT INTO public.security_events (event_type, agent_id, success, details)
+            SELECT 'platform.elevation_session_archived', s.person_agent_id, true,
+                   to_jsonb(s) || jsonb_build_object('archived_by', '125-undo')
+              FROM public.elevation_sessions s
+             ORDER BY s.started_at, s.id
+        $q$;
+        GET DIAGNOSTICS v_sessions = ROW_COUNT;
+    END IF;
+    RAISE NOTICE '125-undo: archived % ticket(s) and % session(s) into security_events',
+                 v_tickets, v_sessions;
 END $$;
 
 DROP TRIGGER IF EXISTS role_assignments_end_elevations ON public.role_assignments;

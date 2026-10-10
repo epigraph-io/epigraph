@@ -2828,10 +2828,13 @@ fn undo_125() -> String {
 /// catalog (relations, function bodies and owners, policies, triggers,
 /// constraints) to the same database's at 124, including the end triggers
 /// 125 put on 118's, 122's, 123's, 124's and 001's tables; the `platform.elevat*`
-/// history stays. Cut at 125, not head: a later migration (the read arms read
-/// `epigraph_is_elevated()`) is undone before this one.
+/// history stays, and every ticket and session is archived into
+/// `security_events` (final review F1-COR-05), evidence included and a redeem
+/// secret's hash excluded. Cut at 125, not head: a later migration (the read
+/// arms read `epigraph_is_elevated()`) is undone before this one.
 ///
-/// Verified to fail: the undo's DROP of the reuse end trigger removed -> the
+/// Verified to fail: the undo's archival removed -> no archived ticket; the
+/// undo's DROP of the reuse end trigger removed -> the
 /// trigger still on `refresh_tokens` blocks its function's DROP (2BP01), so
 /// the undo does not apply; the DROP of `epigraph_end_expired_elevations`
 /// removed -> that function is left behind.
@@ -2854,6 +2857,14 @@ async fn the_rollback_returns_the_catalog_to_124(pool: PgPool) {
         before,
         "CALIBRATION: 125 changed the catalog"
     );
+    let tickets_before: usize = usize::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM elevation_tickets")
+            .fetch_one(&pool)
+            .await
+            .expect("count"),
+    )
+    .expect("count");
+    assert!(tickets_before >= 3, "CALIBRATION: {tickets_before} tickets");
 
     sqlx::raw_sql(&undo_125())
         .execute(&pool)
@@ -2872,6 +2883,38 @@ async fn the_rollback_returns_the_catalog_to_124(pool: PgPool) {
         1,
         "the audit history stays"
     );
+    // Every ticket and session is archived, the evidence the offline
+    // verifier re-checks included, a redeem secret's hash excluded.
+    let tickets: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'platform.elevation_ticket_archived' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("archived tickets");
+    assert_eq!(tickets.len(), tickets_before, "every ticket is archived");
+    assert!(
+        tickets.iter().any(|t| t["outcome"] == "confirmed"
+            && t["assertion_evidence"].is_object()
+            && t["challenge_state"].is_object()
+            && t["session_id"] == serde_json::json!(sid)),
+        "the confirmed ticket keeps its evidence and state: {tickets:?}"
+    );
+    assert!(
+        tickets
+            .iter()
+            .all(|t| t.get("redeem_secret_hash").is_none() && t["archived_by"] == "125-undo"),
+        "{tickets:?}"
+    );
+    let sessions: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'platform.elevation_session_archived'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("archived sessions");
+    assert_eq!(sessions.len(), 1, "the session is archived");
+    assert_eq!(sessions[0]["id"], serde_json::json!(sid));
 }
 
 /// The undo refuses while any row policy still reads `epigraph_is_elevated()`

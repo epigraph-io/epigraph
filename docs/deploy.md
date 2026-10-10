@@ -2426,7 +2426,8 @@ acts. The rollback is `disarm-admin-scopes --reason TEXT --apply` (no DDL).
 Then the undo scripts in reverse: `160-undo.sql` (the final-review
 corrections to 124-132), `132-undo.sql`, `131-undo.sql`,
 `130-undo.sql`, `129-undo.sql`, `128-undo.sql`, `127-undo.sql` (archives the
-log into `security_events` first), `126-undo.sql`, `125-undo.sql`,
+log into `security_events` first), `126-undo.sql`, `125-undo.sql` (archives
+every ticket and session, their assertion evidence included, first),
 `124-undo.sql`. Each script's header names the binaries that must be rolled
 back before it. `epigraph-operator revoke-passkey` is the break-glass that
 returns a passkey holder to the bootstrap path without any undo.
