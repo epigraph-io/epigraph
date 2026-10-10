@@ -1,4 +1,9 @@
 //! POST /oauth/introspect — Token introspection (RFC 7662).
+//!
+//! `scope` is what the token holds at this instant on an UNELEVATED request,
+//! by the same rule the API's own checks apply (`AuthContext::has_scope`,
+//! with the admin-scope switch read): armed, admin-only scopes are absent,
+//! and `platform:admin` is never reported (no elevation is resolved here).
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -74,11 +79,28 @@ pub async fn introspect_endpoint(
         return Ok(Json(inactive()));
     }
 
+    // The scopes the token HOLDS now, as the check chokepoint grants them to
+    // an UNELEVATED request (final review F1-SEC-02): the admin-scope switch
+    // is read (armed, a carried admin-only scope counts for nothing), and no
+    // elevation is resolved, so `platform:admin` and what it stands for are
+    // never reported. That under-reports an elevated token, which is the safe
+    // direction: a resource server cannot learn here whether its session is
+    // still live, so it is not told that it is.
+    let mut ctx = epigraph_auth::AuthContext::from(claims.clone());
+    ctx.admin_scopes = state.admin_scope_posture().await;
+    ctx.elevation = None;
+    let held: Vec<&str> = claims
+        .scopes
+        .iter()
+        .filter(|s| ctx.has_scope(s))
+        .map(String::as_str)
+        .collect();
+
     Ok(Json(IntrospectResponse {
         active: true,
         sub: Some(claims.sub.to_string()),
         client_id: Some(claims.sub.to_string()),
-        scope: Some(claims.scopes.join(" ")),
+        scope: Some(held.join(" ")),
         exp: Some(claims.exp),
         iat: Some(claims.iat),
         token_type: Some("Bearer".to_string()),

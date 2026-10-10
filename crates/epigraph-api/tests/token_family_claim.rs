@@ -711,3 +711,81 @@ async fn introspection_echoes_the_family(pool: PgPool) {
         "an unbound token's introspection carries no fam: {intro}"
     );
 }
+
+/// RFC 7662 answers the scopes a token HOLDS at this instant, as the API's
+/// own check chokepoint (`AuthContext::has_scope`) grants them on an
+/// UNELEVATED request (final review F1-SEC-02). Armed (migration 128's
+/// switch), an admin-only scope the token still carries is not reported; and
+/// `platform:admin` never is (introspection resolves no elevation, so it
+/// under-reports an elevated token rather than vouch for a session that may
+/// have ended). Calibration: unarmed, the admin-only scope is reported; the
+/// ordinary scope always is; the token is active throughout.
+///
+/// Verified to fail with the token's raw `scopes` reported (the code before
+/// this test): `platform:admin` is reported unarmed, and armed `claims:admin`
+/// is still reported.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspection_reports_only_the_scopes_a_check_would_grant(pool: PgPool) {
+    let state = AppState::with_db(app_role_pool(&pool).await, config())
+        .with_admin_scope_arming_ttl(std::time::Duration::ZERO);
+    let jwt = state.jwt_config.clone();
+    let app = create_router(state);
+    let (token, _) = jwt
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec![
+                "claims:read".to_string(),
+                "claims:admin".to_string(),
+                "platform:admin".to_string(),
+            ],
+            "human",
+            None,
+            Some(Uuid::new_v4()),
+            Duration::minutes(5),
+            AccessTokenBinding {
+                family_id: Some(Uuid::new_v4()),
+                elevation_id: Some(Uuid::new_v4()),
+            },
+        )
+        .expect("mint");
+    assert!(
+        jwt.validate_token(&token)
+            .expect("valid")
+            .scopes
+            .contains(&"platform:admin".to_string()),
+        "PREMISE: the token carries platform:admin (it names an elevation)"
+    );
+    let scopes = |intro: &Value| -> Vec<String> {
+        let mut v: Vec<String> = intro["scope"]
+            .as_str()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    };
+
+    let (status, intro) =
+        post_json(app.clone(), "/oauth/introspect", json!({ "token": token })).await;
+    assert_eq!(status, StatusCode::OK, "{intro}");
+    assert_eq!(intro["active"], json!(true), "{intro}");
+    assert_eq!(
+        scopes(&intro),
+        vec!["claims:admin", "claims:read"],
+        "unarmed: the admin-only scope is held; platform:admin never is: {intro}"
+    );
+
+    sqlx::query("SELECT * FROM public.epigraph_set_admin_scope_enforcement(true, 'f1 sec-02')")
+        .execute(&pool)
+        .await
+        .expect("arm");
+    let (status, intro) = post_json(app, "/oauth/introspect", json!({ "token": token })).await;
+    assert_eq!(status, StatusCode::OK, "{intro}");
+    assert_eq!(intro["active"], json!(true), "{intro}");
+    assert_eq!(
+        scopes(&intro),
+        vec!["claims:read"],
+        "armed: the admin-only scope counts for nothing on an unelevated check: {intro}"
+    );
+}
