@@ -518,9 +518,10 @@ async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
 /// client OWNED by a human's client (the rejected owner-rule shape), a human
 /// whose client is suspended, and a NULL argument.
 ///
-/// Verified to fail: the read helper keyed on `oauth_clients.owner_id`
-/// (an owner rule) -> A reads bound; `NOT l.retired` dropped from the
-/// re-bodied `epigraph_author_binding` -> R reads `live_link`.
+/// Should fail if (not measured): the read helper keyed on
+/// `oauth_clients.owner_id` (an owner rule) -> A reads bound; `NOT l.retired`
+/// dropped from the re-bodied `epigraph_author_binding` -> R reads
+/// `live_link`.
 #[sqlx::test(migrations = false)]
 async fn an_empty_allowlist_changes_no_binding_answer(pool: PgPool) {
     migrate(&pool, &up_to_below(149)).await;
@@ -946,10 +947,11 @@ async fn every_unmet_condition_reads_unbound(pool: PgPool) {
 /// Verified to fail: a guard
 /// whose precondition checks are skipped on a direct maintenance write (the
 /// human client row lands); `guard_update`'s column-tuple rule deleted (the
-/// superuser rows land); the `refuse_delete` trigger removed (the superuser
-/// DELETE lands); the allow definer reading before it locks (the concurrent
-/// retry raises 55000); `effective_binding` hard-coded (the suspended
+/// superuser rows land); `effective_binding` hard-coded (the suspended
 /// re-allow); the audit prefix changed to `operator.` (the event counts).
+/// Should fail if (not measured): the `refuse_delete` trigger removed (the
+/// superuser DELETE lands); the allow definer reading before it locks (the
+/// concurrent retry raises 55000).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_allowlist_is_maintenance_written_append_only_and_audited(pool: PgPool) {
     let (h, g_h) = fixture::seed_human_operator(&pool, "human-h").await;
@@ -1493,8 +1495,8 @@ async fn a_direct_insert_of_a_revoked_row_is_refused(pool: PgPool) {
 /// revoked is refused, by name, and records nothing; revoking the allowance
 /// lets the link through.
 ///
-/// Verified to fail: `CREATE TRIGGER operator_links_refuse_allowlisted_agent`
-/// removed -> the link lands.
+/// Should fail if (not measured): `CREATE TRIGGER
+/// operator_links_refuse_allowlisted_agent` removed -> the link lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_link_is_refused_for_an_allowlisted_agent_until_the_allowance_is_revoked(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
