@@ -926,7 +926,10 @@ async fn every_unmet_condition_reads_unbound(pool: PgPool) {
 /// stamps its own provenance; the only change is the revoke, which is final;
 /// no session deletes a row.
 ///
-/// Verified to fail: a `GRANT INSERT` to the app role left in place; a guard
+/// (A leftover app INSERT grant is killed by `app_role_table_lockdown.rs`'s
+/// `NO_WRITE`, not here: the guard refuses the app role with the same 42501.)
+///
+/// Verified to fail: a guard
 /// whose precondition checks are skipped on a direct maintenance write (the
 /// human client row lands); `guard_update`'s column-tuple rule deleted (the
 /// superuser rows land); the `refuse_delete` trigger removed (the superuser
@@ -1320,7 +1323,9 @@ async fn the_allowlist_is_maintenance_written_append_only_and_audited(pool: PgPo
     let mut waited = false;
     for _ in 0..200 {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+            "SELECT count(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND NOT granted \
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         )
         .fetch_one(&pool)
         .await
@@ -1486,7 +1491,9 @@ async fn a_revoked_client_with_a_live_allowance_does_not_wedge_the_legacy_tie(po
 /// and after it. Then armed, the as-itself write is refused (the instrument
 /// can fail).
 ///
-/// Verified to fail: a re-body that runs its check unarmed.
+/// Should fail if a re-body made any check run unarmed (not measured: no 149
+/// object reads the arming state; the armed calibration at the end shows the
+/// instrument can fail).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unarmed_database_admits_the_same_writes_with_or_without_an_allowance(pool: PgPool) {
     let (h, g_h) = fixture::seed_human_operator(&pool, "human-h").await;
@@ -1564,8 +1571,9 @@ async fn under_the_valve_an_allowlisted_writer_is_scoped_to_its_operator(pool: P
 /// write that group. Every "author as itself" path resolves through this one
 /// function.
 ///
-/// Verified to fail: a re-home of an allowlisted author into its operator's
-/// group (the declaration would be G_H).
+/// Should fail if an allowlisted author were re-homed into its operator's
+/// group (the declaration would be G_H); not measured, as no such re-home
+/// exists to mutate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_allowlisted_author_as_itself_is_not_rehomed(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
@@ -1603,8 +1611,9 @@ async fn an_allowlisted_author_as_itself_is_not_rehomed(pool: PgPool) {
 /// another non-revoked client is refused, and a second client created later
 /// ends the binding until it is revoked.
 ///
-/// Verified to fail: the guard's other-client check removed (i lands); the
-/// read's other-client conjunct removed (ii stays bound).
+/// Verified to fail: the guard's other-client check removed (i lands). The
+/// read's other-client conjunct removed is measured by T3 (o); (ii) should
+/// fail the same way.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_second_client_of_the_same_agent_is_refused_and_unbinds(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
@@ -1798,8 +1807,10 @@ fn read_repo(rel: &str) -> String {
 /// `platform.author_binding_allowlist_dropped` event naming the one live
 /// allowance it ended.
 ///
-/// Verified to fail: the undo dropping the helper before restoring the bodies
-/// (the undo errors); a non-122 body restored (catalog differs).
+/// Verified to fail: a non-122 body of `epigraph_human_of` restored (the
+/// catalog differs). Dropping the helper BEFORE restoring the bodies would not
+/// error (a SQL function body records no dependency), so the undo restores
+/// the bodies first by construction, not because this test could catch it.
 #[sqlx::test(migrations = false)]
 async fn the_149_rollback_returns_the_catalog_and_records_the_dropped_allowances(pool: PgPool) {
     migrate(&pool, &up_to_below(149)).await;

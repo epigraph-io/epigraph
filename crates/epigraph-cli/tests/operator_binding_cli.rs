@@ -1194,9 +1194,9 @@ async fn allowance_state(pool: &PgPool, client: Uuid) -> (i64, i64) {
 /// about its private key; a human-type client is refused with nothing
 /// written; the revoke is a dry run first, then final.
 ///
-/// Verified to fail: the dry run committing (rows after the dry run); the
-/// effective-binding check removed from the binary (the suspended re-run
-/// exits 0).
+/// Verified to fail: the effective-binding check removed from the binary (the
+/// suspended re-run exits 0). Should fail if the dry run committed (rows after
+/// the dry run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
     let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;

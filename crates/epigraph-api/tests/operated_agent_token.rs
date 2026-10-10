@@ -795,8 +795,8 @@ fn assert_viewer(what: &str, (status, body): (StatusCode, String)) {
 /// its token keeps a viewer: the allowlist binds the agent, it does not make
 /// it operated.
 ///
-/// Verified to fail: `refuse_operated_agent` (or the bearer) keyed on
-/// `epigraph_author_binding IS NOT NULL` -> 403 on every arm.
+/// Verified to fail: `refuse_operated_agent` refusing a `client_allowlist`
+/// agent -> 403 (measured on the assertion arm, which runs first).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_allowlisted_client_still_mints_and_keeps_its_viewer(pool: PgPool) {
     let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;

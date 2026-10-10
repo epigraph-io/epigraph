@@ -13,14 +13,17 @@
 //!
 //! * (i) no allowance: refused `OPL01` (the writer is unbound), nothing written;
 //! * (ii) an allowance, but no write membership for the agent in the
-//!   operator's group: refused, and NOT by an `OPL` code (row security's
-//!   WITH CHECK): an allowance grants no row-security write authority;
+//!   operator's group: refused by row security's WITH CHECK on `claims`, not
+//!   by an `OPL` code: an allowance grants no row-security write authority.
+//!   (The handler maps that refusal to a 500 "DatabaseError", which predates
+//!   migration 149 and is pinned here as observed.)
 //! * (iii) an allowance and a writer membership in the operator's group: 201,
 //!   one claim, authored as named and owned by the operator's group.
 //!
-//! Verified to fail: a route-layer refusal of an allowlisted principal, or the
-//! `client_allowlist` arm removed from `epigraph_author_binding` -> (iii) is
-//! refused.
+//! Verified to fail: the `client_allowlist` arm removed from
+//! `epigraph_author_binding` -> (ii) is refused OPL01 (the writer is unbound
+//! again) instead of by row security. Should fail if a route-layer check
+//! refused an allowlisted principal ((iii) would be refused).
 
 mod viewer_fixture;
 
@@ -175,9 +178,11 @@ async fn an_allowlisted_service_client_submits_a_packet_authored_by_a_linked_age
     let viewer = Viewer::resolve(&pool, s).await.expect("viewer");
     let (status, body) = post_packet(&state, viewer, l, &content).await;
     assert!(
-        !status.is_success() && !body.contains("OPL0"),
+        status == StatusCode::INTERNAL_SERVER_ERROR
+            && body.contains("row-level security policy for table \\\"claims\\\"")
+            && !body.contains("OPL0"),
         "(ii): an allowance alone grants no row-security write in the operator's group, and \
-         the refusal is not the binding's: {status} {body}"
+         the refusal is row security's, not the binding's: {status} {body}"
     );
     assert!(
         claims_with_content(&pool, &content).await.is_empty(),
