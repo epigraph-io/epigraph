@@ -1827,15 +1827,17 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // "operates other agents" and "retired operator link" refusals fail OPEN;
     // its `platform_roles` read (FORCEd) misses the role nodes, so that refusal
     // fails OPEN too. The audit trigger's `operator.system_agent` row and the
-    // definer's INSERT fail CLOSED (loud: nothing registers). The two guards on
-    // `agents` and `human_operators` read only `system_agents`, which has no
-    // row security, so they keep refusing under any owner.
+    // definer's INSERT fail CLOSED (loud: nothing registers). The three guards
+    // on `agents`, `human_operators` and `operator_links` read only
+    // `system_agents`, which has no row security, so they keep refusing under
+    // any owner.
     ("epigraph_system_agents_guard_insert", 148),
     ("epigraph_system_agents_immutable", 148),
     ("epigraph_system_agents_audit", 148),
     ("epigraph_register_system_agent", 148),
     ("epigraph_agents_refuse_registered_system_key", 148),
     ("epigraph_human_operators_refuse_system_agent", 148),
+    ("epigraph_operator_links_refuse_retired_system_agent", 148),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

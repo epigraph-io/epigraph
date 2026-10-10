@@ -890,3 +890,315 @@ async fn the_registration_event_type_is_reserved(pool: PgPool) {
         .expect("control: another operator.* type is still app-writable");
     assert_eq!(audit_rows(&pool).await, 0);
 }
+
+// ── A registered system agent is never retire-linked, by any door ──────────
+
+/// `(operator_id, retired)` of `agent`'s one link, if any.
+async fn link_of(pool: &PgPool, agent: Uuid) -> Option<(Uuid, bool)> {
+    sqlx::query_as("SELECT operator_id, retired FROM operator_links WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_optional(pool)
+        .await
+        .expect("link read")
+}
+
+/// The guard refuses to REGISTER an agent holding a retired operator link (a
+/// retired link is permanent, so the agent could never be bound). The same
+/// invariant must hold in the other order: once registered, no definer may
+/// RETIRE-link it, or an armed database refuses every workflow-ingest write
+/// for good behind an immutable registration. Each of the three retired-link
+/// definers (the bulk legacy-author tie, the single retire, the attested
+/// shared-signer retire) is refused by `operator_links`' own trigger (its
+/// `operator_links:` prefix), the bulk tie with S excluded still runs, and S
+/// is afterwards live-linkable and BOUND (the row, not the definer's Ok: a
+/// live link over a retired one returns Ok and changes nothing).
+///
+/// Kills: `operator_links_refuse_retired_system_agent` missing (each door lands
+/// a retired link, and the final live link is a silent no-op).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_registered_system_agent_is_never_retire_linked(pool: PgPool) {
+    let s = seed_agent(&pool, "s").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "human").await;
+    let other = seed_agent(&pool, "other-principal").await;
+    assert!(fixture::register_system_agent(&pool, s).await);
+    // Every real system agent has authored something, so the bulk tie sees it.
+    fixture::seed_public_claim(&pool, s, "a claim the system agent authored").await;
+    // The bulk tie that excludes S runs and reports it excluded (the control:
+    // the refusal below is about S, not about the tie).
+    let outcomes: Vec<(Uuid, String)> =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query_as(
+                "SELECT agent_id, outcome FROM public.epigraph_link_legacy_authors($1, $2, NULL)",
+            )
+            .bind(human)
+            .bind(vec![s])
+            .fetch_all(&mut *conn)
+            .await
+            .expect("the tie with S excluded runs");
+            (conn, r)
+        })
+        .await;
+    assert!(
+        outcomes.contains(&(s, "skipped:excluded".to_string())),
+        "{outcomes:?}"
+    );
+    assert_eq!(link_of(&pool, s).await, None);
+
+    let doors = [
+        (
+            "the legacy-author tie",
+            "SELECT * FROM public.epigraph_link_legacy_authors($2, ARRAY[]::uuid[], NULL)",
+        ),
+        (
+            "the single retire",
+            "SELECT * FROM public.epigraph_link_retired_agent($1, $2)",
+        ),
+        (
+            "the attested shared-signer retire",
+            "SELECT * FROM public.epigraph_link_retired_shared_signer($1, $2, ARRAY[$3]::uuid[])",
+        ),
+    ];
+    for (door, sql) in doors {
+        if door.contains("shared-signer") {
+            // The shared-signer fingerprint (OPERATED_BY lineage to two
+            // principals), seeded only now: the tie and the single retire
+            // would skip or refuse such an agent for that reason instead.
+            for target in [human, other] {
+                sqlx::query(
+                    "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                        relationship) \
+                     VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+                )
+                .bind(s)
+                .bind(target)
+                .execute(&pool)
+                .await
+                .expect("lineage edge");
+            }
+        }
+        let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query(sql)
+                .bind(s)
+                .bind(human)
+                .bind(other)
+                .execute(&mut *conn)
+                .await;
+            (conn, r)
+        })
+        .await;
+        assert_refused(
+            &r,
+            "55000",
+            "operator_links: ",
+            &[],
+            &format!("{door} of a registered system agent"),
+        );
+        assert!(
+            r.as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("registered system agent")),
+            "{door}: {r:?}"
+        );
+        assert_eq!(link_of(&pool, s).await, None, "{door}: no link written");
+    }
+
+    // S is still bindable: a live link lands and binds it. (The shared-signer
+    // lineage seeded for the third door is removed first: 107's live link
+    // refuses that fingerprint for its own reason.)
+    sqlx::query(
+        "DELETE FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'OPERATED_BY'",
+    )
+    .bind(s)
+    .bind(other)
+    .execute(&pool)
+    .await
+    .expect("drop the second lineage principal");
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, s, human)
+        .await
+        .expect("live link");
+    drop(conn);
+    assert_eq!(link_of(&pool, s).await, Some((human, false)), "a LIVE link");
+    let bound: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_human_of($1, true)")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("human_of");
+    assert_eq!(bound, Some(human), "S is bound to its human");
+}
+
+// ── The cross-registry guards serialize ────────────────────────────────────
+
+/// Run `second` on its own connection while a maintenance transaction holds an
+/// UNCOMMITTED registration of `s`; return whether `second` blocked on the
+/// shared advisory lock before that transaction committed, and its result.
+///
+/// The guards on either side read the other's table; without a common lock an
+/// uncommitted registration is invisible to the other guard and both commit.
+/// The wait is bounded: when `second` does not block, it finishes and the poll
+/// stops, so a missing lock reports red rather than hanging.
+async fn race_against_an_uncommitted_registration<F, Fut>(
+    pool: &PgPool,
+    s: Uuid,
+    second: F,
+) -> (bool, Result<(), sqlx::Error>)
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = Result<(), sqlx::Error>> + Send + 'static,
+{
+    use sqlx::Executor;
+    let mut t1 = pool.acquire().await.expect("connection T1");
+    t1.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .expect("T1 as maintenance");
+    t1.execute("BEGIN").await.expect("begin T1");
+    sqlx::query("SELECT * FROM public.epigraph_register_system_agent($1, $2, 'race')")
+        .bind(role())
+        .bind(s)
+        .execute(&mut *t1)
+        .await
+        .expect("T1's uncommitted registration");
+
+    let t2 = tokio::spawn(second(pool.clone()));
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND wait_event = 'advisory'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        if t2.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    t1.execute("COMMIT").await.expect("commit T1");
+    t1.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset T1");
+    (blocked, t2.await.expect("join T2"))
+}
+
+/// A retired link of S written concurrently with S's registration waits for
+/// it and is then refused. Kills: the registry guard not taking
+/// `epigraph.operator_links` (the link definer never blocks, reads no
+/// registration, and lands its retired link beside it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_registration_and_a_concurrent_retired_link_serialize(pool: PgPool) {
+    let s = seed_agent(&pool, "s-retire").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "human").await;
+    let (blocked, r) = race_against_an_uncommitted_registration(&pool, s, move |p| async move {
+        let mut c = p.acquire().await?;
+        sqlx::query("SET SESSION AUTHORIZATION epigraph_maintenance")
+            .execute(&mut *c)
+            .await?;
+        let r = sqlx::query("SELECT * FROM public.epigraph_link_retired_agent($1, $2)")
+            .bind(s)
+            .bind(human)
+            .execute(&mut *c)
+            .await
+            .map(|_| ());
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *c)
+            .await?;
+        r
+    })
+    .await;
+    assert!(
+        blocked,
+        "the retire must wait for the uncommitted registration: {r:?}"
+    );
+    assert_refused(&r, "55000", "operator_links: ", &[], "a concurrent retire");
+    assert_eq!(link_of(&pool, s).await, None);
+}
+
+/// A human registration of S written concurrently with S's registration waits
+/// for it and is then refused. Kills: `human_operators_refuse_system_agent`
+/// not taking `epigraph.operator_links` (the human row lands beside the
+/// registration).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_registration_and_a_concurrent_human_registration_serialize(pool: PgPool) {
+    let s2 = seed_agent(&pool, "s-human").await;
+    let (blocked, r) = race_against_an_uncommitted_registration(&pool, s2, move |p| async move {
+        // The client lands at once (no guard reads oauth_clients for a system
+        // agent after registration; that window is accepted and documented);
+        // the registry row is what must wait.
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                        status, agent_id) \
+             VALUES ($1, 'race', 'human', ARRAY['claims:write'], 'active', $2)",
+        )
+        .bind(format!("race-human-{s2}"))
+        .bind(s2)
+        .execute(&p)
+        .await?;
+        sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'race')")
+            .bind(s2)
+            .execute(&p)
+            .await
+            .map(|_| ())
+    })
+    .await;
+    assert!(blocked, "the human registration must wait: {r:?}");
+    assert_refused(
+        &r,
+        "55000",
+        "is a registered system agent",
+        &[],
+        "a concurrent human registration",
+    );
+    let human_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM human_operators WHERE agent_id = $1")
+            .bind(s2)
+            .fetch_one(&pool)
+            .await
+            .expect("human rows");
+    assert_eq!(human_rows, 0);
+}
+
+/// A registration is not written under REPEATABLE READ: its snapshot predates
+/// the wait for a concurrent link or human registration of the agent, so the
+/// guard's reads would not see it. Kills: the isolation refusal removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_registration_under_repeatable_read_is_refused(pool: PgPool) {
+    let s = seed_agent(&pool, "s").await;
+    let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *conn)
+            .await
+            .expect("begin RR");
+        let r = sqlx::query("SELECT * FROM public.epigraph_register_system_agent($1, $2, 'x')")
+            .bind(role())
+            .bind(s)
+            .execute(&mut *conn)
+            .await;
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("rollback");
+        (conn, r)
+    })
+    .await;
+    assert_refused(
+        &r,
+        "55000",
+        "system_agents: ",
+        &[],
+        "a REPEATABLE READ registration",
+    );
+    assert!(
+        r.as_ref()
+            .err()
+            .is_some_and(|e| e.to_string().contains("REPEATABLE READ")),
+        "{r:?}"
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+}

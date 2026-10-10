@@ -1194,7 +1194,14 @@ restart.
   refuses that key to every OTHER agent on every path, so even a binary built
   before this file cannot re-create the identity after a rotation (it fails
   closed). `human_operators_refuse_system_agent` keeps a registered system
-  agent from later becoming a human. The resolvers read the registry first: a
+  agent from later becoming a human, and
+  `operator_links_refuse_retired_system_agent` from later being given a
+  RETIRED operator link by any definer (permanent, so it could never be bound;
+  the bulk legacy-author tie refuses as a whole, and `epigraph-operator
+  link-legacy-authors` excludes registered system agents itself). The guards
+  take the operator-link advisory lock, so a registration and a concurrent
+  link or human registration of one agent serialize; a registration under
+  REPEATABLE READ is refused. The resolvers read the registry first: a
   row wins, always; no row on an ARMED database (122) refuses before writing;
   no row on an unarmed database keeps the old key lookup. Author-name paths
   and `POST /agents` refuse the legacy key and any author resolving to a

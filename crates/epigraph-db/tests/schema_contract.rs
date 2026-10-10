@@ -1629,7 +1629,7 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
     }
 }
 
-/// Migration 148 (the system-agent registry): its six functions are SECURITY
+/// Migration 148 (the system-agent registry): its seven functions are SECURITY
 /// DEFINERs owned by `epigraph_maintenance` with an explicit ACL that excludes
 /// PUBLIC and the application role; `system_agents` is app-READABLE only and
 /// insert-only for the maintenance role, at table AND column level (a later
@@ -1671,6 +1671,11 @@ async fn migration_148_system_agent_registry_keeps_owner_grants_and_acl(pool: Pg
         (
             "epigraph_human_operators_refuse_system_agent",
             "public.epigraph_human_operators_refuse_system_agent()",
+            false,
+        ),
+        (
+            "epigraph_operator_links_refuse_retired_system_agent",
+            "public.epigraph_operator_links_refuse_retired_system_agent()",
             false,
         ),
     ] {
@@ -1802,6 +1807,11 @@ async fn migration_148_system_agent_registry_keeps_owner_grants_and_acl(pool: Pg
         (
             "public.human_operators",
             "human_operators_refuse_system_agent",
+            2 | 4 | 16,
+        ),
+        (
+            "public.operator_links",
+            "operator_links_refuse_retired_system_agent",
             2 | 4 | 16,
         ),
     ] {

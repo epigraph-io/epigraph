@@ -58,7 +58,24 @@
 --     registered agent itself may rotate. Register BEFORE rotating, in its
 --     own committed transaction: the recorded key is the one protected.
 --   * A registered system agent can never later be registered as a human
---     operator (`human_operators_refuse_system_agent`).
+--     operator (`human_operators_refuse_system_agent`), nor given a RETIRED
+--     operator link (`operator_links_refuse_retired_system_agent`): a retired
+--     link is permanent and never promoted, so it would leave the agent
+--     unbindable behind an immutable registration (every workflow write
+--     refused once armed). Every retired-link definer (the bulk legacy-author
+--     tie, the single retire, the attested shared-signer retire) meets it; the
+--     bulk tie refuses as a whole, so `epigraph-operator link-legacy-authors`
+--     excludes every registered system agent itself. A LIVE link is allowed:
+--     it is how the registered agent is bound.
+--   * The guard and both reverse guards take 107 section 10's advisory lock
+--     (`epigraph.operator_links`, which every link definer already takes)
+--     before they read, so a registration and a concurrent link or human
+--     registration of the same agent see each other instead of both
+--     committing. A registration is refused under REPEATABLE READ (its
+--     snapshot would predate that wait; 123's CUS06 reasoning). A human
+--     registration run under REPEATABLE READ concurrently with a registration
+--     of the same agent is the one ordering the lock cannot serialize; 122's
+--     human registration is not changed to refuse it.
 --   * One `security_events` row (`operator.system_agent_registered`) per row,
 --     whatever path inserted it. The `operator.system_agent` event type is
 --     reserved to privileged sessions and maintenance-owned definers
@@ -83,6 +100,7 @@
 -- challenges refuse). Then, as a superuser:
 --   DROP TRIGGER IF EXISTS agents_refuse_registered_system_key ON public.agents;
 --   DROP TRIGGER IF EXISTS human_operators_refuse_system_agent ON public.human_operators;
+--   DROP TRIGGER IF EXISTS operator_links_refuse_retired_system_agent ON public.operator_links;
 --   DROP POLICY IF EXISTS security_events_system_agent_privileged ON public.security_events;
 --   DROP TABLE IF EXISTS public.system_agents;  -- drops its own triggers
 --   DROP FUNCTION IF EXISTS public.epigraph_register_system_agent(text, uuid, text);
@@ -91,6 +109,7 @@
 --   DROP FUNCTION IF EXISTS public.epigraph_system_agents_audit();
 --   DROP FUNCTION IF EXISTS public.epigraph_agents_refuse_registered_system_key();
 --   DROP FUNCTION IF EXISTS public.epigraph_human_operators_refuse_system_agent();
+--   DROP FUNCTION IF EXISTS public.epigraph_operator_links_refuse_retired_system_agent();
 -- `security_events` rows it wrote stay (082: immutable).
 -- DANGER: after a key rotation of a registered agent, an older binary resolves
 -- by the public-constant key again and, once the `agents` guard above is
@@ -142,6 +161,18 @@ BEGIN
         RAISE EXCEPTION 'system_agents: only a maintenance session registers a system agent'
             USING ERRCODE = '42501';
     END IF;
+    -- Section 2: serialize with every link definer and both reverse guards
+    -- BEFORE reading `human_operators` / `operator_links`. Under READ
+    -- COMMITTED the reads after the wait see the other side's commit;
+    -- REPEATABLE READ's snapshot predates the wait, so it is refused.
+    IF current_setting('transaction_isolation') = 'repeatable read' THEN
+        RAISE EXCEPTION 'system_agents: a registration is not written under REPEATABLE READ: its '
+                        'snapshot predates the wait for a concurrent link or human registration '
+                        'of the agent, so neither would see the other'
+            USING ERRCODE = '55000',
+                  HINT = 'Run it under READ COMMITTED (the default) or SERIALIZABLE.';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NEW.reason IS NULL OR length(trim(NEW.reason)) = 0 THEN
         RAISE EXCEPTION 'system_agents: a reason is required' USING ERRCODE = '22004';
     END IF;
@@ -289,6 +320,8 @@ RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 BEGIN
+    -- Section 2: wait for a concurrent registration of the agent, then read.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF EXISTS (SELECT 1 FROM public.system_agents s WHERE s.agent_id = NEW.agent_id) THEN
         RAISE EXCEPTION 'human_operators: % is a registered system agent (migration 148); a '
                         'system agent is never a human operator', NEW.agent_id
@@ -301,6 +334,42 @@ DROP TRIGGER IF EXISTS human_operators_refuse_system_agent ON public.human_opera
 CREATE TRIGGER human_operators_refuse_system_agent
     BEFORE INSERT OR UPDATE OF agent_id ON public.human_operators
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_refuse_system_agent();
+
+-- `operator_links`: a registered system agent is never RETIRE-linked (section
+-- 2). The guard above refuses to register a retired-linked agent; this is the
+-- other order, on the table, so every retired-link definer (107, 116, 122,
+-- 123) meets it without being redefined. A new function; theirs are
+-- unchanged. Fires on UPDATE too, although `operator_links` admits none
+-- (107: no grant, no policy), so a superuser's direct statement meets it.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_links_refuse_retired_system_agent()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_role text;
+BEGIN
+    IF NOT NEW.retired THEN
+        RETURN NEW;
+    END IF;
+    -- Every link definer already holds this lock; a direct statement takes it
+    -- here. Either way a concurrent registration of the agent is waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    SELECT s.role INTO v_role FROM public.system_agents s WHERE s.agent_id = NEW.agent_id;
+    IF FOUND THEN
+        RAISE EXCEPTION 'operator_links: % is a registered system agent (role %, migration 148); '
+                        'a retired link is permanent and would leave it unbindable. Nothing was '
+                        'written', NEW.agent_id, v_role
+            USING ERRCODE = '55000',
+                  HINT = 'Bind it with a LIVE link (epigraph-operator link), or exclude it from '
+                         'the legacy-author tie.';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_refuse_retired_system_agent() FROM PUBLIC;
+DROP TRIGGER IF EXISTS operator_links_refuse_retired_system_agent ON public.operator_links;
+CREATE TRIGGER operator_links_refuse_retired_system_agent
+    BEFORE INSERT OR UPDATE OF retired, agent_id ON public.operator_links
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_refuse_retired_system_agent();
 
 -- Reserve the registration event type (123's RESTRICTIVE shape, scoped to the
 -- one new type, so 122's operator.human_* types are untouched). The row-only
@@ -376,6 +445,8 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_refuse_system_agent() '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_links_refuse_retired_system_agent() '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_register_system_agent(text, uuid, text) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_register_system_agent(text, uuid, text) '
@@ -401,6 +472,8 @@ DO $$ BEGIN
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_agents_refuse_registered_system_key() '
                 'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_human_operators_refuse_system_agent() '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_refuse_retired_system_agent() '
                 'FROM epigraph_app';
     END IF;
 END $$;
