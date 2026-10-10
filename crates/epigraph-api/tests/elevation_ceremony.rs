@@ -22,7 +22,12 @@ mod support;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Extension, Json, Router};
 use chrono::Duration;
+use epigraph_api::middleware::AuthContext;
+use epigraph_api::RouterExtension;
 use epigraph_auth::{AccessTokenBinding, JwtConfig};
 use epigraph_passkey::{AttestationPolicy, PasskeyConfig, Passkeys};
 use reqwest::StatusCode;
@@ -72,6 +77,27 @@ async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
     spawn_on(scoped, passkeys).await
 }
 
+/// [`spawn`], with `extensions` mounted via `create_router_with_extensions`:
+/// the recorder still DECLARES (same application-role pool as `spawn`), so an
+/// elevated read through an extension is recorded exactly as a first-party
+/// one is.
+async fn spawn_with_extensions(
+    pool: &PgPool,
+    passkeys: Option<Passkeys>,
+    extensions: Vec<RouterExtension>,
+) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    spawn_on_with(scoped, passkeys, extensions).await
+}
+
 /// The real router on an application-role pool that declares NO recorder:
 /// the shape of every request unit this tree builds, and of a unit rolled
 /// back to (or left on) a build without the recorder.
@@ -106,11 +132,22 @@ async fn spawn_privileged(pool: &PgPool) -> Server {
 }
 
 async fn spawn_on(scoped: epigraph_db::ScopedPool, passkeys: Option<Passkeys>) -> Server {
+    spawn_on_with(scoped, passkeys, Vec::new()).await
+}
+
+/// [`spawn_on`], with `extensions` mounted through
+/// `create_router_with_extensions` rather than plain `create_router`: the
+/// seam this file's EL-8 recording test exercises.
+async fn spawn_on_with(
+    scoped: epigraph_db::ScopedPool,
+    passkeys: Option<Passkeys>,
+    extensions: Vec<RouterExtension>,
+) -> Server {
     let state =
         epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
             .with_passkeys(passkeys.map(Arc::new));
     let jwt = state.jwt_config.clone();
-    let app = epigraph_api::create_router(state);
+    let app = epigraph_api::create_router_with_extensions(state, extensions);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -2262,6 +2299,92 @@ async fn an_elevated_read_through_the_router_is_recorded_for_its_subject(pool: P
         0,
         "P does not (not B's admin)"
     );
+}
+
+/// An embedder's own state, unrelated to `AppState` — the state kind
+/// `router_extension_seam.rs`'s own convention routes every layer assertion
+/// through, since `RouterExtension::with_state` turns the router into a
+/// separately-stated one before it is nested.
+#[derive(Clone)]
+struct EmbedderState {
+    marker: &'static str,
+}
+
+/// The router-extension seam joins the SAME per-access recorder as a
+/// first-party route: an elevated GET through an extension is served (its
+/// own state and the caller's `AuthContext`, both intact) and recorded as
+/// exactly one log row. `router_extension_seam.rs`'s own elevated-POST tests
+/// (`elevated_post_to_extension_is_refused_as_read_only`,
+/// `elevated_post_to_extension_fallback_is_refused`) pin only
+/// `record_elevated_access`'s method-keyed REFUSAL branch, decided before any
+/// database lookup; this test is the one that exercises its RECORDING branch
+/// through the seam, with a live session (this file's `elevate`).
+///
+/// The surface pin also stands for the seam's known deviation from a
+/// first-party route: axum 0.7.9's `nest_service` leaves no [`MatchedPath`]
+/// for the recorder to read on a nested dispatch (it inserts
+/// `MatchedNestedPath` instead), so `record_elevated_access` falls back to
+/// the raw URI path rather than a route template
+/// (`extensions.rs::mount_all`'s doc comment).
+///
+/// Verified to fail (a) with the recorder changed to WITHHOLD (500) a
+/// request whose `MatchedPath` is absent, instead of falling back to the raw
+/// URI: the elevated extension read would never reach 200. (b) with the
+/// recorder returning `next.run(request)` unrecorded for any path under
+/// [`epigraph_api::EXTENSION_PREFIX`]: `log_of` would stay empty after the
+/// elevated read.
+///
+/// [`MatchedPath`]: axum::extract::MatchedPath
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_through_an_extension_is_recorded_once(pool: PgPool) {
+    let demo = RouterExtension::with_state(
+        "demo",
+        Router::new().route(
+            "/whoami",
+            get(
+                |State(s): State<EmbedderState>, Extension(auth): Extension<AuthContext>| async move {
+                    Json(json!({ "marker": s.marker, "agent": auth.agent_id }))
+                },
+            ),
+        ),
+        EmbedderState { marker: "embedder" },
+    )
+    .expect("valid name");
+    let s = spawn_with_extensions(&pool, Some(software()), vec![demo]).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+
+    // CALIBRATION: unelevated, the extension read is served (own state and
+    // AuthContext both intact) but records nothing.
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.get("/api/v1/ext/demo/whoami", &plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["marker"], json!("embedder"));
+    assert_eq!(body["agent"], json!(p.person.to_string()));
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "an unelevated read through an extension records nothing"
+    );
+
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, body) = s.get("/api/v1/ext/demo/whoami", &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated extension read is served: {body}"
+    );
+    assert_eq!(body["marker"], json!("embedder"));
+    assert_eq!(body["agent"], json!(p.person.to_string()));
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "exactly one row: {log:?}");
+    let (surface, _rows, _groups, args) = &log[0];
+    assert_eq!(
+        surface, "GET /api/v1/ext/demo/whoami",
+        "nest_service leaves no MatchedPath, so the recorder falls back to the raw URI"
+    );
+    assert_eq!(args["path"], json!("/api/v1/ext/demo/whoami"));
+    assert_eq!(args["status"], json!(200));
 }
 
 /// A list's row count is the number of rows the response carried, and its

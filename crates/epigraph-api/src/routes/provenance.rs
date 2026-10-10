@@ -111,6 +111,51 @@ pub async fn set_provenance(
         });
     }
 
+    // ── 1b. A system identity is never an author (migration 148) ─────────
+    // A PRE-PASS, before any write: the loop below commits each author's
+    // edges as it goes (no transaction), so a refusal inside it would leave
+    // the earlier authors attributed. The key is derived with the loop's exact
+    // arguments, so an empty ORCID falls back to the name exactly as it does
+    // there. Refused: the legacy public-constant key of a system role, and any
+    // author that resolves to a REGISTERED system agent under another key.
+    let registered_system_agents = if request.authors.is_empty() {
+        Vec::new()
+    } else {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::DatabaseError {
+            message: e.to_string(),
+        })?;
+        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut conn)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+    };
+    for author in &request.authors {
+        let (_did, public_key) = did_key_for_author(author.orcid.as_deref(), &author.name);
+        let refused = if epigraph_db::is_reserved_author_key(&public_key) {
+            true
+        } else if registered_system_agents.is_empty() {
+            false
+        } else {
+            AgentRepository::get_by_public_key(pool, &public_key)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: e.to_string(),
+                })?
+                .is_some_and(|a| registered_system_agents.contains(&a.id.into()))
+        };
+        if refused {
+            return Err(ApiError::ValidationError {
+                field: "authors".to_string(),
+                reason: format!(
+                    "author {:?} names a system agent's identity; a claim cannot be attributed \
+                     to a system identity. Nothing was written",
+                    author.name
+                ),
+            });
+        }
+    }
+
     let mut author_results: Vec<AuthorAgentResult> = Vec::new();
     let mut edges_created: usize = 0;
 

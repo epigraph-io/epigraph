@@ -1822,6 +1822,50 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // intended (083's case). The table has no row security, so a non-member
     // owner changes nothing else.
     ("epigraph_access_token_revoke", 141),
+    // 148, the system-agent registry. Under a non-member owner the guard's
+    // `operator_links` read is filtered (FORCEd, definer-only), so its
+    // "operates other agents" and "retired operator link" refusals fail OPEN;
+    // its `platform_roles` read (FORCEd) misses the role nodes, so that refusal
+    // fails OPEN too. The audit trigger's `operator.system_agent` row and the
+    // definer's INSERT fail CLOSED (loud: nothing registers). The three guards
+    // on `agents`, `human_operators` and `operator_links` read only
+    // `system_agents`, which has no row security, so they keep refusing under
+    // any owner.
+    ("epigraph_system_agents_guard_insert", 148),
+    ("epigraph_system_agents_immutable", 148),
+    ("epigraph_system_agents_audit", 148),
+    ("epigraph_register_system_agent", 148),
+    ("epigraph_agents_refuse_registered_system_key", 148),
+    ("epigraph_human_operators_refuse_system_agent", 148),
+    ("epigraph_operator_links_refuse_retired_system_agent", 148),
+    // 149, the author-binding allowlist (binding arm (c)). It also re-bodies
+    // `epigraph_author_binding` and `epigraph_human_of` (registered at 122).
+    // The read helper is the control: under a non-member owner its read of the
+    // FORCEd `operator_links` sees NO link, so a linked agent (or an operator of
+    // agents) with a planted allowance would read as allowlisted. That fails
+    // OPEN (the insert guard refuses such a row, but the read-time conjunct is
+    // lost). Its `human_operators`, `oauth_clients` and `system_agents` reads
+    // have no row security and are unaffected.
+    ("epigraph_allowlisted_operator", 149),
+    // The insert and update guards read `operator_links` the same way: under a
+    // non-member owner a linked agent would be admitted (fail-open at write).
+    ("epigraph_author_binding_clients_guard_insert", 149),
+    ("epigraph_author_binding_clients_guard_update", 149),
+    // Reads nothing; registered so the re-own ratchet sees every 149 definer
+    // (it refuses loudly under any owner).
+    ("epigraph_author_binding_clients_refuse_delete", 149),
+    // Its `platform.` INSERT is refused under a non-member owner (123's
+    // restrictive policy), so every allowance and revoke fails CLOSED (loud).
+    ("epigraph_author_binding_clients_audit", 149),
+    // The two maintenance definers: their writes meet the table's grants and
+    // the audit above, so a wrong owner fails loudly.
+    ("epigraph_allow_author_binding_client", 149),
+    ("epigraph_revoke_author_binding_client", 149),
+    // The link guard runs inside a definer frame on a FORCEd table: under a
+    // non-member owner its `operator_links` read is filtered, so the re-link
+    // skip never fires, while the allowance read still works (loud refusals
+    // only).
+    ("epigraph_operator_links_refuse_allowlisted_agent", 149),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2130,6 +2174,30 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_revoke_human_operator",
             "public.epigraph_revoke_human_operator(uuid, text)",
+            false,
+        ),
+        // Registering a system agent (migration 148) is a maintenance act.
+        (
+            "epigraph_register_system_agent",
+            "public.epigraph_register_system_agent(text, uuid, text)",
+            false,
+        ),
+        // 149 (the author-binding allowlist): allowing and revoking a client
+        // are maintenance acts, and the read helper is reached only through
+        // the two re-bodied binding reads above.
+        (
+            "epigraph_allow_author_binding_client",
+            "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_revoke_author_binding_client",
+            "public.epigraph_revoke_author_binding_client(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_allowlisted_operator",
+            "public.epigraph_allowlisted_operator(uuid)",
             false,
         ),
         // A link function: the request DSN must never record links.

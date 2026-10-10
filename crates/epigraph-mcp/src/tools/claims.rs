@@ -980,16 +980,23 @@ pub async fn get_claim(
 /// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
 /// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
 /// carried on the claim, so the comparison decides nothing — reported as
-/// [`HashCheck::NotApplicable`] rather than as a mismatch. Workflow thesis,
-/// phase and step rows written since backlog 6178a205 bind the same kind of
-/// digest (seed `canonical_name`) and carry a `content_hash_scope` marker; rows
-/// written before it keep the plain digest, carry no marker, and are compared
+/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+///
+/// Workflow thesis, phase and step rows written since backlog 6178a205 bind the
+/// same kind of digest with seed `canonical_name` and carry a
+/// `content_hash_scope` marker. That seed IS recoverable: the workflow that
+/// wrote the row links it with an `executes` edge in the same transaction, so
+/// the digest is re-derived from the executing workflows' `canonical_name`s and
+/// the answer is `match` / `mismatch` like a plain row. Only a marked row with no
+/// visible executing workflow stays `not_applicable`. Workflow rows written
+/// before 6178a205 keep the plain digest, carry no marker, and are compared
 /// normally.
 ///
-/// The seed is deliberately NOT guessed back. `verify_claim` was filed as
-/// theatre (backlog `49c17386`) for asserting certainty it did not have;
+/// A document seed is deliberately NOT guessed back. `verify_claim` was filed
+/// as theatre (backlog `49c17386`) for asserting certainty it did not have;
 /// recomputing a compound digest from an inferred seed would reintroduce
-/// exactly that, one level deeper.
+/// exactly that, one level deeper. The workflow seed is read off the graph, and
+/// a match against it requires a blake3 preimage of the stored digest.
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1023,7 +1030,26 @@ pub async fn verify_claim(
             .await
             .map_err(internal_error)?
             .unwrap_or(serde_json::Value::Null);
-        if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
+        if epigraph_ingest::document::stored_content_hash_is_canonical_name_scoped(&properties) {
+            // Workflow structural row: the seed is the canonical_name of the
+            // workflow that executes it — recovered from the edge, not guessed.
+            let names = epigraph_db::WorkflowRepository::executing_canonical_names(
+                &server.pool,
+                viewer,
+                id,
+            )
+            .await
+            .map_err(internal_error)?;
+            match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
+                &claim.content,
+                &claim.content_hash,
+                names.iter().map(String::as_str),
+            ) {
+                Some(true) => HashCheck::Match,
+                Some(false) => HashCheck::Mismatch,
+                None => HashCheck::NotApplicable,
+            }
+        } else if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
             HashCheck::NotApplicable
         } else {
             HashCheck::Mismatch

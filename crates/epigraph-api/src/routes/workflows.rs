@@ -1840,7 +1840,8 @@ pub async fn ingest_workflow(
 // ── Internal helpers ──
 
 /// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
-/// **`workflow-ingest-system`** agent's viewer.
+/// **workflow-ingest system agent's** viewer (the agent migration 148's
+/// `system_agents` registry names; see `get_or_create_system_agent`).
 ///
 /// The HTTP twin of `epigraph-mcp`'s
 /// `claim_helper::begin_system_ingest_stamped_tx`, and identical in substance:
@@ -1954,27 +1955,25 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
     Ok(tx)
 }
 
+/// The workflow-ingest system agent, for `routes/policies.rs::create_challenge`.
+///
+/// Delegates to [`epigraph_ingest_executor::get_or_create_system_agent`], the
+/// ONE resolver (migration 148: the registered agent, a refusal on an armed
+/// database with no registration, the public-constant key only on an unarmed
+/// unregistered one). A second copy of the key lookup here would keep policy
+/// challenges on the pre-148 rule while workflow ingest moved, and after a key
+/// rotation it would try to re-create the public-constant identity
+/// (`system_agent_single_resolver.rs` pins that this body holds no such copy).
 #[cfg(feature = "db")]
 pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
-    let (_did, pub_key_bytes) =
-        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
-    if let Some(a) = epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+    let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })?;
+    epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
-        })?
-    {
-        Ok(a.id.as_uuid())
-    } else {
-        let agent =
-            epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
-        let created = epigraph_db::AgentRepository::create(pool, &agent)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })?;
-        Ok(created.id.as_uuid())
-    }
+        })
 }
 
 #[cfg(feature = "db")]
@@ -1993,7 +1992,7 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
 /// `system_agent_id` from the executor result.
-/// Stamped from the `workflow-ingest-system` agent's viewer, like the plan walk
+/// Stamped from the workflow-ingest system agent's viewer, like the plan walk
 /// it follows: the `claim_frames` / `mass_functions` / cached-belief rows it
 /// writes are claim-derived, so migrations 074/070 fill their tenancy from the
 /// ingest's own claims and the `WITH CHECK` asks about the SYSTEM agent's group.
@@ -2591,8 +2590,10 @@ mod tests {
             .with_state(state)
     }
 
-    /// Insert a system agent (mirrors `get_or_create_system_agent` but without
-    /// going through the public API) and return its id.
+    /// Find or insert an agent holding the all-zero key, straight into `agents`,
+    /// to stand in as a system author for these unit tests. It is NOT the
+    /// registered workflow-ingest agent and never goes through
+    /// `get_or_create_system_agent` (migration 148's registry).
     async fn ensure_system_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![0u8; 32];
         // Try existing first

@@ -23,6 +23,22 @@ closed set by design.
   `episcience` is the reference implementation. Do **not** add federated tools
   to `SCOPE_MAP` — they are gated by the `scope=` in the env var instead.
 
+## Adding HTTP routes from a downstream product
+
+The MCP surface is extended by federation (above). The REST surface is
+extended in-process: an embedder that runs `epigraph-api` as a library passes
+`RouterExtension`s to `create_router_with_extensions`, and each is mounted at
+`/api/v1/ext/<name>` inside the authenticated router (bearer, per-access
+recorder, body limit, rate limit). The recorder logs an extension access
+under its raw request path, not a route template (`nest_service` leaves no
+`MatchedPath`). The recorder refuses an elevated token by method only
+(anything but GET, HEAD and OPTIONS), so an extension handler must never write
+on GET, HEAD or OPTIONS, including in `.fallback()` and `any()`. Scope checks
+and tenancy are the extension's own job; see
+`crates/epigraph-api/src/routes/extensions.rs`.
+Never register a first-party route under `/api/v1/ext`
+(`tests/router_extension_seam_lint.rs` fails if you do).
+
 ## Retiring backlog items
 
 When you complete or refute a claim labelled `backlog`, **always use

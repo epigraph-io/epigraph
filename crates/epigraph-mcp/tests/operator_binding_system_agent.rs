@@ -3,7 +3,8 @@
 //! The workflow executor authors every workflow and step claim as ONE system
 //! agent, stamped from that agent's own viewer. It is not a human, so once a
 //! database is armed its writes are refused unless it holds a LIVE link; the
-//! deploy order live-links it before arming. And because the claims trigger
+//! deploy order registers it (migration 148: once armed, an unregistered
+//! system agent is refused outright) and live-links it before arming. And because the claims trigger
 //! sees only that shared identity, the request path binds the CALLER itself
 //! (`claim_helper::begin_system_ingest_stamped_tx`, review SEC-3): an unbound
 //! caller is refused (OPL01) even though the system agent is bound, and a
@@ -99,6 +100,8 @@ async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(poo
             .await
             .expect("system agent")
     };
+    // Migration 148: registered before arming, as the deploy order does.
+    assert!(fixture::register_system_agent(&pool, system).await);
     let server = app_role_server(&pool, 0xA7).await;
     let other = app_role_server(&pool, 0xB7).await;
 

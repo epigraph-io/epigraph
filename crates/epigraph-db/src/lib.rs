@@ -79,6 +79,7 @@ pub use pool::{
     ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
     MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
+pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
@@ -134,6 +135,8 @@ pub use repos::{
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
+pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
+pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
     ClaimPlacement, ClusterRunRepository, ClusterRunRow, EgoEdgeRow, EgoEdges, EgoEntity,

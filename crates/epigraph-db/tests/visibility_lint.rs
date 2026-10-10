@@ -1369,7 +1369,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
-         NULL) for the NAMED agent; 122 section 5 records the one bit it adds (human-ness).",
+         'client_allowlist' (migration 149) / NULL) for the NAMED agent; 122 section 5 records \
+         the one bit it adds (human-ness), and 149 one more (allowlisted-ness).",
     ),
     (
         "agent.rs",
@@ -1457,6 +1458,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          row security and no policy, as `find_root_by_canonical` records, so there is nothing \
          for a viewer to filter; the ingest entry points call it on the plan walk's own \
          transaction to decide which existing rows need the caller's authority.",
+    ),
+    (
+        "system_agent.rs",
+        "lookup",
+        "READ of migration 148's `system_agents` row for one role, with \
+         `epigraph_operator_binding_armed()`: an AUTHORITY record mapping a system role to an \
+         agent, not a corpus row. It has no `visibility` / `owner_group_id` and no row security \
+         by design, and the workflow-ingest resolvers read it on the system-agent-stamped \
+         connection, so there is nothing for a viewer to filter.",
+    ),
+    (
+        "system_agent.rs",
+        "registered_agent_ids",
+        "READ of every `system_agents.agent_id` (migration 148; one row per system role): the \
+         author-name loops' check that a document never adopts a registered system agent as its \
+         author. An authority record with no tenancy columns and no row security; nothing for \
+         a viewer to filter.",
     ),
     (
         "claim.rs",
@@ -1761,6 +1779,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          id. Its dedup probe is the write-path read `create_or_get` documents (it must see an \
          existing edge whoever asks, or the get half becomes a duplicate create); the INSERT is \
          authorised by edges_tenancy's WITH CHECK on the stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_row_conn",
+        "WRITE. The HTTP route's form of create_symmetric_if_absent_oriented_conn (POST \
+         /api/v1/edges for symmetric claim/claim relationships), returning the stored row. Same \
+         argument: a write-path dedup probe plus an INSERT authorised by edges_tenancy's WITH \
+         CHECK on the caller's stamped transaction.",
     ),
     (
         "edge.rs",
@@ -2596,6 +2622,56 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO NOTHING`. \
          `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
          workflow row cannot survive the rollback of the plan walk that wrote it.",
+    ),
+    // ── U017 (backlog fe874d2a): `deprecate_workflow` retires a hierarchical
+    //    workflow as a unit, on the ingest system agent's stamped transaction.
+    (
+        "claim.rs",
+        "deprecate_claim_if_current",
+        "UPDATE `claims` with `deprecate_claim`'s SET list plus `AND is_current`, so \
+         `rows_affected` means the call retired the row. A write by primary key: the control is \
+         `claims_tenancy`'s `WITH CHECK` against the connection's GUCs (the hierarchical \
+         `deprecate_workflow` runs it on the ingest system agent's stamp, after the workflow \
+         authority rule admitted the caller), exactly as for `deprecate_claim` above.",
+    ),
+    (
+        "workflow.rs",
+        "set_truth_value_if_changed",
+        "UPDATE `workflows` SET `truth_value` WHERE it differs, so `rows_affected` means the \
+         state changed. `workflows` has no row security and no policy (see `set_truth_value`), \
+         so there is nothing for a viewer to filter; the caller's authority is \
+         `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "exists",
+        "READ of `workflows` only: whether a row with this id exists, for `deprecate_workflow`'s \
+         dispatch between a flat claim and a hierarchical row. `workflows` has no row security \
+         and no policy, so the answer is the same on every connection.",
+    ),
+    (
+        "workflow.rs",
+        "lineage_descendants",
+        "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
+         set of `deprecate_workflow`). `workflows` has no row security and no policy; it reads \
+         `parent_id` rather than `edges` precisely so no tenancy filter can truncate the walk.",
+    ),
+    (
+        "workflow.rs",
+        "lock_lineages_for_deprecation",
+        "READ of `workflows` only, `FOR UPDATE`: locks the rows sharing a `canonical_name` with \
+         a deprecation's targets, so two concurrent deprecations cannot each keep a claim the \
+         other retires. `workflows` has no row security and no policy, so there is nothing for \
+         a viewer to filter; the caller's authority is `require_workflow_authority`.",
+    ),
+    (
+        "workflow.rs",
+        "executed_structural_claims",
+        "READ of `edges`/`claims`/`workflows`: the level 0-2 claims a hierarchical workflow \
+         `executes`, each with whether another live workflow executes it. It plans the WRITE \
+         that follows (carries a `VISIBILITY-EXEMPT: WRITE path` note), on the ingest system \
+         agent's stamped transaction that owns these claims; the caller's authority is the \
+         workflow authority rule, not read visibility, so no caller viewer is spliced.",
     ),
 ];
 

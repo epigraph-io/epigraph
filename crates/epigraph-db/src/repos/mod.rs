@@ -74,6 +74,7 @@ pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
 pub mod structural;
+pub mod system_agent;
 pub mod task;
 pub mod trace;
 pub mod triple;
@@ -93,6 +94,7 @@ pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
 };
+pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
@@ -175,8 +177,8 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit,
-    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    ExecutedClaim, HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories
@@ -201,6 +203,7 @@ pub use revoked_access_token::RevokedAccessTokenRepository;
 pub use role_assignment::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
+pub use system_agent::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};
 

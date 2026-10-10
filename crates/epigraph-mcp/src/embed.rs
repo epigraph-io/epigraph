@@ -224,7 +224,8 @@ impl McpEmbedder {
     /// writable set can satisfy the check, and it is NOT `server.agent_id()` for
     /// most of this type's callers: `epigraph_ingest_executor`'s
     /// `execute_workflow_ingest_plan`, `add_step` and `improve_workflow_hierarchy`
-    /// all author as `get_or_create_system_agent(pool)`. A signature that took the
+    /// all author as the workflow-ingest system agent
+    /// (`get_or_create_system_agent`). A signature that took the
     /// author from the caller would have let `store_workflow` pass the MCP
     /// server's agent, produce a session stamped with the WRONG writable group,
     /// and be refused exactly as before — silently, because the embed is

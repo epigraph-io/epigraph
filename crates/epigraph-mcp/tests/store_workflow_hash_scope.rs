@@ -289,30 +289,89 @@ async fn run_verify(pool: &PgPool, claim_id: Uuid) -> Value {
     first_text(&result)
 }
 
-/// An UNTAMPERED step written by `store_workflow` stores a digest that is not
-/// `blake3(content)` by construction, so `verify_claim` must answer
-/// `not_applicable`, never accuse it of tampering with `mismatch`.
-#[sqlx::test(migrations = "../../migrations")]
-async fn verify_claim_on_stored_workflow_step_is_not_a_mismatch(pool: PgPool) {
-    let server = server(&pool).await;
-    let step = format!("verify probe step {}", Uuid::new_v4());
-    let (wf, _) = store(
+/// The canonical_name-scoped rows the two new writers produce, labelled.
+///
+/// TWO stored workflows that share the "Body" phase text and a step text, plus
+/// an `add_step` row on the second: every labelled row's seed is a DIFFERENT
+/// canonical_name from at least one other row with the same body, so a
+/// verifier that recovered the wrong workflow's name (or any one fixed name)
+/// would disagree with the stored digest on some of them.
+async fn new_workflow_rows(pool: &PgPool) -> Vec<(&'static str, Uuid)> {
+    let server = server(pool).await;
+    let goal_a = format!("new goal A {}", Uuid::new_v4());
+    let (wf_a, _) = store(&server, pool, &goal_a, &[SHARED_STEP])
+        .await
+        .expect("store_workflow A");
+    let (wf_b, name_b) = store(
         &server,
-        &pool,
-        &format!("verify probe goal {}", Uuid::new_v4()),
-        &[step.as_str()],
+        pool,
+        &format!("new goal B {}", Uuid::new_v4()),
+        &[SHARED_STEP],
     )
     .await
-    .expect("store_workflow");
-    let (step_id, _, _) = executed_claim(&pool, wf, 2, &step).await;
+    .expect("store_workflow B");
 
-    let resp = run_verify(&pool, step_id).await;
-    assert_eq!(
-        resp["hash_check"],
-        Value::String("not_applicable".to_string()),
-        "a workflow step's stored digest is scoped to its canonical_name: {resp}"
-    );
-    assert_eq!(resp["hash_matches"], Value::Null, "{resp}");
+    let added_step = format!("new added step {}", Uuid::new_v4());
+    let stdio = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("the server agent's stdio viewer");
+    let added = epigraph_mcp::tools::step_ops::add_step(
+        &server,
+        &stdio,
+        AddStepParams {
+            canonical_name: name_b,
+            step_text: added_step,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add_step");
+    let added_id = parse_uuid_field(&first_text(&added), "step_claim_id");
+
+    vec![
+        (
+            "store_workflow A thesis (level 0)",
+            executed_claim(pool, wf_a, 0, &goal_a).await.0,
+        ),
+        (
+            "store_workflow A Body phase (level 1)",
+            executed_claim(pool, wf_a, 1, "Body").await.0,
+        ),
+        (
+            "store_workflow A step (level 2)",
+            executed_claim(pool, wf_a, 2, SHARED_STEP).await.0,
+        ),
+        (
+            "store_workflow B Body phase (level 1)",
+            executed_claim(pool, wf_b, 1, "Body").await.0,
+        ),
+        (
+            "store_workflow B step (level 2)",
+            executed_claim(pool, wf_b, 2, SHARED_STEP).await.0,
+        ),
+        ("add_step step on B (level 2)", added_id),
+    ]
+}
+
+/// An UNTAMPERED row written by `store_workflow` or `add_step` stores
+/// `compound_content_hash(blake3(content), canonical_name)`, and the seed is
+/// RECOVERABLE: the workflow that wrote the row links it with an `executes`
+/// edge in the same transaction. So `verify_claim` re-derives the digest and
+/// answers `match` — not `not_applicable` (no integrity evidence) and never
+/// `mismatch` (a false tampering accusation).
+#[sqlx::test(migrations = "../../migrations")]
+async fn untampered_new_workflow_rows_verify_match(pool: PgPool) {
+    for (shape, id) in new_workflow_rows(&pool).await {
+        let resp = run_verify(&pool, id).await;
+        assert_eq!(
+            resp["hash_check"],
+            Value::String("match".to_string()),
+            "{shape}: the digest is re-derivable from the executing workflow's \
+             canonical_name, so an intact body must verify: {resp}"
+        );
+        assert_eq!(resp["hash_matches"], Value::Bool(true), "{shape}: {resp}");
+    }
 }
 
 /// Workflow rows written BEFORE this change keep their plain digest and must
@@ -501,65 +560,104 @@ async fn tampered_legacy_workflow_rows_report_mismatch(pool: PgPool) {
     }
 }
 
-/// The accepted cost of the fix, pinned for BOTH new writers: a tampered row
-/// that `store_workflow` (the builder) or `add_step` wrote with a
-/// canonical_name-scoped digest is reported `not_applicable` — undecided — and
-/// never as a positive match. The workflow twin of
-/// `verify_claim_after_document_ingest::a_tampered_spine_row_is_reported_undecided_not_clean`.
+/// A TAMPERED row written by `store_workflow` (the builder) or `add_step` with a
+/// canonical_name-scoped digest must report `mismatch`.
+///
+/// The seed is not carried on the claim, but it is not unknown either: the
+/// workflow that wrote the row links it with an `executes` edge, so the digest
+/// can be re-derived from the workflow's own `canonical_name` and a mutated body
+/// is detectable. Reporting `not_applicable` here would leave every post-
+/// 6178a205 workflow phase and step body without tamper detection — the
+/// security-review finding this pins.
 ///
 /// It also pins that `add_step` marks its row: an unmarked `add_step` row would
-/// fall out of the seed-scoped class and report `mismatch` here.
+/// be compared as a plain digest and report `mismatch` even untampered, which
+/// `untampered_new_workflow_rows_verify_match` catches.
 #[sqlx::test(migrations = "../../migrations")]
-async fn tampered_new_workflow_rows_are_reported_undecided_not_clean(pool: PgPool) {
-    let server = server(&pool).await;
-    let stored_step = format!("new stored step {}", Uuid::new_v4());
-    let (wf, name) = store(
-        &server,
-        &pool,
-        &format!("new goal {}", Uuid::new_v4()),
-        &[stored_step.as_str()],
-    )
-    .await
-    .expect("store_workflow");
-
-    let added_step = format!("new added step {}", Uuid::new_v4());
-    let stdio = epigraph_mcp::tools::viewer::request_viewer(&server, None)
-        .await
-        .expect("the server agent's stdio viewer");
-    let added = epigraph_mcp::tools::step_ops::add_step(
-        &server,
-        &stdio,
-        AddStepParams {
-            canonical_name: name,
-            step_text: added_step.clone(),
-            position: None,
-        },
-        None,
-    )
-    .await
-    .expect("add_step");
-    let added_id = parse_uuid_field(&first_text(&added), "step_claim_id");
-
-    let (body_id, _, _) = executed_claim(&pool, wf, 1, "Body").await;
-    let (stored_id, _, _) = executed_claim(&pool, wf, 2, &stored_step).await;
-    for (shape, id) in [
-        ("store_workflow phase", body_id),
-        ("store_workflow step", stored_id),
-        ("add_step step", added_id),
-    ] {
+async fn tampered_new_workflow_rows_report_mismatch(pool: PgPool) {
+    for (shape, id) in new_workflow_rows(&pool).await {
         let resp = tamper_and_verify(&pool, id).await;
         assert_eq!(
             resp["hash_check"],
-            Value::String("not_applicable".to_string()),
-            "{shape}: the stored digest is scoped to canonical_name, so a body/digest \
-             comparison decides nothing: {resp}"
+            Value::String("mismatch".to_string()),
+            "{shape}: the canonical_name seed is recoverable from the executing \
+             workflow, so a mutated body is evidence of tampering: {resp}"
         );
-        assert_eq!(
-            resp["hash_matches"],
-            Value::Null,
-            "{shape}: undecided, never a positive match: {resp}"
-        );
+        assert_eq!(resp["hash_matches"], Value::Bool(false), "{shape}: {resp}");
     }
+}
+
+/// A scope-marked row whose seed CANNOT be recovered — no visible `executes`
+/// edge from any workflow — stays `not_applicable`, whether or not its body
+/// was altered: with no seed there is nothing to re-derive, and neither verdict
+/// may be manufactured. Untampered it must not be accused (`mismatch`);
+/// tampered it must not be cleared (`match`).
+///
+/// The orphan's digest is seeded with the `canonical_name` of a REAL workflow
+/// in the same database — one that does not execute the row. So the seed must
+/// come from THIS row's `executes` edges: a lookup that ignored the edge's
+/// target (and returned every workflow's name) would recover that name and
+/// answer `match` / `mismatch` here instead of `not_applicable`. A seed name no
+/// workflow carries could not tell the two apart.
+#[sqlx::test(migrations = "../../migrations")]
+async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: PgPool) {
+    use epigraph_ingest::workflow::builder::{
+        CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY,
+    };
+    let (_unrelated_wf, unrelated_name) = store(
+        &server(&pool).await,
+        &pool,
+        &format!("unrelated goal {}", Uuid::new_v4()),
+        &["An unrelated step"],
+    )
+    .await
+    .expect("store an unrelated workflow");
+    let agent = seed_agent(&pool).await;
+    let body = format!("orphan marked step {}", Uuid::new_v4());
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, \
+                             is_current, properties) \
+         VALUES ($1, $2, $3, 0.5, $4, ARRAY[]::text[], true, $5)",
+    )
+    .bind(id)
+    .bind(&body)
+    .bind(compound_content_hash(&content_hash(&body), &unrelated_name).as_slice())
+    .bind(agent)
+    .bind(
+        serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
+                             CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME}),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed marked orphan step");
+    let executes_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'executes'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count executes edges");
+    assert_eq!(
+        executes_edges, 0,
+        "the orphan must have no executing workflow"
+    );
+
+    let untampered = run_verify(&pool, id).await;
+    assert_eq!(
+        untampered["hash_check"],
+        Value::String("not_applicable".to_string()),
+        "no executing workflow, so no seed: an intact body must not be accused: {untampered}"
+    );
+    assert_eq!(untampered["hash_matches"], Value::Null, "{untampered}");
+
+    let tampered = tamper_and_verify(&pool, id).await;
+    assert_eq!(
+        tampered["hash_check"],
+        Value::String("not_applicable".to_string()),
+        "no executing workflow, so no seed: undecided, never a positive match: {tampered}"
+    );
+    assert_eq!(tampered["hash_matches"], Value::Null, "{tampered}");
 }
 
 /// A step text equal to another workflow's OPERATION ATOM text must not
@@ -616,4 +714,148 @@ async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPo
         compound_content_hash(&content_hash(&shared), &name_b).to_vec(),
         "the step row must store compound_content_hash(blake3(text), canonical_name)"
     );
+}
+
+/// Soft-retracting the `executes` edge (`EdgeRepository::retract`, which MCP
+/// `delete_edge` reaches) must not downgrade a tampered workflow row from
+/// `mismatch` to `not_applicable`.
+///
+/// The seed is a fact about which workflow WROTE the row, and a retraction does
+/// not change it, so `WorkflowRepository::executing_canonical_names`
+/// deliberately has no `e.valid_to IS NULL` filter. A tidy-up that added the
+/// house-style filter would give anyone who can retract the edge a way to hide
+/// tampering: both verdicts below would become `not_applicable`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracting_the_executes_edge_does_not_mask_tampering(pool: PgPool) {
+    let server = server(&pool).await;
+    let step = format!("retracted-edge step {}", Uuid::new_v4());
+    let (wf, _) = store(
+        &server,
+        &pool,
+        &format!("retracted-edge goal {}", Uuid::new_v4()),
+        &[step.as_str()],
+    )
+    .await
+    .expect("store_workflow");
+    let (id, _, _) = executed_claim(&pool, wf, 2, &step).await;
+
+    let open_edges: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM edges \
+          WHERE target_id = $1 AND relationship = 'executes' AND valid_to IS NULL",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .expect("read the step's open executes edges");
+    assert!(
+        !open_edges.is_empty(),
+        "store_workflow must link its step with an executes edge"
+    );
+    let closed = epigraph_db::EdgeRepository::retract(&pool, &open_edges)
+        .await
+        .expect("retract the executes edges");
+    assert_eq!(
+        closed.len(),
+        open_edges.len(),
+        "every executes edge retracted"
+    );
+    let still_open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE target_id = $1 AND relationship = 'executes' AND valid_to IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count open executes edges");
+    assert_eq!(still_open, 0, "no live executes edge may remain");
+
+    let untampered = run_verify(&pool, id).await;
+    assert_eq!(
+        untampered["hash_check"],
+        Value::String("match".to_string()),
+        "a retracted executes edge still names the workflow that wrote the row: {untampered}"
+    );
+
+    let tampered = tamper_and_verify(&pool, id).await;
+    assert_eq!(
+        tampered["hash_check"],
+        Value::String("mismatch".to_string()),
+        "retracting the executes edge must not hide a mutated body: {tampered}"
+    );
+    assert_eq!(tampered["hash_matches"], Value::Bool(false), "{tampered}");
+}
+
+/// Patching the `content_hash_scope` marker onto a TAMPERED legacy plain-hash
+/// row that a workflow executes must still report `mismatch`.
+///
+/// `patch_claim` merges caller-supplied properties into the row, so a caller
+/// with patch rights can add the marker to a legacy workflow row. Before the
+/// re-derivation, a marked row was `not_applicable` whatever its body, so the
+/// marker hid tampering. Now the digest is re-derived from the executing
+/// workflow's `canonical_name`, which a plain digest does not reproduce, so the
+/// verdict stays `mismatch`. This backs the claim in the
+/// `stored_content_hash_is_seed_scoped` doc
+/// (`epigraph_ingest::document::builder`). The merge is modelled with the same
+/// `properties || patch` jsonb merge, because `patch_claim` would also demand
+/// ownership checks that are beside the point here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_row_patched_with_the_scope_marker_still_reports_mismatch(pool: PgPool) {
+    use epigraph_ingest::workflow::builder::{
+        CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY,
+    };
+    let agent = seed_agent(&pool).await;
+    let tag = Uuid::new_v4().to_string();
+    let name = format!("patched-legacy-wf-{tag}");
+    let extraction = legacy_extraction(&name, &tag);
+    let step = format!("legacy step {tag}");
+    let phase = format!("legacy phase {tag}");
+    let id = compound_claim_id(&content_hash(&step), &name);
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, \
+                             is_current, properties) \
+         VALUES ($1, $2, $3, 0.5, $4, ARRAY[]::text[], true, $5)",
+    )
+    .bind(id)
+    .bind(&step)
+    .bind(content_hash(&step).as_slice())
+    .bind(agent)
+    .bind(
+        serde_json::json!({"level": 2, "source_type": "workflow", "phase": phase,
+                             "rationale": "", "kind": "workflow_step",
+                             "step_lineage_id": Uuid::new_v4().to_string()}),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed legacy plain-hash step");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(&pool, &viewer, &extraction)
+        .await
+        .expect("re-ingest the legacy workflow");
+    let executes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'executes'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count executes edges");
+    assert!(
+        executes > 0,
+        "the re-ingest must link the legacy step to its workflow"
+    );
+
+    sqlx::query("UPDATE claims SET properties = properties || $2 WHERE id = $1")
+        .bind(id)
+        .bind(serde_json::json!({CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME}))
+        .execute(&pool)
+        .await
+        .expect("merge the scope marker the way patch_claim merges properties");
+
+    let resp = tamper_and_verify(&pool, id).await;
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("mismatch".to_string()),
+        "a patched-on scope marker must not hide a mutated legacy body: {resp}"
+    );
+    assert_eq!(resp["hash_matches"], Value::Bool(false), "{resp}");
 }

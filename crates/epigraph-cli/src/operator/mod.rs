@@ -27,8 +27,13 @@
 //!   agent is bound to a human operator. Hosts run it before spawning an agent,
 //!   because under D9 the agent's own app DSN cannot record the link.
 //!
+//! * `register-system-agent` — record which agent IS a system role (migration
+//!   148), e.g. the workflow-ingest system agent; immutable once applied, and
+//!   refused under `--apply` for an agent whose key is no longer the role's
+//!   legacy key unless `--key-not-legacy-ok` (see [`system_agent`]).
 //! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
-//!   unbound agent that wrote recently (see [`arm`]).
+//!   unbound agent that wrote recently and every unregistered system role
+//!   (see [`arm`]).
 //! * `link-legacy-authors` — tie every legacy author to a named human operator with
 //!   a RETIRED link, in one audited definer call (see [`legacy`]).
 //! * `reown-linked` — move the claims a linked author's OWN personal group owns
@@ -107,6 +112,7 @@
 pub mod admin_scopes;
 pub mod arm;
 pub mod bind;
+pub mod binding_client;
 pub mod client_scope;
 pub mod confirmations;
 pub mod custodian;
@@ -120,6 +126,7 @@ pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
 pub mod reverse;
+pub mod system_agent;
 pub mod tables;
 
 use anyhow::{anyhow, bail, Context};
