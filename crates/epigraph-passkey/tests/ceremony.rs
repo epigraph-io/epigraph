@@ -11,8 +11,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use epigraph_passkey::{
-    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, StoredPasskey,
-    Verifier,
+    AttestationPolicy, AuthenticationState, PasskeyConfig, PasskeyError, Passkeys,
+    RegistrationState, StoredPasskey, Verifier,
 };
 use serde_json::Value;
 use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
@@ -373,6 +373,53 @@ async fn an_assertion_without_user_verification_is_refused() {
         ),
         "{err:?}"
     );
+}
+
+/// Every `policy` / `registration_policy` string in a stored state set to
+/// `discouraged`: a state downgraded so the LIBRARY would accept an assertion
+/// without user verification (the stored state is a database row the
+/// application DSN writes).
+fn downgrade(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if (k == "policy" || k == "registration_policy") && val.is_string() {
+                    *val = Value::from("discouraged");
+                } else {
+                    downgrade(val);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(downgrade),
+        _ => {}
+    }
+}
+
+/// D5 is the CRATE's rule, not only the stored state's: with the stored
+/// authentication state downgraded to a user-verification policy the library
+/// itself would accept, an assertion WITHOUT user verification is still
+/// refused `UserNotVerified` by `finish_authentication`'s own check (final
+/// review F1-TST-02; the test above is satisfied by the library refusing on
+/// the state's policy, so it never reached that check).
+///
+/// Verified to fail with `finish_authentication`'s `if !res.user_verified()`
+/// check removed (review mutant m11): the downgraded assertion is accepted.
+#[tokio::test]
+async fn a_downgraded_state_does_not_admit_an_assertion_without_user_verification() {
+    let rp = software();
+    let (mut auth, stored) = registered(&rp).await;
+    let (mut options, state) = rp
+        .start_authentication(std::slice::from_ref(&stored), None)
+        .unwrap();
+    let mut json = state.to_json();
+    let before = json.clone();
+    downgrade(&mut json);
+    assert_ne!(json, before, "CALIBRATION: the state carried a policy");
+    let state = AuthenticationState::from_json(json);
+    options["publicKey"]["userVerification"] = Value::from("discouraged");
+    let response = auth.authenticate(ORIGIN, options).await;
+    let err = rp.finish_authentication(&response, &state).unwrap_err();
+    assert!(matches!(err, PasskeyError::UserNotVerified), "{err:?}");
 }
 
 /// The challenge override is what the authenticator signs and what the
