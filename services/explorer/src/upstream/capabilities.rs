@@ -22,7 +22,16 @@
 //! viewer's own slots or the global permits are all taken, it is not sent,
 //! and the answer is `Unknown` ([`UpstreamError::Busy`]). So a probe that was
 //! sent had its whole deadline in flight, and a timeout it meets is the
-//! API's, not the time it spent behind one viewer's other calls.
+//! API's, not the time it spent queued behind other calls.
+//!
+//! The two kinds of busy differ in reach. The viewer's own slots are that
+//! viewer's alone. The global permits are shared by every viewer, and all
+//! anonymous viewers share one per-viewer cap, so a few slow calls from other
+//! viewers can hold every global permit. While they do, every signed-in
+//! viewer's probe finds no permit and every page hides the feature, until
+//! the calls end. That costs only the nav item: the feature's own page still
+//! works when visited directly, and the same calls already slow every page.
+//! It is never remembered, so it ends when the calls do.
 //!
 //! An `Unknown` is remembered only when the API itself caused it (5xx, 429,
 //! timeout, transport: [`is_api_side`]), and then only for
@@ -30,10 +39,11 @@
 //! calls, so without that memory an API that answers the probe slowly or
 //! with errors would add a full upstream deadline to every page, and a
 //! rate-limited one would get one extra request per page. An `Unknown` that
-//! came from one viewer's session (401, session expired, its slots busy) or
-//! from an answer of the wrong shape is never remembered: it says nothing
-//! about the deployment, and remembering it would hide the feature from
-//! everyone.
+//! came from one viewer's session (401, session expired, its slots busy),
+//! from the Explorer's own load (no free global permit) or from an answer of
+//! the wrong shape is never remembered: it says nothing about the
+//! deployment, and remembering it would hide the feature from everyone for
+//! the whole TTL.
 //! A remembered `Unknown` never replaces a fresh `Present` or `Absent`.
 
 use std::sync::Mutex;

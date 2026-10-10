@@ -25,9 +25,10 @@ mod common;
 use axum::Router;
 use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, BASE};
+use epigraph_explorer::auth::RequestAuth;
 use epigraph_explorer::config::{
     ENV_DEV_BEARER, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL, ENV_SESSION_CONCURRENCY,
-    ENV_UPSTREAM_TIMEOUT_MS,
+    ENV_UPSTREAM_CONCURRENCY, ENV_UPSTREAM_TIMEOUT_MS,
 };
 use epigraph_explorer::upstream::capabilities::Capability;
 use serde_json::{json, Value};
@@ -336,6 +337,80 @@ async fn a_probe_never_waits_behind_the_viewers_own_calls() {
     // answers, so the arm above was the busy slot, not a broken probe.
     assert_eq!(
         app.state.capabilities.admin_acts(&api).await,
+        Capability::Present
+    );
+    assert_eq!(probe_calls(&app).await.len(), 1);
+    app.upstream.verify().await;
+}
+
+/// A probe never waits for a global permit either. Here the viewer's own
+/// slots are free, but the only global permit is held by another caller's
+/// slow call (anonymous traffic, whose viewers all share one per-viewer cap).
+/// The probe must not queue behind it: it is not sent, answers unknown at
+/// once, and nothing is remembered. (A probe that queued for the permit
+/// would be sent only when that call ended, near its own deadline, and a
+/// timeout it met then would be remembered process-wide as the API's.)
+#[tokio::test]
+async fn a_probe_never_waits_for_a_global_permit_another_viewer_holds() {
+    let app = spawn_with(
+        &[
+            (ENV_UPSTREAM_CONCURRENCY, "1"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "1000"),
+        ],
+        Router::new(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    // One probe in all: the calibration's, at the end.
+    probe_answers(&app, 200, 1).await;
+    let sid = app.sign_in("tok");
+    let viewer = app.state.api(&app.session_auth(&sid, "tok"));
+    let other = app.state.api(&RequestAuth::Anonymous);
+    assert_eq!(app.state.upstream.available_permits(), 1);
+
+    let slow = other.stats();
+    let probe = async {
+        // Observe, not sleep: wait until the other caller holds the permit.
+        let waited = std::time::Instant::now();
+        while app.state.upstream.available_permits() != 0 {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(2),
+                "the slow call never took the permit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let started = std::time::Instant::now();
+        let cap = app.state.capabilities.admin_acts(&viewer).await;
+        (cap, started.elapsed())
+    };
+    let (_slow, (cap, took)) = tokio::join!(slow, probe);
+
+    assert_eq!(cap, Capability::Unknown);
+    assert!(
+        took < std::time::Duration::from_millis(300),
+        "the probe waited {took:?} for a global permit"
+    );
+    assert_eq!(
+        app.state.capabilities.cached_admin_acts(),
+        None,
+        "a held global permit is not remembered as the API's unknown"
+    );
+    assert!(probe_calls(&app).await.is_empty(), "the probe was not sent");
+
+    // CALIBRATION: with the permit free again the same probe, through the
+    // same session, is sent and answers, so the arm above was the held
+    // permit, not a broken probe or a busy session.
+    assert_eq!(app.state.upstream.available_permits(), 1);
+    assert_eq!(
+        app.state.capabilities.admin_acts(&viewer).await,
         Capability::Present
     );
     assert_eq!(probe_calls(&app).await.len(), 1);
