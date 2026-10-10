@@ -205,7 +205,10 @@ impl LineageRepository {
     ///   plus its `max_nodes - 1` nearest ancestors — i.e. the last `n`
     ///   entries of `topological_order` — and drops `claims`/`evidence`/
     ///   `traces` entries whose associated claim id falls outside that
-    ///   trimmed set. `None` disables the cap entirely.
+    ///   trimmed set. Each kept claim's `parent_ids` is pruned to the kept
+    ///   set too, so every id in it is a key of `claims`. (`parent_trace_ids`
+    ///   is not pruned: it can name traces outside the lineage even
+    ///   uncapped.) `None` disables the cap entirely.
     ///
     /// # Returns
     /// * `LineageResult` containing all claims, evidence, and traces in the
@@ -550,18 +553,27 @@ impl LineageRepository {
         // furthest ancestors while dropping the target claim itself. Instead
         // we keep the LAST n entries: the target claim plus its (n - 1)
         // nearest ancestors.
+        //
+        // Only a cut needs the trim below. Uncapped, every map already holds
+        // exactly the walked ids, and the edges query constrains both ends to
+        // them, so `parent_ids` cannot reference a claim outside `claims`.
         if let Some(n) = max_nodes {
             if topological_order.len() > n {
                 let start = topological_order.len() - n;
                 topological_order = topological_order.split_off(start);
                 truncated = true;
+
+                let kept_ids: HashSet<Uuid> = topological_order.iter().copied().collect();
+                claims_map.retain(|id, _| kept_ids.contains(id));
+                evidence_map.retain(|_, evidence| kept_ids.contains(&evidence.claim_id));
+                trace_map.retain(|_, trace| kept_ids.contains(&trace.claim_id));
+                // `parent_ids` was built from the untrimmed parent map; without
+                // this a kept claim names an ancestor the cap just dropped.
+                for claim in claims_map.values_mut() {
+                    claim.parent_ids.retain(|p| kept_ids.contains(p));
+                }
             }
         }
-
-        let kept_ids: HashSet<Uuid> = topological_order.iter().copied().collect();
-        claims_map.retain(|id, _| kept_ids.contains(id));
-        evidence_map.retain(|_, evidence| kept_ids.contains(&evidence.claim_id));
-        trace_map.retain(|_, trace| kept_ids.contains(&trace.claim_id));
 
         Ok(LineageResult {
             claims: claims_map,

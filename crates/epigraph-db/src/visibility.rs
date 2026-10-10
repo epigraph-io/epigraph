@@ -19,13 +19,24 @@
 //!   materialise read authority out of nothing at a call site that looks
 //!   innocent. `crates/epigraph-db/tests/no_anonymous_viewer.rs` fails the
 //!   build if any of them reappears in this file.
-//! * **The only unrestricted shape requires a [`MaintenanceLease`]**, which
+//! * **The only shape that reads past the principal's groups WITHOUT the
+//!   database's say-so requires a [`MaintenanceLease`]**, which
 //!   only the maintenance-pool accessor can mint (`ScopedPool`, PR-04). This is
 //!   not ceremony: once RLS is FORCEd, a `Bypass` viewer emits no SQL predicate
 //!   but the database policy still filters, so `Viewer::system(..)` on an
 //!   ordinary `epigraph_app` connection returns **zero** rows, not all rows.
 //!   The lease makes "unrestricted viewer" and "maintenance connection"
 //!   inseparable at the type level.
+//! * **The elevated shape is reachable only through the database.** An
+//!   elevated viewer (elevation plan EL-6; operator ruling D2) is built ONLY by
+//!   [`Viewer::resolve_elevated`], and only after migration 125's
+//!   principal-bound `epigraph_elevation_live` answered with a live session for
+//!   this principal and family. It renders the always-true READ fragment, but
+//!   on an application connection: the rows it may read past its own groups
+//!   are whatever the row policies admit for `epigraph_is_elevated()`, which
+//!   re-checks the session on every statement. It never writes (the pool
+//!   refuses `begin_as`), and a detached copy of it is an ordinary scoped
+//!   viewer.
 //!
 //! # The splice mechanism (PR-06)
 //!
@@ -117,7 +128,9 @@
 //! fragment swap.
 
 use crate::errors::DbError;
-use crate::repos::GroupMembershipRepository;
+use crate::pool::ScopedPool;
+use crate::repos::{ElevationCeremony, GroupMembershipRepository};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -194,10 +207,11 @@ pub struct Viewer {
     shape: ViewerShape,
 }
 
-/// The two — and only two — shapes a [`Viewer`] can take.
+/// The three — and only three — shapes a [`Viewer`] can take.
 ///
 /// Private on purpose: adding a shape must be a change to this file, which is
-/// the file `no_anonymous_viewer.rs` watches.
+/// the file `no_anonymous_viewer.rs` watches (it counts the variants, and the
+/// places that build the elevated one).
 ///
 /// NOT `Clone`, for the same reason [`Viewer`] is not. The derive was dead once
 /// `Viewer` lost its own — nothing in this crate calls `shape.clone()` — and
@@ -247,6 +261,48 @@ enum ViewerShape {
     /// UNRESTRICTED. Background jobs and CLI bins only, **on a maintenance
     /// connection**. Unconstructible without a [`MaintenanceLease`].
     Bypass { reason: SystemReason },
+    /// A `Scoped` principal inside a LIVE elevation session (elevation plan
+    /// EL-6, operator ruling D2): a human holding a live assignment of an
+    /// elevating role, who confirmed a passkey ceremony for this refresh
+    /// family. Built ONLY by [`Viewer::resolve_elevated`], after the database
+    /// answered for the session.
+    ///
+    /// It READS with the always-true fragment (as `Bypass` does), but on an
+    /// application connection stamped with the principal's OWN groups and the
+    /// session pair, so what it actually reads is what the row policies admit
+    /// for `epigraph_is_elevated()`. It WRITES nothing: the pool refuses to
+    /// begin a transaction for it, and its write fragment stays the scoped one.
+    Elevated {
+        principal: Uuid,
+        group_ids: Vec<Uuid>,
+        writable: Vec<Uuid>,
+        elevation: Elevation,
+    },
+}
+
+/// A live elevation session, as the database answered for it
+/// (`epigraph_elevation_live`, migration 125) when the viewer was resolved.
+///
+/// Not authority on its own: there is no constructor from it to a [`Viewer`]
+/// (`#[non_exhaustive]` keeps other crates from building one at all), and the
+/// database re-checks the session on every statement through
+/// `epigraph_is_elevated()`. It is what the request path reports (the session,
+/// its family and expiry), and what the pool stamps as `epigraph.elevation_id`
+/// / `epigraph.family_id`: the SESSION id the database returned, never the
+/// token's claim, which is absent in connector mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Elevation {
+    /// The elevation session (`elevation_sessions.id`).
+    pub session_id: Uuid,
+    /// The refresh family it is bound to.
+    pub family_id: Uuid,
+    /// The live role assignment that justified it.
+    pub assignment_id: Uuid,
+    /// `true` for a connector-mode session (MCP `sudo`), found by family alone.
+    pub connector: bool,
+    /// When it stops, at the latest.
+    pub expires_at: DateTime<Utc>,
 }
 
 /// The closed set of legitimate reasons to hold an unrestricted [`Viewer`].
@@ -401,6 +457,109 @@ impl Viewer {
         })
     }
 
+    /// Resolve `principal`'s viewer, ELEVATED when the database says so.
+    ///
+    /// First the ordinary [`Self::resolve`]. Then, on a connection of `scoped`
+    /// stamped with that scoped viewer, migration 125's principal-bound
+    /// `epigraph_elevation_live(elv, family)`: a session of THIS principal on
+    /// THIS family, un-ended, unexpired, whose elevating assignment is still
+    /// the live one. `elv` is the token's elevation claim (grant mode); `None`
+    /// asks for a connector-mode session on the family. Live: an elevated
+    /// viewer carrying the session the database returned. Not live: the scoped
+    /// viewer, and the request proceeds unelevated.
+    ///
+    /// **Nothing elevates before the per-access recorder.** 125's gate
+    /// (`epigraph_elevated_access_ready()`) ships false and 127 (the
+    /// recorder's migration) to 131 leave it closed; migration 132 opens it
+    /// while the recorder is installed. On a database before 132 (or without
+    /// the recorder) no session is live and this returns the scoped viewer. And
+    /// `epigraph_elevation_live` answers nothing on a connection that does not
+    /// declare the recorder ([`crate::ACCESS_RECORDER_GUC`]), so a pool whose
+    /// process does not record (every pool not built by
+    /// `ScopedPool::connect_recording_elevated_access`) returns the scoped
+    /// viewer even on a database whose gate is open.
+    ///
+    /// **A privileged pool never elevates.** On a login that skips row
+    /// security (a superuser, a BYPASSRLS role) or is a maintenance member,
+    /// 125 answers no live session, so the scoped viewer comes back: there no
+    /// row policy would narrow the elevated shape's always-true fragment, and
+    /// no refusal would stop a write decided on what it read.
+    ///
+    /// **A failure of the liveness check degrades to the scoped viewer** (a
+    /// warning, never an error): a database without migration 125 under a
+    /// newer binary, a transient fault. Not elevating is the safe direction.
+    /// A failure of the membership read is still an error, as in
+    /// [`Self::resolve`].
+    ///
+    /// The ONLY constructor of the elevated shape.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the membership query fails.
+    pub async fn resolve_elevated(
+        scoped: &ScopedPool,
+        principal: Uuid,
+        elv: Option<Uuid>,
+        family: Uuid,
+    ) -> Result<Self, DbError> {
+        let viewer = Self::resolve(scoped.inner(), principal).await?;
+        let live = match Self::elevation_live(scoped, &viewer, elv, family).await {
+            Ok(live) => live,
+            Err(e) => {
+                tracing::warn!(
+                    target: "elevation",
+                    principal = %principal,
+                    error = %e,
+                    "elevation liveness check failed; serving the request unelevated"
+                );
+                None
+            }
+        };
+        let Some(elevation) = live else {
+            return Ok(viewer);
+        };
+        match viewer.shape {
+            ViewerShape::Scoped {
+                principal,
+                group_ids,
+                writable,
+            } => Ok(Viewer {
+                shape: ViewerShape::Elevated {
+                    principal,
+                    group_ids,
+                    writable,
+                    elevation,
+                },
+            }),
+            // `resolve` builds only the scoped shape; anything else is kept
+            // exactly as it is rather than widened.
+            shape => Ok(Viewer { shape }),
+        }
+    }
+
+    /// The live session for (`elv`, `family`) as the stamped `viewer`'s
+    /// principal, or `None`. Cross-checked against what was asked: the
+    /// family, and the session id when one was claimed.
+    async fn elevation_live(
+        scoped: &ScopedPool,
+        viewer: &Viewer,
+        elv: Option<Uuid>,
+        family: Uuid,
+    ) -> Result<Option<Elevation>, DbError> {
+        let mut conn = scoped.read_as(viewer).await?;
+        let live = ElevationCeremony::live(&mut conn, elv, family).await?;
+        conn.commit().await?;
+        Ok(live.and_then(|l| {
+            let matches = l.family_id == family && elv.is_none_or(|id| id == l.session_id);
+            matches.then_some(Elevation {
+                session_id: l.session_id,
+                family_id: l.family_id,
+                assignment_id: l.assignment_id,
+                connector: l.mode == "connector",
+                expires_at: l.expires_at,
+            })
+        }))
+    }
+
     /// Build the unrestricted viewer. Requires a [`MaintenanceLease`], which
     /// only a maintenance-role connection can produce.
     #[must_use]
@@ -414,11 +573,20 @@ impl Viewer {
     /// outlives the request that resolved it.
     ///
     /// [`Viewer`] is not `Clone`, on purpose (see the type doc). This is the
-    /// narrow replacement, and it exists because three production call sites
+    /// narrow replacement, and it exists because production call sites
     /// genuinely need one: a detached `tokio::spawn` cannot borrow the request's
     /// viewer across its `'static` bound, and re-resolving inside the task would
     /// read the principal's membership at task start rather than at request
-    /// time.
+    /// time. The elevation routes use it too, to end or ask for an elevation as
+    /// the principal rather than as the elevation.
+    ///
+    /// # An elevated viewer detaches DOWNGRADED
+    ///
+    /// The copy of an elevated viewer is the principal's plain scoped viewer:
+    /// its own groups, no elevation (its connections stamp the elevation pair
+    /// empty). An elevation is a property of one request bound to a live
+    /// session, re-checked by the database on every statement; a detached task
+    /// outlives the request and is not part of that session.
     ///
     /// # Why the return type is `Option`
     ///
@@ -440,6 +608,12 @@ impl Viewer {
                 principal,
                 group_ids,
                 writable,
+            }
+            | ViewerShape::Elevated {
+                principal,
+                group_ids,
+                writable,
+                ..
             } => Some(Viewer {
                 shape: ViewerShape::Scoped {
                     principal: *principal,
@@ -453,28 +627,65 @@ impl Viewer {
 
     /// The authenticated principal, when there is one.
     ///
-    /// `Some` for `Scoped`, `None` for `Bypass`. Deliberately **not** flattened
+    /// `Some` for `Scoped` and `Elevated`, `None` for `Bypass`. Deliberately **not** flattened
     /// into an `Option<Uuid>`-shaped convenience anywhere else: callers that
     /// care about the difference must `match`, and callers that do not should
     /// not be reaching for the principal at all.
     #[must_use]
     pub const fn principal(&self) -> Option<Uuid> {
         match self.shape {
-            ViewerShape::Scoped { principal, .. } => Some(principal),
+            ViewerShape::Scoped { principal, .. } | ViewerShape::Elevated { principal, .. } => {
+                Some(principal)
+            }
             ViewerShape::Bypass { .. } => None,
         }
     }
 
     /// The group set to bind as `$V` in a scoped query, sorted and deduplicated.
     ///
-    /// `None` for `Bypass` — a bypass viewer emits no predicate, so it has no
-    /// bind to supply.
+    /// `None` for `Bypass` and for `Elevated` — both emit the always-true read
+    /// fragment, so neither has a bind to supply. (An elevated viewer's own
+    /// groups still reach the database: the pool stamps them as
+    /// `epigraph.group_ids` through [`Self::session_groups`].)
     #[must_use]
     pub fn group_bind(&self) -> Option<&[Uuid]> {
         match &self.shape {
             ViewerShape::Scoped { group_ids, .. } => Some(group_ids),
+            ViewerShape::Bypass { .. } | ViewerShape::Elevated { .. } => None,
+        }
+    }
+
+    /// The group set the pool stamps as `epigraph.group_ids`: the principal's
+    /// own groups for `Scoped` AND `Elevated`, nothing for `Bypass`.
+    ///
+    /// Distinct from [`Self::group_bind`] only for the elevated shape, whose
+    /// in-query predicate is always-true while the row policies must still see
+    /// its own groups (its scoped arms admit exactly those; the elevated arms
+    /// admit the rest, and only while `epigraph_is_elevated()` holds).
+    pub(crate) fn session_groups(&self) -> Option<&[Uuid]> {
+        match &self.shape {
+            ViewerShape::Scoped { group_ids, .. } | ViewerShape::Elevated { group_ids, .. } => {
+                Some(group_ids)
+            }
             ViewerShape::Bypass { .. } => None,
         }
+    }
+
+    /// The live elevation this viewer carries: `Some` only for a viewer built
+    /// by [`Self::resolve_elevated`] after the database answered for the
+    /// session.
+    #[must_use]
+    pub const fn elevation(&self) -> Option<&Elevation> {
+        match &self.shape {
+            ViewerShape::Elevated { elevation, .. } => Some(elevation),
+            ViewerShape::Scoped { .. } | ViewerShape::Bypass { .. } => None,
+        }
+    }
+
+    /// `true` for an elevated viewer (see [`Self::elevation`]).
+    #[must_use]
+    pub const fn is_elevated(&self) -> bool {
+        matches!(self.shape, ViewerShape::Elevated { .. })
     }
 
     /// The subset of groups the principal may write to (role `admin` or
@@ -483,7 +694,9 @@ impl Viewer {
     #[must_use]
     pub fn writable_groups(&self) -> &[Uuid] {
         match &self.shape {
-            ViewerShape::Scoped { writable, .. } => writable,
+            ViewerShape::Scoped { writable, .. } | ViewerShape::Elevated { writable, .. } => {
+                writable
+            }
             ViewerShape::Bypass { .. } => &[],
         }
     }
@@ -493,17 +706,23 @@ impl Viewer {
     /// `None` for `Bypass`, so the two binds a scoped statement needs are read
     /// through symmetric accessors and a `Bypass` viewer cannot be mistaken for
     /// one with an empty writable set.
+    ///
+    /// The elevated shape keeps its SCOPED writable set: elevation widens
+    /// reads only, and the pool refuses it a write transaction regardless.
     #[must_use]
     pub fn writable_bind(&self) -> Option<&[Uuid]> {
         match &self.shape {
-            ViewerShape::Scoped { writable, .. } => Some(writable),
+            ViewerShape::Scoped { writable, .. } | ViewerShape::Elevated { writable, .. } => {
+                Some(writable)
+            }
             ViewerShape::Bypass { .. } => None,
         }
     }
 
     /// The SQL this viewer contributes to a tenancy-aware read.
     ///
-    /// **Exactly two distinct strings**, one per shape. `{alias}` is substituted
+    /// **Exactly two distinct strings**: the scoped one, and the single space
+    /// `Bypass` and `Elevated` share. `{alias}` is substituted
     /// by the caller with the table alias the predicate applies to; `$V` is the
     /// single optional bind, supplied from [`Self::group_bind`] — from the
     /// *same* `Viewer` value, which is what makes qual/GUC coherence (plan §4.5)
@@ -532,7 +751,10 @@ impl Viewer {
                 " AND ({alias}.visibility = 'public' \
                    OR {alias}.owner_group_id = ANY($V::uuid[])) "
             }
-            ViewerShape::Bypass { .. } => " ",
+            // Elevated: the always-true READ fragment (DESIGN 6.3, EQ-13 b).
+            // The widening is the database's: on an application connection
+            // the row policies decide, through `epigraph_is_elevated()`.
+            ViewerShape::Bypass { .. } | ViewerShape::Elevated { .. } => " ",
         }
     }
 
@@ -581,7 +803,7 @@ impl Viewer {
                        AND ({alias}.co_owner_group_id IS NULL \
                             OR {alias}.co_owner_group_id = ANY($V::uuid[])))) "
             }
-            ViewerShape::Bypass { .. } => " ",
+            ViewerShape::Bypass { .. } | ViewerShape::Elevated { .. } => " ",
         }
     }
 
@@ -621,7 +843,11 @@ impl Viewer {
     #[must_use]
     pub const fn writable_fragment(&self) -> &'static str {
         match self.shape {
-            ViewerShape::Scoped { .. } => " AND {alias}.owner_group_id = ANY($W::uuid[]) ",
+            // Elevated keeps the SCOPED write fragment: elevation widens reads
+            // only.
+            ViewerShape::Scoped { .. } | ViewerShape::Elevated { .. } => {
+                " AND {alias}.owner_group_id = ANY($W::uuid[]) "
+            }
             ViewerShape::Bypass { .. } => " ",
         }
     }
@@ -683,7 +909,9 @@ impl Viewer {
     ) -> String {
         match self.shape {
             ViewerShape::Bypass { .. } => " ".to_string(),
-            ViewerShape::Scoped { .. } => fragment
+            // An elevated read fragment is `" "` already, so it renders to
+            // `" "` and emits no bind; its write fragment is the scoped one.
+            ViewerShape::Scoped { .. } | ViewerShape::Elevated { .. } => fragment
                 .replace("{alias}", alias)
                 .replace(placeholder, &format!("${bind_index}")),
         }
@@ -875,8 +1103,12 @@ impl Viewer {
         out
     }
 
-    /// The `$N::bool` bypass flag for the four `sqlx::query!` macro read sites,
-    /// which cannot take a spliced literal.
+    /// The `$N::bool` bypass flag for the static-form read sites (the
+    /// `sqlx::query!` macro reads and their runtime siblings), which cannot
+    /// take a spliced literal.
+    ///
+    /// `true` for `Bypass` AND `Elevated`: the same always-true read the
+    /// fragment renders, so a static-form read agrees with a spliced one.
     ///
     /// `true` disables the predicate the same way an emitted-nothing fragment
     /// does; `false` leaves `visibility = 'public' OR owner_group_id = ANY(...)`
@@ -885,10 +1117,14 @@ impl Viewer {
     /// short-circuit.
     #[must_use]
     pub const fn bypass_bind(&self) -> bool {
-        self.is_bypass()
+        self.is_bypass() || self.is_elevated()
     }
 
-    /// `true` when this viewer emits no visibility predicate at all.
+    /// `true` for the UNRESTRICTED (maintenance) shape only.
+    ///
+    /// `false` for an elevated viewer, deliberately: an elevated viewer is not
+    /// a maintenance viewer, must never be routed to a maintenance connection,
+    /// and the maintenance enumerators that `debug_assert!` this refuse it.
     #[must_use]
     pub const fn is_bypass(&self) -> bool {
         matches!(self.shape, ViewerShape::Bypass { .. })
@@ -899,7 +1135,7 @@ impl Viewer {
     pub const fn bypass_reason(&self) -> Option<SystemReason> {
         match self.shape {
             ViewerShape::Bypass { reason } => Some(reason),
-            ViewerShape::Scoped { .. } => None,
+            ViewerShape::Scoped { .. } | ViewerShape::Elevated { .. } => None,
         }
     }
 
@@ -947,6 +1183,29 @@ impl Viewer {
     pub fn test_bypass(reason: SystemReason) -> Self {
         Viewer {
             shape: ViewerShape::Bypass { reason },
+        }
+    }
+
+    /// Test-only elevated viewer, for the fragment and accessor unit tests
+    /// below. `#[cfg(test)]` on the DEFINITION, as for its two siblings; the
+    /// construction ratchet in `no_anonymous_viewer.rs` counts it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_elevated(principal: Uuid, group_ids: Vec<Uuid>) -> Self {
+        let writable = group_ids.clone();
+        Viewer {
+            shape: ViewerShape::Elevated {
+                principal,
+                group_ids,
+                writable,
+                elevation: Elevation {
+                    session_id: Uuid::new_v4(),
+                    family_id: Uuid::new_v4(),
+                    assignment_id: Uuid::new_v4(),
+                    connector: false,
+                    expires_at: Utc::now(),
+                },
+            },
         }
     }
 }
@@ -1036,6 +1295,114 @@ mod tests {
             2,
             "predicate_fragment must return exactly two distinct strings \
              (one per shape); got {seen:?}"
+        );
+    }
+
+    /// The elevated shape adds no THIRD read fragment: it renders the same
+    /// single space `Bypass` does (EQ-13 b), for both read fragments, so the
+    /// two-value guarantee above still holds with it in the set.
+    #[test]
+    fn the_elevated_shape_renders_the_bypass_read_fragments_and_the_scoped_write_one() {
+        let lease = MaintenanceLease::new();
+        let elevated = Viewer::test_elevated(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let scoped = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let bypass = Viewer::system(&lease, SystemReason::DedupSweep);
+
+        assert_eq!(elevated.predicate_fragment(), " ");
+        assert_eq!(elevated.edge_predicate_fragment(), " ");
+        let mut read = std::collections::HashSet::new();
+        for v in [&elevated, &scoped, &bypass] {
+            read.insert(v.predicate_fragment());
+            read.insert(v.edge_predicate_fragment());
+        }
+        assert_eq!(
+            read.len(),
+            3,
+            "scoped plain, scoped edge, and the one shared space: {read:?}"
+        );
+
+        // Writes stay scoped: elevation widens reads only.
+        assert_eq!(elevated.writable_fragment(), scoped.writable_fragment());
+        let w = elevated.render_writable_predicate("e", 3);
+        assert!(w.contains("e.owner_group_id = ANY($3::uuid[])"), "{w}");
+
+        // A spliced elevated read emits no bind, exactly as a bypass one.
+        let out = elevated.splice(
+            "SELECT 1 FROM claims c JOIN edges e ON e.source_id = c.id \
+             WHERE true /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */",
+            4,
+        );
+        assert!(
+            !out.contains('$'),
+            "an elevated splice binds nothing: {out}"
+        );
+    }
+
+    /// The accessors of the elevated shape. Each line is one mutation it
+    /// catches: `group_bind` handing back the groups (a `$V` the fragment does
+    /// not emit, so a bind-arity error at every spliced site); `bypass_bind`
+    /// false (the static-form reads stay public-only); `is_bypass` true (an
+    /// elevated viewer routed onto the maintenance arms); `session_groups`
+    /// empty (the row policies would see a public-only session); the writable
+    /// set widened or dropped.
+    #[test]
+    fn elevated_accessors_widen_the_read_bind_only() {
+        let principal = Uuid::new_v4();
+        let g = Uuid::new_v4();
+        let v = Viewer::test_elevated(principal, vec![g]);
+
+        assert!(v.is_elevated());
+        assert!(v.elevation().is_some());
+        assert_eq!(v.principal(), Some(principal));
+        assert_eq!(v.group_bind(), None, "the always-true fragment binds no $V");
+        assert!(v.bypass_bind(), "static-form reads agree with the fragment");
+        assert!(
+            !v.is_bypass(),
+            "an elevated viewer is not a maintenance viewer"
+        );
+        assert_eq!(v.bypass_reason(), None);
+        assert_eq!(
+            v.session_groups(),
+            Some(&[g][..]),
+            "the policies see its own groups"
+        );
+        assert_eq!(v.writable_bind(), Some(&[g][..]));
+        assert_eq!(v.writable_groups(), &[g][..]);
+
+        // And the other two shapes carry no elevation.
+        let lease = MaintenanceLease::new();
+        assert!(!Viewer::test_scoped(principal, vec![g]).is_elevated());
+        assert!(Viewer::test_scoped(principal, vec![g])
+            .elevation()
+            .is_none());
+        assert!(Viewer::system(&lease, SystemReason::DedupSweep)
+            .elevation()
+            .is_none());
+        assert!(!Viewer::test_scoped(principal, vec![g]).bypass_bind());
+    }
+
+    /// `detach_scoped` on an elevated viewer DOWNGRADES: the principal's own
+    /// scoped authority, no elevation. Mutations caught: returning `None` (a
+    /// detached task of an elevated request would fail closed for no reason),
+    /// and copying the elevated shape (a detached task would outlive the
+    /// session with the always-true fragment).
+    #[test]
+    fn an_elevated_viewer_detaches_as_its_scoped_self() {
+        let principal = Uuid::new_v4();
+        let g = Uuid::new_v4();
+        let v = Viewer::test_elevated(principal, vec![g]);
+        let d = v.detach_scoped().expect("an elevated viewer detaches");
+
+        assert!(!d.is_elevated());
+        assert!(d.elevation().is_none());
+        assert!(!d.bypass_bind());
+        assert_eq!(d.principal(), Some(principal));
+        assert_eq!(d.group_bind(), Some(&[g][..]));
+        assert_eq!(d.writable_bind(), Some(&[g][..]));
+        assert_ne!(
+            d.predicate_fragment(),
+            " ",
+            "the scoped fragment, not always-true"
         );
     }
 

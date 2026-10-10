@@ -13,11 +13,15 @@
 //! verbatim. Neither validates the scope, neither checks what kind of client it
 //! is, and neither leaves an audit row. This command replaces the raw path.
 //!
-//! A human's agents act through that human's OAuth client, so they carry
-//! exactly that human's scopes: the refresh grant re-reads
-//! `oauth_clients.granted_scopes` on every refresh. A grant here therefore
-//! reaches the human's agents at their next token refresh, and a revocation
-//! leaves an already-minted access token valid until it expires.
+//! A human's agents act through that human's OAuth client, so they carry at
+//! most that human's scopes. The refresh grant issues the refresh token's own
+//! scopes (the consent it was minted from) narrowed to
+//! `oauth_clients.granted_scopes` as read at each refresh (migration 140, RFC
+//! 6749 section 6). A REVOCATION here therefore leaves the human's agents at
+//! their next token refresh (an already-minted access token stays valid until
+//! it expires). A GRANT does not widen an existing refresh chain: it reaches a
+//! connector only once the human re-authorizes it (a new authorization-code
+//! grant, e.g. reconnecting the connector), whose consent can then include it.
 //!
 //! # The rules
 //!
@@ -65,6 +69,11 @@
 //!   records `os_user_source` to say so. Run the binary directly as the
 //!   operator: under `sudo -u <service account>` the real uid names that
 //!   account, and only the login uid still names the person.
+//! * **Not while admin scopes are armed.** Once migration 128's switch is
+//!   armed (`arm-admin-scopes`), a grant is refused, dry run included: a
+//!   standing admin scope would be stripped at every mint, and an admin act
+//!   needs an elevation. A revoke still runs. A switch that cannot be read
+//!   refuses the grant too; a database without 128 is unarmed.
 //! * **`--dry-run`** runs the same statements, the audit row included, in a
 //!   transaction that is rolled back, and prints what would change.
 //!
@@ -73,7 +82,10 @@
 
 use anyhow::{bail, Context};
 use epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES;
-use epigraph_db::{OAuthClientRepository, SecurityEventRepository, SecurityEventRow};
+use epigraph_db::{
+    AdminScopeEnforcement, AdminScopeSwitch, OAuthClientRepository, SecurityEventRepository,
+    SecurityEventRow,
+};
 use sqlx::{Acquire, PgConnection};
 use uuid::Uuid;
 
@@ -295,6 +307,27 @@ pub async fn run(
             row.client_name,
             row.client_type
         );
+    }
+    // Migration 128's admin-scope switch (elevation plan EL-9). Armed, a
+    // standing admin scope is what elevation replaces: a grant is refused
+    // (dry run included), a revoke is not (taking authority away is always
+    // safe). A switch that cannot be read is not "unarmed": refused too. A
+    // database without 128 (`Absent`) cannot have been armed.
+    if op == ScopeOp::Grant {
+        match AdminScopeEnforcement::read(&mut *tx).await {
+            Ok(AdminScopeSwitch::Unarmed | AdminScopeSwitch::Absent) => {}
+            Ok(AdminScopeSwitch::Armed) => bail!(
+                "refusing to grant {scope} to client {client}: admin-scope enforcement is armed \
+                 on this database (migration 128), so a standing admin scope would be stripped \
+                 at every mint; an admin act needs an elevation. Disarm first \
+                 (epigraph-operator disarm-admin-scopes) only if that is the decision. Nothing \
+                 was written."
+            ),
+            Err(e) => bail!(
+                "refusing to grant {scope} to client {client}: the admin-scope switch could not \
+                 be read ({e}), and an unreadable switch is not \"unarmed\". Nothing was written."
+            ),
+        }
     }
     if op == ScopeOp::Grant && row.status != "active" {
         bail!(

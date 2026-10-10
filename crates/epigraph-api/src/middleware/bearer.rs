@@ -9,17 +9,82 @@
 // takes the very Viewer this call constructs, so stamping the connection first is circular.
 // Recorded as `D-PR17-live-memberships-is-parameterised-not-principal-bound`. This entry must
 // never be "converted" — a shard that tries will deadlock the bootstrap, not fix a leak.
+// The revocation lookup (`access_token_is_revoked`, migration 141) is pre-authentication for the
+// same reason: it decides whether the verified token yields a principal at all.
 
 use axum::{extract::State, http::Request, middleware::Next, response::Response};
 
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-pub use epigraph_auth::{AuthContext, ClientType};
+pub use epigraph_auth::{AdminScopePosture, AuthContext, ClientType, ElevationRef};
+
+/// Whether the access token `jti` has been revoked (RFC 7009, migration 141's
+/// durable denylist, which `/oauth/revoke` writes and the MCP transport also
+/// reads).
+///
+/// Called by both middlewares here and by `/oauth/introspect`, always AFTER
+/// the token's signature has been verified, so the `jti` is the issuer's and a
+/// forged token never reaches the database. The lookup runs on the raw pool
+/// for this file's reason: it runs BEFORE any principal or viewer exists
+/// (whether there will be one is what it decides), and it reads one
+/// non-tenant credential table by primary key.
+///
+/// `Err` means the answer is unknown; every caller refuses the token (fails
+/// CLOSED). No cache: a negative cache would delay a revocation by its TTL.
+#[cfg(feature = "db")]
+pub(crate) async fn access_token_is_revoked(
+    state: &AppState,
+    jti: uuid::Uuid,
+) -> Result<bool, epigraph_db::DbError> {
+    epigraph_db::RevokedAccessTokenRepository::is_revoked(&state.db_pool, jti).await
+}
+
+/// KNOWN LIMITATION: the non-`db` build has no pool and therefore NO
+/// revocation store. `/oauth/revoke` records nothing there and answers 200, and
+/// a REVOKED but signature-valid, unexpired token is admitted until its `exp`.
+/// This is a regression for that build: before migration 141 it kept an
+/// in-process set, which at least refused the token on the revoking process
+/// until a restart. The non-`db` build is unsupported in production (prod runs
+/// the default features, which include `db`); do not serve OAuth from it.
+///
+/// A function rather than a `cfg` at each call site, so the callers read the
+/// same in both builds.
+#[cfg(not(feature = "db"))]
+pub(crate) async fn access_token_is_revoked(
+    _state: &AppState,
+    _jti: uuid::Uuid,
+) -> Result<bool, std::convert::Infallible> {
+    Ok(false)
+}
+
+/// Refuse a signature-verified token whose `jti` is on the durable revocation
+/// denylist ([`access_token_is_revoked`]): 401 when revoked, 503 when the
+/// lookup cannot answer. Fails CLOSED: an unknown answer never admits the
+/// token.
+pub(crate) async fn refuse_revoked(state: &AppState, jti: uuid::Uuid) -> Result<(), ApiError> {
+    match access_token_is_revoked(state, jti).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ApiError::Unauthorized {
+            reason: "Token has been revoked".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(
+                reason = "revocation_unavailable",
+                error = %e,
+                "bearer token refused: the revocation lookup failed"
+            );
+            Err(ApiError::ServiceUnavailable {
+                service: "token revocation".to_string(),
+            })
+        }
+    }
+}
 
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
-/// Requests without a valid Bearer token are rejected with 401 Unauthorized.
+/// Requests without a valid Bearer token are rejected with 401 Unauthorized,
+/// and so are tokens revoked through `/oauth/revoke` ([`refuse_revoked`]).
 pub async fn bearer_auth_middleware(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -35,13 +100,6 @@ pub async fn bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Check revocation set
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Validate JWT
             let claims =
                 state
@@ -51,8 +109,17 @@ pub async fn bearer_auth_middleware(
                         reason: format!("Invalid token: {e}"),
                     })?;
 
-            // Build AuthContext
-            let auth_ctx: AuthContext = claims.into();
+            // Revocation, by the now-verified jti (fails closed).
+            refuse_revoked(&state, claims.jti).await?;
+
+            // Build AuthContext. The admin-scope switch decides whether its
+            // admin-only scopes count (`AuthContext::has_scope`, elevation
+            // plan EL-10); `From` leaves it armed (fail closed) until read,
+            // and it is read only for a token it can change an answer for.
+            let mut auth_ctx: AuthContext = claims.into();
+            if auth_ctx.carries_switch_decided_scope() {
+                auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            }
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
@@ -95,13 +162,6 @@ pub async fn optional_bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Present token must be valid: revoked → 401.
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Present token must validate: invalid/expired → 401.
             let claims =
                 state
@@ -111,7 +171,13 @@ pub async fn optional_bearer_auth_middleware(
                         reason: format!("Invalid token: {e}"),
                     })?;
 
-            let auth_ctx: AuthContext = claims.into();
+            // Present token must not be revoked: revoked → 401.
+            refuse_revoked(&state, claims.jti).await?;
+
+            let mut auth_ctx: AuthContext = claims.into();
+            if auth_ctx.carries_switch_decided_scope() {
+                auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            }
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }
@@ -284,14 +350,44 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequirePrincipal {
 /// [`require_scope_extractor`] above), so the 401 lands before body parse —
 /// no 422-instead-of-401.
 ///
+/// # Elevation (elevation plan EL-6)
+///
+/// A token carrying an elevation claim (`elv`, minted only by the elevate
+/// grant) AND its refresh family (`fam`) resolves through
+/// `Viewer::resolve_elevated`: ELEVATED only when migration 125's
+/// principal-bound `epigraph_elevation_live` answers for a live session of
+/// this principal on this family, the plain scoped viewer otherwise (a forged,
+/// ended or expired claim, or a liveness check that fails). A READ is never
+/// refused for it: it is served unelevated. (Since EL-10 every non-GET request
+/// whose token carries an elevation claim, live or not, is refused before it
+/// reaches a handler, by `middleware::elevated_access::elevated_write_refusal`,
+/// except the allowlisted routes.) The CLAIM is not
+/// authority; the viewer's [`epigraph_db::Viewer::elevation`] is. Connector
+/// mode (a session found by family alone) is the MCP server's, not this one's.
+///
+/// An elevated viewer reads with the always-true fragment on the application
+/// role (the row policies decide), and writes nothing: `AppState::write_as`
+/// answers 403 for it.
+///
 /// # Cost
 ///
 /// One indexed round trip per request (`Viewer::resolve` →
 /// `GroupMembershipRepository::list_live_for_agent`, served index-only by
-/// `idx_group_memberships_agent_live`). PR-03 defined the extractor; PR-06 and
+/// `idx_group_memberships_agent_live`), plus one stamped liveness check for a
+/// token that claims an elevation. PR-03 defined the extractor; PR-06 and
 /// PR-07 wired it to the read paths.
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
+
+/// [`ViewerExtractor`] for a route that never reads AS an elevated viewer:
+/// it resolves the principal's plain scoped viewer whatever the token's
+/// elevation claim, so the request is not an elevated access and is not
+/// recorded. For the elevation routes themselves (open a ticket, end an
+/// elevation): their definers are principal-bound and act as the person, not
+/// as the elevation, and an end must not be recorded by a session it has just
+/// ended (the recorder would refuse it, and the response would be withheld).
+#[cfg(feature = "db")]
+pub struct UnelevatedViewer(pub epigraph_db::Viewer);
 
 #[cfg(feature = "db")]
 #[axum::async_trait]
@@ -302,6 +398,39 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        extract_viewer(parts, state, true).await.map(Self)
+    }
+}
+
+#[cfg(feature = "db")]
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for UnelevatedViewer {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        extract_viewer(parts, state, false).await.map(Self)
+    }
+}
+
+/// The two extractors' one body. `elevate`: resolve the token's elevation
+/// claim (ViewerExtractor) or ignore it (UnelevatedViewer).
+///
+/// An ELEVATED viewer is handed out only to a request the per-access
+/// recorder wraps (`middleware::elevated_access`, elevation plan EL-8): the
+/// recorder's slot must be in the request's extensions, and is marked here so
+/// the recorder records the response before it is sent. A request without the
+/// slot is refused (500): no route can serve an elevated read the recorder
+/// does not see.
+#[cfg(feature = "db")]
+async fn extract_viewer(
+    parts: &mut axum::http::request::Parts,
+    state: &AppState,
+    elevate: bool,
+) -> Result<epigraph_db::Viewer, ApiError> {
+    {
         // `visibility.viewer.rejected{reason, route}` is emitted as a
         // structured tracing event rather than a Prometheus counter:
         // `metrics::Metrics` is a fixed struct of unlabeled counter handles
@@ -346,8 +475,37 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         // read can say "not acting" while the agent's writer row in the
         // operator's group is live (see `oauth::token::principal_agent_id`).
         // Read concurrently with the resolve, so it adds no latency.
+        // An elevation claim WITH its family, on a process that can stamp a
+        // connection, is checked against the database; every other token
+        // resolves the plain scoped viewer exactly as before.
+        let resolve = async {
+            match (
+                auth.elevation_claim.filter(|_| elevate),
+                auth.family_id,
+                state.scoped.as_ref(),
+            ) {
+                (Some(elv), Some(family), Some(scoped)) => {
+                    let v =
+                        epigraph_db::Viewer::resolve_elevated(scoped, principal, Some(elv), family)
+                            .await;
+                    if let Ok(v) = &v {
+                        if !v.is_elevated() {
+                            tracing::info!(
+                                target: "elevation",
+                                route = %route,
+                                principal = %principal,
+                                "the token's elevation claim is not a live session; serving \
+                                 the request unelevated"
+                            );
+                        }
+                    }
+                    v
+                }
+                _ => epigraph_db::Viewer::resolve(&state.db_pool, principal).await,
+            }
+        };
         let (viewer, actor) = tokio::join!(
-            epigraph_db::Viewer::resolve(&state.db_pool, principal),
+            resolve,
             epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, principal),
         );
         match actor {
@@ -391,7 +549,32 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
             ApiError::from(e)
         })?;
 
-        Ok(Self(viewer))
+        if let Some(elevation) = viewer.elevation() {
+            let Some(slot) = parts
+                .extensions
+                .get::<crate::middleware::elevated_access::ElevatedAccessSlot>()
+            else {
+                tracing::error!(
+                    target: "elevation",
+                    route = %route,
+                    principal = %principal,
+                    "an elevated viewer was resolved for a route the per-access recorder does \
+                     not wrap; refused"
+                );
+                return Err(ApiError::InternalError {
+                    message: "ELEVATED ACCESS NOT RECORDED: this route is not recorded; the \
+                              request is refused"
+                        .to_string(),
+                });
+            };
+            slot.mark(crate::middleware::elevated_access::ElevatedMark {
+                principal,
+                session_id: elevation.session_id,
+                family_id: elevation.family_id,
+            });
+        }
+
+        Ok(viewer)
     }
 }
 
@@ -510,6 +693,10 @@ mod require_scope_tests {
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             jti: uuid::Uuid::nil(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         });
         parts
     }
@@ -596,6 +783,10 @@ mod viewer_extractor_tests {
             client_type: ClientType::Service,
             scopes: vec!["claims:read".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

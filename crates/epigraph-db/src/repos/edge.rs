@@ -744,6 +744,30 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_symmetric_if_absent_conn(&mut conn, a, b, relationship, properties).await
+    }
+
+    /// [`Self::create_symmetric_if_absent`] on a connection the caller owns,
+    /// so a matcher promotion can write its edge on the SAME transaction as
+    /// the candidate's status flip (`MatchCandidateRepo::promote_if_pending`).
+    /// The pool-taking function above delegates here, so there is one INSERT.
+    ///
+    /// Same any-state dedup as the pool form (no `EDGE_IN_FORCE` clause): a
+    /// matcher promotion over a pair whose matcher edge was retracted stays a
+    /// dedup hit. Do not swap in [`Self::create_symmetric_if_absent_returning_conn`],
+    /// which matches rows in force only (migration 120).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, properties))]
+    pub async fn create_symmetric_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -760,7 +784,7 @@ impl EdgeRepository {
         .bind(b)
         .bind(relationship)
         .bind(Json(properties))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -994,6 +1018,128 @@ impl EdgeRepository {
             target_id,
             was_created: false,
         })
+    }
+
+    /// Symmetric idempotent create for the HTTP route (`POST /api/v1/edges`),
+    /// returning the full STORED [`EdgeRow`].
+    ///
+    /// Same bidirectional, in-force-only dedup as
+    /// [`Self::create_symmetric_if_absent_oriented_conn`] — `(a, b)` and
+    /// `(b, a)` with the same `relationship` are one edge — but shaped for the
+    /// HTTP handler, which (unlike `link_epistemic`) accepts `valid_from` /
+    /// `valid_to` and answers with every column of the row. On a dedup hit the
+    /// returned row is the existing one AS STORED: its orientation may be the
+    /// reverse of the caller's `(a, b)`, and its properties / validity window
+    /// are the stored ones, not the request's. Belief-wiring callers must wire
+    /// the returned `source_id` / `target_id` (see
+    /// [`Self::create_symmetric_if_absent_oriented`] for why).
+    ///
+    /// Endpoint types are hard-coded `'claim'` / `'claim'` like the sibling
+    /// functions: symmetry is only established between two claims.
+    ///
+    /// The dedup is best-effort, like the siblings': `INSERT ... WHERE NOT
+    /// EXISTS` under READ COMMITTED with no advisory lock or unique index, so
+    /// two concurrent calls `(a, b)` / `(b, a)` can both insert, and an
+    /// in-force reverse edge this connection cannot see (RLS) does not block
+    /// the insert. Losing either race falls back to the pre-dedup two-row
+    /// behaviour; a database-level backstop waits on canonical relationship
+    /// spelling (migration 090 rejected a broad unique index).
+    ///
+    /// Runtime `sqlx::query*` throughout — no `.sqlx/` prepared-cache entry.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails. On the
+    /// dedup-hit branch that includes the case where the conflicting edge is not
+    /// visible to this connection (`RowNotFound`): a loud error, never a wrong
+    /// answer.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, properties))]
+    pub async fn create_symmetric_if_absent_row_conn(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        type Row = (
+            Uuid,
+            Uuid,
+            String,
+            Uuid,
+            String,
+            String,
+            serde_json::Value,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        );
+        fn edge_row(r: Row) -> EdgeRow {
+            EdgeRow {
+                id: r.0,
+                source_id: r.1,
+                source_type: r.2,
+                target_id: r.3,
+                target_type: r.4,
+                relationship: r.5,
+                properties: r.6,
+                valid_from: r.7,
+                valid_to: r.8,
+            }
+        }
+
+        // In force only (migration 120), as the other link-tool forms: a
+        // retracted edge asserted again is a new edge.
+        let insert = format!(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                relationship, properties, valid_from, valid_to)
+             SELECT $1, 'claim', $2, 'claim', $3, $4, $5, $6
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edges
+                 WHERE ((source_id = $1 AND target_id = $2)
+                     OR (source_id = $2 AND target_id = $1))
+                   AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
+             )
+             RETURNING id, source_id, source_type, target_id, target_type,
+                       relationship, properties, valid_from, valid_to"
+        );
+        let inserted: Option<Row> = sqlx::query_as(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties.unwrap_or(serde_json::json!({}))))
+            .bind(valid_from)
+            .bind(valid_to)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+        if let Some(row) = inserted {
+            return Ok((edge_row(row), true));
+        }
+
+        // Dedup hit — the existing row in force AS STORED, which may be the
+        // reverse of the caller's (a, b).
+        let probe = format!(
+            "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
+             -- same reasoning as `create_or_get`'s.
+             SELECT id, source_id, source_type, target_id, target_type,
+                    relationship, properties, valid_from, valid_to
+               FROM edges
+              WHERE ((source_id = $1 AND target_id = $2)
+                  OR (source_id = $2 AND target_id = $1))
+                AND relationship = $3
+                AND {EDGE_IN_FORCE_UNALIASED}
+              LIMIT 1"
+        );
+        let existing: Row = sqlx::query_as(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(&mut *conn)
+            .await?;
+
+        Ok((edge_row(existing), false))
     }
 
     /// Get edges by source entity

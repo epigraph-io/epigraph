@@ -14,6 +14,16 @@
 //! for the vector column an unseal does not restore, so it is run deliberately
 //! over corpora that contain sealed rows; the exclusion is what makes that
 //! safe. See [`ReembedTarget::sealed_predicate`].
+//!
+//! RETIRED CLAIMS ARE NEVER SELECTED. A retirement (`is_current = false`)
+//! nulls both vector columns, which is exactly the `embedding_3072 IS NULL`
+//! shape this tool selects on; re-populating it would make the claim
+//! retrievable again through recall at `centroid_dim = 3072`
+//! (`ClaimRepository::search_by_embedding_since` has no `is_current` filter),
+//! and `chk_deprecated_no_embedding` (migration 144) refuses the write, so one
+//! retired row would abort the whole run. The UPDATE re-checks the same
+//! predicate, so a claim retired between the fetch and the write is skipped
+//! rather than fatal. See [`ReembedTarget::eligible_predicate`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +64,24 @@ impl ReembedTarget {
             Self::Claims => "content",
             // evidence.raw_content is the text column (see migration 001).
             Self::Evidence => "raw_content",
+        }
+    }
+
+    /// The predicate a row of this table must satisfy to be re-embedded at all.
+    ///
+    /// For `claims` this is `is_current`: a retired claim must hold no vector
+    /// in either ANN column (`chk_deprecated_no_embedding`, widened to
+    /// `embedding_3072` by migration 144), so selecting one would both
+    /// resurrect it in recall at 3072 and raise 23514 mid-run. `is_current` is
+    /// `NOT NULL` (migration 001), so the bare column is the CHECK's admitted
+    /// set exactly; no `COALESCE` is needed.
+    ///
+    /// `evidence` has no `is_current` column and no retirement state of its
+    /// own, so every evidence row stays eligible.
+    fn eligible_predicate(self) -> &'static str {
+        match self {
+            Self::Claims => "is_current",
+            Self::Evidence => "true",
         }
     }
 
@@ -142,8 +170,9 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
 
         for ((row_id, _), embedding) in rows.iter().zip(embeddings.iter()) {
             let pgvec = format_pgvector(embedding);
-            update_embedding_3072(pool, config.target, *row_id, &pgvec).await?;
-            rows_written += 1;
+            if update_embedding_3072(pool, config.target, *row_id, &pgvec).await? {
+                rows_written += 1;
+            }
         }
 
         // Advance checkpoint to last id of this batch.
@@ -165,7 +194,8 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
     })
 }
 
-/// Fetch a batch of rows whose `embedding_3072` is NULL, ordered by id.
+/// Fetch a batch of eligible, unsealed rows whose `embedding_3072` is NULL,
+/// ordered by id.
 async fn fetch_batch(
     pool: &PgPool,
     target: ReembedTarget,
@@ -175,11 +205,13 @@ async fn fetch_batch(
     let table = target.table();
     let content_col = target.content_column();
     let sealed = target.sealed_predicate();
+    let eligible = target.eligible_predicate();
 
     let sql = format!(
         "SELECT id, {content_col} AS content \
          FROM {table} \
          WHERE embedding_3072 IS NULL \
+           AND {eligible} \
            AND ($1::uuid IS NULL OR id > $1) \
            AND {content_col} IS NOT NULL \
            AND length({content_col}) > 0 \
@@ -197,17 +229,27 @@ async fn fetch_batch(
     Ok(rows)
 }
 
-/// UPDATE one row's `embedding_3072` column.
+/// UPDATE one row's `embedding_3072` column, if the row is still eligible.
+///
+/// Re-checks [`ReembedTarget::eligible_predicate`] at write time because the
+/// provider round trip between [`fetch_batch`] and this UPDATE is a window in
+/// which a claim can be retired (supersede, deprecate, mark_duplicate, ...).
+/// Writing anyway would raise 23514 on `chk_deprecated_no_embedding` and abort
+/// the run; the predicate turns it into a zero-row no-op instead.
+///
+/// Returns whether a row was written.
 async fn update_embedding_3072(
     pool: &PgPool,
     target: ReembedTarget,
     id: Uuid,
     pgvec: &str,
-) -> Result<(), ReembedError> {
+) -> Result<bool, ReembedError> {
     let table = target.table();
-    let sql = format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2");
-    sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
-    Ok(())
+    let eligible = target.eligible_predicate();
+    let sql =
+        format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2 AND {eligible}");
+    let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Format a `&[f32]` as pgvector literal `[a,b,c,...]`.

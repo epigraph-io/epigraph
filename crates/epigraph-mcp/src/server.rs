@@ -108,6 +108,27 @@ pub struct EpiGraphMcpFull {
     /// Defaults to `GroupPolicyGate` in every constructor;
     /// [`Self::with_policy_gate`] replaces it.
     pub(crate) policy_gate: Arc<dyn epigraph_interfaces::PolicyGate>,
+    /// Whether an HTTP request whose token carries NO elevation claim may
+    /// still resolve ELEVATED through a CONNECTOR-mode session on its refresh
+    /// family (elevation plan EL-6, the MCP `sudo` path).
+    ///
+    /// OFF by default in every constructor, and off unless `main` is told
+    /// otherwise (`EPIGRAPH_MCP_CONNECTOR_ELEVATION=on`). Operator ruling: the
+    /// connector family scope (plan EQ-7) is unruled and unmeasured (M-E2:
+    /// one refresh family may span every chat of a connector install), so
+    /// only the CLI elevate path (a token carrying `elv`) elevates until it
+    /// is. Off, a token without `elv` resolves the plain scoped viewer with no
+    /// liveness round trip at all.
+    pub(crate) connector_elevation: bool,
+    /// The admin-scope switch (migration 128) as this process reads it,
+    /// behind a short cache (elevation plan EL-10); shared by every session
+    /// the factory clones. [`Self::admin_scope_posture`].
+    pub(crate) admin_scope_arming: Arc<epigraph_db::AdminScopeArmingCache>,
+    /// The public origin the elevation ceremony page is served at (the API's
+    /// `EPIGRAPH_PUBLIC_BASE_URL`), for the URL `sudo` returns (elevation
+    /// plan EL-11). `None` in every constructor and unless `main` reads it:
+    /// with none, `sudo` refuses (it cannot name a page).
+    pub(crate) public_base_url: Option<String>,
 }
 
 impl EpiGraphMcpFull {
@@ -149,6 +170,9 @@ impl EpiGraphMcpFull {
         auth: Option<&epigraph_auth::AuthContext>,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<crate::write_identity::WriteIdentity, McpError> {
+        // An elevated request is read-only (elevation plan §1.4), on every
+        // transport, before anything else: nothing below would see it.
+        crate::write_identity::refuse_elevated(viewer)?;
         let Some(auth) = auth else {
             return Ok(crate::write_identity::WriteIdentity::from_resolved(
                 self.agent_id().await?,
@@ -226,6 +250,7 @@ impl EpiGraphMcpFull {
             &mut *conn,
             auth.client_id,
             principal,
+            auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
         )
         .await
         .map_err(|e| {
@@ -600,8 +625,14 @@ impl EpiGraphMcpFull {
     /// discovery endpoint so agents can introspect available tools at runtime.
     #[must_use]
     pub fn all_tools_json() -> serde_json::Value {
-        let tools = Self::tool_router().list_all();
+        let tools = Self::static_tools();
         serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+    }
+
+    /// Every kernel tool the static router registers, unfiltered.
+    #[must_use]
+    pub fn static_tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
     }
 
     /// Look up the required scope for `tool_name` and verify the
@@ -737,6 +768,245 @@ impl EpiGraphMcpFull {
         Ok(())
     }
 
+    /// Refuse every FEDERATED tool to an ELEVATED request (elevation plan
+    /// EL-10; review cp1 COR-1's residual). A federated call is proxied to the
+    /// extension under the caller's own token before `call_tool` reaches
+    /// [`Self::refuse_elevated_write`] or the per-access recorder, so an
+    /// elevated one would be neither held read-only nor recorded. A request
+    /// that is not elevated passes.
+    ///
+    /// # Errors
+    /// The `ELEVATED READ-ONLY` refusal when `elevated`.
+    pub fn refuse_elevated_federated(elevated: bool, tool_name: &str) -> Result<(), McpError> {
+        if !elevated {
+            return Ok(());
+        }
+        Err(McpError::invalid_request(
+            format!(
+                "ELEVATED READ-ONLY: federated tool '{tool_name}' is unavailable to an elevated \
+                 request (a federated call is neither recorded nor held read-only); call it \
+                 with an unelevated token"
+            ),
+            None,
+        ))
+    }
+
+    /// Refuse a WRITE tool to an ELEVATED request, at dispatch (elevation plan
+    /// §1.4: the elevated viewer is read-only).
+    ///
+    /// A write tool is one whose `SCOPE_MAP` scope is not a `:read` scope (an
+    /// unmapped name counts as a write; `enforce_tool_scope` refuses it first
+    /// anyway). Only a request that CAN be elevated pays for the check: a token
+    /// carrying an elevation claim (`elv`), or, with the connector switch on, a
+    /// token carrying a family. Its viewer is resolved exactly as the tool
+    /// would resolve it (`tools::viewer::request_viewer`), and refused when
+    /// elevated, with the `ELEVATED READ-ONLY` refusal `begin_as` gives. An
+    /// ended or expired session's claim is not elevated, so its writes pass
+    /// here. (The REST API is stricter since EL-10: it refuses every non-GET
+    /// request whose token carries an elevation claim at all,
+    /// `epigraph-api`'s `middleware::elevated_access::elevated_write_refusal`.
+    /// MCP decides on the live session because connector mode has no claim.)
+    ///
+    /// This is the chokepoint for EVERY write tool, including those that never
+    /// call `write_identity` (the admin maintenance tools, the sheaf and theme
+    /// writes); `write_identity` and the detached ingests refuse an elevated
+    /// viewer too, as a second layer for tools driven without dispatch.
+    /// stdio (`auth == None`) never elevates and is not checked.
+    ///
+    /// # Errors
+    /// The refusal, or the viewer resolution's own error.
+    pub async fn refuse_elevated_write(
+        &self,
+        auth: Option<&epigraph_auth::AuthContext>,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        let Some(auth) = auth else {
+            return Ok(());
+        };
+        let writes = crate::scope_map::required_scope(tool_name)
+            .map_or(true, |scope| !scope.ends_with(":read"));
+        if !writes {
+            return Ok(());
+        }
+        let admin = crate::scope_map::required_scope(tool_name)
+            .is_some_and(epigraph_auth::is_admin_only_scope);
+        let say_where = |mut e: McpError| {
+            // An ADMIN write (plan EQ-5): say where it runs instead.
+            if admin {
+                e.message = std::borrow::Cow::Owned(format!(
+                    "{}. Admin writes run through `epigraph-operator` on the maintenance DSN \
+                     while elevated",
+                    e.message
+                ));
+            }
+            e
+        };
+        // THE DISPATCH DECISION BINDS. `auth.elevation` is set only by
+        // `call_tool` after `elevation_at_dispatch` saw a live session, and the
+        // scope gate has already granted the admin-only read scopes from it
+        // (`AuthContext::has_scope`). Re-resolving below could see the session
+        // ended in between and let a write through on scopes only the
+        // elevation granted, so a request dispatch called elevated stays
+        // elevated here. (`sudo`/`unsudo` are not resolved at dispatch, so
+        // their `elevation` is never set.)
+        if auth.elevation.is_some() {
+            return Err(say_where(crate::errors::db_caller_error(
+                epigraph_db::DbError::ElevatedReadOnly,
+            )));
+        }
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if !may_be_elevated {
+            return Ok(());
+        }
+        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        crate::write_identity::refuse_elevated(&viewer).map_err(say_where)
+    }
+
+    /// Decide, ONCE at dispatch, whether an HTTP request is ELEVATED (elevation
+    /// plan EL-8, `crate::elevated_access`): only a request that may be (a
+    /// token carrying an elevation claim, or a family with the connector
+    /// switch on) pays for the resolution. Elevated: the viewer, whose call
+    /// `call_tool` then records before returning its result. Not elevated:
+    /// `None`, and the claim and family are STRIPPED from `auth` so the tool
+    /// cannot resolve an elevated viewer the recorder did not see. stdio
+    /// (`auth == None`) never elevates.
+    ///
+    /// # Errors
+    /// The viewer resolution's own error.
+    pub async fn elevation_at_dispatch(
+        &self,
+        auth: Option<&mut epigraph_auth::AuthContext>,
+    ) -> Result<Option<epigraph_db::Viewer>, McpError> {
+        let Some(auth) = auth else {
+            return Ok(None);
+        };
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if !may_be_elevated {
+            return Ok(None);
+        }
+        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        if viewer.is_elevated() {
+            return Ok(Some(viewer));
+        }
+        auth.elevation_claim = None;
+        auth.family_id = None;
+        Ok(None)
+    }
+
+    /// The admin-scope switch for one HTTP call (elevation plan EL-10): read
+    /// on this server's pool through the shared cache, failing closed
+    /// ([`epigraph_db::AdminScopeArmingCache::armed`]).
+    pub async fn admin_scope_posture(&self) -> epigraph_auth::AdminScopePosture {
+        if self.admin_scope_arming.armed(&self.pool).await {
+            epigraph_auth::AdminScopePosture::Armed
+        } else {
+            epigraph_auth::AdminScopePosture::Unarmed
+        }
+    }
+
+    /// The `AuthContext` a `tools/list` answer is decided on (elevation plan
+    /// EL-11): the admin-scope switch read (as `call_tool` reads it, for a
+    /// token it can change an answer for) and, for a request that may be
+    /// elevated, the database-checked elevation. Nothing is stripped (this
+    /// copy reaches no tool) and nothing is recorded: a listing reads no row.
+    /// A resolution error leaves the request unelevated (the narrower list).
+    pub async fn listing_auth(
+        &self,
+        mut auth: epigraph_auth::AuthContext,
+    ) -> epigraph_auth::AuthContext {
+        if auth.carries_switch_decided_scope() {
+            auth.admin_scopes = self.admin_scope_posture().await;
+        }
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if may_be_elevated {
+            match crate::tools::viewer::request_viewer(self, Some(&auth)).await {
+                Ok(viewer) => {
+                    auth.elevation = viewer.elevation().map(|e| epigraph_auth::ElevationRef {
+                        session_id: e.session_id,
+                        family_id: e.family_id,
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    error = %e.message,
+                    "tools/list: elevation not resolved; listing as unelevated"
+                ),
+            }
+        }
+        auth
+    }
+
+    /// Whether `auth`'s principal holds a live elevating role (operator
+    /// ruling D2), asked of the database on a connection stamped with its
+    /// plain scoped viewer (123's `epigraph_holds_role` is subject-bound).
+    /// `false`, without a round trip, for a token that is not a human
+    /// client's naming its principal; `false` on any error or with no
+    /// tenancy-aware pool (the narrower list).
+    pub async fn holds_elevating_role(&self, auth: &epigraph_auth::AuthContext) -> bool {
+        if !crate::tools::elevation::may_hold_an_elevating_role(auth) {
+            return false;
+        }
+        let (Some(principal), Some(scoped)) = (auth.agent_id, self.scoped.as_ref()) else {
+            return false;
+        };
+        let answer = async {
+            let viewer = epigraph_db::visibility::Viewer::resolve(&self.pool, principal).await?;
+            let mut read = scoped.read_as(&viewer).await?;
+            let held =
+                epigraph_db::RoleAssignmentRepository::holds_elevating_role(&mut read, principal)
+                    .await?;
+            read.commit().await?;
+            Ok::<bool, epigraph_db::DbError>(held)
+        }
+        .await;
+        answer.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "tools/list: the elevating-role check failed; not listing sudo");
+            false
+        })
+    }
+
+    /// The tools listed to one caller (elevation plan EL-11): every kernel
+    /// tool [`crate::tools::elevation::listed`] admits, then every federated
+    /// tool. `auth` is `None` on stdio; over HTTP it must already carry the
+    /// switch and the elevation ([`Self::listing_auth`], or `call_tool`'s
+    /// dispatch for `list_mcp_tools`). The ONE manifest rule `list_tools` and
+    /// `list_mcp_tools` share, so neither can bypass the other.
+    pub async fn manifest_for(
+        &self,
+        http: bool,
+        auth: Option<&epigraph_auth::AuthContext>,
+    ) -> Vec<rmcp::model::Tool> {
+        let holder = match (http, auth) {
+            (true, Some(a)) => self.holds_elevating_role(a).await,
+            _ => false,
+        };
+        let caller = crate::tools::elevation::ManifestCaller {
+            http,
+            auth,
+            holds_elevating_role: holder,
+            connector_elevation: self.connector_elevation,
+        };
+        let mut tools: Vec<rmcp::model::Tool> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| crate::tools::elevation::listed(t.name.as_ref(), &caller))
+            .collect();
+        tools.extend(self.federation.list_federated_tools());
+        tools
+    }
+
+    /// Replace the admin-scope switch's cache with one whose reads stand for
+    /// `ttl` (`Duration::ZERO`: every call reads the switch). For tests that
+    /// arm or disarm mid-run.
+    #[must_use]
+    pub fn with_admin_scope_arming_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.admin_scope_arming = Arc::new(epigraph_db::AdminScopeArmingCache::with_ttl(ttl));
+        self
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -794,6 +1064,9 @@ impl EpiGraphMcpFull {
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
+            connector_elevation: false,
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            public_base_url: None,
         }
     }
 
@@ -822,6 +1095,25 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
+        self
+    }
+
+    /// Switch connector-mode elevation on or off (see the field's doc; OFF is
+    /// the default and the operator ruling until plan EQ-7 is decided).
+    #[must_use]
+    pub fn with_connector_elevation(mut self, enabled: bool) -> Self {
+        self.connector_elevation = enabled;
+        self
+    }
+
+    /// Set the public origin `sudo` names the ceremony page under (the API's
+    /// `EPIGRAPH_PUBLIC_BASE_URL`; a trailing `/` is dropped). `None`, or a
+    /// blank value: `sudo` refuses.
+    #[must_use]
+    pub fn with_public_base_url(mut self, base: Option<String>) -> Self {
+        self.public_base_url = base
+            .map(|b| b.trim().trim_end_matches('/').to_string())
+            .filter(|b| !b.is_empty());
         self
     }
 
@@ -889,6 +1181,9 @@ impl EpiGraphMcpFull {
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
+            connector_elevation: false,
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            public_base_url: None,
         }
     }
 
@@ -1000,7 +1295,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most public claims are owned by the shared world group), the evidence row and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public; the claim's cached Dempster-Shafer belief (belief / plausibility / pignistic_prob) is recombined over every writer's BBAs through an audited path when the cache already carries binary_truth or the claim has no cache at all (otherwise cache_written=false, the response's belief values are this call's combination, and warning says so); but the claim ROW stays its owner's: truth_value is not written (truth_written=false, truth_after=truth_before, evidence_owner=\"writer\") and a call that carries labels is refused with nothing written. On a claim you can write, evidence_owner=\"claim_owner\", truth_written=true and cache_written=true, as before. A group-private claim you cannot read is reported as not found; one you can read but not write is refused. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most public claims are owned by the shared world group), the evidence row and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public; the claim's cached Dempster-Shafer belief (belief / plausibility / pignistic_prob) is recombined over every writer's BBAs through an audited path when the cache already carries binary_truth or the claim has no cache at all (otherwise cache_written=false, the response's belief values are this call's combination, and warning says so); but the claim ROW stays its owner's: truth_value is not written (truth_written=false, truth_after=truth_before, evidence_owner=\"writer\") and a call that carries labels is refused with nothing written. On a claim you can write, evidence_owner=\"claim_owner\", truth_written=true and cache_written=true, as before. LABELS take update_labels' ownership rule even on a claim you can write: over HTTP (authenticated) a call that carries labels requires ownership of the claim (you authored it, you are its author's operator, or your token carries claims:admin), so a writer of the owning group who did not author the claim is refused with nothing written; on stdio only the 'resolved' label is gated (you must be the author or an agent linked to the same operator as its author; a server with no declared signer identity may retire only claims it authored) and every other label is ungated. A group-private claim you cannot read is reported as not found; one you can read but not write is refused. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn update_with_evidence(
         &self,
@@ -1484,7 +1779,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. KNOWN ISSUE (not your error): the steps are filed under a constant 'Body' phase, so once any stored workflow has that phase this call can fail with 'Duplicate entity already exists' and write nothing. Workaround: `ingest_workflow` with a phase summary unique to this workflow (and different from its thesis) and step texts no other workflow uses. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A refusal writes nothing."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. The steps are filed under a phase titled 'Body'; its rows (and the step rows) are scoped to this workflow, so phase and step texts shared with other workflows do not conflict. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing."
     )]
     async fn store_workflow(
         &self,
@@ -1562,7 +1857,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Deprecate a workflow (and optionally its variant_of / supersedes lineage), all-or-nothing. A workflow claim gets truth 0.05 and is_current=false; a hierarchical `workflows` row gets truth 0.05. WARNING: for a hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return for hierarchical workflows) only the `workflows` row changes: its thesis and step claims stay current, yet the id is still reported in deprecated_ids. The id you pass is always listed, whether or not a claim changed; cascaded ids are listed only when a claim was actually deprecated."
+        description = "Deprecate a workflow (and, with cascade, its lineage), all-or-nothing. A flat workflow claim gets truth 0.05 and is_current=false (cascade follows its variant_of / supersedes claims). A hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return) retires the workflow as a unit: its `workflows` row gets truth 0.05, and its thesis, phase and step claims are retired (is_current=false, embeddings removed) unless another live workflow still executes them, in which case they are kept and listed in kept_shared_claim_ids; operation atoms are never retired, since their ids are shared globally. With cascade, every later generation or variant linked to it as parent is deprecated in the same call. Over HTTP a hierarchical workflow can be deprecated only by its submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter (created before batch H-b) only through that admin path; stdio callers are not checked; a refusal writes nothing. The response lists only what changed: deprecated_ids (workflow ids whose state changed; a re-run lists none) and retired_claim_ids. An id that is neither a claim you can read nor a workflows row is an error. Known limitation: a retired thesis, phase or step claim is not revived when a later generation or add_step reuses its exact text, so that workflow then executes a non-current claim."
     )]
     async fn deprecate_workflow(
         &self,
@@ -1583,7 +1878,7 @@ impl EpiGraphMcpFull {
     // variants independently of its workflow root.
 
     #[tool(
-        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. KNOWN ISSUE (not your error): a thesis, phase text (summary, or title when the summary is empty) or step text that another stored workflow already uses can fail the call with 'Duplicate entity already exists', writing nothing. Keep those texts unique to this workflow, and do not reuse the thesis text as a phase summary. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A refusal writes nothing."
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. Thesis, phase and step claims are scoped to this canonical_name, so texts another workflow already uses do not conflict; operation atoms are shared across workflows and documents by text. Within one workflow, do not reuse the thesis text as a phase summary (phase text is the summary, or the title when the summary is empty): the two would resolve to the same claim. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing."
     )]
     async fn ingest_workflow(
         &self,
@@ -1597,7 +1892,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour and duplicate-text known issue as ingest_workflow; texts unchanged from the parent are reused, not duplicated. Over HTTP, requires authority over the parent lineage when it records a submitter (the submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused); batch H-b), and the new generation inherits that submitter; a lineage with no recorded submitter stays open, as before."
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour as ingest_workflow; texts unchanged from the parent are reused, not duplicated. Over HTTP, requires authority over the parent lineage when it records a submitter (the submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused); batch H-b), and the new generation inherits that submitter; a lineage with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may improve it, and the new generation records no submitter either (stdio callers are not checked)."
     )]
     async fn improve_workflow_hierarchy(
         &self,
@@ -1635,7 +1930,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing; a step text another workflow already uses can fail with 'Duplicate entity already exists' (known issue, see ingest_workflow). Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) stays open to any caller, as before."
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing. The step row is scoped to this workflow, so a step text another workflow already uses does not conflict. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written."
     )]
     async fn add_step(
         &self,
@@ -1651,7 +1946,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) stays open to any caller, as before."
+        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written."
     )]
     async fn delete_step(
         &self,
@@ -1681,7 +1976,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means the node limit clipped the walk: raise limit if it is below its maximum of 100, otherwise narrow the walk with relationship or max_depth (limit cannot exceed 100)."
     )]
     async fn traverse(
         &self,
@@ -2160,19 +2455,80 @@ impl EpiGraphMcpFull {
         tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
+    // ── Elevation (3 tools; elevation plan EL-11, EL-12b) ──
+
+    #[tool(
+        description = "Ask to ELEVATE this connection (sudo READ) for at most 15 minutes. Returns ONLY a URL: open it on the device that holds your passkey and confirm. Once confirmed, every request on this connection reads as an elevated custodian: read-only (every write is refused), and every read is recorded where the owners of the rows read can see it. Only a registered human who holds a live elevating role assignment, with a registered passkey, can elevate; agents never can. End it early with unsudo. Served only when the operator has enabled connector-mode elevation; otherwise use the CLI elevate path."
+    )]
+    // `pub` so a test can drive this dispatch body directly (the stdio
+    // refusal is here, before any viewer is resolved).
+    pub async fn sudo(
+        &self,
+        Parameters(params): Parameters<SudoParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth =
+            tools::elevation::over_http(extensions.get::<epigraph_auth::AuthContext>(), "sudo")?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::sudo(self, viewer, auth, &params.reason).await
+    }
+
+    #[tool(
+        description = "End this connection's elevation now (see sudo). Returns {\"ended\": true} when an elevation of yours was live and is now ended, else {\"ended\": false}."
+    )]
+    pub async fn unsudo(
+        &self,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth =
+            tools::elevation::over_http(extensions.get::<epigraph_auth::AuthContext>(), "unsudo")?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::unsudo(self, viewer, auth).await
+    }
+
+    #[tool(
+        description = "Propose an administrative act (role.grant, role.end, claim.custodial_supersede, passkey.register) while ELEVATED. Returns ONLY a URL: open it on the device that holds your passkey and confirm the act it shows; the act is then executed once, by the maintenance command line (epigraph-operator ... --act <id>), within 30 minutes. Listed and served only to an elevated request; nothing is executed by this tool."
+    )]
+    pub async fn propose_admin_act(
+        &self,
+        Parameters(params): Parameters<ProposeAdminActParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = tools::elevation::over_http(
+            extensions.get::<epigraph_auth::AuthContext>(),
+            tools::elevation::PROPOSE_ADMIN_ACT,
+        )?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::propose_admin_act(
+            self,
+            viewer,
+            auth,
+            &params.kind,
+            serde_json::Value::Object(params.args),
+            &params.reason,
+        )
+        .await
+    }
+
     // ── Meta (1 tool) ──
 
     #[tool(
         description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
     )]
-    async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
-        // Kernel tools + every federated tool the gateway advertises, matching
-        // `ServerHandler::list_tools`. `server_instructions` directs clients here
-        // to enumerate every tool with its schema, so the federated tools must be
-        // present or a deferred-schema client following that guidance would never
-        // discover them.
-        let mut tools = self.tool_router.list_all();
-        tools.extend(self.federation.list_federated_tools());
+    async fn list_mcp_tools(
+        &self,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        // The SAME manifest `ServerHandler::list_tools` answers
+        // (`manifest_for`, elevation plan EL-11): kernel tools as this caller
+        // may see them, then every federated tool the gateway advertises.
+        // `server_instructions` directs clients here to enumerate every tool
+        // with its schema, so the federated tools must be present, and the
+        // filter must be the same or this tool would bypass it. `call_tool`
+        // has already stamped the switch and the elevation on the
+        // `AuthContext`; stdio has none.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let tools = self.manifest_for(auth.is_some(), auth).await;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
@@ -2243,7 +2599,7 @@ impl ServerHandler for EpiGraphMcpFull {
         // tower.rs:326/384/463). For stdio transport there is no `Parts` attached —
         // the stdio process boundary is the trust gate and no auth check applies.
         let is_http_call;
-        let auth_owned: Option<epigraph_auth::AuthContext>;
+        let mut auth_owned: Option<epigraph_auth::AuthContext>;
         // The verbatim caller bearer, present only on the HTTP path (stashed by
         // `auth::bearer_auth_middleware`). Needed to forward to a downstream
         // extension MCP on a federated call.
@@ -2260,6 +2616,44 @@ impl ServerHandler for EpiGraphMcpFull {
             raw_token = http_parts
                 .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
                 .map(|t| t.0.clone());
+        }
+        // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
+        // caller's admin-only scopes count (`AuthContext::has_scope`). Read
+        // before any scope gate, the federated one included, for a token it
+        // can change an answer for; the bearer middleware's context leaves it
+        // armed (fail closed) until read.
+        if let Some(auth) = auth_owned
+            .as_mut()
+            .filter(|a| a.carries_switch_decided_scope())
+        {
+            auth.admin_scopes = self.admin_scope_posture().await;
+        }
+
+        // THE PER-ACCESS RECORDER (elevation plan EL-8; `crate::elevated_access`)
+        // and THE CHECK CHOKEPOINT's elevation (EL-10). A request that MAY be
+        // elevated has its viewer resolved once, here, before any scope gate:
+        // elevated, the AuthContext carries the database-checked elevation (the
+        // authority `has_scope` grants the admin-only read scopes from) and the
+        // result is recorded before it is returned (or withheld); not
+        // elevated, the claim and the family are stripped from the AuthContext
+        // the tool sees, so the tool cannot resolve an elevated viewer this
+        // wrapper did not see. Every other request pays nothing.
+        //
+        // `sudo` and `unsudo` act ON the caller's elevation, not AS it
+        // (elevation plan EL-11): not resolved, not stripped, not recorded.
+        // `sudo` needs the family a not-elevated request would lose, and an
+        // `unsudo` would otherwise be recorded by the session it just ended.
+        // Both stamp the principal's plain scoped viewer and read no row.
+        let elevated = if tools::elevation::acts_on_the_elevation(&request.name) {
+            None
+        } else {
+            self.elevation_at_dispatch(auth_owned.as_mut()).await?
+        };
+        if let (Some(viewer), Some(auth)) = (elevated.as_ref(), auth_owned.as_mut()) {
+            auth.elevation = viewer.elevation().map(|e| epigraph_auth::ElevationRef {
+                session_id: e.session_id,
+                family_id: e.family_id,
+            });
         }
 
         // FEDERATION BRANCH — only for names the static tool router does NOT own.
@@ -2279,6 +2673,16 @@ impl ServerHandler for EpiGraphMcpFull {
             if let Some(ext) = self.federation.route_config(&request.name) {
                 let ext_name = ext.name;
                 let ext_scope = ext.scope;
+                // (0) an ELEVATED request reaches no federated tool (review
+                // cp1 COR-1's residual, elevation plan EL-10): it is proxied
+                // under the caller's token, so neither the read-only refusal
+                // below nor the per-access recorder would see it.
+                if let Err(err) = Self::refuse_elevated_federated(elevated.is_some(), &request.name)
+                {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
+                    return Err(err);
+                }
                 // (a) enforce the extension's configured scope against the caller.
                 if let Err(err) =
                     Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)
@@ -2348,6 +2752,16 @@ impl ServerHandler for EpiGraphMcpFull {
                     .await;
                 return Err(err);
             }
+            // An elevated request is read-only: every write tool is refused
+            // here, before dispatch (elevation plan §1.4).
+            if let Err(err) = self
+                .refuse_elevated_write(auth_owned.as_ref(), &request.name)
+                .await
+            {
+                self.emit_tool_invoked(&format!("denied:{}", request.name))
+                    .await;
+                return Err(err);
+            }
             // An HTTP listener must never serve as an operator-linked signer
             // (migration 107): it authors every caller's claims as this one
             // agent. The startup gate (`operator::refuse_operated_http_signer`)
@@ -2363,6 +2777,14 @@ impl ServerHandler for EpiGraphMcpFull {
                 return Err(err);
             }
         }
+
+        let recording = elevated.as_ref().map(|_| {
+            (
+                request.name.to_string(),
+                request.arguments.clone(),
+                auth_owned.as_ref().map(|a| a.jti).unwrap_or_default(),
+            )
+        });
 
         // Single chokepoint for every MCP tool invocation: emit a durable
         // tool.invoked event before dispatch, then forward to the
@@ -2398,20 +2820,45 @@ impl ServerHandler for EpiGraphMcpFull {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        let result = self.tool_router.call(tcc).await;
+        match (elevated, recording) {
+            (Some(viewer), Some((tool, arguments, jti))) => {
+                crate::elevated_access::record_elevated_call(
+                    self,
+                    &viewer,
+                    &tool,
+                    arguments.as_ref(),
+                    jti,
+                    result,
+                )
+                .await
+            }
+            _ => result,
+        }
     }
 
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         // Kernel tools first, then every federated tool the gateway currently
         // advertises. Static-first mirrors `call_tool`'s resolution order: a
         // kernel tool always wins a name clash (the operator resolves clashes
         // between an extension and the kernel with a `prefix=`).
-        let mut tools = self.tool_router.list_all();
-        tools.extend(self.federation.list_federated_tools());
+        //
+        // The kernel list is THIS caller's (elevation plan EL-11, D2):
+        // `sudo`/`unsudo` only to a holder of a live elevating role, and an
+        // admin-only-scoped tool only where the scope gate would admit it. The
+        // HTTP transport carries `Parts` (and, behind the bearer, an
+        // `AuthContext`); stdio carries neither.
+        let parts = context.extensions.get::<Parts>();
+        let http = parts.is_some();
+        let auth = match parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>()) {
+            Some(a) => Some(self.listing_auth(a.clone()).await),
+            None => None,
+        };
+        let tools = self.manifest_for(http, auth.as_ref()).await;
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,
@@ -2445,6 +2892,10 @@ mod scope_guard_tests {
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

@@ -973,3 +973,378 @@ async fn dcr_rejects_non_claude_redirect_host() {
         "a non-claude redirect host must be rejected with 400, got {status}"
     );
 }
+
+/// The consent page (`GET /oauth/callback`'s 200) carries a single-use consent
+/// ticket and an Allow button. It must not render inside another origin's frame
+/// (a signed-in Google user could be walked onto Allow from an attacker page:
+/// clickjacking) and must not be stored by a cache. Driven through the REAL
+/// callback, not an error response: Google's token endpoint is a wiremock that
+/// returns an ID token signed by the fixture key the JWKS serves, so the handler
+/// validates it, provisions the user and renders the page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let fx = ProviderFixture::new().await;
+    let now = Utc::now().timestamp();
+    let id_token = fx.sign(&serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-google-audience",
+        "sub": format!("u002-{}", Uuid::new_v4().simple()),
+        "email": "consent-headers@example.test",
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 600,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id_token": id_token })),
+        )
+        .mount(&fx.mock_server)
+        .await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(format!("{}/token", fx.mock_server.uri()));
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        &pool,
+        &google_state,
+        "u002-requesting-app",
+        REDIRECT_URI,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("claude-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::OK, "the consent page renders: {body}");
+    assert!(
+        body.contains("Authorize Claude") && body.contains("name=\"ticket\""),
+        "this is the consent page with its ticket: {body}"
+    );
+    for (name, expected) in [
+        ("content-security-policy", "frame-ancestors 'none'"),
+        ("x-frame-options", "DENY"),
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+    ] {
+        assert_eq!(
+            headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "consent page header {name}"
+        );
+    }
+}
+
+// ── Loopback (RFC 8252) redirect URIs: native MCP clients such as OpenAI Codex ──
+//
+// Codex's MCP OAuth (codex-rs/rmcp-client, perform_oauth_login.rs::resolve_redirect_uri
+// and oauth_callback.rs) registers and authorizes with an IP-literal loopback
+// callback, `http://127.0.0.1:<ephemeral port>/callback/<id>`; with a configured
+// callback URL it registers `http://127.0.0.1/callback/...` WITHOUT a port and adds
+// the live listener port only to the authorization request, relying on RFC 8252
+// §7.3 ("the authorization server MUST allow any port to be specified at the time
+// of the request for loopback IP redirect URIs").
+
+/// A Codex-shaped callback id (base64url of 9 SHA-256 bytes of the MCP URL).
+const CODEX_CALLBACK: &str = "http://127.0.0.1:53682/callback/Xq3vT0aBk9Lm";
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_loopback_redirects_for_native_clients(pool: PgPool) {
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_providers(Arc::new(ProviderRegistry::default())),
+    );
+    for uri in [
+        CODEX_CALLBACK,                           // Codex default: live port in the URI
+        "http://127.0.0.1/callback/Xq3vT0aBk9Lm", // Codex configured callback: no port
+        "http://[::1]:53682/callback",            // IPv6 loopback listener
+    ] {
+        let (status, body) = post_json2(
+            app.clone(),
+            "/oauth/register",
+            serde_json::json!({
+                "client_name": "Codex",
+                "redirect_uris": [uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a loopback redirect_uri {uri} must register, got {status}: {body}"
+        );
+        assert_eq!(
+            body["redirect_uris"][0], uri,
+            "the loopback redirect_uri must be locked and echoed verbatim, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dcr_rejects_loopback_lookalikes() {
+    // Each of these must be refused by the allowlist BEFORE any DB access (dummy-DB
+    // app): only an IP-literal loopback host over plain http, with no userinfo and
+    // no fragment, is a loopback redirect.
+    for uri in [
+        "http://localhost:53682/callback", // a name, not an IP literal (RFC 8252 §8.3)
+        "http://127.0.0.2:53682/callback", // not THE loopback address
+        "https://127.0.0.1:53682/callback", // loopback redirects are http
+        "http://127.0.0.1.evil.example/callback", // a DNS name that starts like one
+        "http://127.0.0.1:80@evil.example/callback", // userinfo trick: the host is evil.example
+        "http://user@127.0.0.1:53682/callback", // userinfo on a loopback host
+        "http://127.0.0.1:53682/callback#frag", // RFC 6749 §3.1.2: no fragment
+        "http://evil.example:53682/callback",
+        "ftp://127.0.0.1/callback",
+    ] {
+        let (status, _body) = post_json2(
+            app(),
+            "/oauth/register",
+            serde_json::json!({
+                "client_name": "Lookalike",
+                "redirect_uris": [uri],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} is not an acceptable redirect and must be rejected with 400, got {status}"
+        );
+    }
+}
+
+/// The google-backed app for `pool`, plus an active client whose ONLY registered
+/// redirect is `registered`.
+async fn loopback_authorize_app(
+    pool: &PgPool,
+    registered: &str,
+) -> (axum::Router, String, ProviderFixture) {
+    let fx = ProviderFixture::new().await;
+    let provider = Arc::new(
+        GoogleProvider::from_config(&google_cfg(&fx.jwks_url), JwksCache::new())
+            .expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+    let (client_id, _uuid) = seed_active_human_client(pool, &["claims:read".to_string()]).await;
+    sqlx::query("UPDATE oauth_clients SET redirect_uris = $2 WHERE client_id = $1")
+        .bind(&client_id)
+        .bind(&[registered.to_string()][..])
+        .execute(pool)
+        .await
+        .expect("seed redirect_uris");
+    (app, client_id, fx)
+}
+
+fn authorize_uri(client_id: &str, redirect_uri: &str) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
+    format!(
+        "/oauth/authorize?response_type=code&client_id={client_id}\
+         &redirect_uri={encoded}&code_challenge={}&code_challenge_method=S256&state=abc",
+        pkce_challenge(VERIFIER)
+    )
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_accepts_any_request_port_for_a_registered_loopback_redirect(pool: PgPool) {
+    // Registered WITHOUT a port (Codex's configured-callback shape); the request
+    // carries the listener's ephemeral port.
+    let registered = "http://127.0.0.1/callback/Xq3vT0aBk9Lm";
+    let requested = "http://127.0.0.1:54321/callback/Xq3vT0aBk9Lm";
+    let (app, client_id, _fx) = loopback_authorize_app(&pool, registered).await;
+
+    let (status, loc) = get_redirect(app, &authorize_uri(&client_id, requested)).await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "a loopback redirect differing only in port must be accepted (RFC 8252 §7.3), got {status}"
+    );
+    assert!(
+        loc.as_deref()
+            .unwrap_or("")
+            .starts_with(GOOGLE_AUTH_ENDPOINT),
+        "the accepted request continues to the identity provider, got {loc:?}"
+    );
+
+    // The pending session keeps the REQUEST-time URI (with its port): that is where
+    // the code is delivered and what the token exchange later compares exactly.
+    let stored: String = sqlx::query_scalar(
+        "SELECT redirect_uri FROM oauth_authorize_sessions WHERE client_id = $1",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("one pending session");
+    assert_eq!(stored, requested);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_relaxes_only_the_loopback_port(pool: PgPool) {
+    let (app, client_id, _fx) =
+        loopback_authorize_app(&pool, "http://127.0.0.1/callback/Xq3vT0aBk9Lm").await;
+    for requested in [
+        "http://127.0.0.1:54321/callback/other", // a different path
+        "http://127.0.0.1:54321/callback/Xq3vT0aBk9Lm?x=1", // an added query
+        "http://localhost:54321/callback/Xq3vT0aBk9Lm", // a name, not the registered IP
+        "http://[::1]:54321/callback/Xq3vT0aBk9Lm", // a different loopback host
+    ] {
+        let (status, _loc) = get_redirect(app.clone(), &authorize_uri(&client_id, requested)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{requested} differs from the registered loopback redirect in more than its port; got {status}"
+        );
+    }
+
+    // A hosted (https) redirect keeps exact matching: no port relaxation for claude.ai.
+    let (app, client_id, _fx) = loopback_authorize_app(&pool, REDIRECT_URI).await;
+    let (status, _loc) = get_redirect(
+        app,
+        &authorize_uri(&client_id, "https://claude.ai:8443/api/mcp/auth_callback"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a claude.ai redirect with a different port must still be rejected, got {status}"
+    );
+}
+
+/// The consent page `GET /oauth/callback` renders for a pending session whose
+/// request carried `redirect_uri` (Google's token endpoint mocked as in
+/// `the_consent_page_cannot_be_framed_or_cached`).
+async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let fx = ProviderFixture::new().await;
+    let now = Utc::now().timestamp();
+    let unique = Uuid::new_v4().simple().to_string();
+    let email = format!("consent-{unique}@example.test");
+    let id_token = fx.sign(&serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-google-audience",
+        "sub": format!("loopback-{unique}"),
+        "email": email,
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 600,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id_token": id_token })),
+        )
+        .mount(&fx.mock_server)
+        .await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(format!("{}/token", fx.mock_server.uri()));
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        pool,
+        &google_state,
+        "loopback-requesting-app",
+        redirect_uri,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("client-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the consent page renders");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (String::from_utf8_lossy(&body).into_owned(), email)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_a_local_application_for_a_loopback_redirect(pool: PgPool) {
+    // The page must not tell a Codex (loopback) user that CLAUDE is asking: the
+    // label follows the redirect's class, which the server validated, never the
+    // self-declared DCR client_name.
+    let (body, email) = consent_page_for(&pool, CODEX_CALLBACK).await;
+    assert!(
+        !body.contains("Claude"),
+        "a loopback sign-in must not be presented as Claude: {body}"
+    );
+    assert!(
+        body.contains("Authorize an application on this computer")
+            && body.contains("http://127.0.0.1:53682"),
+        "the page names a local application and the origin that receives access: {body}"
+    );
+    assert!(
+        body.contains("name=\"ticket\"") && body.contains(&email),
+        "it is still the consent page for the signed-in user: {body}"
+    );
+
+    // A hosted claude.ai redirect keeps the Claude wording.
+    let (body, _email) = consent_page_for(&pool, REDIRECT_URI).await;
+    assert!(
+        body.contains("Authorize Claude"),
+        "a claude.ai sign-in is still presented as Claude: {body}"
+    );
+}

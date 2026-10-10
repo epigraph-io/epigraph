@@ -17,6 +17,8 @@
 pub mod activities;
 pub mod admin;
 #[cfg(feature = "db")]
+pub mod admin_acts;
+#[cfg(feature = "db")]
 pub mod agent_keys;
 #[cfg(feature = "db")]
 pub mod agents;
@@ -44,6 +46,10 @@ pub mod crud;
 pub mod edges;
 #[cfg(feature = "db")]
 pub mod ego;
+#[cfg(feature = "db")]
+pub mod elevate;
+#[cfg(feature = "db")]
+pub mod elevation;
 pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
@@ -52,6 +58,7 @@ pub mod events;
 pub mod experiment_loop;
 #[cfg(feature = "db")]
 pub mod experiments;
+pub mod extensions;
 #[cfg(feature = "db")]
 pub mod gaps;
 #[cfg(feature = "db")]
@@ -108,6 +115,8 @@ pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
 pub mod tasks;
+#[cfg(any(test, feature = "db"))]
+pub(crate) mod text;
 #[cfg(feature = "db")]
 pub mod timeline;
 pub mod versioning;
@@ -223,6 +232,35 @@ use axum::{
     Router,
 };
 
+/// Response headers for every route of the anonymous `/oauth` and
+/// `/.well-known` router, in both router variants.
+///
+/// * `Content-Security-Policy: frame-ancestors 'none'` and
+///   `X-Frame-Options: DENY`: the consent page (`GET /oauth/callback`) is an
+///   Allow button bound to a single-use ticket. Rendered inside another
+///   origin's frame, a signed-in user can be walked onto it (clickjacking).
+///   The legacy header covers browsers without CSP level 2.
+/// * `Cache-Control: no-store`: that ticket, and every token response (RFC 6749
+///   section 5.1 requires it there), must not be stored by any cache.
+/// * `Referrer-Policy: no-referrer`: these URLs carry codes and state.
+///
+/// Inserted, not appended, so a handler cannot weaken them.
+async fn oauth_response_headers(mut res: axum::response::Response) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
+
 /// Create the main application router with all routes.
 ///
 /// # Route structure — authenticated by default
@@ -271,6 +309,23 @@ use axum::{
 /// rate limiter is configured in `AppState`.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Vec::new())
+}
+
+/// [`create_router`] with embedder routes nested inside the authenticated
+/// router, at `/api/v1/ext/<name>` each. They are mounted before the
+/// authenticated router's layers, so they inherit bearer authentication, the
+/// per-access recorder, the body limit and the rate limiter. They do not
+/// inherit scope checks or tenancy; see [`extensions`] for that contract.
+/// Passing no extensions is exactly [`create_router`].
+///
+/// # Panics
+/// When two extensions share a name.
+#[cfg(feature = "db")]
+pub fn create_router_with_extensions(
+    state: AppState,
+    extensions: Vec<extensions::RouterExtension>,
+) -> Router {
     // Write operations. Read operations are appended below by the PR-03
     // inversion; the two halves are separate only because of the order the
     // chain was written in, not because they differ in authority.
@@ -745,6 +800,20 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
         .route("/api/v1/stats", get(stats::corpus_stats))
+        // Elevation (plan EL-5, rulings D2/D5): a human asks for a grant-mode
+        // ticket for ITSELF (the definer is principal-bound and refuses anyone
+        // without a live elevating-role assignment and a live passkey), and
+        // ends its own elevation. The ceremony itself is on the public router.
+        .route("/api/v1/elevation/tickets", post(elevation::create_ticket))
+        .route("/api/v1/elevation/end", post(elevation::end_elevation))
+        // Admin acts (plan EL-12b): an ELEVATED request proposes an act (the
+        // definer refuses any other, ELV07), and anyone lists their OWN acts.
+        // Confirmation is the public `/elevate/act/:id` ceremony; execution is
+        // the maintenance CLI's (`--act`).
+        .route(
+            "/api/v1/admin/acts",
+            post(admin_acts::propose_act).get(admin_acts::list_acts),
+        )
         .route(
             "/api/v1/clusters/boundary-claims",
             get(crud::get_boundary_claims),
@@ -968,10 +1037,26 @@ pub fn create_router(state: AppState) -> Router {
     // been deleted. `require_packet_signatures` survives under its new name and
     // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
     // a different mechanism at a different layer.
-    let protected = protected.layer(middleware::from_fn_with_state(
-        state.clone(),
-        bearer_auth_middleware,
-    ));
+    //
+    // THE PER-ACCESS RECORDER (elevation plan EL-8): a ROUTE layer, so it runs
+    // after routing (the matched route names the access) and inside the bearer
+    // layer (the `AuthContext` is known). Every request served to an ELEVATED
+    // viewer is recorded in migration 127's log before its response leaves, or
+    // the response is withheld; `ViewerExtractor` refuses an elevated viewer to
+    // a request this layer does not wrap. A token without an elevation claim
+    // passes straight through.
+    // Embedder extensions (`extensions::mount_all`) are nested HERE, before
+    // either layer: `route_layer` and `layer` wrap only routes that already
+    // exist, so a mount below them would be unauthenticated.
+    let protected = extensions::mount_all(protected, extensions, &state)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::elevated_access::record_elevated_access,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ));
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
@@ -990,14 +1075,60 @@ pub fn create_router(state: AppState) -> Router {
     // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
     // surface, and is anonymous by construction: discovery and token issuance
     // must precede authentication.
+    //
+    // The passkey enrollment ceremony (elevation plan EL-3) is the third
+    // anonymous application surface, and is anonymous BY DESIGN: the operator
+    // opens the page on the device that holds the authenticator, with no bearer
+    // token to present. The enrollment id (random, live for at most 15 minutes,
+    // consumed once) and the authenticator are its credentials; every handler
+    // reads only that one enrollment, through migration 124's ceremony
+    // definers, and answers 503 when no relying party is configured. The two
+    // assets are static text from this binary, served here because the page's
+    // CSP admits script and style from its own origin only. `db` variant only:
+    // the ceremony needs the database.
+    //
+    // The ELEVATION ceremony (plan EL-5) is the same kind of surface: the human
+    // opens `/elevate/<ticket>` on the device that holds the passkey, again
+    // with no bearer token to present. The ticket id (random, live for at most
+    // 5 minutes, asserted once) and the passkey are its credentials; every
+    // handler reads only that one ticket through migration 125's ceremony
+    // definers, the challenge allows only the TICKET person's live passkeys,
+    // and nothing here mints a token (the elevate grant at `/oauth/token`
+    // does, against the ticket's redeem secret).
+    //
+    // The ADMIN-ACT confirmation (plan EL-12b) is the same kind of surface:
+    // the proposer opens `/elevate/act/<id>` on the device that holds the
+    // passkey. The act id (random, live for at most 30 minutes, asserted once)
+    // and the PROPOSER's passkey are its credentials; every handler reads only
+    // that one act through migration 130's ceremony definers, the challenge
+    // commits to the act's stored args digest, and nothing here executes an
+    // act (the maintenance CLI's `--act` does).
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
             "/api/v1/openapi.json",
             get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        );
+        )
+        .route("/elevate/enroll/:id", get(elevate::enroll_page))
+        .route(
+            "/elevate/enroll/:id/challenge",
+            post(elevate::enroll_challenge),
+        )
+        .route("/elevate/enroll/:id/finish", post(elevate::enroll_finish))
+        .route("/elevate/assets/enroll.js", get(elevate::enroll_js))
+        .route("/elevate/assets/elevate.css", get(elevate::elevate_css))
+        .route("/elevate/:ticket", get(elevate::ticket_page))
+        .route(
+            "/elevate/:ticket/challenge",
+            post(elevate::ticket_challenge),
+        )
+        .route("/elevate/:ticket/assert", post(elevate::ticket_assert))
+        .route("/elevate/act/:id", get(elevate::act_page))
+        .route("/elevate/act/:id/challenge", post(elevate::act_challenge))
+        .route("/elevate/act/:id/assert", post(elevate::act_assert))
+        .route("/elevate/assets/elevate.js", get(elevate::elevate_js));
 
-    // Layered on the two-route allowlist: a request with no Authorization
+    // Layered on the allowlist: a request with no Authorization
     // header passes through, a request with a present-but-invalid token still
     // 401s. Retained rather than dropped so an allowlisted handler can still
     // see who is calling when a token happens to be supplied.
@@ -1040,7 +1171,8 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
-        );
+        )
+        .layer(middleware::map_response(oauth_response_headers));
 
     // Apply rate limiting and body limit as outermost layers
     // Rate limiting bypasses health endpoints internally
@@ -1082,6 +1214,23 @@ pub fn create_router(state: AppState) -> Router {
 /// rate limiter is configured in `AppState`.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Vec::new())
+}
+
+/// [`create_router`] with embedder routes nested inside the authenticated
+/// router, at `/api/v1/ext/<name>` each. They are mounted before the
+/// authenticated router's layers, so they inherit bearer authentication, the
+/// body limit and the rate limiter. They do not inherit scope checks or
+/// tenancy; see [`extensions`] for that contract. Passing no extensions is
+/// exactly [`create_router`].
+///
+/// # Panics
+/// When two extensions share a name.
+#[cfg(not(feature = "db"))]
+pub fn create_router_with_extensions(
+    state: AppState,
+    extensions: Vec<extensions::RouterExtension>,
+) -> Router {
     // Protected write operations
     let protected = Router::new()
         // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
@@ -1463,10 +1612,12 @@ pub fn create_router(state: AppState) -> Router {
     // been deleted. `require_packet_signatures` survives under its new name and
     // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
     // a different mechanism at a different layer.
-    let protected = protected.layer(middleware::from_fn_with_state(
-        state.clone(),
-        bearer_auth_middleware,
-    ));
+    // Embedder extensions (`extensions::mount_all`) are nested HERE, before
+    // the bearer layer: `layer` wraps only routes that already exist, so a
+    // mount below it would be unauthenticated.
+    let protected = extensions::mount_all(protected, extensions, &state).layer(
+        middleware::from_fn_with_state(state.clone(), bearer_auth_middleware),
+    );
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
@@ -1523,7 +1674,8 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
-        );
+        )
+        .layer(middleware::map_response(oauth_response_headers));
 
     // Apply rate limiting and body limit as outermost layers
     // Rate limiting bypasses health endpoints internally

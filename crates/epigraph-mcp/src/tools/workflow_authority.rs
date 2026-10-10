@@ -54,10 +54,18 @@
 //!   the write records a `workflows.admin_write` `security_events` row on its
 //!   own transaction, naming the admin, the token, the workflow, its submitter
 //!   and what was written (D2's semantics for a write that needs no definer).
-//! * A workflow with NO record keeps today's behaviour, with a WARN naming it,
-//!   so the legacy population is neither tightened by accident nor handed to
-//!   whoever touches it first. Which authority legacy workflows carry is an
-//!   operator decision this module does not make.
+//! * A workflow with NO record (every workflow written before batch H-b) is
+//!   PLATFORM CORPUS (U005, default decision A, following the D1 ruling that
+//!   the legacy corpus stays platform-owned). Over the authenticated transport
+//!   it is mutable ONLY through the audited admin arm, whose audit row records
+//!   `"submitter": null`; everyone else, the agent that happened to ingest it
+//!   included, is refused with "no recorded submitter". It used to keep the
+//!   pre-H-b behaviour with a WARN, which left any `claims:write` token able to
+//!   `delete_step` on the whole legacy corpus. A new generation of a legacy
+//!   lineage inherits no record, so platform lineage stays platform. No
+//!   submitter is backfilled: there is no provenance to backfill from. stdio is
+//!   unchanged here as everywhere in this module. When the custodian role
+//!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
 //!   the wrong object and the wrong verb.
@@ -111,18 +119,27 @@ pub(crate) async fn require_workflow_authority(
     let Some(auth) = auth else {
         return Ok(grant(false));
     };
-    let Some(owner) = owner else {
-        tracing::warn!(
-            tool = tool_name,
-            workflow_id = %workflow_id,
-            caller = %caller.agent_id(),
-            "workflow mutation on a workflow with no recorded submitter (written before batch \
-             H-b): allowed, as before; which authority legacy workflows carry is an operator \
-             decision"
-        );
-        return Ok(grant(false));
-    };
     let caller_agent = caller.agent_id();
+    // A workflow with NO recorded submitter (written before batch H-b) is
+    // platform corpus (U005, default decision A; the D1 ruling keeps the
+    // legacy corpus platform-owned). There is no submitter to match and no
+    // operator to derive, so the only arm is the audited admin arm. When the
+    // custodian role lands (#529), its check replaces `claims:admin` here.
+    let Some(owner) = owner else {
+        let subject = format!(
+            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
+             written before batch H-b)"
+        );
+        let needs = "a live claims:admin grant (the audited claims:admin path)";
+        return match admin_arm(conn, auth, caller_agent, &subject, needs, tool_name).await? {
+            Some(()) => Ok(grant(true)),
+            None => Err(crate::errors::invalid_params(format!(
+                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on a \
+                 legacy platform workflow requires the audited claims:admin path. Nothing was \
+                 written."
+            ))),
+        };
+    };
     // 1. The submitter.
     if caller_agent == owner {
         return Ok(grant(false));
@@ -132,39 +149,65 @@ pub(crate) async fn require_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(grant(false));
     }
-    // 3. The AUDITED admin arm. The token's scope is necessary, not sufficient:
-    //    its client record must still grant `claims:admin` to this principal
-    //    (migration 111's ADM02 predicate), and the write that follows records
-    //    a `workflows.admin_write` audit row on the same transaction.
-    if auth.has_scope("claims:admin") {
-        let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
-            &mut *conn,
-            auth.client_id,
-            caller_agent,
-        )
-        .await
-        .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: could not re-check the admin grant: {e}"
-            ))
-        })?;
-        if live {
-            return Ok(grant(true));
-        }
-        return Err(crate::errors::invalid_params(format!(
-            "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} \
-             holds claims:admin in its token, but the token's client record ({}) grants it no \
-             live claims:admin, so the audited admin path refused it (ADM02). {tool_name} \
-             requires the workflow's submitter, the submitter's operator, or a live \
-             claims:admin grant. Nothing was written.",
-            auth.client_id
-        )));
+    // 3. The AUDITED admin arm.
+    let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
+    let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
+    if admin_arm(conn, auth, caller_agent, &subject, needs, tool_name)
+        .await?
+        .is_some()
+    {
+        return Ok(grant(true));
     }
     Err(crate::errors::invalid_params(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
          neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
          the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
          Nothing was written."
+    )))
+}
+
+/// The AUDITED admin arm, shared by a submitted workflow (after its submitter
+/// and operator arms) and a legacy one (its only arm). The token's scope is
+/// necessary, not sufficient: its client record must still grant
+/// `claims:admin` to this principal (migration 111's ADM02 predicate), and the
+/// write that follows records a `workflows.admin_write` audit row on the same
+/// transaction.
+///
+/// `Ok(Some(()))`: admitted. `Ok(None)`: the token holds no `claims:admin`, so
+/// the caller words its own refusal. `Err`: the token holds `claims:admin` but
+/// its client record grants none (ADM02), refused with `subject` naming the
+/// workflow and `needs` naming the arms that would admit.
+async fn admin_arm(
+    conn: &mut sqlx::PgConnection,
+    auth: &epigraph_auth::AuthContext,
+    caller_agent: uuid::Uuid,
+    subject: &str,
+    needs: &str,
+    tool_name: &'static str,
+) -> Result<Option<()>, McpError> {
+    if !auth.has_scope("claims:admin") {
+        return Ok(None);
+    }
+    let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
+        &mut *conn,
+        auth.client_id,
+        caller_agent,
+        auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
+    )
+    .await
+    .map_err(|e| {
+        internal_error(format!(
+            "{tool_name}: could not re-check the admin grant: {e}"
+        ))
+    })?;
+    if live {
+        return Ok(Some(()));
+    }
+    Err(crate::errors::invalid_params(format!(
+        "{subject}; caller agent {caller_agent} holds claims:admin in its token, but the token's \
+         client record ({}) grants it no live claims:admin, so the audited admin path refused it \
+         (ADM02). {tool_name} requires {needs}. Nothing was written.",
+        auth.client_id
     )))
 }
 

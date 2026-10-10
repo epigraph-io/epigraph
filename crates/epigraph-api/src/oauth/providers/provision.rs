@@ -166,13 +166,18 @@ pub async fn provision_external_user(
     provider: &dyn ExternalIdentityProvider,
     identity: &ExternalIdentity,
     requested_scope: Option<&str>,
+    grant: crate::oauth::scopes::MintGrant,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     use epigraph_db::repos::refresh_token::RefreshTokenRepository;
 
     let client = provision_external_user_client(state, provider, identity).await?;
 
     let ttl = Duration::hours(1);
-    let effective_scopes = match requested_scope {
+    // The request's intersection with the client's scopes, through the mint
+    // chokepoint (never the elevation scope; the admin-only scopes per
+    // migration 128's switch), under the grant that reached this mint (the
+    // token endpoint's assertion grant or the redirect exchange).
+    let requested_scopes = match requested_scope {
         Some(req) => req
             .split(' ')
             .map(|s| s.to_string())
@@ -180,6 +185,8 @@ pub async fn provision_external_user(
             .collect::<Vec<_>>(),
         None => client.granted_scopes.clone(),
     };
+    let effective_scopes =
+        crate::oauth::scopes::grantable(state, client.id, requested_scopes, grant).await;
 
     // The FOURTH token-mint site (the other three are in oauth/token.rs). It
     // previously passed literal `None` for both owner_id and agent_id, so every
@@ -190,27 +197,17 @@ pub async fn provision_external_user(
     let agent_id =
         crate::oauth::token::principal_agent_id(state, client.id, client.agent_id).await?;
 
-    let (access_token, _jti) = state
-        .jwt_config
-        .issue_access_token(
-            client.id,
-            effective_scopes.clone(),
-            "human",
-            client.owner_id,
-            Some(agent_id),
-            ttl,
-        )
-        .map_err(|e| ApiError::InternalError {
-            message: format!("JWT signing failed: {e}"),
-        })?;
-
-    let refresh_token = {
+    // The refresh row is inserted BEFORE the access token is signed, so the
+    // access token can name its family (a new row is its own family,
+    // migration 118); see `oauth::token::binds_refresh_family`. If the signing
+    // fails, the row is left unreturned and can never be presented.
+    let (refresh_token, refresh_id) = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
         let hash = blake3::hash(&raw);
         let refresh_ttl = Duration::days(30);
-        RefreshTokenRepository::create(
+        let refresh_id = RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
@@ -221,8 +218,28 @@ pub async fn provision_external_user(
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?;
-        token_str
+        (token_str, refresh_id)
     };
+
+    let binding = if crate::oauth::token::binds_refresh_family("human") {
+        epigraph_auth::AccessTokenBinding::family(refresh_id)
+    } else {
+        epigraph_auth::AccessTokenBinding::NONE
+    };
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            effective_scopes.clone(),
+            "human",
+            client.owner_id,
+            Some(agent_id),
+            ttl,
+            binding,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
 
     Ok((
         StatusCode::OK,

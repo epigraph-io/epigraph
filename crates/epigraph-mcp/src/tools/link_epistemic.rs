@@ -112,9 +112,10 @@ fn is_structural_relationship(s: &str) -> bool {
 ///
 /// Why it matters (backlog 9a0bd3e2): `link_epistemic` wrote every
 /// relationship through the directional repo, so an agent filing `contradicts`
-/// in both orders produced two `edges` rows for one disagreement. Every
-/// conflict-density measure counts rows — `silence_alarm`'s
-/// `check_conflict_density` included — so one dispute read as two.
+/// in both orders produced two `edges` rows for one disagreement, and a
+/// measure that counts rows read one dispute as two. (The silence alarm's
+/// count, `epigraph_db::ConflictDensityRepository`, now counts unordered claim
+/// pairs, so it no longer depends on this dedup.)
 ///
 /// The five excluded epistemic relations are genuinely directional and MUST
 /// NOT be added here: `supports`, `elaborates`, `generalizes`, `specializes`
@@ -129,10 +130,17 @@ fn is_structural_relationship(s: &str) -> bool {
 /// ORDERS of `link_epistemic`'s own `corroborates`; it does NOT unify a
 /// `link_epistemic` `corroborates` with a matcher-written `CORROBORATES`.
 /// That casing split is pre-existing and out of scope here.
-pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+///
+/// Re-exported from the shared definition in `epigraph_core` so this tool and
+/// the HTTP twin (`POST /api/v1/edges`) cannot drift apart.
+pub const SYMMETRIC_RELATIONSHIPS: &[&str] =
+    epigraph_core::edge::relationships::SYMMETRIC_CLAIM_RELATIONSHIPS;
 
+/// Membership is ASCII-case-insensitive (the shared helper), but this tool
+/// validates against the lower-case `EPISTEMIC_RELATIONSHIPS` first, so only
+/// the lower-case spellings ever reach it here: behaviour is unchanged.
 fn is_symmetric_relationship(s: &str) -> bool {
-    SYMMETRIC_RELATIONSHIPS.contains(&s)
+    epigraph_core::edge::relationships::is_symmetric_claim_relationship(s)
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {

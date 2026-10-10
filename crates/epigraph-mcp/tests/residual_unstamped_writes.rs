@@ -162,24 +162,24 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          (BYPASSRLS) where there is no tenancy context to stamp. A server on an ordinary pool \
          with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
     ),
-    (
-        "tools/matching.rs",
-        "EdgeRepository::create_symmetric_if_absent",
-        1,
-        "`decide_match_candidate`'s SAME_AS edge. CORRECTED by the batch H-a review, which \
-         MEASURED it on a clean migrate (config A): promote own<->own, foreign<->foreign and \
-         own<->foreign all created the edge. Between PUBLIC claims, migration 070's BEFORE \
-         trigger makes the edge world-owned and `edges_tenancy`'s static world arm admits it \
-         unstamped. The earlier reason (\"refused on a clean migrate\") was an inference. An \
-         edge touching a group-private claim is NOT covered by that measurement.",
-    ),
+    // `tools/matching.rs` / `EdgeRepository::create_symmetric_if_absent` (1)
+    // left in U012 WITHOUT being stamped. `decide_match_candidate`'s matcher
+    // edge is now written inside `MatchCandidateRepo::promote_if_pending`, on
+    // the same transaction as the candidate's status flip, on the pool the repo
+    // was built from (`MatchCandidateRepo::new(server.pool.clone())`): a pool
+    // held in a struct field, which this scan does not follow (module doc).
+    // The batch H-a measurement still describes it: between PUBLIC claims,
+    // migration 070's BEFORE trigger makes the edge world-owned and
+    // `edges_tenancy`'s static world arm admits it unstamped; an edge touching
+    // a group-private claim is NOT covered by that measurement.
     (
         "tools/perspectives.rs",
         "EdgeRepository::create",
         1,
         "`create_perspective`'s provenance edge. CORRECTED by the batch H-a review: MEASURED OK \
          on a clean migrate (config A), the edge world-public, perspective +1. Same static world \
-         arm as `matching.rs` above; the earlier \"refused on a clean migrate\" was inferred.",
+         arm as the matcher edge noted above; the earlier \"refused on a clean migrate\" was \
+         inferred.",
     ),
     (
         "tools/perspectives.rs",

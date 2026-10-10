@@ -472,6 +472,290 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "admin_act.rs",
+        "get",
+        "READ of one `pending_admin_acts` row by id for the maintenance CLI (migration 130): an \
+         authority record about a principal (its proposer and confirmation), no `visibility` / \
+         `owner_group_id`; 130's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "propose",
+        "WRITE through migration 130's PRINCIPAL-BOUND, elevation-gated app-callable definer \
+         `epigraph_propose_admin_act` (EL-12b), called only by `ScopedPool::propose_admin_act` on \
+         a transaction STAMPED with the proposer's viewer: the definer refuses an unelevated \
+         connection (ELV07) and takes the proposer, elevation and assignment from the stamped \
+         session. An act is an authority record about a principal, not a corpus row; the \
+         viewer is spent on the stamp.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "list_mine",
+        "READ through migration 131's principal-bound app-callable definer \
+         `epigraph_admin_acts_of_principal` on the requester's STAMPED connection: only the \
+         stamped principal's own acts (no caller-supplied id), no ceremony state or evidence. \
+         Authority records about the requester, not corpus rows; the viewer is spent on the \
+         stamp.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "live_act",
+        "READ of ONE act by id through 130's app-callable definer `epigraph_act_for_ceremony`, \
+         for the anonymous confirmation page (EL-12b): only while the act is live, and it \
+         enumerates nothing. An authority record, not a corpus row, and the page has no \
+         principal a Viewer could carry.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "passkeys",
+        "READ through 130's app-callable definer `epigraph_passkeys_for_act`: the act PROPOSER's \
+         live passkeys (the ceremony's allowCredentials and verifying keys), only while the act \
+         is live, never anyone else's. Authentication records, not corpus rows.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "store_challenge",
+        "WRITE through 130's app-callable definer `epigraph_set_admin_act_challenge` (the \
+         confirmation state of one live act, by id); the table's guard refuses a non-live act. \
+         Nothing for a viewer to filter.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "confirm",
+        "WRITE through 130's app-callable definer `epigraph_confirm_admin_act`: an assertion over \
+         one live, started act, confirmed or RETURNED as an audited refusal. Every rule (only a \
+         live passkey of the proposer, the counter, the backup flag, the proposer's assignment) \
+         is the definer's and the table's; nothing for a viewer to filter.",
+    ),
+    (
+        "admin_scope_enforcement.rs",
+        "state",
+        "READ of migration 128's one-row admin-scope switch (`admin_scope_enforcement`) for the \
+         maintenance CLI's report: control state with no `visibility` / `owner_group_id`, the \
+         same row for every caller; nothing for a viewer to filter.",
+    ),
+    (
+        "admin_scope_enforcement.rs",
+        "set",
+        "WRITE through migration 128's maintenance-only definer \
+         `epigraph_set_admin_scope_enforcement` (arm or disarm the admin-scope switch, with a \
+         reason): one control row, no tenancy columns; the definer refuses every login but the \
+         maintenance role (ADS02) and the table's own trigger audits the change.",
+    ),
+    (
+        "passkey.rs",
+        "create_enrollment",
+        "WRITE through migration 124's maintenance-only definer \
+         `epigraph_create_passkey_enrollment` into `passkey_enrollments`, an authentication \
+         record about a registered human, not a corpus row: no `visibility` / \
+         `owner_group_id`, its own triggers enforce every rule (ELV01/ELV03) and write the \
+         `platform.passkey_enrollment_created` row. Nothing for a viewer to filter.",
+    ),
+    (
+        "passkey.rs",
+        "create_enrollment_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_create_passkey_enrollment`: as `create_enrollment`, opened `confirmed_act` on \
+         a confirmed `passkey.register` act its guard consumes. An authentication record, not a \
+         corpus row.",
+    ),
+    (
+        "passkey.rs",
+        "get_enrollment",
+        "READ of one `passkey_enrollments` row by id for the maintenance CLI. No tenancy \
+         columns; 124's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
+        "passkey.rs",
+        "revoke",
+        "WRITE through 124's maintenance-only `epigraph_revoke_passkey`: the one revoke stamp \
+         on one `person_authenticators` row, an authentication record with no tenancy columns.",
+    ),
+    (
+        "passkey.rs",
+        "get",
+        "READ of one `person_authenticators` row by id for the maintenance CLI. No tenancy \
+         columns; 124's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
+        "passkey.rs",
+        "list",
+        "READ of `person_authenticators` for the maintenance CLI (`list-passkeys`). No tenancy \
+         columns; on an application connection 124's policy returns nothing, which is why the \
+         CLI runs it on the maintenance connection.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "live_enrollment",
+        "READ of ONE enrollment by id through migration 124's app-callable SECURITY DEFINER \
+         `epigraph_enrollment_for_ceremony`, for the anonymous enrollment page (EL-3): it \
+         returns only that row's person, reason, label, expiry and challenge, and only while it \
+         is live, and enumerates nothing. An authentication record about a principal, not a \
+         corpus row: no `visibility` / `owner_group_id`, and the page has no principal a \
+         Viewer could carry.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "store_challenge",
+        "WRITE through 124's app-callable definer `epigraph_set_passkey_enrollment_challenge` \
+         (the ceremony state of one live enrollment, by id). The table's guard refuses a \
+         non-live enrollment (ELV04); nothing for a viewer to filter.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "complete",
+        "WRITE through 124's app-callable definer `epigraph_complete_passkey_enrollment`: the \
+         passkey a verified ceremony registered, consuming its enrollment. Every rule is the \
+         tables' (ELV01/ELV03/ELV04, user verification a CHECK) and the audit row their \
+         trigger's; nothing for a viewer to filter.",
+    ),
+    (
+        "elevated_access.rs",
+        "record",
+        "WRITE through migration 127's app-callable definer `epigraph_record_elevated_access` \
+         (EL-8), on a connection `ScopedPool::record_elevated_access` has STAMPED with the \
+         ELEVATED viewer (it refuses any other): the definer refuses an unelevated connection \
+         (ELV07), takes the person and session from the stamped elevation, and decides the \
+         owner groups itself. The row is the log of a read, not a corpus row; there is nothing \
+         for a viewer to filter, and the viewer is spent on the stamp.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "create_ticket",
+        "WRITE through migration 125's PRINCIPAL-BOUND app-callable definer \
+         `epigraph_create_elevation_ticket` (EL-5): the caller passes its connection STAMPED with \
+         the requester's viewer, and the definer takes the person from `epigraph_principal_id()`, \
+         never from an argument. An authentication record about a principal, not a corpus row: \
+         no `visibility` / `owner_group_id`; the table's guard enforces who may elevate (ELV02).",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "live_ticket",
+        "READ of ONE ticket by id through migration 125's app-callable SECURITY DEFINER \
+         `epigraph_ticket_for_ceremony`, for the anonymous elevation page (EL-5): only that \
+         ticket's person, client, family, mode, reason, expiry and challenge, only while it is \
+         live, no secret, and it enumerates nothing. An authentication record about a principal, \
+         not a corpus row, and the page has no principal a Viewer could carry.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "passkeys",
+        "READ through 125's app-callable definer `epigraph_passkeys_for_ticket`: the TICKET \
+         person's live passkeys (the ceremony's allowCredentials and verifying keys), only while \
+         the ticket is live, never anyone else's. Authentication records, not corpus rows.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "store_challenge",
+        "WRITE through 125's app-callable definer `epigraph_set_elevation_ticket_challenge` (the \
+         ceremony state of one live ticket, by id); the table's guard refuses a non-live ticket \
+         (ELV06). Nothing for a viewer to filter.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "confirm",
+        "WRITE through 125's app-callable definer `epigraph_confirm_elevation`: an assertion over \
+         one live ticket, which opens a session or RETURNS an audited refusal. Every rule (the \
+         credential is the ticket person's, the counter, the backup flag, D2 re-checked at use) \
+         is the definer's and the tables'; nothing for a viewer to filter.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "redeem",
+        "WRITE through 125's app-callable definer `epigraph_redeem_elevation_ticket`, for the \
+         token endpoint's elevate grant (pre-authentication: the redeem secret's SHA-256 is the \
+         credential): it answers pending / issued ONCE / invalid for one grant-mode ticket and \
+         marks it redeemed. An authentication record, not a corpus row.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "end",
+        "WRITE through 125's principal-bound app-callable definer `epigraph_end_elevation`, on \
+         the requester's STAMPED connection: it ends only the stamped principal's own live \
+         session (a privileged session, any). Nothing for a viewer to filter.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "live",
+        "READ through 125's principal-bound app-callable definer `epigraph_elevation_live`, on a \
+         connection STAMPED with the requester's scoped viewer (EL-6, `Viewer::resolve_elevated`): \
+         the stamped principal's own live elevation session on one family, or nothing. It is the \
+         input that BUILDS a viewer, an authentication record about a principal rather than a \
+         corpus row, so there is no viewer yet to filter it by.",
+    ),
+    (
+        "role_assignment.rs",
+        "grant",
+        "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \
+         `role_assignments`, an AUTHORITY record about a principal, not a corpus row: it has no \
+         `visibility` / `owner_group_id`, its own triggers enforce every rule (CUS01-03) and its \
+         audit trigger writes the `platform.role_granted` row. Nothing for a viewer to filter.",
+    ),
+    (
+        "role_assignment.rs",
+        "grant_on_act",
+        "WRITE through migration 130's maintenance-only act-taking `epigraph_grant_role`: as \
+         `grant`, on a confirmed `role.grant` act the table's guard consumes. An authority \
+         record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "end_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_end_role_assignment`: as `end`, on a confirmed `role.end` act the table's \
+         guard consumes. An authority record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "end",
+        "WRITE through 123's maintenance-only `epigraph_end_role_assignment`: the one revoke \
+         stamp on one `role_assignments` row, an authority record with no tenancy columns.",
+    ),
+    (
+        "role_assignment.rs",
+        "get",
+        "READ of one `role_assignments` row by id. No tenancy columns; 123's FORCEd \
+         self-or-definer policy already narrows an application connection to the caller's own \
+         assignments, and the operator CLI reads it on the maintenance connection.",
+    ),
+    (
+        "role_assignment.rs",
+        "list",
+        "READ of `role_assignments` for the maintenance CLI (`list-role-assignments`). No \
+         tenancy columns; on an application connection 123's self-or-definer policy narrows it \
+         to the caller's own rows, which is why the CLI runs it on the maintenance connection.",
+    ),
+    (
+        "role_assignment.rs",
+        "live_for",
+        "READ through 123's subject-bound `epigraph_role_assignment_for` (answers about the \
+         session principal, or anyone on a privileged session): one assignment id, an authority \
+         fact about the caller, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "holds_elevating_role",
+        "READ of the `platform_roles` catalog (readable by every session) through 123's \
+         subject-bound `epigraph_holds_role`: whether the session principal holds a live \
+         assignment of an elevating role (the MCP manifest's `sudo` listing, D2). One boolean, \
+         an authority fact about the caller, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "record_custodial_act",
+        "WRITE through 123's maintenance-only `epigraph_record_custodial_act`: one \
+         `platform.custodial_act` security_events row, refused (CUS04) unless the named \
+         assignment is live and held by the actor. An audit record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "record_custodial_act_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_record_custodial_act`: as `record_custodial_act`, consuming a confirmed \
+         `claim.custodial_supersede` act whose args the recorder recomputes from the stored \
+         successor. An audit record, not a corpus row.",
+    ),
+    (
         "maintenance_lock.rs",
         "try_take",
         "NO TABLE. `SELECT pg_try_advisory_lock($1)` on the maintenance timer's own connection \
@@ -547,10 +831,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim_encryption.rs",
         "get_by_claim_id_conn",
         "READ, and the only exempt read that touches a tenanted table — so it is the one to \
-         re-check. Its two callers (routes/claims.rs::get_claim and the batch sibling) both run it \
-         on the SAME transaction immediately after ClaimRepository::get_by_id_conn(&mut tx, \
-         &viewer, id) has already resolved the parent claim under the viewer predicate, so the \
-         authority decision has been made one statement earlier on the same connection. \
+         re-check. Its two callers both run it on the SAME viewer-stamped connection after a \
+         viewer-spliced read has already resolved the parent claim: routes/claims.rs::get_claim \
+         immediately after ClaimRepository::get_by_id_with_labels(&mut *read, &viewer, id), and \
+         its batch sibling list_claims per item of ClaimRepository::list_conn(&mut read, \
+         &viewer, ..), so the authority decision has been made earlier on the same connection. \
          claim_encryption is additionally in migration 077's `enc` protected array, so RLS \
          backstops it from step 11d onward. A shard that ever calls this WITHOUT the preceding \
          gated fetch must give it a Viewer instead of inheriting this entry.",
@@ -1394,6 +1679,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
+        "current_decision",
+        "READ of one `match_candidates` row's status and verdict, a table with no tenancy \
+         columns to filter on, after a conditional decide matched no row (refusal message; lost \
+         decision vs re-scored verdict); the caller already read the same row by id \
+         (`MatchCandidateRepo::get`).",
+    ),
+    (
+        "match_candidate.rs",
         "require_privileged",
         "Reads no table and filters nothing: it asks the session one boolean, \
          `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
@@ -1468,6 +1761,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          id. Its dedup probe is the write-path read `create_or_get` documents (it must see an \
          existing edge whoever asks, or the get half becomes a duplicate create); the INSERT is \
          authorised by edges_tenancy's WITH CHECK on the stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_row_conn",
+        "WRITE. The HTTP route's form of create_symmetric_if_absent_oriented_conn (POST \
+         /api/v1/edges for symmetric claim/claim relationships), returning the stored row. Same \
+         argument: a write-path dedup probe plus an INSERT authorised by edges_tenancy's WITH \
+         CHECK on the caller's stamped transaction.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_conn",
+        "WRITE. `create_symmetric_if_absent` on a caller's connection, so a matcher promotion \
+         writes its edge on the same transaction as the candidate's status flip \
+         (`MatchCandidateRepo::promote_if_pending`); the pool form delegates here. One \
+         INSERT ... WHERE NOT EXISTS (any-state dedup), authorised by edges_tenancy's WITH CHECK.",
     ),
     (
         "edge.rs",
@@ -1662,6 +1971,21 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    (
+        "admin_scope_enforcement.rs",
+        "read",
+        "READ of migration 128's admin-scope switch through its app-callable definer \
+         `epigraph_admin_scopes_armed()`: one boolean of control state, the same for every \
+         caller, read by the token endpoint BEFORE any principal exists. No tenancy to filter.",
+    ),
+    (
+        "admin_scope_enforcement.rs",
+        "record_would_strip",
+        "WRITE through migration 128's app-callable definer \
+         `epigraph_record_admin_scope_would_strip`: one `oauth.admin_scope_would_strip` \
+         measurement event about an OAuth client, at mint time, before any principal exists. \
+         The definer checks the client and its scopes itself (ADS03); not a corpus row.",
+    ),
     // ── Batch W10 (migration 117): the administrative cascade's audit row.
     (
         "admin_cascade.rs",
@@ -2295,6 +2619,56 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO NOTHING`. \
          `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
          workflow row cannot survive the rollback of the plan walk that wrote it.",
+    ),
+    // ── U017 (backlog fe874d2a): `deprecate_workflow` retires a hierarchical
+    //    workflow as a unit, on the ingest system agent's stamped transaction.
+    (
+        "claim.rs",
+        "deprecate_claim_if_current",
+        "UPDATE `claims` with `deprecate_claim`'s SET list plus `AND is_current`, so \
+         `rows_affected` means the call retired the row. A write by primary key: the control is \
+         `claims_tenancy`'s `WITH CHECK` against the connection's GUCs (the hierarchical \
+         `deprecate_workflow` runs it on the ingest system agent's stamp, after the workflow \
+         authority rule admitted the caller), exactly as for `deprecate_claim` above.",
+    ),
+    (
+        "workflow.rs",
+        "set_truth_value_if_changed",
+        "UPDATE `workflows` SET `truth_value` WHERE it differs, so `rows_affected` means the \
+         state changed. `workflows` has no row security and no policy (see `set_truth_value`), \
+         so there is nothing for a viewer to filter; the caller's authority is \
+         `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "exists",
+        "READ of `workflows` only: whether a row with this id exists, for `deprecate_workflow`'s \
+         dispatch between a flat claim and a hierarchical row. `workflows` has no row security \
+         and no policy, so the answer is the same on every connection.",
+    ),
+    (
+        "workflow.rs",
+        "lineage_descendants",
+        "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
+         set of `deprecate_workflow`). `workflows` has no row security and no policy; it reads \
+         `parent_id` rather than `edges` precisely so no tenancy filter can truncate the walk.",
+    ),
+    (
+        "workflow.rs",
+        "lock_lineages_for_deprecation",
+        "READ of `workflows` only, `FOR UPDATE`: locks the rows sharing a `canonical_name` with \
+         a deprecation's targets, so two concurrent deprecations cannot each keep a claim the \
+         other retires. `workflows` has no row security and no policy, so there is nothing for \
+         a viewer to filter; the caller's authority is `require_workflow_authority`.",
+    ),
+    (
+        "workflow.rs",
+        "executed_structural_claims",
+        "READ of `edges`/`claims`/`workflows`: the level 0-2 claims a hierarchical workflow \
+         `executes`, each with whether another live workflow executes it. It plans the WRITE \
+         that follows (carries a `VISIBILITY-EXEMPT: WRITE path` note), on the ingest system \
+         agent's stamped transaction that owns these claims; the caller's authority is the \
+         workflow authority rule, not read visibility, so no caller viewer is spliced.",
     ),
 ];
 

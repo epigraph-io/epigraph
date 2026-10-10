@@ -101,7 +101,16 @@ pub async fn traverse(
 
     let mut visited: HashSet<uuid::Uuid> = HashSet::new();
     let mut nodes = Vec::new();
-    let mut edges = Vec::new();
+    // Ids pushed into `nodes`. Not `visited`, which also holds nodes that were
+    // queued but never admitted (node cap) or were dropped by `min_truth`.
+    let mut admitted: HashSet<uuid::Uuid> = HashSet::new();
+    // Every edge followed during the walk, as raw (source, target, relationship).
+    // Filtered to edges between ADMITTED nodes only after the walk (backlog
+    // cdd8d097): the node cap and `min_truth` bound `nodes`, but each expanded
+    // node contributes ALL its outgoing edges here — 4,561 from one paper under
+    // `limit: 3` — and the BFS admits a target only after the edge to it was
+    // collected, so the filter cannot run at push time.
+    let mut collected: Vec<(uuid::Uuid, uuid::Uuid, String)> = Vec::new();
     // Each queued node carries the endpoint type(s) it is known by (backlog
     // aedde855). A node reached over an edge takes that edge's `target_type`;
     // the start node's are read from its visible edges. The walk used to
@@ -176,6 +185,7 @@ pub async fn traverse(
             }
         }
 
+        admitted.insert(current_id);
         nodes.push(TraverseNode {
             id: current_id.to_string(),
             node_type: if truth.is_some() {
@@ -220,11 +230,7 @@ pub async fn traverse(
                         }
                     }
 
-                    edges.push(TraverseEdge {
-                        source_id: e.source_id.to_string(),
-                        target_id: e.target_id.to_string(),
-                        relationship: e.relationship,
-                    });
+                    collected.push((e.source_id, e.target_id, e.relationship));
 
                     if visited.insert(e.target_id) {
                         queue.push_back((e.target_id, depth + 1, vec![e.target_type]));
@@ -234,10 +240,26 @@ pub async fn traverse(
         }
     }
 
+    // Keep only edges whose endpoints were both admitted. An edge to a node
+    // beyond the node cap, or to one `min_truth` dropped, would otherwise
+    // dangle; `edges_omitted` tells the caller the walk was truncated.
+    let collected_count = collected.len();
+    let edges: Vec<TraverseEdge> = collected
+        .into_iter()
+        .filter(|(source, target, _)| admitted.contains(source) && admitted.contains(target))
+        .map(|(source, target, relationship)| TraverseEdge {
+            source_id: source.to_string(),
+            target_id: target.to_string(),
+            relationship,
+        })
+        .collect();
+    let edges_omitted = collected_count - edges.len();
+
     success_json(&TraverseResponse {
         start_id: start_id.to_string(),
         nodes,
         edges,
+        edges_omitted,
         depth_reached,
     })
 }

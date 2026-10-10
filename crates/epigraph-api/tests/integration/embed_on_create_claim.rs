@@ -32,6 +32,7 @@ fn test_bearer_token(agent_id: Uuid) -> String {
             None,
             Some(agent_id),
             chrono::Duration::seconds(300),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("issue_access_token must succeed for tests");
     token

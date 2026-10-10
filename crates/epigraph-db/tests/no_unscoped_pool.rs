@@ -460,7 +460,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        2,
+        3,
         "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
@@ -470,7 +470,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          `epigraph_operator_of_author` SECURITY DEFINER read of the link RECORD, which must \
          answer BEFORE there is a viewer (it decides whether the principal gets one: a linked \
          agent is stdio-only), reads no tenancy-partitioned row, and returns only the named \
-         principal's own link.",
+         principal's own link. The third is access_token_is_revoked (migration 141): the \
+         RFC 7009 denylist lookup both middlewares and /oauth/introspect run after verifying a \
+         token's signature and BEFORE any principal exists (a revoked token gets none), keyed by \
+         that signature-verified jti, on a non-tenant credential table read by primary key.",
     ),
     (
         "middleware/rate_limit.rs",
@@ -492,9 +495,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          shard should re-read this entry rather than assume it, and it is the first exemption to \
          revisit if the consent step ever mints early. \
          \
-         6 -> 7: the Explorer branch's consent-page fix adds one \
-         OAuthClientRepository::get_by_client_id in callback_endpoint, so the page can name the \
-         REQUESTING client instead of a hard-coded product name. The file-level reason covers it \
+         6 -> 7: the Explorer branch adds one OAuthClientRepository::get_by_client_id in \
+         callback_endpoint, so a client suspended or revoked after /oauth/authorize is refused \
+         before the provider exchange (the consent page itself is labelled from the redirect \
+         class and never shows the row's client_name). The file-level reason covers it \
          and was re-read rather than assumed: it is the same repo method this file already calls \
          at /oauth/authorize, on the same anonymous router, strictly BEFORE the provider exchange \
          and before any principal is provisioned. `oauth_clients` additionally carries no tenancy \
@@ -517,37 +521,83 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/register.rs",
-        3,
+        4,
         "Pre-authentication. RFC 7591 dynamic client registration CREATES the client; no principal \
-         exists until it succeeds, so there is nothing to stamp the connection from.",
+         exists until it succeeds, so there is nothing to stamp the connection from. The fourth \
+         site (elevation plan EL-9) reads migration 128's admin-scope switch through its \
+         app-callable definer, only when the request names an admin-only scope: one control \
+         row, no tenancy-partitioned read, before any principal exists.",
     ),
     (
         "oauth/revoke.rs",
-        1,
+        2,
         "Pre-authentication. RFC 7009 revocation authenticates the token being revoked rather than \
-         a session principal, and is reachable on the anonymous OAuth router.",
+         a session principal, and is reachable on the anonymous OAuth router. Two sites, one per \
+         token type: the refresh-token definer (118) and the access-token denylist definer \
+         (141), the second reached only with a jti read from a signature-verified token.",
+    ),
+    (
+        "oauth/scopes.rs",
+        1,
+        "Pre-authentication, inside token issuance (elevation plan EL-9). The mint chokepoint \
+         reads migration 128's admin-scope switch through its app-callable definer and, while \
+         unarmed, records the would-strip measurement through another, both before the \
+         principal being minted exists; one pool binding serves both. Neither reads a \
+         tenancy-partitioned row: the switch is one control row and the recorder writes one \
+         `oauth.` event about the client.",
     ),
     (
         "oauth/token.rs",
-        14,
+        17,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
          whether the agent has ANY operator link record, through the \
          `epigraph_operator_of_author` SECURITY DEFINER read, which answers without a stamp and \
          returns only the named agent's operator — the same pre-authentication reason, re-read \
-         for it.",
+         for it. The fifteenth is the refresh grant's `RefreshTokenRepository::family_of` read: \
+         before minting, it reads the presented refresh token's rotation family (`id` and \
+         `family_id` only, inside migration 118's column grant; `refresh_tokens` has no RLS) so a \
+         human client's access token can name it — still before the principal is minted, the same \
+         reason again. The sixteenth and seventeenth are the elevate grant's (elevation plan \
+         EL-5): the client lookup by its `client_id`, as every other grant does, and the one \
+         connection for migration 125's `epigraph_redeem_elevation_ticket`, an app-callable \
+         definer keyed by the ticket and its redeem secret's hash (the credential), which needs \
+         no stamp. Both run before the elevated principal's token is minted.",
+    ),
+    (
+        "routes/elevate.rs",
+        4,
+        "Pre-authentication, BY DESIGN rather than by sequence. The passkey enrollment ceremony \
+         (elevation plan EL-3, migration 124) is a page the operator opens on the device that \
+         holds the authenticator, with no bearer token to present: the enrollment id (random, \
+         live for at most 15 minutes, consumed once) and the authenticator are its credentials, \
+         so there is no principal a Viewer could resolve and nothing to stamp. The elevation \
+         ceremony (EL-5, migration 125) is the same: the ticket id (live for at most 5 minutes, \
+         asserted once) and the passkey are its credentials. Three sites are one connection each \
+         for the enrollment reader, challenge store and completion; the fourth is the one \
+         `ceremony_conn` acquire every ticket handler shares. Each calls one of 124's or 125's \
+         ceremony definers, keyed by that id, which need no stamp: their \
+         SECURITY DEFINER frame is what the tables' policies admit, and the application role \
+         holds no DML on either table. Unlike the OAuth entries this is not 'before a principal \
+         is minted': no principal is ever minted here, which is why a later shard must not read \
+         it as convertible.",
     ),
     (
         "state.rs",
-        11,
+        12,
         "Boot and observability, including the session-GUC probe itself. ENUMERATED rather than \
          waved at, because this is the one file where the needle is an indirection layer: a \
          `pub async fn` on AppState that reads self.db_pool is exempt-by-file no matter who calls \
          it, and a ViewerExtractor grep cannot detect the mixed case (AppState methods take &self; \
-         the Viewer lives in the calling handler). The ten sites are exactly \
+         the Viewer lives in the calling handler). The twelve sites are exactly \
          load_entity_type_cache (1), assert_tenancy_triggers_armed (3), probe_rls_posture (3), \
-         rls_canary_visible (2), warn_on_privileged_connection (1), and begin_claim_write (1). \
+         rls_canary_visible (2), warn_on_privileged_connection (1), begin_claim_write (1), and \
+         admin_scope_posture (1, elevation plan EL-10): the admin-scope switch read for the \
+         check chokepoint, `epigraph_admin_scopes_armed()` through AdminScopeArmingCache, called \
+         by the bearer middlewares BEFORE any viewer exists (it decides the request's \
+         AuthContext); the switch is a one-row control table with no tenancy columns and no row \
+         security (migration 128), the same answer for every caller. \
          begin_claim_write's site is the fallback for a TEST-BUILT AppState with no ScopedPool: \
          every server is built through with_scoped_pool and takes the stamped write_as branch, \
          and a claim written by an unstamped application session is refused by migration 122 \
@@ -558,7 +608,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
          routes/edges.rs. Scoping the probe to a Viewer would make it prove a property of that \
-         viewer instead of the pool. The count is pinned so a twelfth site cannot inherit this \
+         viewer instead of the pool. The count is pinned so a thirteenth site cannot inherit this \
          reason silently — see the `state.rs` note in the module's Known limits.",
     ),
     (
@@ -585,9 +635,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `create_hypothesis` reads its frame and writes the frame bind and the prior
 /// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
-/// 260 -> 259 when `GET /api/v1/audit/security` moved onto `AppState::read_as`
-/// (`routes/audit.rs` 1 -> 0, key deleted).
-const HIGH_WATER: usize = 259;
+/// 260 -> 259 in its round 4 (COR-R4-3, migration 123's batch):
+/// `create_hypothesis` caches its VOI score on that same transaction
+/// (`routes/hypothesis.rs` 7 -> 6).
+/// 259 -> 258 in U012 (merged onto main d5e8860d; each side removed a different
+/// site): the promote arm of `routes/cross_source.rs` writes its matcher edge
+/// inside `MatchCandidateRepo::promote_if_pending` instead of on `state.db_pool`
+/// (the file 7 -> 6, keeping sites), read off `the_scanner_is_not_vacuous`'s own
+/// failure on the merged tree (`left: 258, right: 259`).
+/// 258 -> 257 when the Explorer branch merged main: `GET /api/v1/audit/security`
+/// moved onto `AppState::read_as` (`routes/audit.rs` 1 -> 0, key deleted).
+const HIGH_WATER: usize = 257;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -738,6 +796,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // for two converted sites in two files. The three that remain
     // (`learn_convention`, `forget_convention`, `share_skill`) all WRITE.
     ("routes/conventions.rs", 3),
+    // 7 until U012 (concurrent match-candidate decides), which removed the
+    // promote arm's own `EdgeRepository::create_symmetric_if_absent(&state.db_pool, …)`:
+    // the edge is now written inside `MatchCandidateRepo::promote_if_pending`,
+    // on the same transaction as the status flip, through the repo's own pool.
+    // The rest of this note is the measurement that held the count at 7.
+    //
     // UNCHANGED at 7, and that is a measurement rather than an omission.
     // Conversion shard 5 was sized to include this file (4 of its 7 sites were
     // classified as convertible reads) and then measured it site by site. Three
@@ -754,7 +818,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `read_as` doc's own stated hazard, and the disposition shard 4 already
     // took when `routes/computation.rs` offered the same choice. Whole handlers
     // or nothing.
-    ("routes/cross_source.rs", 7),
+    ("routes/cross_source.rs", 6),
     // 40 before conversion shard 7, which moved the four read-only
     // `ClaimThemeRepository` handlers (`get_boundary_claims`,
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
@@ -817,8 +881,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/graph_query.rs", 1),
     ("routes/groups.rs", 12),
     // 11 before the operator-binding delta review, which moved
-    // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`.
-    ("routes/hypothesis.rs", 7),
+    // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
+    // 6 since its VOI cache moved onto that same stamped transaction (round 4
+    // COR-R4-3).
+    ("routes/hypothesis.rs", 6),
     ("routes/isomorphism.rs", 3),
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`

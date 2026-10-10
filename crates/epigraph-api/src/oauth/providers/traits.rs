@@ -31,6 +31,7 @@ pub enum ProviderError {
     Upstream(String),
 }
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait ExternalIdentityProvider: Send + Sync {
     /// Stable identifier — used as the prefix in `client_id` and the path
@@ -71,6 +72,7 @@ pub trait ExternalIdentityProvider: Send + Sync {
     }
 }
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait OidcRedirectFlow: Send + Sync {
     fn build_auth_url(&self, state: &str, pkce_challenge: &str, redirect_uri: &str) -> String;

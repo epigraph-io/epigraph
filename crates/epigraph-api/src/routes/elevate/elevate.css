@@ -1,0 +1,36 @@
+/* The passkey ceremony pages (elevation plan EL-3). Served from the API binary. */
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  margin: 0;
+  padding: 2rem 1rem;
+  color: #1d1d1f;
+  background: #f6f6f7;
+}
+main {
+  max-width: 36rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+  background: #fff;
+  border: 1px solid #d9d9de;
+  border-radius: 8px;
+}
+h1 { font-size: 1.4rem; margin-top: 0; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 1rem; }
+dt { font-weight: 600; }
+dd { margin: 0; overflow-wrap: anywhere; }
+button {
+  font: inherit;
+  padding: 0.6rem 1.2rem;
+  border: 0;
+  border-radius: 6px;
+  background: #1f5fbf;
+  color: #fff;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+#status.ok { color: #1a7f37; }
+#status.error { color: #b42318; }
+@media (prefers-color-scheme: dark) {
+  body { color: #ececf1; background: #17171a; }
+  main { background: #222226; border-color: #3a3a40; }
+}

@@ -1244,10 +1244,11 @@ pub async fn deprecate_workflow(
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
     let cascade = params.cascade.unwrap_or(false);
+    let caller = server.write_identity(auth, viewer).await?;
 
     let mut deprecated_ids = Vec::new();
 
-    // ── THE WHOLE DEPRECATION, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    // ── THE FLAT PATH: ONE AUTHOR-STAMPED TRANSACTION ───────────────────
     //
     // `deprecate_claim` is an `UPDATE claims`, so `claims_tenancy`'s WITH CHECK
     // governs it and an unstamped session is refused with `42501`. The cascade
@@ -1286,57 +1287,97 @@ pub async fn deprecate_workflow(
     // `workflows` and absent from `claims`). No discovery tool in this surface
     // hands `deprecate_workflow` a system-agent-owned CLAIM id.
     //
-    // THE RESIDUAL THAT IS REAL, stated so the green above is not over-read: for a
-    // HIERARCHICAL workflow this tool deprecates nothing in `claims` at all. It is
-    // handed the `workflows` row id, `deprecate_claim` matches zero rows, and the
-    // thesis and step claims stay `is_current = true` while the response reports
-    // that id as deprecated. MEASURED: `deprecated_ids: ["3d99ce3a-…"]` with
-    // `SELECT … FROM claims WHERE id = '3d99ce3a-…'` returning no row and all four
-    // seeded workflow claims still current. Fixing that means deprecating claims
-    // the system agent owns, which is the author-stamping question (#493) rather
-    // than a rename — it is recorded here, not silently widened.
+    // A HIERARCHICAL workflow id (a `workflows` row, not a claim) used to run
+    // this same path: `deprecate_claim` matched zero rows, the thesis, phase and
+    // step claims stayed current, and the id was reported as deprecated anyway.
+    // It now takes `deprecate_hierarchical_workflow` below (U017; backlog
+    // fe874d2a), on the ingest system agent's stamp, behind the workflow
+    // authority rule. The dispatch is by what the id IS: a claim this caller
+    // can read takes this path (flat first, so an id that is both keeps
+    // today's behaviour), else a `workflows` row takes the hierarchical one,
+    // else nothing was deprecated and the call says so.
     //
-    // TWO AUTHORITIES IN ONE LOOP, deliberately. The transaction's session GUCs
-    // carry the SERVER AGENT's groups (the write authority), while the traversal
-    // below splices the CALLER's `viewer` (the read authority). That divergence is
-    // intentional and neither half may take the other's: stamping the caller would
-    // refuse the write this tool exists to perform, and reading with the server
-    // agent's viewer would let a caller cascade into workflow claims it cannot
-    // see. The widened USING side does mean the cascade can ENUMERATE rows the
-    // caller's viewer would not reach on the unstamped pool; the `viewer.splice`
-    // label oracle below is what keeps that from turning into a write, and it is
-    // filtered rather than exempted for exactly this reason. On stdio the caller
-    // and the server agent coincide, so this only differs on authenticated HTTP.
+    // TWO AUTHORITIES IN ONE LOOP, AND THEY NAME ONE PRINCIPAL. The stamp is
+    // `write_identity`'s: the token's principal over authenticated HTTP (batch
+    // H-b), this server's own agent on stdio. The traversal below splices the
+    // caller's `viewer` (the read authority), which `write_identity` has
+    // already checked names the same principal. So over HTTP the UPDATE reaches
+    // only rows the caller's groups may write (`claims_tenancy`'s USING side
+    // filters any other row to zero rows, silently, with no `42501`), and the
+    // cascade enumerates only children the caller can read; on stdio both are
+    // the server agent. (This paragraph used to say the session GUCs carried
+    // the SERVER agent's groups on every transport; that predates
+    // `write_identity`, and U017's council caught the stale claim.) The
+    // `viewer.splice` label oracle below is filtered rather than exempted so a
+    // child the caller cannot read is never cascaded into.
     //
     // The traversal reads run on the same stamped connection as the writes, which
     // is the correct direction: an unstamped read returns FEWER rows, so a
     // cascade planned on one connection and executed on another could silently
     // skip a child it was entitled to deprecate.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.write_identity(auth, viewer).await?,
-        "deprecate_workflow",
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "deprecate_workflow").await?;
+
+    // DISPATCH. The claim read uses the CALLER's viewer, the read authority
+    // the cascade below already uses. An id the caller cannot read is an
+    // error, not a reported deprecation. The caller-stamped UPDATE that used
+    // to run on it was USING-filtered to zero rows, yet the id was listed
+    // (pinned by `an_unreadable_flat_claim_is_an_error_not_a_deprecation`).
+    // The read accepts ANY readable claim, not only a `workflow`-labelled one,
+    // as the flat path always has. The HTTP twin requires the label, and
+    // narrowing this path is flat-path authority, which U017 leaves alone.
+    // `workflows` has no row security, so its existence check reads the same
+    // on any connection.
+    let is_claim = ClaimRepository::get_by_id(
+        &mut *tx,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
     )
-    .await?;
+    .await
+    .map_err(internal_error)?
+    .is_some();
+    if !is_claim {
+        let is_row = epigraph_db::WorkflowRepository::exists(&mut *tx, workflow_id)
+            .await
+            .map_err(internal_error)?;
+        tx.rollback().await.map_err(internal_error)?;
+        if !is_row {
+            return Err(invalid_params(format!(
+                "no claim you can read and no hierarchical workflows row has id \
+                 {workflow_id}; nothing was deprecated"
+            )));
+        }
+        return deprecate_hierarchical_workflow(server, auth, caller, workflow_id, cascade, params)
+            .await;
+    }
 
     // Deprecate the target workflow (A4: also set is_current = false).
-    // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
-    // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
-    // so the deprecated workflow drops out of semantic recall and does not
-    // inflate the `stale_present` audit count.
-    ClaimRepository::deprecate_claim(&mut *tx, epigraph_core::ClaimId::from_uuid(workflow_id))
-        .await
-        .map_err(internal_error)?;
+    // `deprecate_claim_if_current` ALSO nulls both embedding columns in the
+    // same statement — required by CLAUDE.md "Embedding policy → Cleanup
+    // paths" so the deprecated workflow drops out of semantic recall and does
+    // not inflate the `stale_present` audit count — and matches only a row
+    // that is still current, so a re-run reports nothing.
+    let root_rows = ClaimRepository::deprecate_claim_if_current(
+        &mut *tx,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+    )
+    .await
+    .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
     // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
     // tier-A), so this half was never refused — it is in the transaction so the
     // two halves of one deprecation cannot land apart.
-    epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, workflow_id, 0.05)
-        .await
-        .map_err(internal_error)?;
-    deprecated_ids.push(workflow_id.to_string());
+    let row_rows =
+        epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
+            .await
+            .map_err(internal_error)?;
+    // REPORT ONLY WHAT CHANGED (U017). The id used to be listed whether or not
+    // anything was written.
+    if root_rows > 0 || row_rows > 0 {
+        deprecated_ids.push(workflow_id.to_string());
+    }
 
     if cascade {
         // A5: Walk both 'supersedes' and 'variant_of' edges, but only
@@ -1414,7 +1455,7 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                let child_rows = ClaimRepository::deprecate_claim(
+                let child_rows = ClaimRepository::deprecate_claim_if_current(
                     &mut *tx,
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
@@ -1446,6 +1487,180 @@ pub async fn deprecate_workflow(
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,
+        retired_claim_ids: Vec::new(),
+        kept_shared_claim_ids: Vec::new(),
+        reason: params.reason,
+    })
+}
+
+/// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
+/// retire the workflow as a unit (U017; backlog fe874d2a).
+///
+/// * ONE transaction on the ingest system agent's stamp
+///   (`begin_system_ingest_stamped_tx`, as `step_ops::delete_step`): the
+///   thesis, phase and step claims are that agent's, and the server agent's
+///   stamp that the flat path uses is USING-filtered to zero rows on them.
+/// * The target set is the row plus, with `cascade`, every row descended from
+///   it through `workflows.parent_id` (the lineage the `workflow -variant_of->
+///   workflow` edges describe).
+/// * `require_workflow_authority` over EVERY target, with NO lock held, so a
+///   caller without authority is refused before it takes or waits for any
+///   lineage row lock; one refusal writes nothing. A legacy row with no
+///   recorded submitter gets U005's rule (admin-only over the authenticated
+///   transport); stdio is unchecked, the batch H-b bar.
+/// * Then every `workflows` row sharing a `canonical_name` with a target is
+///   locked, so two concurrent deprecations of one lineage cannot each keep a
+///   claim the other is retiring.
+/// * Then authority is RE-CHECKED over every target under that lock (TOCTOU),
+///   before any write; only those grants admit the write and drive the audit.
+/// * Per target: `workflows.truth_value` to 0.05, then every level 0-2 claim
+///   it executes that no live workflow outside the target set also executes
+///   is retired (`is_current = false`, both ANN columns nulled). A claim a
+///   live sibling still executes is kept and reported in
+///   `kept_shared_claim_ids`. Level-3 operation atoms are never retired:
+///   their ids are global and a document may share one.
+/// * An admin-arm target is audited (`workflows.admin_write`) on the same
+///   transaction.
+/// * Only what changed is reported.
+///
+/// KNOWN LIMITATION (follow-up, not fixed here): a retired level 0-2 claim is
+/// not revived when a later generation (`improve_workflow_hierarchy`) or
+/// `add_step` reuses its exact text. The claim id depends only on the text and
+/// the `canonical_name`, the executor's dedup-by-id skips an existing row, and
+/// `add_step` inserts with `ON CONFLICT (id) DO NOTHING`. So the new live
+/// workflow executes a claim that has `is_current = false` and no embeddings.
+/// A correct revival has to tell this deprecation's retirements apart from an
+/// `evolve_step` supersede, which also sets `is_current = false` on purpose,
+/// so it needs a retirement marker and touches the shared executor.
+async fn deprecate_hierarchical_workflow(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    workflow_id: uuid::Uuid,
+    cascade: bool,
+    params: DeprecateWorkflowParams,
+) -> Result<CallToolResult, McpError> {
+    const TOOL: &str = "deprecate_workflow";
+    let (_system_agent_id, mut tx) =
+        crate::claim_helper::begin_system_ingest_stamped_tx(server, TOOL, caller.agent_id())
+            .await?;
+
+    let mut targets = vec![workflow_id];
+    if cascade {
+        for d in WorkflowRepository::lineage_descendants(&mut *tx, workflow_id)
+            .await
+            .map_err(internal_error)?
+        {
+            if !targets.contains(&d) {
+                targets.push(d);
+            }
+        }
+    }
+
+    // AUTHORITY, THEN THE LOCK, THEN AUTHORITY AGAIN (security review of U017:
+    // lock-before-authz).
+    //
+    // 1. Authority over the WHOLE target set with no lock held. A caller with
+    //    no authority over the lineage is refused here, before it takes, or
+    //    queues for, a single row lock: the lock used to come first, so every
+    //    refused `claims:write` call first waited on and then held every row of
+    //    the lineage until its refusal rolled back, a repeatable contention
+    //    lever on anyone's workflow.
+    for &row in &targets {
+        crate::tools::workflow_authority::require_workflow_authority(
+            server, &mut tx, auth, caller, row, TOOL,
+        )
+        .await?;
+    }
+
+    // 2. Serialize against any other deprecation that could share a claim with
+    //    this target set, BEFORE the sharing rule reads other workflows' truth
+    //    (write skew; see `lock_lineages_for_deprecation`).
+    WorkflowRepository::lock_lineages_for_deprecation(&mut *tx, &targets)
+        .await
+        .map_err(internal_error)?;
+
+    // 3. RE-CHECK under the lock (TOCTOU): the call may have waited on the lock
+    //    while another transaction changed what step 1 read (a row's recorded
+    //    submitter, the caller's admin grant). Only the grant decided here,
+    //    with every target row now locked against another writer and the
+    //    admin grant re-read after the wait, admits the write and drives the
+    //    per-target audit; step 1's grants are discarded.
+    let mut grants = Vec::with_capacity(targets.len());
+    for &row in &targets {
+        grants.push(
+            crate::tools::workflow_authority::require_workflow_authority(
+                server, &mut tx, auth, caller, row, TOOL,
+            )
+            .await?,
+        );
+    }
+
+    let mut deprecated_ids = Vec::new();
+    let mut retired_claim_ids = Vec::new();
+    let mut kept_shared_claim_ids: Vec<String> = Vec::new();
+    for (&row, grant) in targets.iter().zip(&grants) {
+        let row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
+            .await
+            .map_err(internal_error)?;
+        let claims = WorkflowRepository::executed_structural_claims(&mut *tx, row, &targets)
+            .await
+            .map_err(internal_error)?;
+        let mut row_retired = Vec::new();
+        let mut row_kept = Vec::new();
+        for c in claims {
+            if c.shared {
+                row_kept.push(c.id.to_string());
+                continue;
+            }
+            let n = ClaimRepository::deprecate_claim_if_current(
+                &mut *tx,
+                epigraph_core::ClaimId::from_uuid(c.id),
+            )
+            .await
+            .map_err(internal_error)?;
+            if n > 0 {
+                row_retired.push(c.id.to_string());
+            }
+        }
+        if grant.admin {
+            crate::tools::workflow_authority::audit_admin_workflow_write(
+                &mut tx,
+                auth,
+                caller,
+                TOOL,
+                row,
+                grant.owner,
+                serde_json::json!({
+                    "truth_value_after": 0.05,
+                    "workflow_row_changed": row_changed > 0,
+                    "retired_claim_ids": row_retired,
+                    "kept_shared_claim_ids": row_kept,
+                    "cascade": cascade,
+                    "reason": params.reason,
+                }),
+            )
+            .await?;
+        }
+        if row_changed > 0 {
+            deprecated_ids.push(row.to_string());
+        }
+        retired_claim_ids.extend(row_retired);
+        for k in row_kept {
+            if !kept_shared_claim_ids.contains(&k) {
+                kept_shared_claim_ids.push(k);
+            }
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(format!("{TOOL}: could not commit: {e}")))?;
+
+    success_json(&DeprecateWorkflowResponse {
+        deprecated_ids,
+        retired_claim_ids,
+        kept_shared_claim_ids,
         reason: params.reason,
     })
 }

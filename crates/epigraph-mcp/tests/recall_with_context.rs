@@ -543,6 +543,113 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
     );
 }
 
+/// U014 PR-1 (backlog 3ce5e00c): the batched CORROBORATES context matched only
+/// the upper-case spelling the cross-source matcher writes. MCP
+/// `link_epistemic` writes `corroborates`, and a later normalise-on-write or
+/// data fold makes every row lower case, so a lower-case edge must be read as
+/// the same corroboration. The fixture's `CORROBORATES` edge from
+/// `paragraphs[0]` is the control.
+///
+/// The read is a UNION ALL of two arms, one keyed on `source_id` and one on
+/// `target_id`, and each arm names the relationship separately. So a
+/// lower-case edge is seeded in each direction: `paragraphs[1]` is the SOURCE
+/// of one and `paragraphs[2]` is the TARGET of the other. Neither paragraph
+/// has any other corroboration in the fixture, so each total is exactly 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn fetch_batched_context_counts_lowercase_corroborates(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let lower_target = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        lower_target,
+        "lower-case corroboration partner",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        fx.paragraphs[1],
+        "claim",
+        lower_target,
+        "claim",
+        "corroborates",
+        Some(r#"{"strength": 0.8}"#),
+    )
+    .await;
+    // Target arm: the requested paragraph is the edge's TARGET.
+    let lower_source = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        lower_source,
+        "lower-case corroboration pointing at a paragraph",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        lower_source,
+        "claim",
+        fx.paragraphs[2],
+        "claim",
+        "corroborates",
+        Some(r#"{"strength": 0.6}"#),
+    )
+    .await;
+
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0], fx.paragraphs[1], fx.paragraphs[2]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
+
+    let control = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[0])
+        .expect("control: the CORROBORATES edge is read");
+    assert!(control.iter().any(|e| e.claim_id == fx.corroborates_target));
+
+    let lower = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[1])
+        .expect("a lower-case `corroborates` edge must appear in the batched context");
+    assert!(
+        lower.iter().any(|e| e.claim_id == lower_target),
+        "paragraphs[1]'s corroborates list must include the lower-case partner",
+    );
+    assert_eq!(
+        ctx.corroborates_total_by_paragraph
+            .get(&fx.paragraphs[1])
+            .copied(),
+        Some(1),
+        "and it is counted once in the per-paragraph total"
+    );
+
+    let incoming = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[2])
+        .expect("a lower-case `corroborates` edge INTO a paragraph must be read by the target arm");
+    assert!(
+        incoming.iter().any(|e| e.claim_id == lower_source),
+        "paragraphs[2]'s corroborates list must include the lower-case source; got {incoming:?}",
+    );
+    assert_eq!(
+        ctx.corroborates_total_by_paragraph
+            .get(&fx.paragraphs[2])
+            .copied(),
+        Some(1),
+        "the incoming lower-case edge is counted once in paragraphs[2]'s total"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let viewer = viewerfx::public_viewer(&pool).await;

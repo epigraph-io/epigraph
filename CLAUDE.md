@@ -23,6 +23,22 @@ closed set by design.
   `episcience` is the reference implementation. Do **not** add federated tools
   to `SCOPE_MAP` — they are gated by the `scope=` in the env var instead.
 
+## Adding HTTP routes from a downstream product
+
+The MCP surface is extended by federation (above). The REST surface is
+extended in-process: an embedder that runs `epigraph-api` as a library passes
+`RouterExtension`s to `create_router_with_extensions`, and each is mounted at
+`/api/v1/ext/<name>` inside the authenticated router (bearer, per-access
+recorder, body limit, rate limit). The recorder logs an extension access
+under its raw request path, not a route template (`nest_service` leaves no
+`MatchedPath`). The recorder refuses an elevated token by method only
+(anything but GET, HEAD and OPTIONS), so an extension handler must never write
+on GET, HEAD or OPTIONS, including in `.fallback()` and `any()`. Scope checks
+and tenancy are the extension's own job; see
+`crates/epigraph-api/src/routes/extensions.rs`.
+Never register a first-party route under `/api/v1/ext`
+(`tests/router_extension_seam_lint.rs` fails if you do).
+
 ## Retiring backlog items
 
 When you complete or refute a claim labelled `backlog`, **always use
@@ -42,14 +58,17 @@ Do NOT:
   that bypasses the canonical resolution-claim trail.
 
 **Enforcement (issue #374).** `resolved` is the one label with retirement
-semantics, so `update_labels` and `patch_claim` apply `resolve_backlog_item`'s
+semantics, so `update_labels`, `patch_claim` and `update_with_evidence`'s
+`labels` merge (drain U004) apply `resolve_backlog_item`'s
 `require_owner_or_admin` check when a call adds or removes it, on EVERY
 transport (the stdio half closed in batch H-b). Ownership is the claim's
 author, or an agent linked to the same operator as the author (stdio;
 migration 107's operator arms, which is what makes a model-bumped fleet agent
 able to retire its predecessor's items), or the author's operator (HTTP).
 Over HTTP a `claims:admin` token also passes; its write into a group the admin
-cannot write goes through the audited admin path (batch H-b, D2). Over HTTP the
+cannot write goes through the audited admin path (batch H-b, D2) on
+`update_labels` / `patch_claim`; `update_with_evidence` has no admin path and
+refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
@@ -110,9 +129,11 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 
 **Invariant:** every **non-telemetry** claim with `is_current = true` should
 have an embedding; every claim with `is_current = false` should have
-`embedding = NULL`. Semantic recall (`recall()`, `recall_with_context()`,
-`theme_cluster`, `find_workflow`'s semantic path) reads from `embedding`, so
-violations either hide live claims or surface stale ones.
+`embedding = NULL` AND `embedding_3072 = NULL` (enforced by
+`chk_deprecated_no_embedding`, migrations 052 and 144). Semantic recall
+(`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
+semantic path) reads from `embedding`, so violations either hide live claims
+or surface stale ones.
 
 **Telemetry exception:** host-provenance claims (epiclaw-host's
 `ProvenanceRecorder` — container/task lifecycle, agent output, messages) are
@@ -148,14 +169,30 @@ caller embeds with its own configured embedder.
 
 ### Cleanup paths (must null on `is_current = false`)
 
-When superseding or otherwise flipping `is_current` to false, null the
-embedding in the same transaction:
+When superseding or otherwise flipping `is_current` to false, null BOTH
+`embedding` and `embedding_3072` in the SAME statement that sets
+`is_current = false`. `chk_deprecated_no_embedding` (`CHECK (is_current OR
+(embedding IS NULL AND embedding_3072 IS NULL))`) is checked per statement, so a
+separate `UPDATE ... SET embedding = NULL` afterwards is refused with 23514.
+`embedding_3072` matters as much as `embedding`: recall at centroid_dim=3072
+(`ClaimRepository::search_by_embedding_since`) has no `is_current` filter.
 
-- **`ClaimRepository::supersede`** — `crates/epigraph-db/src/repos/claim.rs:1401`
-- **`ClaimRepository::mark_duplicate`** — `crates/epigraph-db/src/repos/claim.rs:2076`
+The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 
-If you add a third path that flips `is_current = false`, add the matching
-`UPDATE claims SET embedding = NULL WHERE id = $1` inside the same tx.
+- **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
+- **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
+- **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
+- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL`
+- **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
+
+Outside the repo layer, `scripts/fuzzy_dedup_claims.py` matches
+`mark_duplicate_act` column for column. On the re-embed side,
+`crates/epigraph-cli/src/reembed.rs::fetch_batch` selects only current claims
+(`ReembedTarget::eligible_predicate`), so `epigraph-cli reembed` never writes a
+3072 vector back onto a retired claim.
+
+If you add another path that flips `is_current = false`, null both columns in
+that same statement and add it to this list.
 
 ### Auditing the gap
 
@@ -201,7 +238,11 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
                             AND j.payload #>> '{EmbeddingGeneration,claim_id}'
                                 = claims.id::text)
        ) AS live_missing,
-       COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present,
+       -- BOTH vector columns, for the same reason as `sealed_with_embedding`
+       -- below: a clause naming only `embedding` reports zero while a retired
+       -- claim still carries an `embedding_3072` recall at 3072 can return.
+       COUNT(*) FILTER (WHERE NOT is_current
+         AND (embedding IS NOT NULL OR embedding_3072 IS NOT NULL)) AS stale_present,
        -- A sealed claim that still carries a plaintext-derived vector is a
        -- CONFIDENTIALITY VIOLATION, not an embedding gap. Must be zero.
        -- BOTH vector columns: `embedding_3072` (migration 027) is a second live

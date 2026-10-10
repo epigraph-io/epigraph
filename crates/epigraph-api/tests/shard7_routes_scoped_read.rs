@@ -194,6 +194,7 @@ use epigraph_api::routes::entities::{entity_neighborhood, query_triples, QueryTr
 use epigraph_api::routes::versioning::claim_history;
 use epigraph_api::routes::workflows::{list_workflows, ListWorkflowsQuery};
 use epigraph_api::state::{ApiConfig, AppState};
+use epigraph_api::ApiError;
 use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture::{
@@ -466,6 +467,78 @@ async fn list_claims_counts_the_viewers_own_group_private_claim(pool: PgPool) {
     );
 }
 
+/// `GET /claims` serves each listed claim's OWN stored labels — the success-path
+/// twin of `list_claims_surfaces_a_failed_label_read_instead_of_empty_labels`.
+///
+/// Drain unit U008 replaced `list_claims`' inline batched label read with
+/// `ClaimRepository::labels_by_ids(&mut *read, &viewer, ..)` plus a per-item
+/// `labels_map.remove(&id)`. The fault-injection arm proves an error is no
+/// longer swallowed; nothing proved the labels still ARRIVE. A handler that
+/// calls the read, keeps the `?`, and then serves `labels: []` — the original
+/// defect of backlog `1e6efd2d` — or a viewer splice that drops the labels of
+/// the viewer's own group-private claim, would leave every other arm green.
+///
+/// Three claims, three distinct label shapes: a public claim with two labels
+/// (order as stored), the viewer's own group-private claim with one, and an
+/// unlabelled public claim that must come back `[]`, not borrow a neighbour's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_serves_each_claims_stored_labels(pool: PgPool) {
+    let (viewer_agent, viewer_group) =
+        seed_agent_with_group(&pool, "u008-list-labels-viewer").await;
+
+    let public = seed_public_claim(&pool, viewer_agent, "u008 list labels public").await;
+    let mine = seed_group_claim(&pool, viewer_agent, viewer_group, "u008 list labels mine").await;
+    let bare = seed_public_claim(&pool, viewer_agent, "u008 list labels unlabelled").await;
+    set_labels(&pool, public, &["u008-pub-a", "u008-pub-b"]).await;
+    set_labels(&pool, mine, &["u008-mine"]).await;
+
+    let viewer = viewer_for(&pool, viewer_agent).await;
+    let state = split_state(&pool).await;
+
+    let response = list_claims(
+        ViewerExtractor(viewer),
+        State(state),
+        Query(PaginationParams {
+            limit: 100,
+            offset: 0,
+            search: None,
+            agent_id: None,
+            group_id: None,
+        }),
+        None,
+    )
+    .await
+    .expect("list_claims");
+
+    let served: std::collections::HashMap<Uuid, Vec<String>> = response
+        .0
+        .items
+        .iter()
+        .map(|c| (c.id, c.labels.clone()))
+        .collect();
+    let labels_of = |id: Uuid| -> &Vec<String> {
+        served
+            .get(&id)
+            .unwrap_or_else(|| panic!("claim {id} not listed; served {served:?}"))
+    };
+
+    assert_eq!(
+        labels_of(public),
+        &vec!["u008-pub-a".to_string(), "u008-pub-b".to_string()],
+        "the public claim's stored labels must be served, not []: {served:?}"
+    );
+    assert_eq!(
+        labels_of(mine),
+        &vec!["u008-mine".to_string()],
+        "the viewer's OWN group-private claim must keep its labels through the \
+         viewer-spliced label read: {served:?}"
+    );
+    assert!(
+        labels_of(bare).is_empty(),
+        "an unlabelled claim must be served [], not another claim's labels: {served:?}"
+    );
+}
+
 /// `GET /claims/:id` — the transaction site.
 ///
 /// The claim under test is group-private to the VIEWER's own group, so the read
@@ -518,9 +591,9 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     assert_eq!(
         body.labels,
         vec!["shard7-get".to_string()],
-        "the inline label read runs on the SAME connection as the claim read, so a \
-         label set that comes back empty means the two statements did not share a \
-         tenancy stamp"
+        "the labels are read in the SAME statement as the claim row \
+         (get_by_id_with_labels), so a label set that comes back empty means the \
+         stored labels were dropped, not merely read under another tenancy stamp"
     );
 
     let withheld = get_claim(
@@ -539,6 +612,118 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
         "a STRANGER's group-private claim must NOT be served. Serving it is the \
          widening direction, which the arm above cannot see"
     );
+}
+
+/// Make every statement that reads `claims.labels` fail, in this test's private
+/// database only, while leaving every statement that does not name it working.
+///
+/// A column RENAME rather than a REVOKE: `#[sqlx::test]`'s role is superuser, so
+/// a column privilege cannot be withdrawn from it. Nothing on the read path
+/// names `labels` except the label reads under test — no `claims` policy does
+/// (`git grep -i labels migrations/` finds only the 043 view, which follows a
+/// rename by attnum, one-shot UPDATEs, and migration 111's admin-write body).
+async fn break_the_labels_column(pool: &PgPool) {
+    sqlx::query("ALTER TABLE claims RENAME COLUMN labels TO labels_u008")
+        .execute(pool)
+        .await
+        .expect("rename claims.labels");
+}
+
+/// `GET /claims/:id` must not turn a failed label read into `200` with
+/// `labels: []` (backlog `1e6efd2d` residual, drain unit U008).
+///
+/// The handler used to fetch the row with `get_by_id_conn` and then the labels
+/// in a SECOND statement whose error was `.unwrap_or_default()`-ed away — so a
+/// broken label read answered 200 with an empty label set, indistinguishable
+/// from an unlabelled claim, and the two statements were not one snapshot. The
+/// read is now `ClaimRepository::get_by_id_with_labels`, one statement, so the
+/// label column failing fails the request.
+///
+/// The error must be a DATABASE fault, not `NotFound`: a 404 would mean the
+/// row read itself was filtered, which is a different defect this arm must not
+/// accept as a pass.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_claim_surfaces_a_failed_label_read_instead_of_empty_labels(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "u008-get-viewer").await;
+    let mine = seed_group_claim(&pool, viewer_agent, viewer_group, "u008 get labelled").await;
+    set_labels(&pool, mine, &["u008-get"]).await;
+
+    let viewer = viewer_for(&pool, viewer_agent).await;
+    let state = split_state(&pool).await;
+    break_the_labels_column(&pool).await;
+
+    let served = get_claim(
+        ViewerExtractor(viewer),
+        State(state),
+        Path(mine),
+        Query(GetClaimQuery {
+            agent_id: None,
+            group_id: None,
+        }),
+        None,
+    )
+    .await;
+
+    match served {
+        Ok(body) => panic!(
+            "a failed label read was swallowed: get_claim answered Ok with labels {:?} \
+             for a claim stored with [\"u008-get\"]",
+            body.0.labels
+        ),
+        Err(e) => assert!(
+            matches!(
+                e,
+                ApiError::DatabaseError { .. } | ApiError::InternalError { .. }
+            ),
+            "the label read failing must surface as a database fault, not {e:?}"
+        ),
+    }
+}
+
+/// `GET /claims` — the batched twin of the arm above. Its label read was
+/// `SELECT id, unnest(labels) … .unwrap_or_default()`, unspliced; it is now
+/// `ClaimRepository::labels_by_ids` with the viewer and a propagated error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_surfaces_a_failed_label_read_instead_of_empty_labels(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "u008-list-viewer").await;
+    let mine = seed_group_claim(&pool, viewer_agent, viewer_group, "u008 list labelled").await;
+    set_labels(&pool, mine, &["u008-list"]).await;
+
+    let viewer = viewer_for(&pool, viewer_agent).await;
+    let state = split_state(&pool).await;
+    break_the_labels_column(&pool).await;
+
+    let served = list_claims(
+        ViewerExtractor(viewer),
+        State(state),
+        Query(PaginationParams {
+            limit: 100,
+            offset: 0,
+            search: None,
+            agent_id: None,
+            group_id: None,
+        }),
+        None,
+    )
+    .await;
+
+    match served {
+        Ok(body) => panic!(
+            "a failed label read was swallowed: list_claims answered Ok with items {:?}",
+            body.0
+                .items
+                .iter()
+                .map(|c| (c.id, c.labels.clone()))
+                .collect::<Vec<_>>()
+        ),
+        Err(e) => assert!(
+            matches!(
+                e,
+                ApiError::DatabaseError { .. } | ApiError::InternalError { .. }
+            ),
+            "the label read failing must surface as a database fault, not {e:?}"
+        ),
+    }
 }
 
 /// `GET /api/v1/claims/by-labels`.

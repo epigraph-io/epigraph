@@ -59,6 +59,81 @@ async fn count_edges(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) -> i6
     .unwrap()
 }
 
+fn stub_vector(dim: usize) -> String {
+    let mut v = vec!["0.0"; dim];
+    v[0] = "0.1";
+    format!("[{}]", v.join(","))
+}
+
+/// Retiring a source must null BOTH ANN columns in the statement that flips
+/// `is_current` (`chk_deprecated_no_embedding`, widened to `embedding_3072` by
+/// migration 144; recall at centroid_dim=3072 has no is_current filter). The
+/// merged claim is a fresh row the merge never embeds, so it must come out
+/// current with both columns still NULL — the merge must not copy a source's
+/// vector onto it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn merge_nulls_both_embeddings_on_retired_sources(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let actor = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "embedded source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "embedded source two", &[]).await;
+    for s in [s1, s2] {
+        sqlx::query(
+            "UPDATE claims SET embedding = $2::vector, embedding_3072 = $3::vector WHERE id = $1",
+        )
+        .bind(s)
+        .bind(stub_vector(1536))
+        .bind(stub_vector(3072))
+        .execute(&pool)
+        .await
+        .expect("seed both vectors on a source");
+    }
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "merged embedded restatement",
+        0.8,
+        ConsolidateMode::Merge,
+        "near-identical",
+        actor,
+    )
+    .await
+    .expect("consolidate embedded sources");
+    assert!(!res.already_existed);
+
+    for s in [s1, s2] {
+        let (is_current, has_1536, has_3072): (bool, bool, bool) = sqlx::query_as(
+            "SELECT is_current, embedding IS NOT NULL, embedding_3072 IS NOT NULL \
+               FROM claims WHERE id = $1",
+        )
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("read source");
+        assert!(!is_current, "source {s} retired");
+        assert!(!has_1536, "source {s} embedding nulled with is_current");
+        assert!(
+            !has_3072,
+            "source {s} embedding_3072 nulled with is_current"
+        );
+    }
+
+    let (m_current, m_1536, m_3072): (bool, bool, bool) = sqlx::query_as(
+        "SELECT is_current, embedding IS NOT NULL, embedding_3072 IS NOT NULL \
+           FROM claims WHERE id = $1",
+    )
+    .bind(res.merged_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read merged");
+    assert!(m_current, "merged claim is current");
+    assert!(
+        !m_1536 && !m_3072,
+        "the merge writes no vector onto the merged claim (embedding is the caller's, post-commit)"
+    );
+}
+
 /// Baseline: sources retired with a forwarding pointer, merged owned by the
 /// ACTING agent (not inherited — ill-defined for N>1), labels unioned,
 /// properties.merge populated, and N supersedes edges fanned out.

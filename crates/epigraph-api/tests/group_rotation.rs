@@ -82,6 +82,7 @@ fn token(scopes: &[&str], agent_id: Uuid) -> String {
             None,
             Some(agent_id),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     t
