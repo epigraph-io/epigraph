@@ -881,6 +881,29 @@ mod tests {
             ela.abs() < 1e-9,
             "elaborates shortfall must be 0, got {ela}"
         );
+
+        // A target BETWEEN the two bel floors (0.30 < 0.35 < 0.40) keeps the
+        // ordering check meaningful on the fixed code: the stronger edge has a
+        // real shortfall, the weaker one none.
+        let between = EpistemicInterval::new(0.35, 0.90, 0.0);
+        let inc_between = |rel: &str| {
+            compute_cdst_edge_inconsistency(s, t, source, between, rel, &sci())
+                .interval_inconsistency
+        };
+        let sup_b = inc_between("supports");
+        let ela_b = inc_between("elaborates");
+        assert!(
+            ela_b <= sup_b + 1e-12,
+            "weaker edge demanded more: elaborates={ela_b} > supports={sup_b}"
+        );
+        assert!(
+            (sup_b - 0.05).abs() < 1e-9,
+            "supports shortfall should be the bel shortfall 0.40-0.35=0.05, got {sup_b}"
+        );
+        assert!(
+            ela_b.abs() < 1e-9,
+            "elaborates bel floor 0.30 is cleared by 0.35: shortfall must be 0, got {ela_b}"
+        );
     }
 
     #[test]
