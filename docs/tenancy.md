@@ -894,10 +894,13 @@ tool result) is recorded in `elevated_access` BEFORE the response leaves; if
 the record cannot be written the response is withheld. A row names the
 session, the person, the reason, the surface, the ids and filters (never
 content), the row count, and the GROUPS whose non-public rows the response
-named; an admin member of such a group reads the row through its row policy,
-and a holder of `role:auditor` or an elevated custodian reads all rows through
-a definer reader. Attribution is by the ids the response contains, so it errs
-toward the subject: a group id merely mentioned (a public row's owner, a
+named; an admin member of such a group reads the row through its row policy.
+All rows are read through a definer reader by an elevated session and by a
+holder of any role whose `reads_audit` flag is set: `role:auditor`, AND the
+custodian role (123 seeds it `reads_audit`), so a custodian reads the whole
+log STANDING, unelevated, and still does once admin scopes are armed (arming
+converts 129's four policy arms, not this reader). Attribution is by the ids
+the request names and the response contains, so it errs toward the subject: a group id merely mentioned (a public row's owner, a
 not-found error naming an id) attributes that group, and an aggregate with no
 row ids is recorded with no group. No API route or MCP tool shows a subject
 their rows yet: they are readable on the database through the policy.
