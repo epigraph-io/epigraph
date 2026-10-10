@@ -96,8 +96,12 @@
 -- 4. UNDO, RESTORE, AND DATABASES WITHOUT THE MAINTENANCE ROLE
 --
 -- Roll back every binary built against this file FIRST: they read
--- `system_agents` and fail closed without it (workflow ingest and policy
--- challenges refuse). Then, as a superuser:
+-- `system_agents` and fail closed without it. That refuses (500 /
+-- internal error) workflow ingest (MCP and REST), REST policy challenges, MCP
+-- `ingest_document` and `ingest_document_spine` with any author, and
+-- `POST /api/v1/claims/:id/provenance` with any author; the operator CLI's
+-- arm census and `link-legacy-authors` tolerate the missing table. Then, as a
+-- superuser:
 --   DROP TRIGGER IF EXISTS agents_refuse_registered_system_key ON public.agents;
 --   DROP TRIGGER IF EXISTS human_operators_refuse_system_agent ON public.human_operators;
 --   DROP TRIGGER IF EXISTS operator_links_refuse_retired_system_agent ON public.operator_links;

@@ -1214,7 +1214,8 @@ restart.
   event policy), `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
   `epigraph-mcp/tests/system_agent_registry_resolver.rs`. **Deploy order:**
   migrate 148 before the binaries that read it (they fail closed without
-  it); every deployed copy of the API and MCP binaries, including any
+  it: workflow ingest, REST policy challenges, document and spine ingest with
+  authors, and provenance with authors all refuse); every deployed copy of the API and MCP binaries, including any
   container image that embeds the stdio MCP server, at >=148 BEFORE a
   registered agent's key is rotated (an older copy now fails closed on its
   first workflow write instead of splitting); register the system agent
