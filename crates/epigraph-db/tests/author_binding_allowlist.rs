@@ -21,8 +21,9 @@
 //!
 //! The binding reads use the registered system-agent table when it exists
 //! (`public.system_agents`), softly: [`ensure_system_agents`] creates a
-//! stand-in with the same `agent_id` column on a database that does not carry
-//! it, so the system-agent cases run with or without that migration.
+//! stand-in carrying the columns [`plant_system_agent`] writes on a database
+//! that does not carry it, and the plant writes a row the real table accepts,
+//! so the system-agent cases run with or without that migration.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -423,7 +424,9 @@ async fn ensure_system_agents(pool: &PgPool) {
            IF to_regclass('public.system_agents') IS NULL THEN \
              CREATE TABLE public.system_agents ( \
                role text PRIMARY KEY, \
-               agent_id uuid NOT NULL REFERENCES public.agents(id)); \
+               agent_id uuid NOT NULL REFERENCES public.agents(id), \
+               registered_public_key bytea NOT NULL, \
+               reason text NOT NULL); \
              GRANT SELECT ON public.system_agents TO epigraph_maintenance; \
            END IF; \
          END $$",
@@ -433,7 +436,14 @@ async fn ensure_system_agents(pool: &PgPool) {
     .expect("system_agents");
 }
 
-/// Plant a `system_agents` row for `agent` past any guard (replica mode).
+/// Plant the `workflow-ingest` `system_agents` row for `agent` past any guard
+/// (replica mode skips triggers, not constraints). The row satisfies the
+/// system-agent registry migration's own table (its closed role vocabulary,
+/// the registered key, a reason), so the same plant runs whether that
+/// migration is in the chain or the stand-in above is; the registry's definer
+/// cannot be used, because it refuses an agent that is an OAuth client's
+/// principal, which these tests set up on purpose. One plant per test (the
+/// role is the primary key; each `sqlx::test` has its own database).
 async fn plant_system_agent(pool: &PgPool, agent: Uuid) {
     ensure_system_agents(pool).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -441,12 +451,16 @@ async fn plant_system_agent(pool: &PgPool, agent: Uuid) {
         .execute(&mut *tx)
         .await
         .expect("replica");
-    sqlx::query("INSERT INTO public.system_agents (role, agent_id) VALUES ($1, $2)")
-        .bind(format!("allowlist-test-{agent}"))
-        .bind(agent)
-        .execute(&mut *tx)
-        .await
-        .expect("plant a system agent");
+    let planted = sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'allowlist test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(agent)
+    .execute(&mut *tx)
+    .await
+    .expect("plant a system agent");
+    assert_eq!(planted.rows_affected(), 1, "plant: agent {agent} exists");
     tx.commit().await.expect("commit");
 }
 
