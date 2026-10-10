@@ -1220,12 +1220,85 @@ fn grant_error(r: &(StatusCode, Value)) -> (StatusCode, &str) {
 
 /// Give `p`'s human client these granted scopes.
 async fn grant_scopes(pool: &PgPool, p: &Person, scopes: &[&str]) {
+    client_scopes(pool, p, scopes).await;
+    // ...and the person's refresh family consented for the same scopes: the
+    // elevate grant mints within the family's consent (final review
+    // F1-SEC-01), so a test about the CLIENT's scopes consents to them all.
+    sqlx::query("UPDATE refresh_tokens SET scopes = $2 WHERE client_id = $1")
+        .bind(p.client)
+        .bind(scopes.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("the family's consent");
+}
+
+/// The client's `granted_scopes` alone (its families keep their consent).
+async fn client_scopes(pool: &PgPool, p: &Person, scopes: &[&str]) {
     sqlx::query("UPDATE oauth_clients SET granted_scopes = $2, allowed_scopes = $2 WHERE id = $1")
         .bind(p.client)
         .bind(scopes.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
         .execute(pool)
         .await
         .expect("granted scopes");
+}
+
+/// The elevate grant mints within the ticket's FAMILY's consent, never the
+/// client's whole grant (final review F1-SEC-01 / F1-COR-11; RFC 6749 s6, as
+/// migration 140 already applies it to refresh): a family consented for
+/// `claims:read` alone, on a client granted `claims:read`, `groups:read` and
+/// `agents:read`, redeems an elevated token carrying `claims:read` and
+/// `platform:admin` only. Calibration: a second holder whose family consented
+/// to all three gets all three.
+///
+/// Verified to fail with the grant minting from `client.granted_scopes`
+/// (the code before this test): `agents:read` and `groups:read` are present.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_mints_within_the_familys_consent(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "narrow", &mut auth).await;
+    client_scopes(&pool, &p, &["claims:read", "groups:read", "agents:read"]).await;
+    let (ticket, secret) = open(&s, &p, "narrow family").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut scopes = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token")
+        .scopes;
+    scopes.sort();
+    assert_eq!(
+        scopes,
+        vec!["claims:read", "platform:admin"],
+        "only the family's consent, plus the elevation"
+    );
+
+    let mut auth2 = SoftAuthenticator::new(MODEL);
+    let q = holder(&pool, &s, "wide", &mut auth2).await;
+    grant_scopes(&pool, &q, &["claims:read", "groups:read", "agents:read"]).await;
+    let (ticket, secret) = open(&s, &q, "wide family").await;
+    let (status, body) = s.ceremony(ticket, &mut auth2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &q.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut scopes = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token")
+        .scopes;
+    scopes.sort();
+    assert_eq!(
+        scopes,
+        vec![
+            "agents:read",
+            "claims:read",
+            "groups:read",
+            "platform:admin"
+        ],
+        "CALIBRATION: a family consented to all three"
+    );
 }
 
 /// The grant mode end to end: `authorization_pending` until the ceremony

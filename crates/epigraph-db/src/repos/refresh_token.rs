@@ -118,6 +118,39 @@ impl RefreshTokenRepository {
             .map_err(|e| DbError::QueryFailed { source: e })
     }
 
+    /// The scopes refresh family `family` of `client` was consented for: those
+    /// of its newest LIVE token (unrevoked, unexpired). Rotation keeps a
+    /// family's scopes at or below its consent (migration 140), so this is
+    /// the ceiling a grant minted FROM the family may not exceed. `None` when
+    /// the family has no live token of that client.
+    ///
+    /// Reads only columns inside migration 118's grant to the application
+    /// role (`scopes`, `id`, `family_id`, `client_id`, `revoked_at`,
+    /// `expires_at`, `created_at`); `refresh_tokens` has no row policy. Takes
+    /// the caller's connection: the elevate grant reads it on the connection
+    /// that redeemed the ticket (final review F1-SEC-01).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    #[instrument(skip(conn))]
+    pub async fn live_family_scopes(
+        conn: &mut sqlx::PgConnection,
+        family: Uuid,
+        client: Uuid,
+    ) -> Result<Option<Vec<String>>, DbError> {
+        sqlx::query_scalar(
+            "SELECT t.scopes FROM refresh_tokens t \
+              WHERE COALESCE(t.family_id, t.id) = $1 AND t.client_id = $2 \
+                AND t.revoked_at IS NULL AND t.expires_at > now() \
+              ORDER BY t.created_at DESC, t.id DESC LIMIT 1",
+        )
+        .bind(family)
+        .bind(client)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })
+    }
+
     /// Read a live row by hash, `token_hash` included. Since migration 118 the
     /// application role cannot read `token_hash`, so this runs only on a
     /// privileged connection; no request path calls it (the refresh grant uses

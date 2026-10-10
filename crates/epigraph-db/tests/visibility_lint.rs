@@ -472,6 +472,15 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "refresh_token.rs",
+        "live_family_scopes",
+        "READ of the newest live `refresh_tokens` row's `scopes` for one (family, client) pair, \
+         inside migration 118's column grant: an authentication record about a client's \
+         consent (no `visibility` / `owner_group_id`; the table has no row policy). Called by \
+         the elevate grant, before the elevated principal's token is minted, on the connection \
+         that redeemed the ticket (final review F1-SEC-01).",
+    ),
+    (
         "admin_act.rs",
         "get",
         "READ of one `pending_admin_acts` row by id for the maintenance CLI (migration 130): an \

@@ -1358,7 +1358,6 @@ async fn handle_elevate_grant(
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?;
-    drop(conn);
     match r.status.as_str() {
         "pending" => {
             return Err(elevate_error(
@@ -1393,10 +1392,30 @@ async fn handle_elevate_grant(
         return Err(elevate_error("invalid_grant", INVALID));
     }
     let ttl = Duration::seconds(secs);
+    // The ceiling is the ticket's FAMILY's consent, not the client's whole
+    // grant (RFC 6749 s6, as migration 140 applies it to refresh; final review
+    // F1-SEC-01): a family consented for fewer scopes than the client holds
+    // never elevates into the rest. A family with no live token is refused.
+    let consented =
+        epigraph_db::RefreshTokenRepository::live_family_scopes(&mut conn, family, client.id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?;
+    drop(conn);
+    let Some(consented) = consented else {
+        return Err(elevate_error("invalid_grant", INVALID));
+    };
+    let ceiling: Vec<String> = client
+        .granted_scopes
+        .iter()
+        .filter(|s| consented.contains(s))
+        .cloned()
+        .collect();
     let scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
-        client.granted_scopes.clone(),
+        ceiling,
         crate::oauth::scopes::MintGrant::Elevate,
     )
     .await;
