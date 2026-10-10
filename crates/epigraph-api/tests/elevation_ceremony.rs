@@ -2460,6 +2460,53 @@ async fn an_elevated_read_through_an_extension_is_recorded_once(pool: PgPool) {
     assert_eq!(args["status"], json!(200));
 }
 
+/// An elevated read is attributed to its subjects by the ids the REQUEST
+/// names as well as those its response carries (final review F1-COR-07): an
+/// extension route that reads by a path id and answers without echoing it
+/// (here it answers a constant) is still recorded with the group of the
+/// private claim the path named, so that group's admin reads the row.
+///
+/// Verified to fail with the candidate ids taken from the response alone
+/// (the code before this test): the row is recorded with no group and B
+/// reads nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_is_attributed_by_the_ids_its_request_names(pool: PgPool) {
+    let silent = RouterExtension::with_state(
+        "silent",
+        Router::new().route(
+            "/claims/:id",
+            get(|State(_): State<EmbedderState>| async move { Json(json!({ "ok": true })) }),
+        ),
+        EmbedderState { marker: "silent" },
+    )
+    .expect("valid name");
+    let s = spawn_with_extensions(&pool, Some(software()), vec![silent]).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "cor07-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "cor07 B private claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+
+    let (status, body) = s
+        .get(&format!("/api/v1/ext/silent/claims/{claim}"), &elevated)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({ "ok": true }),
+        "CALIBRATION: no id in the answer"
+    );
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "exactly one row: {log:?}");
+    assert_eq!(
+        log[0].2,
+        vec![b_group],
+        "attributed to the group of the claim the request named"
+    );
+    assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
+}
+
 /// A list's row count is the number of rows the response carried, and its
 /// subjects are every group whose private row it named; the request's own
 /// filters are in the args.

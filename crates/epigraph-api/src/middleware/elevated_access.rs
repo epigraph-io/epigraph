@@ -234,6 +234,17 @@ pub async fn record_elevated_access(
     let body_ids = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map(|v| id_fields_in(&v))
         .unwrap_or_else(|_| serde_json::json!({}));
+    // The ids the REQUEST names (its path, query and body) are subjects too,
+    // not only those the response carries (final review F1-COR-07): a route
+    // that reads by id and answers without echoing it, or in an encoding the
+    // scan cannot read (a compressed or binary extension response), is still
+    // attributed to the rows it was asked about. Errs toward the subject, as
+    // the response scan does.
+    let mut request_ids = candidate_ids_in(parts.uri.path().as_bytes());
+    request_ids.extend(candidate_ids_in(
+        parts.uri.query().unwrap_or_default().as_bytes(),
+    ));
+    request_ids.extend(candidate_ids_in(&bytes));
     let mut request = Request::from_parts(parts, Body::from(bytes));
     let slot = ElevatedAccessSlot::default();
     request.extensions_mut().insert(slot.clone());
@@ -302,7 +313,17 @@ pub async fn record_elevated_access(
             "status": parts.status.as_u16(),
         }),
         row_count,
-        candidate_ids: candidate_ids_in(&bytes),
+        candidate_ids: {
+            // The response's ids first (as before), then the request's; once
+            // each.
+            let mut ids = candidate_ids_in(&bytes);
+            for id in request_ids {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        },
     };
     let Some(scoped) = state.scoped.as_ref() else {
         return withheld("no ScopedPool to record on");
