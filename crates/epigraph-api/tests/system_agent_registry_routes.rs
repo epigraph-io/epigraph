@@ -16,6 +16,13 @@
 //! Handlers are invoked directly with the caller's `ViewerExtractor` on an
 //! application-role `AppState`, as `claim_routes_bind_the_caller.rs` does; the
 //! harness superuser seeds, rotates keys and arms.
+//!
+//! Verified to fail: `routes/workflows.rs::get_or_create_system_agent` put back
+//! to the pre-148 key lookup -> `policy_challenge_after_rotation_*` answers 500
+//! (the re-mint is refused by the `agents` guard); the provenance refusal moved
+//! from the pre-pass into the author loop ->
+//! `provenance_refuses_an_author_naming_the_system_identity` finds the first
+//! author's edges (a partial write).
 
 mod viewer_fixture;
 

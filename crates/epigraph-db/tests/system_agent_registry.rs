@@ -19,6 +19,20 @@
 //! The `rolsuper` arm of the definer and of the guard (a database without
 //! `epigraph_maintenance` registers as a superuser) is not demonstrable on this
 //! harness: the role always exists here, and a superuser is also a member of it.
+//!
+//! Verified to fail (each mutation of `migrations/148_system_agent_registry.sql`
+//! run against this file): the app-role `REVOKE ALL` removed ->
+//! `the_app_role_cannot_write_the_registry` (the guard answered 42501 and only
+//! the message assert caught it); the guard's session check removed ->
+//! `the_guard_refuses_a_non_maintenance_direct_insert_even_if_granted` (the
+//! INSERT landed); the definer's session check removed ->
+//! `the_definer_refuses_a_non_maintenance_session_even_if_granted` (the guard's
+//! prefix answered); `system_agents_no_truncate` removed ->
+//! `a_registration_is_immutable` (superuser TRUNCATE returned Ok); the reserved
+//! event policy removed -> `the_registration_event_type_is_reserved` (the app
+//! forge landed); the `agents` guard's `agent_id <> NEW.id` exclusion removed ->
+//! `a_registered_key_cannot_be_taken_by_another_agent` step (0). Not run: the
+//! remaining per-branch guard mutations named in each test's doc.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
