@@ -421,6 +421,36 @@ the mechanical requirement is (1)-(3) above, not a particular release count.
 `docs/runbooks/084-undo.sql` recreates the EMPTY SHAPE only; read it before
 applying 084 to anything you cannot rebuild.
 
+### 1e. `POST /api/v1/claims/batch` now persists its claims
+
+Each item goes through the same code as `POST /api/v1/claims`, on its own
+transaction. Before this change the route returned ids that named no row.
+
+- An item may carry any `POST /api/v1/claims` field. An item without
+  `agent_id` is authored by the caller. `truth_value` is still accepted as
+  `initial_truth`, but giving both is refused.
+- `if_not_exists: true` makes re-running a batch safe: matched items return
+  the existing id with `was_created: false` and are counted in the new
+  `existing` field.
+- Each failed item's result carries `status` (the code the single route would
+  return, e.g. 400 or 409) next to `error`.
+- The request now needs an authenticated agent with `claims:write`, the same
+  as the single route.
+- Still no `ClaimSubmitted` event, the same as `POST /api/v1/claims`.
+- Once operator binding is armed (migration 122), the database checks each
+  item as it checks a single claim. An item naming an author the caller may
+  not write as, and any item from an unbound caller, is refused in its own
+  slot with 403 (`OPL01`/`OPL02`), and the other items are unaffected.
+- Allowlisted service clients writing under an armed binding must send
+  `group_id`. The default owner, the client's own personal group, is not
+  a group its operator writes, so it is refused with `OPL02`. Fleet agents
+  can't call this route over HTTP, because their token mint is refused.
+- A batch embeds its items one after another, so a large public batch can
+  take tens of seconds. The rate limiter counts the request, not its items.
+
+Clients that relied on the old behaviour see real rows, and the response ids
+now name them.
+
 #### One route needs more than a token
 
 | Route | Was | Now | Failure if you get it wrong |
