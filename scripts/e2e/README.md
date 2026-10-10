@@ -573,8 +573,6 @@ decision or conversion before the operator drops `claims_privacy`,
      do not exist.
 6. **Known shapes that meet the R3 gate's "succeeds while writing nothing"
    definition**, the same on both configs; each must be accepted or fixed:
-   - `POST /api/v1/claims/batch`: 200 `created: 2` with ids and 0 rows, because
-     `AppState::claim_store` is an in-memory map (the handler doc says so);
    - MCP `deprecate_workflow` on a hierarchical id: `deprecated_ids=[id]`, but the
      id is not a claim (README trap 2);
    - HTTP `/workflows/:id/outcome`, `/behavioral-executions`, `/skills/share` and
