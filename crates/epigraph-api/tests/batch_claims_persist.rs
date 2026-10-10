@@ -4,6 +4,8 @@
 //! `if_not_exists` makes a re-run idempotent, and a failing item is reported
 //! in its own slot without affecting the others.
 
+use axum::extract::State;
+use axum::Json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -331,6 +333,105 @@ async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embe
             "slot {i}: create_claim never writes embedding_3072"
         );
     }
+}
+
+/// Review finding (fix round 1): `agentless_token_is_401_and_writes_nothing`
+/// above goes through HTTP, where `ViewerExtractor::extract_viewer`
+/// (`middleware/bearer.rs`) already answers 401 before the handler body
+/// runs — it is tautological with respect to `batch_create_claims`'s own
+/// `let Some(caller_agent_id) = auth.agent_id else { .. }` guard: that
+/// mutation check (fix round 1 report) proved `create_claim_core` carries an
+/// identical per-item "token carries no agent_id" check, so even with the
+/// handler's own guard deleted, an agentless caller still gets refused —
+/// just as a per-item 401 inside a 200, not as the single `Err(Unauthorized)`
+/// this test pins. This calls the handler directly, bypassing the extractor,
+/// with an `AuthContext` whose `agent_id` is `None` but whose scopes already
+/// satisfy `claims:write`, so the ONLY thing that can make the WHOLE request
+/// answer `Err(Unauthorized)` (never reaching the per-item loop at all) is
+/// the handler's own guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_create_claims_401s_without_an_agent_id_and_writes_nothing() {
+    let db = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db)
+        .await
+        .unwrap();
+    let agent = common::seed_system_agent(&pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let state = epigraph_api::AppState::with_db(pool.clone(), epigraph_api::ApiConfig::default());
+    let auth = epigraph_api::middleware::bearer::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: None,
+        owner_id: None,
+        client_type: epigraph_api::middleware::ClientType::Agent,
+        scopes: vec!["claims:write".to_string()],
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+    };
+    let a = uniq("handler-no-agent");
+    let req: epigraph_api::routes::batch::BatchClaimRequest =
+        serde_json::from_value(serde_json::json!({"claims": [{"content": a}]})).expect("request");
+
+    let err = epigraph_api::routes::batch::batch_create_claims(
+        epigraph_api::middleware::bearer::ViewerExtractor(viewer),
+        State(state),
+        Some(axum::Extension(auth)),
+        Json(req),
+    )
+    .await
+    .expect_err("a token with no agent_id must be refused by the handler itself");
+    assert!(
+        matches!(err, epigraph_api::errors::ApiError::Unauthorized { .. }),
+        "{err:?}"
+    );
+    assert_eq!(count_content(&pool, &a).await, 0);
+}
+
+/// Review finding (fix round 1): the `auth_ctx: None` arm
+/// (`let Some(axum::Extension(auth)) = auth_ctx.as_ref() else { .. }`) is
+/// unreachable over HTTP on this route. `ViewerExtractor`'s own
+/// `extract_viewer` (`middleware/bearer.rs`) reads `AuthContext` straight out
+/// of `parts.extensions` and 401s there, before axum ever resolves this
+/// handler's separate `Option<Extension<AuthContext>>` parameter — so a
+/// request with no `AuthContext` extension never reaches the handler body in
+/// the first place, over HTTP. Calling the handler directly with `None` is
+/// the only way to prove this guard independently.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_create_claims_401s_without_an_auth_ctx_and_writes_nothing() {
+    let db = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db)
+        .await
+        .unwrap();
+    let agent = common::seed_system_agent(&pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let state = epigraph_api::AppState::with_db(pool.clone(), epigraph_api::ApiConfig::default());
+    let a = uniq("handler-no-authctx");
+    let req: epigraph_api::routes::batch::BatchClaimRequest =
+        serde_json::from_value(serde_json::json!({"claims": [{"content": a}]})).expect("request");
+
+    let err = epigraph_api::routes::batch::batch_create_claims(
+        epigraph_api::middleware::bearer::ViewerExtractor(viewer),
+        State(state),
+        None,
+        Json(req),
+    )
+    .await
+    .expect_err("no auth_ctx extension must be refused by the handler itself");
+    assert!(
+        matches!(err, epigraph_api::errors::ApiError::Unauthorized { .. }),
+        "{err:?}"
+    );
+    assert_eq!(count_content(&pool, &a).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
