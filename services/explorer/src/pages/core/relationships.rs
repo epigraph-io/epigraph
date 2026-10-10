@@ -509,11 +509,12 @@ mod tests {
         agent_edge.target_type = "agent".into();
         let ego = EgoResponse {
             center: node(1, "claim", "c"),
-            // `experiment` is hydrated, `agent` is one of upstream's
-            // unhydrated nodes (label == entity_type, no content).
+            // As upstream sends them: `experiment` is not a hydrated type
+            // (label == entity_type, no content); `agent` is, and its label
+            // is the agent's display name.
             nodes: vec![
                 node(4, "experiment", "experiment"),
-                node(6, "agent", "agent"),
+                node(6, "agent", "Ada Example"),
             ],
             edges: vec![experiment_edge, agent_edge],
             total_edges: 2,
@@ -533,6 +534,7 @@ mod tests {
             agent.href.as_deref(),
             Some(format!("/explorer/agent/{}", id(6)).as_str())
         );
+        assert_eq!(agent.text, "Ada Example", "a hydrated agent shows its name");
         assert!(!o.truncated);
     }
 
