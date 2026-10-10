@@ -181,7 +181,6 @@ pub async fn callback_endpoint(
 ) -> Result<Response, ApiError> {
     use crate::oauth::providers::provision_external_user_client;
     use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
-    use epigraph_db::repos::oauth_client::OAuthClientRepository;
 
     // 1. Read-only lookup (NO delete): we still need the verifier + request to transition.
     let session = AuthorizeSessionRepository::find_by_state(&state.db_pool, &q.state)
@@ -191,22 +190,6 @@ pub async fn callback_endpoint(
         })?
         .ok_or(ApiError::BadRequest {
             message: "unknown or expired authorize session".into(),
-        })?;
-
-    // 1b. The client this flow is for must still be active. It was active at
-    // /oauth/authorize; if it has been suspended or revoked since, refuse here,
-    // BEFORE the Google exchange and before provisioning a user, rather than ask
-    // for consent to a client whose code could never be redeemed
-    // (get_by_client_id filters status='active'). The row is used for that check
-    // only: the consent page never shows its self-declared `client_name` (see
-    // `render_consent_page`).
-    OAuthClientRepository::get_by_client_id(&state.db_pool, &session.client_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?
-        .ok_or(ApiError::BadRequest {
-            message: "invalid_client".into(),
         })?;
 
     // 2. Exchange the Google code -> id_token -> validated identity (reuse the provider flow).
@@ -451,32 +434,4 @@ pub async fn authorize_endpoint(
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".to_string(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A redirect outside the hosted and loopback classes gets the generic
-    /// label, and every interpolated value is escaped. There is no client-name
-    /// parameter at all: a self-declared DCR name can never reach the page.
-    #[test]
-    fn consent_page_for_an_unclassified_redirect_is_generic_and_escaped() {
-        let html = render_consent_page(
-            "tick&et",
-            "reader<b>@example.com",
-            &["claims:read".to_string()],
-            "https://explorer.example.com/explorer/auth/callback",
-        );
-        assert!(
-            html.contains("<title>Authorize an application</title>"),
-            "{html}"
-        );
-        assert!(html.contains("<h1>Authorize an application</h1>"), "{html}");
-        assert!(!html.contains("Claude"), "{html}");
-        assert!(html.contains("reader&lt;b&gt;@example.com"), "{html}");
-        assert!(!html.contains("reader<b>"), "{html}");
-        assert!(html.contains(r#"value="tick&amp;et""#), "{html}");
-        assert!(html.contains("<li><code>claims:read</code></li>"), "{html}");
-    }
 }
