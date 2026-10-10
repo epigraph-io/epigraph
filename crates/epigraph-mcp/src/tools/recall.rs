@@ -219,11 +219,12 @@ pub struct RecallWithContextParams {
     /// be exhaustive.
     ///
     /// **Boundary: the window constrains top-level HITS, not their CONTEXT.**
-    /// `atoms`, `siblings`, `corroborates`, `neighbor_paragraphs`, `section`
-    /// and `paper` are deliberately NOT filtered. A two-year-old supporting
-    /// paragraph is legitimate evidence for a claim created yesterday;
-    /// dropping it would remove the caller's ability to see *why* a recent
-    /// hit is believed, which is the opposite of what this parameter is for.
+    /// `atoms`, `siblings`, `corroborates`, `epistemic_edges`,
+    /// `neighbor_paragraphs`, `section` and `paper` are deliberately NOT
+    /// filtered. A two-year-old supporting paragraph is legitimate evidence
+    /// for a claim created yesterday; dropping it would remove the caller's
+    /// ability to see *why* a recent hit is believed, which is the opposite of
+    /// what this parameter is for.
     /// "What changed since T" is a question about hits; the reasons a hit is
     /// believed are older than the change by construction.
     ///
