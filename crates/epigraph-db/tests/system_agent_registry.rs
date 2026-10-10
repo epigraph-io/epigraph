@@ -31,7 +31,17 @@
 //! `a_registration_is_immutable` (superuser TRUNCATE returned Ok); the reserved
 //! event policy removed -> `the_registration_event_type_is_reserved` (the app
 //! forge landed); the `agents` guard's `agent_id <> NEW.id` exclusion removed ->
-//! `a_registered_key_cannot_be_taken_by_another_agent` step (0). Not run: the
+//! `a_registered_key_cannot_be_taken_by_another_agent` step (0); the
+//! definer's existence check disabled -> `only_known_roles_and_real_agents_register`
+//! (the guard's prefix answered); the reserved-event policy's
+//! `created_at = now()` conjunct removed -> `the_registration_event_type_is_reserved`
+//! (the back-dated maintenance row landed); the `human_operators` reverse
+//! guard's advisory lock removed ->
+//! `a_registration_and_a_concurrent_human_registration_serialize`. Seen red
+//! before their fix existed: `a_registered_system_agent_is_never_retire_linked`
+//! (the legacy tie landed a retired link),
+//! `a_registration_and_a_concurrent_retired_link_serialize` (the retire never
+//! waited) and `a_registration_under_repeatable_read_is_refused`. Not run: the
 //! remaining per-branch guard mutations named in each test's doc.
 
 #[path = "viewer_fixture.rs"]

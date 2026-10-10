@@ -13,10 +13,16 @@
 //! definer on a maintenance session (`fixture::register_system_agent`). No test
 //! calls `fixture::grant_app_privileges`.
 //!
-//! Verified to fail (the one mutation run against this file):
+//! Verified to fail (mutations run against this file):
 //! `SystemAgentRepository::lookup` keyed on
 //! `epigraph_operator_binding_enforced()` instead of `..._armed()` ->
-//! `the_valve_does_not_reopen_the_fallback` returns `Ok`. Each test's "Kills:"
+//! `the_valve_does_not_reopen_the_fallback` returns `Ok`; the legacy-key author
+//! check moved to the create branch only (workflow, document, spine) -> the
+//! three `*_skips_an_author_naming_the_system_identity` tests adopt S in state
+//! (0); the spine path's registered-id check disabled ->
+//! `an_author_resolving_to_a_registered_agent_is_never_adopted`; a failed
+//! registry read mapped to the unarmed fallback ->
+//! `a_database_without_the_registry_fails_closed_*`. Each test's "Kills:"
 //! line names the mutation it is designed to catch; those were not run
 //! individually (every test was seen red against the pre-registry resolver).
 
@@ -531,10 +537,12 @@ async fn store_workflow_after_rotation_authors_as_the_registered_agent(pool: PgP
     assert_eq!(k_holders(&pool).await, 0);
 }
 
-/// `add_step` (whose executor resolves the system agent again inside the
-/// stamped transaction) after a rotation authors as S and mints nothing. The
-/// workflow is stored BEFORE the rotation, so the only post-rotation resolution
-/// is `add_step`'s own.
+/// `add_step` after a rotation authors as S and mints nothing. The workflow is
+/// stored BEFORE the rotation, so every post-rotation resolution belongs to the
+/// `add_step` call: MCP `add_step` resolves on its autocommit `boot` connection
+/// (`system_agent_write_authority`) and the executor resolves again inside the
+/// stamped transaction. Both go to the same function, so this guards the entry
+/// point; it cannot isolate the in-transaction call.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mcp_add_step_after_rotation_mints_nothing(pool: PgPool) {
     let s = legacy_system_agent_registered(&pool).await;
