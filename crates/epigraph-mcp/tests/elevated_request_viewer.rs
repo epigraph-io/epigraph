@@ -687,8 +687,10 @@ async fn a_write_is_refused_when_the_elevation_ends_after_dispatch(pool: PgPool)
 
 /// Source lock: `call_tool` runs `refuse_elevated_write` inside the HTTP
 /// gate, AFTER the scope gate and BEFORE `tool_router.call`, so no write tool
-/// body runs for an elevated request (no behavioural test in this crate can
-/// drive `call_tool`: it needs an rmcp `RequestContext`).
+/// body runs for an elevated request. The ORDER is what this source lock
+/// pins; the refusal's BEHAVIOUR through the real `call_tool` is pinned by
+/// `an_elevated_write_is_refused_at_dispatch_before_its_invocation_is_logged`
+/// (the listener below drives `call_tool` over streamable HTTP).
 ///
 /// Verified to fail with the call removed from `call_tool`.
 #[test]
@@ -1185,6 +1187,79 @@ async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: P
     assert!(
         elevated.contains("epigraph-operator"),
         "an admin write's refusal says where admin writes run (plan EQ-5): {elevated}"
+    );
+}
+
+/// The `tools.invoked` event log: the `tool` of every `tool.invoked` event.
+async fn invoked_tools(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT payload->>'tool' FROM events WHERE event_type = 'tool.invoked' \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("tool.invoked events")
+}
+
+/// `call_tool`'s OWN dispatch refusal, behaviourally (final review F1-TST-04):
+/// an elevated `delete_edge` (past the scope gate on the elevation's
+/// `platform:admin`) is refused ELEVATED READ-ONLY naming `epigraph-operator`
+/// AT DISPATCH: the denial event `denied:delete_edge` is logged and the
+/// pre-dispatch `delete_edge` invocation event never is (a refusal further
+/// down, by `write_identity`, would come after that event). Calibration: an
+/// unelevated `claims:admin` call of the same tool is dispatched and logs
+/// `delete_edge`.
+///
+/// Verified to fail with `call_tool`'s `refuse_elevated_write` result
+/// discarded (review mutant mA): no `denied:delete_edge`, and the
+/// `delete_edge` invocation is logged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_write_is_refused_at_dispatch_before_its_invocation_is_logged(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "tst04-dispatch").await;
+    let (client, family) = make_holder(&pool, p, 11).await;
+    let live = session(&pool, p, client, family, 11, "grant").await;
+    let url = el8_listener(&pool).await;
+    let mint = |scopes: &[&str], elv: Option<Uuid>| {
+        epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+            .issue_access_token(
+                client,
+                scopes.iter().map(|s| (*s).to_string()).collect(),
+                "human",
+                None,
+                Some(p),
+                chrono::Duration::minutes(10),
+                epigraph_auth::AccessTokenBinding {
+                    family_id: Some(family),
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0
+    };
+
+    let plain = el10_delete_edge(&url, &mint(&["claims:read", "claims:admin"], None)).await;
+    assert!(
+        !plain.contains("ELEVATED READ-ONLY"),
+        "CALIBRATION: unelevated, dispatched: {plain}"
+    );
+    let logged = invoked_tools(&pool).await;
+    assert!(
+        logged.iter().any(|t| t == "delete_edge"),
+        "CALIBRATION: a dispatched call logs its invocation: {logged:?}"
+    );
+    let before = logged.len();
+
+    let elevated =
+        el10_delete_edge(&url, &mint(&["claims:read", "platform:admin"], Some(live))).await;
+    assert!(
+        elevated.contains("ELEVATED READ-ONLY") && elevated.contains("epigraph-operator"),
+        "refused at dispatch, with the admin-write pointer: {elevated}"
+    );
+    let after: Vec<String> = invoked_tools(&pool).await.split_off(before);
+    assert_eq!(
+        after,
+        vec!["denied:delete_edge".to_string()],
+        "the elevated write is denied at dispatch and never logged as invoked"
     );
 }
 
