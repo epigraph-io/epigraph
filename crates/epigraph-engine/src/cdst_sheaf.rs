@@ -826,6 +826,36 @@ mod tests {
     }
 
     #[test]
+    fn test_supports_full_plausibility_source_drops_from_cohomology() {
+        // Cohomology-level twin of the edge test above: the live symptom of
+        // b3476233 was pl_s = 1.0 supporter edges landing in the obstruction
+        // set (and so in reconcile clusters) at the 0.15 threshold. A target
+        // that clears the bel floor must be absent from obstructions and H¹.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 1.0, 0.0);
+        let target = EpistemicInterval::new(0.50, 0.60, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(s, t, source, target, "supports", &sci());
+        let coh = compute_cdst_cohomology(vec![obs], 0.15);
+
+        assert_eq!(coh.edge_count, 1, "one edge in the sheaf");
+        assert!(
+            coh.obstructions.is_empty(),
+            "a pl=1 supporter of a target above the bel floor must not be an obstruction at 0.15, got {:?}",
+            coh.obstructions
+                .iter()
+                .map(|o| o.interval_inconsistency)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            coh.h1.abs() < 1e-9,
+            "it must contribute exactly 0 to H¹, got h1={}",
+            coh.h1
+        );
+    }
+
+    #[test]
     fn test_supports_weaker_edge_never_demands_more() {
         // Same source/target; `elaborates` (f=0.60) is a weaker positive edge
         // than `supports` (f=0.80), so it must never impose a larger shortfall.
