@@ -439,12 +439,15 @@ The API's authorization server signs people in **only through Google**, and
 ### 3. The consent page
 
 After Google, the API shows its own consent page, and the user must press
-**Allow** on every sign-in (consent is not stored). The page names the
-requesting client from `oauth_clients.client_name` (plan §2.7, landed in
-`fix(oauth): name the requesting client on the consent page`), so whatever you
-put in `client_name` above is what your users read there. Older API builds
-hard-code "Authorize Claude"; if that is what the page says, the API is behind
-this tree.
+**Allow** on every sign-in (consent is not stored). The API labels the page
+from the class of the sign-in's registered `redirect_uri`, never from
+`oauth_clients.client_name`, which whoever registers a client chooses: a
+claude.ai redirect reads "Authorize Claude", a loopback one "Authorize an
+application on this computer", and anything else, the Explorer's own
+`https://` callback included, "Authorize an application", followed by the
+user's email and the scopes asked for. So the `client_name` above is not
+shown to your users. An API build that says "Authorize Claude" for the
+Explorer's sign-in is older than that labelling.
 
 ### 4. Keep `/oauth/*` browser-reachable
 
@@ -848,10 +851,13 @@ if the login response's cookie starts `__Host-` and the startup log
   refresh-token reuse security event, the signal a stolen token's replay
   raises, and an operator could not tell the two apart. The clean fix is for
   the API to revoke a rotated-out token's family on `/oauth/revoke`.
-- **The consent page shows a name the registrant chose.** The API's consent
-  page names the requesting client by its `client_name`, which whoever
-  registered the client picked, so the name alone does not prove which
-  application is asking. That is the API's consent UI to fix.
+- **The consent page does not name the Explorer.** For the Explorer's
+  redirect the API's consent page reads "Authorize an application" and shows
+  the email and scopes, because the only name it could show is a
+  `client_name` whoever registered the client chose. A user therefore learns
+  which application is asking from having just clicked "Sign in" on the
+  Explorer, not from the page. A verified name would be the API's consent UI
+  to add.
 - **Untested surfaces.** The `Dockerfile` has never been built, and neither
   the Notion embed nor Safari is exercised by any test; every test stubs the
   API. Build the image and check those browsers at deploy (Operator setup §7).
