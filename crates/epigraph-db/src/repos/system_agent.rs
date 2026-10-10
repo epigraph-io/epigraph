@@ -244,11 +244,14 @@ mod tests {
         );
     }
 
+    /// `parse` is exact: a near-miss spelling (the CLI's most likely typo) is
+    /// no role. (The round trip of a valid role cannot fail by construction,
+    /// and vocabulary drift against the SQL CHECK is pinned by every test that
+    /// registers through `as_str`.)
     #[test]
-    fn roles_round_trip_through_their_text() {
-        for r in SystemAgentRole::ALL {
-            assert_eq!(SystemAgentRole::parse(r.as_str()), Some(*r));
+    fn parse_refuses_near_miss_spellings() {
+        for near_miss in ["workflow_ingest", "Workflow-Ingest", " workflow-ingest", ""] {
+            assert_eq!(SystemAgentRole::parse(near_miss), None, "{near_miss:?}");
         }
-        assert_eq!(SystemAgentRole::parse("workflow_ingest"), None);
     }
 }
