@@ -256,7 +256,8 @@ samp,
 }
 
 /* Who the viewer is signed in as, and what their token carries. Plain
-   information: a wider-than-requested token is not styled as a warning. */
+   information, except a wider-than-requested token, which is flagged as a
+   warning (identity-strip__note--warn). */
 .identity-strip {
   margin: 0;
   display: flex;
@@ -273,6 +274,15 @@ samp,
 
 .identity-strip__note {
   font-style: italic;
+}
+
+.identity-strip__note--warn {
+  font-style: normal;
+  padding: 0 var(--space-1);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 3px;
+  color: var(--text);
 }
 
 /* Signed-in sections: a second header row of plain links. */

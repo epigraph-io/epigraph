@@ -40,7 +40,7 @@
         {%- endif %}
         <span class="identity-strip__scope">token scope: {{ who.scope_text() }}</span>
         {%- if who.widened() %}
-        <span class="identity-strip__note">wider than requested</span>
+        <span class="identity-strip__note identity-strip__note--warn" title="This token carries scopes the Explorer did not request. EpiGraph should not issue a token wider than requested; signing out and in again asks for a fresh one.">wider than requested</span>
         {%- endif %}
         <span class="identity-strip__expiry">expires in {{ who.minutes_left() }} min</span>
       </p>

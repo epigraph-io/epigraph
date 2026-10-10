@@ -643,10 +643,13 @@ if the login response's cookie starts `__Host-` and the startup log
     fails, the strip says "sign-in client unavailable" until the next token,
     and the page still renders.
 
-  A token wider than the scopes requested is shown as neutral information,
-  "wider than requested": the API's refresh currently issues the user's full
-  granted scopes (see Caveats), so expect it on most sessions after the first
-  refresh. The strip is display only; no authorization decision reads it.
+  A token wider than the scopes requested is flagged as a warning, "wider
+  than requested". The API grants at most the scopes requested at sign-in,
+  and a refresh issues the presented token's own scopes narrowed to what the
+  user is still granted, never more, so a wider token is not expected; an
+  API build from before that refresh fix widened tokens on refresh (see
+  Caveats). The strip is display only; no authorization decision reads it,
+  and the Explorer does not refuse such a token.
 - **Session cookie.** At the root of a secure origin (the production
   topology, see Deploy) the session cookie is `__Host-epx_session` with
   `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` and a 30-day
@@ -768,12 +771,15 @@ if the login response's cookie starts `__Host-` and the startup log
   per-claim share token, or an explicit `visibility = 'public'` read on the
   allowlist — and the Explorer will not use a service token to get around
   that.
-- **The session store is credential storage.** When a token is refreshed,
-  the API issues it with the user's **full** granted scopes, whatever was
-  requested at sign-in. Those scopes include write scopes such as
-  `claims:write` and `edges:write`. Every session therefore holds a
-  write-capable 30-day refresh credential, even though the Explorer only
-  reads. Sessions live **only in process memory**: they are never written to
+- **The session store is credential storage.** Every session holds a 30-day
+  refresh credential. The API issues it with the scopes granted at sign-in
+  (`claims:read audit:read`, narrowed to the user's grant), and a refresh
+  never widens them. An API build from before that refresh fix issued a
+  refreshed token with the user's **full** granted scopes, write scopes such
+  as `claims:write` included, so against such a build every session held a
+  write-capable credential although the Explorer only reads; the identity
+  strip's "wider than requested" warning is how that shows. Sessions live
+  **only in process memory**: they are never written to
   disk and never logged (`Debug` output redacts them). Treat core dumps and
   memory access to this process as sensitive.
 - **Sessions are in memory, so a restart signs everyone out.** The refresh

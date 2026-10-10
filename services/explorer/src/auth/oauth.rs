@@ -165,7 +165,8 @@ impl TokenError {
 /// did not ("token wider than requested"). Both are space-separated lists;
 /// order and repeats do not matter. An empty `granted` means "as requested"
 /// (RFC 6749 §5.1), so it is never widened. Display only: the session
-/// records it, and nothing authorizes on it.
+/// records it and the identity strip flags it as a warning, and nothing
+/// authorizes on it.
 pub fn scope_widened(requested: &str, granted: &str) -> bool {
     let requested: std::collections::HashSet<&str> = requested.split_whitespace().collect();
     granted.split_whitespace().any(|s| !requested.contains(s))
@@ -442,9 +443,11 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
         .as_deref()
         .is_some_and(|granted| scope_widened(SCOPE, granted));
     if scope_widened {
-        // Neutral info, not a warning: upstream widens the scope on refresh
-        // today, so this is expected until that changes. Never the token.
-        tracing::info!("token wider than requested");
+        // A warning: the API intersects the requested scopes with the user's
+        // grant at sign-in, and a refresh no longer widens a token past what
+        // it was minted with, so a token wider than requested is no longer
+        // expected. Shown to the viewer, never refused here. Never the token.
+        tracing::warn!("token wider than requested");
     }
     let lifetime = r.expires_in.clamp(0, MAX_TOKEN_LIFETIME_SECS);
     Ok(TokenSet {

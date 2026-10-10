@@ -2174,10 +2174,11 @@ async fn identity_strip_shows_the_tokens_actual_scopes() {
     assert!(!anon.body.contains("identity-strip"), "{}", anon.body);
 }
 
-/// A token wider than requested is shown as neutral information until the
-/// kernel stops widening on refresh: the words, never warning styling.
+/// A token wider than requested is flagged as a warning now that the kernel
+/// never widens a token on refresh: the same words, in the warning variant,
+/// and still no refusal (the page renders with the strip).
 #[tokio::test]
-async fn identity_strip_shows_a_widened_token_as_neutral_info() {
+async fn identity_strip_flags_a_widened_token_as_a_warning() {
     let app = app().await;
     introspect_call("access-1")
         .respond_with(introspected(SUB_1))
@@ -2193,9 +2194,25 @@ async fn identity_strip_shows_a_widened_token_as_neutral_info() {
         s.contains("token scope: claims:read audit:read claims:write"),
         "{s}"
     );
-    assert_eq!(strip_part(s, "note"), "wider than requested", "{s}");
-    assert!(!s.contains("warn"), "neutral, not a warning: {s}");
-    assert!(!s.contains("notice"), "neutral, not a notice box: {s}");
+    let open = "<span class=\"identity-strip__note identity-strip__note--warn\"";
+    let start = s
+        .find(open)
+        .unwrap_or_else(|| panic!("the note is the warning variant: {s}"));
+    let text_start = start + s[start..].find('>').expect("span opens") + 1;
+    let text_len = s[text_start..].find("</span>").expect("span closes");
+    assert_eq!(
+        &s[text_start..text_start + text_len],
+        "wider than requested",
+        "{s}"
+    );
+    assert!(
+        !s.contains("<span class=\"identity-strip__note\">"),
+        "no neutral note beside the warning: {s}"
+    );
+    assert!(
+        !s.contains("notice"),
+        "a strip marker, not a notice box: {s}"
+    );
 }
 
 /// Introspection is for the sign-in client only. When it fails, the client
