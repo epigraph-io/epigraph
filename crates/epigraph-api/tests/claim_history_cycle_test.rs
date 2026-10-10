@@ -5,18 +5,17 @@
 //! make an X↔Y loop; the walk used to follow it forever, holding a pooled
 //! connection and growing the version list without bound.
 //!
-//! # What these arms assert now, and why it is weaker than it was
+//! # What these arms assert
 //!
-//! The inline three-statement walk this branch guarded with two visited-sets is
-//! gone. `ClaimRepository::version_history` replaces it with ONE viewer-filtered
-//! recursive CTE that stops a loop with `depth < 100` on both recursive terms,
-//! so an X↔Y cycle terminates at roughly 101 entries with duplicated ids rather
-//! than at 2 distinct ones. The DoS is stopped either way — which is what these
-//! arms exist for — but the response shape is main's, so the cycle arms assert
-//! BOUNDED AND TERMINATING rather than an exact set. Reintroducing the exact
-//! shape would mean reintroducing three unfiltered inline reads, and this branch
-//! is not trading a tenancy filter for a cosmetic wart on data that is already
-//! malformed.
+//! `ClaimRepository::version_history` is ONE viewer-filtered recursive CTE.
+//! Its `depth < 100` bound alone stopped a loop running forever but not
+//! EMITTING: an X↔Y pair came back as ~101 alternating rows and a self-loop
+//! as the same row ~101 times, so these arms used to assert only "bounded and
+//! terminating". Main's `CYCLE id SET … USING …` clause on both recursive
+//! terms (with the cycle flag filtered in `root` and in the final SELECT) now
+//! makes each version appear exactly once, so the arms assert the exact
+//! shape again: `{x, y}` once each from either end of the pair, and `[z]`
+//! once for the self-loop.
 //!
 //! `history_of_a_linear_chain_is_unchanged` is kept VERBATIM: it is a genuine
 //! non-regression over main's new CTE, which derives `superseded_by` from
@@ -128,15 +127,15 @@ async fn history_terminates_on_a_mark_duplicate_cycle() {
         let body = history(&client, addr, start).await;
         let ids = version_ids(&body);
         let total = body["total_versions"].as_i64().expect("total_versions");
-        assert!(
-            total <= 101,
-            "start {start}: the CTE's depth<100 cap must bound the walk, got {total}"
+        assert_eq!(
+            total, 2,
+            "start {start}: the CYCLE clause lists each version of the loop once, got {ids:?}"
         );
-        assert_eq!(ids.len() as i64, total, "start {start}: {ids:?}");
+        assert_eq!(ids.len(), 2, "start {start}: {ids:?}");
         assert_eq!(
             ids.iter().copied().collect::<HashSet<_>>(),
             HashSet::from([x, y]),
-            "start {start}: the loop may repeat ids but must not invent any"
+            "start {start}: exactly X and Y, once each, got {ids:?}"
         );
         assert_eq!(body["claim_id"], start.to_string());
     }
@@ -167,13 +166,10 @@ async fn history_terminates_on_a_self_supersedes_loop() {
 
     let body = history(&client, addr, z).await;
     let ids = version_ids(&body);
-    assert!(
-        !ids.is_empty() && ids.len() <= 101,
-        "a self-loop must terminate inside the depth cap, got {ids:?}"
-    );
-    assert!(
-        ids.iter().all(|id| *id == z),
-        "a self-loop must not reach any other claim, got {ids:?}"
+    assert_eq!(
+        ids,
+        vec![z],
+        "a self-loop is listed once, as itself, not repeated to the depth cap"
     );
     unlink(&pool, &[z]).await;
 }
