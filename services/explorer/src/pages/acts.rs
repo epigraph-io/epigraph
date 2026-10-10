@@ -1,10 +1,13 @@
 //! `/acts`: the viewer's own admin acts (J7), read-only, linking a pending
 //! act out to the API's own confirmation page.
 //!
-//! The listing exists only on an API with the elevation stack; the section
-//! nav shows this page only when the capability probe has seen the route
-//! (`upstream::capabilities`). Visited directly against an API without it,
-//! the page says so instead of erroring.
+//! The listing exists only on an API with the elevation routes (main has
+//! them; an older deployment does not); the section nav shows this page only
+//! when the capability probe has seen the route (`upstream::capabilities`).
+//! It lists the caller's OWN acts and needs no admin scope, so on such an API
+//! the link shows for every signed-in viewer, and one who never proposed an
+//! act sees the empty state. Visited directly against an API without the
+//! route, the page says so instead of erroring.
 //!
 //! The Explorer never hosts, proxies or frames the passkey ceremony: a
 //! pending act's link is the API's public origin (`EPIGRAPH_OAUTH_BASE_URL`)

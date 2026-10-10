@@ -1,8 +1,9 @@
 //! Typed calls behind the admin-acts page: the viewer's own acts.
 //!
-//! `GET /api/v1/admin/acts?mine&limit=` (`routes/admin_acts.rs::list_acts`
-//! on the elevation stack, read at `feat/mt-c-elevation` `3387413f`)
-//! answers `{"acts": [...]}`, each a `ProposedAct` flattened with the
+//! `GET /api/v1/admin/acts?mine&limit=` (`routes/admin_acts.rs::list_acts`,
+//! on main since the elevation stack merged; first read at `3387413f`, and
+//! `admin_acts.rs` and `repos/admin_act_ceremony.rs` are byte-identical at
+//! main's `7296fe49`) answers `{"acts": [...]}`, each a `ProposedAct` flattened with the
 //! confirmation page's `path`. Only the fields the page shows are decoded;
 //! `args`, `args_digest` and `elevation_id` are ignored.
 //!

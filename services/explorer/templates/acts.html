@@ -13,7 +13,7 @@
   {%- match view %}
   {%- when ActsView::Listed(list) %}
   {%- if list.rows.is_empty() %}
-  <p class="muted" data-acts="empty">You have no admin acts.</p>
+  <p class="muted" data-acts="empty">You have no admin acts. An act is proposed from an elevated session, which the Explorer does not start; any you propose are listed here for confirmation.</p>
   {%- else %}
   {%- if list.capped %}
   <p class="notice notice--warn" data-acts="capped">Showing your newest {{ limit }} acts; older ones are not listed.</p>

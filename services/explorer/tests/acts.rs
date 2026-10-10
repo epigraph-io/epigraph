@@ -1,11 +1,11 @@
 //! J7: the admin-acts capability probe and the `/acts` link-out page.
 //!
-//! The listing is the elevation stack's `routes/admin_acts.rs::list_acts`
-//! response, `{"acts": [ProposedAct (flattened) + "path"]}`, copied from
-//! `feat/mt-c-elevation` at `3387413f` (`admin_acts.rs`,
-//! `repos/admin_act_ceremony.rs::ProposedAct` and the `/elevate/act/:id`
-//! routes are unchanged through `121d6cca`). Re-check it when that stack
-//! gets a PR.
+//! The listing is `routes/admin_acts.rs::list_acts`'s response,
+//! `{"acts": [ProposedAct (flattened) + "path"]}`, copied from
+//! `feat/mt-c-elevation` at `3387413f`. The stack is now on main:
+//! `admin_acts.rs` (with `act_path`'s `/elevate/act/<id>`) and
+//! `repos/admin_act_ceremony.rs::ProposedAct` are byte-identical at main's
+//! `7296fe49`.
 //!
 //! The probe is `GET /api/v1/admin/acts?mine&limit=1` with the viewer's own
 //! token, made by signed-in page requests: 2xx (with the `{acts: [...]}`
@@ -467,7 +467,7 @@ async fn probe_403_counts_as_present() {
 }
 
 /// Present is remembered for the TTL: three pages, one probe. The probe is
-/// the exact request the kernel's `unregistered_route_status_test` pins,
+/// the exact request the kernel's `admin_acts_probe_status_test` pins,
 /// sent with the viewer's own token.
 #[tokio::test]
 async fn probe_result_is_cached_for_the_ttl() {
@@ -862,6 +862,12 @@ async fn acts_page_with_no_acts_says_so() {
     let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
     assert_eq!(res.status, 200, "{}", res.body);
     assert!(res.body.contains("data-acts=\"empty\""), "{}", res.body);
+    assert!(
+        res.body.contains("proposed from an elevated session"),
+        "the empty state says where acts come from, since every signed-in \
+         viewer sees the link on an API with the route: {}",
+        res.body
+    );
 }
 
 #[tokio::test]

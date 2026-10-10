@@ -90,7 +90,7 @@ path. A base path costs the `__Host-` cookie prefix (see Security model).
 | `GET /audit?since=&until=&type=&failures=1` | Security events the viewer may read, counted by type, with a drill-down (see Operator pages) |
 | `GET /activity?since=` | The watched agents' newest claims, and an events tail (see Operator pages) |
 | `GET /candidates?status=` | Cross-source match candidates as side-by-side pairs (see Operator pages) |
-| `GET /acts` | The viewer's own admin acts, each pending one linking out to the API's confirmation page. Only APIs with the elevation routes have them; the navigation link appears only there (see Operator pages) |
+| `GET /acts` | The viewer's own admin acts, each pending one linking out to the API's confirmation page. Only APIs with the elevation routes (current main) have them; the navigation link appears only there (see Operator pages) |
 | `GET /bff/claim/{id}` · `/bff/search` · `/bff/graph/ego/{id}?max_degree=` · `/bff/themes` · `/bff/communities` · `/bff/neighborhood/{id}` | JSON for the canvas |
 | `GET /bff/audit?since=&until=&type=&failures=1` | The audit page's counted window as JSON |
 | `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` · `POST /auth/redeem` | Sign-in (see Security model) |
@@ -172,7 +172,12 @@ bare date, and `since` defaults to 24 hours ago.
   CLI.
 - **`/acts`** lists the viewer's own admin acts, newest first (at most 50,
   marked when cut): kind, target, reason, status and times. The listing
-  route exists only on an API that has the elevation routes. Each signed-in
+  route exists only on an API that has the elevation routes (main has them;
+  an older deployment does not). It lists the caller's own acts and needs
+  no admin scope, so on such an API the link appears for every signed-in
+  viewer, and someone who never proposed an act sees an empty list that says
+  where acts come from (an elevated session, which the Explorer does not
+  start). Each signed-in
   page asks the API once whether it has it (`GET
   /api/v1/admin/acts?mine&limit=1`, with the viewer's own token), and the
   "Admin acts" link appears only when it does (an answer of 200 or 403).

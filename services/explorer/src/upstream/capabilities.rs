@@ -1,8 +1,9 @@
 //! Feature detection for API routes that only some deployments have.
 //!
-//! The admin-acts listing (`GET /api/v1/admin/acts`) exists only once the
-//! elevation stack is deployed. `openapi.json` cannot tell: it lists none of
-//! the elevation routes. So the Explorer asks the route itself, with the
+//! The admin-acts listing (`GET /api/v1/admin/acts`) exists only on an API
+//! that carries the elevation routes (main since they merged; an older
+//! deployment lacks it). `openapi.json` cannot tell: it lists none of the
+//! elevation routes. So the Explorer asks the route itself, with the
 //! viewer's own token ([`ADMIN_ACTS_PROBE`]), and reads the answer as a
 //! tri-state ([`classify`]):
 //!
@@ -55,8 +56,9 @@ use serde::Deserialize;
 use super::{Api, Slot, UpstreamError};
 
 /// The probe request, byte for byte. The kernel's
-/// `crates/epigraph-api/tests/unregistered_route_status_test.rs` sends the
-/// same string to a router without the route and pins its 404.
+/// `crates/epigraph-api/tests/admin_acts_probe_status_test.rs` sends the
+/// same string, with the Explorer's scopes and no admin scope, and pins the
+/// 200 `{"acts": []}` it gets now that the route is on main.
 pub const ADMIN_ACTS_PROBE: &str = "/api/v1/admin/acts?mine&limit=1";
 
 /// How long a `Present` / `Absent` answer is trusted.
