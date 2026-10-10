@@ -694,6 +694,11 @@ human (`OPL02`).
   command prints `REVOKED`, `ALREADY-REVOKED` (with when and by whom; exit 0)
   or `NOT-ALLOWED` when no allowance row names the client (exit 1: usually a
   mistyped id, and the real allowance is still live).
+* **After a revoke** the agent belongs to no human again. A revoked allowance
+  has no retired state (unlike a retired link, whose agent still belongs to
+  its human): `epigraph_human_of` returns NULL for it, so its past claims,
+  including those in its operator's groups, are attributable as an unbound
+  agent's are, exactly as before the allowance.
 * **Incident response.** Revoke the allowance AND the client. Suspending the
   client alone is not a durable unbind: a privileged re-activation re-binds.
 * **Links.** A new operator link of an allowlisted agent is refused (`55000`)
