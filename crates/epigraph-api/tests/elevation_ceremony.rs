@@ -2507,6 +2507,56 @@ async fn an_elevated_read_is_attributed_by_the_ids_its_request_names(pool: PgPoo
     assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
 }
 
+/// An elevated response the recorder cannot buffer (larger than
+/// `MAX_RECORDED_BODY`) is WITHHELD, never streamed past the scan unrecorded
+/// (final review F1-TST-06): an extension route answering one byte more than
+/// the limit is a 500 with the recorder's message and no log row when
+/// elevated. Calibration: unelevated, the same route is served in full.
+///
+/// Verified to fail with the oversized branch sending the response through
+/// unrecorded (`return Response::from_parts(parts, body)` in place of the
+/// withhold): the elevated read is a 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_response_too_large_to_record_is_withheld(pool: PgPool) {
+    const OVER: usize = epigraph_api::middleware::elevated_access::MAX_RECORDED_BODY + 1;
+    let big = RouterExtension::with_state(
+        "big",
+        Router::new().route(
+            "/blob",
+            get(|State(_): State<EmbedderState>| async move { vec![b'a'; OVER] }),
+        ),
+        EmbedderState { marker: "big" },
+    )
+    .expect("valid name");
+    let s = spawn_with_extensions(&pool, Some(software()), vec![big]).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let resp = s
+        .http
+        .get(s.url("/api/v1/ext/big/blob"))
+        .bearer_auth(&plain)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "CALIBRATION");
+    assert_eq!(
+        resp.bytes().await.unwrap().len(),
+        OVER,
+        "CALIBRATION: served in full"
+    );
+
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, body) = s.get("/api/v1/ext/big/blob", &elevated).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.to_string().contains("ELEVATED ACCESS NOT RECORDED"),
+        "the recorder's own refusal: {body}"
+    );
+    assert!(log_of(&pool).await.is_empty(), "nothing recorded");
+}
+
 /// A list's row count is the number of rows the response carried, and its
 /// subjects are every group whose private row it named; the request's own
 /// filters are in the args.

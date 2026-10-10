@@ -185,6 +185,14 @@ fn withheld(reason: &str) -> Response {
     .into_response()
 }
 
+/// What the slot says once the handler has run: `Ok(None)`, nothing elevated
+/// (sent unrecorded); `Ok(Some(mark))`, record it; a POISONED slot is a
+/// failure to record, so the response is withheld (`Err`, the 500 to send).
+fn mark_after_handler(slot: &ElevatedAccessSlot) -> Result<Option<ElevatedMark>, Box<Response>> {
+    slot.take()
+        .map_err(|()| Box::new(withheld("the elevation slot was poisoned")))
+}
+
 /// The layer (installed as a route layer on the authenticated router, inside
 /// the bearer middleware, so the `AuthContext` and the matched route are
 /// known).
@@ -291,10 +299,10 @@ pub async fn record_elevated_access(
 
     let response = next.run(request).await;
 
-    let mark = match slot.take() {
+    let mark = match mark_after_handler(&slot) {
         Ok(None) => return response,
         Ok(Some(mark)) => mark,
-        Err(()) => return withheld("the elevation slot was poisoned"),
+        Err(withheld) => return *withheld,
     };
     let (parts, body) = response.into_parts();
     let Ok(bytes) = to_bytes(body, MAX_RECORDED_BODY).await else {
@@ -347,8 +355,44 @@ pub async fn record_elevated_access(
 
 #[cfg(test)]
 mod tests {
-    use super::{elevated_write_refusal, ELEVATED_NON_GET_ALLOWLIST};
-    use axum::http::Method;
+    use super::{
+        elevated_write_refusal, mark_after_handler, ElevatedAccessSlot, ElevatedMark,
+        ELEVATED_NON_GET_ALLOWLIST,
+    };
+    use axum::http::{Method, StatusCode};
+
+    /// A POISONED slot (a panic while it was held) is a failure to record:
+    /// the layer withholds the response with a 500, never sends it unrecorded
+    /// (final review F1-TST-06). Calibration: an unmarked slot reads as
+    /// nothing elevated, a marked one as its mark.
+    ///
+    /// Verified to fail with the poisoned case read as "nothing elevated"
+    /// (`slot.take().or(Ok(None))`): the response would be sent unrecorded.
+    #[test]
+    fn a_poisoned_slot_withholds_the_response() {
+        let plain = ElevatedAccessSlot::default();
+        assert!(matches!(mark_after_handler(&plain), Ok(None)));
+        let marked = ElevatedAccessSlot::default();
+        let mark = ElevatedMark {
+            principal: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            family_id: uuid::Uuid::new_v4(),
+        };
+        marked.mark(mark);
+        assert!(matches!(mark_after_handler(&marked), Ok(Some(m)) if m == mark));
+
+        let poisoned = ElevatedAccessSlot::default();
+        let inner = poisoned.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = inner.lock().expect("lock");
+            panic!("poison the slot");
+        })
+        .join();
+        match mark_after_handler(&poisoned) {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(m) => panic!("a poisoned slot was read as {m:?}"),
+        }
+    }
 
     /// Reads pass, every other method is refused unless allowlisted, and the
     /// refusal carries the elevated read-only marker and the CLI pointer.
