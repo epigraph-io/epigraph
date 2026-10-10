@@ -1185,6 +1185,19 @@ async fn allowance_state(pool: &PgPool, client: Uuid) -> (i64, i64) {
     .expect("allowance state")
 }
 
+/// Live (unrevoked) membership rows `agent` holds in `group`.
+async fn live_writer_rows(pool: &PgPool, group: Uuid, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("live membership rows")
+}
+
 /// The allow command: a dry run writes nothing; `--apply` records one row and
 /// one audit event and prints the client, the pinned agent, the operator and
 /// the binding the agent now has; the writer rows the agent holds in groups
@@ -1266,6 +1279,40 @@ async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
         applied.show()
     );
     assert_eq!(allowance_state(&pool, client).await, (1, 1));
+    // Without the flag the foreign writer row is listed and KEPT: revoking
+    // another human's group membership needs the operator's explicit consent.
+    assert!(
+        applied.stdout.contains(&format!(
+            "FOREIGN-WRITE\tagent={s}\tgroup={other_group}\ta writer/admin row in a group its \
+             operator does not write: KEPT"
+        )),
+        "{}",
+        applied.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        1,
+        "a plain --apply revokes no foreign writer row: {}",
+        applied.show()
+    );
+
+    // A dry run WITH the flag says what it would revoke, and revokes nothing.
+    let mut dry_revoke_foreign = args.to_vec();
+    dry_revoke_foreign.push("--revoke-foreign-writes");
+    let drf = run_op(&pool, &dry_revoke_foreign).await;
+    assert_eq!(drf.code, 0, "{}", drf.show());
+    assert!(
+        drf.stdout.contains(&format!("group={other_group}"))
+            && drf.stdout.contains("WOULD BE REVOKED"),
+        "{}",
+        drf.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        1,
+        "a dry run revokes nothing: {}",
+        drf.show()
+    );
 
     // On request, the foreign writer row is revoked (same transaction).
     let mut revoke_foreign = apply.clone();
@@ -1273,16 +1320,20 @@ async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
     let rf = run_op(&pool, &revoke_foreign).await;
     assert_eq!(rf.code, 0, "{}", rf.show());
     assert!(rf.stdout.contains("ALREADY-ALLOWED\t"), "{}", rf.show());
-    let live_foreign: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM group_memberships \
-          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(other_group)
-    .bind(s)
-    .fetch_one(&pool)
-    .await
-    .expect("foreign rows");
-    assert_eq!(live_foreign, 0, "{}", rf.show());
+    assert!(
+        rf.stdout.contains(&format!(
+            "group={other_group}\ta writer/admin row in a group its operator does not write: \
+             REVOKED"
+        )),
+        "{}",
+        rf.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        0,
+        "{}",
+        rf.show()
+    );
     assert_eq!(
         allowance_state(&pool, client).await,
         (1, 1),
