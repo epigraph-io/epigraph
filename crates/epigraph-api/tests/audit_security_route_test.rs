@@ -3,7 +3,9 @@
 //!
 //! The route's only per-principal narrowing is the `security_events_read` RLS
 //! policy (migration 083): bypass, definer bypass, `agent_id =
-//! epigraph_principal_id()`, or `epigraph_is_instance_admin(principal)`. Every
+//! epigraph_principal_id()`, or the instance-admin arm (migration 129: while
+//! the admin-scope switch is unarmed, `epigraph_is_instance_admin(principal)`,
+//! which migration 123 answers as "holds `role:platform-custodian` now"). Every
 //! arm but the two bypasses reads the session's STAMPED principal, so the
 //! handler has to read on the viewer's stamped connection. On an unstamped
 //! application-role connection every arm is false and the route answers `[]`
@@ -21,7 +23,7 @@
 //! `app_role_state` asserts both pools' `session_user` before any test relies
 //! on it.
 //!
-//! Seeding (agents, events, the `instance_admins` row) runs on the superuser
+//! Seeding (agents, events, the custodian assignment) runs on the superuser
 //! pool. Each test uses its own `event_type` and passes it as a filter, so the
 //! exact-set assertions cannot be disturbed by rows that triggers write while
 //! the fixtures are seeded.
@@ -102,12 +104,11 @@ async fn seed_event(pool: &PgPool, agent: Option<Uuid>, event_type: &str) -> Uui
     id
 }
 
+/// Since migration 123 the only instance administrator is a live
+/// `role:platform-custodian` holder: `instance_admins` is frozen for every
+/// role, so a fixture row would be refused (CUS05).
 async fn grant_instance_admin(pool: &PgPool, agent: Uuid) {
-    sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'audit route test')")
-        .bind(agent)
-        .execute(pool)
-        .await
-        .expect("seed instance_admins row");
+    fixture::make_custodian(pool, agent).await;
 }
 
 /// Every row of `event_type`, read on the superuser pool: proves the seeds
@@ -228,8 +229,11 @@ async fn a_viewer_never_sees_another_agents_events(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_instance_admin_sees_every_agents_rows_including_null_agent(pool: PgPool) {
-    // Pins migration 083's admin arm as it stands on main. A later redefinition
-    // of `epigraph_is_instance_admin` changes what this asserts, on purpose.
+    // Pins the admin arm as it stands on main with the admin-scope switch
+    // unarmed (the migration default): 083's `epigraph_is_instance_admin`
+    // conjunct, kept by 129's unarmed branch and answered by 123 from a live
+    // custodian assignment. Arming the switch (128) makes this arm
+    // elevation-only, and this test is the one that then changes, on purpose.
     let admin = common::seed_system_agent(&pool).await;
     let x = common::seed_system_agent(&pool).await;
     let y = common::seed_system_agent(&pool).await;
