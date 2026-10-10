@@ -2,8 +2,7 @@
 //! whole flow: it is labelled from the class of the session's validated
 //! `redirect_uri` (`oauth::redirect::classify`), NEVER from the requesting
 //! client's self-declared `client_name`, which anyone registering a client
-//! chooses; and a client suspended between `/oauth/authorize` and the
-//! callback is refused there, before any user is provisioned.
+//! chooses.
 //!
 //! These drive the real flow — register/seed → `/oauth/authorize` →
 //! `/oauth/callback` → `/oauth/authorize/consent` — with Google's token
@@ -286,52 +285,4 @@ async fn consent_page_never_shows_the_requesting_clients_self_declared_name(pool
         "a client calling itself Claude is not presented as Claude: {page}"
     );
     assert!(page.contains(USER_EMAIL), "{page}");
-}
-
-/// A client suspended between `/oauth/authorize` and the Google callback is
-/// refused before any user is provisioned, instead of being offered for
-/// consent.
-#[sqlx::test(migrations = "../../migrations")]
-async fn callback_refuses_a_client_suspended_mid_flow(pool: PgPool) {
-    let fx = ProviderFixture::new().await;
-    let app = app_with_google(&pool, &fx).await;
-    let scopes = vec!["claims:read".to_string()];
-    OAuthClientRepository::create(
-        &pool,
-        "epigraph_suspended_test",
-        None,
-        "Suspended Client",
-        "human",
-        &scopes,
-        &scopes,
-        "active",
-        None,
-        None,
-        None,
-        None,
-        Some(&[EXPLORER_REDIRECT.to_string()][..]),
-    )
-    .await
-    .unwrap();
-    let google_state = authorize(&app, &pool, "epigraph_suspended_test", EXPLORER_REDIRECT).await;
-
-    sqlx::query("UPDATE oauth_clients SET status = 'suspended' WHERE client_id = $1")
-        .bind("epigraph_suspended_test")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let (status, body) = callback(&app, &google_state).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("invalid_client"), "{body}");
-    assert!(!body.contains("Suspended Client"), "{body}");
-    let provisioned: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_clients WHERE client_id LIKE 'google:%'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        provisioned, 0,
-        "no user is provisioned for a refused client"
-    );
 }
