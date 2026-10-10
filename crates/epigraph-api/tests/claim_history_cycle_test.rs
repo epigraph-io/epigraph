@@ -147,11 +147,23 @@ async fn history_terminates_on_a_mark_duplicate_cycle() {
 async fn history_terminates_on_a_self_supersedes_loop() {
     let (pool, addr, _shutdown, client) = pool_and_app().await;
     let z = common::seed_claim(&pool, "history self-loop Z").await;
-    sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
-        .bind(z)
-        .execute(&pool)
+    // Migration 123 refuses WRITING a self-supersede (OPL02, on every
+    // session), but says a self-loop written before it can still exist and be
+    // retired, so the walk must still terminate on one. The seed stands in for
+    // that legacy row: user triggers off for this one statement, on one
+    // connection, inside a transaction, so `SET LOCAL` cannot leak replica
+    // mode back into the pool even if the statement fails.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
+        .bind(z)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     let body = history(&client, addr, z).await;
     let ids = version_ids(&body);
