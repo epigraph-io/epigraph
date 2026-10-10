@@ -944,3 +944,110 @@ async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool
         "spine: N authored nothing"
     );
 }
+
+// ── Matrix row 13: the registry absent fails closed, never falls back ──────
+
+/// Migration 148's documented UNDO, applied as the superuser: a >=148 binary
+/// against a database without the registry (binaries rolled out before the
+/// migration, or the migration undone under running binaries). The `agents`
+/// and `operator_links` guards go with the table, as the UNDO orders, so the
+/// refusal below is the resolver's own and not a trigger's 42P01.
+async fn undo_148(pool: &PgPool) {
+    for stmt in [
+        "DROP TRIGGER IF EXISTS agents_refuse_registered_system_key ON public.agents",
+        "DROP TRIGGER IF EXISTS human_operators_refuse_system_agent ON public.human_operators",
+        "DROP TRIGGER IF EXISTS operator_links_refuse_retired_system_agent ON public.operator_links",
+        "DROP POLICY IF EXISTS security_events_system_agent_privileged ON public.security_events",
+        "DROP TABLE public.system_agents",
+    ] {
+        sqlx::query(stmt)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+}
+
+/// Without `system_agents` the resolver refuses with the registry read named
+/// and mints nothing, and neither a workflow ingest nor a document ingest with
+/// an author writes anything, armed or not.
+///
+/// Verified to fail: a failed registry read mapped to the unarmed fallback
+/// (`unwrap_or(UnregisteredUnarmed)` in `get_or_create_system_agent`) -> both
+/// cases answer `Ok` with a freshly minted public-constant identity. Verified
+/// to SURVIVE, as an equivalent mutant: the document author loop treating a
+/// failed registered-id read as an empty set. The read runs inside the ingest
+/// transaction, so its 42P01 has already aborted it and every later statement
+/// fails; the ingest refuses either way, which is what this test pins.
+async fn registry_absent_fails_closed(pool: PgPool, armed: bool) {
+    if armed {
+        arm(&pool).await;
+    }
+    undo_148(&pool).await;
+    let before = snapshot(&pool).await;
+    let edges_before = count(&pool, "edges").await;
+
+    match resolve(&pool).await {
+        Err(IngestExecutorError::AgentCreation(m)) => assert!(
+            m.contains("system-agent registry read"),
+            "armed={armed}: the refusal names the registry read: {m}"
+        ),
+        other => panic!("armed={armed}: expected the registry-read refusal, got {other:?}"),
+    }
+    assert_eq!(k_holders(&pool).await, 0, "armed={armed}: nothing minted");
+
+    let extraction = workflow_extraction(
+        &format!("registry-absent-{}", Uuid::new_v4()),
+        &["Ada Lovelace"],
+    );
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r =
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, &plan, &extraction).await;
+    drop(conn);
+    assert!(
+        r.is_err(),
+        "armed={armed}: the workflow ingest refuses: {r:?}"
+    );
+    assert_eq!(
+        snapshot(&pool).await,
+        before,
+        "armed={armed}: the resolver and the workflow ingest wrote nothing"
+    );
+
+    // Document ingest uses no system agent; its author loop reads the
+    // registered ids, and that read failing must refuse the ingest, not run
+    // it with an empty set.
+    let server = superuser_server(&pool).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let r = epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &document(&["Ada Lovelace"], None),
+        None,
+    )
+    .await
+    .map_err(|e| e.message.to_string());
+    assert!(r.is_err(), "armed={armed}: the document ingest refuses");
+    assert_eq!(
+        agent_with_key(&pool, &name_key("Ada Lovelace")).await,
+        None,
+        "armed={armed}: no author minted"
+    );
+    // The server provisions its OWN signer agent when it is built; only the
+    // ingest's rows are asked about here.
+    assert_eq!(
+        (count(&pool, "claims").await, count(&pool, "edges").await),
+        (before.3, edges_before),
+        "armed={armed}: the document ingest wrote no claim and no edge"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_without_the_registry_fails_closed_unarmed(pool: PgPool) {
+    registry_absent_fails_closed(pool, false).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_without_the_registry_fails_closed_armed(pool: PgPool) {
+    registry_absent_fails_closed(pool, true).await;
+}
