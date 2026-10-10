@@ -1183,7 +1183,10 @@ restart.
   section per decision. Section 1: 124's `person_authenticators` insert guard
   refuses `ELV10` when a MAINTENANCE enrollment completes for a person who
   already holds a live passkey (130 tested only when an enrollment opened), under
-  a per-person advisory lock. Behaviour in
+  a per-person advisory lock. Section 2: 130's `epigraph_consume_admin_act`
+  executes an act only while the proposer's live elevating assignment IS the
+  act's `assignment_id` (as confirmation and session liveness bind it), not
+  merely while some custodian assignment is live. Behaviour in
   `epigraph-db/tests/pending_admin_acts.rs`; the file as a whole in
   `migration_160.rs`. Sets `lock_timeout = '3s'`. Undo
   (`docs/runbooks/160-undo.sql`, restores every re-bodied function; run it

@@ -1546,6 +1546,92 @@ async fn a_register_act_opens_only_the_enrollment_it_confirmed(pool: PgPool) {
 }
 
 // =====================================================================
+// AN ACT EXECUTES ONLY UNDER THE ASSIGNMENT IT WAS CONFIRMED UNDER
+// (migration 160, section 2; final review F1-COR-10).
+// =====================================================================
+
+/// An act confirmed while its proposer held assignment A does not execute
+/// once A has ended, even if the proposer has since been given a NEW
+/// elevating assignment A' (confirmation bound A; consumption now binds it
+/// too, as the session-liveness test does). Refused ELV08; nothing written;
+/// the act stays unspent. Calibration: before A ends, the same kind of act
+/// executes.
+///
+/// Verified to fail: 160's consumer reverted to 130's test ("the proposer
+/// holds SOME live role:platform-custodian assignment") -> the grant lands
+/// under A'.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_executes_only_under_the_assignment_that_confirmed_it(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let (y, _) = human(&pool, "calibration holder").await;
+    let calibration = confirmed(&pool, &p, "role.grant", &grant_args(AUDITOR, y, None, "c")).await;
+    let stale = confirmed(
+        &pool,
+        &p,
+        "role.grant",
+        &grant_args(AUDITOR, x, None, "audit"),
+    )
+    .await;
+    grant_on(
+        &pool,
+        AUDITOR,
+        y,
+        None,
+        Some(p.person),
+        "c",
+        Some(calibration),
+    )
+    .await
+    .expect("CALIBRATION: an act executes under the assignment it was confirmed under");
+
+    // A ends (on its own confirmed role.end act), and the proposer is given a
+    // fresh custodian assignment A' (bootstrap: no other live custodian).
+    let end = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!(
+            "{{\"assignment\": \"{}\", \"reason\": \"rotate\"}}",
+            p.assignment
+        ),
+    )
+    .await;
+    maint(
+        &pool,
+        "SELECT public.epigraph_end_role_assignment($1, 'rotate', $2)",
+        &[Some(p.assignment), Some(end)],
+    )
+    .await
+    .expect("end A");
+    let a2 = fixture::make_custodian(&pool, p.person).await;
+    assert_ne!(a2, p.assignment, "CALIBRATION: a new assignment");
+
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            None,
+            Some(p.person),
+            "audit",
+            Some(stale),
+        )
+        .await,
+        "ELV08",
+        "an act confirmed under an assignment that has since ended",
+    );
+    assert!(!act_consumed(&pool, stale).await, "the act stays unspent");
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM role_assignments WHERE holder_person_id = $1")
+            .bind(x)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(held, 0, "nothing granted");
+}
+
+// =====================================================================
 // THE CANONICAL FORM: the CLI's (Rust) and the database's agree.
 // =====================================================================
 
