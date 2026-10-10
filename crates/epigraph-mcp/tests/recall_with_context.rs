@@ -2300,6 +2300,27 @@ async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: P
         "a member of the edge's owning group must see the private incoming edge; got {edges:?}"
     );
     assert_eq!(total, Some(3));
+
+    // Calibration: a BYPASS (system / maintenance) viewer is in no group, yet the
+    // `$4::bool OR` disjunct must still admit both private edges, as it does in
+    // `dispute_batch` and 7b's sibling queries.
+    let (_scoped, system) = viewerfx::bypass(&pool).await;
+    let (edges, total) = ctx_edges_for(&pool, &system, para).await;
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == behind_private_edge
+                && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a bypass viewer must see the group-private OUTGOING edge (query 7b's outgoing \
+         arm lost its `$4::bool OR` bypass disjunct); got {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_incoming
+            && matches!(e.direction, EdgeDirection::Incoming)),
+        "a bypass viewer must see the group-private INCOMING edge (query 7b's incoming \
+         arm lost its `$4::bool OR` bypass disjunct); got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
 }
 
 /// The co-owner half of the edge-tenancy predicate. A CO-OWNED edge (owner
