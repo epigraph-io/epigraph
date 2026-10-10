@@ -100,7 +100,8 @@ pub async fn authorize_endpoint(
         });
     }
 
-    // ── Client + exact redirect_uri validation (DB) ──────────────────────────
+    // ── Client + redirect_uri validation (DB): exact, except a loopback redirect's
+    //    port, which RFC 8252 §7.3 lets a native client choose per request ──────
     let client = OAuthClientRepository::get_by_client_id(&state.db_pool, &q.client_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -112,7 +113,10 @@ pub async fn authorize_endpoint(
     let ok_redirect = client
         .redirect_uris
         .as_deref()
-        .map(|uris| uris.iter().any(|u| u == &q.redirect_uri))
+        .map(|uris| {
+            uris.iter()
+                .any(|u| crate::oauth::redirect::matches_registered(u, &q.redirect_uri))
+        })
         .unwrap_or(false);
     if !ok_redirect {
         return Err(ApiError::BadRequest {
@@ -189,20 +193,21 @@ pub async fn callback_endpoint(
             message: "unknown or expired authorize session".into(),
         })?;
 
-    // 1b. The client this flow is for — the consent page must name it, not a
-    // hard-coded product. It was active at /oauth/authorize; if it has been
-    // suspended or revoked since, refuse here, BEFORE the Google exchange and
-    // before provisioning a user, rather than ask for consent to a client whose
-    // code could never be redeemed (get_by_client_id filters status='active').
-    let requesting_client =
-        OAuthClientRepository::get_by_client_id(&state.db_pool, &session.client_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })?
-            .ok_or(ApiError::BadRequest {
-                message: "invalid_client".into(),
-            })?;
+    // 1b. The client this flow is for must still be active. It was active at
+    // /oauth/authorize; if it has been suspended or revoked since, refuse here,
+    // BEFORE the Google exchange and before provisioning a user, rather than ask
+    // for consent to a client whose code could never be redeemed
+    // (get_by_client_id filters status='active'). The row is used for that check
+    // only: the consent page never shows its self-declared `client_name` (see
+    // `render_consent_page`).
+    OAuthClientRepository::get_by_client_id(&state.db_pool, &session.client_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or(ApiError::BadRequest {
+            message: "invalid_client".into(),
+        })?;
 
     // 2. Exchange the Google code -> id_token -> validated identity (reuse the provider flow).
     let provider = state
@@ -271,45 +276,76 @@ pub async fn callback_endpoint(
         message: "authorize session expired".into(),
     })?;
 
-    // 6. Render consent keyed by the nonce. The client name, email and scopes are all
-    // server-derived (the registered client row, the Google identity, the session), not
-    // from a form.
+    // 6. Render consent keyed by the nonce. email + scopes are server-derived, not from a form.
     Ok(Html(render_consent_page(
         &consent_nonce,
-        &requesting_client.client_name,
         &user.client_name,
         &grantable,
+        &session.redirect_uri,
     ))
     .into_response())
 }
 
 /// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.
-/// `client_name` is the REQUESTING client's registered name (`oauth_clients.client_name`
-/// of the `client_id` that started the flow) — every EpiGraph deployment has more than
-/// one client, so the page names the one asking; `email` is the signed-in user's
-/// per-user client name. Both are attacker-influenced (registration is dynamic), so both
-/// go through `html_escape`.
-fn render_consent_page(ticket: &str, client_name: &str, email: &str, scopes: &[String]) -> String {
+///
+/// Who is asking is named from the class of the session's `redirect_uri` (validated
+/// against the client's registration at /authorize), never from the self-declared
+/// DCR `client_name`, which anyone registering a client chooses.
+fn render_consent_page(ticket: &str, email: &str, scopes: &[String], redirect_uri: &str) -> String {
+    use crate::oauth::redirect::{classify, RedirectClass};
     let scope_items: String = scopes
         .iter()
         .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
         .collect();
+    let (title, lead) = match classify(redirect_uri) {
+        Some(RedirectClass::Hosted) => (
+            "Authorize Claude".to_string(),
+            format!(
+                "Claude wants to access EpiGraph as <strong>{}</strong> with:",
+                html_escape(email)
+            ),
+        ),
+        Some(RedirectClass::Loopback) => (
+            "Authorize an application on this computer".to_string(),
+            format!(
+                "An application on this computer (for example the OpenAI Codex CLI) wants to \
+                 access EpiGraph as <strong>{}</strong>. Access goes to <code>{}</code>. Allow \
+                 only if you just started this sign-in yourself. It asks for:",
+                html_escape(email),
+                html_escape(&loopback_origin(redirect_uri)),
+            ),
+        ),
+        None => (
+            "Authorize an application".to_string(),
+            format!(
+                "An application wants to access EpiGraph as <strong>{}</strong> with:",
+                html_escape(email)
+            ),
+        ),
+    };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
-<title>Authorize {client_name}</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
-<h1>Authorize {client_name}</h1>
-<p><strong>{client_name}</strong> wants to access EpiGraph as <strong>{email}</strong> with:</p>
+<title>{title}</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
+<h1>{title}</h1>
+<p>{lead}</p>
 <ul>{scope_items}</ul>
 <form method="post" action="/oauth/authorize/consent">
   <input type="hidden" name="ticket" value="{ticket}">
   <button name="decision" value="allow">Allow</button>
   <button name="decision" value="deny">Deny</button>
 </form></body></html>"#,
-        client_name = html_escape(client_name),
-        email = html_escape(email),
+        title = html_escape(&title),
+        lead = lead,
         ticket = html_escape(ticket),
         scope_items = scope_items
     )
+}
+
+/// `scheme://host:port` of a loopback redirect, for the consent page.
+fn loopback_origin(redirect_uri: &str) -> String {
+    url::Url::parse(redirect_uri)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 /// Minimal HTML escaping for every value interpolated into the consent page.
@@ -421,27 +457,25 @@ pub async fn authorize_endpoint(
 mod tests {
     use super::*;
 
-    /// The page names the requesting client instead of a hard-coded product,
-    /// and escapes it: `client_name` comes from dynamic registration.
+    /// A redirect outside the hosted and loopback classes gets the generic
+    /// label, and every interpolated value is escaped. There is no client-name
+    /// parameter at all: a self-declared DCR name can never reach the page.
     #[test]
-    fn consent_page_names_and_escapes_the_requesting_client() {
+    fn consent_page_for_an_unclassified_redirect_is_generic_and_escaped() {
         let html = render_consent_page(
             "tick&et",
-            "Explorer <b>beta</b>",
-            "reader@example.com",
+            "reader<b>@example.com",
             &["claims:read".to_string()],
+            "https://explorer.example.com/explorer/auth/callback",
         );
         assert!(
-            html.contains("<title>Authorize Explorer &lt;b&gt;beta&lt;/b&gt;</title>"),
+            html.contains("<title>Authorize an application</title>"),
             "{html}"
         );
-        assert!(
-            html.contains("<h1>Authorize Explorer &lt;b&gt;beta&lt;/b&gt;</h1>"),
-            "{html}"
-        );
-        assert!(!html.contains("<b>beta</b>"), "{html}");
+        assert!(html.contains("<h1>Authorize an application</h1>"), "{html}");
         assert!(!html.contains("Claude"), "{html}");
-        assert!(html.contains("reader@example.com"), "{html}");
+        assert!(html.contains("reader&lt;b&gt;@example.com"), "{html}");
+        assert!(!html.contains("reader<b>"), "{html}");
         assert!(html.contains(r#"value="tick&amp;et""#), "{html}");
         assert!(html.contains("<li><code>claims:read</code></li>"), "{html}");
     }

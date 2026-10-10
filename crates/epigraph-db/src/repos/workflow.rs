@@ -307,6 +307,56 @@ impl WorkflowRepository {
         })
     }
 
+    /// The distinct `canonical_name`s of the workflows that EXECUTE `claim_id`
+    /// (a visible `workflow —executes→ claim` edge).
+    ///
+    /// Exists for MCP `verify_claim`: a workflow level-0..2 row marked
+    /// `content_hash_scope = "canonical_name"` stores
+    /// `compound_content_hash(blake3(content), canonical_name)`, and its seed is
+    /// the name of the workflow that wrote it, which links the row by this edge
+    /// in the same transaction (the executor's `executes` loop, and
+    /// `workflow_steps::add_step`). Returning every executing workflow rather
+    /// than one keeps the caller's rule simple — a match against ANY of them is
+    /// sound — and an empty result (no edge, or none visible to `viewer`) means
+    /// the seed is unrecoverable, which the caller reports as undecided.
+    ///
+    /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the `workflows`
+    /// table carries no visibility columns.
+    ///
+    /// RETRACTED edges are included ON PURPOSE — there is deliberately no
+    /// `e.valid_to IS NULL` filter here, unlike the house-style edge read. The
+    /// seed is a fact about who WROTE the row, and a soft retraction
+    /// (`EdgeRepository::retract`, MCP `delete_edge`) does not change that.
+    /// Filtering retracted edges would let anyone who can retract the
+    /// `executes` edge downgrade a tampered row from `mismatch` to
+    /// `not_applicable`. Including them is sound, because a match still needs a
+    /// blake3 preimage of the stored digest. Pinned by
+    /// `store_workflow_hash_scope::retracting_the_executes_edge_does_not_mask_tampering`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn executing_canonical_names(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT w.canonical_name \
+             FROM edges e \
+             JOIN workflows w ON w.id = e.source_id \
+             WHERE e.target_id = $1 AND e.relationship = 'executes' \
+               AND e.source_type = 'workflow' AND e.target_type = 'claim' \
+               /* {EDGE_VISIBILITY:e} */ \
+             ORDER BY w.canonical_name",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(pool).await.map_err(DbError::from)
+    }
+
     /// Look up a workflow root by `(canonical_name, generation)`.
     pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -1322,6 +1372,184 @@ impl WorkflowRepository {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// [`Self::set_truth_value`], but `rows_affected` means "the state
+    /// CHANGED": a row already at `truth_value` matches nothing, so a re-run of
+    /// a deprecation reports nothing (U017; backlog fe874d2a). `truth_value` is
+    /// `DOUBLE PRECISION NOT NULL` (migration 033), and an `f64` bind round-trips
+    /// exactly, so `IS DISTINCT FROM` compares the same value it wrote.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the statement fails.
+    pub async fn set_truth_value_if_changed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+        truth_value: f64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE workflows SET truth_value = $1 \
+              WHERE id = $2 AND truth_value IS DISTINCT FROM $1",
+        )
+        .bind(truth_value)
+        .bind(workflow_id)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Whether a hierarchical `workflows` row with this id exists. `workflows`
+    /// has no row security and no policy, so the answer is the same on every
+    /// connection.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn exists<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workflows WHERE id = $1)")
+            .bind(id)
+            .fetch_one(executor)
+            .await
+    }
+
+    /// Every `workflows` row descended from `id` through `workflows.parent_id`
+    /// (later generations and variants), transitively, in walk order and
+    /// without `id` itself.
+    ///
+    /// `parent_id` and the `workflow -variant_of-> workflow` edge are written
+    /// by the ingest executor under the SAME condition (a linked parent), so
+    /// this is the lineage the variant edges describe. It is read from
+    /// `workflows` rather than from `edges` because `workflows` has no row
+    /// security, so the walk cannot be silently truncated by an edge the
+    /// session's tenancy context does not reach. Cycle-guarded: a hand-edited
+    /// `parent_id` loop terminates.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lineage_descendants<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "WITH RECURSIVE d(id, depth) AS ( \
+                 SELECT w.id, 1 FROM workflows w WHERE w.parent_id = $1 AND w.id <> $1 \
+                 UNION ALL \
+                 SELECT w.id, d.depth + 1 FROM workflows w JOIN d ON w.parent_id = d.id \
+                  WHERE w.id <> $1 \
+             ) CYCLE id SET is_cycle USING path \
+             SELECT id FROM d WHERE NOT is_cycle \
+              GROUP BY id ORDER BY min(depth), id",
+        )
+        .bind(id)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// Lock, `FOR UPDATE` and in id order, every `workflows` row that shares a
+    /// `canonical_name` with any of `ids` (U017; backlog fe874d2a).
+    ///
+    /// # Why
+    ///
+    /// [`Self::executed_structural_claims`] decides a claim is `shared` by
+    /// reading OTHER workflows' `truth_value`. Under READ COMMITTED two
+    /// concurrent deprecations of one lineage (say gen0 and gen1) would each
+    /// read the other as live, because the other's `truth_value = 0.05` is not
+    /// yet committed, and each would keep the step they share. Both commit, and
+    /// the step stays current with no live workflow executing it: the stranded
+    /// state the deprecation exists to prevent (write skew).
+    ///
+    /// Every possible sharer of a level 0-2 claim carries the same
+    /// `canonical_name`, because that claim's id is
+    /// `compound_claim_id(hash(text), canonical_name)` in both the ingest
+    /// builder and `add_step`. So locking the rows of those canonical names
+    /// serializes every pair of deprecations that could share a claim. A
+    /// second deprecation waits for the first to commit, and its next
+    /// statement takes a fresh snapshot that sees the first one's 0.05. Taking
+    /// the locks in id order means two such calls cannot deadlock each other.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lock_lineages_for_deprecation<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT w.id FROM workflows w \
+              WHERE w.canonical_name IN ( \
+                    SELECT t.canonical_name FROM workflows t WHERE t.id = ANY($1::uuid[])) \
+              ORDER BY w.id \
+                FOR UPDATE",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// The thesis, phase and step claims (levels 0-2) that hierarchical
+    /// workflow `workflow_id` executes and that are still current, each with
+    /// whether ANOTHER live workflow also executes it (U017; backlog
+    /// fe874d2a).
+    ///
+    /// # Why "shared" exists
+    ///
+    /// A level 0-2 claim id is `compound_claim_id(hash(text), canonical_name)`:
+    /// the generation is not in the seed, so every generation of a lineage
+    /// that keeps a text executes the SAME claim row. Retiring it because one
+    /// generation was deprecated would retire a step a live sibling still runs.
+    /// A claim is `shared` when a workflow that is NOT in `deprecating` (the
+    /// whole set being deprecated in this call) and is still live
+    /// (`truth_value > 0.05`; `NOT NULL` since migration 033) executes it.
+    ///
+    /// Level-3 operation atoms are excluded outright: their ids are content-only
+    /// and global, so a document may share one.
+    ///
+    /// The read rides the deprecation's own system-stamped transaction and is
+    /// not filtered by a caller viewer on purpose: workflow claims belong to
+    /// the ingest system agent, and the authority decision is the workflow
+    /// authority rule over the `workflows` row, not read visibility.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn executed_structural_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+        deprecating: &[Uuid],
+    ) -> Result<Vec<ExecutedClaim>, sqlx::Error> {
+        let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+            "-- VISIBILITY-EXEMPT: WRITE path. The deprecation this read plans is gated by the workflow authority rule over the workflows row; the claims are the ingest system agent's and the read rides that agent's stamped transaction.
+             SELECT DISTINCT c.id, \
+                    EXISTS (SELECT 1 FROM edges e2 JOIN workflows w2 ON w2.id = e2.source_id \
+                             WHERE e2.target_id = c.id AND e2.relationship = 'executes' \
+                               AND e2.source_type = 'workflow' \
+                               AND NOT (w2.id = ANY($2::uuid[])) \
+                               AND w2.truth_value > 0.05) AS shared \
+               FROM edges e JOIN claims c ON c.id = e.target_id \
+              WHERE e.source_id = $1 AND e.source_type = 'workflow' \
+                AND e.relationship = 'executes' \
+                AND c.properties->>'level' IN ('0', '1', '2') \
+                AND c.is_current \
+              ORDER BY c.id",
+        )
+        .bind(workflow_id)
+        .bind(deprecating)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, shared)| ExecutedClaim { id, shared })
+            .collect())
+    }
+}
+
+/// One row of [`WorkflowRepository::executed_structural_claims`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutedClaim {
+    /// The thesis, phase or step claim.
+    pub id: Uuid,
+    /// Another live workflow, outside the set being deprecated, executes it.
+    pub shared: bool,
 }
 
 #[cfg(test)]

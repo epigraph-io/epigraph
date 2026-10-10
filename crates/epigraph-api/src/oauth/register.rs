@@ -76,15 +76,16 @@ pub async fn register_endpoint(
     // Enforce the redirect-host allowlist FIRST, before any client_id generation or
     // DB access, so an abusive registration is rejected DB-free (and so the negative
     // test needs no database). This closes the open-redirect / open-registration gap
-    // flagged in recon: any redirect_uri whose host is not claude.ai/claude.com is
-    // refused regardless of client_type.
+    // flagged in recon: a redirect_uri that is neither a hosted MCP client's callback
+    // (claude.ai/claude.com) nor an RFC 8252 loopback listener (native clients such as
+    // OpenAI Codex) is refused regardless of client_type. See `oauth::redirect`.
     if let Some(uris) = req.redirect_uris.as_deref() {
         for u in uris {
-            let host_ok =
-                u.starts_with("https://claude.ai/") || u.starts_with("https://claude.com/");
-            if !host_ok {
+            if crate::oauth::redirect::classify(u).is_none() {
                 return Err(ApiError::BadRequest {
-                    message: "redirect_uri host must be claude.ai or claude.com".to_string(),
+                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, or a \
+                              loopback http://127.0.0.1 or http://[::1] callback"
+                        .to_string(),
                 });
             }
         }
@@ -102,6 +103,31 @@ pub async fn register_endpoint(
         return Err(ApiError::BadRequest {
             message: "redirect_uris is required for dynamic client registration".to_string(),
         });
+    }
+
+    // Admin-only scopes (elevation plan EL-9). Registration grants a fixed
+    // set (never one of these) whatever `scope` asks for; a request that NAMES
+    // one is refused while migration 128's switch is armed (or unreadable),
+    // and logged while it is unarmed, so a client written to expect a
+    // standing admin scope learns at registration that it will not get one.
+    if let Some(requested) = req.scope.as_deref() {
+        let requested: Vec<String> = requested.split_whitespace().map(str::to_string).collect();
+        match crate::oauth::scopes::hand_out(&state.db_pool, &requested).await {
+            crate::oauth::scopes::HandOut::Allowed => {}
+            crate::oauth::scopes::HandOut::Warned(admin) => tracing::warn!(
+                scopes = ?admin,
+                "a client registration asked for admin-only scopes (not granted; admin-scope \
+                 enforcement is unarmed)"
+            ),
+            crate::oauth::scopes::HandOut::Refused(admin) => {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "invalid_scope: admin-only scopes {admin:?} are not granted to any \
+                         registered client; admin acts need an elevation"
+                    ),
+                })
+            }
+        }
     }
 
     // Resolve the effective EpiGraph client_type. DCR maps to a 'human' client.

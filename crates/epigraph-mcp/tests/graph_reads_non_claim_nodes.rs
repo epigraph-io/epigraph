@@ -254,3 +254,288 @@ async fn a_private_edge_is_not_returned_to_a_stranger(pool: PgPool) {
     let t = traverse(&server, &public, paper).await;
     assert_eq!(t["edges"], serde_json::json!([]), "{t}");
 }
+
+// ── traverse emits only edges between returned nodes (backlog cdd8d097, U010) ──
+//
+// `traverse` capped NODES at `limit` but pushed EVERY outgoing edge of each
+// expanded node, admitted target or not. Live: traverse(paper, asserts,
+// max_depth=1, limit=3) returned 3 nodes and 4,561 edges (744,289 chars, over
+// the MCP output limit). These fixtures reproduce that shape at small scale
+// through the real ingest path.
+
+/// A paper whose one paragraph carries 8 atoms, so it asserts well over the
+/// `limit: 3` the live repro used.
+const HIGH_DEGREE_PAPER: &str = r#"{
+  "source": {
+    "title": "U010 high degree traverse paper",
+    "doi": "10.1234/u010-traverse-edge-cap",
+    "source_type": "Paper",
+    "authors": [{"name": "Bob Author", "affiliations": [], "roles": ["author"]}]
+  },
+  "thesis": "U010 thesis about bounded traverse edges",
+  "thesis_derivation": "TopDown",
+  "sections": [{
+    "title": "Body",
+    "paragraphs": [{
+      "text": "U010 paragraph whose atoms fan out from the paper",
+      "atoms": [
+        "U010 atom one about edge caps",
+        "U010 atom two about node admission",
+        "U010 atom three about breadth first order",
+        "U010 atom four about dangling targets",
+        "U010 atom five about output limits",
+        "U010 atom six about omitted counts",
+        "U010 atom seven about min truth drops",
+        "U010 atom eight about paper fan out"
+      ],
+      "generality": [3, 3, 3, 3, 3, 3, 3, 3],
+      "confidence": 0.8
+    }]
+  }],
+  "relationships": []
+}"#;
+
+async fn ingest_high_degree_paper(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Uuid {
+    let extraction: DocumentExtraction = serde_json::from_str(HIGH_DEGREE_PAPER).unwrap();
+    let out = tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
+        .await
+        .expect("ingest");
+    first_text(&out)["paper_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// MEASURED ground truth, independent of the tool under test.
+async fn paper_asserts_targets(pool: &PgPool, paper: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT target_id FROM edges WHERE source_id = $1 AND source_type = 'paper' \
+         AND relationship = 'asserts'",
+    )
+    .bind(paper)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn traverse_with(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    first_text(
+        &tools::graph::traverse(server, viewer, serde_json::from_value(params).unwrap())
+            .await
+            .expect("traverse"),
+    )
+}
+
+fn node_ids(t: &serde_json::Value) -> std::collections::HashSet<String> {
+    t["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|n| n["id"].as_str().expect("node id").to_string())
+        .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_high_degree_paper_walk_returns_only_edges_between_returned_nodes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let paper = ingest_high_degree_paper(&server, &viewer).await;
+
+    let asserts = paper_asserts_targets(&pool, paper).await.len();
+    assert!(
+        asserts > 3,
+        "calibration: the paper must assert more claims than the node limit ({asserts})"
+    );
+
+    // The live repro's arguments.
+    let t = traverse_with(
+        &server,
+        &viewer,
+        serde_json::json!({
+            "start_id": paper.to_string(),
+            "relationship": "asserts",
+            "max_depth": 1,
+            "limit": 3,
+        }),
+    )
+    .await;
+
+    let nodes = node_ids(&t);
+    assert_eq!(nodes.len(), 3, "the node cap holds: {t}");
+    assert!(nodes.contains(&paper.to_string()), "start node: {t}");
+
+    let edges = t["edges"].as_array().expect("edges");
+    for e in edges {
+        assert!(
+            nodes.contains(e["source_id"].as_str().unwrap())
+                && nodes.contains(e["target_id"].as_str().unwrap()),
+            "edge {e} points outside the returned nodes {nodes:?} \
+             ({} edges for {} nodes)",
+            edges.len(),
+            nodes.len()
+        );
+    }
+    // Each admitted claim is reached by exactly one asserts edge from the paper.
+    assert_eq!(edges.len(), 2, "{t}");
+    assert_eq!(
+        t["edges_omitted"],
+        serde_json::json!(asserts - 2),
+        "the response must say how many edges were left out: {t}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_min_truth_filtered_node_leaves_no_dangling_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let paper = ingest_high_degree_paper(&server, &viewer).await;
+
+    let targets = paper_asserts_targets(&pool, paper).await;
+    assert!(
+        targets.len() > 3,
+        "calibration: fan-out ({})",
+        targets.len()
+    );
+
+    // Refute ONE asserted claim, on both the DS cache (which `min_truth` reads
+    // when present) and `truth_value` (its fallback), so it falls under the
+    // gate whichever column is consulted.
+    let refuted = targets[0];
+    let changed = sqlx::query(
+        "UPDATE claims SET truth_value = 0.01, belief = 0.01, plausibility = 0.01, \
+         pignistic_prob = 0.01 WHERE id = $1",
+    )
+    .bind(refuted)
+    .execute(&pool)
+    .await
+    .expect("refute one claim")
+    .rows_affected();
+    assert_eq!(changed, 1);
+
+    let t = traverse_with(
+        &server,
+        &viewer,
+        serde_json::json!({
+            "start_id": paper.to_string(),
+            "relationship": "asserts",
+            "max_depth": 1,
+            "limit": 100,
+            "min_truth": 0.05,
+        }),
+    )
+    .await;
+
+    // Calibration: the gate dropped exactly the refuted claim and admitted the
+    // rest, so a pass below cannot come from an empty or over-filtered walk.
+    let nodes = node_ids(&t);
+    assert!(
+        !nodes.contains(&refuted.to_string()),
+        "calibration: min_truth must drop the refuted claim: {t}"
+    );
+    assert_eq!(
+        nodes.len(),
+        targets.len(),
+        "calibration: the paper plus every other asserted claim is admitted: {t}"
+    );
+
+    let edges = t["edges"].as_array().expect("edges");
+    assert!(
+        edges
+            .iter()
+            .all(|e| e["target_id"] != refuted.to_string() && e["source_id"] != refuted.to_string()),
+        "no edge may point at the node min_truth dropped: {t}"
+    );
+    assert_eq!(edges.len(), targets.len() - 1, "{t}");
+    assert_eq!(t["edges_omitted"], serde_json::json!(1), "{t}");
+}
+
+/// MEASURED ground truth: the public claim->claim edges (plan edges such as
+/// `decomposes_to`) whose source AND target the paper asserts.
+async fn edges_among_asserted_claims(pool: &PgPool, paper: Uuid) -> Vec<(Uuid, Uuid, String)> {
+    sqlx::query_as(
+        "SELECT e.source_id, e.target_id, e.relationship FROM edges e \
+         WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+           AND e.visibility = 'public' \
+           AND e.source_id IN (SELECT target_id FROM edges WHERE source_id = $1 \
+                               AND source_type = 'paper' AND relationship = 'asserts') \
+           AND e.target_id IN (SELECT target_id FROM edges WHERE source_id = $1 \
+                               AND source_type = 'paper' AND relationship = 'asserts')",
+    )
+    .bind(paper)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The filter must keep an edge between two RETURNED nodes even when its target
+/// was already visited, i.e. a cross-edge in the BFS. A depth-2 walk from the
+/// paper reaches every asserted claim at depth 1 over `asserts`, then follows
+/// the claim->claim plan edges between them at depth 1 -> already-visited
+/// targets. Emitting an edge only on a target's first visit would drop all of
+/// those, and no depth-1 fan-out test can see it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unclipped_depth_two_walk_keeps_edges_between_already_visited_nodes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let paper = ingest_high_degree_paper(&server, &viewer).await;
+
+    let cross = edges_among_asserted_claims(&pool, paper).await;
+    assert!(
+        !cross.is_empty(),
+        "calibration: ingest must write claim->claim edges between asserted claims"
+    );
+
+    let t = traverse_with(
+        &server,
+        &viewer,
+        serde_json::json!({
+            "start_id": paper.to_string(),
+            "max_depth": 2,
+            "limit": 100,
+        }),
+    )
+    .await;
+
+    let nodes = node_ids(&t);
+    assert!(
+        nodes.len() < 100,
+        "calibration: the walk must not reach the node cap ({}): {t}",
+        nodes.len()
+    );
+    for (s, d, _) in &cross {
+        assert!(
+            nodes.contains(&s.to_string()) && nodes.contains(&d.to_string()),
+            "calibration: both endpoints of {s} -> {d} must be returned: {t}"
+        );
+    }
+
+    let returned: std::collections::HashSet<(String, String, String)> = t["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .map(|e| {
+            (
+                e["source_id"].as_str().unwrap().to_string(),
+                e["target_id"].as_str().unwrap().to_string(),
+                e["relationship"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (s, d, rel) in &cross {
+        assert!(
+            returned.contains(&(s.to_string(), d.to_string(), rel.clone())),
+            "edge {s} -{rel}-> {d} joins two returned nodes and must be returned: {t}"
+        );
+    }
+    // Nothing was clipped (no node cap reached, no min_truth), so the field is
+    // present and zero rather than absent.
+    assert_eq!(t["edges_omitted"], serde_json::json!(0), "{t}");
+}

@@ -487,17 +487,19 @@ mod tests {
         let wf_plan = crate::workflow::build_ingest_plan(&wf);
 
         // The predicate must agree with the observable fact it stands in for:
-        // "the stored digest is not blake3(content)". Checked over BOTH builders,
-        // because the workflow builder binds the PLAIN hash on its compound
-        // nodes — `level < 3` alone would misclassify all of them.
-        let mut seed_scoped_seen = 0_usize;
+        // "the stored digest is not blake3(content)". Checked over BOTH builders:
+        // both bind a seed-scoped digest on their level-0..2 nodes (the workflow
+        // builder since backlog 6178a205) and the plain hash on atoms, and they
+        // stamp different `source_type`s, so each stamp must be in the class.
+        let mut seed_scoped_seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
             for c in &plan.claims {
                 let plain = content_hash(&c.content);
                 let digest_is_derivable = c.content_hash == plain;
                 let predicate = stored_content_hash_is_seed_scoped(&c.properties);
                 if predicate {
-                    seed_scoped_seen += 1;
+                    *seed_scoped_seen.entry(label).or_default() += 1;
                 }
                 assert_eq!(
                     predicate,
@@ -516,11 +518,172 @@ mod tests {
                 );
             }
         }
-        assert!(
-            seed_scoped_seen >= 3,
+        // Counted PER BUILDER: a single total could be met by the document plan
+        // alone and say nothing about the workflow writer.
+        assert_eq!(
+            seed_scoped_seen.get("document").copied().unwrap_or(0),
+            3,
             "guard is vacuous unless the document plan contributes its thesis, section and \
-             paragraph rows; saw {seed_scoped_seen}"
+             paragraph rows; saw {seed_scoped_seen:?}"
         );
+        assert_eq!(
+            seed_scoped_seen.get("workflow").copied().unwrap_or(0),
+            3,
+            "the workflow plan's thesis, phase and step rows store a canonical_name-scoped \
+             digest (two workflows sharing a text must not collide on \
+             uq_claims_content_hash_agent); saw {seed_scoped_seen:?}"
+        );
+    }
+
+    /// Workflow rows written BEFORE backlog 6178a205 store the PLAIN
+    /// `blake3(content)` under the very same `{level 0-2, source_type:
+    /// "workflow"}` stamp the compound-hash writers use. Production holds
+    /// hundreds of them (thesis/phase/step rows from the builder, step rows from
+    /// `add_step`). If the predicate classified them by stamp alone, MCP
+    /// `verify_claim` would answer `not_applicable` for a tampered legacy row
+    /// that origin/main reported as `mismatch` — a silent loss of tamper
+    /// detection on existing data. Only rows carrying the scope marker the new
+    /// writers stamp may be classed as seed-scoped.
+    #[test]
+    fn unmarked_legacy_workflow_rows_are_not_seed_scoped() {
+        use crate::document::stored_content_hash_is_seed_scoped;
+        use crate::workflow::builder::{CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY};
+
+        // The shapes production actually holds: the builder's thesis, phase and
+        // step rows (the executor adds `step_lineage_id` on level 2), and
+        // `add_step`'s row.
+        let legacy = [
+            serde_json::json!({"level": 0, "source_type": "workflow",
+                               "thesis_derivation": "top_down", "kind": "workflow_thesis"}),
+            serde_json::json!({"level": 1, "source_type": "workflow", "phase": "Body",
+                               "kind": "workflow_step"}),
+            serde_json::json!({"level": 2, "source_type": "workflow", "phase": "Body",
+                               "rationale": "", "kind": "workflow_step",
+                               "step_lineage_id": "00000000-0000-4000-8000-000000000001"}),
+            serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
+                               "step_lineage_id": "00000000-0000-4000-8000-000000000002"}),
+        ];
+        for props in &legacy {
+            assert!(
+                !stored_content_hash_is_seed_scoped(props),
+                "an unmarked workflow row stores blake3(content); classing it seed-scoped \
+                 would excuse a tampered body as not_applicable: {props}"
+            );
+
+            let mut marked = props.clone();
+            marked[CONTENT_HASH_SCOPE_KEY] =
+                serde_json::Value::String(CONTENT_HASH_SCOPE_CANONICAL_NAME.to_string());
+            assert!(
+                stored_content_hash_is_seed_scoped(&marked),
+                "a marked workflow row stores a canonical_name-scoped digest, so a \
+                 body/digest disagreement is expected, not tampering: {marked}"
+            );
+
+            let mut other_scope = props.clone();
+            other_scope[CONTENT_HASH_SCOPE_KEY] = serde_json::Value::String("plain".to_string());
+            assert!(
+                !stored_content_hash_is_seed_scoped(&other_scope),
+                "only the canonical_name scope value is recognised: {other_scope}"
+            );
+        }
+
+        // The marker does not extend the class past the compound levels: an
+        // operation atom stores the plain hash whatever its properties say.
+        assert!(!stored_content_hash_is_seed_scoped(&serde_json::json!({
+            "level": 3, "source_type": "workflow", "kind": "workflow_atom",
+            CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
+        })));
+    }
+
+    /// The workflow subset is RE-DERIVABLE from the executing workflow's
+    /// `canonical_name`, over the real builder's output: every row the narrower
+    /// predicate selects reproduces its stored digest from the right name even
+    /// when listed after a wrong one, reports `Some(false)` once its body
+    /// changes, and is undecided (`None`) with no candidate at all. Document
+    /// rows are never in the subset — their seed is not recoverable.
+    #[test]
+    fn canonical_name_scoped_rows_rederive_from_the_executing_workflow() {
+        use crate::document::{
+            stored_content_hash_is_canonical_name_scoped, stored_content_hash_is_seed_scoped,
+        };
+        use crate::workflow::builder::canonical_name_scoped_hash_matches;
+
+        let name = "rederive-guard-wf";
+        let wf: crate::workflow::WorkflowExtraction = serde_json::from_value(serde_json::json!({
+            "source": {"canonical_name": name, "goal": "G", "generation": 0, "authors": []},
+            "thesis": "T",
+            "phases": [{"title": "P", "summary": "S",
+                        "steps": [{"compound": "C", "operations": ["op"], "confidence": 0.8}]}]
+        }))
+        .unwrap();
+        let plan = crate::workflow::build_ingest_plan(&wf);
+
+        let mut scoped = 0_usize;
+        for c in &plan.claims {
+            if !stored_content_hash_is_canonical_name_scoped(&c.properties) {
+                assert_eq!(
+                    c.level, 3,
+                    "only atoms fall outside the subset: {:?}",
+                    c.properties
+                );
+                continue;
+            }
+            scoped += 1;
+            assert!(stored_content_hash_is_seed_scoped(&c.properties));
+            assert_eq!(
+                canonical_name_scoped_hash_matches(&c.content, &c.content_hash, [name]),
+                Some(true),
+                "intact level-{} row must re-derive from its own canonical_name",
+                c.level
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &c.content,
+                    &c.content_hash,
+                    ["another-workflow", name]
+                ),
+                Some(true),
+                "a wrong candidate listed first must not hide the right one"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &format!("{} (tampered)", c.content),
+                    &c.content_hash,
+                    [name]
+                ),
+                Some(false),
+                "an altered body must not re-derive the stored digest"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(
+                    &c.content,
+                    &c.content_hash,
+                    ["another-workflow"]
+                ),
+                Some(false),
+                "another workflow's name is not this row's seed"
+            );
+            assert_eq!(
+                canonical_name_scoped_hash_matches(&c.content, &c.content_hash, []),
+                None,
+                "no executing workflow: the seed is unrecoverable, so undecided"
+            );
+        }
+        assert_eq!(
+            scoped, 3,
+            "thesis, phase and step rows are canonical_name-scoped"
+        );
+
+        // Neither document rows nor unmarked legacy workflow rows are in the subset.
+        for props in [
+            serde_json::json!({"level": 1, "source_type": "Paper"}),
+            serde_json::json!({"level": 1, "source_type": "workflow", "kind": "workflow_step"}),
+        ] {
+            assert!(
+                !stored_content_hash_is_canonical_name_scoped(&props),
+                "{props}"
+            );
+        }
     }
 
     #[test]

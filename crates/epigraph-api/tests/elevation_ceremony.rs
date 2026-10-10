@@ -1,0 +1,3469 @@
+#![cfg(feature = "db")]
+//! Elevation over HTTP (elevation plan EL-5; operator rulings D2 and D5): the
+//! ticket API, the ceremony page and its assertion, and the token endpoint's
+//! elevate grant, through the REAL router on an APPLICATION-ROLE pool
+//! (`SET SESSION AUTHORIZATION epigraph_app`), with every passkey registered
+//! through the real enrollment ceremony by an INDEPENDENT authenticator
+//! (`epigraph-passkey/tests/support/soft_authenticator.rs`).
+//!
+//! The rules themselves (who may elevate, the confused deputy, the counter,
+//! the 15 minutes) are migration 125's and are mutated in
+//! `epigraph-db/tests/elevation_sessions.rs`; what is pinned here is that the
+//! API reaches them on the right connection with the right arguments, and
+//! what it adds (the 503, the token shape, the grant's polling). Every test
+//! names the mutation it was run against.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+#[path = "../../epigraph-passkey/tests/support/soft_authenticator.rs"]
+mod support;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use chrono::Duration;
+use epigraph_api::middleware::AuthContext;
+use epigraph_api::RouterExtension;
+use epigraph_auth::{AccessTokenBinding, JwtConfig};
+use epigraph_passkey::{AttestationPolicy, PasskeyConfig, Passkeys};
+use reqwest::StatusCode;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+/// The authenticator model the test authenticators claim.
+const MODEL: Uuid = Uuid::from_u128(0x2fc0_579f_8113_47ea_b116_bb5a_8db9_202a);
+
+fn software() -> Passkeys {
+    Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::SoftwareAllowed,
+    })
+    .expect("relying party")
+}
+
+/// The real router on an application-role pool over `pool`'s database.
+struct Server {
+    addr: SocketAddr,
+    jwt: Arc<JwtConfig>,
+    http: reqwest::Client,
+    _stop: oneshot::Sender<()>,
+}
+
+/// Its pool DECLARES the per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`)
+/// on an application-role login, as the server binary's
+/// `ScopedPool::connect_recording_elevated_access` does on its own DSN (that
+/// constructor cannot downgrade the harness's superuser login); with
+/// `holder`'s open gate it stands in for a recording build on a database whose
+/// gate is open (review cp3: COR-1).
+async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    spawn_on(scoped, passkeys).await
+}
+
+/// [`spawn`], with `extensions` mounted via `create_router_with_extensions`:
+/// the recorder still DECLARES (same application-role pool as `spawn`), so an
+/// elevated read through an extension is recorded exactly as a first-party
+/// one is.
+async fn spawn_with_extensions(
+    pool: &PgPool,
+    passkeys: Option<Passkeys>,
+    extensions: Vec<RouterExtension>,
+) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    spawn_on_with(scoped, passkeys, extensions).await
+}
+
+/// The real router on an application-role pool that declares NO recorder:
+/// the shape of every request unit this tree builds, and of a unit rolled
+/// back to (or left on) a build without the recorder.
+async fn spawn_unrecorded(pool: &PgPool) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role pool, no recorder");
+    spawn_on(scoped, None).await
+}
+
+/// The real router on a PRIVILEGED pool: the harness's superuser login, the
+/// shape of a request unit whose DSN skips row security. It DECLARES the
+/// recorder, like [`spawn`], so a refusal there is the login's alone (an
+/// undeclared unit never elevates anyway; that is
+/// `a_unit_that_declares_no_access_recorder_never_serves_an_elevated_read`).
+async fn spawn_privileged(pool: &PgPool) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        None,
+    )
+    .await
+    .expect("privileged pool");
+    spawn_on(scoped, None).await
+}
+
+async fn spawn_on(scoped: epigraph_db::ScopedPool, passkeys: Option<Passkeys>) -> Server {
+    spawn_on_with(scoped, passkeys, Vec::new()).await
+}
+
+/// [`spawn_on`], with `extensions` mounted through
+/// `create_router_with_extensions` rather than plain `create_router`: the
+/// seam this file's EL-8 recording test exercises.
+async fn spawn_on_with(
+    scoped: epigraph_db::ScopedPool,
+    passkeys: Option<Passkeys>,
+    extensions: Vec<RouterExtension>,
+) -> Server {
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
+            .with_passkeys(passkeys.map(Arc::new));
+    let jwt = state.jwt_config.clone();
+    let app = epigraph_api::create_router_with_extensions(state, extensions);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    Server {
+        addr,
+        jwt,
+        http: reqwest::Client::new(),
+        _stop: tx,
+    }
+}
+
+impl Server {
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    async fn post(&self, path: &str, token: Option<&str>, body: &Value) -> (StatusCode, Value) {
+        let mut req = self.http.post(self.url(path)).json(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// A human token for `p`, naming `fam` (or no family).
+    fn human_token(&self, p: &Person, fam: Option<Uuid>, elv: Option<Uuid>) -> String {
+        self.jwt
+            .issue_access_token(
+                p.client,
+                vec!["claims:read".into()],
+                "human",
+                None,
+                Some(p.person),
+                Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: fam,
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0
+    }
+
+    /// [`Self::human_token`] with explicit scopes.
+    fn scoped_token(&self, p: &Person, elv: Option<Uuid>, scopes: &[&str]) -> String {
+        self.jwt
+            .issue_access_token(
+                p.client,
+                scopes.iter().map(|s| (*s).to_string()).collect(),
+                "human",
+                None,
+                Some(p.person),
+                Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: Some(p.family),
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0
+    }
+
+    async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn open_ticket(&self, token: &str, reason: &str) -> (StatusCode, Value) {
+        self.post(
+            "/api/v1/elevation/tickets",
+            Some(token),
+            &json!({ "reason": reason }),
+        )
+        .await
+    }
+}
+
+/// A registered human (an active `human` client and a live registry row).
+#[derive(Clone, Debug)]
+struct Person {
+    person: Uuid,
+    /// The human client's row id (the token's `sub`).
+    client: Uuid,
+    /// The human client's `client_id` (what the token endpoint takes).
+    client_id: String,
+    /// A live refresh family of that client.
+    family: Uuid,
+}
+
+async fn person(pool: &PgPool, label: &str) -> Person {
+    let (person, _) = fixture::seed_human_operator(pool, label).await;
+    let (client, client_id): (Uuid, String) = sqlx::query_as(
+        "SELECT id, client_id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    let family = family(pool, client).await;
+    Person {
+        person,
+        client,
+        client_id,
+        family,
+    }
+}
+
+/// A live refresh token of `client`, which is its own family.
+async fn family(pool: &PgPool, client: Uuid) -> Uuid {
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a refresh token")
+}
+
+/// Register a passkey for `person` the way production does: the enrollment
+/// opened on a maintenance session (`epigraph-operator passkey-enroll`), then
+/// the page's challenge and finish over HTTP by `auth`.
+async fn enroll(pool: &PgPool, s: &Server, person: Uuid, auth: &mut SoftAuthenticator) {
+    enroll_with(pool, s, person, auth, Value::clone).await;
+}
+
+/// [`enroll`], with the authenticator's registration response passed through
+/// `shape` first (a packed attestation for an allowlist relying party, or a
+/// device-bound rewrite).
+async fn enroll_with(
+    pool: &PgPool,
+    s: &Server,
+    person: Uuid,
+    auth: &mut SoftAuthenticator,
+    shape: impl Fn(&Value) -> Value,
+) {
+    let id = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'elevation test', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("open the enrollment");
+        (conn, id)
+    })
+    .await;
+    let base = format!("/elevate/enroll/{id}");
+    let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "enrollment challenge: {options}");
+    let response = shape(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let (status, body) = s.post(&format!("{base}/finish"), None, &response).await;
+    assert_eq!(status, StatusCode::OK, "enrollment finish: {body}");
+}
+
+/// A platform custodian with one live passkey (on `auth`) and a family.
+async fn holder(pool: &PgPool, s: &Server, label: &str, auth: &mut SoftAuthenticator) -> Person {
+    let p = person(pool, label).await;
+    fixture::make_custodian(pool, p.person).await;
+    enroll(pool, s, p.person, auth).await;
+    p
+}
+
+async fn tickets_of(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM elevation_tickets WHERE person_agent_id = $1")
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("count tickets")
+}
+
+/// A session for `p`'s ticket `ticket`, confirmed through migration 125's
+/// ticket-keyed definers on an unstamped application session with synthetic
+/// evidence (the ceremony's own path is pinned by the ceremony tests).
+async fn confirm_directly(pool: &PgPool, ticket: Uuid, credential: Vec<u8>) -> Uuid {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"s\": 1}')")
+            .bind(ticket)
+            .execute(&mut *conn)
+            .await
+            .expect("challenge");
+        let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT outcome, session_id \
+               FROM public.epigraph_confirm_elevation($1, $2, 0, true, '{\"e\": 1}')",
+        )
+        .bind(ticket)
+        .bind(credential)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("confirm");
+        assert_eq!(outcome, "confirmed", "CALIBRATION: the direct confirm");
+        (conn, session.expect("a session"))
+    })
+    .await
+}
+
+async fn credential_of(pool: &PgPool, person: Uuid) -> Vec<u8> {
+    sqlx::query_scalar(
+        "SELECT credential_id FROM person_authenticators \
+          WHERE person_agent_id = $1 AND revoked_at IS NULL ORDER BY created_at LIMIT 1",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("a live passkey")
+}
+
+async fn ended_reason(pool: &PgPool, session: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("the session")
+}
+
+// =====================================================================
+// POST /api/v1/elevation/tickets
+// =====================================================================
+
+/// CALIBRATION for every refusal below: a custodian with a passkey, on its own
+/// family, gets a GRANT-mode ticket for itself: the ceremony path, a secret
+/// whose SHA-256 is what the row keeps, and its own client's `client_id`.
+///
+/// Mutations: the definer called on an unstamped `db_pool` connection -> 403
+/// (ELV02); `TicketMode::Connector` -> the row's mode; the hash taken over the
+/// hex text instead of the secret's bytes -> the stored hash; the client's row
+/// id returned as `client_id` -> the client id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_holder_gets_a_grant_mode_ticket(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (status, body) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read a report")
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ticket: Uuid = body["ticket_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(body["path"], format!("/elevate/{ticket}"));
+    assert_eq!(body["client_id"], p.client_id);
+    assert_eq!(body["grant_type"], "urn:epigraph:grant:elevate");
+    let secret = hex::decode(body["redeem_secret"].as_str().unwrap()).expect("hex secret");
+    assert_eq!(secret.len(), 32);
+
+    let (person, client, fam, mode, reason, hash): (Uuid, Uuid, Uuid, String, String, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT person_agent_id, client_id, family_id, mode, reason, redeem_secret_hash \
+               FROM elevation_tickets WHERE id = $1",
+        )
+        .bind(ticket)
+        .fetch_one(&pool)
+        .await
+        .expect("the ticket row");
+    assert_eq!(
+        (person, client, fam, mode.as_str(), reason.as_str()),
+        (p.person, p.client, p.family, "grant", "read a report")
+    );
+    assert_eq!(hash, Sha256::digest(&secret).to_vec());
+}
+
+/// D2: a registered human with a passkey and a live family, but no
+/// assignment of an elevating role, is refused (ELV02) and no ticket is
+/// written. Mutation (125): the ticket guard's elevating-assignment check
+/// dropped -> 201.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ticket_is_refused_to_a_human_without_an_elevating_assignment(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = person(&pool, "no-role").await;
+    enroll(&pool, &s, p.person, &mut SoftAuthenticator::new(MODEL)).await;
+    let (status, body) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "try")
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.to_string().contains("ELV02"), "{body}");
+    assert_eq!(tickets_of(&pool, p.person).await, 0);
+}
+
+/// D2: a principal with only a legacy `instance_admins` row (frozen since
+/// 123; seeded with its triggers off) is refused: a standing flag is not an
+/// elevation. Mutation (125): the guard keyed on "the role OR
+/// `instance_admins`" -> 201.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ticket_is_refused_to_an_instance_admins_only_principal(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = person(&pool, "legacy-admin").await;
+    enroll(&pool, &s, p.person, &mut SoftAuthenticator::new(MODEL)).await;
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("SET session_replication_role = replica")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'legacy')")
+            .bind(p.person)
+            .execute(&mut *conn)
+            .await
+            .expect("legacy row");
+        conn.execute("SET session_replication_role = origin")
+            .await
+            .unwrap();
+    }
+    let (status, body) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "legacy")
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(tickets_of(&pool, p.person).await, 0);
+}
+
+/// An AGENT's token is refused by the DATABASE (ELV02: an agent holds no
+/// role), even carrying a `fam` of its own client's live refresh row, so the
+/// refusal is not merely the missing-family check. Mutation: as the first
+/// refusal above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ticket_is_refused_to_an_agent(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
+    let owner = person(&pool, "owner").await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'el5-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3) RETURNING id",
+    )
+    .bind(format!("el5-agent-{agent}"))
+    .bind(agent)
+    .bind(owner.client)
+    .fetch_one(&pool)
+    .await
+    .expect("agent client");
+    let fam = family(&pool, client).await;
+    let token = s
+        .jwt
+        .issue_access_token(
+            client,
+            vec!["claims:read".into()],
+            "agent",
+            Some(owner.client),
+            Some(agent),
+            Duration::minutes(15),
+            AccessTokenBinding::family(fam),
+        )
+        .unwrap()
+        .0;
+    let (status, body) = s.open_ticket(&token, "agent").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.to_string().contains("ELV02"), "{body}");
+    assert_eq!(tickets_of(&pool, agent).await, 0);
+}
+
+/// A holder presenting ANOTHER person's family (a forged token: the HS256
+/// secret's holder can mint one) is refused (ELV02: the family must be a live
+/// family of the principal's OWN human client), whether the token names the
+/// holder's client with B's family, or B's client and B's family with the
+/// holder as principal. The second case is the one only the family OWNER
+/// clause refuses (the first is also refused by the client clause).
+/// Mutation (125): `AND c.agent_id = p_person` dropped from
+/// `epigraph_family_of_person_is_live` -> the second case gets a ticket.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ticket_is_refused_on_another_persons_family(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let b = person(&pool, "other").await;
+    let on_bs_client = Person {
+        client: b.client,
+        client_id: b.client_id.clone(),
+        ..p.clone()
+    };
+    for (what, token) in [
+        (
+            "own client, B's family",
+            s.human_token(&p, Some(b.family), None),
+        ),
+        (
+            "B's client and family",
+            s.human_token(&on_bs_client, Some(b.family), None),
+        ),
+    ] {
+        let (status, body) = s.open_ticket(&token, "forged family").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+    }
+    assert_eq!(tickets_of(&pool, p.person).await, 0);
+}
+
+/// A token that names no refresh family is refused BEFORE the database, with
+/// its own reason (a ticket binds a family; the database would refuse a made-up
+/// one too, with ELV02, which is why the reason is asserted). Mutation: the
+/// check removed and the nil family passed on -> the database's ELV02 text.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_without_a_family_gets_no_ticket(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (status, body) = s
+        .open_ticket(&s.human_token(&p, None, None), "no fam")
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string().contains("names no refresh family"),
+        "{body}"
+    );
+    assert_eq!(tickets_of(&pool, p.person).await, 0);
+}
+
+/// No relying party configured: no ceremony could ever complete, so ticket
+/// creation answers 503 and writes nothing. Mutation: the check removed ->
+/// 201.
+#[sqlx::test(migrations = "../../migrations")]
+async fn without_a_relying_party_ticket_creation_answers_503(pool: PgPool) {
+    let configured = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &configured,
+        "holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let s = spawn(&pool, None).await;
+    let (status, body) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "unconfigured")
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(tickets_of(&pool, p.person).await, 0);
+}
+
+/// A reason is required (blank -> 400) and bounded (501 characters -> 400).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ticket_needs_a_bounded_reason(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let token = s.human_token(&p, Some(p.family), None);
+    assert_eq!(
+        s.open_ticket(&token, "   ").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        s.open_ticket(&token, &"x".repeat(501)).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        s.open_ticket(&token, &"x".repeat(500)).await.0,
+        StatusCode::CREATED,
+        "CALIBRATION: the bound is inclusive"
+    );
+}
+
+// =====================================================================
+// POST /api/v1/elevation/end
+// =====================================================================
+
+/// The caller ends its OWN session, by id or by presenting the elevated token;
+/// another person's request names it and ends nothing; an ended session ends
+/// once. Mutations: the handler ignoring the body's id (using only the
+/// token's) -> P's by-id end answers false; `EndReason::Unsudo` -> the recorded
+/// reason; the definer called unstamped -> nothing ends.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_end_route_ends_only_the_callers_own_session(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let b = holder(&pool, &s, "other", &mut SoftAuthenticator::new(MODEL)).await;
+    let p_token = s.human_token(&p, Some(p.family), None);
+
+    let (_, t) = s.open_ticket(&p_token, "first").await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+
+    let (status, body) = s
+        .post(
+            "/api/v1/elevation/end",
+            Some(&s.human_token(&b, Some(b.family), None)),
+            &json!({ "elevation_id": session }),
+        )
+        .await;
+    assert_eq!(
+        (status, body["ended"].as_bool()),
+        (StatusCode::OK, Some(false))
+    );
+    assert_eq!(ended_reason(&pool, session).await, None, "B ended nothing");
+
+    let (status, body) = s
+        .post(
+            "/api/v1/elevation/end",
+            Some(&p_token),
+            &json!({ "elevation_id": session }),
+        )
+        .await;
+    assert_eq!(
+        (status, body["ended"].as_bool()),
+        (StatusCode::OK, Some(true))
+    );
+    assert_eq!(ended_reason(&pool, session).await.as_deref(), Some("ended"));
+    let (_, body) = s
+        .post(
+            "/api/v1/elevation/end",
+            Some(&p_token),
+            &json!({ "elevation_id": session }),
+        )
+        .await;
+    assert_eq!(body["ended"].as_bool(), Some(false), "ends once");
+
+    // By the elevated token's own `elv`, with no body.
+    let (_, t) = s.open_ticket(&p_token, "second").await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let second = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(s.human_token(&p, Some(p.family), Some(second)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.json::<Value>().await.unwrap()["ended"], true);
+    assert_eq!(ended_reason(&pool, second).await.as_deref(), Some("ended"));
+
+    // Nothing named, no elevated token: 400.
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&p_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A second ticket while the family is elevated is refused (409, ELV06).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_family_gets_no_second_ticket(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let token = s.human_token(&p, Some(p.family), None);
+    let (_, t) = s.open_ticket(&token, "first").await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let (status, body) = s.open_ticket(&token, "second").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+// =====================================================================
+// The ceremony: /elevate/:ticket, /challenge, /assert
+// =====================================================================
+
+/// A grant-mode ticket for `p` (its id and redeem secret), through the API.
+async fn open(s: &Server, p: &Person, reason: &str) -> (Uuid, String) {
+    let (status, body) = s
+        .open_ticket(&s.human_token(p, Some(p.family), None), reason)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "ticket: {body}");
+    (
+        body["ticket_id"].as_str().unwrap().parse().unwrap(),
+        body["redeem_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+impl Server {
+    async fn page(&self, ticket: Uuid) -> reqwest::Response {
+        self.http
+            .get(self.url(&format!("/elevate/{ticket}")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn challenge(&self, ticket: Uuid) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/{ticket}/challenge"), None, &json!({}))
+            .await
+    }
+
+    async fn options(&self, ticket: Uuid) -> Value {
+        let (status, options) = self.challenge(ticket).await;
+        assert_eq!(status, StatusCode::OK, "challenge: {options}");
+        options
+    }
+
+    async fn assert_raw(&self, ticket: Uuid, body: &str) -> (StatusCode, Value) {
+        let resp = self
+            .http
+            .post(self.url(&format!("/elevate/{ticket}/assert")))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn assert(&self, ticket: Uuid, response: &Value) -> (StatusCode, Value) {
+        self.assert_raw(ticket, &response.to_string()).await
+    }
+
+    /// The whole ceremony by `auth` over a fresh challenge.
+    async fn ceremony(&self, ticket: Uuid, auth: &mut SoftAuthenticator) -> (StatusCode, Value) {
+        let options = self.options(ticket).await;
+        let response = auth.authenticate(ORIGIN, options).await;
+        self.assert(ticket, &response).await
+    }
+}
+
+/// `(outcome, refusal, session_id)` of a ticket.
+async fn ticket_row(pool: &PgPool, ticket: Uuid) -> (Option<String>, Option<String>, Option<Uuid>) {
+    sqlx::query_as("SELECT outcome, refusal, session_id FROM elevation_tickets WHERE id = $1")
+        .bind(ticket)
+        .fetch_one(pool)
+        .await
+        .expect("the ticket")
+}
+
+async fn events(pool: &PgPool, event_type: &str, key: &str, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = $1 AND details->>$2 = $3",
+    )
+    .bind(event_type)
+    .bind(key)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("events")
+}
+
+async fn sessions_of(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM elevation_sessions WHERE person_agent_id = $1")
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("count sessions")
+}
+
+/// The ceremony end to end: the page, a challenge allowing ONLY the ticket
+/// person's passkey with user verification required, the holder's assertion,
+/// a session on the ticket's family with `platform.elevated`, and the ticket
+/// used up (its page is gone).
+///
+/// Mutations: the confirm handed the library's counter as 0 or the BE flag as
+/// false are caught by the counter and BE tests below; the routes unregistered
+/// -> red here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ceremony_confirms_and_opens_a_session(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (ticket, _) = open(&s, &p, "read a report").await;
+    assert_eq!(s.page(ticket).await.status(), StatusCode::OK);
+
+    let options = s.options(ticket).await;
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    let allowed: Vec<Vec<u8>> = options["publicKey"]["allowCredentials"]
+        .as_array()
+        .expect("allowCredentials")
+        .iter()
+        .map(|c| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                c["id"].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(allowed, vec![credential_of(&pool, p.person).await]);
+
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.assert(ticket, &response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "confirmed");
+
+    let (outcome, _, session) = ticket_row(&pool, ticket).await;
+    assert_eq!(outcome.as_deref(), Some("confirmed"));
+    let session = session.expect("a session");
+    let (person, fam, mode): (Uuid, Uuid, String) = sqlx::query_as(
+        "SELECT person_agent_id, family_id, mode FROM elevation_sessions WHERE id = $1",
+    )
+    .bind(session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((person, fam, mode.as_str()), (p.person, p.family, "grant"));
+    assert_eq!(
+        events(&pool, "platform.elevated", "session_id", session).await,
+        1
+    );
+    assert_eq!(
+        s.page(ticket).await.status(),
+        StatusCode::NOT_FOUND,
+        "used up"
+    );
+}
+
+/// THE CONFUSED DEPUTY: P's passkey completing B's ticket (a hostile client
+/// ignoring `allowCredentials`) is REFUSED, the ticket is burned, no session
+/// opens for anyone, and `platform.elevation_refused` names the mismatch. B's
+/// own passkey cannot then complete the burned ticket.
+///
+/// Mutation: the assertion of a credential outside the ticket person's
+/// passkeys answered 400 without reaching the definer -> no refusal recorded,
+/// no event, and B's later assertion confirms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_passkey_is_refused_and_audited(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut p_auth = SoftAuthenticator::new(MODEL);
+    let _p = holder(&pool, &s, "custodian-p", &mut p_auth).await;
+    let mut b_auth = SoftAuthenticator::new(MODEL);
+    let b = holder(&pool, &s, "custodian-b", &mut b_auth).await;
+    let (ticket, _) = open(&s, &b, "B's request").await;
+
+    let mut options = s.options(ticket).await;
+    options["publicKey"]["allowCredentials"] = json!([]);
+    let response = p_auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.assert(ticket, &response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["refusal"], "person_mismatch");
+
+    let (outcome, refusal, session) = ticket_row(&pool, ticket).await;
+    assert_eq!(
+        (outcome.as_deref(), refusal.as_deref(), session),
+        (Some("refused"), Some("person_mismatch"), None)
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_refused", "ticket_id", ticket).await,
+        1
+    );
+    let evidence_verified: Option<bool> = sqlx::query_scalar(
+        "SELECT (assertion_evidence->>'verified')::boolean FROM elevation_tickets WHERE id = $1",
+    )
+    .bind(ticket)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence_verified, Some(false), "recorded as unverified");
+
+    assert_eq!(
+        s.challenge(ticket).await.0,
+        StatusCode::NOT_FOUND,
+        "the burned ticket is not live"
+    );
+    let (status, _) = s.assert(ticket, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nor can it be asserted again"
+    );
+    let _ = &mut b_auth;
+    assert_eq!(sessions_of(&pool, b.person).await, 0);
+}
+
+/// ELV05 through the API: an authenticator that replays a counter the
+/// database already holds is refused AND audited
+/// (`platform.passkey_counter_regressed`), which needs the definer, not the
+/// library, to decide. Mutation: the challenge started COUNTED from the stored
+/// counter -> the library refuses first: 400, no event.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replayed_counter_is_refused_and_audited(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL).counting();
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (first, _) = open(&s, &p, "first").await;
+    let (status, body) = s.ceremony(first, &mut auth).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: counter 1 confirms: {body}"
+    );
+    let (_, _, session) = ticket_row(&pool, first).await;
+    let (status, _) = s
+        .post(
+            "/api/v1/elevation/end",
+            Some(&s.human_token(&p, Some(p.family), None)),
+            &json!({ "elevation_id": session }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (second, _) = open(&s, &p, "second").await;
+    auth.set_counter(0); // the next assertion replays counter 1
+    let (status, body) = s.ceremony(second, &mut auth).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        (body["refusal"].as_str(), body["code"].as_str()),
+        (Some("counter_regressed"), Some("ELV05"))
+    );
+    assert_eq!(
+        events(
+            &pool,
+            "platform.passkey_counter_regressed",
+            "ticket_id",
+            second
+        )
+        .await,
+        1
+    );
+}
+
+/// A passkey registered DEVICE-BOUND (BE clear) that later asserts
+/// backup-eligible is refused, whichever layer catches it: BE with BS (backed
+/// up) the library refuses itself (400); BE WITHOUT BS the library's passkey
+/// path accepts as an "upgrade", so the asserted flag must reach the definer,
+/// which refuses (`backup_eligibility_changed`, 403, audited). No session
+/// either way.
+///
+/// Mutation: the confirm handed `backup_eligible: false` -> the BE-only case
+/// confirms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_device_bound_passkey_asserting_backup_eligible_is_refused(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    for (label, auth, want_status, want_refusal) in [
+        (
+            "backed-up",
+            SoftAuthenticator::new(MODEL),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            "eligible-only",
+            SoftAuthenticator::new(MODEL).eligible_not_backed_up(),
+            StatusCode::FORBIDDEN,
+            Some("backup_eligibility_changed"),
+        ),
+    ] {
+        let mut auth = auth;
+        let p = person(&pool, label).await;
+        fixture::make_custodian(&pool, p.person).await;
+        enroll_with(&pool, &s, p.person, &mut auth, hardware_bound).await;
+        let stored_be: bool = sqlx::query_scalar(
+            "SELECT backup_eligible FROM person_authenticators WHERE person_agent_id = $1",
+        )
+        .bind(p.person)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!stored_be, "CALIBRATION: {label} registered device-bound");
+
+        let (ticket, _) = open(&s, &p, label).await;
+        let (status, body) = s.ceremony(ticket, &mut auth).await;
+        assert_eq!(status, want_status, "{label}: {body}");
+        assert_eq!(body["refusal"].as_str(), want_refusal, "{label}: {body}");
+        assert_eq!(sessions_of(&pool, p.person).await, 0, "{label}");
+    }
+}
+
+/// The protocol-level "no or garbage assertion" negative: an assertion before
+/// any challenge (409), a body that is not JSON or names no credential (400),
+/// and the holder's own assertion with a tampered signature (400, the
+/// library's refusal) each leave the ticket LIVE, unrefused and without a
+/// session; the genuine assertion then confirms.
+///
+/// Mutation: a library refusal falling through to the confirm definer -> the
+/// tampered assertion confirms (or burns) the ticket, and the genuine one
+/// does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_garbage_or_unverified_assertion_leaves_the_ticket_live(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (ticket, _) = open(&s, &p, "garbage").await;
+
+    let (status, body) = s.assert(ticket, &json!({})).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("no_ceremony_started"))
+    );
+    let options = s.options(ticket).await;
+    assert_eq!(
+        s.assert_raw(ticket, "not json").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        s.assert(ticket, &json!({"id": "x", "type": "public-key"}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let genuine = auth.authenticate(ORIGIN, options).await;
+    let mut tampered = genuine.clone();
+    let sig = tampered["response"]["signature"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &sig).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    tampered["response"]["signature"] = Value::from(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        &bytes,
+    ));
+    let (status, body) = s.assert(ticket, &tampered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        ticket_row(&pool, ticket).await,
+        (None, None, None),
+        "still live"
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_refused", "ticket_id", ticket).await,
+        0
+    );
+    assert_eq!(s.page(ticket).await.status(), StatusCode::OK);
+    let (status, body) = s.assert(ticket, &genuine).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// EQ-1 (a) end to end: a passkey registered under the ALLOWLIST policy (an
+/// attested credential) elevates through the passkey-authentication path.
+/// The interop pin for the attested credential's serialized form, which the
+/// enrollment tests never asserted with.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attested_passkey_elevates(pool: PgPool) {
+    let att = TestAttestation::new("Allowlisted");
+    let rp = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [MODEL].into_iter().collect(),
+        },
+    })
+    .expect("relying party");
+    let s = spawn(&pool, Some(rp)).await;
+    // A hardware key: `rewrap` clears BE/BS at registration, and a synced
+    // authenticator would then assert BE and be refused (as it should be).
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let p = person(&pool, "attested").await;
+    fixture::make_custodian(&pool, p.person).await;
+    enroll_with(&pool, &s, p.person, &mut auth, |r| att.rewrap(r)).await;
+    let fmt: String = sqlx::query_scalar(
+        "SELECT attestation_format FROM person_authenticators WHERE person_agent_id = $1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt, "packed", "CALIBRATION: an attested registration");
+    let (ticket, _) = open(&s, &p, "attested").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The page escapes a hostile reason, loads only the binary's own script, and
+/// every ceremony response carries the CSP and capability-URL headers.
+/// Mutations: the reason interpolated without `html_escape` -> the raw tag;
+/// the ticket page not passed through `harden` -> no CSP.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ticket_page_escapes_and_carries_the_csp(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let hostile = r#"<script>alert(1)</script><img src=x onerror="y">"#;
+    let (ticket, _) = open(&s, &p, hostile).await;
+    let page = s.page(ticket).await;
+    let challenge = s
+        .http
+        .post(s.url(&format!("/elevate/{ticket}/challenge")))
+        .send()
+        .await
+        .unwrap();
+    let js = s
+        .http
+        .get(s.url("/elevate/assets/elevate.js"))
+        .send()
+        .await
+        .unwrap();
+    for (what, resp) in [("page", &page), ("challenge", &challenge), ("js", &js)] {
+        assert_eq!(resp.status(), StatusCode::OK, "{what}");
+        let h = resp.headers();
+        assert!(
+            h["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .starts_with("default-src 'none'; script-src 'self';"),
+            "{what}"
+        );
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        assert_eq!(h["cache-control"], "no-store", "{what}");
+    }
+    assert!(js.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+    let html = page.text().await.unwrap();
+    assert!(!html.contains("<script>alert"), "{html}");
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{html}"
+    );
+    assert_eq!(html.matches("<script").count(), 1, "{html}");
+    assert!(html.contains(r#"<script src="/elevate/assets/elevate.js"></script>"#));
+}
+
+/// No relying party: every ticket ceremony endpoint answers 503 even for a
+/// live ticket. An unknown ticket is 404 on every endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ceremony_fails_closed_unconfigured_and_on_an_unknown_ticket(pool: PgPool) {
+    let configured = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &configured,
+        "holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let (ticket, _) = open(&configured, &p, "unconfigured").await;
+    let s = spawn(&pool, None).await;
+    assert_eq!(
+        s.page(ticket).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(s.challenge(ticket).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        s.assert(ticket, &json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        configured.page(unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(configured.challenge(unknown).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        configured.assert(unknown, &json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+// =====================================================================
+// /oauth/token, grant_type=urn:epigraph:grant:elevate
+// =====================================================================
+
+const ELEVATE: &str = "urn:epigraph:grant:elevate";
+
+impl Server {
+    async fn redeem(&self, ticket: Uuid, secret: &str, client_id: &str) -> (StatusCode, Value) {
+        self.post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": ELEVATE,
+                "ticket_id": ticket,
+                "redeem_secret": secret,
+                "client_id": client_id,
+            }),
+        )
+        .await
+    }
+}
+
+fn grant_error(r: &(StatusCode, Value)) -> (StatusCode, &str) {
+    (r.0, r.1["error"].as_str().unwrap_or_default())
+}
+
+/// Give `p`'s human client these granted scopes.
+async fn grant_scopes(pool: &PgPool, p: &Person, scopes: &[&str]) {
+    sqlx::query("UPDATE oauth_clients SET granted_scopes = $2, allowed_scopes = $2 WHERE id = $1")
+        .bind(p.client)
+        .bind(scopes.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("granted scopes");
+}
+
+/// The grant mode end to end: `authorization_pending` until the ceremony
+/// lands, then ONE elevated token, then `invalid_grant`. The token: the
+/// holder as principal, `elv` = the session, `fam` = the ticket's family, the
+/// client's scopes minus every standing admin scope plus `platform:admin`, at
+/// most 15 minutes, and NO refresh token (the key is absent).
+///
+/// Mutations: "pending" answered as `invalid_grant` -> the first poll; the
+/// response built with a refresh token -> the key is present; the binding
+/// without `elv` -> the claim; `client.granted_scopes` minted unstripped ->
+/// `claims:admin` present; the redemption run before nothing else changed
+/// (second redeem answered `issued`) is the definer's, mutated in
+/// `elevation_sessions.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_waits_for_the_ceremony_then_issues_once(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(&pool, &p, &["claims:read", "claims:admin", "groups:admin"]).await;
+    let (ticket, secret) = open(&s, &p, "grant mode").await;
+
+    let pending = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(
+        grant_error(&pending),
+        (StatusCode::BAD_REQUEST, "authorization_pending"),
+        "{pending:?}"
+    );
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    let session = session.expect("a session");
+
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "no refresh token, not even null: {body}"
+    );
+    let claims = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token");
+    assert_eq!(claims.elv, Some(session), "elv names the session");
+    assert_eq!(claims.fam, Some(p.family));
+    assert_eq!(claims.agent_id, Some(p.person));
+    assert_eq!(claims.sub, p.client);
+    let mut scopes = claims.scopes.clone();
+    scopes.sort();
+    assert_eq!(scopes, vec!["claims:read", "platform:admin"]);
+    assert_eq!(body["scope"], "claims:read platform:admin");
+    let lifetime = claims.exp - claims.iat;
+    assert!((880..=900).contains(&lifetime), "exp - iat = {lifetime}");
+    assert_eq!(body["expires_in"].as_i64(), Some(lifetime));
+
+    let again = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(
+        grant_error(&again),
+        (StatusCode::BAD_REQUEST, "invalid_grant")
+    );
+}
+
+/// The elevated token is sudo READ (D2): redeemed for a client that holds
+/// write scopes (`claims:write`, `agents:write`, `tasks:write`), it carries
+/// none of them, only the client's read scopes and `platform:admin`. So a
+/// route that authorizes a write on the token's SCOPES alone and writes on
+/// the unscoped pool (never meeting `begin_as` or 126's refusals), here
+/// `POST /api/v1/agents`, refuses it 403. Calibration: the same person's
+/// ordinary token with `agents:write` creates the agent.
+///
+/// Mutations: `elevated_scopes` keeping the write scopes (the pre-cp1 shape)
+/// -> the token carries `agents:write` and the agent is created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevated_token_carries_no_write_scope(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(
+        &pool,
+        &p,
+        &[
+            "claims:read",
+            "claims:write",
+            "agents:read",
+            "agents:write",
+            "tasks:write",
+        ],
+    )
+    .await;
+    let (ticket, secret) = open(&s, &p, "read only").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["access_token"].as_str().unwrap().to_string();
+    let mut scopes = s.jwt.validate_token(&token).expect("a valid token").scopes;
+    scopes.sort();
+    assert_eq!(scopes, vec!["agents:read", "claims:read", "platform:admin"]);
+
+    let agent = |key: u8| json!({ "public_key": hex::encode([key; 32]), "display_name": "cp1" });
+    // Since EL-10 the API refuses the elevated token's non-GET request before
+    // the route's scope check (`elevated_write_refusal`); the token's scope
+    // set above is what this test pins.
+    let (status, body) = s.post("/api/v1/agents", Some(&token), &agent(0x11)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string().contains("agents:write") || refused_as_elevated(&body),
+        "{body}"
+    );
+
+    let plain = s.scoped_token(&p, None, &["agents:write"]);
+    let (status, body) = s.post("/api/v1/agents", Some(&plain), &agent(0x22)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: an ordinary token with agents:write creates it: {body}"
+    );
+}
+
+/// ARMED (migration 128's admin-scope switch), the elevate grant still mints
+/// the client's read scopes plus `platform:admin`, and no admin-only scope:
+/// the mint chokepoint's armed strip never touches what elevation is FOR, and
+/// the standing admin scopes stay replaced, not stacked. Calibration: the
+/// switch reads armed for the application role.
+///
+/// Mutations: `grantable` routing the elevate grant through the general path
+/// (it drops `platform:admin` like every other grant) -> the scope is gone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_the_elevate_grant_keeps_platform_admin_and_no_admin_only_scope(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(&pool, &p, &["claims:read", "claims:admin", "groups:admin"]).await;
+    sqlx::query("SELECT * FROM public.epigraph_set_admin_scope_enforcement(true, 'el9 elevate')")
+        .execute(&pool)
+        .await
+        .expect("arm");
+    let armed: bool = sqlx::query_scalar("SELECT public.epigraph_admin_scopes_armed()")
+        .fetch_one(&pool)
+        .await
+        .expect("armed read");
+    assert!(armed, "CALIBRATION: the switch is armed");
+
+    let (ticket, secret) = open(&s, &p, "armed elevate").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut scopes = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token")
+        .scopes;
+    scopes.sort();
+    assert_eq!(scopes, vec!["claims:read", "platform:admin"]);
+    assert_eq!(body["scope"], "claims:read platform:admin");
+}
+
+/// The grant refuses, with one `invalid_grant` and WITHOUT spending the
+/// ticket: a wrong secret, a malformed one, another client's `client_id`, an
+/// unknown client; and a request missing a parameter is `invalid_request`.
+/// The right triple then still issues.
+///
+/// Mutations: the secret hashed as its hex text -> the right triple is
+/// refused; (125) the redemption's client clause dropped -> B's client
+/// issues.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_binds_the_secret_and_the_client(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let b = person(&pool, "other").await;
+    let (ticket, secret) = open(&s, &p, "binding").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let wrong = hex::encode([0x5a_u8; 32]);
+    for (what, sec, client) in [
+        ("wrong secret", wrong.as_str(), p.client_id.as_str()),
+        ("malformed secret", "zz", p.client_id.as_str()),
+        ("short secret", "abcd", p.client_id.as_str()),
+        ("another client", secret.as_str(), b.client_id.as_str()),
+        ("unknown client", secret.as_str(), "no-such-client"),
+    ] {
+        let r = s.redeem(ticket, sec, client).await;
+        assert_eq!(
+            grant_error(&r),
+            (StatusCode::BAD_REQUEST, "invalid_grant"),
+            "{what}: {r:?}"
+        );
+    }
+    let r = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": ELEVATE, "redeem_secret": secret, "client_id": p.client_id}),
+        )
+        .await;
+    assert_eq!(
+        grant_error(&r),
+        (StatusCode::BAD_REQUEST, "invalid_request")
+    );
+
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "the refusals spent nothing: {body}");
+}
+
+/// The elevate grant never PROVISIONS a principal. A redeemable ticket names a
+/// family whose client is already linked to the ticket's person (125's
+/// `epigraph_family_of_person_is_live` requires `c.agent_id = p_person`), so a
+/// client with no agent can hold no ticket; the grant answers it
+/// `invalid_grant` from the client row alone and reaches neither the OAuth
+/// principal mint (`ensure_for_client`) nor, through it, the personal-group
+/// mint (`personal_group_mint_ratchet` registers exactly three
+/// `principal_agent_id` sites in `oauth/token.rs`, the three grants that
+/// legitimately provision). The client stays unlinked and no agent is created.
+///
+/// Mutation: the grant resolving its principal through `principal_agent_id`
+/// (the cold path materialises an agent and links the client) -> the client is
+/// linked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_never_provisions_a_principal(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let client_id = format!("el5-unlinked-{}", Uuid::new_v4());
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, 'el5-unlinked', 'human', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', NULL) RETURNING id",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("an unlinked human client");
+    let agents = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agents")
+            .fetch_one(&pool)
+            .await
+            .expect("count agents")
+    };
+    let before = agents().await;
+
+    let r = s
+        .redeem(Uuid::new_v4(), &hex::encode([0x11_u8; 32]), &client_id)
+        .await;
+    assert_eq!(
+        grant_error(&r),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "{r:?}"
+    );
+    let linked: Option<Uuid> =
+        sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("the client");
+    assert_eq!(linked, None, "the elevate grant linked a principal");
+    assert_eq!(agents().await, before, "the elevate grant created an agent");
+}
+
+/// A ticket whose 5 minutes pass with no ceremony is `invalid_grant`, no
+/// longer `authorization_pending`. Mutation: "invalid" answered as
+/// `authorization_pending` -> pending forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unconfirmed_ticket_expires_into_invalid_grant(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (ticket, secret) = open(&s, &p, "expiring").await;
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("SET session_replication_role = replica")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE elevation_tickets SET created_at = created_at - interval '10 minutes', \
+                                          expires_at = expires_at - interval '10 minutes' \
+              WHERE id = $1",
+        )
+        .bind(ticket)
+        .execute(&mut *conn)
+        .await
+        .expect("age the ticket");
+        conn.execute("SET session_replication_role = origin")
+            .await
+            .unwrap();
+    }
+    let r = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(grant_error(&r), (StatusCode::BAD_REQUEST, "invalid_grant"));
+}
+
+/// A CONNECTOR-mode ticket (the kind MCP `sudo` opens, elevation plan EL-11;
+/// owed since EL-5's hand-off), confirmed by the REAL ceremony over HTTP, is
+/// never redeemed at the token endpoint: whatever secret is presented, the
+/// answer is `invalid_grant` with no token, and the session it opened stays
+/// the family's (reached by the family's own requests, never by a minted
+/// token). Calibration: the ceremony did confirm (a live session exists).
+///
+/// A REGRESSION PIN at the HTTP level: 125's redeem definer refuses it by its
+/// mode clause and, equivalently, because a connector ticket stores no redeem
+/// hash (EL-5 measured the mode-clause mutation as equivalent under the
+/// secret-shape CHECK); the Rust grant adds no mode check of its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_confirmed_connector_ticket_is_never_redeemed_for_a_token(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "connector", &mut auth).await;
+    let (person, client, family) = (p.person, p.client, p.family);
+    let ticket: Uuid = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(person.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp the principal");
+        let t = epigraph_db::ElevationCeremony::create_ticket(
+            &mut conn,
+            client,
+            family,
+            "connector mode",
+            epigraph_db::TicketMode::Connector,
+        )
+        .await
+        .expect("a connector ticket, as sudo opens it");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, t)
+    })
+    .await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the ceremony confirms: {body}"
+    );
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    assert!(session.is_some(), "CALIBRATION: a session opened");
+
+    for secret in [
+        hex::encode([0x5a_u8; 32]),
+        hex::encode(Sha256::digest(b"guess")),
+    ] {
+        let r = s.redeem(ticket, &secret, &p.client_id).await;
+        assert_eq!(
+            grant_error(&r),
+            (StatusCode::BAD_REQUEST, "invalid_grant"),
+            "a connector ticket redeems for nothing: {r:?}"
+        );
+        assert!(r.1.get("access_token").is_none(), "no token: {:?}", r.1);
+    }
+    let redeemed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT redeemed_at FROM elevation_tickets WHERE id = $1")
+            .bind(ticket)
+            .fetch_one(&pool)
+            .await
+            .expect("ticket");
+    assert!(redeemed.is_none(), "never marked redeemed");
+}
+
+/// The elevated token never outlives the ASSIGNMENT: a custodian whose
+/// assignment ends in 5 minutes gets a session (and a token) of at most 5
+/// minutes, not 15. Mutation: the token's lifetime fixed at 15 minutes ->
+/// exp - iat = 900.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevated_token_never_outlives_the_assignment(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = person(&pool, "short-assignment").await;
+    let _assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, \
+                now() + interval '5 minutes', NULL, 'test: a five-minute assignment')",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("a five-minute custodian");
+    enroll(&pool, &s, p.person, &mut auth).await;
+    let (ticket, secret) = open(&s, &p, "short").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claims = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    let lifetime = claims.exp - claims.iat;
+    assert!(
+        (200..=300).contains(&lifetime),
+        "the token lives with the assignment: {lifetime}"
+    );
+}
+
+const REDIRECT_URI: &str = "https://claude.ai/api/mcp/auth_callback";
+const VERIFIER: &str = "el5-fixed-pkce-code-verifier-of-adequate-length-0123456789";
+
+/// One authorization code for `p`'s own human client.
+async fn code_for(pool: &PgPool, p: &Person) -> String {
+    use base64::Engine as _;
+    let code = format!("code_{}", Uuid::new_v4().simple());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(VERIFIER.as_bytes()));
+    epigraph_db::repos::authorization_code::AuthorizationCodeRepository::create(
+        pool,
+        blake3::hash(code.as_bytes()).as_bytes(),
+        &p.client_id,
+        p.client,
+        REDIRECT_URI,
+        &challenge,
+        &["claims:read".to_string()],
+        None,
+        chrono::Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .expect("seed code");
+    code
+}
+
+/// No other grant mints `elv`: with the family ELEVATED (a live session from
+/// the real ceremony), a code exchange and a refresh of that very family each
+/// mint a token naming the family and NO elevation. (The external grant's
+/// token is pinned the same way in `token_family_claim.rs`.)
+///
+/// Mutation: the refresh grant's binding given `elevation_id` -> the
+/// refreshed token carries `elv`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_other_grant_mints_elv_even_while_the_family_is_elevated(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let code = code_for(&pool, &p).await;
+    let (status, first) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {first}");
+    let token = first["access_token"].as_str().unwrap().to_string();
+    let claims = s.jwt.validate_token(&token).unwrap();
+    assert_eq!(claims.elv, None);
+    let fam = claims.fam.expect("a family");
+
+    // Elevate that family through the real API.
+    let (status, t) = s
+        .post(
+            "/api/v1/elevation/tickets",
+            Some(&token),
+            &json!({"reason": "elevate the family"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{t}");
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    let live_fam: Uuid =
+        sqlx::query_scalar("SELECT family_id FROM elevation_sessions WHERE id = $1")
+            .bind(session.unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        live_fam, fam,
+        "CALIBRATION: the code grant's family is elevated"
+    );
+
+    let (status, refreshed) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": "refresh_token", "refresh_token": first["refresh_token"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {refreshed}");
+    let rc = s
+        .jwt
+        .validate_token(refreshed["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!((rc.fam, rc.elv), (Some(fam), None));
+
+    let code = code_for(&pool, &p).await;
+    let (status, second) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let sc = s
+        .jwt
+        .validate_token(second["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sc.elv, None);
+}
+
+/// `platform:admin` is minted ONLY by the elevate grant (review cp1: until the
+/// admin-scope chokepoints exist, nothing stripped it from the other grants,
+/// so a client whose `granted_scopes` held it would mint it on a code
+/// exchange or a refresh and pre-arm any later check of it). A client holding
+/// it gets neither a code-exchange token nor a refreshed token carrying it,
+/// and neither response's `scope` names it; its other scope survives. The
+/// auth crate's constant is the core crate's.
+///
+/// Mutations: the refresh site's strip dropped -> the refresh response's
+/// `scope` names it (the token itself is still stripped by
+/// `issue_access_token`, whose own mutation the auth crate's unit test
+/// catches); the code-exchange site's strip dropped -> that response names it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_grant_but_elevate_mints_platform_admin(pool: PgPool) {
+    use base64::Engine as _;
+    assert_eq!(
+        epigraph_auth::ELEVATED_ONLY_SCOPE,
+        epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE
+    );
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    grant_scopes(&pool, &p, &["claims:read", "platform:admin"]).await;
+    let code = format!("code_{}", Uuid::new_v4().simple());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(VERIFIER.as_bytes()));
+    epigraph_db::repos::authorization_code::AuthorizationCodeRepository::create(
+        &pool,
+        blake3::hash(code.as_bytes()).as_bytes(),
+        &p.client_id,
+        p.client,
+        REDIRECT_URI,
+        &challenge,
+        &["claims:read".to_string(), "platform:admin".to_string()],
+        None,
+        chrono::Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .expect("seed code");
+    let (status, first) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {first}");
+    let (status, refreshed) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": "refresh_token", "refresh_token": first["refresh_token"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {refreshed}");
+    for (what, body) in [("code exchange", &first), ("refresh", &refreshed)] {
+        let claims = s
+            .jwt
+            .validate_token(body["access_token"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(claims.scopes, vec!["claims:read"], "{what}: the token");
+        assert_eq!(body["scope"], "claims:read", "{what}: the response");
+    }
+}
+
+// =====================================================================
+// EL-6: what the elevated token's viewer may do through the real router
+// =====================================================================
+
+/// A body for `POST /api/v1/edges` that reaches the handler's write
+/// transaction (the scope check passes; nothing is validated before it).
+fn an_edge() -> Value {
+    json!({
+        "source_id": Uuid::new_v4(),
+        "target_id": Uuid::new_v4(),
+        "source_type": "claim",
+        "target_type": "claim",
+        "relationship": "supports",
+    })
+}
+
+fn refused_as_elevated(body: &Value) -> bool {
+    body.to_string().contains("ELEVATED READ-ONLY")
+}
+
+/// The elevated token (the elevate grant's: `elv` = a live session, `fam` =
+/// its family) resolves an ELEVATED viewer: a write is refused 403 ELEVATED
+/// READ-ONLY, a read of the caller's own private row still answers 200. The
+/// same principal's unelevated token writes (not refused for elevation).
+///
+/// Since EL-10 the API refuses every non-GET request whose token CARRIES an
+/// elevation claim (`middleware::elevated_access::elevated_write_refusal`),
+/// before the viewer is resolved: so a forged claim and the claim of an ENDED
+/// session are refused the write too (an elevate-grant token is read-only for
+/// its life), while their READS resolve the scoped viewer and are served.
+///
+/// Verified to fail with the chokepoint removed from the recorder layer AND
+/// the extractor ignoring the claim (the elevated write is not refused; either
+/// alone is covered by the other), and with a forged claim's write let through
+/// (the chokepoint keyed on a live session).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let group: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("the personal group");
+    let mine = fixture::seed_group_claim(&pool, p.person, group, "P's private row").await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "edges:write"];
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+
+    let (status, body) = s.post("/api/v1/edges", Some(&elevated), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(refused_as_elevated(&body), "{body}");
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
+    assert_eq!(status, StatusCode::OK, "an elevated read is served: {body}");
+
+    let (status, body) = s
+        .post(
+            "/api/v1/edges",
+            Some(&s.scoped_token(&p, None, &scopes)),
+            &an_edge(),
+        )
+        .await;
+    assert!(
+        !refused_as_elevated(&body),
+        "the unelevated token: refused as elevated ({status}): {body}"
+    );
+    let forged = s.scoped_token(&p, Some(Uuid::new_v4()), &scopes);
+    let (status, body) = s.post("/api/v1/edges", Some(&forged), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        refused_as_elevated(&body),
+        "a token carrying a (forged) elevation claim writes nothing: {body}"
+    );
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a forged claim's read resolves the scoped viewer and is served: {body}"
+    );
+
+    // The elevated token ends its own session (the route acts as the
+    // principal), and its claim then resolves scoped: served, not refused.
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (status, body) = s.post("/api/v1/edges", Some(&elevated), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        refused_as_elevated(&body),
+        "an ended session's elevate-grant token still writes nothing ({status}): {body}"
+    );
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an ended session's claim reads unelevated, served: {body}"
+    );
+}
+
+// =====================================================================
+// EL-7: what the elevated token reads through the real router once
+// migration 126's arms are in
+// =====================================================================
+
+fn ids(v: &Value) -> Vec<String> {
+    let items = v
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| i.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+/// A REPRESENTATIVE read set through the real router (plan EL-7: one list and
+/// one by-id route per armed class the REST surface stamps): the claim by id
+/// and in a list (T-OWN), its evidence (T-OWN, derived by 070), and an edge
+/// between two of B's private claims (T-EDGE). The elevated token reads B's
+/// private row on each, served 200 with no `ELEVATED READ-ONLY`, so no read
+/// route here writes on the elevated connection; the same principal's
+/// unelevated token reads none of them (the calibration that the rows ARE
+/// private to P).
+///
+/// Verified to fail with each of 126's `claims_elevated_read`,
+/// `evidence_elevated_read` and `edges_elevated_read` made USING (false) (the
+/// elevated token no longer reads that row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_reads_foreign_private_rows_through_the_router(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el7-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "zentrovium private claim").await;
+    let other = fixture::seed_group_claim(&pool, b, b_group, "zentrovium other claim").await;
+    let evidence = fixture::seed_evidence(&pool, claim, "observation").await;
+    let edge = fixture::seed_edge(&pool, claim, other).await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "edges:read", "evidence:read"];
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+    let plain = s.scoped_token(&p, None, &scopes);
+
+    let reads: [(&str, String, Uuid); 4] = [
+        ("claim by id", format!("/api/v1/claims/{claim}"), claim),
+        (
+            "claim list",
+            "/claims?search=zentrovium&limit=100".to_string(),
+            claim,
+        ),
+        (
+            "claim evidence",
+            format!("/api/v1/claims/{claim}/evidence"),
+            evidence,
+        ),
+        (
+            "edge list",
+            format!("/api/v1/edges?source_id={claim}"),
+            edge,
+        ),
+    ];
+    for (what, path, want) in &reads {
+        let (status, body) = s.get(path, &elevated).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{what}: an elevated read is served: {body}"
+        );
+        assert!(!refused_as_elevated(&body), "{what}: {body}");
+        let seen = if *what == "claim by id" {
+            body.get("id").and_then(Value::as_str).map(str::to_string) == Some(want.to_string())
+        } else {
+            ids(&body).contains(&want.to_string())
+        };
+        assert!(
+            seen,
+            "{what}: the elevated token reads B's private row: {body}"
+        );
+
+        let (status, body) = s.get(path, &plain).await;
+        let seen = status == StatusCode::OK
+            && (body.get("id").and_then(Value::as_str) == Some(&want.to_string())
+                || ids(&body).contains(&want.to_string()));
+        assert!(
+            !seen,
+            "{what}: CALIBRATION: P unelevated does not read B's private row ({status}): {body}"
+        );
+    }
+}
+
+/// A request unit whose build declares no per-access recorder never serves an
+/// elevated request, even on a database whose recorder gate is OPEN (review
+/// cp3: COR-1). The gate is opened by a migration and the recorder lives in
+/// the binaries, so a unit rolled back to (or left on) a build without the
+/// recorder would otherwise read B's private rows for an elevated token and
+/// record nothing. Here the token resolves the principal's scoped viewer: the
+/// read is 404. Calibrations with the same session: on a declaring unit the
+/// elevated token reads B's claim (before and after) and the plain token does
+/// not.
+///
+/// Verified to fail with `ScopedPool` stamping the declaration whatever the
+/// constructor asked, and with both declaration conjuncts dropped from 125
+/// (`epigraph_elevation_live`, `epigraph_is_elevated()`): the bare unit
+/// answers 200 with B's claim, the reviewer's repro.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_unit_that_declares_no_access_recorder_never_serves_an_elevated_read(pool: PgPool) {
+    let app = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &app, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "cp3-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "cp3 B private claim").await;
+    let (_, t) = app
+        .open_ticket(&app.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let read = format!("/api/v1/claims/{claim}");
+    let on_app = |app: &Server| app.scoped_token(&p, Some(session), &["claims:read"]);
+
+    let (status, seen) = app.get(&read, &on_app(&app)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session elevates on a declaring unit: {seen}"
+    );
+    let (status, _) = app
+        .get(&read, &app.scoped_token(&p, None, &["claims:read"]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "CALIBRATION: unelevated, B's claim is private to P"
+    );
+
+    let bare = spawn_unrecorded(&pool).await;
+    let (status, seen) = bare.get(&read, &on_app(&bare)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a unit that declares no recorder reads nothing past P's groups for an elevated \
+         token: {seen}"
+    );
+
+    let (status, _) = app.get(&read, &on_app(&app)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session is still live (the refusal was the unit's)"
+    );
+}
+
+/// A request unit on a PRIVILEGED DSN never serves an elevated request
+/// (review cp2: COR-1, SEC-02). The reviewer's measured failure: on such a
+/// unit an elevated token holding only `claims:read` POSTed
+/// `/api/v1/claims/{B's private claim}/assess`, the handler found the claim
+/// through the elevated viewer's always-true fragment on the unstamped pool
+/// and wrote a mass function and a new belief onto it (200), because no row
+/// policy or RESTRICTIVE refusal applies to a login that skips row security.
+/// Now the token resolves the principal's SCOPED viewer there: the read is
+/// 404 and nothing is written. Calibrations, all with the same session: on
+/// the application-role unit the elevated token READS B's claim (so the
+/// session is live and elevates, before and after) and the plain token does
+/// not (so the claim is private to P).
+///
+/// Verified to fail (the state it was written red against) with 125's
+/// privileged-login conjuncts dropped from
+/// `epigraph_elevation_session_is_live`: the privileged unit writes the mass
+/// function (and answers 200 to the elevated GET).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
+    // `assess` loads `calibration.toml` relative to the working directory (the
+    // repository root in production); without it the handler answers 500
+    // before it writes, and the write-refusal assertion below would pass for
+    // the wrong reason. No other test in this file reads a relative path.
+    std::env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
+    let app = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &app, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "cp2-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "cp2 B private claim").await;
+    let p_group: Uuid = sqlx::query_scalar(
+        "SELECT group_id FROM group_memberships WHERE agent_id = $1 ORDER BY group_id LIMIT 1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("P's own group");
+    let mine = fixture::seed_group_claim(&pool, p.person, p_group, "cp2 P own claim").await;
+    let (_, t) = app
+        .open_ticket(&app.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let read = format!("/api/v1/claims/{claim}");
+    let assess = format!("/api/v1/claims/{claim}/assess");
+    let body = json!({"evidence_type": "empirical", "methodology": "instrumental",
+                      "confidence": 0.8, "supports": true});
+    let written = || {
+        let pool = pool.clone();
+        async move {
+            let mfs: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+                    .bind(claim)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let belief: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            (mfs, belief)
+        }
+    };
+    let before = written().await;
+
+    let (status, body_seen) = app
+        .get(
+            &read,
+            &app.scoped_token(&p, Some(session), &["claims:read"]),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session elevates on the application-role unit: {body_seen}"
+    );
+    let (status, _) = app
+        .get(&read, &app.scoped_token(&p, None, &["claims:read"]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "CALIBRATION: unelevated, B's claim is private to P"
+    );
+
+    let privileged = spawn_privileged(&pool).await;
+    let elevated = privileged.scoped_token(&p, Some(session), &["claims:read"]);
+    // CALIBRATION that the route CAN write here: P's unelevated assess of its
+    // OWN claim on the same privileged unit is served.
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{mine}/assess"),
+            Some(&privileged.scoped_token(&p, None, &["claims:read"])),
+            &body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: assess writes: {seen}");
+    // The write first, so a regression shows the reviewer's failure itself.
+    let (status, seen) = privileged.post(&assess, Some(&elevated), &body).await;
+    assert_eq!(
+        written().await,
+        before,
+        "no mass function and no belief written onto B's private claim ({status}): {seen}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a privileged unit writes nothing for an elevated token: {seen}"
+    );
+    let (status, seen) = privileged.get(&read, &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a privileged unit reads nothing past P's groups for an elevated token: {seen}"
+    );
+
+    let (status, _) = app
+        .get(
+            &read,
+            &app.scoped_token(&p, Some(session), &["claims:read"]),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session is still live (the refusal was the login's)"
+    );
+}
+
+// =====================================================================
+// EL-8: every elevated access is recorded, fail-closed, where its subject
+// can read it
+// =====================================================================
+
+/// Open and confirm a grant-mode session for `p` on `s`; its id.
+async fn elevate(pool: &PgPool, s: &Server, p: &Person) -> Uuid {
+    let (_, t) = s
+        .open_ticket(&s.human_token(p, Some(p.family), None), "el8 audit read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    confirm_directly(pool, ticket, credential_of(pool, p.person).await).await
+}
+
+/// The log rows (harness view): `(surface, row_count, owner_group_ids, args)`.
+async fn log_of(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, Value)> {
+    sqlx::query_as(
+        "SELECT surface, row_count, owner_group_ids, args FROM elevated_access \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the log")
+}
+
+/// The log rows `who` reads as the application role (the subject policy).
+async fn log_seen_by(pool: &PgPool, who: Uuid) -> i64 {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(who.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.elevated_access")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read the log");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, n)
+    })
+    .await
+}
+
+/// An elevated read of B's private claim through the real router is recorded
+/// as exactly ONE log row before the response leaves: the matched route as the
+/// surface, the concrete path and the token's jti in the args, one row in the
+/// response, and B's group (and only B's) as the subject. B (the admin of its
+/// personal group) reads that row; an unrelated A does not, nor does P.
+///
+/// Verified to fail with the recorder layer removed from the router (the
+/// extractor refuses the elevated viewer: 500, no row), and with the layer
+/// sending the response without recording (no row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_through_the_router_is_recorded_for_its_subject(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-b").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "el8-a").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "el8 B private claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let jti = s
+        .jwt
+        .validate_token(&elevated)
+        .expect("the token decodes")
+        .jti;
+
+    let (status, body) = s.get(&format!("/api/v1/claims/{claim}"), &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated read is served: {body}"
+    );
+    assert_eq!(body["id"], json!(claim.to_string()));
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "exactly one row: {log:?}");
+    let (surface, rows, groups, args) = &log[0];
+    assert_eq!(surface, "GET /api/v1/claims/:id");
+    assert_eq!(*rows, 1, "one row in the response");
+    assert_eq!(groups, &vec![b_group], "B's group, and only B's");
+    assert_eq!(args["path"], json!(format!("/api/v1/claims/{claim}")));
+    assert_eq!(args["jti"], json!(jti.to_string()));
+    assert_eq!(args["status"], json!(200));
+    assert!(
+        !args.to_string().contains("el8 B private claim"),
+        "no content in the args: {args}"
+    );
+
+    assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
+    assert_eq!(log_seen_by(&pool, a).await, 0, "A does not");
+    assert_eq!(
+        log_seen_by(&pool, p.person).await,
+        0,
+        "P does not (not B's admin)"
+    );
+}
+
+/// An embedder's own state, unrelated to `AppState` — the state kind
+/// `router_extension_seam.rs`'s own convention routes every layer assertion
+/// through, since `RouterExtension::with_state` turns the router into a
+/// separately-stated one before it is nested.
+#[derive(Clone)]
+struct EmbedderState {
+    marker: &'static str,
+}
+
+/// The router-extension seam joins the SAME per-access recorder as a
+/// first-party route: an elevated GET through an extension is served (its
+/// own state and the caller's `AuthContext`, both intact) and recorded as
+/// exactly one log row. `router_extension_seam.rs`'s own elevated-POST tests
+/// (`elevated_post_to_extension_is_refused_as_read_only`,
+/// `elevated_post_to_extension_fallback_is_refused`) pin only
+/// `record_elevated_access`'s method-keyed REFUSAL branch, decided before any
+/// database lookup; this test is the one that exercises its RECORDING branch
+/// through the seam, with a live session (this file's `elevate`).
+///
+/// The surface pin also stands for the seam's known deviation from a
+/// first-party route: axum 0.7.9's `nest_service` leaves no [`MatchedPath`]
+/// for the recorder to read on a nested dispatch (it inserts
+/// `MatchedNestedPath` instead), so `record_elevated_access` falls back to
+/// the raw URI path rather than a route template
+/// (`extensions.rs::mount_all`'s doc comment).
+///
+/// Verified to fail (a) with the recorder changed to WITHHOLD (500) a
+/// request whose `MatchedPath` is absent, instead of falling back to the raw
+/// URI: the elevated extension read would never reach 200. (b) with the
+/// recorder returning `next.run(request)` unrecorded for any path under
+/// [`epigraph_api::EXTENSION_PREFIX`]: `log_of` would stay empty after the
+/// elevated read.
+///
+/// [`MatchedPath`]: axum::extract::MatchedPath
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_through_an_extension_is_recorded_once(pool: PgPool) {
+    let demo = RouterExtension::with_state(
+        "demo",
+        Router::new().route(
+            "/whoami",
+            get(
+                |State(s): State<EmbedderState>, Extension(auth): Extension<AuthContext>| async move {
+                    Json(json!({ "marker": s.marker, "agent": auth.agent_id }))
+                },
+            ),
+        ),
+        EmbedderState { marker: "embedder" },
+    )
+    .expect("valid name");
+    let s = spawn_with_extensions(&pool, Some(software()), vec![demo]).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+
+    // CALIBRATION: unelevated, the extension read is served (own state and
+    // AuthContext both intact) but records nothing.
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.get("/api/v1/ext/demo/whoami", &plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["marker"], json!("embedder"));
+    assert_eq!(body["agent"], json!(p.person.to_string()));
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "an unelevated read through an extension records nothing"
+    );
+
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, body) = s.get("/api/v1/ext/demo/whoami", &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated extension read is served: {body}"
+    );
+    assert_eq!(body["marker"], json!("embedder"));
+    assert_eq!(body["agent"], json!(p.person.to_string()));
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "exactly one row: {log:?}");
+    let (surface, _rows, _groups, args) = &log[0];
+    assert_eq!(
+        surface, "GET /api/v1/ext/demo/whoami",
+        "nest_service leaves no MatchedPath, so the recorder falls back to the raw URI"
+    );
+    assert_eq!(args["path"], json!("/api/v1/ext/demo/whoami"));
+    assert_eq!(args["status"], json!(200));
+}
+
+/// A list's row count is the number of rows the response carried, and its
+/// subjects are every group whose private row it named; the request's own
+/// filters are in the args.
+///
+/// Verified to fail with the row count fixed at 1 (the list counts 3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_list_records_its_row_count_and_every_subject(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-list-b").await;
+    let (c, c_group) = fixture::seed_agent_with_group(&pool, "el8-list-c").await;
+    for (who, g, n) in [(b, b_group, 2), (c, c_group, 1)] {
+        for i in 0..n {
+            fixture::seed_group_claim(&pool, who, g, &format!("quarvelline row {i}")).await;
+        }
+    }
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, body) = s
+        .get("/claims?search=quarvelline&limit=100", &elevated)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        ids(&body).len(),
+        3,
+        "CALIBRATION: the list holds 3 rows: {body}"
+    );
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    let (surface, rows, groups, args) = &log[0];
+    assert_eq!(surface, "GET /claims");
+    assert_eq!(*rows, 3, "three rows in the response");
+    let mut want = vec![b_group, c_group];
+    want.sort();
+    assert_eq!(groups, &want);
+    assert_eq!(args["query"], json!("search=quarvelline&limit=100"));
+}
+
+/// An AGGREGATE answer names no private row, so its elevated request is
+/// recorded with an EMPTY group list (the stated limit: the log says an
+/// elevated aggregate ran, not whose rows it counted). Here B's epistemic
+/// profile, computed over B's private claims.
+///
+/// Verified to fail with the layer skipping a response that carries no row
+/// object (no log row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_aggregate_is_recorded_with_no_groups(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-agg-b").await;
+    fixture::seed_group_claim(&pool, b, b_group, "el8 aggregate input").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read", "agents:read"]);
+    let (status, body) = s
+        .get(&format!("/api/v1/agents/{b}/epistemic-profile"), &elevated)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    let (surface, rows, groups, _) = &log[0];
+    assert_eq!(surface, "GET /api/v1/agents/:id/epistemic-profile");
+    assert!(groups.is_empty(), "no group named: {groups:?}");
+    assert_eq!(*rows, 0, "no row object in an aggregate");
+}
+
+/// FAIL-CLOSED: when the recorder cannot record (here its EXECUTE is revoked
+/// from the application role), the elevated response is WITHHELD: 500, and
+/// none of B's row reaches the caller. Calibrated by the same request served
+/// once the grant is back.
+///
+/// Verified to fail with the layer sending the handler's response when the
+/// record fails (200 with B's claim).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_record_withholds_the_elevated_response(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-fail-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "el8 withheld claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let grant = |on: bool| {
+        let pool = pool.clone();
+        async move {
+            let verb = if on { "GRANT" } else { "REVOKE" };
+            let dir = if on { "TO" } else { "FROM" };
+            sqlx::query(&format!(
+                "{verb} EXECUTE ON FUNCTION public.epigraph_record_elevated_access(text, jsonb, \
+                 integer, uuid[]) {dir} epigraph_app"
+            ))
+            .execute(&pool)
+            .await
+            .expect("grant change");
+        }
+    };
+
+    grant(false).await;
+    let resp = s
+        .http
+        .get(s.url(&format!("/api/v1/claims/{claim}")))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains(&claim.to_string()) && !text.contains("el8 withheld claim"),
+        "nothing of B's row is sent: {text}"
+    );
+    assert!(text.contains("NOT RECORDED"), "{text}");
+    assert!(log_of(&pool).await.is_empty());
+
+    grant(true).await;
+    let (status, body) = s.get(&format!("/api/v1/claims/{claim}"), &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: recorded, then served: {body}"
+    );
+    assert_eq!(log_of(&pool).await.len(), 1);
+}
+
+/// A request that is not elevated writes no row: the same principal's plain
+/// token, a token whose elevation claim names no live session (served
+/// unelevated), and the elevated token ENDING its own session (the end route
+/// acts as the principal, so it is not an elevated access; recording it would
+/// be refused by the session it just ended).
+///
+/// Verified to fail with the end route taking `ViewerExtractor` (its response
+/// is withheld: 500, the session ended anyway).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_request_that_is_not_elevated_writes_no_row(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let group: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("the personal group");
+    let mine = fixture::seed_group_claim(&pool, p.person, group, "el8 P's own row").await;
+    let session = elevate(&pool, &s, &p).await;
+    let read = format!("/api/v1/claims/{mine}");
+    for (what, token) in [
+        ("plain", s.scoped_token(&p, None, &["claims:read"])),
+        (
+            "forged claim",
+            s.scoped_token(&p, Some(Uuid::new_v4()), &["claims:read"]),
+        ),
+    ] {
+        let (status, body) = s.get(&read, &token).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {body}");
+    }
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "no row for an unelevated request"
+    );
+
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the end is answered");
+    assert_eq!(ended_reason(&pool, session).await.as_deref(), Some("ended"));
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "the end is not an elevated access"
+    );
+}
+
+/// No route outside the recorder can hand a handler an elevated viewer: a
+/// router that serves a `ViewerExtractor` handler WITHOUT the recorder layer
+/// refuses the elevated token (500, NOT RECORDED) and serves the plain one.
+///
+/// Verified to fail with the extractor's slot check removed (the elevated
+/// token is served, unrecorded).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_viewer_is_refused_outside_the_recorder(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let session = elevate(&pool, &s, &p).await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default());
+    let jwt = state.jwt_config.clone();
+    async fn probe(
+        epigraph_api::middleware::bearer::ViewerExtractor(v): epigraph_api::middleware::bearer::ViewerExtractor,
+    ) -> String {
+        format!("elevated={}", v.is_elevated())
+    }
+    let app = axum::Router::new()
+        .route("/probe", axum::routing::get(probe))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            epigraph_api::middleware::bearer_auth_middleware,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let token = |elv: Option<Uuid>| {
+        jwt.issue_access_token(
+            p.client,
+            vec!["claims:read".into()],
+            "human",
+            None,
+            Some(p.person),
+            Duration::minutes(30),
+            AccessTokenBinding {
+                family_id: Some(p.family),
+                elevation_id: elv,
+            },
+        )
+        .expect("mint")
+        .0
+    };
+    let get = |t: String| async move {
+        let r = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .bearer_auth(t)
+            .send()
+            .await
+            .unwrap();
+        (r.status(), r.text().await.unwrap())
+    };
+    let (status, text) = get(token(None)).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "elevated=false"));
+    let (status, text) = get(token(Some(session))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(text.contains("NOT RECORDED"), "{text}");
+}
+
+/// The server binary builds its pool with the one constructor that declares
+/// the recorder (`epigraph-db`'s `only_the_recording_constructor_declares_the_recorder`
+/// pins what that constructor does), and the router installs the recorder
+/// layer on the authenticated routes. Source lock: `bin/server.rs` is a
+/// binary `main` no test can construct.
+///
+/// Verified to fail with `bin/server.rs` reverted to `ScopedPool::connect`.
+#[test]
+fn the_server_binary_records_and_declares() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let server = std::fs::read_to_string(root.join("src/bin/server.rs")).unwrap();
+    assert!(
+        server.contains("ScopedPool::connect_recording_elevated_access("),
+        "bin/server.rs must build the recording pool"
+    );
+    assert!(
+        !server.contains("ScopedPool::connect(&database_url"),
+        "bin/server.rs must not build a non-declaring request pool"
+    );
+    let routes = std::fs::read_to_string(root.join("src/routes/mod.rs")).unwrap();
+    assert!(
+        routes.contains("elevated_access::record_elevated_access"),
+        "the router must install the recorder layer"
+    );
+}
+
+/// The operator's interim ruling (2026-10-04) through the router: an elevated
+/// read of a claim's evidence returns the operator-HIDDEN (pinned) evidence
+/// row too, and that read is recorded against the row's owning group (the
+/// hiding operator H's), which H reads; the claim's author B does not.
+/// Calibration: P unelevated does not see the pinned row.
+///
+/// Verified to fail with `public.evidence` removed from the recorder's
+/// attribution (the row names no group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_of_pinned_evidence_is_recorded_for_its_owner(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "el8-pin-b").await;
+    let (h, h_group) = fixture::seed_agent_with_group(&pool, "el8-pin-h").await;
+    let claim = fixture::seed_public_claim(&pool, b, "el8 public claim, hidden evidence").await;
+    let evidence = fixture::seed_evidence(&pool, claim, "observation").await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'el8 test: hidden by the operator')",
+    )
+    .bind(evidence)
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("pin");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(evidence)
+        .bind(h_group)
+        .execute(&pool)
+        .await
+        .expect("hide");
+    let session = elevate(&pool, &s, &p).await;
+    let scopes = ["claims:read", "evidence:read"];
+    let path = format!("/api/v1/claims/{claim}/evidence");
+
+    let (status, body) = s.get(&path, &s.scoped_token(&p, None, &scopes)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !ids(&body).contains(&evidence.to_string()),
+        "CALIBRATION: unelevated, the pinned row is hidden: {body}"
+    );
+    assert!(log_of(&pool).await.is_empty());
+
+    let (status, body) = s
+        .get(&path, &s.scoped_token(&p, Some(session), &scopes))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        ids(&body).contains(&evidence.to_string()),
+        "the elevated read returns the pinned row (the ruling): {body}"
+    );
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(
+        log[0].2,
+        vec![h_group],
+        "attributed to the pinned row's owner"
+    );
+    assert_eq!(log_seen_by(&pool, h).await, 1, "H reads it");
+    assert_eq!(log_seen_by(&pool, b).await, 0, "B does not");
+}
+
+// =====================================================================
+// EL-10: an elevated token writes through no non-GET route
+// =====================================================================
+
+/// The API refuses every non-GET request whose token carries an elevation
+/// claim, except the allowlisted ones (review cp2 COR-1 / cp1 SEC-06; the
+/// recorder gate's opening condition (2)). On the APPLICATION-ROLE unit:
+///
+/// * `POST /api/v1/claims/{P's own claim}/assess` checks no scope and writes
+///   on the unscoped pool (the cp2 class). On a unit whose pool reads P's
+///   private claim (the privileged unit: the application-role unit's unscoped
+///   pool sees no private row, so the route cannot reach it there), P's plain
+///   `claims:read` token is served and writes a mass function (CALIBRATION:
+///   the route writes); P's elevated token is refused 403 ELEVATED READ-ONLY
+///   and writes nothing.
+/// * `POST /api/v1/admin/clients/:id/approve` (an admin write) is refused the
+///   same way, and the refusal points at `epigraph-operator`.
+/// * `POST /api/v1/triples/query` (allowlisted: it only reads) is served to
+///   the elevated token, and so is `POST /api/v1/elevation/end`.
+///
+/// Verified to fail with the refusal removed from the recorder layer (the
+/// elevated assess writes a mass function), and with the allowlist emptied
+/// (the elevated triples query is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_writes_through_no_non_get_route(pool: PgPool) {
+    // `assess` loads `calibration.toml` relative to the working directory (see
+    // `a_privileged_unit_never_serves_an_elevated_request`).
+    std::env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let p_group: Uuid = sqlx::query_scalar(
+        "SELECT group_id FROM group_memberships WHERE agent_id = $1 ORDER BY group_id LIMIT 1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("P's own group");
+    let mine = fixture::seed_group_claim(&pool, p.person, p_group, "el10 P own claim").await;
+    let other = fixture::seed_group_claim(&pool, p.person, p_group, "el10 P other claim").await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let mass_functions = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let body = json!({"evidence_type": "empirical", "methodology": "instrumental",
+                      "confidence": 0.8, "supports": true});
+
+    let privileged = spawn_privileged(&pool).await;
+    let before = mass_functions(other).await;
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{other}/assess"),
+            Some(&plain),
+            &body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: assess writes: {seen}");
+    assert!(
+        mass_functions(other).await > before,
+        "CALIBRATION: the plain token's assess wrote a mass function"
+    );
+
+    let before = mass_functions(mine).await;
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{mine}/assess"),
+            Some(&elevated),
+            &body,
+        )
+        .await;
+    assert_eq!(
+        mass_functions(mine).await,
+        before,
+        "nothing written for the elevated token ({status}): {seen}"
+    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{seen}");
+    assert!(refused_as_elevated(&seen), "{seen}");
+
+    let (status, seen) = s
+        .post(
+            &format!("/api/v1/admin/clients/{}/approve", Uuid::new_v4()),
+            Some(&elevated),
+            &json!({"scopes": ["claims:read"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{seen}");
+    assert!(
+        refused_as_elevated(&seen) && seen.to_string().contains("epigraph-operator"),
+        "an admin write is maintenance-CLI-only for an elevated token: {seen}"
+    );
+
+    let (status, seen) = s
+        .post("/api/v1/triples/query", Some(&elevated), &json!({}))
+        .await;
+    assert!(
+        status.is_success() && !refused_as_elevated(&seen),
+        "an allowlisted read POST is served elevated ({status}): {seen}"
+    );
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the elevated token ends its own session"
+    );
+}
+
+/// An ELEVATED token reads an admin route that takes no viewer (`GET
+/// /api/v1/admin/stats`, `RequireScopeAdmin`): the recorder layer checks the
+/// claim against the database and sets the request's elevation, so the
+/// elevate grant's `platform:admin` stands in for the `claims:admin` it
+/// stripped (200), and the layer MARKS the request, so the access is recorded
+/// (exactly one `elevated_access` row for the route) although no viewer was
+/// built. Calibrations: the same scopes on a token whose claim names no live
+/// session are refused (403: elevation, not the scope string, is the
+/// authority); a plain read writes no row.
+///
+/// Verified to fail with the layer not setting the request's elevation (403),
+/// and with the layer not marking the slot (200 and no row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_admin_read_is_served_and_recorded(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "platform:admin"];
+    let rows = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM elevated_access WHERE surface = 'GET /api/v1/admin/stats'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let forged = s.scoped_token(&p, Some(Uuid::new_v4()), &scopes);
+    let (status, body) = s.get("/api/v1/admin/stats", &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "CALIBRATION: platform:admin without a live elevation is nothing: {body}"
+    );
+    assert_eq!(rows().await, 0, "an unelevated request records nothing");
+
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+    let (status, body) = s.get("/api/v1/admin/stats", &elevated).await;
+    assert_eq!(status, StatusCode::OK, "the elevated admin read: {body}");
+    assert_eq!(rows().await, 1, "recorded once, though no viewer was built");
+}
+
+// =====================================================================
+// EL-12b: proposing admin acts over HTTP, and listing one's own
+// =====================================================================
+
+/// `role.grant` act args for `holder` (the args migration 130 takes).
+fn grant_act_args(holder: Uuid, reason: &str) -> Value {
+    json!({"role": "role:auditor", "holder": holder.to_string(), "valid_from": null,
+           "valid_to": null, "reason": reason})
+}
+
+impl Server {
+    async fn propose(
+        &self,
+        token: &str,
+        kind: &str,
+        args: &Value,
+        reason: &str,
+    ) -> (StatusCode, Value) {
+        self.post(
+            "/api/v1/admin/acts",
+            Some(token),
+            &json!({"kind": kind, "args": args, "reason": reason}),
+        )
+        .await
+    }
+}
+
+/// `(proposed_by, elevation_id, jti)` of every act, oldest first.
+async fn acts(pool: &PgPool) -> Vec<(Uuid, Uuid, Option<String>)> {
+    sqlx::query_as(
+        "SELECT proposed_by, elevation_id, jti FROM pending_admin_acts ORDER BY proposed_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the acts")
+}
+
+/// A grant-mode session for `p` (ceremony stood in) and a token naming it.
+async fn elevated_token(pool: &PgPool, s: &Server, p: &Person) -> (Uuid, String) {
+    let session = elevate(pool, s, p).await;
+    (
+        session,
+        s.scoped_token(p, Some(session), &["claims:read", "platform:admin"]),
+    )
+}
+
+/// The jti of a token this server minted.
+fn jti_of(s: &Server, token: &str) -> String {
+    s.jwt.validate_token(token).expect("valid").jti.to_string()
+}
+
+/// An admin act is proposed only by an ELEVATED request: P's plain token is
+/// refused 403 (the database's ELV07) and nothing is written; P's elevated
+/// token gets 201 with the act id, its confirmation path and URL on the
+/// relying party's origin, and the act names P, P's elevation and the token's
+/// jti. The proposal is recorded as an elevated access. Args the kind does
+/// not take and a missing reason are 400; with no relying party configured,
+/// 503.
+///
+/// Mutations: `POST /api/v1/admin/acts` removed from the elevated allowlist
+/// -> the elevated proposal is refused ELEVATED READ-ONLY; the handler
+/// proposing as `viewer.detach_scoped()` -> ELV07 for the elevated token too;
+/// the route unregistered -> red (404/405).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_is_proposed_only_by_an_elevated_request(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let x = person(&pool, "grantee").await;
+    let args = grant_act_args(x.person, "audit");
+
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.propose(&plain, "role.grant", &args, "audit x").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string().contains("ELEVATED request"),
+        "the refusal says why: {body}"
+    );
+    assert!(acts(&pool).await.is_empty(), "nothing proposed");
+
+    let (session, elevated) = elevated_token(&pool, &s, &p).await;
+    let (status, body) = s.propose(&elevated, "role.grant", &args, "audit x").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let act: Uuid = body["act_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(body["path"], format!("/elevate/act/{act}"));
+    assert_eq!(body["url"], format!("{ORIGIN}/elevate/act/{act}"));
+    assert_eq!(
+        acts(&pool).await,
+        vec![(p.person, session, Some(jti_of(&s, &elevated)))]
+    );
+    assert_eq!(
+        log_of(&pool)
+            .await
+            .iter()
+            .filter(|r| r.0 == "POST /api/v1/admin/acts")
+            .count(),
+        1,
+        "the proposal is recorded as an elevated access"
+    );
+
+    let (status, body) = s
+        .propose(
+            &elevated,
+            "role.grant",
+            &json!({"role": "role:auditor"}),
+            "x",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "args: {body}");
+    let (status, body) = s.propose(&elevated, "role.grant", &args, "  ").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "reason: {body}");
+    assert_eq!(acts(&pool).await.len(), 1, "no other act");
+
+    let unconfigured = spawn(&pool, None).await;
+    let (status, body) = unconfigured
+        .propose(&elevated, "role.grant", &args, "audit x")
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// An AGENT cannot propose: its token is refused whether it carries no
+/// elevation claim or a forged one naming the holder's live session (the
+/// claim resolves no elevation for the agent, so the request is served
+/// unelevated and the database refuses: ELV07). Regression pin: agents never
+/// elevate (CUS01, 125's ELV02), so no Rust mutation reaches this alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_cannot_propose(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (session, _) = elevated_token(&pool, &s, &p).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "el12b-agent").await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'el12b-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3) RETURNING id",
+    )
+    .bind(format!("el12b-agent-{agent}"))
+    .bind(agent)
+    .bind(p.client)
+    .fetch_one(&pool)
+    .await
+    .expect("agent client");
+    for elv in [None, Some(session)] {
+        let token = s
+            .jwt
+            .issue_access_token(
+                client,
+                vec!["claims:read".into(), "platform:admin".into()],
+                "agent",
+                Some(p.client),
+                Some(agent),
+                Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: Some(p.family),
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0;
+        let (status, body) = s
+            .propose(
+                &token,
+                "role.grant",
+                &grant_act_args(p.person, "a"),
+                "agent",
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "elv {elv:?}: {body}");
+    }
+    assert!(acts(&pool).await.is_empty(), "nothing proposed");
+}
+
+/// `GET /api/v1/admin/acts?mine` lists the caller's OWN acts (elevated or
+/// not), newest first, each with its confirmation path, and never another
+/// person's; `?mine=false` is refused (only one's own are listed).
+///
+/// Mutations: the list read on an unstamped connection -> P lists nothing;
+/// the route unregistered -> red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_lists_only_their_own_acts_over_http(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder-p", &mut SoftAuthenticator::new(MODEL)).await;
+    let b = holder(&pool, &s, "holder-b", &mut SoftAuthenticator::new(MODEL)).await;
+    let x = person(&pool, "grantee").await;
+    let (_, p_elevated) = elevated_token(&pool, &s, &p).await;
+    let (_, b_elevated) = elevated_token(&pool, &s, &b).await;
+    let (_, mine) = s
+        .propose(
+            &p_elevated,
+            "role.grant",
+            &grant_act_args(x.person, "p"),
+            "p's",
+        )
+        .await;
+    let (_, theirs) = s
+        .propose(
+            &b_elevated,
+            "role.grant",
+            &grant_act_args(x.person, "b"),
+            "b's",
+        )
+        .await;
+    let mine: Uuid = mine["act_id"].as_str().unwrap().parse().unwrap();
+    let theirs: Uuid = theirs["act_id"].as_str().unwrap().parse().unwrap();
+
+    let p_plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.get("/api/v1/admin/acts?mine", &p_plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<Uuid> = body["acts"]
+        .as_array()
+        .expect("acts")
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert!(listed.contains(&mine), "P lists its act: {body}");
+    assert!(!listed.contains(&theirs), "never B's: {body}");
+    let first = &body["acts"][0];
+    assert_eq!(first["id"], mine.to_string(), "newest first: {body}");
+    assert_eq!(first["path"], format!("/elevate/act/{mine}"));
+    assert_eq!(first["kind"], "role.grant");
+    assert!(first["outcome"].is_null(), "unconfirmed: {first}");
+    assert!(
+        first.get("challenge_state").is_none() && first.get("assertion_evidence").is_none(),
+        "no ceremony state or evidence: {first}"
+    );
+    let (status, _) = s.get("/api/v1/admin/acts?mine", &p_elevated).await;
+    assert_eq!(status, StatusCode::OK, "listed elevated too");
+    let (status, body) = s.get("/api/v1/admin/acts?mine=false", &p_plain).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+// =====================================================================
+// EL-12b: the admin-act confirmation, /elevate/act/:id
+// =====================================================================
+
+impl Server {
+    async fn act_page(&self, act: Uuid) -> reqwest::Response {
+        self.http
+            .get(self.url(&format!("/elevate/act/{act}")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn act_challenge(&self, act: Uuid) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/act/{act}/challenge"), None, &json!({}))
+            .await
+    }
+
+    async fn act_options(&self, act: Uuid) -> Value {
+        let (status, options) = self.act_challenge(act).await;
+        assert_eq!(status, StatusCode::OK, "act challenge: {options}");
+        options
+    }
+
+    async fn act_assert(&self, act: Uuid, response: &Value) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/act/{act}/assert"), None, response)
+            .await
+    }
+}
+
+/// A `role.grant` act proposed over HTTP with the elevated `token`, for a
+/// fresh grantee, with `reason`; its id.
+async fn propose_with(pool: &PgPool, s: &Server, token: &str, reason: &str) -> Uuid {
+    let x = person(pool, &format!("grantee {reason}")).await;
+    let (status, body) = s
+        .propose(
+            token,
+            "role.grant",
+            &grant_act_args(x.person, "audit"),
+            reason,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "CALIBRATION: propose: {body}");
+    body["act_id"].as_str().unwrap().parse().unwrap()
+}
+
+/// [`propose_with`], `p` elevated for the purpose (one session per family:
+/// call it once per person).
+async fn proposed_act(pool: &PgPool, s: &Server, p: &Person, reason: &str) -> Uuid {
+    let (_, token) = elevated_token(pool, s, p).await;
+    propose_with(pool, s, &token, reason).await
+}
+
+/// `(outcome, refusal)` of an act.
+async fn act_row(pool: &PgPool, act: Uuid) -> (Option<String>, Option<String>) {
+    sqlx::query_as("SELECT outcome, refusal FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(pool)
+        .await
+        .expect("the act")
+}
+
+/// `(args_digest, stored challenge state)` of an act.
+async fn act_ceremony_row(pool: &PgPool, act: Uuid) -> (Vec<u8>, Option<Value>) {
+    sqlx::query_as("SELECT args_digest, challenge_state FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(pool)
+        .await
+        .expect("the act")
+}
+
+/// The confirmation end to end: the page names the act, its digest and the
+/// verb that executes it; the challenge allows ONLY the proposer's passkey,
+/// with user verification required, and IS `act_challenge(act, stored digest,
+/// stored nonce)`; the proposer's assertion confirms the act (audited), the
+/// page is gone, and the act lists as confirmed.
+///
+/// Mutation: the challenge started with no override (the library's random
+/// challenge) -> the challenge is not the act's (and the assertion is refused
+/// `challenge_not_bound`); the routes unregistered -> red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_ceremony_confirms_with_the_proposers_passkey(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let act = proposed_act(&pool, &s, &p, "grant an auditor").await;
+
+    let page = s.act_page(act).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = page.text().await.unwrap();
+    let (digest, _) = act_ceremony_row(&pool, act).await;
+    assert!(html.contains("<code>role.grant</code>"), "{html}");
+    assert!(html.contains(&hex::encode(&digest)), "the digest: {html}");
+    assert!(
+        html.contains(&format!("epigraph-operator grant-role --act {act}")),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-base="/elevate/act/"#), "{html}");
+
+    let options = s.act_options(act).await;
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    let allowed: Vec<Vec<u8>> = options["publicKey"]["allowCredentials"]
+        .as_array()
+        .expect("allowCredentials")
+        .iter()
+        .map(|c| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                c["id"].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(allowed, vec![credential_of(&pool, p.person).await]);
+    let (_, stored) = act_ceremony_row(&pool, act).await;
+    let stored = stored.expect("a stored ceremony");
+    let nonce: [u8; 32] = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        stored["nonce"].as_str().expect("a nonce"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let expected =
+        epigraph_passkey::act_challenge(act, &digest.clone().try_into().unwrap(), &nonce);
+    assert_eq!(
+        options["publicKey"]["challenge"],
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, expected),
+        "the challenge commits to the act"
+    );
+
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(act, &response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "confirmed");
+    assert_eq!(act_row(&pool, act).await.0.as_deref(), Some("confirmed"));
+    assert_eq!(
+        events(&pool, "platform.admin_act_confirmed", "act_id", act).await,
+        1
+    );
+    assert_eq!(s.act_page(act).await.status(), StatusCode::NOT_FOUND);
+    let (_, listed) = s
+        .get(
+            "/api/v1/admin/acts?mine",
+            &s.scoped_token(&p, None, &["claims:read"]),
+        )
+        .await;
+    assert_eq!(listed["acts"][0]["outcome"], "confirmed", "{listed}");
+}
+
+/// THE CONTENT BINDING: a stored ceremony whose challenge was computed for a
+/// DIFFERENT act is refused. The application DSN can write any act's
+/// ceremony state (`epigraph_set_admin_act_challenge` is app-callable): copy
+/// act B's started ceremony onto act A, let the proposer's passkey sign B's
+/// options, and post that assertion to A. Refused 409 `challenge_not_bound`,
+/// A stays unasserted and unconfirmed. Calibration: a fresh, genuine ceremony
+/// for A then confirms it.
+///
+/// Mutation: the binding check skipped (the stored ceremony used as it is)
+/// -> A is CONFIRMED by an assertion over B's challenge: a random challenge
+/// alone does not catch this, because the library compares the response with
+/// whatever challenge the row holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_challenge_computed_for_another_act_is_refused(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (_, token) = elevated_token(&pool, &s, &p).await;
+    let a = propose_with(&pool, &s, &token, "act a").await;
+    let b = propose_with(&pool, &s, &token, "act b").await;
+
+    let b_options = s.act_options(b).await;
+    let (_, b_state) = act_ceremony_row(&pool, b).await;
+    let b_state = b_state.expect("B's ceremony");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_admin_act_challenge($1, $2)")
+            .bind(a)
+            .bind(&b_state)
+            .execute(&mut *conn)
+            .await
+            .expect("an app-DSN write of A's ceremony state");
+        (conn, ())
+    })
+    .await;
+    let signed_for_b = auth.authenticate(ORIGIN, b_options).await;
+    let (status, body) = s.act_assert(a, &signed_for_b).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "challenge_not_bound", "{body}");
+    assert_eq!(act_row(&pool, a).await, (None, None), "A is untouched");
+    assert_eq!(
+        events(&pool, "platform.admin_act_confirmed", "act_id", a).await,
+        0
+    );
+
+    let options = s.act_options(a).await;
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(a, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: A's own ceremony: {body}"
+    );
+}
+
+/// The page renders the STORED args and reason, escaped, under the strict
+/// CSP, with no-store and no-referrer on the page and the challenge.
+///
+/// Mutation: the args rendered unescaped -> the raw markup appears.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_page_escapes_the_stored_args(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (_, token) = elevated_token(&pool, &s, &p).await;
+    let x = person(&pool, "grantee").await;
+    let hostile_arg = r#"<script>alert(1)</script>"#;
+    let hostile_reason = r#""><img src=x onerror="y">"#;
+    let (status, body) = s
+        .propose(
+            &token,
+            "role.grant",
+            &grant_act_args(x.person, hostile_arg),
+            hostile_reason,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let act: Uuid = body["act_id"].as_str().unwrap().parse().unwrap();
+    let page = s.act_page(act).await;
+    let challenge = s
+        .http
+        .post(s.url(&format!("/elevate/act/{act}/challenge")))
+        .send()
+        .await
+        .unwrap();
+    for (what, resp) in [("page", &page), ("challenge", &challenge)] {
+        assert_eq!(resp.status(), StatusCode::OK, "{what}");
+        let h = resp.headers();
+        assert!(
+            h["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .starts_with("default-src 'none'; script-src 'self';"),
+            "{what}"
+        );
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        assert_eq!(h["cache-control"], "no-store", "{what}");
+    }
+    let html = page.text().await.unwrap();
+    assert!(!html.contains("<script>alert"), "{html}");
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "the stored arg, escaped: {html}"
+    );
+    assert!(
+        html.contains("&quot;&gt;&lt;img src=x onerror=&quot;y&quot;&gt;"),
+        "the reason, escaped: {html}"
+    );
+    assert!(
+        html.contains(&x.person.to_string()),
+        "the grantee the args name: {html}"
+    );
+    assert_eq!(html.matches("<script").count(), 1, "{html}");
+}
+
+/// THE CONFUSED DEPUTY on an act: B's passkey (a hostile client ignoring
+/// `allowCredentials`) completing P's act is REFUSED `person_mismatch` and
+/// audited, and a refused act is final (its page is gone).
+///
+/// Mutation: an assertion by a credential outside the proposer's passkeys
+/// answered 400 without reaching the definer -> no refusal recorded, and the
+/// act stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_passkey_is_refused_on_an_act(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "custodian-p", &mut SoftAuthenticator::new(MODEL)).await;
+    let mut b_auth = SoftAuthenticator::new(MODEL);
+    let _b = holder(&pool, &s, "custodian-b", &mut b_auth).await;
+    let act = proposed_act(&pool, &s, &p, "P's act").await;
+
+    let mut options = s.act_options(act).await;
+    options["publicKey"]["allowCredentials"] = json!([]);
+    let response = b_auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(act, &response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["refusal"], "person_mismatch");
+    assert_eq!(
+        act_row(&pool, act).await,
+        (Some("refused".into()), Some("person_mismatch".into()))
+    );
+    assert_eq!(
+        events(&pool, "platform.admin_act_refused", "act_id", act).await,
+        1
+    );
+    assert_eq!(s.act_page(act).await.status(), StatusCode::NOT_FOUND);
+}
+
+/// No relying party: every act ceremony endpoint answers 503 even for a live
+/// act. An unknown act is 404 on every endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_ceremony_fails_closed_unconfigured_and_on_an_unknown_act(pool: PgPool) {
+    let configured = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &configured,
+        "holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let act = proposed_act(&pool, &configured, &p, "unconfigured").await;
+    let s = spawn(&pool, None).await;
+    assert_eq!(
+        s.act_page(act).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        s.act_challenge(act).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        s.act_assert(act, &json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        configured.act_page(unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        configured.act_challenge(unknown).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        configured.act_assert(unknown, &json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

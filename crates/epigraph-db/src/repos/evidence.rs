@@ -501,6 +501,13 @@ impl EvidenceRepository {
 
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.
     ///
+    /// A case-folded relationship (`epigraph_core::edge::relationships::
+    /// CASE_FOLDED_RELATIONSHIPS`) matches BOTH stored spellings: the routes
+    /// pass `"SUPPORTS"` / `"CONTRADICTS"`, the DS writers store upper case and
+    /// MCP stores lower case, and both are the same relationship. Any other
+    /// relationship still matches byte-exactly. The spellings bind as an array
+    /// so the btree index on `edges.relationship` stays usable.
+    ///
     /// Backs `GET /api/v1/claims/:id/supporting-evidence` and
     /// `…/contradicting-evidence`. Both the edge and the evidence row are
     /// filtered: an edge the viewer cannot see must not surface its endpoint,
@@ -527,15 +534,16 @@ impl EvidenceRepository {
              WHERE ed.target_id = $1 \
                AND ed.target_type = 'claim' \
                AND ed.source_type = 'evidence' \
-               AND ed.relationship = $2 \
+               AND ed.relationship = ANY($2) \
                /* {EDGE_VISIBILITY:ed} */ \
              ORDER BY ev.created_at DESC \
              LIMIT 100",
             3,
         );
+        let spellings = epigraph_core::edge::relationships::relationship_spellings(relationship);
         let mut q = sqlx::query_as::<_, EvidenceEdgeRow>(&sql)
             .bind(claim_id)
-            .bind(relationship);
+            .bind(&spellings);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

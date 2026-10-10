@@ -339,6 +339,15 @@ pub struct GetProvenanceParams {
                        `content_truncated: true` and the original `content_chars`."
     )]
     pub max_content_chars: Option<usize>,
+
+    #[schemars(
+        description = "Budget for the whole response, in characters of compact JSON. \
+                       Default 40000, clamped to 10000..=500000. Claims are admitted \
+                       nearest-first with their evidence (at most 10 per claim) and \
+                       traces until the next would overrun it; the bundle then reports \
+                       `budget_exhausted: true` and `truncated: true`."
+    )]
+    pub max_output_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -833,7 +842,7 @@ pub struct ReportWorkflowOutcomeParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
     #[schemars(
-        description = "UUID of the workflow to deprecate. A hierarchical workflows-table id deprecates only that workflows row, not its thesis or step claims (see the tool description)."
+        description = "UUID of the workflow to deprecate: a flat workflow claim id, or a hierarchical workflows-table id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return). A hierarchical id retires the workflow with the thesis, phase and step claims no other live workflow executes (see the tool description). An id that is neither is an error."
     )]
     pub workflow_id: String,
 
@@ -1300,8 +1309,12 @@ pub enum HashCheck {
     /// signal** — the body was mutated without rewriting the hash.
     Mismatch,
     /// The stored digest is not a function of the body alone, so comparing them
-    /// decides nothing. Reported for document-scoped compound rows, detected via
-    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`.
+    /// decides nothing. Reported for document-scoped compound rows (detected
+    /// via `epigraph_ingest::document::stored_content_hash_is_seed_scoped`),
+    /// and for a canonical_name-scoped WORKFLOW row only when no executing
+    /// workflow is visible to recover its seed from — a workflow row whose
+    /// seed is recovered is re-derived and reported [`Self::Match`] or
+    /// [`Self::Mismatch`].
     ///
     /// **Undecided, not clean.** Content-hash verification cannot rule tampering
     /// in *or* out here: the artifact seed that went into the stored digest is
@@ -2261,7 +2274,15 @@ pub struct ReportWorkflowOutcomeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DeprecateWorkflowResponse {
+    /// Workflow ids (a flat workflow claim or a hierarchical `workflows` row)
+    /// whose state this call changed. An id already deprecated is not listed.
     pub deprecated_ids: Vec<String>,
+    /// Thesis, phase and step claims of a hierarchical workflow that this call
+    /// retired (`is_current = false`, embeddings nulled).
+    pub retired_claim_ids: Vec<String>,
+    /// Claims of a deprecated hierarchical workflow that were KEPT because
+    /// another live workflow still executes them.
+    pub kept_shared_claim_ids: Vec<String>,
     pub reason: String,
 }
 
@@ -2316,7 +2337,13 @@ pub struct TraverseEdge {
 pub struct TraverseResponse {
     pub start_id: String,
     pub nodes: Vec<TraverseNode>,
+    /// Only edges whose source AND target are in `nodes`.
     pub edges: Vec<TraverseEdge>,
+    /// Edges the walk followed (relationship filter already applied) that are
+    /// not in `edges` because an endpoint was not returned: the node `limit`
+    /// was reached, or `min_truth` dropped it. Always present, 0 when nothing
+    /// was left out (backlog cdd8d097).
+    pub edges_omitted: usize,
     pub depth_reached: i32,
 }
 
@@ -3143,6 +3170,35 @@ pub struct DecideMatchCandidateParams {
 /// (`claims:admin`). Supersession is no longer the analogy: since batch OA1 it is
 /// the caller's act on a claim it writes, at `claims:write`. Folding it back into
 /// `decide_match_candidate` would force one of the two to hold the wrong scope.
+/// `sudo` (elevation plan EL-11): why the caller asks to elevate. Shown on
+/// the ceremony page and kept on the ticket, the session and their audit
+/// rows.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SudoParams {
+    #[schemars(
+        description = "Why you need to elevate (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
+/// `propose_admin_act` (elevation plan EL-12b): an administrative act an
+/// ELEVATED caller asks its own passkey to confirm.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeAdminActParams {
+    #[schemars(
+        description = "The act: role.grant, role.end, claim.custodial_supersede or passkey.register"
+    )]
+    pub kind: String,
+    #[schemars(
+        description = "The act's arguments, exactly the kind's keys. role.grant: role, holder (uuid), valid_from (time or null: from the execution), valid_to (time or null: open-ended), reason. role.end: assignment (uuid), reason. claim.custodial_supersede: claim (uuid), content_sha256 (64 hex), truth (decimal string, six places), reason, allow_owned (bool). passkey.register: person (your own uuid), label (or null), reason"
+    )]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    #[schemars(
+        description = "Why you propose it (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetireMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to retire")]

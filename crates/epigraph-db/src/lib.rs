@@ -76,9 +76,12 @@ pub use pool::{
     probe_maintenance_privilege, probe_maintenance_privilege_conn,
     request_unit_maintenance_dsn_check, resolve_maintenance_url, MaintenanceConn,
     MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn,
-    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
-    MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
+    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
+    MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
+pub use repos::ElevatedAccess;
+pub use repos::{admin_act, AdminActRepository, AdminActRow};
+pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
     AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
@@ -90,7 +93,7 @@ pub use repos::{
     ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
     ClusterRunRepository, ClusterRunRow, CommunityRepository, ConsolidateEdgeMigration,
     ConsolidateMode, ConsolidateResult, ContextRepository, CorpusCounts, CorpusStatsRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
+    CounterfactualRepository, CounterfactualRow, DecideOutcome, DedupRepair, DivergenceRepository,
     EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EgoEdgeRow, EgoEdges, EgoEntity,
     EgoRepository, EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository,
     EpistemicEdgePairRow, EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow,
@@ -112,15 +115,26 @@ pub use repos::{
     ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
     RecallEventRepository, RecallEventRow, RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome,
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
-    RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
-    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SupersedeEdgeMigration,
-    SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
-    TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
-    WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    RevokedAccessTokenRepository, RotateOutcome, ScopedBeliefRepository,
+    ScoredHierarchicalWorkflowRow, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    SortDirection, StructuralRepository, SupersedeEdgeMigration, SweepCandidate, TaskRepository,
+    TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep,
+    TripleRepository, TripleRow, WebhookSubscriptionRepository, WebhookSubscriptionRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
-pub use visibility::{MaintenanceLease, SystemReason, Viewer};
+pub use repos::{
+    AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
+    AdminScopeSwitch,
+};
+pub use repos::{
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
+    Redemption, TicketMode, TicketPasskey,
+};
+pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
+pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
 
 // Re-export sqlx types that users will need
 pub use sqlx::PgPool;
@@ -128,6 +142,7 @@ pub use sqlx::PgPool;
 // Re-export row types for users of repositories
 pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
+pub use repos::conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{

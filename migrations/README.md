@@ -823,15 +823,358 @@ Current reservation:
   is in the file's header. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
-- **123+**: public next
+- **123**: public `custodian_role` — instance administration becomes
+  `role:platform-custodian`, held by a REGISTERED HUMAN through a timestamped,
+  append-only `role_assignments` row (catalog `platform_roles`, with
+  `role:auditor`). Table triggers: `CUS01` the holder is not a registered human
+  (agents never hold a role; re-checked at read time), `CUS02` not append-only
+  (no back-dating; the only change is one end stamped now; an ended row is
+  final), `CUS03` the grantor rule; FORCE RLS on both tables, 083's pattern
+  (self-or-definer reads, bypass-only writes, no DELETE policy). Subject-bound
+  readers `epigraph_role_assignment_for` / `epigraph_holds_role`;
+  `epigraph_is_instance_admin` RE-BODIED to "holds the custodian role now"
+  (same signature, grants and subject binding). `security_events`'s
+  `platform.` prefix reserved to definers (a RESTRICTIVE insert policy, 117/118's
+  shape); every grant, end, custodial act (`epigraph_record_custodial_act`,
+  `CUS04` unless the actor's assignment is live) writes one, naming the
+  assignment; reader
+  `epigraph_platform_audit`. Each assignment is projected as an `OCCUPIES` edge
+  (never read for authority; ratchet-tested); the role nodes are refused as
+  link or registry subjects, and a role holder is refused as a link's agent
+  (`CUS01`: end the assignment first, so the end is audited). Live `instance_admins` rows of registered humans
+  are carried over from their `granted_at`; others are skipped loudly; the table
+  is then FROZEN for every role but a mirrored `revoked_at` stamp. 122's
+  `epigraph_operator_scope_exempt` is re-bodied to `epigraph_bypass()` alone
+  (operator ruling OQ-1 (b): no `OPL02` relief for a role holder on an
+  application session; custodial writes go through `epigraph-operator
+  custodial-supersede` on the maintenance DSN). 122's
+  `epigraph_require_operator_scope` / `_writer_scope` / `_attributable` (still
+  STABLE; corrected HINTs) and the claims trigger body are re-applied with the
+  round-4 fixes: a claim never supersedes itself (refused first, on
+  every session); a retired identity's claim is restated at most once on an
+  application session; re-open and lineage relief is the privileged session's
+  alone. Registered in
+  `schema_contract.rs::migration_123_custodian_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 123) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/custodian_role.rs` and
+  `operator_binding.rs`. Undo: `docs/runbooks/123-undo.sql` (roll back every
+  binary that calls a 123 function first; docs/deploy.md). Checked before
+  claiming: 113 is held by an open PR that renumbers when it lands; no open PR
+  branch carries a `123`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `123` or
+- **124**: public `person_authenticators` — a registered human's WebAuthn
+  passkeys (`person_authenticators`: credential id, the library's serialized
+  credential, AAGUID and attestation format, user verification as a CHECK,
+  backup eligibility, an explicit signature counter) and the maintenance
+  enrollment tickets that admit them (`passkey_enrollments`: at most 15
+  minutes, the ceremony's stored challenge, consumed once by the passkey it
+  admitted). Table triggers: `ELV01` the subject is not a registered human or
+  is linked as another human's agent (checked when the ticket opens AND when
+  it completes), `ELV03` not the append-only shape (database-supplied
+  provenance; no confirmed-act path yet; a ticket takes only a challenge
+  while live and one consumption; a passkey takes only one revoke and its
+  use, the counter never going back; a revoked passkey is final), `ELV04` the
+  ticket is not live. FORCE RLS on both: the application role keeps SELECT
+  but its policies show it no row, and it holds no DML; writes admit a
+  privileged session or a maintenance-owned definer frame. Definers:
+  `epigraph_create_passkey_enrollment` and `epigraph_revoke_passkey`
+  (maintenance-only; `epigraph-operator passkey-enroll` / `revoke-passkey`),
+  and the three the unauthenticated ceremony calls on the request DSN,
+  `epigraph_enrollment_for_ceremony`,
+  `epigraph_set_passkey_enrollment_challenge`,
+  `epigraph_complete_passkey_enrollment`. Audited from the tables:
+  `platform.passkey_enrollment_created`, `_registered`, `_revoked`. Registered
+  in `schema_contract.rs::migration_124_passkey_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 124) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/person_authenticators.rs` and
+  `epigraph-cli/tests/operator_passkey_cli.rs`. Undo:
+  `docs/runbooks/124-undo.sql` (drops both tables and every 124 function;
+  roll back every binary that calls one first). Checked before claiming: no
+  open PR branch carries a `124`. **Applied to a throwaway database only, NOT
+  to any deployed database.**
+
+- **125**: public `elevation` — elevation tickets and elevation sessions,
+  and `epigraph_is_elevated()`. INERT: nothing stamps `epigraph.elevation_id`
+  / `epigraph.family_id` yet and no row policy reads the function.
+  `elevation_tickets`: one per request (the session principal, its human
+  client and refresh family, `grant` or `connector` mode, a reason, the
+  hashed grant-mode secret, the ceremony's stored challenge, ONE outcome:
+  `confirmed` with its session or `refused` with why; 5 minutes).
+  `elevation_sessions`: one per confirmed ticket (the person, the assignment
+  of an `elevates` role it rests on, client, family, passkey; CHECK at most
+  15 minutes; one end; a partial unique index allows one un-ended session per
+  family). Table triggers: `ELV02` the subject may not elevate (operator
+  ruling D2: a registered human that is no other human's agent, holding a
+  LIVE assignment of an `elevates` role, with a live passkey, on a live
+  family of its own human client; never `instance_admins`), `ELV03` not the
+  append-only shape, `ELV06` the ticket is not live or the family is already
+  elevated; the confirmation RETURNS its audited refusals (`ELV02`, `ELV05`
+  for a regressed signature counter) instead of raising them. Five end
+  triggers: `role_assignments` (the assignment revoked), `human_operators`
+  (the registration revoked), `refresh_tokens` (the family revoked for any
+  reason but a rotation: reuse, RFC 7009, a denied refresh, a client-wide
+  revoke), `oauth_clients` (the session's client leaves `active` or stops
+  being the person's human client) and `person_authenticators` (the passkey
+  that confirmed it revoked); expiry is lazy. Liveness is one predicate, `epigraph_elevation_session_is_live`,
+  shared by `epigraph_is_elevated`, `epigraph_elevation_live` and the
+  grant-mode redemption, judged on the statement's clock and re-checking the
+  assignment, the family and its client, and the passkey; never live on a
+  privileged login (a superuser, a BYPASSRLS role or a maintenance member)
+  nor on a connection switched to a superuser or BYPASSRLS role (the
+  session's `role` setting; review cp3), and never before the recorder gate
+  opens. `epigraph_is_elevated` and `epigraph_elevation_live` also require the
+  connection to declare the per-access recorder (`epigraph.access_recorder` =
+  `on`, stamped only by a build that records: the API server and the MCP
+  HTTP transport, through `ScopedPool::connect_recording_elevated_access`), so a
+  unit on a build without the recorder never elevates on a gate-opened
+  database (review cp3). FORCE RLS on
+  both: the application role keeps SELECT but its policies show it no row,
+  and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
+  (principal-bound), `epigraph_ticket_for_ceremony`,
+  `epigraph_set_elevation_ticket_challenge`, `epigraph_passkeys_for_ticket`,
+  `epigraph_confirm_elevation`, `epigraph_redeem_elevation_ticket`,
+  `epigraph_elevation_live` (principal-bound), `epigraph_end_elevation`,
+  `epigraph_is_elevated`; NOT app-callable: `epigraph_live_elevating_assignment`,
+  `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
+  `epigraph_end_expired_elevations`, and the recorder gate
+  `epigraph_elevated_access_ready` (ships `false`: no session is live until
+  the migration that opens elevation replaces it, once the preconditions in
+  125's header hold; review cp2, cp3. That migration is 132.)
+  Audited from the tables: `platform.elevation_requested`, `_refused`,
+  `platform.elevated`, `platform.elevation_ended` (carrying the operator's
+  `--reason` as `operator_reason` when a privileged login ended it), and
+  `platform.passkey_counter_regressed`. Registered in
+  `schema_contract.rs::migration_125_elevation_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 125) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/elevation_sessions.rs`. Undo:
+  `docs/runbooks/125-undo.sql` (refuses while a policy reads
+  `epigraph_is_elevated()`; drops the end triggers, both tables and every 125
+  function; run it BEFORE 124-undo). Checked before claiming: no open PR
+  branch carries a `125`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
+
+- **126** `126_elevated_arms.sql` (elevation plan EL-7, `-- no-transaction`):
+  the ELEVATED READ ARMS and the elevated WRITE REFUSAL. Per armed table, one
+  PERMISSIVE `<t>_elevated_read FOR SELECT TO epigraph_app USING ((SELECT
+  epigraph_is_elevated()))` and three RESTRICTIVE `<t>_elevated_no_insert` /
+  `_update` / `_delete TO epigraph_app` with `NOT (SELECT
+  epigraph_is_elevated())`; no existing policy body changes. `TO
+  epigraph_app` so definers (which run as `epigraph_maintenance`) are not
+  refused and `epigraph_is_elevated()` cannot recurse. The census (every
+  row-security table in exactly one list): read + refusal for T-OWN,
+  T-OWN-PRIV, T-DER, T-EDGE, T-AGENT, T-GROUP (25 tables); read only for the
+  two T-AUDIT tables (`security_events`, `privatization_audit`); refusal
+  only for the eight T-DROP tables; 13 excluded with a reason (the
+  elevation and passkey tables, the governance tables `epigraph_is_elevated()`
+  reads, `instance_admins`, `evidence_visibility_pins`, the privatization
+  plans, and the two bypass-only tables). Pinned from the catalog by
+  `epigraph-db/tests/elevation_arms_census.rs`; behaviour in
+  `epigraph-db/tests/elevated_arms.rs`. Lock plan: one table per `DO` block,
+  each followed by `COMMIT;` (see the `-- no-transaction` section below),
+  with a transaction-local 3 s lock timeout and drop-before-create, so a
+  lock timeout fails the file at one table with the earlier tables armed and
+  no `_sqlx_migrations` row, and a rerun resumes. Undo:
+  `docs/runbooks/126-undo.sql` (run it BEFORE 125-undo, which refuses while
+  any policy reads `epigraph_is_elevated()`). Inert until a session is
+  elevated: for every other session the arm is false and every refusal true.
+  Checked before claiming: no open PR branch carries a `126`. **Applied to a
+  throwaway database only, NOT to any deployed database.**
+
+- **127** `127_elevated_access.sql` (elevation plan EL-8): the ELEVATED-ACCESS
+  LOG. `elevated_access` (FORCE RLS; append-only: a BEFORE INSERT guard
+  binds each row to its session's person, assignment and reason, stamped now
+  by the inserting login, and a BEFORE UPDATE OR DELETE guard refuses every
+  login, `ELV03`). `epigraph_record_elevated_access(surface, args,
+  row_count, candidate_ids)` is refused (`ELV07`) unless THIS connection is
+  elevated (`epigraph_is_elevated()`); it takes the session, person,
+  assignment and reason from the session row and decides the OWNER GROUPS
+  itself: the private rows among the candidate ids that the elevator could
+  not read unelevated, by each table's own tenancy rule (the 126 read-armed
+  owner-group tables keyed by a uuid `id`, edges by owner AND co-owner,
+  another agent's `recall_events` by owner group, groups and memberships).
+  Read: `elevated_access_subject_read` admits a live ADMIN member of a named
+  group (`epigraph_admin_group_ids()`, principal-bound, argument-free);
+  `epigraph_elevated_access_audit(since, limit)` serves `reads_audit` holders,
+  an elevated session and privileged sessions (123's audit-reader pattern).
+  The recorder gate (`epigraph_elevated_access_ready()`, 125) is NOT opened:
+  of the opening conditions in 125's header, pinned evidence is settled (the
+  operator's interim ruling: an elevated session may read it, and the read is
+  recorded for the row's owner) and `recall_events` is attributed here, but
+  the API refusal of elevated non-GET requests is not built (EL-10 builds it
+  later, in `epigraph-api`, and the gate still stays closed), so no session is
+  live after 127 either. Registers: the census EXCLUDED list, the
+  FORCE registers (state.rs, locked_decisions, rls_enforcement, 079-undo),
+  rls_enforcement's session helpers. Behaviour in
+  `epigraph-db/tests/elevated_access.rs`. Checked before claiming: no open PR
+  branch carries a `127`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
+
+- **128** `128_admin_scope_enforcement.sql` (elevation plan EL-9): the
+  ADMIN-SCOPE ARMING SWITCH, shipped UNARMED. `admin_scope_enforcement` (one
+  row, seeded unarmed; no row security, 122's arming-record precedent: the
+  application holds SELECT only, the maintenance role SELECT and UPDATE of
+  `armed` and `reason`). A BEFORE guard (`ADS01`) refuses INSERT and DELETE for
+  every login, refuses an UPDATE that does not change `armed` or carries no
+  reason, and stamps `changed_at` / `changed_by`; an AFTER UPDATE trigger
+  writes `platform.admin_scopes_armed` / `platform.admin_scopes_disarmed` for
+  every change, a direct maintenance statement's too.
+  `epigraph_admin_scopes_armed()` (app-callable) is read by the token
+  endpoint's mint chokepoint, registration, client approval and the operator
+  CLI. `epigraph_set_admin_scope_enforcement(armed, reason)` arms or disarms
+  (maintenance only, `ADS02`). `epigraph_record_admin_scope_would_strip(client,
+  grant, scopes)` (app-callable: `oauth.` is a privileged event prefix since
+  118) records the ROL-11b measurement while unarmed: a fixed grant label,
+  scopes the client holds, at most one event per client per hour (`ADS03`
+  otherwise). Behaviour in `epigraph-db/tests/admin_scope_enforcement.rs`.
+  Checked before claiming: no remote branch carries a `128`. **Applied to a
+  throwaway database only, NOT to any deployed database.**
+
+- **129** `129_standing_admin_arms_follow_the_switch.sql` (elevation plan
+  EL-10): the four STANDING instance-admin read arms (`security_events_read`,
+  `privatization_audit_read`, `privatization_plans_read`,
+  `privatization_plan_items_read`) follow 128's switch. Each policy is
+  recreated with its `epigraph_is_instance_admin(principal)` conjunct replaced
+  by `(SELECT CASE WHEN epigraph_admin_scopes_armed() THEN
+  epigraph_is_elevated() ELSE epigraph_is_instance_admin(principal) END)`;
+  every other conjunct is byte-identical (the plans' and audit's group-admin
+  conjunct stays, so an elevated custodian reads only the plans of groups it
+  administers). Unarmed, nothing changes; arming is one row change. One
+  transaction, 3 s `lock_timeout` (083/087's form). Behaviour in
+  `epigraph-db/tests/elevated_arms.rs`; undo
+  (`docs/runbooks/129-undo.sql`, BEFORE 128-undo, whose `DROP FUNCTION`
+  refuses while these policies call the switch) in
+  `epigraph-db/tests/admin_scope_enforcement.rs`. The recorder gate stays
+  CLOSED. Checked before claiming: no remote branch carries a `129`.
+  **Applied to a throwaway database only, NOT to any deployed database.**
+
+- **130** `130_pending_admin_acts.sql` (elevation plan EL-12a): PENDING
+  ADMIN ACTS. `pending_admin_acts` (FORCE RLS; the app reads no row): an act
+  of a closed kind (`role.grant`, `role.end`, `claim.custodial_supersede`,
+  `passkey.register`) is PROPOSED by an elevated session
+  (`epigraph_propose_admin_act`, ELV07 otherwise; the insert guard binds the
+  row to a live elevation of its proposer), its args stored in canonical form
+  (`epigraph_admin_act_args`, `epigraph_canonical_json`: keys in byte order,
+  no whitespace, no numbers) with their SHA-256 digest; CONFIRMED once by a
+  live passkey of the proposer (`epigraph_confirm_admin_act`; refusals
+  recorded, audited and returned, never raised); CONSUMED once from inside the
+  maintenance write it authorizes (`epigraph_consume_admin_act`: ELV08 not
+  live, ELV09 another kind, other args or another actor). The 123 guards are
+  amended (`epigraph_role_assignments_guard_insert` / `_guard_update` /
+  `_audit`): a `grant_act_id` must name a confirmed `role.grant` act whose
+  args the guard recomputes from the row and whose proposer is `granted_by`
+  (no longer CUS02 outright); the new `revoke_act_id` column does the same for
+  `role.end`; `epigraph_record_custodial_act` gains `p_act_id` (the
+  six-parameter form is a wrapper); 124's enrollment guard admits
+  `confirmed_act` on a `passkey.register` act. ELV10 (EQ-2 (a)): a grantor
+  holding a live passkey, an end while any live custodian holds one, a
+  `claim.supersede` by a passkey holder, and a later passkey all need a
+  confirmed act; bootstrap stays unconfirmed and every `platform.` row names
+  its confirmation. New overloads `epigraph_grant_role(.., p_act)`,
+  `epigraph_end_role_assignment(.., p_act)`,
+  `epigraph_create_passkey_enrollment(.., p_act)`. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs`; undo
+  (`docs/runbooks/130-undo.sql`, which archives the acts, restores 123's and
+  124's bodies verbatim and keeps the column; BEFORE 129-undo and 123-undo).
+  The recorder gate stays CLOSED here, so no act can be proposed on a
+  deployed database until the gate opens (132). Checked before claiming: no
+  remote branch carries a `130`. **Applied to a throwaway database only, NOT to any deployed
+  database.**
+
+- **131** `131_admin_acts_of_principal.sql` (elevation plan EL-12b): a person
+  reads their OWN admin acts. 130's act table admits no application-role read,
+  so `GET /api/v1/admin/acts?mine` needs one principal-bound reader:
+  `epigraph_admin_acts_of_principal(p_limit)` lists the acts whose proposer is
+  the session principal, newest first, at most `p_limit` (clamped to 1..200;
+  NULL reads 50); an unstamped connection lists nothing. It returns the act's
+  kind, canonical args and digest, target, reason, elevation, times and each
+  step's outcome, NEVER the ceremony state, the assertion evidence, the
+  consuming login or the result. Owned by the maintenance role (under any
+  other owner the table's definer-frame policy admits no row); the app may
+  EXECUTE it. No table, policy or earlier body changes. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs`; undo
+  (`docs/runbooks/131-undo.sql`, BEFORE 130-undo: a `LANGUAGE sql` body
+  records no dependency on the table it reads). Checked before claiming: no
+  remote branch carries a `131`. **Applied to a throwaway database only, NOT
+  to any deployed database.**
+
+- **132** `132_open_elevation.sql` (elevation plan EL-14): OPENS ELEVATION.
+  The one migration of the stack that replaces 125's recorder gate,
+  `epigraph_elevated_access_ready()`: its body becomes a READINESS TEST (true
+  while the per-access recorder is installed: the `elevated_access` table and
+  `epigraph_record_elevated_access` both exist), so taking 127 back out
+  closes the gate by itself. Every condition 125's header lists under
+  "OPENING IT WAITS ON MORE THAN THE RECORDER" is met by an earlier migration
+  or batch: pinned evidence (interim operator ruling, recorded for the row's
+  owner, 127), the API's refusal of elevated non-GET requests and the MCP
+  transport's refusal of elevated non-read and federated tools, and
+  `recall_events` attributed by owner group (127). The second key (the
+  connection declares the recorder; only a recording build does) is
+  unchanged. No table, policy or grant changes; `CREATE OR REPLACE` keeps the
+  owner and ACL (pinned by 125's register in `schema_contract.rs`). Behaviour
+  in `epigraph-db/tests/elevated_access.rs` (closed through 131, open at 132,
+  follows the recorder) and `elevation_sessions.rs`. Undo
+  (`docs/runbooks/132-undo.sql`, restores 125's `SELECT false`; run it FIRST,
+  before every other elevation undo). The operational preconditions for the
+  first real elevation are in `docs/deploy.md`, "Opening elevation (migration
+  132)". Checked before claiming: no remote branch carries a `132`.
+  **Applied to a throwaway database only, NOT to any deployed database.**
+
+- **133+**: public next (the elevation stack stays at or below 139; 140-159
+  are reserved)
+
+- **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
+  slot from the drain block 140-159, so 123-139 stay free for the in-flight
+  custodian and elevation series). Redefines 118's
+  `epigraph_refresh_token_rotate` (`CREATE OR REPLACE`, same signature, owner
+  and ACL re-asserted): the successor keeps the presented token's scopes
+  narrowed to the client's grant instead of taking the whole grant (RFC 6749
+  section 6). Pinned by `app_role_table_lockdown.rs::rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients_grant`
+  and `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`.
+  Undo is in the file's header. **Deploy order:** after 123-129 have been
+  applied (sqlx would otherwise apply them out of order after 140).
+
+- **141**: public `access_token_revocation` (backlog drain U003; slot from the
+  drain block 140-159, so 123-139 stay free for the in-flight custodian and
+  elevation series). Adds `revoked_access_tokens` (a `jti` denylist; no
+  tenancy, no row security) and its only write path, the maintenance-owned
+  definer `epigraph_access_token_revoke(jti, client, exp)`, which also prunes
+  rows whose token expired over 24 hours ago (a clock-skew margin on the
+  database clock; the same margin bounds which already expired tokens it still
+  records). `epigraph_app` keeps SELECT and
+  loses INSERT/UPDATE/DELETE/TRUNCATE. Written by `/oauth/revoke` (signature
+  verified first), read by both API bearer middlewares, `/oauth/introspect` and
+  the MCP bearer middleware. Pinned by `app_role_table_lockdown.rs` (its
+  `CLOSED` list and `::access_token_revocations_go_through_the_definer`,
+  `::access_token_revocation_prune_keeps_a_day_of_clock_skew_margin`,
+  `::a_token_expired_inside_the_skew_margin_is_still_recorded`) and
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`.
+  Undo is in the file's header. **Deploy order:** with the API and MCP binaries
+  that read it (they fail closed without it), and after 123-129 have been
+  applied (sqlx would otherwise apply them out of order after 141).
+
+Next public migration **outside both reserved tenancy ranges** must be `133` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
 the same commit as the file**. Picking a colliding version (checksum mismatch on
 a `_sqlx_migrations` row that's already applied) will panic the api binary on
 restart.
+
+- **144**: public `null_retired_claim_embedding_3072` (drain U016, backlog
+  9217b3fb) — backfills `embedding_3072 = NULL` on retired claims and widens
+  052's `chk_deprecated_no_embedding` (same name) to
+  `is_current OR (embedding IS NULL AND embedding_3072 IS NULL)`. Slot from the
+  drain's migration-slot register; checked before claiming: no open PR branch
+  carries a `144`. Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/deprecated_no_embedding_3072.rs`. **Deploy order:** the
+  `epigraph-cli reembed` binary that selects only current claims first (an
+  older run raises 23514 after this file); apply as a role that bypasses row
+  security. Undo is in the file's header. **Applied to throwaway databases
+  only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
@@ -843,7 +1186,10 @@ migration. It is not: sqlx-core 0.8.6 honours a leading `-- no-transaction` line
 (`src/migrate/source.rs:127`) and sqlx-macros-core propagates the flag into the
 compile-time `migrate!()` literal, so `epigraph-migrate` honours it too.
 
-### THE RULE: one statement per `-- no-transaction` file
+### THE RULE: one statement per `-- no-transaction` INDEX file
+
+(A second, different shape exists for per-table policy DDL: see "Per-table
+policy files" below. It applies to `126_elevated_arms.sql` only.)
 
 Not style. sqlx-postgres 0.8.6's `execute_migration` runs
 `conn.execute(&*migration.sql)` (`src/migrate.rs:280`) — the **simple query
@@ -866,7 +1212,33 @@ Two further constraints:
   this tree opens with one; these four must not).
 * A `-- no-transaction` file's `_sqlx_migrations` bookkeeping is **not atomic**
   with its DDL (`sqlx-postgres/src/migrate.rs:214`). Keep such files to index
-  statements only, all `IF NOT EXISTS`, so a failure can never strand a column.
+  statements only, all `IF NOT EXISTS`, so a failure can never strand a column
+  (or to the idempotent per-table policy shape below).
+
+### Per-table policy files (`126_elevated_arms.sql`)
+
+`CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so a file arming many
+tables in one transaction holds every one of those locks until the end. The
+implicit block above is the trap: a multi-statement `-- no-transaction` file
+is STILL one transaction unless it commits along the way. Unlike `CREATE INDEX
+CONCURRENTLY`, a `DO` block does not refuse the implicit block, and an
+interleaved `COMMIT;` DOES end it (measured on the test cluster: with a
+`COMMIT;` after each table's block, a later table's lock timeout left the
+earlier tables' policies in place; without it, it rolled all of them back).
+PostgreSQL answers each such `COMMIT` with `WARNING: there is no transaction
+in progress`; that is expected and the COMMIT commits. The shape, pinned by
+`tenancy_migration_shape.rs::a_policy_arm_no_transaction_file_commits_each_table`:
+
+* every statement is a `DO $$ … $$` block followed by its own `COMMIT;`;
+* every block bounds its lock wait with `set_config('lock_timeout', '3s',
+  true)` (transaction-local; a plain `SET` would outlive the file on the
+  migrator's connection and apply to the next migration in the same run);
+* every `CREATE POLICY` is preceded by its `DROP POLICY IF EXISTS`, so a rerun
+  after a lock timeout is a no-op on the armed tables and resumes at the
+  first unarmed one.
+
+A failure leaves no `_sqlx_migrations` row and the tables before it armed;
+rerun the migration.
 
 ### Recovery from a failed `CREATE INDEX CONCURRENTLY`
 

@@ -16,6 +16,7 @@ pub mod theme_cluster;
 
 pub type CandidatePair = (Uuid, Uuid);
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait Blocker: Send + Sync {
     /// For the given seed claim ids, return candidate pairs in canonical

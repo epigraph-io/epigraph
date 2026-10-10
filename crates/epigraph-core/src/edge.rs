@@ -125,6 +125,41 @@ impl std::hash::Hash for Edge {
 
 /// Well-known relationship types for `EpiGraph`
 pub mod relationships {
+    // ── Case-folded relationships ────────────────────────────────────
+
+    /// Relationships stored today in TWO spellings that mean the same thing:
+    /// the lower-case form written by MCP `link_epistemic` (and named by this
+    /// module's constants) and the upper-case form written by the HTTP edge
+    /// route, the DS evidence writers and the cross-source matcher
+    /// (`SUPPORTS`, `CONTRADICTS`, `CORROBORATES`, `REFUTES`).
+    ///
+    /// A closed list, never a blanket `lower()`: other upper/lower pairs are
+    /// DIFFERENT relationships (`REFINES` is synthesis→synthesis while
+    /// `refines` is claim→claim; `DERIVED_FROM` and `derived_from` carry
+    /// different factor strengths), so folding them would merge distinct
+    /// meanings.
+    pub const CASE_FOLDED_RELATIONSHIPS: &[&str] =
+        &["supports", "contradicts", "corroborates", "refutes"];
+
+    /// Every stored spelling a reader must match to see all rows of
+    /// `relationship`.
+    ///
+    /// For a member of [`CASE_FOLDED_RELATIONSHIPS`] (in any ASCII case) this
+    /// is its lower-case and upper-case spelling; any other relationship is
+    /// returned unchanged as the single spelling, so `REFINES` never matches
+    /// `refines`. Bind the result as an array (`relationship = ANY($n)`) to
+    /// keep the btree index on `edges.relationship` usable.
+    #[must_use]
+    pub fn relationship_spellings(relationship: &str) -> Vec<String> {
+        match CASE_FOLDED_RELATIONSHIPS
+            .iter()
+            .find(|r| r.eq_ignore_ascii_case(relationship))
+        {
+            Some(r) => vec![(*r).to_string(), r.to_ascii_uppercase()],
+            None => vec![relationship.to_string()],
+        }
+    }
+
     /// Claim A supports Claim B (evidence relationship)
     pub const SUPPORTS: &str = "supports";
 
@@ -198,11 +233,62 @@ pub mod relationships {
 
     /// Instrument is manufactured by an organization
     pub const MANUFACTURED_BY: &str = "MANUFACTURED_BY";
+
+    // ── Symmetric claim/claim relationships ──────────────────────────
+
+    /// Relationships that state ONE fact about an unordered pair of claims:
+    /// "A contradicts B" is "B contradicts A". Writers dedup them on the
+    /// unordered pair (MCP `link_epistemic`, HTTP `POST /api/v1/edges`), so the
+    /// two call orders collapse onto one row instead of double-counting one
+    /// disagreement in DS / BP.
+    ///
+    /// Listed in the lower-case canonical spelling; use
+    /// [`is_symmetric_claim_relationship`] to test membership, which ignores
+    /// ASCII case so the upper-case `CONTRADICTS` / `CORROBORATES` the HTTP
+    /// allow-list admits are recognised too. Recognising a spelling does not
+    /// unify spellings: the writers' dedup probe still compares
+    /// `relationship` byte-exactly.
+    ///
+    /// The other epistemic relations (`supports`, `refutes`, `elaborates`,
+    /// `generalizes`, `specializes`) are directional and MUST NOT be added:
+    /// collapsing their orderings would erase information, not a duplicate.
+    pub const SYMMETRIC_CLAIM_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+
+    /// Whether `relationship` is one of [`SYMMETRIC_CLAIM_RELATIONSHIPS`],
+    /// ignoring ASCII case.
+    #[must_use]
+    pub fn is_symmetric_claim_relationship(relationship: &str) -> bool {
+        SYMMETRIC_CLAIM_RELATIONSHIPS
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(relationship))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symmetric_claim_relationships_match_either_case_and_exclude_directional_ones() {
+        use relationships::is_symmetric_claim_relationship as sym;
+        // Both spellings each writer admits: MCP lower case, HTTP upper case.
+        for rel in ["contradicts", "CONTRADICTS", "corroborates", "CORROBORATES"] {
+            assert!(sym(rel), "{rel} is symmetric");
+        }
+        // Directional epistemic relations, in both cases, and a near-miss.
+        for rel in [
+            "supports",
+            "SUPPORTS",
+            "refutes",
+            "elaborates",
+            "generalizes",
+            "specializes",
+            "alternative_of",
+            "contradict",
+        ] {
+            assert!(!sym(rel), "{rel} is directional or unknown");
+        }
+    }
 
     #[test]
     fn create_edge_between_nodes() {
@@ -255,5 +341,34 @@ mod tests {
                 .and_then(super::super::properties::PropertyValue::as_float),
             Some(0.85)
         );
+    }
+
+    #[test]
+    fn relationship_spellings_pairs_only_the_case_folded_relationships() {
+        use relationships::relationship_spellings as spell;
+        // A folded relationship, asked for in any case, yields both stored
+        // spellings: lower (MCP / core) and UPPER (HTTP route, DS writers,
+        // cross-source matcher).
+        for (asked, lower, upper) in [
+            ("supports", "supports", "SUPPORTS"),
+            ("SUPPORTS", "supports", "SUPPORTS"),
+            ("Contradicts", "contradicts", "CONTRADICTS"),
+            ("CORROBORATES", "corroborates", "CORROBORATES"),
+            ("refutes", "refutes", "REFUTES"),
+        ] {
+            let mut got = spell(asked);
+            got.sort();
+            assert_eq!(got, vec![upper.to_string(), lower.to_string()], "{asked}");
+        }
+        // Upper/lower pairs that are DIFFERENT relationships stay byte-exact.
+        for rel in [
+            "REFINES",
+            "refines",
+            "DERIVED_FROM",
+            "derived_from",
+            "supersedes",
+        ] {
+            assert_eq!(spell(rel), vec![rel.to_string()], "{rel} must not fold");
+        }
     }
 }
