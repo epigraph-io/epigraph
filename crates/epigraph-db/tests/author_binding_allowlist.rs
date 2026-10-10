@@ -1377,6 +1377,109 @@ async fn the_allowlist_is_maintenance_written_append_only_and_audited(pool: PgPo
     );
 }
 
+/// A direct maintenance INSERT that names an agent other than the client's
+/// own is refused by the insert guard, and nothing is stored (D-4: the row
+/// pins the client's agent; the guard's other checks must never run against
+/// a supplied agent).
+///
+/// Verified to fail: the guard's pinned-agent check removed (the row lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_direct_insert_naming_another_agent_is_refused(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let s = service(&pool, "service-s").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "other").await;
+    let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO author_binding_clients (client_id, agent_id, operator_id, reason) \
+             VALUES ($1, $2, $3, 'direct')",
+        )
+        .bind(s.id)
+        .bind(other)
+        .bind(h)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_refused(&r, OBJECT_STATE, "agent is", "a mismatched pinned agent");
+    assert_eq!(
+        (
+            events(&pool, ALLOWED_EVENT, s.id).await,
+            binding(&pool, Some(s.agent)).await
+        ),
+        (0, UNBOUND),
+        "nothing stored, nothing audited"
+    );
+}
+
+/// A direct maintenance INSERT with a blank reason is refused by the insert
+/// guard itself (the definer's own reason check never runs on this path).
+///
+/// Verified to fail: the guard's reason check removed (the row lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_direct_insert_with_a_blank_reason_is_refused(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let s = service(&pool, "service-s").await;
+    let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO author_binding_clients (client_id, operator_id, reason) \
+             VALUES ($1, $2, '   ')",
+        )
+        .bind(s.id)
+        .bind(h)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_refused(
+        &r,
+        NULL_VALUE,
+        "reason is required",
+        "a blank direct reason",
+    );
+    assert_eq!(binding(&pool, Some(s.agent)).await, UNBOUND);
+}
+
+/// A direct maintenance INSERT of an already-revoked row is refused: an
+/// allowance is recorded live and revoked only through the revoke path, so a
+/// dead row (which would also block the client from ever being allowed) is
+/// never stored with an `..._allowed` audit row.
+///
+/// Verified to fail: the guard's live-on-insert check removed (the row lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_direct_insert_of_a_revoked_row_is_refused(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let s = service(&pool, "service-s").await;
+    let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO author_binding_clients (client_id, operator_id, reason, revoked_at, \
+                                                 revoked_by, revoked_reason) \
+             VALUES ($1, $2, 'direct', now(), 'x', 'x')",
+        )
+        .bind(s.id)
+        .bind(h)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_refused(
+        &r,
+        OBJECT_STATE,
+        "recorded live",
+        "a pre-revoked direct row",
+    );
+    assert_eq!(
+        events(&pool, ALLOWED_EVENT, s.id).await,
+        0,
+        "nothing audited"
+    );
+    allow(&pool, s.id, h, "allowed after the refused direct row")
+        .await
+        .expect("the client is still allowable");
+}
+
 // =====================================================================
 // T5 / T10: links and the allowlist.
 // =====================================================================
@@ -1434,6 +1537,75 @@ async fn a_link_is_refused_for_an_allowlisted_agent_until_the_allowance_is_revok
     assert_eq!(
         binding(&pool, Some(s.agent)).await,
         (Some("live_link".to_string()), Some(h), Some(h))
+    );
+}
+
+/// The link guard's "unmet" column: a live allowance whose client is
+/// SUSPENDED (not revoked) still refuses a new link. Suspending is the
+/// incident step that comes before a revoke; a link landing then would make
+/// the agent stdio-only, the side effect the guard exists to refuse.
+///
+/// Verified to fail: the guard narrowed to `c.status = 'active'` (the link
+/// lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_suspended_allowlisted_client_still_refuses_a_link(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let s = service(&pool, "service-s").await;
+    allow(&pool, s.id, h, "test").await.expect("allow");
+    set_status(&pool, s.id, "suspended").await;
+    let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query("SELECT * FROM public.epigraph_link_operator($1, $2)")
+            .bind(s.agent)
+            .bind(h)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await;
+    assert_refused(
+        &r,
+        OBJECT_STATE,
+        LINK_GUARD_FRAGMENT,
+        "suspended client, live allowance",
+    );
+    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = $1")
+        .bind(s.agent)
+        .fetch_one(&pool)
+        .await
+        .expect("links");
+    assert_eq!(links, 0, "no link recorded");
+}
+
+/// An exact re-link (the agent already holds its link row) is discarded by
+/// the caller's `ON CONFLICT DO NOTHING`, never refused by the link guard,
+/// even when a live allowance for the agent exists (planted: the state a
+/// concurrent allow and link can reach under REPEATABLE READ). A stdio
+/// process re-links at every start, so a refusal here would be a fatal
+/// startup.
+///
+/// Verified to fail: the guard's existing-link early return removed (the
+/// re-link raises 55000).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_exact_relink_is_never_refused(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "human-h").await;
+    let (l, _) = fixture::seed_agent_with_group(&pool, "linked").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, l, h)
+            .await
+            .expect("first link");
+    }
+    let c = new_client(&pool, Some(l), "service", "active", None).await;
+    plant(&pool, c, l, h, false).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, l, h)
+        .await
+        .expect("an exact re-link is discarded, not refused");
+    drop(conn);
+    assert_eq!(
+        binding(&pool, Some(l)).await,
+        (Some("live_link".to_string()), Some(h), Some(h)),
+        "the link decides"
     );
 }
 
