@@ -674,7 +674,9 @@ async fn direct_inserts_meet_the_same_rules_and_audit(pool: PgPool) {
 }
 
 /// Kills: the role CHECK dropped (23514 expected); the definer's existence check
-/// removed (the FK would answer 23503 instead of 22023).
+/// removed (the guard would then answer the same 22023 "does not exist", so the
+/// definer's own prefix is asserted, with the guard's absent); the guard's
+/// existence check removed (the direct INSERT would reach the FK's 23503).
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_known_roles_and_real_agents_register(pool: PgPool) {
     let a = seed_agent(&pool, "a").await;
@@ -686,8 +688,32 @@ async fn only_known_roles_and_real_agents_register(pool: PgPool) {
         &[],
         "unknown role",
     );
+    // Each layer answers a missing agent itself: the definer first (its own
+    // prefix, and NOT the guard's), and the guard for a direct INSERT.
     let missing = maint_register(&pool, Some(role()), Uuid::new_v4(), "x").await;
-    assert_refused(&missing, "22023", "does not exist", &[], "missing agent");
+    assert_refused(
+        &missing,
+        "22023",
+        "epigraph_register_system_agent: agent",
+        &["system_agents: agent"],
+        "missing agent (definer)",
+    );
+    let direct = maint_exec(
+        &pool,
+        &format!(
+            "INSERT INTO system_agents (role, agent_id, reason) VALUES ('{}', $1, 'x')",
+            role()
+        ),
+        Uuid::new_v4(),
+    )
+    .await;
+    assert_refused(
+        &direct,
+        "22023",
+        "system_agents: agent",
+        &["epigraph_register_system_agent"],
+        "missing agent (guard, direct INSERT)",
+    );
     let blank = maint_register(&pool, Some(role()), a, "").await;
     assert_refused(
         &blank,
@@ -862,8 +888,10 @@ async fn a_registered_system_agent_never_becomes_a_human_operator(pool: PgPool) 
 }
 
 /// Kills: the RESTRICTIVE policy not created; its prefix length or its
-/// `lower(btrim(..))` normalisation wrong. The control proves the refusal is
-/// the new policy, not a general refusal of `operator.` rows.
+/// `lower(btrim(..))` normalisation wrong; its `created_at = now()` conjunct
+/// removed (the back-dated maintenance row lands). The controls prove the
+/// refusal is the new policy, not a general refusal of `operator.` rows or of
+/// the maintenance role's INSERT.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_registration_event_type_is_reserved(pool: PgPool) {
     let p = seed_agent(&pool, "p").await;
@@ -889,6 +917,37 @@ async fn the_registration_event_type_is_reserved(pool: PgPool) {
         .await
         .expect("control: another operator.* type is still app-writable");
     assert_eq!(audit_rows(&pool).await, 0);
+
+    // A privileged session's row is stamped now(): never back-dated.
+    let maint_insert = |created_at: &'static str| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+                let r = sqlx::query(&format!(
+                    "INSERT INTO security_events (event_type, agent_id, success, details, \
+                                                  created_at) \
+                     VALUES ('{EVENT}', $1, true, '{{}}'::jsonb, {created_at})"
+                ))
+                .bind(p)
+                .execute(&mut *conn)
+                .await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    let back_dated = maint_insert("now() - interval '1 day'").await;
+    assert_refused(
+        &back_dated,
+        "42501",
+        "row-level security",
+        &[],
+        "a back-dated registration event on the maintenance role",
+    );
+    maint_insert("now()")
+        .await
+        .expect("control: the maintenance role may write the event at now()");
+    assert_eq!(audit_rows(&pool).await, 1, "only the control landed");
 }
 
 // ── A registered system agent is never retire-linked, by any door ──────────
