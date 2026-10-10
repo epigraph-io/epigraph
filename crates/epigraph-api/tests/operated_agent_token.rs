@@ -924,5 +924,9 @@ async fn an_operated_agent_on_the_allowlist_still_cannot_mint(pool: PgPool) {
         );
         let (status, body) = refresh_grant(&pool, &refresh).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "(c) {what}: {body}");
+        assert!(
+            body.to_string().contains(&link_to.to_string()),
+            "(c) {what}: {body}"
+        );
     }
 }

@@ -1301,7 +1301,12 @@ async fn the_allowlist_is_maintenance_written_append_only_and_audited(pool: PgPo
         (conn, r)
     })
     .await;
-    assert!(forged.is_err(), "an app-forged platform event: {forged:?}");
+    assert_refused(
+        &forged,
+        INSUFFICIENT_PRIVILEGE,
+        "security_events_platform_privileged",
+        "an app-forged platform event",
+    );
 
     // A concurrent retry: the second caller waits on the lock, then finds the row.
     let racer = service(&pool, "racer").await;
