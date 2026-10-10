@@ -2417,7 +2417,14 @@ them. Record each deployed commit as you go.
 **Arming the admin-scope chokepoints** (a separate, later step): only after
 every request unit runs the check-chokepoint build (129's section) and the
 `oauth.admin_scope_would_strip` events have read zero for a soak window, run
-`epigraph-operator arm-admin-scopes --reason TEXT --apply`. Armed, standing
+`epigraph-operator arm-admin-scopes --reason TEXT --apply`. The soak cannot
+read zero while the `epigraph-admin` canonical client holds admin-only
+scopes: `bootstrap_clients` reconciles its canonical set (every scope, the
+admin-only ones included) without reading the switch, so every mint for it
+writes a would-strip event. Rehome its consumers first (onto the maintenance
+CLI, or an elevation) and take the admin-only scopes out of its canonical set
+and its `granted_scopes`. Armed, the mint chokepoint strips them at issue
+whatever the client holds, so this blocks the soak; it never fails open. Armed, standing
 admin-only scopes count for nothing on an unelevated request and no grant
 mints them; admin reads need an elevation; admin writes are maintenance-CLI
 acts. The rollback is `disarm-admin-scopes --reason TEXT --apply` (no DDL).

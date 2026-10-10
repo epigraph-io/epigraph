@@ -746,8 +746,10 @@ fn join_uuids(ids: Option<&[uuid::Uuid]>) -> String {
 ///
 /// Plan §4.5 requirement 1 is enforced structurally rather than by review: this
 /// function is private, takes the `&Viewer` itself, and has exactly two callers
-/// ([`ScopedPool::acquire_as`] and [`ScopedPool::begin_as`]), so a `Viewer`
-/// cannot be constructed and a connection then stamped from a different one.
+/// ([`ScopedPool::acquire_as`] and `ScopedPool::begin_stamped`, which
+/// [`ScopedPool::begin_as`] and [`ScopedPool::begin_read_as`] go through), so a
+/// `Viewer` cannot be constructed and a connection then stamped from a
+/// different one.
 ///
 /// `is_local = true` is a **silent no-op outside a transaction block**, which is
 /// why `begin_as` verifies its effect in debug builds.
@@ -1269,6 +1271,9 @@ impl ScopedPool {
     /// # Errors
     /// * `DbError::InvalidData` if `v` is a bypass viewer (see
     ///   [`Self::acquire_as`]).
+    /// * `DbError::ElevatedReadOnly` if `v` is an ELEVATED viewer: an elevated
+    ///   session writes nothing (a transactional read takes
+    ///   [`Self::begin_read_as`]). Callers map it to a refusal, not a 500.
     /// * `DbError::ConnectionFailed` / `DbError::QueryFailed` on `BEGIN` or the
     ///   stamp.
     ///
