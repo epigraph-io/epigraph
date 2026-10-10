@@ -21,6 +21,11 @@
 //! key unless `--key-not-legacy-ok` is given (an agent that never held the
 //! legacy key, e.g. one created with a secret key from the start). A dry run
 //! only warns.
+//!
+//! The identity line is read before the transaction, so the refusal is checked
+//! twice: once on that line, and again inside the transaction against the key
+//! the definer actually recorded (`registered_public_key`). A rotation that
+//! commits in between is therefore refused and rolled back, not registered.
 
 use anyhow::bail;
 use epigraph_db::SystemAgentRole;
@@ -134,7 +139,8 @@ pub enum Outcome {
 ///
 /// # Errors
 /// `apply` on an agent whose current key is not the legacy key without
-/// `key_not_legacy_ok` (nothing was called); the definer refused (another
+/// `key_not_legacy_ok` (nothing was called, or, when the key changed after the
+/// identity was read, the call was rolled back); the definer refused (another
 /// agent is registered for the role, the agent is a human, an OAuth principal,
 /// an operator, retired-linked, missing; a blank reason); or a statement
 /// failed.
@@ -172,6 +178,26 @@ pub async fn register(
              registration is immutable)",
             identity.id
         );
+    }
+    // The key the definer snapshotted, not the one the identity line read: a
+    // rotation committed in between must not slip past the refusal above.
+    if apply && !key_not_legacy_ok {
+        let recorded: Vec<u8> = sqlx::query_scalar(
+            "SELECT s.registered_public_key FROM public.system_agents s WHERE s.role = $1",
+        )
+        .bind(role.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if recorded.as_slice() != role.legacy_public_key().as_slice() {
+            tx.rollback().await?;
+            bail!(
+                "refusing to register {} for the {role} role: its key changed after the identity \
+                 line was read and is NOT the role's legacy key now, so the registration would \
+                 protect the new key. Register BEFORE rotating the key, or pass \
+                 --key-not-legacy-ok if this agent never held it. Nothing was registered",
+                identity.id
+            );
+        }
     }
     if apply {
         tx.commit().await?;

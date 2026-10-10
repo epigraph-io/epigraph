@@ -1477,3 +1477,45 @@ async fn link_legacy_authors_excludes_a_registered_system_agent(pool: PgPool) {
     assert_eq!(link_row(&pool, s).await, None, "S keeps its one link slot");
     assert_eq!(link_row(&pool, author).await, Some((human, true)));
 }
+
+/// The `--apply` refusal of a non-legacy key holds at the moment the definer
+/// snapshots the key, not only at the identity line: an identity read before a
+/// concurrent rotation (here: a stale `key_is_legacy = true` for an agent whose
+/// key is not the legacy one) is refused inside the transaction and rolled
+/// back. Kills: the in-transaction re-check removed (the stale identity
+/// registers the rotated key).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_refuses_a_key_that_stopped_being_legacy_after_the_identity_line(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity, Outcome};
+    let (s, _) = fixture::seed_agent_with_group(&pool, "rotated-meanwhile").await;
+    let stale = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let id = stale.clone();
+    let refused = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("the rotated key is refused at registration time");
+    assert!(e.to_string().contains("--key-not-legacy-ok"), "{e:#}");
+    assert_eq!(registry_rows(&pool).await, 0, "rolled back");
+    assert_eq!(system_audit_rows(&pool).await, 0, "its audit row with it");
+
+    let id = stale.clone();
+    let forced = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, true).await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        forced.expect("control: --key-not-legacy-ok registers it"),
+        Outcome::Registered
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+}
