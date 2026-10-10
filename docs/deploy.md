@@ -2389,26 +2389,25 @@ CREATE on `public` re-creates under the same names do not reopen it), but run
 The per-migration sections above hold the detail; this is the order across
 them. Record each deployed commit as you go.
 
-**Deploy (W-list order).**
+**Deploy.** `epigraph-migrate` takes no target: it applies every embedded
+migration up to the build's head. Every build of `main` carries 124-132 (and
+160) together, so ONE build applies them all in ONE migrate step; the stack
+cannot be staged migration by migration from `main` (the per-migration
+sections above remain the reference for what each one does and needs). So,
+BEFORE the deploy that carries them:
 
-1. Migrate 124 (passkeys and enrollment tickets) and 125 (elevation tickets and
-   sessions; inert: the gate is closed).
-2. Deploy the binaries that understand elevation: `epigraph-api`, the HTTP and
-   fleet/stdio `epigraph-mcp` units, the maintenance CLIs
-   (`epigraph-operator`, `epigraph-tenancy-backfill`), the jobs runner. Old
-   binaries stamp no elevation pair and never elevate.
-3. Migrate 126 (the elevated read arms and write refusals) under its lock plan
-   (timers stopped, no long transaction, outside backup windows).
-4. Migrate 127 (the elevated-access log) and deploy the RECORDING builds (API
-   server, HTTP MCP units). Then 128 (the admin-scope switch, shipped
-   UNARMED) and 129 (the standing admin arms follow the switch, under the lock
-   plan), with the builds that read the switch.
-5. Migrate 130 (pending admin acts) with the CLIs that take `--act`, then 131
-   (a person reads their own acts) before the API and MCP builds that serve the
-   act routes and tool.
-6. Meet the preconditions in "Opening elevation (migration 132)", then deploy
-   the build that carries 132 (its migrate step opens the gate).
-7. Enroll the operator's passkey (`epigraph-operator passkey-enroll`, then the
+1. Meet 126's and 129's lock plans (timers stopped, no long transaction,
+   outside backup windows): both take locks on many tables in that one step.
+2. Meet the preconditions in "Opening elevation (migration 132)": its migrate
+   step opens the gate in the same run.
+3. Deploy the build: its migrate step, then every binary of it together (the
+   API server and HTTP MCP units are the recording builds; the maintenance
+   CLIs take `--act`; the API calls 160's completion). An older binary left
+   running stamps no elevation pair and never elevates.
+4. Admin-scope enforcement stays UNARMED (128's switch); arming is the
+   separate step below.
+5. Record the deployed commit.
+6. Enroll the operator's passkey (`epigraph-operator passkey-enroll`, then the
    ceremony on the operator's device at the relying party's host), elevate
    once through the CLI path, read one row of another group, and confirm its
    `elevated_access` row. Run `verify-confirmations` after every admin session
