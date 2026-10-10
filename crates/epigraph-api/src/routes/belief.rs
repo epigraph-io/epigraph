@@ -155,7 +155,9 @@ pub struct SubmitEvidenceRequest {
     /// `epigraph_engine::belief_query::get_perspective_belief`.
     #[serde(default)]
     pub evidence_type: Option<String>,
-    /// Conflict threshold for adaptive combination
+    /// Conflict K at or above which a `conflict.detected` event is emitted.
+    /// Since U025 it no longer selects a combination rule: `combine_multiple`
+    /// folds with Dempster at every step.
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Mass assignments: keys are comma-separated hypothesis indices, values are mass.
@@ -1304,7 +1306,7 @@ pub async fn submit_evidence(
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
     for_combination.extend(group_results);
 
-    // 10c. Standard adaptive combination on the now-independent set
+    // 10c. Dempster fold (`combine_multiple`, U025) on the now-independent set
     let (combined, reports) = if for_combination.len() <= 1 {
         (
             for_combination

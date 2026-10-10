@@ -309,7 +309,7 @@ pub async fn assess_claim(
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
     for_combination.extend(group_results);
 
-    // Standard adaptive combination
+    // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
     let (combined, reports) = if for_combination.len() <= 1 {
         (
