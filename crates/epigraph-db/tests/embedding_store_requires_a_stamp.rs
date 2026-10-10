@@ -277,7 +277,8 @@ async fn store_embedding_if_unsealed_is_refused_when_the_session_is_not_stamped(
 //
 // `McpEmbedder::store_vector` cannot take the author from its caller: seven of
 // its nine callers embed claims the INGEST EXECUTOR authored, and that executor
-// authors as `get_or_create_system_agent(pool)` rather than as the MCP server's
+// authors as the workflow-ingest system agent (`get_or_create_system_agent`)
+// rather than as the MCP server's
 // agent, so a caller-supplied author would stamp the wrong writable group and be
 // refused — silently, because the embed is best-effort. It therefore reads the
 // author off the row, on the SAME unstamped application pool.

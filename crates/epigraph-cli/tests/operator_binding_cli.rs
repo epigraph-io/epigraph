@@ -1131,3 +1131,424 @@ async fn link_records_the_llm_provenance_of_a_row_the_process_created(pool: PgPo
     assert_eq!(src.as_deref(), Some("mcp-llm-agent"));
     assert_eq!(link_row(&pool, agent).await, Some((human, false)));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// register-system-agent (migration 148) and the arm census's system roles
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_EVENT: &str = "operator.system_agent_registered";
+
+async fn registry_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM system_agents")
+        .fetch_one(pool)
+        .await
+        .expect("registry rows")
+}
+
+async fn system_audit_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM security_events WHERE event_type = $1")
+        .bind(SYSTEM_EVENT)
+        .fetch_one(pool)
+        .await
+        .expect("audit rows")
+}
+
+/// An agent holding the workflow-ingest role's LEGACY key, as every database
+/// created before migration 148 has one.
+async fn legacy_key_holder(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'workflow-ingest-system') \
+         RETURNING id",
+    )
+    .bind(
+        epigraph_db::SystemAgentRole::WorkflowIngest
+            .legacy_public_key()
+            .as_slice(),
+    )
+    .fetch_one(pool)
+    .await
+    .expect("legacy key holder")
+}
+
+fn register_args<'a>(agent: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec![
+        "register-system-agent",
+        "--role",
+        "workflow-ingest",
+        "--agent",
+        agent,
+        "--reason",
+        "the ingest identity",
+    ];
+    v.extend_from_slice(extra);
+    v
+}
+
+/// The dry run runs the definer and rolls it back (no row, no audit row);
+/// `--apply` records exactly one row and one audit row; a repeat is
+/// ALREADY-REGISTERED with no second audit row. The identity line comes first.
+///
+/// Kills: the dry run committing (its "nothing written" assertions would fail).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_dry_run_changes_nothing_and_apply_records_once(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await;
+    let s_str = s.to_string();
+
+    let dry = run_op(&pool, &register_args(&s_str, &[])).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!(
+            "AGENT\tid={s_str}\tdisplay_name=workflow-ingest-system"
+        )),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("link=none\tkey=LEGACY"),
+        "{}",
+        dry.show()
+    );
+    assert!(!dry.stdout.contains("WARNING"), "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!(
+            "WOULD BE REGISTERED\trole=workflow-ingest\tagent={s_str}"
+        )),
+        "{}",
+        dry.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0, "a dry run registers nothing");
+    assert_eq!(
+        system_audit_rows(&pool).await,
+        0,
+        "a dry run audits nothing"
+    );
+
+    let apply = run_op(&pool, &register_args(&s_str, &["--apply"])).await;
+    assert_eq!(apply.code, 0, "{}", apply.show());
+    assert!(
+        apply.stdout.contains(&format!(
+            "\nREGISTERED\trole=workflow-ingest\tagent={s_str}"
+        )),
+        "{}",
+        apply.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+    assert_eq!(system_audit_rows(&pool).await, 1);
+
+    let again = run_op(&pool, &register_args(&s_str, &["--apply"])).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again.stdout.contains("ALREADY-REGISTERED"),
+        "{}",
+        again.show()
+    );
+    assert_eq!(system_audit_rows(&pool).await, 1, "no second audit row");
+}
+
+/// A typo in `--role` is refused by the tool, BEFORE any connection, naming
+/// the valid roles. Kills: the client-side vocabulary check removed (the
+/// table's CHECK would then answer 23514 after connecting, also writing
+/// nothing, which is why the text and the missing "connected as" line are
+/// asserted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_refuses_an_unknown_role_before_the_database(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "register-system-agent",
+            "--role",
+            "workflow_ingest",
+            "--agent",
+            &s,
+            "--reason",
+            "x",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stderr
+            .contains("unknown system-agent role 'workflow_ingest'")
+            && r.stderr.contains("valid: workflow-ingest"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        !r.stderr.contains("23514")
+            && !r.stderr.contains("system_agents_role_known")
+            && !r.stderr.contains("connected as"),
+        "refused before the database: {}",
+        r.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}
+
+/// On a DSN that is not a maintenance login the command is refused and
+/// registers nothing. This is a regression test of the connect path
+/// (`operator::connect()`'s maintenance-membership refusal answers before any
+/// `register-system-agent` code runs); the definer's own refusal of an
+/// application-role caller is
+/// `register_on_an_app_role_connection_is_refused_by_the_definer`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_on_an_app_dsn_is_refused(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await.to_string();
+    let role = format!("sysagent_probe_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD 'probe-only'"))
+        .execute(&pool)
+        .await
+        .expect("probe login");
+    sqlx::query(&format!("GRANT epigraph_app TO {role}"))
+        .execute(&pool)
+        .await
+        .expect("an application login");
+    let url = fixture::database_url_for(&pool).await;
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials in DATABASE_URL");
+    let app_url = format!("{scheme}://{role}:probe-only@{host}");
+    let out = Command::new(BIN)
+        .args(register_args(&s, &["--apply"]))
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, app_url)
+        .output()
+        .expect("spawn epigraph-operator");
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = sqlx::query(&format!("DROP OWNED BY {role}"))
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await;
+    assert_ne!(code, 0, "{stderr}");
+    assert!(stderr.contains("epigraph_maintenance"), "{stderr}");
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}
+
+/// The identity line before an immutable registration: a retired-linked agent
+/// shows `link=retired:` and the definer then refuses it; an agent whose key
+/// is not the legacy one shows `key=NOT-LEGACY` with a WARNING, and `--apply`
+/// REFUSES it (nothing called, nothing written) unless `--key-not-legacy-ok`.
+///
+/// Kills: the identity line missing or computed from the wrong key; the
+/// `--apply` refusal of a non-legacy key removed (the plain `--apply` lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_prints_the_identity_line(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    let retired_s = retired.to_string();
+    let r = run_op(&pool, &register_args(&retired_s, &[])).await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!("link=retired:{human}")),
+        "{}",
+        r.show()
+    );
+    assert!(r.stderr.contains("retired operator link"), "{}", r.show());
+
+    let (fresh, _) = fixture::seed_agent_with_group(&pool, "secret-key").await;
+    let fresh_s = fresh.to_string();
+    let dry = run_op(&pool, &register_args(&fresh_s, &[])).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("key=NOT-LEGACY"), "{}", dry.show());
+    assert!(dry.stdout.contains("\nWARNING\t"), "{}", dry.show());
+
+    let refused = run_op(&pool, &register_args(&fresh_s, &["--apply"])).await;
+    assert_ne!(refused.code, 0, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("--key-not-legacy-ok"),
+        "{}",
+        refused.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+
+    let forced = run_op(
+        &pool,
+        &register_args(&fresh_s, &["--apply", "--key-not-legacy-ok"]),
+    )
+    .await;
+    assert_eq!(forced.code, 0, "{}", forced.show());
+    assert!(
+        forced.stdout.contains("\nREGISTERED\t"),
+        "{}",
+        forced.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+}
+
+/// The arm census names a system role with no registration, and stops naming
+/// it once registered. Report only: the dry run arms nothing either way.
+/// Kills: the `NOT EXISTS` inverted, or the line never printed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_names_an_unregistered_system_role(pool: PgPool) {
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains("SYSTEM-AGENT-UNREGISTERED\tworkflow-ingest\t"),
+        "{}",
+        r.show()
+    );
+    let s = legacy_key_holder(&pool).await;
+    assert!(fixture::register_system_agent(&pool, s).await);
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        !r.stdout.contains("SYSTEM-AGENT-UNREGISTERED"),
+        "{}",
+        r.show()
+    );
+    assert!(!armed(&pool).await);
+}
+
+/// A >=148 tool against a database without the registry (a rehearsal database
+/// below 148) still runs the census and says so, instead of failing on 42P01.
+/// Kills: an unguarded registry read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_tolerates_a_database_without_the_registry(pool: PgPool) {
+    sqlx::query("DROP TABLE public.system_agents")
+        .execute(&pool)
+        .await
+        .expect("stand in for a database below 148");
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("SYSTEM-AGENT-REGISTRY-ABSENT"),
+        "{}",
+        r.show()
+    );
+}
+
+/// `link-legacy-authors` never asks the definer to retire a REGISTERED system
+/// agent: it adds every `system_agents` agent to the exclusion list, names
+/// each one, and the tie runs for the other authors (migration 148 refuses a
+/// retired link of a registered system agent, which would otherwise abort the
+/// whole tie). Kills: the CLI exclusion missing (the run fails on the
+/// `operator_links` refusal and ties no one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_legacy_authors_excludes_a_registered_system_agent(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "system").await;
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    for (a, g) in [(s, s_group), (author, author_group)] {
+        insert_claim(&pool, a, g).await.expect("seed claim");
+    }
+    assert!(fixture::register_system_agent(&pool, s).await);
+    let human_s = human.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "link-legacy-authors",
+            "--operator",
+            &human_s,
+            "--no-quiet-window",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains(&format!("AUTO-EXCLUDED\t{s}\tregistered system agent")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("SKIPPED:excluded\t{s}")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("LINKED-RETIRED\t{author}")),
+        "{}",
+        r.show()
+    );
+    assert_eq!(link_row(&pool, s).await, None, "S keeps its one link slot");
+    assert_eq!(link_row(&pool, author).await, Some((human, true)));
+}
+
+/// The `--apply` refusal of a non-legacy key holds at the moment the definer
+/// snapshots the key, not only at the identity line: an identity read before a
+/// concurrent rotation (here: a stale `key_is_legacy = true` for an agent whose
+/// key is not the legacy one) is refused inside the transaction and rolled
+/// back. Kills: the in-transaction re-check removed (the stale identity
+/// registers the rotated key).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_refuses_a_key_that_stopped_being_legacy_after_the_identity_line(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity, Outcome};
+    let (s, _) = fixture::seed_agent_with_group(&pool, "rotated-meanwhile").await;
+    let stale = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let id = stale.clone();
+    let refused = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("the rotated key is refused at registration time");
+    assert!(e.to_string().contains("--key-not-legacy-ok"), "{e:#}");
+    assert_eq!(registry_rows(&pool).await, 0, "rolled back");
+    assert_eq!(system_audit_rows(&pool).await, 0, "its audit row with it");
+
+    let id = stale.clone();
+    let forced = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, true).await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        forced.expect("control: --key-not-legacy-ok registers it"),
+        Outcome::Registered
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+}
+
+/// `register` on an APPLICATION-role connection reaches the definer and is
+/// refused by its grant set (PostgreSQL's own text), registering nothing; the
+/// CLI surfaces that refusal rather than swallowing it. Kills: the error of
+/// the definer call dropped, or `register` committing anyway.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_on_an_app_role_connection_is_refused_by_the_definer(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity};
+    let s = legacy_key_holder(&pool).await;
+    let identity = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let r = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = register(&mut conn, role, &identity, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = r.expect_err("the application role cannot register");
+    assert!(
+        format!("{e:#}").contains("permission denied for function epigraph_register_system_agent"),
+        "{e:#}"
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}

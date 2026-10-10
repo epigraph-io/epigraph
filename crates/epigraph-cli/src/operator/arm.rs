@@ -10,6 +10,12 @@
 //! `--allow-unbound-writers` says the operator has decided those writers stop.
 //!
 //! A dry run (the default) prints the report and arms nothing.
+//!
+//! The census also names every system role with no `system_agents` row
+//! (migration 148). Once armed, a binary at or above 148 refuses every write
+//! through an unregistered system agent (workflow ingest, policy challenges),
+//! so `register-system-agent` belongs BEFORE arming. The line is a report
+//! only: it does not change what `--apply` refuses.
 
 use anyhow::bail;
 use sqlx::PgConnection;
@@ -26,6 +32,45 @@ pub struct ArmReport {
     pub armed_now: bool,
     /// `--apply` was refused because of `unbound_writers` (nothing armed).
     pub refused: bool,
+    /// System roles with no `system_agents` row (migration 148).
+    pub unregistered_system_roles: Vec<&'static str>,
+    /// The database has no `system_agents` table (below migration 148).
+    pub system_agent_registry_absent: bool,
+}
+
+/// The system roles with no `system_agents` row, or `None` when the table does
+/// not exist (a database below migration 148: the census still runs).
+///
+/// # Errors
+/// A statement failed.
+pub async fn unregistered_system_roles(
+    conn: &mut PgConnection,
+) -> anyhow::Result<Option<Vec<&'static str>>> {
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.system_agents') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !present {
+        return Ok(None);
+    }
+    let roles: Vec<&'static str> = epigraph_db::SystemAgentRole::ALL
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT r.role FROM unnest($1::text[]) AS r(role) \
+          WHERE NOT EXISTS (SELECT 1 FROM public.system_agents s WHERE s.role = r.role) \
+          ORDER BY r.role",
+    )
+    .bind(&roles)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Some(
+        roles
+            .into_iter()
+            .filter(|r| missing.iter().any(|m| m == r))
+            .collect(),
+    ))
 }
 
 /// The census: unbound agents that authored claims in the last `days` days.
@@ -68,9 +113,12 @@ pub async fn run(
             .fetch_optional(&mut *conn)
             .await?;
     let unbound_writers = unbound_recent_writers(conn, days).await?;
+    let system_roles = unregistered_system_roles(conn).await?;
     let mut report = ArmReport {
         already,
         unbound_writers,
+        system_agent_registry_absent: system_roles.is_none(),
+        unregistered_system_roles: system_roles.unwrap_or_default(),
         ..Default::default()
     };
     if !apply || report.already.is_some() {
@@ -100,6 +148,19 @@ pub fn describe(r: &ArmReport, days: i32, apply: bool) -> Vec<String> {
     ));
     for (agent, n) in &r.unbound_writers {
         out.push(format!("UNBOUND\t{agent}\t{n} claim(s)"));
+    }
+    if r.system_agent_registry_absent {
+        out.push(
+            "SYSTEM-AGENT-REGISTRY-ABSENT\t(migration 148 not applied; once armed, workflow \
+             writes are refused by a >=148 binary)"
+                .to_string(),
+        );
+    }
+    for role in &r.unregistered_system_roles {
+        out.push(format!(
+            "SYSTEM-AGENT-UNREGISTERED\t{role}\t(once armed, every write through this system \
+             agent is refused until it is registered: epigraph-operator register-system-agent)"
+        ));
     }
     if r.refused {
         out.push(format!(
