@@ -139,4 +139,36 @@ async fn head_on_conflict_is_cached_and_classified(pool: PgPool) {
         "framed get_belief reported mass_on_conflict {}, cache holds 0.64",
         framed.mass_on_conflict
     );
+
+    // The lensed reads build their own `BeliefInterval` from the shared fold,
+    // one literal each, so each needs its own check. A perspective id with no
+    // row reduces to no opinion (no reweighting), so the fold is the same
+    // head-on pair and K stays 0.64.
+    let lens = Uuid::new_v4();
+    let lensed = epigraph_engine::belief_query::get_perspective_belief(
+        &pool, &viewer, claim, frame.id, lens,
+    )
+    .await
+    .unwrap();
+    assert!(
+        (lensed.mass_on_conflict - 0.64).abs() < 1e-9,
+        "get_perspective_belief reported mass_on_conflict {}, cache holds 0.64",
+        lensed.mass_on_conflict
+    );
+    let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
+        &pool,
+        &viewer,
+        &[claim],
+        frame.id,
+        lens,
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch.len(), 1, "one claim in, one interval out");
+    let batched = batch[0].1.as_ref().expect("batch interval for the claim");
+    assert!(
+        (batched.mass_on_conflict - 0.64).abs() < 1e-9,
+        "get_perspective_belief_batch reported mass_on_conflict {}, cache holds 0.64",
+        batched.mass_on_conflict
+    );
 }
