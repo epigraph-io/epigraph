@@ -966,24 +966,59 @@ mod item_decoding_tests {
         let caller = Uuid::new_v4();
         let named = Uuid::new_v4();
         let trace = Uuid::new_v4();
+        let evidence = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let content_hash = "a".repeat(64);
         let req = batch_item_to_create_request(
             json!({
                 "content": "c", "agent_id": named, "initial_truth": 0.7, "trace_id": trace,
+                "content_hash": content_hash,
                 "properties": {"source_uri": "doi:10.1/x", "page": 3},
+                "evidence_id": evidence,
+                "privacy_tier": "fully_private",
+                "group_id": group,
+                "encrypted_content": "ciphertext-base64",
+                "encryption_epoch": 2,
                 "labels": ["a", "b"], "if_not_exists": true
             }),
             caller,
         )
         .expect("full shape decodes");
-        assert_eq!(req.agent_id, named, "an item that names an author keeps it");
-        assert_eq!(req.initial_truth, Some(0.7));
-        assert_eq!(req.trace_id, Some(trace));
+        // Destructuring with no `..` makes this exhaustive at compile time: a
+        // field added to `CreateClaimRequest` later fails to compile here
+        // until this test is updated to cover it, so "every single claim
+        // field" can't quietly go false again.
+        let crate::routes::claims::CreateClaimRequest {
+            content,
+            agent_id,
+            trace_id,
+            initial_truth,
+            content_hash: got_content_hash,
+            properties,
+            evidence_id,
+            privacy_tier,
+            group_id,
+            encrypted_content,
+            encryption_epoch,
+            labels,
+            if_not_exists,
+        } = req;
+        assert_eq!(content, "c");
+        assert_eq!(agent_id, named, "an item that names an author keeps it");
+        assert_eq!(initial_truth, Some(0.7));
+        assert_eq!(trace_id, Some(trace));
+        assert_eq!(got_content_hash, Some(content_hash));
         assert_eq!(
-            req.properties,
+            properties,
             Some(json!({"source_uri": "doi:10.1/x", "page": 3}))
         );
-        assert_eq!(req.labels, vec!["a".to_string(), "b".to_string()]);
-        assert!(req.if_not_exists);
+        assert_eq!(evidence_id, Some(evidence));
+        assert_eq!(privacy_tier, Some("fully_private".to_string()));
+        assert_eq!(group_id, Some(group));
+        assert_eq!(encrypted_content, Some("ciphertext-base64".to_string()));
+        assert_eq!(encryption_epoch, Some(2));
+        assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
+        assert!(if_not_exists);
     }
 
     #[test]
