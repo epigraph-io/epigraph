@@ -741,6 +741,23 @@ const EL11_BASE: &str = "http://localhost:8080";
 /// `connector` (the switch is OFF in `main` unless enabled) and name the
 /// ceremony page under [`EL11_BASE`].
 async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: bool) -> String {
+    listener_with_federation(
+        pool,
+        arming_ttl,
+        connector,
+        epigraph_mcp::federation::SharedFederation::empty(),
+    )
+    .await
+}
+
+/// [`listener`] whose servers route federated tools through `federation` (as
+/// `main` clones its boot-time registry into every session).
+async fn listener_with_federation(
+    pool: &PgPool,
+    arming_ttl: std::time::Duration,
+    connector: bool,
+    federation: epigraph_mcp::federation::SharedFederation,
+) -> String {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -762,13 +779,18 @@ async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: boo
     );
     let service = StreamableHttpService::new(
         move || {
-            Ok(
-                EpiGraphMcpFull::new_shared(pool.clone(), signer.clone(), embedder.clone(), false)
-                    .with_scoped_pool(scoped.clone())
-                    .with_admin_scope_arming_ttl(arming_ttl)
-                    .with_connector_elevation(connector)
-                    .with_public_base_url(Some(EL11_BASE.to_string())),
+            Ok(EpiGraphMcpFull::new_shared_with_federation(
+                pool.clone(),
+                signer.clone(),
+                embedder.clone(),
+                false,
+                federation.clone(),
+                None,
             )
+            .with_scoped_pool(scoped.clone())
+            .with_admin_scope_arming_ttl(arming_ttl)
+            .with_connector_elevation(connector)
+            .with_public_base_url(Some(EL11_BASE.to_string())))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
@@ -1263,12 +1285,156 @@ async fn an_elevated_write_is_refused_at_dispatch_before_its_invocation_is_logge
     );
 }
 
+/// A stub downstream MCP server exposing one tool, counting its calls.
+#[derive(Clone)]
+struct CountingStub {
+    tool: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl rmcp::ServerHandler for CountingStub {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            ..Default::default()
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        Ok(rmcp::model::ListToolsResult {
+            tools: vec![rmcp::model::Tool::new(
+                self.tool.clone(),
+                "counting stub tool",
+                std::sync::Arc::new(schema.as_object().cloned().unwrap_or_default()),
+            )],
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        _request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(rmcp::model::CallToolResult::success(vec![
+            rmcp::model::Content::text("{\"stub\": true}"),
+        ]))
+    }
+}
+
+/// Serve a [`CountingStub`] for `tool` on a loopback port: `(host:port, calls)`.
+async fn spawn_counting_stub(
+    tool: &str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stub = CountingStub {
+        tool: tool.to_string(),
+        calls: calls.clone(),
+    };
+    let service = StreamableHttpService::new(
+        move || Ok(stub.clone()),
+        std::sync::Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = format!("127.0.0.1:{}", listener.local_addr().expect("addr").port());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    (addr, calls)
+}
+
+/// An ELEVATED request reaches no FEDERATED tool, end to end through the real
+/// `call_tool` over HTTP with a live downstream extension (final review
+/// F1-TST-01): the elevated call is refused `ELEVATED READ-ONLY` naming the
+/// tool, the denial is logged, and the extension is never called.
+/// Calibration: the same person's unelevated token (the extension's scope
+/// `claims:read`) is proxied and the extension called once.
+///
+/// Verified to fail with the federation branch's `refuse_elevated_federated`
+/// result discarded (review mutant mB): the elevated call is proxied and the
+/// extension's call count reaches 2.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_request_is_never_proxied_to_a_federated_tool(pool: PgPool) {
+    use epigraph_mcp::federation::config::ExtensionConfig;
+    use epigraph_mcp::federation::{FederationRegistry, SharedFederation};
+    let (p, _) = fixture::seed_human_operator(&pool, "tst01-federated").await;
+    let (client, family) = make_holder(&pool, p, 12).await;
+    let live = session(&pool, p, client, family, 12, "grant").await;
+    let (addr, calls) = spawn_counting_stub("ext_probe").await;
+    let registry = FederationRegistry::build(
+        vec![ExtensionConfig {
+            name: "stubext".to_string(),
+            addr,
+            scope: "claims:read".to_string(),
+            prefix: None,
+        }],
+        "discovery-token",
+    )
+    .await
+    .expect("the stub extension mounts");
+    let url = listener_with_federation(
+        &pool,
+        epigraph_db::AdminScopeArmingCache::DEFAULT_TTL,
+        false,
+        SharedFederation::new(registry),
+    )
+    .await;
+
+    let plain = el8_token(p, client, family, None);
+    let answer = el11_call(&url, &plain, "ext_probe", serde_json::json!({})).await;
+    assert!(
+        el11_error(&answer).is_none(),
+        "CALIBRATION: an unelevated call is proxied: {answer}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "CALIBRATION: the extension was called"
+    );
+
+    let elevated = el8_token(p, client, family, Some(live));
+    let answer = el11_call(&url, &elevated, "ext_probe", serde_json::json!({})).await;
+    let err = el11_error(&answer).unwrap_or_else(|| panic!("refused: {answer}"));
+    assert!(
+        err.contains("ELEVATED READ-ONLY") && err.contains("ext_probe"),
+        "the elevated call is refused naming the tool: {err}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the extension never sees the elevated call"
+    );
+    assert!(
+        invoked_tools(&pool)
+            .await
+            .contains(&"denied:stubext:ext_probe".to_string()),
+        "the denial is logged"
+    );
+}
+
 /// An ELEVATED request reaches no FEDERATED tool (review cp1 COR-1's residual,
 /// plan EL-10): the refusal answers `ELEVATED READ-ONLY` and names the tool;
-/// an unelevated request passes. Source lock (a federated call needs a live
-/// extension to drive end to end): in `call_tool`'s federation branch the
-/// elevation is resolved first and the refusal runs before the extension's
-/// scope gate and the proxy call.
+/// an unelevated request passes. Source lock: in `call_tool`'s federation
+/// branch the elevation is resolved first and the refusal runs before the
+/// extension's scope gate and the proxy call (the behaviour end to end, with
+/// a live extension: `an_elevated_request_is_never_proxied_to_a_federated_tool`).
 ///
 /// Verified to fail with the refusal's call removed from the federation
 /// branch, and with the refusal answering `Ok` for an elevated request.
