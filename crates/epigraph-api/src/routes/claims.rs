@@ -415,10 +415,24 @@ pub(crate) async fn create_claim_core(
     auth_ctx: Option<&crate::middleware::bearer::AuthContext>,
     request: CreateClaimRequest,
 ) -> Result<ClaimResponse, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(auth) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Bind the caller FIRST, then check its scope unconditionally.
+    //
+    // This is the prescribed shape from `tests/viewer_route_table_lint.rs`
+    // (`let Some(..) = auth_ctx else { return Err(Unauthorized) }`), not the
+    // `if let Some(..) = auth_ctx { check_scopes(..) }` idiom it registers as
+    // fail-open. The move out of `create_claim` respelled that idiom over
+    // `Option<&AuthContext>`, a spelling the lint's needles do not match, so
+    // the site dropped out of its registers without being fixed; hoisting the
+    // guard is what actually retires it. `None` is unreachable over HTTP
+    // (`ViewerExtractor` and the bearer middleware 401 first), so the only
+    // observable change is for a direct caller: `None` is now refused before
+    // the privacy and content validation below rather than after it.
+    let Some(ctx) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create a claim".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(ctx, &["claims:write"])?;
 
     // Validate privacy fields first (needed to know if content check applies)
     let privacy_tier = validate_privacy_fields(&request)?;
@@ -467,11 +481,7 @@ pub(crate) async fn create_claim_core(
 
         // SECURITY: Use ONLY authenticated identity for membership check, never request body
         // Prefer agent_id, fall back to client_id (sub) for human clients
-        let caller_agent_id = auth_ctx
-            .and_then(|ctx| ctx.agent_id.or(Some(ctx.client_id)))
-            .ok_or_else(|| ApiError::Forbidden {
-                reason: "Authentication required to create encrypted claims".to_string(),
-            })?;
+        let caller_agent_id = ctx.agent_id.unwrap_or(ctx.client_id);
 
         // Verify caller is a member of the group
         let is_member =
@@ -546,12 +556,8 @@ pub(crate) async fn create_claim_core(
     // Every arm now resolves to 401. That is the right code rather than 403 or
     // 500 in all three cases: no credential, a credential with no principal,
     // and a credential naming a principal that does not exist are all "re-mint
-    // your token", which is what RFC 6750 `invalid_token` means.
-    let Some(ctx) = auth_ctx else {
-        return Err(ApiError::Unauthorized {
-            reason: "authentication required to create a claim".to_string(),
-        });
-    };
+    // your token", which is what RFC 6750 `invalid_token` means. (The
+    // no-credential arm is the guard at the top of this function.)
     let Some(author_agent_id) = ctx.agent_id else {
         return Err(ApiError::Unauthorized {
             reason: "token carries no agent_id; re-authenticate to obtain a \
@@ -958,8 +964,9 @@ pub(crate) async fn create_claim_core(
     response.labels = request.labels;
     response.was_created = was_created;
 
-    // Record provenance chain of custody when OAuth2-authenticated
-    if let Some(auth) = auth_ctx {
+    // Record provenance chain of custody. Unconditional on the caller: `ctx`
+    // is bound by the guard at the top of this function.
+    {
         // Content hash for provenance: BLAKE3 of claim content
         let content_hash = blake3::hash(request.content.as_bytes());
         // Provenance signature placeholder (agent did not sign this request body via Ed25519)
@@ -967,7 +974,7 @@ pub(crate) async fn create_claim_core(
 
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            ctx,
             "claim",
             claim_uuid,
             "create",
@@ -3424,5 +3431,75 @@ mod db_tests {
             count, 0,
             "no row may land when create_claim_core's own scope check refuses the call"
         );
+    }
+    // ────────────────────────────────────────────────────────────────────────
+    // TEST 14: create_claim_core refuses a missing caller before anything else
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Pins the `let Some(ctx) = auth_ctx else { return Err(Unauthorized) }`
+    /// guard at the TOP of `create_claim_core`.
+    ///
+    /// `None` is unreachable over HTTP — `ViewerExtractor` and the bearer
+    /// middleware answer 401 before `create_claim` runs — so only a direct
+    /// call can reach this arm, and every other caller of the core (the batch
+    /// route, one call per item) depends on it holding.
+    ///
+    /// Two requests, because one cannot tell the guard's POSITION:
+    ///
+    /// * a valid public request — the refusal must be `Unauthorized`, not a
+    ///   scope 403 or a write;
+    /// * an EMPTY-content request — with the guard anywhere below the content
+    ///   check this would be a 400 `ValidationError`, so `Unauthorized` here
+    ///   is what proves the caller is bound before any validation runs.
+    ///
+    /// No row count is asserted: the guard is the function's first statement,
+    /// so there is no write it could follow, and a `SELECT .. FROM claims
+    /// WHERE content = ..` read-back would add a second scalar read to this
+    /// module's `TEST_ONLY_INLINE_READS` register in
+    /// `tests/viewer_route_table_lint.rs` for no extra evidence.
+    #[tokio::test]
+    async fn test_create_claim_core_without_auth_ctx_is_401() {
+        let pool = test_pool_or_skip!();
+        let principal = Uuid::new_v4();
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, principal)
+            .await
+            .expect("resolve viewer");
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        );
+
+        for (what, content) in [
+            (
+                "a valid public request",
+                format!("create_claim_core no-auth probe {}", Uuid::new_v4()),
+            ),
+            ("an empty-content request", String::new()),
+        ] {
+            let request = CreateClaimRequest {
+                content,
+                agent_id: principal,
+                trace_id: None,
+                initial_truth: None,
+                content_hash: None,
+                properties: None,
+                evidence_id: None,
+                privacy_tier: None,
+                group_id: None,
+                encrypted_content: None,
+                encryption_epoch: None,
+                labels: vec![],
+                if_not_exists: false,
+            };
+            let result = create_claim_core(&state, &viewer, None, request).await;
+            assert!(
+                matches!(result, Err(ApiError::Unauthorized { .. })),
+                "{what}: a call with no AuthContext must be refused Unauthorized \
+                 before any validation or write, got {result:?}"
+            );
+        }
     }
 }

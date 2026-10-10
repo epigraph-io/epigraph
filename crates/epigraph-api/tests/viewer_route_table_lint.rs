@@ -357,7 +357,19 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // the sole per-principal narrowing on the table this route reads, and a
     // fail-open scope check on the caller-facing end of a policy being widened in
     // the same commit is not a debt worth carrying forward one more PR.
-    ("claims.rs", 1),
+    // `("claims.rs", 1)` REMOVED by the batch-claims change (issue #477), on
+    // the PR-10 precedent below. The site was `create_claim`'s
+    // `if let Some(axum::Extension(ref auth)) = auth_ctx { check_scopes(..) }`.
+    // Moving that body into `create_claim_core` first RESPELLED it as
+    // `if let Some(auth) = auth_ctx` over `Option<&AuthContext>` — a spelling
+    // `AUTH_CTX_NEEDLES` does not match — so the file read 0 while the check
+    // was still conditional. That reading was the scanner losing sight of the
+    // site, not a fix, and lowering this row on it alone would have laundered
+    // the debt. The row is removed because the site is now FIXED:
+    // `create_claim_core` takes the prescribed
+    // `let Some(ctx) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape as its first statement and checks `claims:write` unconditionally.
+    // Removed rather than set to `0` for the reason the PR-10 note gives.
     // 7 before PR-16/16b. `update_evidence` moved its `raw_content` UPDATE into
     // `EvidenceRepository::update_raw_content` behind the write-side predicate,
     // and took the prescribed
@@ -402,7 +414,11 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
 /// unauthenticated write path. It is a debt register, not a permission slip.
 const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
     ("agents.rs", 1),
-    ("claims.rs", 1),
+    // `("claims.rs", 1)` REMOVED by the batch-claims change (issue #477), for
+    // the reason recorded on the matching `FAIL_OPEN_SCOPE_SITES` removal: the
+    // provenance block was respelled out of the needles' view by the move into
+    // `create_claim_core`, and the row goes only because the block is now
+    // unconditional on the `ctx` the function binds as its first statement.
     ("crud.rs", 4),
     // `("edges.rs", 4)` REMOVED by batch W12b: the provenance blocks of
     // `create_edge`, `delete_edge`, `patch_edge` and `relate_claims` sit in
