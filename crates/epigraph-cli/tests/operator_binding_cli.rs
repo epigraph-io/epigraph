@@ -1188,8 +1188,7 @@ fn register_args<'a>(agent: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
 /// `--apply` records exactly one row and one audit row; a repeat is
 /// ALREADY-REGISTERED with no second audit row. The identity line comes first.
 ///
-/// Verified to fail: the dry run committing -> its "nothing written"
-/// assertions fail.
+/// Kills: the dry run committing (its "nothing written" assertions would fail).
 #[sqlx::test(migrations = "../../migrations")]
 async fn register_system_agent_dry_run_changes_nothing_and_apply_records_once(pool: PgPool) {
     let s = legacy_key_holder(&pool).await;

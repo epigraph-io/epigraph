@@ -13,10 +13,12 @@
 //! definer on a maintenance session (`fixture::register_system_agent`). No test
 //! calls `fixture::grant_app_privileges`.
 //!
-//! Verified to fail (mutations run against this file; see each test's doc for
-//! the ones it names): `SystemAgentRepository::lookup` keyed on
+//! Verified to fail (the one mutation run against this file):
+//! `SystemAgentRepository::lookup` keyed on
 //! `epigraph_operator_binding_enforced()` instead of `..._armed()` ->
-//! `the_valve_does_not_reopen_the_fallback` returns `Ok`.
+//! `the_valve_does_not_reopen_the_fallback` returns `Ok`. Each test's "Kills:"
+//! line names the mutation it is designed to catch; those were not run
+//! individually (every test was seen red against the pre-registry resolver).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
