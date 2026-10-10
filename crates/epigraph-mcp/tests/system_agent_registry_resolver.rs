@@ -572,14 +572,20 @@ async fn mcp_add_step_after_rotation_mints_nothing(pool: PgPool) {
 
 // ── 4.4: author-NAME paths never adopt or mint a system agent ──────────────
 //
-// Each runs in two states: (a) S registered while holding the public-constant
-// key K, and (b) after S's key rotation. The reserved author is
-// "Workflow-Ingest-System." (case AND punctuation): a lowercase+trim string
+// Each runs in three states, in order on one database: (0) S holds the
+// public-constant key K and NOTHING is registered (every database between the
+// >=148 deploy and the registration, and every fresh install); (a) S
+// registered while holding K; (b) after S's key rotation. The reserved author
+// is "Workflow-Ingest-System." (case AND punctuation): a lowercase+trim string
 // guard misses it, but `normalize_author_name` strips the `.`, so it derives K.
-// Kills, per path: the guard missing (state (a) adopts S as an author; state
-// (b) tries to mint a K holder, which the `agents` guard refuses, failing the
-// whole ingest); a weak string compare (the punctuation variant passes); the
-// guard placed after the key lookup (state (a) adopts S).
+//
+// State (0) is the one where the legacy-key check is the ONLY guard: the
+// registered-id check has an empty set and the `agents` trigger has no
+// snapshot. Kills, per path: the legacy-key check missing, weakened to the
+// create branch only, or run only when something is registered (state (0)
+// adopts S as an author; in (a) the registered-id check would hide it, in (b)
+// the `agents` guard would); a weak string compare (the punctuation variant
+// passes).
 
 const RESERVED_AUTHOR: &str = "Workflow-Ingest-System.";
 
@@ -747,22 +753,30 @@ async fn ingest_document_authors(
         .expect("the document ingest succeeds with a reserved author present");
 }
 
-/// The two states: returns S. `rotated` = state (b).
-async fn reserved_state(pool: &PgPool, rotated: bool) -> Uuid {
-    let s = legacy_system_agent_registered(pool).await;
-    if rotated {
-        rotate(pool, s).await;
+/// The three states, in order. `enter` moves the database from the previous
+/// state into `state` and calibrates (0): S holds K and nothing is registered.
+const RESERVED_STATES: [&str; 3] = [
+    "(0) S holds K, nothing registered",
+    "(a) S holds K, registered",
+    "(b) S rotated",
+];
+
+async fn enter(pool: &PgPool, s: Uuid, state: &str) {
+    match &state[..3] {
+        "(0)" => {
+            assert_eq!(count(pool, "system_agents").await, 0, "CALIBRATION {state}");
+            assert_eq!(k_holders(pool).await, 1, "CALIBRATION {state}");
+        }
+        "(a)" => assert!(fixture::register_system_agent(pool, s).await),
+        _ => rotate(pool, s).await,
     }
-    s
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn workflow_ingest_skips_an_author_naming_the_system_identity(pool: PgPool) {
-    let s = reserved_state(&pool, false).await;
-    for state in ["(a) S holds K", "(b) S rotated"] {
-        if state.starts_with("(b)") {
-            rotate(&pool, s).await;
-        }
+    let s = resolve(&pool).await.expect("unarmed fallback creates S");
+    for state in RESERVED_STATES {
+        enter(&pool, s, state).await;
         ingest_workflow_authors(&pool, &["Ada Lovelace", RESERVED_AUTHOR]).await;
         let ada = agent_with_key(&pool, &name_key("Ada Lovelace"))
             .await
@@ -777,7 +791,7 @@ async fn workflow_ingest_skips_an_author_naming_the_system_identity(pool: PgPool
             "{state}: no author edge from S"
         );
         assert_eq!(edges_from_k_holders(&pool).await, 0, "{state}");
-        let expected_holders = if state.starts_with("(a)") { 1 } else { 0 };
+        let expected_holders = if state.starts_with("(b)") { 0 } else { 1 };
         assert_eq!(
             k_holders(&pool).await,
             expected_holders,
@@ -787,11 +801,9 @@ async fn workflow_ingest_skips_an_author_naming_the_system_identity(pool: PgPool
 }
 
 async fn document_skips_reserved(pool: PgPool, path: DocPath) {
-    let s = reserved_state(&pool, false).await;
-    for state in ["(a) S holds K", "(b) S rotated"] {
-        if state.starts_with("(b)") {
-            rotate(&pool, s).await;
-        }
+    let s = resolve(&pool).await.expect("unarmed fallback creates S");
+    for state in RESERVED_STATES {
+        enter(&pool, s, state).await;
         let ada_before = match agent_with_key(&pool, &name_key("Ada Lovelace")).await {
             Some(a) => edges_from(&pool, a, Some("authored")).await,
             None => 0,

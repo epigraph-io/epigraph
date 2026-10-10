@@ -22,7 +22,8 @@
 //! (the re-mint is refused by the `agents` guard); the provenance refusal moved
 //! from the pre-pass into the author loop ->
 //! `provenance_refuses_an_author_naming_the_system_identity` finds the first
-//! author's edges (a partial write).
+//! author's edges (a partial write); the pre-pass's legacy-key check run only
+//! when something is registered -> the same test answers 200 in state (0).
 
 mod viewer_fixture;
 
@@ -334,25 +335,43 @@ fn name_key(name: &str) -> [u8; 32] {
 /// `POST /api/v1/claims/:id/provenance` refuses (400, `field = authors`) a
 /// request naming the system identity, from a PRE-PASS: the handler writes each
 /// author's edges as it goes on the raw pool, so an in-loop refusal would have
-/// committed the authors before it. Run in both states (S holds K; S rotated).
-/// Kills: an in-loop guard (Ada's edges and agent would exist); a guard keyed
-/// on `orcid.is_some()` (the empty-ORCID request would pass); the guard
-/// missing (state (a) adopts S, state (b) mints a K holder or 500s).
+/// committed the authors before it. Run in three states, in order: (0) S holds
+/// K and NOTHING is registered (the legacy-key check is the only guard there);
+/// (a) S registered; (b) S rotated. Kills: an in-loop guard (Ada's edges and
+/// agent would exist); a guard keyed on `orcid.is_some()` (the empty-ORCID
+/// request would pass); the legacy-key check missing or run only when
+/// something is registered (state (0) adopts S with 200; (a) would hide it
+/// behind the registered-id check, (b) behind the `agents` guard).
 #[sqlx::test(migrations = "../../migrations")]
 async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
-    let s = legacy_system_agent_registered(&pool).await;
+    let s = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
+            .await
+            .expect("the unarmed fallback creates S")
+    };
     let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
     let state = superuser_state(&pool);
     let ada = serde_json::json!({ "name": "Ada Lovelace", "position": 0 });
 
-    for rotated in [false, true] {
-        if rotated {
-            rotate(&pool, s).await;
+    for phase in ["(0) unregistered", "(a) registered", "(b) rotated"] {
+        let rotated = phase.starts_with("(b)");
+        match &phase[..3] {
+            "(0)" => {
+                assert_eq!(
+                    count(&pool, "system_agents").await,
+                    0,
+                    "CALIBRATION {phase}"
+                );
+                assert_eq!(k_holders(&pool).await, 1, "CALIBRATION {phase}");
+            }
+            "(a)" => assert!(register_system_agent(&pool, s).await),
+            _ => rotate(&pool, s).await,
         }
         let claim = viewer_fixture::seed_public_claim(
             &pool,
             owner,
-            &format!("provenance target {rotated} {}", Uuid::new_v4()),
+            &format!("provenance target {phase} {}", Uuid::new_v4()),
         )
         .await;
 
@@ -362,21 +381,17 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
             serde_json::json!([ada, { "name": RESERVED_AUTHOR, "position": 1 }]),
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "rotated={rotated} (i): {body}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{phase} (i): {body}");
         assert!(body.contains("authors"), "names the field: {body}");
         assert_eq!(
             provenance_edges(&pool, claim).await,
             0,
-            "rotated={rotated}: no partial write"
+            "{phase}: no partial write"
         );
         assert_eq!(
             agents_with_key(&pool, &name_key("Ada Lovelace")).await,
             0,
-            "rotated={rotated}: the first author was not created either"
+            "{phase}: the first author was not created either"
         );
 
         let (status, body) = provenance(
@@ -388,7 +403,7 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "rotated={rotated} (ii) empty ORCID: {body}"
+            "{phase} (ii) empty ORCID: {body}"
         );
 
         let (status, body) = provenance(
@@ -400,7 +415,7 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         assert_eq!(
             status,
             StatusCode::OK,
-            "rotated={rotated} (iii) control: a real ORCID derives from the ORCID: {body}"
+            "{phase} (iii) control: a real ORCID derives from the ORCID: {body}"
         );
         if rotated {
             assert_eq!(k_holders(&pool).await, 0, "no K holder minted");
