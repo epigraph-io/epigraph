@@ -585,3 +585,68 @@ async fn evolve_step_binds_the_authenticated_caller(pool: PgPool) {
         "the step is A's, in A's group"
     );
 }
+
+/// Issue #477: `POST /api/v1/claims/batch` writes each item through
+/// `create_claim_core` on its own stamped transaction. Under an armed operator
+/// binding, an item naming an author the caller may not write as is refused
+/// ALONE (403 OPL0x); the items around it persist in the caller's group. This is
+/// the one place a trigger refusal lands mid-batch, so it is what proves the
+/// per-item transactions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_create_claims_refuses_a_foreign_author_per_item(pool: PgPool) {
+    let (a, a_group) = seed_human_operator(&pool, "human-a").await;
+    let (b, _) = seed_human_operator(&pool, "human-b").await;
+    install_orphan_policy_and_arm(&pool).await;
+    let state = app_role_state(&pool).await;
+
+    let first = format!("batch by A, first {}", Uuid::new_v4());
+    let foreign = format!("batch by A naming human B {}", Uuid::new_v4());
+    let last = format!("batch by A, last {}", Uuid::new_v4());
+    let viewer = Viewer::resolve(&pool, a).await.expect("viewer");
+    let req: epigraph_api::routes::batch::BatchClaimRequest =
+        serde_json::from_value(serde_json::json!({"claims": [
+            {"content": first, "initial_truth": 0.6},
+            {"content": foreign, "agent_id": b, "initial_truth": 0.6},
+            {"content": last, "initial_truth": 0.6}
+        ]}))
+        .expect("request");
+    let resp = epigraph_api::routes::batch::batch_create_claims(
+        ViewerExtractor(viewer),
+        State(state),
+        Some(Extension(token(a, ClientType::Human))),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_text(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refused item is a partial success: {body}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["created"], 2, "{body}");
+    assert_eq!(v["failed"], 1, "{body}");
+    assert_eq!(v["results"][1]["status"], 403, "{body}");
+    assert!(
+        v["results"][1]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("OPL0"),
+        "the trigger's refusal reaches the slot: {body}"
+    );
+    assert!(
+        claims_with_content(&pool, &foreign).await.is_empty(),
+        "nothing written for slot 1"
+    );
+    assert_eq!(
+        claims_with_content(&pool, &first).await,
+        vec![(a, a_group)],
+        "slot 0: A's claim, A's group"
+    );
+    assert_eq!(
+        claims_with_content(&pool, &last).await,
+        vec![(a, a_group)],
+        "slot 2 after the refusal"
+    );
+}
