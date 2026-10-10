@@ -1,7 +1,9 @@
-//! The consent page rendered by `GET /oauth/callback` names the client that
-//! started the authorization-code flow (`oauth_clients.client_name` of the
-//! session's `client_id`), HTML-escaped. It used to say "Authorize Claude"
-//! whatever the client was.
+//! The consent page rendered by `GET /oauth/callback`, driven through the
+//! whole flow: it is labelled from the class of the session's validated
+//! `redirect_uri` (`oauth::redirect::classify`), NEVER from the requesting
+//! client's self-declared `client_name`, which anyone registering a client
+//! chooses; and a client suspended between `/oauth/authorize` and the
+//! callback is refused there, before any user is provisioned.
 //!
 //! These drive the real flow — register/seed → `/oauth/authorize` →
 //! `/oauth/callback` → `/oauth/authorize/consent` — with Google's token
@@ -173,12 +175,12 @@ async fn callback(app: &axum::Router, google_state: &str) -> (StatusCode, String
     (status, body)
 }
 
-/// The claude.ai path end to end: RFC 7591 registration with only
-/// `client_name` + a claude.ai redirect, consent names "Claude" (its
-/// registered name, no longer a hard-coded string), and Allow still redirects
-/// back with a code.
+/// The claude.ai path end to end: RFC 7591 registration with a claude.ai
+/// redirect is labelled "Authorize Claude" from the HOSTED redirect class,
+/// whatever name the registration declared (here one that is not "Claude",
+/// and that never appears), and Allow still redirects back with a code.
 #[sqlx::test(migrations = "../../migrations")]
-async fn claude_ai_flow_names_its_registered_client_and_still_mints_a_code(pool: PgPool) {
+async fn claude_ai_flow_is_labelled_by_its_redirect_class_and_still_mints_a_code(pool: PgPool) {
     let fx = ProviderFixture::new().await;
     let app = app_with_google(&pool, &fx).await;
 
@@ -190,7 +192,7 @@ async fn claude_ai_flow_names_its_registered_client_and_still_mints_a_code(pool:
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "client_name": "Claude",
+                    "client_name": "Self Named Connector",
                     "redirect_uris": [CLAUDE_REDIRECT],
                     "response_types": ["code"],
                     "grant_types": ["authorization_code", "refresh_token"],
@@ -210,6 +212,10 @@ async fn claude_ai_flow_names_its_registered_client_and_still_mints_a_code(pool:
     assert_eq!(status, StatusCode::OK, "callback: {page}");
     assert!(page.contains("<title>Authorize Claude</title>"), "{page}");
     assert!(page.contains("<h1>Authorize Claude</h1>"), "{page}");
+    assert!(
+        !page.contains("Self Named Connector"),
+        "the self-declared client name never reaches the page: {page}"
+    );
     assert!(page.contains(USER_EMAIL), "{page}");
 
     let ticket = page
@@ -234,11 +240,14 @@ async fn claude_ai_flow_names_its_registered_client_and_still_mints_a_code(pool:
     assert!(location.contains("state=client-state"), "{location}");
 }
 
-/// A client registered by an operator (the Explorer's route, since
-/// `/oauth/register` only accepts claude.ai redirects) is named on the page,
-/// with its name escaped, and nothing on the page says "Claude".
+/// A client registered by an operator with a redirect outside the hosted and
+/// loopback classes (the Explorer's shape, since `/oauth/register` only
+/// accepts claude.ai and loopback redirects) gets the generic "Authorize an
+/// application" label. Its self-declared name is never shown, even when it
+/// calls itself "Claude": that is the impersonation the redirect-class label
+/// exists to prevent.
 #[sqlx::test(migrations = "../../migrations")]
-async fn consent_page_names_the_requesting_client_escaped(pool: PgPool) {
+async fn consent_page_never_shows_the_requesting_clients_self_declared_name(pool: PgPool) {
     let fx = ProviderFixture::new().await;
     let app = app_with_google(&pool, &fx).await;
     let scopes = vec!["claims:read".to_string()];
@@ -246,7 +255,7 @@ async fn consent_page_names_the_requesting_client_escaped(pool: PgPool) {
         &pool,
         "epigraph_explorer_test",
         None,
-        r#"Explorer <b>beta</b> & "co""#,
+        r#"Claude <b>beta</b> & "co""#,
         "human",
         &scopes,
         &scopes,
@@ -263,20 +272,19 @@ async fn consent_page_names_the_requesting_client_escaped(pool: PgPool) {
     let google_state = authorize(&app, &pool, "epigraph_explorer_test", EXPLORER_REDIRECT).await;
     let (status, page) = callback(&app, &google_state).await;
     assert_eq!(status, StatusCode::OK, "callback: {page}");
-    let escaped = "Explorer &lt;b&gt;beta&lt;/b&gt; &amp; &quot;co&quot;";
     assert!(
-        page.contains(&format!("<title>Authorize {escaped}</title>")),
+        page.contains("<title>Authorize an application</title>"),
         "{page}"
     );
+    assert!(page.contains("<h1>Authorize an application</h1>"), "{page}");
     assert!(
-        page.contains(&format!("<h1>Authorize {escaped}</h1>")),
-        "{page}"
+        !page.contains("beta"),
+        "the self-declared client name never reaches the page: {page}"
     );
     assert!(
-        !page.contains("<b>beta</b>"),
-        "client name must be escaped: {page}"
+        !page.contains("Claude"),
+        "a client calling itself Claude is not presented as Claude: {page}"
     );
-    assert!(!page.contains("Claude"), "no hard-coded client: {page}");
     assert!(page.contains(USER_EMAIL), "{page}");
 }
 
