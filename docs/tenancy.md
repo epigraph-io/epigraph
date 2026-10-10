@@ -870,8 +870,9 @@ passkey ends the elevation at once.
   (only their own passkeys are offered; another person's passkey on the
   ticket is REFUSED and audited); the client then redeems the ticket at
   `/oauth/token` (`urn:epigraph:grant:elevate`) for ONE token: at most the
-  session's lifetime, no refresh token, the client's scopes minus every
-  admin-only one plus `platform:admin`, naming the session (`elv`).
+  session's lifetime, no refresh token, the client's READ scopes that the
+  ticket's refresh family was consented for (never a write scope, never a
+  standing admin-only one) plus `platform:admin`, naming the session (`elv`).
 * MCP `sudo` / `unsudo` (connector mode) exist but `sudo` is served only with
   `EPIGRAPH_MCP_CONNECTOR_ELEVATION` on, which is OFF by default (see the
   limits). `unsudo`, `POST /api/v1/elevation/end` and `epigraph-operator
