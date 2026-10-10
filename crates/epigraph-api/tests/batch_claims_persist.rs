@@ -335,6 +335,106 @@ async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embe
     }
 }
 
+/// Final review, Important item 2 (deferred #6): the encrypted path's
+/// group-membership refusal. `create_claim_core` checks
+/// `GroupMembershipRepository::is_member` against the AUTHENTICATED identity
+/// before it writes a sealed claim into `group_id`; batch reaches that check
+/// once per item. Here agent B creates group G (so B is its only member) and
+/// agent A, a non-member with a valid `claims:write` token, sends a
+/// `fully_private` item naming G between two public controls.
+///
+/// The slot must be 403 and must name the membership refusal: a status-only
+/// assertion would let a mutation that deletes the `!is_member` arm survive
+/// if some later check also refused the write. No `claim_encryption` row may
+/// exist for G afterwards (the claim's content is overridden to `[private]`,
+/// so it cannot be found by content). The public items around it persist,
+/// so the refusal is per item.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_private_item_naming_a_group_the_caller_is_not_in_is_403_and_writes_nothing() {
+    let db = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db)
+        .await
+        .unwrap();
+    let owner = common::seed_system_agent(&pool).await;
+    let outsider = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&db).await;
+    let (owner_token, _) = common::test_bearer_token_with_seeded_client_for_agent(
+        &pool,
+        &["claims:write", "groups:write"],
+        owner,
+    )
+    .await;
+    let (outsider_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["claims:write"], outsider)
+            .await;
+    let client = reqwest::Client::new();
+    let group: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/groups"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": uniq("grp-not-mine"),
+            "group_public_key": hex::encode(blake3::hash(b"batch477-nonmember").as_bytes())
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id: Uuid = group["group_id"]
+        .as_str()
+        .expect("group created (epoch 0 active)")
+        .parse()
+        .unwrap();
+
+    let (before, after) = (uniq("before-nonmember"), uniq("after-nonmember"));
+    let r = client
+        .post(format!("http://{addr}/api/v1/claims/batch"))
+        .bearer_auth(&outsider_token)
+        .json(&serde_json::json!({"claims": [
+            {"content": before},
+            {"content": uniq("sealed-nonmember"), "privacy_tier": "fully_private",
+             "group_id": group_id, "encrypted_content": "Y2lwaGVydGV4dA==",
+             "encryption_epoch": 0},
+            {"content": after}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "a refused item is a partial success"
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["created"], 2, "{body}");
+    assert_eq!(body["failed"], 1, "{body}");
+    assert_eq!(body["results"][1]["status"], 403, "{body}");
+    assert!(
+        body["results"][1]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a member"),
+        "the membership check is what refuses the slot: {body}"
+    );
+    assert!(body["results"][1]["claim_id"].is_null(), "{body}");
+
+    let sealed_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claim_encryption WHERE group_id = $1")
+            .bind(group_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sealed_rows, 0,
+        "no sealed claim may land in a group the caller is not in"
+    );
+    assert_eq!(count_content(&pool, &before).await, 1, "slot 0 persists");
+    assert_eq!(count_content(&pool, &after).await, 1, "slot 2 persists");
+}
+
 /// Review finding (fix round 1): `agentless_token_is_401_and_writes_nothing`
 /// above goes through HTTP, where `ViewerExtractor::extract_viewer`
 /// (`middleware/bearer.rs`) already answers 401 before the handler body
