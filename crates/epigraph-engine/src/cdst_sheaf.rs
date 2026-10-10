@@ -266,9 +266,11 @@ pub fn compute_cdst_section(
 /// `relationship` to `source_interval`.  The obstruction components are:
 /// - `interval_inconsistency` / `conflict_component`: for `contradicts` / frame-
 ///   evidence / neutral, the symmetric Bel/Pl distance (Hausdorff); for
-///   `supports` (Positive), the directional floor *shortfall* — only the target
-///   sitting below the corroborated `expected` floor on bel/pl counts, so over-
-///   support is benign corroboration and contributes 0 to both fields and to H¹.
+///   `supports` (Positive), the directional floor *shortfall*
+///   `max(0, expected.bel − target.bel)` — only the target's bel sitting below
+///   the corroborated `expected` bel floor counts (plausibility is neither a
+///   floor nor a ceiling), so over-support is benign corroboration and
+///   contributes 0 to both fields and to H¹.
 /// - `open_world_component`: |source_ow − expected_ow|
 /// - `ignorance_component`: |width_target − width_expected|
 pub fn compute_cdst_edge_inconsistency(
@@ -312,13 +314,21 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
         RestrictionKind::Neutral => target_interval,
     };
 
-    // For a `supports` edge the expected interval is a one-sided FLOOR — the
-    // target should be AT LEAST this strongly believed AND plausible
-    // (`restrict_epistemic_positive` sets `expected.bel = source.bel * factor`
-    // and `expected.pl = 1-(1-source.pl)*factor`). Only UNDER-support — the
-    // target sitting *below* that corroborated floor on bel OR pl — is a genuine
-    // conflict; a strongly corroborated hub that *exceeds* a discounted weak
-    // supporter is benign corroboration, not contradiction.
+    // For a `supports` edge the expected interval is a one-sided FLOOR on
+    // BELIEF only — a supporter commits the target to AT LEAST
+    // `expected.bel = source.bel * factor` (`restrict_epistemic_positive`).
+    // Only UNDER-support — the target's bel sitting *below* that corroborated
+    // floor — is a genuine conflict; a strongly corroborated hub that *exceeds*
+    // a discounted weak supporter is benign corroboration, not contradiction.
+    //
+    // Plausibility is deliberately NOT a floor. `expected.pl = 1-(1-source.pl)
+    // *factor` RISES toward 1 as the edge weakens, so a pl floor would demand
+    // MORE of the target the weaker the support, impose the maximal constraint
+    // pl_t >= 1 for a vacuous (factor -> 0) message, and flag every pl < 1
+    // target of a pl_s = 1.0 supporter (backlog b3476233; the pl half of
+    // 6c5dcca5). Nor is it a ceiling: "target more plausible than its doubted
+    // supporter" is exactly the over-support case above (denying the
+    // antecedent), see `test_supports_over_support_is_benign`.
     //
     // So the Positive arm is directional for BOTH twin fields: `interval_
     // inconsistency` (which `compute_cdst_cohomology` filters/sorts/sums to form
@@ -334,11 +344,9 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
     // Hausdorff distance and `conflict_component` its (equal) symmetric form.
     let (interval_inconsistency, conflict_component) = match kind {
         RestrictionKind::Positive(_) => {
-            // Floor shortfall: only mass BELOW the corroborated floor on either
-            // endpoint is inconsistency; over-support contributes 0.
-            let below = (expected_interval.bel - target_interval.bel)
-                .max(0.0)
-                .max((expected_interval.pl - target_interval.pl).max(0.0));
+            // Bel-floor shortfall: only belief BELOW the corroborated floor is
+            // inconsistency; over-support contributes 0.
+            let below = (expected_interval.bel - target_interval.bel).max(0.0);
             (below, below)
         }
         _ => {
@@ -590,7 +598,7 @@ mod tests {
         // Stale support: source is strong but target is very low
         // source: [0.8, 0.95, 0.1], target: [0.1, 0.2, 0.1]
         // expected bel = 0.8*0.8=0.64, pl = 1-(1-0.95)*0.8=0.96, ow=0.1
-        // hausdorff = max(|0.1-0.64|, |0.2-0.96|) = max(0.54, 0.76) = 0.76
+        // supports is a bel floor: shortfall = 0.64-0.1 = 0.54
         let src_id = Uuid::new_v4();
         let tgt_id = Uuid::new_v4();
         let source = EpistemicInterval::new(0.8, 0.95, 0.1);
@@ -600,8 +608,8 @@ mod tests {
             compute_cdst_edge_inconsistency(src_id, tgt_id, source, target, "supports", &sci());
 
         assert!(
-            obs.interval_inconsistency > 0.5,
-            "Expected high inconsistency for stale support, got {}",
+            (obs.interval_inconsistency - 0.54).abs() < 1e-9,
+            "stale support shortfall should be the bel shortfall 0.64-0.1=0.54, got {}",
             obs.interval_inconsistency
         );
         assert!(
@@ -631,7 +639,8 @@ mod tests {
         // scan re-observed it forever. AFTER the fix the Positive arm is
         // directional on BOTH fields and only the (here zero) UNDER-support
         // shortfall counts:
-        //   below = (0.40-0.98).max(0).max((0.68-1.0).max(0)) = 0.0.
+        //   below = (0.40-0.98).max(0) = 0.0
+        // (pl is not a floor; b3476233).
         let src_id = Uuid::new_v4();
         let tgt_id = Uuid::new_v4();
         let weak_source = EpistemicInterval::new(0.50, 0.60, 0.0);
@@ -667,6 +676,13 @@ mod tests {
         assert!(
             obs.interval_inconsistency < 0.05,
             "over-support must also be sheaf-consistent; interval_inconsistency={} (was {symmetric_before} symmetric)",
+            obs.interval_inconsistency
+        );
+        // Clamped to exactly 0, never negative: a signed shortfall would
+        // SUBTRACT mass from H¹ for every over-supported hub.
+        assert!(
+            obs.interval_inconsistency.abs() < 1e-9,
+            "over-support shortfall must be exactly 0 (not negative), got {}",
             obs.interval_inconsistency
         );
         // Twin fields stay equal for supports edges, as origin/main has them.
@@ -716,7 +732,7 @@ mod tests {
             coh.obstructions.len()
         );
         assert!(
-            coh.h1 < 1e-9,
+            coh.h1.abs() < 1e-9,
             "over-support must contribute 0 to H¹, got h1={}",
             coh.h1
         );
@@ -751,21 +767,20 @@ mod tests {
             &sci(),
         );
 
-        // The floor shortfall is the MAX over both endpoints:
-        //   expected.bel = 0.90*0.80 = 0.72, target.bel = 0.10 → bel shortfall 0.62
-        //   expected.pl  = 1-(1-1.0)*0.80 = 1.0, target.pl = 0.30 → pl shortfall 0.70
-        //   below = max(0.62, 0.70) = 0.70.
-        // (The pl shortfall dominates; the prior bel-only formula pinned 0.62.
-        // Still a real conflict, still classifies BeliefConflict — the metric is
-        // merely corrected to the larger, true endpoint shortfall.)
+        // The floor is on bel only:
+        //   expected.bel = 0.90*0.80 = 0.72, target.bel = 0.10 → shortfall 0.62.
+        // expected.pl = 1-(1-1.0)*0.80 = 1.0 is NOT a floor: it rises toward 1
+        // as the edge weakens (and is 1.0 for every factor when pl_s = 1.0), so
+        // the former pl shortfall 1.0-0.30 = 0.70 measured nothing about this
+        // edge (backlog b3476233).
         assert!(
             obs.conflict_component > 0.0,
             "under-support must still flag a conflict, got {}",
             obs.conflict_component
         );
         assert!(
-            (obs.conflict_component - 0.70).abs() < 1e-9,
-            "under-support shortfall should be max(0.72-0.10, 1.0-0.30)=0.70, got {}",
+            (obs.conflict_component - 0.62).abs() < 1e-9,
+            "under-support shortfall should be the bel shortfall 0.72-0.10=0.62, got {}",
             obs.conflict_component
         );
         // Twin field equality for supports edges.
@@ -774,6 +789,178 @@ mod tests {
             "supports twin fields must be equal: interval={} conflict={}",
             obs.interval_inconsistency,
             obs.conflict_component
+        );
+    }
+
+    // ── supports-edge floor coherence (backlog b3476233) ──────────────────
+    //
+    // `restrict_epistemic_positive` gives expected.pl = 1-(1-pl_s)*f, which
+    // RISES toward 1 as the edge weakens (f → 0). A floor on pl therefore
+    // demands MORE of the target the weaker the support, and a vacuous message
+    // (f → 0) would impose the maximal constraint pl_t ≥ 1. Only the bel floor
+    // (bel_s*f, falling to 0 as f → 0) is a coherent "at least" constraint.
+
+    #[test]
+    fn test_supports_full_plausibility_source_does_not_flag_target_above_bel_floor() {
+        // pl_s == 1.0 is the degenerate case behind ~97% of positive
+        // obstructions >= 0.15 in the 2026-09-17 replay: expected.pl = 1.0 for
+        // every factor, so ANY target with pl < 1 was flagged.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 1.0, 0.0);
+        // bel 0.50 is above the floor 0.50*0.80 = 0.40; pl 0.60 < 1.
+        let target = EpistemicInterval::new(0.50, 0.60, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(s, t, source, target, "supports", &sci());
+
+        assert!(
+            obs.interval_inconsistency.abs() < 1e-9,
+            "target above the bel floor must not be flagged by a pl=1 supporter, got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.conflict_component.abs() < 1e-9,
+            "conflict_component must also be 0, got {}",
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_supports_full_plausibility_source_drops_from_cohomology() {
+        // Cohomology-level twin of the edge test above: the live symptom of
+        // b3476233 was pl_s = 1.0 supporter edges landing in the obstruction
+        // set (and so in reconcile clusters) at the 0.15 threshold. A target
+        // that clears the bel floor must be absent from obstructions and H¹.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 1.0, 0.0);
+        let target = EpistemicInterval::new(0.50, 0.60, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(s, t, source, target, "supports", &sci());
+        let coh = compute_cdst_cohomology(vec![obs], 0.15);
+
+        assert_eq!(coh.edge_count, 1, "one edge in the sheaf");
+        assert!(
+            coh.obstructions.is_empty(),
+            "a pl=1 supporter of a target above the bel floor must not be an obstruction at 0.15, got {:?}",
+            coh.obstructions
+                .iter()
+                .map(|o| o.interval_inconsistency)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            coh.h1.abs() < 1e-9,
+            "it must contribute exactly 0 to H¹, got h1={}",
+            coh.h1
+        );
+    }
+
+    #[test]
+    fn test_supports_weaker_edge_never_demands_more() {
+        // Same source/target; `elaborates` (f=0.60) is a weaker positive edge
+        // than `supports` (f=0.80), so it must never impose a larger shortfall.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 0.90, 0.0);
+        let target = EpistemicInterval::new(0.50, 0.90, 0.0);
+
+        let inc = |rel: &str| {
+            compute_cdst_edge_inconsistency(s, t, source, target, rel, &sci())
+                .interval_inconsistency
+        };
+        let sup = inc("supports");
+        let ela = inc("elaborates");
+
+        assert!(
+            ela <= sup + 1e-12,
+            "weaker edge demanded more: elaborates={ela} > supports={sup}"
+        );
+        // Target bel 0.50 clears both bel floors (0.40, 0.30): no shortfall.
+        assert!(sup.abs() < 1e-9, "supports shortfall must be 0, got {sup}");
+        assert!(
+            ela.abs() < 1e-9,
+            "elaborates shortfall must be 0, got {ela}"
+        );
+
+        // A target BETWEEN the two bel floors (0.30 < 0.35 < 0.40) keeps the
+        // ordering check meaningful on the fixed code: the stronger edge has a
+        // real shortfall, the weaker one none.
+        let between = EpistemicInterval::new(0.35, 0.90, 0.0);
+        let inc_between = |rel: &str| {
+            compute_cdst_edge_inconsistency(s, t, source, between, rel, &sci())
+                .interval_inconsistency
+        };
+        let sup_b = inc_between("supports");
+        let ela_b = inc_between("elaborates");
+        assert!(
+            ela_b <= sup_b + 1e-12,
+            "weaker edge demanded more: elaborates={ela_b} > supports={sup_b}"
+        );
+        assert!(
+            (sup_b - 0.05).abs() < 1e-9,
+            "supports shortfall should be the bel shortfall 0.40-0.35=0.05, got {sup_b}"
+        );
+        assert!(
+            ela_b.abs() < 1e-9,
+            "elaborates bel floor 0.30 is cleared by 0.35: shortfall must be 0, got {ela_b}"
+        );
+    }
+
+    #[test]
+    fn test_supports_shortfall_monotone_in_factor_and_vanishes_at_zero() {
+        // Sweep the transmission factor directly via the CDST edge properties
+        // (`cdst_pl > 0.5` → Positive(cdst_bel)). The shortfall must be
+        // non-increasing as f falls, and tend to 0 as the message goes vacuous.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.80, 0.90, 0.0);
+        // Below the bel floor for strong edges (0.80*0.99 = 0.792 > 0.30), above
+        // it for weak ones (0.80*0.30 = 0.24 < 0.30), so the sweep is non-trivial.
+        let target = EpistemicInterval::new(0.30, 0.50, 0.0);
+
+        let factors = [0.99, 0.90, 0.80, 0.60, 0.50, 0.40, 0.30, 0.10, 0.01];
+        let shortfalls: Vec<f64> = factors
+            .iter()
+            .map(|&f| {
+                let props = serde_json::json!({ "cdst_bel": f, "cdst_pl": 0.95 });
+                compute_cdst_edge_inconsistency_with_properties(
+                    s,
+                    t,
+                    source,
+                    target,
+                    "supports",
+                    &props,
+                    &sci(),
+                )
+                .interval_inconsistency
+            })
+            .collect();
+
+        assert!(
+            shortfalls.iter().all(|&x| x >= 0.0),
+            "a shortfall is never negative (all: {shortfalls:?})"
+        );
+        for (w, f) in shortfalls.windows(2).zip(factors.windows(2)) {
+            assert!(
+                w[1] <= w[0] + 1e-12,
+                "shortfall rose as factor fell {}→{}: {}→{} (all: {shortfalls:?})",
+                f[0],
+                f[1],
+                w[0],
+                w[1]
+            );
+        }
+        // Strong edge: genuine bel shortfall 0.80*0.99 - 0.30 = 0.492.
+        assert!(
+            (shortfalls[0] - 0.492).abs() < 1e-9,
+            "f=0.99 shortfall should be the bel shortfall 0.492, got {}",
+            shortfalls[0]
+        );
+        // Near-vacuous edge imposes (almost) no constraint.
+        let last = *shortfalls.last().unwrap();
+        assert!(
+            last.abs() < 1e-9,
+            "f=0.01 (near-vacuous) must impose no shortfall, got {last} (all: {shortfalls:?})"
         );
     }
 
