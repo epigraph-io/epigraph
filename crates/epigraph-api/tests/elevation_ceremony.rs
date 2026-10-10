@@ -146,6 +146,32 @@ async fn spawn_on_with(
     let state =
         epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
             .with_passkeys(passkeys.map(Arc::new));
+    serve(state, extensions).await
+}
+
+/// [`spawn`] with a deterministic embedding provider (the mock), for the
+/// routes that embed a query first.
+async fn spawn_with_embedder(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    let svc: Arc<dyn EmbeddingService> = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
+            .with_passkeys(passkeys.map(Arc::new))
+            .with_embedding_service(svc);
+    serve(state, Vec::new()).await
+}
+
+/// Serve `state` (with `extensions`) on a loopback port.
+async fn serve(state: epigraph_api::AppState, extensions: Vec<RouterExtension>) -> Server {
     let jwt = state.jwt_config.clone();
     let app = epigraph_api::create_router_with_extensions(state, extensions);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3019,6 +3045,116 @@ async fn an_elevated_token_writes_through_no_non_get_route(pool: PgPool) {
         StatusCode::OK,
         "the elevated token ends its own session"
     );
+}
+
+/// Every public table's content (its rows' text, digested), by name, except
+/// the per-access log itself: what a request wrote shows up here.
+async fn table_digests(pool: &PgPool) -> std::collections::BTreeMap<String, String> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c \
+          WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') \
+            AND c.relname <> 'elevated_access' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("tables");
+    let mut out = std::collections::BTreeMap::new();
+    for t in tables {
+        let digest: String = sqlx::query_scalar(&format!(
+            "SELECT md5(coalesce(string_agg(x::text, E'\\n' ORDER BY x::text), '')) \
+               FROM public.\"{t}\" x"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("digest {t}: {e}"));
+        out.insert(t, digest);
+    }
+    out
+}
+
+/// The tables whose digest differs.
+fn changed(
+    a: &std::collections::BTreeMap<String, String>,
+    b: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    a.keys()
+        .chain(b.keys())
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Each allowlisted read-only POST (`ELEVATED_NON_GET_ALLOWLIST`'s four read
+/// routes) is SERVED to an elevated token and writes NOTHING: every public
+/// table but the per-access log is byte-identical before and after (final
+/// review F1-TST-05; the allowlist's doc says each was measured to write
+/// nothing, and adding a route there is a security decision). CALIBRATION
+/// that the instrument sees a write: an unelevated `POST /api/v1/agents`
+/// (not allowlisted) changes a table.
+///
+/// Verified to fail with a write planted in a served read POST (an
+/// `INSERT` into `security_events` on the triples query's path is the shape a
+/// telemetry or cache row would take): the changed-table list is not empty.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_allowlisted_read_posts_write_nothing_while_elevated(pool: PgPool) {
+    let s = spawn_with_embedder(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "tst05-b").await;
+    fixture::seed_group_claim(&pool, b, b_group, "tst05 B private claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+
+    let before = table_digests(&pool).await;
+    let plain = s.scoped_token(&p, None, &["agents:write"]);
+    let (status, body) = s
+        .post(
+            "/api/v1/agents",
+            Some(&plain),
+            &json!({ "public_key": hex::encode([0x51; 32]), "display_name": "tst05" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: {body}");
+    let after = table_digests(&pool).await;
+    assert!(
+        !changed(&before, &after).is_empty(),
+        "CALIBRATION: the instrument sees an unelevated write"
+    );
+
+    for (route, request) in [
+        (
+            "/api/v1/search/semantic",
+            json!({ "query": "tst05", "limit": 5 }),
+        ),
+        (
+            "/api/v1/graph/query",
+            json!({ "query": "MATCH (n:claim) RETURN * LIMIT 5" }),
+        ),
+        ("/api/v1/triples/query", json!({})),
+        (
+            "/api/v1/embeddings/neighborhood-density",
+            json!({ "query": "tst05", "radius": 0.3, "max_sample": 10 }),
+        ),
+    ] {
+        assert!(
+            epigraph_api::middleware::elevated_access::ELEVATED_NON_GET_ALLOWLIST
+                .contains(&("POST", route)),
+            "CALIBRATION: {route} is allowlisted"
+        );
+        let before = table_digests(&pool).await;
+        let (status, body) = s.post(route, Some(&elevated), &request).await;
+        assert!(
+            status.is_success() && !refused_as_elevated(&body),
+            "{route} is served to the elevated token ({status}): {body}"
+        );
+        let after = table_digests(&pool).await;
+        assert_eq!(
+            changed(&before, &after),
+            Vec::<String>::new(),
+            "{route} wrote nothing while elevated"
+        );
+    }
 }
 
 /// An ELEVATED token reads an admin route that takes no viewer (`GET
