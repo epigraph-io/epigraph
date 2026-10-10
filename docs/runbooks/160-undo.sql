@@ -10,6 +10,8 @@
 --      enrollment opened before the first passkey completes).
 --   2. 130's `epigraph_consume_admin_act` (an act executes while its proposer
 --      holds SOME live role:platform-custodian assignment again).
+--   3. 132's `epigraph_elevated_access_ready` (the gate answers from the
+--      existence of the recorder's names again, whoever owns them).
 --
 -- ORDER: run this FIRST, before 132-undo and every other elevation undo. It
 -- needs no binary rolled back first.
@@ -124,5 +126,16 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION
     public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb) FROM PUBLIC;
+
+-- 3. 132's recorder gate, verbatim.
+CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT to_regclass('public.elevated_access') IS NOT NULL
+       AND to_regprocedure(
+               'public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])'
+           ) IS NOT NULL
+$$;
 
 COMMIT;

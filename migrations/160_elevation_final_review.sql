@@ -44,6 +44,29 @@
 -- Nothing else in the consumer changes.
 --
 -- ===================================================================
+-- 3. THE OPENED GATE READS THE RECORDER THE MAINTENANCE ROLE OWNS
+--
+-- 132 made 125's recorder gate, `epigraph_elevated_access_ready()`, a
+-- readiness test: true while a relation named `public.elevated_access` and a
+-- function named `public.epigraph_record_elevated_access(text, jsonb,
+-- integer, uuid[])` exist. That is an EXISTENCE test, the form the review
+-- that built the gate rejected as spoofable by CREATE on the schema. With
+-- 127 taken back out and 132's undo skipped (which 132's header called
+-- safe: "closes the gate by itself"), any login holding CREATE on `public`
+-- (on PostgreSQL 15 and later, the database owner) re-created both names as
+-- stubs, the gate answered true, sessions were live again, and the API and
+-- MCP recorders "succeeded" against a stub that recorded nothing.
+--
+-- The gate now also requires the recorder to be a SECURITY DEFINER owned by
+-- a member of `epigraph_maintenance` (the role 127 hands it to; the same
+-- `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')` test
+-- `epigraph_definer_bypass()` and `epigraph-tenancy-backfill verify` make).
+-- A login outside that role cannot create a function it owns. On a database
+-- without the role the gate stays closed. Who may still replace the gate
+-- itself (a maintenance member holding CREATE, a superuser) is unchanged:
+-- `epigraph-tenancy-backfill verify` and the deploy preconditions cover it.
+--
+-- ===================================================================
 -- UNDO: `docs/runbooks/160-undo.sql` restores each re-bodied function to the
 -- body it had before this file. Run it FIRST, before 132-undo and every other
 -- elevation undo.
@@ -180,3 +203,26 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION
     public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb) FROM PUBLIC;
+
+-- ===================================================================
+-- 3. 132's recorder gate, reading the recorder's owner
+-- (delta from 132: the owner and SECURITY DEFINER test).
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT to_regclass('public.elevated_access') IS NOT NULL
+       AND EXISTS (
+               SELECT 1
+                 FROM pg_catalog.pg_proc p
+                WHERE p.oid = to_regprocedure(
+                          'public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])')
+                  AND p.prosecdef
+                  AND CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                                         WHERE r.rolname = 'epigraph_maintenance')
+                           THEN pg_catalog.pg_has_role(p.proowner, 'epigraph_maintenance',
+                                                       'MEMBER')
+                           ELSE false
+                      END)
+$$;

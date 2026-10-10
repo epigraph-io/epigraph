@@ -1186,8 +1186,14 @@ restart.
   a per-person advisory lock. Section 2: 130's `epigraph_consume_admin_act`
   executes an act only while the proposer's live elevating assignment IS the
   act's `assignment_id` (as confirmation and session liveness bind it), not
-  merely while some custodian assignment is live. Behaviour in
-  `epigraph-db/tests/pending_admin_acts.rs`; the file as a whole in
+  merely while some custodian assignment is live. Section 3: 132's recorder
+  gate `epigraph_elevated_access_ready()` also requires the recorder to be a
+  `SECURITY DEFINER` owned by a member of `epigraph_maintenance` (132 tested
+  only that the two names exist, which CREATE on `public` alone could spoof
+  once 127 was undone); 160 is therefore the third file allowed to define the
+  gate (`elevated_access.rs::every_132_object_is_registered`). Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs` (sections 1, 2) and
+  `elevated_access.rs` (section 3); the file as a whole in
   `migration_160.rs`. Sets `lock_timeout = '3s'`. Undo
   (`docs/runbooks/160-undo.sql`, restores every re-bodied function; run it
   FIRST, before 132-undo). **Deploy order:** after 124-132 (sqlx would

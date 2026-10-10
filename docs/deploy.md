@@ -2356,7 +2356,10 @@ every other elevation undo: it restores 125's `SELECT false`, so every session
 stops being live at its next statement (no binary needs rolling back first: a
 recording build on a gate-closed database serves every request unelevated).
 Taking 127 back out also closes the gate by itself (the readiness test reads
-the recorder), but run 132-undo first anyway.
+the recorder; since migration 160 only a `SECURITY DEFINER` recorder owned by
+a member of `epigraph_maintenance` counts, so stubs that a login holding
+CREATE on `public` re-creates under the same names do not reopen it), but run
+160-undo and 132-undo first anyway.
 
 ## The elevation stack as a whole (migrations 124-132) — order, undo order, arming
 

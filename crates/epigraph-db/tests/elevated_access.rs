@@ -895,6 +895,64 @@ async fn the_opened_gate_follows_the_recorder(pool: PgPool) {
     }
 }
 
+/// The opened gate answers from the recorder the MAINTENANCE role owns, not
+/// from whatever carries its names: on a database whose recorder is gone
+/// (`127-undo.sql` applied, 132's and 160's undos skipped), an application
+/// login that holds CREATE on `public` re-creates a stub `elevated_access`
+/// table and a stub `SECURITY DEFINER` recorder that records nothing. The
+/// gate stays closed and the session is not elevated.
+///
+/// Verified to fail: 160's gate body reverted to 132's existence test ->
+/// the application's stubs reopen the gate and the session is elevated
+/// behind a recorder that records nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_recorder_the_maintenance_role_does_not_own_opens_nothing(pool: PgPool) {
+    let p = holder(&pool, "gate-owner-p", 44).await;
+    let live = session(&pool, &p, "gate owner").await;
+    assert!(gate(&pool).await, "CALIBRATION: open at head");
+    sqlx::raw_sql(&undo_127())
+        .execute(&pool)
+        .await
+        .expect("127-undo applies at head");
+    assert!(!gate(&pool).await, "CALIBRATION: 127-undo closes the gate");
+
+    sqlx::query("GRANT CREATE ON SCHEMA public TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("the application may CREATE in public");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        for stmt in [
+            "CREATE TABLE public.elevated_access (x integer)",
+            "CREATE FUNCTION public.epigraph_record_elevated_access(text, jsonb, integer, uuid[]) \
+             RETURNS uuid LANGUAGE sql SECURITY DEFINER AS 'SELECT gen_random_uuid()'",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("CALIBRATION: the application creates {stmt}: {e}"));
+        }
+        (conn, ())
+    })
+    .await;
+    let stubs: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.elevated_access') IS NOT NULL \
+            AND to_regprocedure('public.epigraph_record_elevated_access(text, jsonb, integer, \
+                                 uuid[])') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert!(stubs, "CALIBRATION: both names exist again");
+    assert!(
+        !gate(&pool).await,
+        "a recorder the application owns does not open the gate"
+    );
+    assert!(
+        !is_elevated(&pool, &p, live).await,
+        "behind an application-owned recorder the session is not elevated"
+    );
+}
+
 /// The recorder's attribution covers every table an elevated session reads
 /// whose rows carry an owner group and a uuid `id`: each such table with a
 /// 126 read arm is named in the recorder's body, or listed here as not
@@ -1266,8 +1324,9 @@ async fn the_132_rollback_closes_the_gate_and_restores_125s_body(pool: PgPool) {
 /// 125's recorder gate, which stays on `epigraph-tenancy-backfill verify`'s
 /// ownership list at its own migration (125) and on the grant register as
 /// NOT application-callable; `docs/runbooks/132-undo.sql` restores it; and no
-/// file but 125, 132 and 132's undo defines it (125's header: nothing else
-/// may replace it).
+/// migration but 125 (closed), 132 (opened) and 160 (the final review's
+/// owner test on the recorder; its undo restores 132's body) defines it
+/// (125's header: nothing else may replace it).
 ///
 /// Verified to fail: a second `CREATE OR REPLACE` of the gate planted in
 /// 131 (named here).
@@ -1312,8 +1371,12 @@ fn every_132_object_is_registered() {
     replacing.sort();
     assert_eq!(
         replacing,
-        vec!["125_elevation.sql", "132_open_elevation.sql"],
-        "only 125 (closed) and 132 (open) define the recorder gate"
+        vec![
+            "125_elevation.sql",
+            "132_open_elevation.sql",
+            "160_elevation_final_review.sql"
+        ],
+        "only 125 (closed), 132 (open) and 160 (owner-checked) define the recorder gate"
     );
 }
 
