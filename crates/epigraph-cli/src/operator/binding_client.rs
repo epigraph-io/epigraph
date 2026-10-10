@@ -132,8 +132,25 @@ pub async fn allow(
     })
 }
 
-/// Revoke `client`'s allowance. Returns whether this call revoked it
-/// (`false`: there was no live allowance). Final for that client.
+/// What [`revoke`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// This call revoked the live allowance.
+    RevokedNow,
+    /// The allowance was already revoked (final): when, and by which session
+    /// user.
+    AlreadyRevoked {
+        revoked_at: String,
+        revoked_by: String,
+    },
+    /// No allowance row names this client: nothing to revoke. Usually a
+    /// mistyped id, so the binary exits non-zero.
+    NotAllowed,
+}
+
+/// Revoke `client`'s allowance. Final for that client. Tells "revoked now"
+/// from "already revoked" from "never allowed", read in the same transaction
+/// as the revoke.
 ///
 /// # Errors
 /// A blank reason, or a statement failed.
@@ -142,7 +159,7 @@ pub async fn revoke(
     client: Uuid,
     reason: &str,
     apply: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RevokeOutcome> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     let now: bool = sqlx::query_scalar(
         "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, $2)",
@@ -151,12 +168,52 @@ pub async fn revoke(
     .bind(reason)
     .fetch_one(&mut *tx)
     .await?;
+    let outcome = if now {
+        RevokeOutcome::RevokedNow
+    } else {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT revoked_at::text, revoked_by FROM public.author_binding_clients \
+              WHERE client_id = $1",
+        )
+        .bind(client)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("reading the client's allowance row")?;
+        match row {
+            None => RevokeOutcome::NotAllowed,
+            Some((revoked_at, revoked_by)) => RevokeOutcome::AlreadyRevoked {
+                revoked_at: revoked_at.unwrap_or_else(|| "-".to_string()),
+                revoked_by: revoked_by.unwrap_or_else(|| "-".to_string()),
+            },
+        }
+    };
     if apply {
         tx.commit().await?;
     } else {
         tx.rollback().await?;
     }
-    Ok(now)
+    Ok(outcome)
+}
+
+/// The operator-facing line for a [`RevokeOutcome`].
+#[must_use]
+pub fn describe_revoke(client: Uuid, o: &RevokeOutcome, apply: bool) -> String {
+    match o {
+        RevokeOutcome::RevokedNow => format!(
+            "{}REVOKED\tclient={client}",
+            if apply { "" } else { "WOULD BE " }
+        ),
+        RevokeOutcome::AlreadyRevoked {
+            revoked_at,
+            revoked_by,
+        } => format!(
+            "ALREADY-REVOKED\tclient={client}\trevoked_at={revoked_at}\trevoked_by={revoked_by}"
+        ),
+        RevokeOutcome::NotAllowed => format!(
+            "NOT-ALLOWED\tclient={client}\tno allowance row names this client, so nothing was \
+             revoked; check the id (`oauth_clients.id`, not its `client_id`)"
+        ),
+    }
 }
 
 /// The operator-facing lines for an [`AllowOutcome`].

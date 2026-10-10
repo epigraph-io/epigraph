@@ -1456,6 +1456,98 @@ async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
     assert_eq!(binding, None, "the revoke unbinds");
 }
 
+/// The revoke command never reports a no-op as done: a client with no
+/// allowance row (a mistyped id) exits non-zero and says NOT-ALLOWED, dry run
+/// or `--apply`, writing nothing; an already-revoked allowance says
+/// ALREADY-REVOKED with when and by whom, exits 0 (the end state holds) and
+/// writes no second audit row.
+///
+/// Verified to fail: the pre-fix binary (an unknown client exits 0 with
+/// NOT-ALLOWED; an already-revoked one prints the same NOT-ALLOWED).
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_unknown_or_revoked_client_is_not_reported_as_done(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let revoked_events = |pool: PgPool, client: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM security_events \
+              WHERE event_type = 'platform.author_binding_client_revoked' \
+                AND details->>'client_id' = $1::text",
+        )
+        .bind(client)
+        .fetch_one(&pool)
+        .await
+        .expect("revoke events")
+    };
+
+    // A mistyped id: no row names it.
+    let unknown = Uuid::new_v4().to_string();
+    for apply in [false, true] {
+        let mut argv = vec![
+            "revoke-author-binding-client",
+            "--client",
+            unknown.as_str(),
+            "--reason",
+            "incident",
+        ];
+        if apply {
+            argv.push("--apply");
+        }
+        let out = run_op(&pool, &argv).await;
+        assert_ne!(out.code, 0, "apply={apply}: {}", out.show());
+        assert!(
+            out.stdout
+                .contains(&format!("NOT-ALLOWED\tclient={unknown}"))
+                && !out.stdout.contains("REVOKED"),
+            "apply={apply}: {}",
+            out.show()
+        );
+    }
+    assert_eq!(
+        allowance_state(&pool, client).await.0,
+        1,
+        "the real allowance is untouched"
+    );
+
+    // Revoked once, then again.
+    let client_s = client.to_string();
+    let revoke = [
+        "revoke-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--reason",
+        "incident",
+        "--apply",
+    ];
+    let first = run_op(&pool, &revoke).await;
+    assert_eq!(first.code, 0, "{}", first.show());
+    assert!(
+        first.stdout.contains(&format!("REVOKED\tclient={client}")),
+        "{}",
+        first.show()
+    );
+    assert_eq!(revoked_events(pool.clone(), client).await, 1);
+    let again = run_op(&pool, &revoke).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again
+            .stdout
+            .contains(&format!("ALREADY-REVOKED\tclient={client}\trevoked_at="))
+            && again.stdout.contains("\trevoked_by=")
+            && !again.stdout.contains("NOT-ALLOWED"),
+        "{}",
+        again.show()
+    );
+    assert_eq!(
+        revoked_events(pool.clone(), client).await,
+        1,
+        "no second revoke is recorded"
+    );
+}
+
 /// Allow `client` for `operator` on the harness (superuser) pool through the
 /// maintenance definer.
 async fn allow_direct(pool: &PgPool, client: Uuid, operator: Uuid) {

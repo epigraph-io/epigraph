@@ -690,7 +690,10 @@ human (`OPL02`).
   row, which no application session can forge. Revoke is FINAL for that
   client (mint a new client to allow again); no session deletes a row, and
   the FKs are `ON DELETE RESTRICT`, so an agent, operator or client ever
-  allowlisted cannot be deleted (122's `human_operators` parity).
+  allowlisted cannot be deleted (122's `human_operators` parity). The revoke
+  command prints `REVOKED`, `ALREADY-REVOKED` (with when and by whom; exit 0)
+  or `NOT-ALLOWED` when no allowance row names the client (exit 1: usually a
+  mistyped id, and the real allowance is still live).
 * **Incident response.** Revoke the allowance AND the client. Suspending the
   client alone is not a durable unbind: a privileged re-activation re-binds.
 * **Links.** A new operator link of an allowlisted agent is refused (`55000`)

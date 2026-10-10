@@ -17,6 +17,10 @@
 //! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
 //! recent writers refused it. `verify-confirmations` exits 2 when at least one
 //! stored confirmation does not verify (each is recorded).
+//! `allow-author-binding-client` exits 3 when the allowance is recorded but
+//! does not bind (ALLOWED-BUT-INEFFECTIVE); `revoke-author-binding-client`
+//! exits 1 when no allowance row names the client (NOT-ALLOWED: nothing to
+//! revoke, usually a mistyped id).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -57,6 +61,9 @@
 //!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
 //!     epigraph-operator list-elevations [--person <uuid>] [--live]
 //!     epigraph-operator verify-confirmations [--since <RFC3339>] [--json]
+//!     epigraph-operator allow-author-binding-client --client <uuid> --operator <uuid> \
+//!         --reason TEXT [--revoke-foreign-writes] [--apply]
+//!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
@@ -326,7 +333,9 @@ enum Command {
         apply: bool,
     },
     /// Revoke a client's author-binding allowance. Final for that client:
-    /// mint a new client to allow again.
+    /// mint a new client to allow again. Prints ALREADY-REVOKED (exit 0) for
+    /// a revoked allowance, and NOT-ALLOWED (exit 1) when no allowance row
+    /// names the client.
     RevokeAuthorBindingClient {
         /// The OAuth client (`oauth_clients.id`).
         #[arg(long)]
@@ -985,16 +994,19 @@ async fn main_inner() -> anyhow::Result<i32> {
             reason,
             apply,
         } => {
-            let now = binding_client::revoke(&mut conn, client, &reason, apply).await?;
+            let outcome = binding_client::revoke(&mut conn, client, &reason, apply).await?;
             println!(
-                "{}{}\tclient={client}",
-                if apply { "" } else { "WOULD BE " },
-                if now { "REVOKED" } else { "NOT-ALLOWED" }
+                "{}",
+                binding_client::describe_revoke(client, &outcome, apply)
             );
             if !apply {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");
             }
-            Ok(0)
+            Ok(if outcome == binding_client::RevokeOutcome::NotAllowed {
+                1
+            } else {
+                0
+            })
         }
         Command::Link {
             agent,
