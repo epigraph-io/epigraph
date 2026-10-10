@@ -1287,8 +1287,11 @@ async fn register_system_agent_refuses_an_unknown_role_before_the_database(pool:
 }
 
 /// On a DSN that is not a maintenance login the command is refused and
-/// registers nothing (the tool's own maintenance check answers before the
-/// definer's grant set would).
+/// registers nothing. This is a regression test of the connect path
+/// (`operator::connect()`'s maintenance-membership refusal answers before any
+/// `register-system-agent` code runs); the definer's own refusal of an
+/// application-role caller is
+/// `register_on_an_app_role_connection_is_refused_by_the_definer`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn register_system_agent_on_an_app_dsn_is_refused(pool: PgPool) {
     let s = legacy_key_holder(&pool).await.to_string();
@@ -1518,4 +1521,34 @@ async fn register_refuses_a_key_that_stopped_being_legacy_after_the_identity_lin
         Outcome::Registered
     );
     assert_eq!(registry_rows(&pool).await, 1);
+}
+
+/// `register` on an APPLICATION-role connection reaches the definer and is
+/// refused by its grant set (PostgreSQL's own text), registering nothing; the
+/// CLI surfaces that refusal rather than swallowing it. Kills: the error of
+/// the definer call dropped, or `register` committing anyway.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_on_an_app_role_connection_is_refused_by_the_definer(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity};
+    let s = legacy_key_holder(&pool).await;
+    let identity = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let r = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = register(&mut conn, role, &identity, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = r.expect_err("the application role cannot register");
+    assert!(
+        format!("{e:#}").contains("permission denied for function epigraph_register_system_agent"),
+        "{e:#}"
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
 }
