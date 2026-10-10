@@ -3467,3 +3467,83 @@ async fn the_act_ceremony_fails_closed_unconfigured_and_on_an_unknown_act(pool: 
         StatusCode::NOT_FOUND
     );
 }
+
+// =====================================================================
+// The Explorer's read routes join the same per-access recorder
+// =====================================================================
+
+/// The read routes the Explorer branch added (`/api/v1/claims/:id/ego`,
+/// `/placement`, `/provenance-chain`, `/api/v1/stats`) and the audit route it
+/// moved onto the stamped connection (`/api/v1/audit/security`) sit on the
+/// protected chain under `record_elevated_access`, like every first-party
+/// route: an ELEVATED read of each is served and recorded as exactly one
+/// `elevated_access` row whose surface is its matched route, and the same
+/// reads with the same scopes on an UNELEVATED token record nothing. The
+/// claim read is the holder's own public claim, so every route answers 200 on
+/// both tokens and the only difference is the elevation.
+///
+/// The mutation it is aimed at: one of these routes registered where the
+/// recorder layer does not wrap it, which `ViewerExtractor` answers with a
+/// 500 ("ELEVATED ACCESS NOT RECORDED") and no row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_explorer_read_routes_are_recorded_when_elevated_and_only_then(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &s,
+        "explorer-holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let claim = fixture::seed_public_claim(&pool, p.person, "explorer recorder claim").await;
+    let scopes = ["claims:read", "audit:read"];
+    let reads = [
+        (
+            format!("/api/v1/claims/{claim}/ego"),
+            "GET /api/v1/claims/:id/ego",
+        ),
+        (
+            format!("/api/v1/claims/{claim}/placement"),
+            "GET /api/v1/claims/:id/placement",
+        ),
+        (
+            format!("/api/v1/claims/{claim}/provenance-chain"),
+            "GET /api/v1/claims/:id/provenance-chain",
+        ),
+        ("/api/v1/stats".to_string(), "GET /api/v1/stats"),
+        (
+            "/api/v1/audit/security?limit=1".to_string(),
+            "GET /api/v1/audit/security",
+        ),
+    ];
+
+    let plain = s.scoped_token(&p, None, &scopes);
+    for (path, _) in &reads {
+        let (status, body) = s.get(path, &plain).await;
+        assert_eq!(status, StatusCode::OK, "unelevated {path}: {body}");
+    }
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "an unelevated read records nothing"
+    );
+
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+    for (path, _) in &reads {
+        let (status, body) = s.get(path, &elevated).await;
+        assert_eq!(status, StatusCode::OK, "elevated {path}: {body}");
+    }
+
+    let mut surfaces: Vec<String> = log_of(&pool)
+        .await
+        .into_iter()
+        .map(|(surface, _, _, _)| surface)
+        .collect();
+    surfaces.sort();
+    let mut expected: Vec<String> = reads.iter().map(|(_, s)| (*s).to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        surfaces, expected,
+        "exactly one row per elevated Explorer read, under its matched route"
+    );
+}
