@@ -1082,12 +1082,15 @@ fn undo_127() -> String {
 /// `docs/runbooks/127-undo.sql`, applied to a database that went 126 -> 127
 /// and holds a log row, returns its catalog (relations, function bodies and
 /// owners, policies, triggers, constraints) to the same database's at 126;
-/// the row survives as one `platform.elevated_access` event carrying it; and a
-/// second run changes nothing. Cut at 127, not head: a later migration is
-/// undone before this one.
+/// the row survives as one `platform.elevated_access` event carrying it, and
+/// as one `platform.elevated_access_subject` copy for the admin of the group
+/// it names, which that admin reads on its own session; and a second run
+/// changes nothing. Cut at 127, not head: a later migration is undone before
+/// this one.
 ///
 /// Verified to fail: the undo's DROP of `epigraph_admin_group_ids` removed
-/// (left behind); the archival INSERT removed (the history is lost).
+/// (left behind); the archival INSERT removed (the history is lost); the
+/// subject copies removed (B reads nothing after the undo).
 #[sqlx::test(migrations = false)]
 async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgPool) {
     migrate(&pool, &up_to(126)).await;
@@ -1103,6 +1106,8 @@ async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgP
     // records; the insert guard still binds it to a real session).
     let p = holder_behind_the_gate(&pool, "access-undo-p", 29).await;
     let live = session(&pool, &p, "undo history").await;
+    // The row names B's group; B is its admin (the subject).
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "access-undo-b").await;
     let row: Uuid = sqlx::query_scalar(
         "INSERT INTO elevated_access (elevation_id, person_agent_id, assignment_id, reason, \
                                       surface, args, row_count, owner_group_ids) \
@@ -1111,10 +1116,15 @@ async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgP
            FROM elevation_sessions s WHERE s.id = $1 RETURNING id",
     )
     .bind(live)
-    .bind(p.group)
+    .bind(b_group)
     .fetch_one(&pool)
     .await
     .expect("a log row");
+    assert_eq!(
+        visible(&pool, b).await,
+        vec![row],
+        "CALIBRATION: B reads it"
+    );
 
     for run in 1..=2 {
         sqlx::raw_sql(&undo_127())
@@ -1144,6 +1154,30 @@ async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgP
     assert_eq!(reason.as_deref(), Some("undo history"));
     assert_eq!(surface.as_deref(), Some("GET /x"));
     assert_eq!(by.as_deref(), Some("127-undo"));
+
+    // The subject keeps its record: B reads, on its own application session,
+    // one copy attributed to it (final review F1-COR-04); the elevator's
+    // archived event is not B's.
+    let (mine, elevators): (i64, i64) = stamped(&pool, Stamp::plain(b), |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE event_type = 'platform.elevated_access_subject' \
+                                       AND details->>'id' = $1 \
+                                       AND details->>'reason' = 'undo history'), \
+                    count(*) FILTER (WHERE event_type = 'platform.elevated_access') \
+               FROM security_events",
+        )
+        .bind(row.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .expect("B's security events");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        (mine, elevators),
+        (1, 0),
+        "after the undo B reads its own copy of the row, once, and not the elevator's"
+    );
 }
 
 // =====================================================================
