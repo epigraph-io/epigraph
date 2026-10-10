@@ -20,6 +20,7 @@ pub mod claim;
 pub mod claim_encryption;
 pub mod claim_theme;
 pub mod claim_version;
+pub mod cluster_run;
 pub mod community;
 pub mod conflict_density;
 pub mod context;
@@ -29,6 +30,7 @@ pub mod decomposition_priority;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
+pub mod ego;
 pub mod elevated_access;
 pub mod elevation_ceremony;
 pub mod entity;
@@ -112,6 +114,7 @@ pub use claim_theme::{
     ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
+pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::{CommunityRepository, MembershipOutcome};
 pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use context::ContextRepository;
@@ -119,6 +122,7 @@ pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
+pub use ego::{EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository};
 pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
     AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,

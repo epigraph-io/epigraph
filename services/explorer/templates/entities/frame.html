@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} · Frame · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<header class="entity-head">
+  <p class="entity-kind">Frame of discernment</p>
+  <h1>{{ title }}</h1>
+</header>
+
+<section class="section" aria-labelledby="definition-title">
+  <h2 id="definition-title" class="section__title">Definition</h2>
+  {%- match definition %}
+  {%- when Degraded::Available { data } %}
+  {%- if let Some(d) = data.description %}
+  <p class="prose">{{ d }}</p>
+  {%- endif %}
+  <dl class="meta card">
+    <dt>Frame id</dt>
+    <dd class="mono">{{ id }}</dd>
+    <dt>Claims</dt>
+    <dd class="num">{{ data.claim_count }}</dd>
+    <dt>Version</dt>
+    <dd class="num">{{ data.version }}</dd>
+    <dt>Refinable</dt>
+    <dd>{% if data.is_refinable %}Yes{% else %}No{% endif %}</dd>
+    <dt>Created</dt>
+    <dd>{{ data.created }}</dd>
+    {%- if let Some(url) = data.parent_url %}
+    <dt>Parent frame</dt>
+    <dd><a href="{{ url }}">Open the parent frame</a></dd>
+    {%- endif %}
+  </dl>
+  <h3>Hypotheses</h3>
+  {%- if data.hypotheses.is_empty() %}
+  <p class="muted">No hypotheses are defined.</p>
+  {%- else %}
+  <ol class="hypotheses" start="0">
+    {%- for (i, h) in data.hypotheses %}
+    <li value="{{ i }}">{{ h }}</li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+
+<section class="section" aria-labelledby="claims-title">
+  <h2 id="claims-title" class="section__title">Claims in this frame</h2>
+  <form class="sort-form" method="get" action="{{ self_url }}">
+    <label for="frame-sort">Sort by</label>
+    <select id="frame-sort" name="sort">
+      {%- for (s, selected) in sort_options %}
+      <option value="{{ s }}"{% if *selected %} selected{% endif %}>{{ s }}</option>
+      {%- endfor %}
+    </select>
+    <label for="frame-order" class="visually-hidden">Order</label>
+    <select id="frame-order" name="order">
+      {%- for (o, selected) in order_options %}
+      <option value="{{ o }}"{% if *selected %} selected{% endif %}>{% if *o == "desc" %}highest first{% else %}lowest first{% endif %}</option>
+      {%- endfor %}
+    </select>
+    <button type="submit" class="button-quiet">Sort</button>
+  </form>
+  {%- match claims %}
+  {%- when Degraded::Available { data } %}
+  <p class="small">{{ data.pager.summary }}</p>
+  {%- if !data.rows.is_empty() %}
+  <ul class="link-list">
+    {%- for c in data.rows %}
+    <li>
+      <a class="entity-row__text" href="{{ c.url }}">{{ c.text.text }}</a>
+      <p class="small muted">
+        {%- if let Some(h) = c.hypothesis %}Hypothesis: {{ h }} · {% endif -%}
+        belief <span class="num">{{ c.belief }}</span> · plausibility <span class="num">{{ c.plausibility }}</span> · ignorance <span class="num">{{ c.ignorance }}</span></p>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- if data.pager.prev_url.is_some() || data.pager.next_url.is_some() %}
+  <nav class="pager" aria-label="Frame claims pages">
+    {%- if let Some(url) = data.pager.prev_url %}
+    <a class="button-quiet button" href="{{ url }}" rel="prev">Previous</a>
+    {%- endif %}
+    {%- if let Some(url) = data.pager.next_url %}
+    <a class="button-quiet button" href="{{ url }}" rel="next">Next</a>
+    {%- endif %}
+  </nav>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+{% endblock %}

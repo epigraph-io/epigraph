@@ -45,6 +45,8 @@ pub mod cross_source;
 pub mod crud;
 pub mod edges;
 #[cfg(feature = "db")]
+pub mod ego;
+#[cfg(feature = "db")]
 pub mod elevate;
 #[cfg(feature = "db")]
 pub mod elevation;
@@ -88,6 +90,8 @@ mod negative_tests;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
+pub mod placement;
+#[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
 pub mod privatization;
@@ -96,6 +100,8 @@ pub mod privatization;
 pub mod projection;
 #[cfg(feature = "db")]
 pub mod provenance;
+#[cfg(feature = "db")]
+pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
 pub mod revoke_signature;
@@ -103,6 +109,8 @@ pub mod revoke_signature;
 pub mod search;
 pub mod spans;
 pub mod staging;
+#[cfg(feature = "db")]
+pub mod stats;
 pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
@@ -791,6 +799,7 @@ pub fn create_router_with_extensions(
             get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
+        .route("/api/v1/stats", get(stats::corpus_stats))
         // Elevation (plan EL-5, rulings D2/D5): a human asks for a grant-mode
         // ticket for ITSELF (the definer is principal-bound and refuses anyone
         // without a live elevating-role assignment and a live passkey), and
@@ -844,6 +853,15 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/claims/:id/provenance",
             get(edges::claim_provenance),
+        )
+        .route(
+            "/api/v1/claims/:id/provenance-chain",
+            get(provenance_chain::claim_provenance_chain),
+        )
+        .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/placement",
+            get(placement::claim_placement),
         )
         .route(
             "/api/v1/claims/:id/supporting-evidence",

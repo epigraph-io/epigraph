@@ -1,0 +1,9 @@
+<section class="notice notice--warn graph-expired" aria-labelledby="expired-title">
+  <h2 id="expired-title">View expired — clustering has re-run</h2>
+  <p>This {{ what }} belonged to an earlier clustering run, and its id is no longer valid.</p>
+  {%- if let Some(s) = share %}
+  <p><a href="{{ s.href }}">Go back to the claim</a> to see where it sits now.</p>
+  {%- else %}
+  <p><a href="{{ ctx.home_url() }}">Start again from the overview</a>, or search for a claim.</p>
+  {%- endif %}
+</section>
