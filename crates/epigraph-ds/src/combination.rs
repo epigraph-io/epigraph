@@ -543,10 +543,11 @@ pub fn fold_conflict(combined: &MassFunction, reports: &[CombinationReport]) -> 
 ///
 /// Every pairwise step uses Dempster's rule (CDST conjunctive combination,
 /// then normalisation by `1 - K_c`). Dempster's rule is commutative and
-/// associative, so the result does not depend on the order of `masses`, and
-/// appending a BBA that supports a hypothesis can never lower that
-/// hypothesis's pignistic probability (the numerator only gains, the
-/// normaliser only shrinks). See `tests/supports_monotonicity.rs`.
+/// associative, so, unless a step hits total conflict (below), the result does
+/// not depend on the order of `masses`, and appending a BBA that supports a
+/// hypothesis can never lower that hypothesis's pignistic probability (the
+/// numerator only gains, the normaliser only shrinks). See
+/// `tests/supports_monotonicity.rs`.
 ///
 /// History (drain unit U025, backlog 9d4821c1): this used to re-pick a rule
 /// per step via [`select_combination_rule`] (Dempster / CDST conjunctive /
@@ -565,14 +566,21 @@ pub fn fold_conflict(combined: &MassFunction, reports: &[CombinationReport]) -> 
 /// **Total conflict.** If a single step has `K_c ≈ 1` (Dempster undefined),
 /// that step alone falls back to Yager's closed-world rule (all conflict to
 /// Theta) and is reported as [`CombinationMethod::YagerClosed`], rather than
-/// failing the whole fold.
+/// failing the whole fold. That fallback is NOT associative: it resets the
+/// accumulated mass to Theta, discarding what was folded before it, so with
+/// categorical opposing inputs the outcome depends on where the fallback step
+/// falls in the fold (e.g. `[T=1, F=1]` folds to Theta, while adding a third
+/// `F=1` can fold to `F=1`). The canonical sort below keeps it deterministic
+/// for a given input multiset, and [`aggregate_conflict`] is then 1.0.
 ///
 /// The `_conflict_threshold` parameter is retained for backward compatibility
 /// but is unused.
 ///
 /// Inputs are still sorted via [`canonical_mass_cmp`] before folding; with an
 /// associative rule this only makes the floating-point result bit-for-bit
-/// reproducible across caller iteration orders.
+/// reproducible across caller iteration orders. When a total-conflict
+/// fallback step occurs, the sort is also what makes the (order-dependent)
+/// outcome independent of the caller's order.
 ///
 /// # Errors
 /// - `DsError::InsufficientSources` if `masses` is empty
@@ -1860,6 +1868,67 @@ mod tests {
         assert!((result.mass_of(&FocalElement::theta(&frame)) - 1.0).abs() < 1e-12);
         assert!(result.mass_of_missing() < 1e-12);
         assert!((aggregate_conflict(&reports) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn total_conflict_fallback_mid_fold_is_deterministic_across_caller_orders() {
+        // Three inputs where the YagerClosed fallback fires mid-fold. The
+        // fallback is not associative (it resets the accumulated mass to
+        // Theta), so a naive left fold gives different BetP(TRUE) for
+        // different input orders (0.25 vs 0.5 here). combine_multiple's
+        // canonical sort must make every caller order produce the SAME
+        // result, and the fold must report total conflict.
+        let frame = binary_frame();
+        let t1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 1.0).unwrap();
+        let f1 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 1.0).unwrap();
+        let f05 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.5).unwrap();
+
+        // Precondition: the fold really is order-dependent without the sort.
+        let naive = |ms: [&MassFunction; 3]| -> f64 {
+            let mut acc = ms[0].clone();
+            for m in &ms[1..] {
+                acc = match dempster_combine(&acc, m) {
+                    Ok(r) => r,
+                    Err(DsError::TotalConflict) => yager_closed_combine(&acc, m).unwrap(),
+                    Err(e) => panic!("{e}"),
+                };
+            }
+            crate::measures::pignistic_probability(&acc, 0)
+        };
+        let a = naive([&t1, &f1, &f05]);
+        let b = naive([&f05, &t1, &f1]);
+        assert!(
+            (a - b).abs() > 0.1,
+            "precondition: naive fold should be order-dependent here ({a} vs {b})"
+        );
+
+        let orders: [[&MassFunction; 3]; 6] = [
+            [&t1, &f1, &f05],
+            [&t1, &f05, &f1],
+            [&f1, &t1, &f05],
+            [&f1, &f05, &t1],
+            [&f05, &t1, &f1],
+            [&f05, &f1, &t1],
+        ];
+        let (reference, ref_reports) = combine_multiple(&orders[0].map(Clone::clone), 0.9).unwrap();
+        assert!(
+            ref_reports
+                .iter()
+                .any(|r| r.method_used == CombinationMethod::YagerClosed),
+            "a step must hit total conflict: {ref_reports:?}"
+        );
+        assert!((aggregate_conflict(&ref_reports) - 1.0).abs() < 1e-12);
+
+        for order in &orders[1..] {
+            let (result, reports) = combine_multiple(&order.map(Clone::clone), 0.9).unwrap();
+            assert_eq!(
+                result.masses(),
+                reference.masses(),
+                "caller order changed the result of a fold with a fallback step"
+            );
+            assert_eq!(reports.len(), ref_reports.len());
+            assert!((aggregate_conflict(&reports) - 1.0).abs() < 1e-12);
+        }
     }
 
     #[test]
