@@ -1376,6 +1376,10 @@ async fn handle_elevate_grant(
             message: "the redemption issued no session".into(),
         });
     };
+    // True by construction (125's family-liveness helper ties the ticket's
+    // family to a client whose agent is the person), so NO TEST REACHES THIS
+    // BRANCH (final review F1-PLAN-06); it is the last check that the token is
+    // minted for the session's own person. Keep it.
     if person != agent_id {
         tracing::error!(
             target: "elevation",

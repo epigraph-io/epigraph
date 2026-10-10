@@ -890,6 +890,11 @@ impl EpiGraphMcpFull {
         if viewer.is_elevated() {
             return Ok(Some(viewer));
         }
+        // Not elevated: strip the claim and the family, so the tool cannot
+        // resolve an elevated viewer this dispatch did not see (and record).
+        // NO TEST REACHES the difference this makes (final review
+        // F1-PLAN-06): it shows only if the session turns live between this
+        // check and the tool's own resolution. Keep it.
         auth.elevation_claim = None;
         auth.family_id = None;
         Ok(None)

@@ -766,7 +766,11 @@ pub async fn ticket_assert(
     };
     if c.outcome != "refused" {
         // Never commit an unverified confirmation (a passkey registered between
-        // the read above and the definer's lock).
+        // the read above and the definer's lock). NO TEST REACHES THIS BRANCH
+        // (final review F1-PLAN-06): it needs a passkey with the asserted
+        // credential id enrolled inside that window. It is the only thing
+        // that keeps an UNVERIFIED assertion from committing a confirmed
+        // session there; keep it, and keep it ahead of the commit.
         let _ = tx.rollback().await;
         tracing::error!(
             target: "elevate.ticket",
@@ -1193,6 +1197,9 @@ pub async fn act_assert(
         Err(e) => return act_confirm_failed(&e),
     };
     if c.outcome != "refused" {
+        // As the ticket path's guard above: race-only, NO TEST REACHES IT
+        // (final review F1-PLAN-06); it keeps an unverified assertion from
+        // committing a confirmed act.
         let _ = tx.rollback().await;
         tracing::error!(
             target: "elevate.act",
