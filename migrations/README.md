@@ -1226,6 +1226,43 @@ restart.
   logical restore loads `system_agents` with `--disable-triggers`. Undo is in
   the file's header. **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **149**: public `author_binding_allowlist` — a third way for a writing agent
+  to be bound (122): the agent of an OAuth client NAMED on the
+  maintenance-only registry `author_binding_clients`, bound to the registered
+  human operator its row names, while every read-time condition holds (row
+  not revoked; client `active`, `service` or `agent`, still on its pinned
+  agent and that agent's only non-revoked client; the agent neither human,
+  linked, an operator of agents nor a registered system agent; the operator a
+  live registered human that is not itself linked). Read only by
+  `epigraph_author_binding` (a third label, `client_allowlist`) and
+  `epigraph_human_of`, both re-bodied (`CREATE OR REPLACE`, same signature,
+  owner and ACL re-asserted); no 122/123 check body changes, and nothing on the
+  token, bearer, viewer or webhook path reads the registry, so the client's
+  agent keeps minting and is never "operated". Written only through two
+  maintenance-only audited definers (`platform.` events); guard triggers hold a
+  direct write to the same rules, the only change is a final revoke, and no
+  session deletes a row. A new operator link of an allowlisted agent is
+  refused while its client is not revoked. No row is seeded. The
+  `system_agents` read is SOFT (`to_regclass` in plpgsql), so this file applies
+  and reads correctly with or without the system-agent registry, in either
+  undo order. Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/author_binding_allowlist.rs`; owners and grants pinned by
+  `schema_contract.rs::migration_149_author_binding_allowlist_definers_are_owned_and_granted`,
+  `app_role_table_lockdown.rs` (`CLOSED` and `NO_WRITE`) and
+  `tenancy_backfill.rs` (8 definers at 149, 3 grant entries). Undo:
+  `docs/runbooks/149-undo.sql` (restores 122's two bodies first; records one
+  `platform.author_binding_allowlist_dropped` event). Checked before claiming: no
+  open PR branch and no remote branch carries a `149`. **Deploy order:** with
+  (or before) the binaries that call its definers or compare its label (the
+  operator CLI, the MCP signer gate); an older binary is harmless while the
+  registry is empty. Rows are added only after the binaries and before the
+  database is armed. Merge AND deploy after the system-agent registry (148):
+  sqlx applies a later-merged 148 after 149, and until 148's `system_agents`
+  exists the soft read finds no table, so the "not a registered system agent"
+  conjunct is absent and a client whose agent is the public-constant
+  workflow-ingest identity is kept off the allowlist only by the operator's
+  care (the allow command's agent-client warning). **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

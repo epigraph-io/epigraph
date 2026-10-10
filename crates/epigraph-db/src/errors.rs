@@ -41,9 +41,15 @@ pub const OPERATOR_SCOPE_REFUSED: &str = "OPL02";
 
 /// The remedy every surface prints with an [`DbError::OperatorLinkRequired`].
 /// One string, so the HTTP body, the MCP message and the CLI text cannot drift.
+///
+/// The second remedy (migration 149) is for an HTTP OAuth client, which a link
+/// would make stdio-only: the operator allowlists its agent instead.
 pub const OPERATOR_LINK_FIX: &str = "an operator records a live link for the agent on a \
      maintenance DSN: `epigraph-operator link --agent <agent id> --operator <human operator \
-     agent id> --apply` (docs/tenancy.md, \"Operator binding\")";
+     agent id> --apply` (docs/tenancy.md, \"Operator binding\"); for an HTTP OAuth client \
+     (which a link would make stdio-only), allowlist it instead: `epigraph-operator \
+     allow-author-binding-client --client <oauth client id> --operator <human operator agent \
+     id> --reason <text> --apply`";
 
 /// Database operation errors
 #[derive(Error, Debug)]

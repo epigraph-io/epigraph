@@ -112,6 +112,7 @@
 pub mod admin_scopes;
 pub mod arm;
 pub mod bind;
+pub mod binding_client;
 pub mod client_scope;
 pub mod confirmations;
 pub mod custodian;

@@ -669,7 +669,89 @@ principal (a `service` or `agent` client) that writes over REST can be neither
 linked (it would lose HTTP) nor left unlinked once armed (`OPL01`). `link` and
 `link-legacy-authors` refuse or skip such agents rather than cut them off, and
 the arming census lists them if they wrote recently. Decide how each is bound
-before arming.
+before arming: the author-binding allowlist below is the way to bind one.
+
+### Arm (c): the author-binding allowlist (migration 149)
+
+A third way to be bound, after (a) and (b): **the agent of an OAuth client the
+operator NAMED** on the maintenance-only registry `author_binding_clients`,
+bound to the registered human operator its row names. `epigraph_author_binding`
+reads `client_allowlist` for it and `epigraph_human_of` returns that human, so
+every check above applies unchanged: a bound allowlisted writer writes only
+into groups its operator writes (`OPL02`) and names only authors of its own
+human (`OPL02`).
+
+* **What it binds.** One client's AGENT, keyed on the session stamp (the
+  agent), not the client: any process holding that agent's private key writes
+  as the bound agent too. Every condition is re-read on every check: the row is
+  not revoked; the client is `active`, a `service` or `agent` client, still on
+  the agent the row pinned, and that agent's only non-revoked client; the agent
+  is not a human, holds no link of any state (a link always wins), operates no
+  agent and is not a registered system agent; the operator is a live
+  registered human that is not itself linked. Suspending or revoking the
+  client, revoking the human, or creating a second client for the agent
+  unbinds it at once.
+* **What it does not do.** It is not an operator link: nothing on the token,
+  bearer, viewer or webhook path reads it, so the client keeps minting tokens
+  and keeps its viewer, and an operated agent is still refused whether or not
+  it is allowlisted. It is not an ownership relation (the human does not own
+  the agent's claims). And it does not reach the membership door
+  (`epigraph_require_operator_scope` reads links only).
+* **The door gap.** Because of that last point, an allowlisted agent's
+  evidence, edge and belief writes into a group its operator does not write
+  are not refused by the binding, although its claims there are (`OPL02`).
+  `allow-author-binding-client` lists the agent's live writer/admin rows in
+  such groups (`FOREIGN-WRITE`) and revokes them under
+  `--revoke-foreign-writes`.
+* **Authoring as itself.** The allowance binds a WRITER into its operator's
+  groups; it does not re-home the agent's own authorship. A write that names
+  the allowlisted agent as its own author on the default declaration lands in
+  the agent's own personal group, which its operator does not write, so it is
+  refused `OPL02` once armed, also with the session's valve open (where,
+  without the allowance, it was admitted). Allowlist a client only when its
+  writes land in groups the operator writes, for example packets authored by
+  the operator's live-linked agents.
+* **Operating it.** `epigraph-operator allow-author-binding-client --client
+  <oauth client id> --operator <human operator agent id> --reason <text>
+  [--revoke-foreign-writes] [--apply]` and `revoke-author-binding-client
+  --client <id> --reason <text> [--apply]` (maintenance DSN; a dry run rolls
+  back with its audit row). The client must have minted once (its agent is
+  pinned from it). The command prints the binding the agent actually has and
+  exits non-zero with `ALLOWED-BUT-INEFFECTIVE` when the allowance does not
+  bind. Each allowance and revoke writes one `platform.` `security_events`
+  row, which no application session can forge. Revoke is FINAL for that
+  client (mint a new client to allow again); no session deletes a row, and
+  the FKs are `ON DELETE RESTRICT`, so an agent, operator or client ever
+  allowlisted cannot be deleted (122's `human_operators` parity). The revoke
+  command prints `REVOKED`, `ALREADY-REVOKED` (with when and by whom; exit 0)
+  or `NOT-ALLOWED` when no allowance row names the client (exit 1: usually a
+  mistyped id, and the real allowance is still live).
+* **After a revoke** the agent belongs to no human again. A revoked allowance
+  has no retired state (unlike a retired link, whose agent still belongs to
+  its human): `epigraph_human_of` returns NULL for it, so its past claims,
+  including those in its operator's groups, are attributable as an unbound
+  agent's are, exactly as before the allowance.
+* **Incident response.** Revoke the allowance AND the client. Suspending the
+  client alone is not a durable unbind: a privileged re-activation re-binds.
+* **Links.** A new operator link of an allowlisted agent is refused (`55000`)
+  while its client is not revoked, because a link would make the agent
+  stdio-only and end its client's HTTP access; revoke the allowance first. The
+  legacy-author tie skips such an agent as an OAuth principal and never meets
+  the refusal.
+* **The MCP HTTP listener** refuses to start, and refuses every call, while
+  its signer agent is allowlisted, as for a human signer.
+* **The arming census** counts an allowlisted author as bound and lists, as
+  `OUT-OF-SCOPE`, its recent claims in groups its operator does not write;
+  `--apply` refuses on them under the same `--allow-unbound-writers`
+  override. The census reads authors, not writing principals: it sees writer
+  scope only where the author was also the writer.
+
+Deploy 149 with or after the system-agent registry (148): its
+"not a registered system agent" conjunct reads `system_agents` softly and is
+absent while that table is.
+
+Undo: `docs/runbooks/149-undo.sql` (it records one
+`platform.author_binding_allowlist_dropped` event first).
 
 ### Existing rows
 
