@@ -2513,7 +2513,7 @@ impl EpiGraphMcpFull {
     // ── Meta (1 tool) ──
 
     #[tool(
-        description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
+        description = "List the MCP tools this server offers YOU. Returns the name, description, and full JSON Schema for every tool your caller may see — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph. It is filtered per caller, exactly as tools/list is: a tool absent here may still exist for another caller (the elevation tools are listed only to a holder of an elevating role, propose_admin_act only to an elevated request, admin-only tools by scope)."
     )]
     async fn list_mcp_tools(
         &self,

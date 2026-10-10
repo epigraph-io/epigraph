@@ -3,10 +3,14 @@
 //! See `epigraph_cli::operator` for what each subcommand does and why. This
 //! file is argument parsing and exit codes only.
 //!
-//! Every subcommand is a DRY RUN unless `--apply` is given (the two scope
-//! commands take exactly one of `--dry-run` / `--apply`, and refuse neither),
-//! and every subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone
-//! and refuses a session user that is not a member of `epigraph_maintenance`.
+//! Every subcommand that changes a row is a DRY RUN unless `--apply` is given
+//! (the two scope commands take exactly one of `--dry-run` / `--apply`, and
+//! refuse neither), with ONE exception: `verify-confirmations` takes no
+//! `--apply` and records each finding it reports as a
+//! `platform.confirmation_unverified` security event on every run (once per
+//! finding; it changes no other row). The `list-*` subcommands only read.
+//! Every subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone and
+//! refuses a session user that is not a member of `epigraph_maintenance`.
 //!
 //! Exit codes: 0 success; 1 refused or failed before writing (for
 //! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
