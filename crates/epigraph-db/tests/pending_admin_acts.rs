@@ -1151,6 +1151,247 @@ async fn a_later_passkey_rides_a_confirmed_register_act(pool: PgPool) {
 }
 
 // =====================================================================
+// A MAINTENANCE ENROLLMENT ADMITS ONLY A FIRST PASSKEY, WHEN IT COMPLETES
+// (migration 160, section 1; final review F1-COR-01).
+// =====================================================================
+
+/// Open a maintenance enrollment for `person` (no act); its id.
+async fn open_enrollment(pool: &PgPool, person: Uuid, label: &str) -> Uuid {
+    let label = label.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'act test', $2)",
+        )
+        .bind(person)
+        .bind(&label)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("open a maintenance enrollment");
+        (conn, e)
+    })
+    .await
+}
+
+/// Start the enrollment's ceremony (the unstamped app stores a challenge).
+async fn start_enrollment(pool: &PgPool, enrollment: Uuid) {
+    as_app(pool, None, "", "", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+        )
+        .bind(enrollment)
+        .execute(&mut *conn)
+        .await
+        .expect("enrollment challenge");
+        (conn, ())
+    })
+    .await;
+}
+
+const COMPLETE: &str = "SELECT public.epigraph_complete_passkey_enrollment($1, $2, \
+                        '{\"cred\": 1}'::jsonb, '00000000-0000-0000-0000-000000000000'::uuid, \
+                        'none', true, false)";
+
+/// Complete a started enrollment on the unstamped app; the new passkey or the
+/// refusal.
+async fn try_complete(pool: &PgPool, enrollment: Uuid, n: u8) -> Result<Uuid, sqlx::Error> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(COMPLETE)
+            .bind(enrollment)
+            .bind(credential(n))
+            .fetch_one(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+}
+
+async fn live_passkeys(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM person_authenticators \
+          WHERE person_agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("count passkeys")
+}
+
+async fn enrollment_consumed(pool: &PgPool, enrollment: Uuid) -> bool {
+    sqlx::query_scalar("SELECT consumed_at IS NOT NULL FROM passkey_enrollments WHERE id = $1")
+        .bind(enrollment)
+        .fetch_one(pool)
+        .await
+        .expect("the enrollment")
+}
+
+/// Two maintenance enrollments opened while the person held no passkey (each
+/// passes the OPENING guard) cannot both complete: once the first has given
+/// the person a passkey, completing the second is refused ELV10, writes no
+/// passkey and leaves the enrollment unconsumed. A later passkey goes through
+/// a confirmed `passkey.register` act, whose enrollment still completes for a
+/// person who already holds one. After a break-glass revoke (no live passkey
+/// left) a maintenance enrollment completes again.
+///
+/// Verified to fail: 160's ELV10 test at completion dropped (124's guard,
+/// which checks only the enrollment's liveness) -> the second maintenance
+/// enrollment completes and the person holds two passkeys with no act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_enrollment_completes_only_a_first_passkey(pool: PgPool) {
+    let (person, _) = human(&pool, "two tickets").await;
+    let e1 = open_enrollment(&pool, person, "key 1").await;
+    let e2 = open_enrollment(&pool, person, "key 2").await;
+    start_enrollment(&pool, e1).await;
+    start_enrollment(&pool, e2).await;
+    try_complete(&pool, e1, 1)
+        .await
+        .expect("CALIBRATION: the first maintenance enrollment completes");
+    assert_eq!(live_passkeys(&pool, person).await, 1, "CALIBRATION");
+
+    assert_code(
+        &try_complete(&pool, e2, 2).await,
+        "ELV10",
+        "a second maintenance enrollment, completed after the first passkey exists",
+    );
+    assert_eq!(
+        live_passkeys(&pool, person).await,
+        1,
+        "the refused completion wrote no passkey"
+    );
+    assert!(
+        !enrollment_consumed(&pool, e2).await,
+        "the refused enrollment stays unconsumed"
+    );
+
+    // The act path still completes for a holder.
+    let p = elevated_custodian(&pool, "act holder", 3).await;
+    let act = confirmed(
+        &pool,
+        &p,
+        "passkey.register",
+        &format!(
+            "{{\"person\": \"{}\", \"label\": \"key 2\", \"reason\": \"a second key\"}}",
+            p.person
+        ),
+    )
+    .await;
+    maint(
+        &pool,
+        "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', 'key 2', $2)",
+        &[Some(p.person), Some(act)],
+    )
+    .await
+    .expect("the confirmed enrollment opens");
+    let e3: Uuid = sqlx::query_scalar("SELECT id FROM passkey_enrollments WHERE act_id = $1")
+        .bind(act)
+        .fetch_one(&pool)
+        .await
+        .expect("the act's enrollment");
+    start_enrollment(&pool, e3).await;
+    try_complete(&pool, e3, 4)
+        .await
+        .expect("a confirmed-act enrollment completes for a passkey holder");
+    assert_eq!(live_passkeys(&pool, p.person).await, 2);
+
+    // The break-glass: with the passkey revoked, a maintenance enrollment
+    // completes again.
+    let k1: Uuid = sqlx::query_scalar(
+        "SELECT id FROM person_authenticators WHERE person_agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(person)
+    .fetch_one(&pool)
+    .await
+    .expect("the first passkey");
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+        &[Some(k1)],
+    )
+    .await
+    .expect("revoke");
+    let e4 = open_enrollment(&pool, person, "key 3").await;
+    start_enrollment(&pool, e4).await;
+    try_complete(&pool, e4, 5)
+        .await
+        .expect("after the break-glass revoke a maintenance enrollment completes");
+}
+
+/// Whether some backend of THIS database waits on an advisory lock: polled
+/// until one does (true), or `task` finishes or 10 s pass (false)
+/// (`custodian_role.rs`' helper).
+async fn waits_on_an_advisory_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks l \
+                             WHERE l.locktype = 'advisory' AND NOT l.granted \
+                               AND l.database = (SELECT oid FROM pg_database \
+                                                  WHERE datname = current_database()))",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_locks");
+        if waiting {
+            return true;
+        }
+        if task.is_finished() || std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Two maintenance completions of ONE person in flight at once serialise on
+/// the person: the second waits for the first to commit, then sees its
+/// passkey and is refused ELV10. (The enrollment row lock does not serialise
+/// them: they lock different enrollments.)
+///
+/// Verified to fail: 160's per-person advisory lock dropped -> the second
+/// completion does not wait, reads no live passkey in its snapshot, and both
+/// commit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_maintenance_completions_of_one_person_serialise(pool: PgPool) {
+    use sqlx::Executor;
+    let (person, _) = human(&pool, "racing tickets").await;
+    let e1 = open_enrollment(&pool, person, "key 1").await;
+    let e2 = open_enrollment(&pool, person, "key 2").await;
+    start_enrollment(&pool, e1).await;
+    start_enrollment(&pool, e2).await;
+
+    let mut first = pool.acquire().await.expect("acquire");
+    first
+        .execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("as app");
+    first.execute("BEGIN").await.expect("begin");
+    sqlx::query_scalar::<_, Uuid>(COMPLETE)
+        .bind(e1)
+        .bind(credential(1))
+        .fetch_one(&mut *first)
+        .await
+        .expect("the first completion, uncommitted");
+
+    let p2 = pool.clone();
+    let second = tokio::spawn(async move { try_complete(&p2, e2, 2).await });
+    assert!(
+        waits_on_an_advisory_lock(&pool, &second).await,
+        "the second completion waits on the person while the first is uncommitted"
+    );
+    first.execute("COMMIT").await.expect("commit the first");
+    first
+        .execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    drop(first);
+    let r = second.await.expect("join");
+    assert_code(
+        &r,
+        "ELV10",
+        "the second of two racing maintenance completions",
+    );
+    assert_eq!(live_passkeys(&pool, person).await, 1);
+}
+
+// =====================================================================
 // THE CANONICAL FORM: the CLI's (Rust) and the database's agree.
 // =====================================================================
 

@@ -1176,6 +1176,21 @@ restart.
   security. Undo is in the file's header. **Applied to throwaway databases
   only, NOT to any deployed database.**
 
+- **160**: public `elevation_final_review` (the elevation stack's final
+  review; slot: the first after the drain block 140-159, and no remote branch
+  carries a `160`). 124-132 are applied and immutable, so each correction
+  re-bodies a function here (`CREATE OR REPLACE`, owner and ACL kept), one
+  section per decision. Section 1: 124's `person_authenticators` insert guard
+  refuses `ELV10` when a MAINTENANCE enrollment completes for a person who
+  already holds a live passkey (130 tested only when an enrollment opened), under
+  a per-person advisory lock. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs`; the file as a whole in
+  `migration_160.rs`. Sets `lock_timeout = '3s'`. Undo
+  (`docs/runbooks/160-undo.sql`, restores every re-bodied function; run it
+  FIRST, before 132-undo). **Deploy order:** after 124-132 (sqlx would
+  otherwise apply them out of order after 160); no binary depends on it.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

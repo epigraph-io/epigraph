@@ -2397,7 +2397,8 @@ mints them; admin reads need an elevation; admin writes are maintenance-CLI
 acts. The rollback is `disarm-admin-scopes --reason TEXT --apply` (no DDL).
 
 **Undo order.** Disarm first (if armed). Roll back the binaries, newest first.
-Then the undo scripts in reverse: `132-undo.sql`, `131-undo.sql`,
+Then the undo scripts in reverse: `160-undo.sql` (the final-review
+corrections to 124-132), `132-undo.sql`, `131-undo.sql`,
 `130-undo.sql`, `129-undo.sql`, `128-undo.sql`, `127-undo.sql` (archives the
 log into `security_events` first), `126-undo.sql`, `125-undo.sql`,
 `124-undo.sql`. Each script's header names the binaries that must be rolled
