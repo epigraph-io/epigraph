@@ -1176,6 +1176,57 @@ restart.
   security. Undo is in the file's header. **Applied to throwaway databases
   only, NOT to any deployed database.**
 
+- **148**: public `system_agent_registry` — which agent IS a system role (today
+  only `workflow-ingest`, the agent every workflow-ingest row and every REST
+  policy challenge is authored by) is RECORDED in `system_agents`, not derived
+  from the public constant `"workflow-ingest-system"`. Before this file both
+  resolvers looked the agent up by that constant's derived key and created one
+  on a miss, so a key rotation (`UPDATE agents SET public_key = <secret>`) made
+  the next ingest mint a second agent holding the public-constant key: a split
+  identity. The registry is written only by a maintenance session (the definer
+  `epigraph_register_system_agent`, or a guarded direct INSERT; a superuser
+  where `epigraph_maintenance` does not exist), audited
+  (`operator.system_agent_registered`, a reserved event type), immutable
+  (UPDATE, DELETE and TRUNCATE refused for every role), app-readable, and
+  refuses a human operator, a platform role node, an OAuth principal or an
+  agent client's key, an operator, and a retired-linked agent. It snapshots
+  the agent's key at registration, and `agents_refuse_registered_system_key`
+  refuses that key to every OTHER agent on every path, so even a binary built
+  before this file cannot re-create the identity after a rotation (it fails
+  closed). `human_operators_refuse_system_agent` keeps a registered system
+  agent from later becoming a human, and
+  `operator_links_refuse_retired_system_agent` from later being given a
+  RETIRED operator link by any definer (permanent, so it could never be bound;
+  the bulk legacy-author tie refuses as a whole, and `epigraph-operator
+  link-legacy-authors` excludes registered system agents itself). The guards
+  take the operator-link advisory lock, so a registration and a concurrent
+  link or human registration of one agent serialize; a registration under
+  REPEATABLE READ is refused. The resolvers read the registry first: a
+  row wins, always; no row on an ARMED database (122) refuses before writing;
+  no row on an unarmed database keeps the old key lookup. Author-name paths
+  and `POST /agents` refuse the legacy key and any author resolving to a
+  registered agent. Slot from the drain register (145-147 assigned
+  elsewhere); checked before claiming: no open PR branch carries a 145-159
+  migration. Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/system_agent_registry.rs`,
+  `schema_contract.rs::migration_148_system_agent_registry_keeps_owner_grants_and_acl`,
+  `app_role_table_lockdown.rs` (`CLOSED`), `rls_enforcement.rs` (the reserved
+  event policy), `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
+  `epigraph-mcp/tests/system_agent_registry_resolver.rs`. **Deploy order:**
+  migrate 148 before the binaries that read it (they fail closed without
+  it: workflow ingest, REST policy challenges, document and spine ingest with
+  authors, and provenance with authors all refuse); every deployed copy of the API and MCP binaries, including any
+  container image that embeds the stdio MCP server, at >=148 BEFORE a
+  registered agent's key is rotated (an older copy now fails closed on its
+  first workflow write instead of splitting); register the system agent
+  (`epigraph-operator register-system-agent`, its own committed transaction)
+  BEFORE rotating its key and BEFORE arming 122. **Relative to 145-147:** 148
+  (and 149) reach shared databases first; the owners of 145-147 renumber them
+  above the highest applied version before they land ("Why 107–109"). A
+  logical restore loads `system_agents` with `--disable-triggers`. Undo is in
+  the file's header. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

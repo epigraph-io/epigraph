@@ -1459,6 +1459,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          transaction to decide which existing rows need the caller's authority.",
     ),
     (
+        "system_agent.rs",
+        "lookup",
+        "READ of migration 148's `system_agents` row for one role, with \
+         `epigraph_operator_binding_armed()`: an AUTHORITY record mapping a system role to an \
+         agent, not a corpus row. It has no `visibility` / `owner_group_id` and no row security \
+         by design, and the workflow-ingest resolvers read it on the system-agent-stamped \
+         connection, so there is nothing for a viewer to filter.",
+    ),
+    (
+        "system_agent.rs",
+        "registered_agent_ids",
+        "READ of every `system_agents.agent_id` (migration 148; one row per system role): the \
+         author-name loops' check that a document never adopts a registered system agent as its \
+         author. An authority record with no tenancy columns and no row security; nothing for \
+         a viewer to filter.",
+    ),
+    (
         "claim.rs",
         "admin_patch_claim_conn",
         "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \

@@ -72,6 +72,7 @@ pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
 pub mod structural;
+pub mod system_agent;
 pub mod task;
 pub mod trace;
 pub mod triple;
@@ -197,6 +198,7 @@ pub use revoked_access_token::RevokedAccessTokenRepository;
 pub use role_assignment::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
+pub use system_agent::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};
 

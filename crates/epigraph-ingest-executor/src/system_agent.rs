@@ -1,19 +1,47 @@
-//! Resolves the shared `workflow-ingest-system` agent identity, and the write
+//! Resolves the shared workflow-ingest system agent identity, and the write
 //! authority a caller must stamp a connection with before the executor may run.
 //!
-//! Both ingest call sites (MCP `do_ingest_workflow_via_pool` and
-//! HTTP `ingest_workflow`) need to attribute persisted claims to a
-//! deterministic system agent. This helper looks it up by deterministic
-//! `did:key` and creates it on first use.
+//! Every workflow-ingest call site (MCP `store_workflow` / `ingest_workflow` /
+//! `add_step` / `delete_step`, the REST `/api/v1/workflows/*` routes and REST
+//! policy challenges) attributes persisted claims to ONE system agent. Which
+//! agent that is comes from migration 148's `system_agents` registry; the
+//! public-constant `did:key` derivation is only the fallback of an unarmed,
+//! unregistered database (see [`get_or_create_system_agent`]).
 
 use uuid::Uuid;
 
 use crate::error::IngestExecutorError;
 
-/// Get-or-create the canonical `workflow-ingest-system` agent.
+/// Resolve the workflow-ingest system agent: the REGISTERED one, or, only on
+/// an unarmed database with no registration, the pre-148 public-constant one.
 ///
-/// Idempotent across processes: derives a deterministic `did:key` from a
-/// fixed seed and either fetches the matching `agents` row or inserts one.
+/// # The rule (migration 148)
+///
+/// * **A `system_agents` row exists:** that agent, always. Never the key
+///   lookup, never a create. This is what makes the identity rotatable: after
+///   `UPDATE agents SET public_key = <secret>` the derived public-constant key
+///   no longer resolves, and before 148 that miss minted a SECOND agent
+///   holding it (a split identity, unlinked, with its own group).
+/// * **No row, and the database is ARMED (migration 122):**
+///   [`IngestExecutorError::SystemAgentUnregistered`], before anything is
+///   written. Once armed, the system agent is exactly the registered one;
+///   re-deriving it from a public constant is the split above. Armed is
+///   `epigraph_operator_binding_armed()`, not `..._enforced()`: the session
+///   valve relieves the binding only and must not reopen the create path.
+/// * **No row, unarmed:** the pre-148 behaviour, unchanged: look the agent up
+///   by `did_key_for_author(None, "workflow-ingest-system")` and create it on
+///   a miss. Every fresh install and every test database is here; refusing
+///   would make workflow ingest permanently unavailable for exactly the
+///   population that has nothing to register yet. The documented order
+///   (register, commit, THEN rotate the key) keeps this fallback from ever
+///   seeing a rotated agent, and once a key is registered migration 148's
+///   `agents` guard refuses any other agent that key, so even a binary that
+///   predates this function cannot re-create it.
+///
+/// The registry row and the arming state are read in one statement
+/// ([`epigraph_db::SystemAgentRepository::lookup`]). A database below
+/// migration 148 fails that read (the table is missing), which surfaces as
+/// [`IngestExecutorError::AgentCreation`]: fail closed, never fall back.
 ///
 /// # Why an executor rather than a pool
 ///
@@ -25,16 +53,46 @@ use crate::error::IngestExecutorError;
 /// onto the stamped connection changes nothing about whether it succeeds. It
 /// changes only *which* transaction it is part of, which is the whole point:
 /// an agent minted on a sibling checkout survives a rollback of the ingest
-/// that minted it.
+/// that minted it. `system_agents` has no row security and the application
+/// role may SELECT it, so the registry read succeeds on that connection too.
+///
+/// # A lost first-resolution race
+///
+/// `AgentRepository::create_conn` maps any unique violation to
+/// `DbError::DuplicateKey`. On an autocommit connection (`boot` in
+/// [`system_agent_write_authority`], the REST delegate's acquired connection)
+/// that means a concurrent first resolution created the agent first, so the
+/// key is looked up ONCE more; still absent is an error, never a loop. Inside
+/// a transaction the violation has already aborted it, so the re-lookup fails
+/// too and the call refuses exactly as it would have without the retry (and
+/// the create branch is unreachable there in practice: the write authority
+/// resolved the agent on `boot` first).
 ///
 /// # Errors
-/// [`IngestExecutorError::AgentCreation`] if the lookup or the insert fails.
+/// [`IngestExecutorError::SystemAgentUnregistered`] as above;
+/// [`IngestExecutorError::AgentCreation`] if the registry read, the lookup or
+/// the insert fails.
 pub async fn get_or_create_system_agent(
     conn: &mut sqlx::PgConnection,
 ) -> Result<Uuid, IngestExecutorError> {
-    let (_did, pub_key_bytes) =
-        epigraph_crypto::did_key::did_key_for_author(None, "workflow-ingest-system");
+    use epigraph_db::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 
+    let role = SystemAgentRole::WorkflowIngest;
+    match SystemAgentRepository::lookup(&mut *conn, role)
+        .await
+        .map_err(|e| {
+            IngestExecutorError::AgentCreation(format!("system-agent registry read: {e}"))
+        })? {
+        SystemAgentLookup::Registered(id) => return Ok(id),
+        SystemAgentLookup::UnregisteredArmed => {
+            return Err(IngestExecutorError::SystemAgentUnregistered {
+                role: role.as_str(),
+            })
+        }
+        SystemAgentLookup::UnregisteredUnarmed => {}
+    }
+
+    let pub_key_bytes = role.legacy_public_key();
     if let Some(existing) =
         epigraph_db::AgentRepository::get_by_public_key(&mut *conn, &pub_key_bytes)
             .await
@@ -43,12 +101,22 @@ pub async fn get_or_create_system_agent(
         return Ok(existing.id.into());
     }
 
-    let agent =
-        epigraph_core::Agent::new(pub_key_bytes, Some("workflow-ingest-system".to_string()));
-    let created = epigraph_db::AgentRepository::create_conn(&mut *conn, &agent)
-        .await
-        .map_err(|e| IngestExecutorError::AgentCreation(format!("create: {e}")))?;
-    Ok(created.id.into())
+    let agent = epigraph_core::Agent::new(pub_key_bytes, Some(role.legacy_seed_name().to_string()));
+    match epigraph_db::AgentRepository::create_conn(&mut *conn, &agent).await {
+        Ok(created) => Ok(created.id.into()),
+        Err(epigraph_db::DbError::DuplicateKey { .. }) => {
+            epigraph_db::AgentRepository::get_by_public_key(&mut *conn, &pub_key_bytes)
+                .await
+                .map_err(|e| IngestExecutorError::AgentCreation(format!("re-lookup: {e}")))?
+                .map(|a| a.id.into())
+                .ok_or_else(|| {
+                    IngestExecutorError::AgentCreation(
+                        "agent disappeared after DuplicateKey".to_string(),
+                    )
+                })
+        }
+        Err(e) => Err(IngestExecutorError::AgentCreation(format!("create: {e}"))),
+    }
 }
 
 /// The system agent's id together with the viewer a caller must stamp a

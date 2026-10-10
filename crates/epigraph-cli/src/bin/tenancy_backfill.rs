@@ -1822,6 +1822,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // intended (083's case). The table has no row security, so a non-member
     // owner changes nothing else.
     ("epigraph_access_token_revoke", 141),
+    // 148, the system-agent registry. Under a non-member owner the guard's
+    // `operator_links` read is filtered (FORCEd, definer-only), so its
+    // "operates other agents" and "retired operator link" refusals fail OPEN;
+    // its `platform_roles` read (FORCEd) misses the role nodes, so that refusal
+    // fails OPEN too. The audit trigger's `operator.system_agent` row and the
+    // definer's INSERT fail CLOSED (loud: nothing registers). The three guards
+    // on `agents`, `human_operators` and `operator_links` read only
+    // `system_agents`, which has no row security, so they keep refusing under
+    // any owner.
+    ("epigraph_system_agents_guard_insert", 148),
+    ("epigraph_system_agents_immutable", 148),
+    ("epigraph_system_agents_audit", 148),
+    ("epigraph_register_system_agent", 148),
+    ("epigraph_agents_refuse_registered_system_key", 148),
+    ("epigraph_human_operators_refuse_system_agent", 148),
+    ("epigraph_operator_links_refuse_retired_system_agent", 148),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2130,6 +2146,12 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_revoke_human_operator",
             "public.epigraph_revoke_human_operator(uuid, text)",
+            false,
+        ),
+        // Registering a system agent (migration 148) is a maintenance act.
+        (
+            "epigraph_register_system_agent",
+            "public.epigraph_register_system_agent(text, uuid, text)",
             false,
         ),
         // A link function: the request DSN must never record links.

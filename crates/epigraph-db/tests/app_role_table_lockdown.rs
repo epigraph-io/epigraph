@@ -122,6 +122,11 @@ const CLOSED: &[&str] = &[
     "refresh_tokens",
     // Migration 141: written only through `epigraph_access_token_revoke`.
     "revoked_access_tokens",
+    // Migration 148: the system-agent registry, written only by a maintenance
+    // session (its definer or a guarded direct INSERT). It has a writer, so it
+    // is not in NO_WRITE; its INSERT and column-level grants are pinned in
+    // `schema_contract.rs::migration_148_system_agent_registry_keeps_owner_grants_and_acl`.
+    "system_agents",
     "tenancy_backfill_progress",
     "tenancy_exempt",
     "tenancy_transcription_log",
