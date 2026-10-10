@@ -432,6 +432,13 @@ transaction. Before this change the route returned ids that named no row.
 - `if_not_exists: true` makes re-running a batch safe: matched items return
   the existing id with `was_created: false` and are counted in the new
   `existing` field.
+- A matched item writes nothing. Its `AUTHORED`, `HAS_TRACE` (`trace_id`)
+  and `DERIVED_FROM` (`evidence_id`) edges and its "create" provenance row
+  are written only for a claim the call created. This also changes
+  `POST /api/v1/claims` with `if_not_exists: true`, which used to write those
+  edges onto whatever claim it matched, including another agent's. A client
+  that relied on a re-run attaching new evidence to an existing claim must
+  link it with `POST /api/v1/edges`.
 - Each failed item's result carries `status` (the code the single route would
   return, e.g. 400 or 409) next to `error`.
 - The request now needs an authenticated agent with `claims:write`, the same

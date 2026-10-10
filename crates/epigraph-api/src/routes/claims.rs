@@ -912,48 +912,63 @@ pub(crate) async fn create_claim_core(
         }
     }
 
-    // Materialize edges (best-effort, after commit)
-    let _ = epigraph_db::EdgeRepository::create(
-        &state.db_pool,
-        request.agent_id,
-        "agent",
-        claim_uuid,
-        "claim",
-        "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    if let Some(trace_uuid) = request.trace_id {
+    // Materialize edges (best-effort, after commit) — ONLY for a row this call
+    // created.
+    //
+    // On an `if_not_exists` dedup hit `created_claim` is a row someone else
+    // may own: `create_or_get` matches on `(content_hash, agent_id)`, and
+    // `agent_id` is the request BODY's (see the note on `claim` above), so any
+    // caller can name another agent's public claim. These statements run on
+    // the raw, unstamped pool after the commit, so migration 122's trigger
+    // never sees them (no claims INSERT happens) and the edges land public and
+    // world-owned, which migration 120 makes administrative: neither the
+    // caller nor the claim's owner can retract them.
+    // Unguarded, a dedup hit let a caller hang `AUTHORED`, `HAS_TRACE` and
+    // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
+    // and for the same reason, as the labels and properties writes above.
+    if was_created {
         let _ = epigraph_db::EdgeRepository::create(
             &state.db_pool,
+            request.agent_id,
+            "agent",
             claim_uuid,
             "claim",
-            trace_uuid,
-            "trace",
-            "HAS_TRACE",
+            "AUTHORED",
             None,
             None,
             None,
         )
         .await;
-    }
 
-    if let Some(evidence_id) = request.evidence_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            &state.db_pool,
-            claim_uuid,
-            "claim",
-            evidence_id,
-            "evidence",
-            "DERIVED_FROM",
-            None,
-            None,
-            None,
-        )
-        .await;
+        if let Some(trace_uuid) = request.trace_id {
+            let _ = epigraph_db::EdgeRepository::create(
+                &state.db_pool,
+                claim_uuid,
+                "claim",
+                trace_uuid,
+                "trace",
+                "HAS_TRACE",
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        if let Some(evidence_id) = request.evidence_id {
+            let _ = epigraph_db::EdgeRepository::create(
+                &state.db_pool,
+                claim_uuid,
+                "claim",
+                evidence_id,
+                "evidence",
+                "DERIVED_FROM",
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
     }
 
     let mut response: ClaimResponse = created_claim.into();
@@ -964,9 +979,11 @@ pub(crate) async fn create_claim_core(
     response.labels = request.labels;
     response.was_created = was_created;
 
-    // Record provenance chain of custody. Unconditional on the caller: `ctx`
-    // is bound by the guard at the top of this function.
-    {
+    // Record provenance chain of custody. Unconditional on the caller (`ctx`
+    // is bound by the guard at the top of this function), but only for a row
+    // this call created: the action recorded is "create", and on an
+    // `if_not_exists` dedup hit nothing was.
+    if was_created {
         // Content hash for provenance: BLAKE3 of claim content
         let content_hash = blake3::hash(request.content.as_bytes());
         // Provenance signature placeholder (agent did not sign this request body via Ed25519)

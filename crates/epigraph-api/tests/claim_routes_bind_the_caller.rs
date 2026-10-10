@@ -650,3 +650,166 @@ async fn batch_create_claims_refuses_a_foreign_author_per_item(pool: PgPool) {
         "slot 2 after the refusal"
     );
 }
+
+/// Final branch review, item 3 (inherited from `POST /api/v1/claims`, reached
+/// by batch through the shared `create_claim_core`): an `if_not_exists` dedup
+/// hit must not write edges or a "create" provenance row onto the claim it
+/// found.
+///
+/// `create_or_get` matches on `(content_hash, agent_id)` with `agent_id` taken
+/// from the request BODY, so human A can name human B's public claim by
+/// sending its text with `agent_id: B`. The match returns B's row with
+/// `was_created = false` and no claims INSERT happens, so migration 122's
+/// trigger never fires. Before the fix the post-commit edge writes still ran,
+/// on the raw unstamped pool, and hung a duplicate `AUTHORED`, a `HAS_TRACE`
+/// and a `DERIVED_FROM` off B's claim — world-owned, so neither A nor B could
+/// retract them.
+///
+/// Slot 1 is the positive control that keeps the slot-0 assertions from being
+/// vacuous: A's own NEW claim with the same `evidence_id` and `trace_id` gets
+/// its `DERIVED_FROM` and `HAS_TRACE` edges and a "create" provenance row in
+/// this same setup (application role, armed binding). A's token carries A's
+/// real `oauth_clients` id as both `client_id` and `owner_id`, because
+/// `provenance_log` keys both on `oauth_clients` and a random id would make
+/// every provenance write fail silently.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_dedup_hit_on_another_humans_claim_writes_no_edges_or_provenance(pool: PgPool) {
+    let (a, _) = seed_human_operator(&pool, "human-a").await;
+    let (b, _) = seed_human_operator(&pool, "human-b").await;
+    // A's evidence and trace, hung off a public claim of A's, seeded before
+    // arming so the fixture writes are not what this test measures.
+    let a_parent = viewer_fixture::seed_public_claim(
+        &pool,
+        a,
+        &format!("A's evidence parent {}", Uuid::new_v4()),
+    )
+    .await;
+    let a_evidence = viewer_fixture::seed_evidence(&pool, a_parent, "document").await;
+    let a_trace = viewer_fixture::seed_reasoning_trace(&pool, a_parent, "deductive").await;
+    install_orphan_policy_and_arm(&pool).await;
+    let state = app_role_state(&pool).await;
+
+    // B's public claim, written by B as itself through the single route.
+    let b_content = format!("B's public claim {}", Uuid::new_v4());
+    let b_req: epigraph_api::routes::claims::CreateClaimRequest =
+        serde_json::from_value(serde_json::json!({
+            "content": b_content, "agent_id": b, "initial_truth": 0.6
+        }))
+        .expect("request");
+    let resp = epigraph_api::routes::claims::create_claim(
+        ViewerExtractor(Viewer::resolve(&pool, b).await.expect("viewer")),
+        State(state.clone()),
+        Some(Extension(token(b, ClientType::Human))),
+        Json(b_req),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_text(resp).await;
+    assert!(status.is_success(), "B as itself: {status} {body}");
+    let b_claim: Uuid = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("B's claim id")
+        .parse()
+        .unwrap();
+
+    let edges_on = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT id, relationship FROM edges \
+                 WHERE source_id = $1 OR target_id = $1 ORDER BY id",
+            )
+            .bind(claim)
+            .fetch_all(&pool)
+            .await
+            .expect("edges")
+        }
+    };
+    let provenance_on = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provenance_log WHERE record_id = $1 AND action = 'create'",
+            )
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("provenance")
+        }
+    };
+    let edges_before = edges_on(b_claim).await;
+    let provenance_before = provenance_on(b_claim).await;
+
+    let a_client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .expect("A's oauth client");
+    let mut a_token = token(a, ClientType::Human);
+    a_token.client_id = a_client;
+    a_token.owner_id = Some(a_client);
+
+    let a_own = format!("A's own claim with evidence {}", Uuid::new_v4());
+    let req: epigraph_api::routes::batch::BatchClaimRequest =
+        serde_json::from_value(serde_json::json!({"claims": [
+            {"content": b_content, "agent_id": b, "if_not_exists": true,
+             "evidence_id": a_evidence, "trace_id": a_trace},
+            {"content": a_own, "if_not_exists": true,
+             "evidence_id": a_evidence, "trace_id": a_trace}
+        ]}))
+        .expect("request");
+    let resp = epigraph_api::routes::batch::batch_create_claims(
+        ViewerExtractor(Viewer::resolve(&pool, a).await.expect("viewer")),
+        State(state),
+        Some(Extension(a_token)),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_text(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+
+    // Slot 0 really was a dedup hit on B's row; otherwise "no new edges"
+    // below would pass for an item that simply failed.
+    assert_eq!(v["existing"], 1, "{body}");
+    assert_eq!(v["created"], 1, "{body}");
+    assert_eq!(v["failed"], 0, "{body}");
+    assert_eq!(v["results"][0]["claim_id"], b_claim.to_string(), "{body}");
+    assert_eq!(v["results"][0]["was_created"], false, "{body}");
+
+    assert_eq!(
+        edges_on(b_claim).await,
+        edges_before,
+        "a dedup hit must not write any edge onto the claim it found"
+    );
+    assert_eq!(
+        provenance_on(b_claim).await,
+        provenance_before,
+        "a dedup hit must not record a 'create' for a claim it did not create"
+    );
+
+    // Positive control: the same writes land for a row this call created.
+    let a_claim: Uuid = v["results"][1]["claim_id"]
+        .as_str()
+        .expect("slot 1 created")
+        .parse()
+        .unwrap();
+    assert_eq!(v["results"][1]["was_created"], true, "{body}");
+    let rels: Vec<String> = edges_on(a_claim)
+        .await
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    for want in ["AUTHORED", "HAS_TRACE", "DERIVED_FROM"] {
+        assert!(
+            rels.iter().any(|r| r == want),
+            "control: A's new claim gets its {want} edge: {rels:?}"
+        );
+    }
+    assert_eq!(
+        provenance_on(a_claim).await,
+        1,
+        "control: A's new claim gets one 'create' provenance row"
+    );
+}
