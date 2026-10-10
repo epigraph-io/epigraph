@@ -1392,6 +1392,160 @@ async fn concurrent_maintenance_completions_of_one_person_serialise(pool: PgPool
 }
 
 // =====================================================================
+// THE DATABASE BINDS AN ACT TO THE WRITE IT AUTHORIZES, WITHOUT THE CLI
+// (final review F1-TST-03; 130's binding for the supersede and register
+// kinds, which the CLI's own pre-check otherwise refuses first).
+// =====================================================================
+
+async fn act_consumed(pool: &PgPool, act: Uuid) -> bool {
+    sqlx::query_scalar("SELECT consumed_at IS NOT NULL FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(pool)
+        .await
+        .expect("the act")
+}
+
+/// A claim of `content` and truth 0.7 that supersedes `target` (stored as the
+/// custodial-supersede CLI leaves a successor: `supersedes` set); its id.
+async fn successor(pool: &PgPool, author: Uuid, target: Uuid, content: &str) -> Uuid {
+    let id = fixture::seed_public_claim(pool, author, content).await;
+    without_triggers(
+        pool,
+        &format!("UPDATE claims SET truth_value = 0.7, supersedes = '{target}' WHERE id = $1"),
+        id,
+    )
+    .await;
+    id
+}
+
+/// A confirmed `claim.custodial_supersede` act is spent only by a supersede
+/// record whose STORED successor is the content it confirmed: a maintenance
+/// session calling the recorder directly (no CLI, so no pre-check) with a
+/// successor of other content is refused ELV09 and the act stays unspent;
+/// the successor it confirmed spends it.
+///
+/// Verified to fail (final review m19): 130's recorder passing the act's own
+/// stored digest to the consumer instead of the one it recomputes from the
+/// successor -> the other content's record lands and spends the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_supersede_act_is_spent_only_on_the_content_it_confirmed(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let target = fixture::seed_public_claim(&pool, p.person, "the original").await;
+    let confirmed_content = successor(&pool, p.person, target, "the confirmed text").await;
+    let other_content = successor(&pool, p.person, target, "some other text").await;
+    let sha: String = sqlx::query_scalar(
+        "SELECT encode(sha256(convert_to(content, 'UTF8')), 'hex') FROM claims WHERE id = $1",
+    )
+    .bind(confirmed_content)
+    .fetch_one(&pool)
+    .await
+    .expect("sha");
+    let act = confirmed(
+        &pool,
+        &p,
+        "claim.custodial_supersede",
+        &format!(
+            "{{\"claim\": \"{target}\", \"content_sha256\": \"{sha}\", \"truth\": \"0.7\", \
+             \"reason\": \"fix\", \"allow_owned\": false}}"
+        ),
+    )
+    .await;
+    let rec = "SELECT public.epigraph_record_custodial_act($1, $2, 'claim.supersede', 'claim', \
+               $3, jsonb_build_object('new_id', $4::uuid, 'reason', 'fix', \
+                                      'allow_owned', false), $5)";
+    assert_code(
+        &maint(
+            &pool,
+            rec,
+            &[
+                Some(p.assignment),
+                Some(p.person),
+                Some(target),
+                Some(other_content),
+                Some(act),
+            ],
+        )
+        .await,
+        "ELV09",
+        "a supersede record whose successor is not the confirmed content",
+    );
+    assert!(!act_consumed(&pool, act).await, "the act stays unspent");
+    maint(
+        &pool,
+        rec,
+        &[
+            Some(p.assignment),
+            Some(p.person),
+            Some(target),
+            Some(confirmed_content),
+            Some(act),
+        ],
+    )
+    .await
+    .expect("CALIBRATION: the confirmed content's record spends the act");
+    assert!(act_consumed(&pool, act).await);
+}
+
+/// A confirmed `passkey.register` act opens only the enrollment it confirmed:
+/// a maintenance session opening one with another label (no CLI pre-check)
+/// is refused ELV09, nothing opens and the act stays unspent; the confirmed
+/// label opens it.
+///
+/// Verified to fail (final review m20): 130's enrollment guard passing the
+/// act's own stored digest to the consumer instead of the one it recomputes
+/// from the enrollment -> the other label's enrollment opens on the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_register_act_opens_only_the_enrollment_it_confirmed(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let act = confirmed(
+        &pool,
+        &p,
+        "passkey.register",
+        &format!(
+            "{{\"person\": \"{}\", \"label\": \"key 2\", \"reason\": \"a second key\"}}",
+            p.person
+        ),
+    )
+    .await;
+    let open = "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', $2, $3)";
+    let other = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(open)
+            .bind(p.person)
+            .bind("key 3")
+            .bind(act)
+            .fetch_one(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await;
+    assert_code(
+        &other,
+        "ELV09",
+        "an enrollment with a label the act did not confirm",
+    );
+    assert!(!act_consumed(&pool, act).await, "the act stays unspent");
+    let opened: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM passkey_enrollments WHERE act_id = $1")
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(opened, 0, "nothing opened on the act");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(open)
+            .bind(p.person)
+            .bind("key 2")
+            .bind(act)
+            .fetch_one(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect("CALIBRATION: the confirmed label opens the enrollment");
+    assert!(act_consumed(&pool, act).await);
+}
+
+// =====================================================================
 // THE CANONICAL FORM: the CLI's (Rust) and the database's agree.
 // =====================================================================
 
