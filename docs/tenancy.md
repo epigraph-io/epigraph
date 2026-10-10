@@ -972,6 +972,15 @@ scopes; arming is an operator step (`docs/deploy.md`).
   calling token's refresh family; whether a connector shares one family
   across chats is not measured, so connector mode stays OFF and the CLI path
   is the served one.
+* **A data subject reads its record only on the database.** The
+  `elevated_access` subject policy admits a group's admins to the rows that
+  name the group, but no API route or MCP tool serves those rows yet, and
+  the product shows a subject nothing. Until a principal-bound read exists
+  (a GET over the subject policy on the caller's stamped connection, and an
+  MCP read tool), "visible to data subjects" holds only for someone with a
+  database session; the deterrent otherwise rests on the custodians and
+  auditors who read the whole log. Recording itself is fail-closed on both
+  surfaces.
 * **MCP reads are not widened.** The MCP read tools read on the server's own
   unstamped pool, so an elevated MCP request reads no more than before; its
   calls are still recorded (attributed when the answer names a row). The REST
