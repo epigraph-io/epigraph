@@ -1428,3 +1428,52 @@ async fn arm_census_tolerates_a_database_without_the_registry(pool: PgPool) {
         r.show()
     );
 }
+
+/// `link-legacy-authors` never asks the definer to retire a REGISTERED system
+/// agent: it adds every `system_agents` agent to the exclusion list, names
+/// each one, and the tie runs for the other authors (migration 148 refuses a
+/// retired link of a registered system agent, which would otherwise abort the
+/// whole tie). Kills: the CLI exclusion missing (the run fails on the
+/// `operator_links` refusal and ties no one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_legacy_authors_excludes_a_registered_system_agent(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "system").await;
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    for (a, g) in [(s, s_group), (author, author_group)] {
+        insert_claim(&pool, a, g).await.expect("seed claim");
+    }
+    assert!(fixture::register_system_agent(&pool, s).await);
+    let human_s = human.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "link-legacy-authors",
+            "--operator",
+            &human_s,
+            "--no-quiet-window",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains(&format!("AUTO-EXCLUDED\t{s}\tregistered system agent")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("SKIPPED:excluded\t{s}")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("LINKED-RETIRED\t{author}")),
+        "{}",
+        r.show()
+    );
+    assert_eq!(link_row(&pool, s).await, None, "S keeps its one link slot");
+    assert_eq!(link_row(&pool, author).await, Some((human, true)));
+}

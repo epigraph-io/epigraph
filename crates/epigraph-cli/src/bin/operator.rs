@@ -1039,10 +1039,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             if !no_quiet_window && quiet_days <= 0 {
                 anyhow::bail!("--quiet-days must be at least 1 (or pass --no-quiet-window)");
             }
-            let exclude = match exclude_agents_file {
+            let mut exclude = match exclude_agents_file {
                 Some(f) => operator::read_ids_file(&f)?,
                 None => Vec::new(),
             };
+            let system_agents = legacy::registered_system_agents(&mut conn).await?;
+            for id in legacy::exclude_system_agents(&mut exclude, &system_agents) {
+                println!(
+                    "AUTO-EXCLUDED\t{id}\tregistered system agent (migration 148: a retired \
+                     link would leave it unbindable)"
+                );
+            }
             let opts = legacy::Options {
                 operator: op,
                 exclude,

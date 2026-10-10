@@ -530,6 +530,13 @@ legacy key, and any author that resolves to a registered system agent, is
 skipped by ingest and refused (400) by `POST /api/v1/claims/:id/provenance`
 and `POST /api/v1/agents`.
 
+A registered system agent is bound with a LIVE link only. No definer may give
+it a RETIRED link (a retired link is permanent and never promoted, so it would
+leave the agent unbindable behind an immutable registration), and it is never
+registered as a human. `epigraph-operator link-legacy-authors` excludes every
+registered system agent itself and prints an `AUTO-EXCLUDED` line for each; a
+direct call of the bulk tie that does not exclude one is refused as a whole.
+
 **Scope: claim INSERTs.** The trigger governs claim INSERTs, changes of
 `claims.agent_id`, the clearing or re-pointing of an existing
 `claims.supersedes` (above), and a claim becoming current again
