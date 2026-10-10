@@ -876,8 +876,9 @@ async fn ingest_document_byline_fallback_skips_the_system_identity(pool: PgPool)
 
 /// An author whose name resolves to the REGISTERED agent through a key that is
 /// not the legacy one (an agent registered under a name-derived key) is never
-/// adopted. Kills: the second check (registered-id set) missing, since the
-/// first check (legacy key) passes "Some Name".
+/// adopted, on the workflow, document and spine paths. Kills: the second check
+/// (registered-id set) missing on any of the three, since the first check
+/// (legacy key) passes "Some Name".
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool) {
     let n: Uuid = sqlx::query_scalar(
@@ -928,5 +929,18 @@ async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool
     assert!(
         !body.contains(&n.to_string()),
         "N is not among the response's authors: {body}"
+    );
+
+    // The spine path carries its own copy of the registered-id check.
+    ingest_document_authors(&pool, DocPath::Spine, &["Ada Lovelace", "Some Name"], None).await;
+    assert_eq!(
+        edges_from(&pool, ada, Some("authored")).await,
+        2,
+        "spine: control: Ada authored the second paper"
+    );
+    assert_eq!(
+        edges_from(&pool, n, Some("authored")).await,
+        0,
+        "spine: N authored nothing"
     );
 }
