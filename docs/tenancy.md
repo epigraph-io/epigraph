@@ -891,7 +891,14 @@ elevated request runs as the person's ordinary viewer.
 
 **Who sees that it happened.** Every elevated request (REST response or MCP
 tool result) is recorded in `elevated_access` BEFORE the response leaves; if
-the record cannot be written the response is withheld. A row names the
+the record cannot be written the response is withheld. One exception: the
+one WRITE an elevated request may make, an act PROPOSAL (`POST
+/api/v1/admin/acts`, MCP `propose_admin_act`), commits in its own transaction
+before the recorder runs, so when recording then fails the response (the
+confirmation path) is withheld but the act exists, with no `elevated_access`
+row for the request. Its `platform.admin_act_proposed` audit row still
+records it, its proposer still lists it, and it expires unconfirmed after 30
+minutes. A row names the
 session, the person, the reason, the surface, the ids and filters (never
 content), the row count, and the GROUPS whose non-public rows the response
 named; an admin member of such a group reads the row through its row policy.
