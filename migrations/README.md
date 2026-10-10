@@ -1206,8 +1206,12 @@ restart.
   (or before) the binaries that call its definers or compare its label (the
   operator CLI, the MCP signer gate); an older binary is harmless while the
   registry is empty. Rows are added only after the binaries and before the
-  database is armed. Merge after the system-agent registry (148), or sqlx
-  applies a later-merged 148 after 149. **Applied to throwaway databases only,
+  database is armed. Merge AND deploy after the system-agent registry (148):
+  sqlx applies a later-merged 148 after 149, and until 148's `system_agents`
+  exists the soft read finds no table, so the "not a registered system agent"
+  conjunct is absent and a client whose agent is the public-constant
+  workflow-ingest identity is kept off the allowlist only by the operator's
+  care (the allow command's agent-client warning). **Applied to throwaway databases only,
   NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

@@ -709,6 +709,10 @@ human (`OPL02`).
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
 
+Deploy 149 with or after the system-agent registry (148): its
+"not a registered system agent" conjunct reads `system_agents` softly and is
+absent while that table is.
+
 Undo: `docs/runbooks/149-undo.sql` (it records one
 `platform.author_binding_allowlist_dropped` event first).
 
