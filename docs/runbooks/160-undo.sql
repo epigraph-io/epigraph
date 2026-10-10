@@ -3,8 +3,9 @@
 -- corrections) back out, in ONE transaction, on the migration (superuser)
 -- DSN.
 --
--- WHAT IT DOES: restores, byte for byte, the body each re-bodied function had
--- before 160. `CREATE OR REPLACE` keeps the owners and the ACLs, as 160 did.
+-- WHAT IT DOES: restores, byte for byte, the body each function 160 re-bodied
+-- had before it (`CREATE OR REPLACE` keeps the owners and the ACLs, as 160
+-- did), and archives, then drops, what 160's section 4 added.
 --   1. 124's `epigraph_person_authenticators_guard_insert` (a completion
 --      checks only its enrollment's liveness again: a second maintenance
 --      enrollment opened before the first passkey completes).
@@ -12,9 +13,17 @@
 --      holds SOME live role:platform-custodian assignment again).
 --   3. 132's `epigraph_elevated_access_ready` (the gate answers from the
 --      existence of the recorder's names again, whoever owns them).
+--   4. Archives every stored passkey registration into `security_events`
+--      as one `platform.passkey_registration_archived` event (the passkey
+--      id, its person and the registration: what the offline verifier
+--      re-checks, which an undo must not erase), then drops the column, its
+--      immutability trigger and the eight-argument completion. The API
+--      binary that calls that form must be rolled back first.
 --
--- ORDER: run this FIRST, before 132-undo and every other elevation undo. It
--- needs no binary rolled back first.
+-- ORDER: run this FIRST, before 132-undo and every other elevation undo.
+-- Roll back first the API binary that calls 160's eight-argument completion
+-- (step 4 drops it; a build older than 160 calls 124's form); nothing else
+-- needs a binary rolled back.
 --
 -- WHAT IT LEAVES: every row 160's rules admitted or refused, and 160's
 -- `_sqlx_migrations` row. Re-applying the corrections is a NEW migration,
@@ -137,5 +146,34 @@ SET search_path = public, pg_temp AS $$
                'public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])'
            ) IS NOT NULL
 $$;
+
+-- 4. The stored registration: archived, then dropped.
+DO $$
+DECLARE
+    v_rows bigint := 0;
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'person_authenticators'
+                  AND column_name = 'registration') THEN
+        EXECUTE $q$
+            INSERT INTO public.security_events (event_type, agent_id, success, details)
+            SELECT 'platform.passkey_registration_archived', a.person_agent_id, true,
+                   jsonb_build_object('passkey_id', a.id, 'enrollment_id', a.enrollment_id,
+                                      'registration', a.registration,
+                                      'archived_by', '160-undo')
+              FROM public.person_authenticators a
+             WHERE a.registration IS NOT NULL
+             ORDER BY a.created_at, a.id
+        $q$;
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
+    END IF;
+    RAISE NOTICE '160-undo: archived % passkey registration(s) into security_events', v_rows;
+END $$;
+DROP FUNCTION IF EXISTS public.epigraph_complete_passkey_enrollment(
+    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb);
+DROP TRIGGER IF EXISTS person_authenticators_registration_fixed
+    ON public.person_authenticators;
+DROP FUNCTION IF EXISTS public.epigraph_person_authenticators_registration_fixed();
+ALTER TABLE public.person_authenticators DROP COLUMN IF EXISTS registration;
 
 COMMIT;

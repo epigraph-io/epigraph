@@ -60,6 +60,10 @@ pub struct VerifiedPasskey<'a> {
     pub user_verified: bool,
     /// Whether the credential may be synced.
     pub backup_eligible: bool,
+    /// The authenticator's raw registration response (the
+    /// `PublicKeyCredential` JSON the credential was verified from), kept so
+    /// the offline verifier can run the registration again (migration 160).
+    pub registration: &'a serde_json::Value,
 }
 
 /// The ceremony half of migration 124's definers.
@@ -108,9 +112,10 @@ impl PasskeyCeremony {
         Ok(())
     }
 
-    /// Record the passkey a verified ceremony registered, consuming
-    /// `enrollment` (`epigraph_complete_passkey_enrollment`, which writes
-    /// `platform.passkey_registered`). Returns the passkey's id.
+    /// Record the passkey a verified ceremony registered, with the
+    /// registration response it was verified from, consuming `enrollment`
+    /// (migration 160's eight-argument `epigraph_complete_passkey_enrollment`,
+    /// which writes `platform.passkey_registered`). Returns the passkey's id.
     ///
     /// # Errors
     /// `DbError::QueryFailed` carrying `ELV04` (not live, or no ceremony
@@ -123,7 +128,7 @@ impl PasskeyCeremony {
         passkey: VerifiedPasskey<'_>,
     ) -> Result<Uuid, DbError> {
         let id: Uuid = sqlx::query_scalar(
-            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7)",
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(enrollment)
         .bind(passkey.credential_id)
@@ -132,6 +137,7 @@ impl PasskeyCeremony {
         .bind(passkey.attestation_format)
         .bind(passkey.user_verified)
         .bind(passkey.backup_eligible)
+        .bind(passkey.registration)
         .fetch_one(&mut *conn)
         .await?;
         Ok(id)

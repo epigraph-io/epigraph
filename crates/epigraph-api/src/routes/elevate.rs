@@ -390,6 +390,7 @@ pub async fn enroll_finish(
         attestation_format: &registered.attestation_format,
         user_verified: registered.user_verified,
         backup_eligible: registered.backup_eligible,
+        registration: &response,
     };
     match PasskeyCeremony::complete(&mut conn, id, verified).await {
         Ok(passkey_id) => {

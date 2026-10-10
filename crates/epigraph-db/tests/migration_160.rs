@@ -123,18 +123,41 @@ fn functions_in(sql: &str) -> Vec<String> {
     out
 }
 
-/// Every function 160 re-bodies is restored by its undo, and the undo
-/// restores nothing else.
+/// The functions 160 CREATES, with the statement its undo drops each with.
+/// (`epigraph_complete_passkey_enrollment` keeps 124's seven-argument form;
+/// 160 adds the eight-argument overload.)
+const NEW_IN_160: &[(&str, &str)] = &[
+    (
+        "epigraph_person_authenticators_registration_fixed",
+        "DROP FUNCTION IF EXISTS public.epigraph_person_authenticators_registration_fixed();",
+    ),
+    (
+        "epigraph_complete_passkey_enrollment",
+        "DROP FUNCTION IF EXISTS public.epigraph_complete_passkey_enrollment(\n    \
+         uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb);",
+    ),
+];
+
+/// Every function 160 re-bodies is restored by its undo, every function it
+/// creates is dropped by it, and the undo restores nothing else.
 ///
 /// Verified to fail: a function re-bodied by 160 and left out of the undo
-/// (named here).
+/// (named here); the new overload's DROP removed from the undo.
 #[test]
-fn every_160_function_is_restored_by_its_undo() {
-    let migration = functions_in(&read("migrations/160_elevation_final_review.sql"));
-    let undo = functions_in(&read("docs/runbooks/160-undo.sql"));
-    assert!(!migration.is_empty(), "CALIBRATION: 160 defines functions");
+fn every_160_function_is_restored_or_dropped_by_its_undo() {
+    let migration_sql = read("migrations/160_elevation_final_review.sql");
+    let undo_sql = read("docs/runbooks/160-undo.sql");
+    let rebodied: Vec<String> = functions_in(&migration_sql)
+        .into_iter()
+        .filter(|f| !NEW_IN_160.iter().any(|(n, _)| n == f))
+        .collect();
+    assert!(!rebodied.is_empty(), "CALIBRATION: 160 re-bodies functions");
     assert_eq!(
-        migration, undo,
+        rebodied,
+        functions_in(&undo_sql),
         "160 re-bodies exactly what its undo restores"
     );
+    for (name, drop) in NEW_IN_160 {
+        assert!(undo_sql.contains(drop), "the undo drops 160's new {name}");
+    }
 }

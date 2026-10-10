@@ -1822,6 +1822,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // intended (083's case). The table has no row security, so a non-member
     // owner changes nothing else.
     ("epigraph_access_token_revoke", 141),
+    // 160, the elevation stack's final-review corrections. The registration
+    // trigger keeps a passkey's stored registration fixed; under an APP owner
+    // it still runs (it reads only the row), so the stake is the register's
+    // consistency: every elevation definer is maintenance-owned. (160's
+    // eight-argument `epigraph_complete_passkey_enrollment` shares its name
+    // with 124's entry above, which checks every overload of it.)
+    ("epigraph_person_authenticators_registration_fixed", 160),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2389,6 +2396,20 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_admin_acts_of_principal",
             "public.epigraph_admin_acts_of_principal(integer)",
             true,
+        ),
+        // 160: the API's completion now stores the registration response (the
+        // eight-argument overload, keyed on 160's trigger function, which
+        // exists exactly when it does); the trigger function is no one's to
+        // call.
+        (
+            "epigraph_person_authenticators_registration_fixed",
+            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_person_authenticators_registration_fixed",
+            "public.epigraph_person_authenticators_registration_fixed()",
+            false,
         ),
     ];
 

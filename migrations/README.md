@@ -1123,7 +1123,8 @@ Current reservation:
   132)". Checked before claiming: no remote branch carries a `132`.
   **Applied to a throwaway database only, NOT to any deployed database.**
 
-- **133+**: public next (the elevation stack stays at or below 139; 140-159
+- **133+**: public next (the elevation stack's original series stays at or
+  below 139, its final-review corrections are 160; 140-159
   are reserved)
 
 - **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
@@ -1179,8 +1180,8 @@ restart.
 - **160**: public `elevation_final_review` (the elevation stack's final
   review; slot: the first after the drain block 140-159, and no remote branch
   carries a `160`). 124-132 are applied and immutable, so each correction
-  re-bodies a function here (`CREATE OR REPLACE`, owner and ACL kept), one
-  section per decision. Section 1: 124's `person_authenticators` insert guard
+  lands here, one section per decision: sections 1-3 re-body functions
+  (`CREATE OR REPLACE`, owner and ACL kept), section 4 adds objects. Section 1: 124's `person_authenticators` insert guard
   refuses `ELV10` when a MAINTENANCE enrollment completes for a person who
   already holds a live passkey (130 tested only when an enrollment opened), under
   a per-person advisory lock. Section 2: 130's `epigraph_consume_admin_act`
@@ -1191,13 +1192,25 @@ restart.
   `SECURITY DEFINER` owned by a member of `epigraph_maintenance` (132 tested
   only that the two names exist, which CREATE on `public` alone could spoof
   once 127 was undone); 160 is therefore the third file allowed to define the
-  gate (`elevated_access.rs::every_132_object_is_registered`). Behaviour in
-  `epigraph-db/tests/pending_admin_acts.rs` (sections 1, 2) and
-  `elevated_access.rs` (section 3); the file as a whole in
+  gate (`elevated_access.rs::every_132_object_is_registered`). Section 4:
+  `person_authenticators.registration` (nullable jsonb object, fixed after
+  the insert by its own trigger) keeps the raw registration response a
+  passkey was admitted with, written by a new eight-argument
+  `epigraph_complete_passkey_enrollment` (app-callable, refuses a missing
+  registration; 124's seven-argument form stays), so `epigraph-operator
+  verify-confirmations` can re-run the registration under the API's
+  attestation policy. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs` (sections 1, 2),
+  `elevated_access.rs` (section 3) and `epigraph-cli/tests/operator_admin_act_cli.rs`
+  (section 4); the file as a whole in
   `migration_160.rs`. Sets `lock_timeout = '3s'`. Undo
   (`docs/runbooks/160-undo.sql`, restores every re-bodied function; run it
-  FIRST, before 132-undo). **Deploy order:** after 124-132 (sqlx would
-  otherwise apply them out of order after 160); no binary depends on it.
+  FIRST, before 132-undo; it archives the stored registrations into
+  `security_events` before dropping the column). **Deploy order:** after
+  124-132 (sqlx would otherwise apply them out of order after 160), with the
+  API binary that calls the eight-argument completion (an older one keeps
+  calling 124's form, whose passkeys the verifier reports as not
+  re-verifiable).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

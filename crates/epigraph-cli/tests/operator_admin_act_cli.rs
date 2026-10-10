@@ -638,6 +638,17 @@ async fn api(
     std::net::SocketAddr,
     std::sync::Arc<epigraph_auth::JwtConfig>,
 ) {
+    api_with(pool, epigraph_passkey::AttestationPolicy::SoftwareAllowed).await
+}
+
+/// [`api`] under the attestation `policy`.
+async fn api_with(
+    pool: &PgPool,
+    policy: epigraph_passkey::AttestationPolicy,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<epigraph_auth::JwtConfig>,
+) {
     let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         epigraph_db::SessionGucMode::Session,
@@ -649,7 +660,7 @@ async fn api(
     let rp = epigraph_passkey::Passkeys::new(epigraph_passkey::PasskeyConfig {
         rp_id: soft_authenticator::RP_ID.into(),
         origin: soft_authenticator::ORIGIN.parse().unwrap(),
-        policy: epigraph_passkey::AttestationPolicy::SoftwareAllowed,
+        policy,
     })
     .expect("relying party");
     let state =
@@ -1183,8 +1194,26 @@ async fn forged_elevation(pool: &PgPool, e: &mut Elevated) -> Uuid {
 }
 
 /// Run `verify-confirmations` with the test relying party (`origin`
-/// overridable; `None` leaves the relying party unset).
+/// overridable; `None` leaves the relying party unset) under the software
+/// attestation policy the test API runs with.
 async fn run_verify(pool: &PgPool, args: &[&str], origin: Option<&str>) -> Run {
+    let policy: &[(&str, &str)] = &[("EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION", "1")];
+    run_verify_with(
+        pool,
+        args,
+        origin,
+        if origin.is_some() { policy } else { &[] },
+    )
+    .await
+}
+
+/// [`run_verify`] with the attestation policy given as its variables.
+async fn run_verify_with(
+    pool: &PgPool,
+    args: &[&str],
+    origin: Option<&str>,
+    policy: &[(&str, &str)],
+) -> Run {
     let url = fixture::database_url_for(pool).await;
     let mut cmd = Command::new(BIN);
     cmd.arg("verify-confirmations")
@@ -1194,10 +1223,16 @@ async fn run_verify(pool: &PgPool, args: &[&str], origin: Option<&str>) -> Run {
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("EPIGRAPH_WEBAUTHN_RP_ID")
         .env_remove("EPIGRAPH_WEBAUTHN_ORIGIN")
+        .env_remove("EPIGRAPH_WEBAUTHN_AAGUIDS")
+        .env_remove("EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE")
+        .env_remove("EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION")
         .env(DSN_ENV, url);
     if let Some(origin) = origin {
         cmd.env("EPIGRAPH_WEBAUTHN_RP_ID", soft_authenticator::RP_ID)
             .env("EPIGRAPH_WEBAUTHN_ORIGIN", origin);
+    }
+    for (k, v) in policy {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn");
     Run {
@@ -1241,11 +1276,13 @@ async fn recorded(pool: &PgPool) -> Vec<(Option<Uuid>, String, String, String)> 
 
 /// Every genuine confirmation verifies: an elevation and an admin act, both
 /// through the real ceremonies, are checked (1 and 1), nothing is flagged,
-/// nothing recorded, exit 0. A REFUSED assertion (an unknown credential, the
+/// nothing recorded, exit 0, and P's passkey's stored registration re-runs
+/// clean (1 checked). A REFUSED assertion (an unknown credential, the
 /// API's audited path, whose evidence by design does not verify) granted
 /// nothing and is counted, not flagged. CALIBRATIONS that the evidence is really
 /// re-verified: under another origin both are flagged
-/// `assertion_does_not_verify` (exit 2); with no relying party configured
+/// `assertion_does_not_verify` and the registration
+/// `registration_does_not_verify` (exit 2); with no relying party configured
 /// the verb refuses to run (exit 1, nothing recorded), since a run that
 /// verified nothing must not exit 0.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1300,9 +1337,11 @@ async fn verify_confirmations_passes_every_genuine_confirmation(pool: PgPool) {
         (
             &report["elevations_checked"],
             &report["acts_checked"],
-            &report["refused_seen"]
+            &report["refused_seen"],
+            &report["passkeys_checked"]
         ),
         (
+            &serde_json::json!(1),
             &serde_json::json!(1),
             &serde_json::json!(1),
             &serde_json::json!(1)
@@ -1327,9 +1366,220 @@ async fn verify_confirmations_passes_every_genuine_confirmation(pool: PgPool) {
             e.ticket,
             "assertion_does_not_verify".to_string(),
         ),
+        (
+            "passkey".to_string(),
+            passkey_of(&pool, e.person).await,
+            "registration_does_not_verify".to_string(),
+        ),
     ];
     want.sort();
     assert_eq!(got, want);
+}
+
+/// The id of `person`'s one passkey.
+async fn passkey_of(pool: &PgPool, person: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM person_authenticators WHERE person_agent_id = $1")
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("the passkey")
+}
+
+/// The model the allowlisted test authenticator attests as.
+const ATTESTED_MODEL: Uuid = Uuid::from_u128(0x2fc0_579f_8113_47ea_b116_bb5a_8db9_202a);
+
+/// A maintenance enrollment for `person`; its id.
+async fn open_enrollment(pool: &PgPool, person: Uuid) -> Uuid {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'verify', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an enrollment");
+        (conn, e)
+    })
+    .await
+}
+
+/// THE FORGED COMPLETION (final review F1-COR-02): an application-DSN holder
+/// who knows a live enrollment id stores a ceremony state of its own and
+/// completes the enrollment through the definers, past the API and its
+/// attestation allowlist, with a SOFTWARE key (`none` attestation); `with_
+/// registration` stores the registration response (the eight-argument form)
+/// or not (124's seven-argument form). Returns the passkey id.
+async fn forged_completion(pool: &PgPool, person: Uuid, with_registration: bool) -> Uuid {
+    use soft_authenticator::{ClientUv, SoftAuthenticator, ORIGIN, RP_ID};
+    let enrollment = open_enrollment(pool, person).await;
+    let soft = epigraph_passkey::Passkeys::new(epigraph_passkey::PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: epigraph_passkey::AttestationPolicy::SoftwareAllowed,
+    })
+    .expect("the forger's relying party");
+    let (options, state) = soft
+        .start_registration(person, "forged", "Forged")
+        .expect("start");
+    let response = SoftAuthenticator::new(ATTESTED_MODEL)
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let reg = soft
+        .finish_registration(&response, &state)
+        .expect("the forger's own key verifies under its own policy");
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_passkey_enrollment_challenge($1, $2)")
+            .bind(enrollment)
+            .bind(state.to_json())
+            .execute(&mut *conn)
+            .await
+            .expect("the app stores the state");
+        let id: Uuid = if with_registration {
+            sqlx::query_scalar(
+                "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, \
+                        $8)",
+            )
+            .bind(enrollment)
+            .bind(&reg.credential_id)
+            .bind(&reg.passkey)
+            .bind(reg.aaguid)
+            .bind(&reg.attestation_format)
+            .bind(reg.user_verified)
+            .bind(reg.backup_eligible)
+            .bind(&response)
+            .fetch_one(&mut *conn)
+            .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(enrollment)
+            .bind(&reg.credential_id)
+            .bind(&reg.passkey)
+            .bind(reg.aaguid)
+            .bind(&reg.attestation_format)
+            .bind(reg.user_verified)
+            .bind(reg.backup_eligible)
+            .fetch_one(&mut *conn)
+            .await
+        }
+        .expect("CALIBRATION: the database admits the forged completion");
+        (conn, id)
+    })
+    .await
+}
+
+/// A PASSKEY COMPLETED PAST THE API IS FLAGGED (final review F1-COR-02). The
+/// API runs the attestation ALLOWLIST; P registers an attested hardware key
+/// through it. Q's enrollment is completed through the application DSN with a
+/// software key and its registration stored; S's the same way with no
+/// registration stored. Under the API's own policy (the allowlist's roots and
+/// model) `verify-confirmations` re-runs each stored registration: P's
+/// re-verifies, Q's is `registration_does_not_verify`, S's
+/// `registration_not_stored`, each recorded, exit 2. CALIBRATION that it is
+/// the POLICY that catches Q: under the software policy Q's registration
+/// re-verifies (and P's, started under the allowlist, does not).
+///
+/// Verified to fail with the registration pass's checks skipped (every
+/// passkey passes: exit 0 under the allowlist).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_passkey_completed_past_the_api_is_flagged(pool: PgPool) {
+    use soft_authenticator::{ClientUv, SoftAuthenticator, TestAttestation, ORIGIN};
+    let att = TestAttestation::new("Allowlisted");
+    let (addr, _) = api_with(
+        &pool,
+        epigraph_passkey::AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [ATTESTED_MODEL].into_iter().collect(),
+        },
+    )
+    .await;
+    let (p, _) = fixture::seed_human_operator(&pool, "genuine").await;
+    let enrollment = open_enrollment(&pool, p).await;
+    let base = format!("/elevate/enroll/{enrollment}");
+    let (_, options) = post(
+        addr,
+        &format!("{base}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    let mut auth = SoftAuthenticator::new(ATTESTED_MODEL).hardware();
+    let registration = att.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let (status, body) = post(addr, &format!("{base}/finish"), None, &registration).await;
+    assert_eq!(
+        status, 200,
+        "CALIBRATION: the API admits the attested key: {body}"
+    );
+    let genuine = passkey_of(&pool, p).await;
+
+    let (q, _) = fixture::seed_human_operator(&pool, "forged, stored").await;
+    let (s_person, _) = fixture::seed_human_operator(&pool, "forged, unstored").await;
+    let forged = forged_completion(&pool, q, true).await;
+    let unstored = forged_completion(&pool, s_person, false).await;
+
+    let ca = std::env::temp_dir().join(format!("verify-ca-{}.pem", Uuid::new_v4()));
+    std::fs::write(&ca, att.root_pem()).expect("the CA file");
+    let model = ATTESTED_MODEL.to_string();
+    let allowlist = [
+        ("EPIGRAPH_WEBAUTHN_AAGUIDS", model.as_str()),
+        (
+            "EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE",
+            ca.to_str().unwrap(),
+        ),
+    ];
+    let run = run_verify_with(&pool, &["--json"], Some(ORIGIN), &allowlist).await;
+    let _ = std::fs::remove_file(&ca);
+    assert_eq!(run.code, 2, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(report["passkeys_checked"], serde_json::json!(3), "{report}");
+    let mut got = findings_of(&report);
+    got.sort();
+    let mut want = vec![
+        (
+            "passkey".to_string(),
+            forged,
+            "registration_does_not_verify".to_string(),
+        ),
+        (
+            "passkey".to_string(),
+            unstored,
+            "registration_not_stored".to_string(),
+        ),
+    ];
+    want.sort();
+    assert_eq!(got, want, "{report}");
+    let recorded_ids: Vec<String> = recorded(&pool)
+        .await
+        .into_iter()
+        .map(|(_, subject, id, _)| format!("{subject} {id}"))
+        .collect();
+    assert_eq!(recorded_ids.len(), 2, "{recorded_ids:?}");
+    assert!(
+        !recorded_ids.contains(&format!("passkey {genuine}")),
+        "the genuine passkey is not flagged"
+    );
+
+    let soft = run_verify(&pool, &["--json"], Some(ORIGIN)).await;
+    let mut got = findings_of(&report_of(&soft));
+    got.sort();
+    let mut want = vec![
+        (
+            "passkey".to_string(),
+            genuine,
+            "registration_does_not_verify".to_string(),
+        ),
+        (
+            "passkey".to_string(),
+            unstored,
+            "registration_not_stored".to_string(),
+        ),
+    ];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "CALIBRATION: under the software policy the forged key re-verifies"
+    );
 }
 
 /// THE APPLICATION-DSN FORGERY IS FLAGGED (elevation plan EL-13): a ticket
@@ -1489,9 +1739,10 @@ async fn the_verifier_reads_and_records_on_a_maintenance_login(pool: PgPool) {
     let mut e = elevated_custodian(&pool).await;
     let forged = forged_elevation(&pool, &mut e).await;
     let verifier = || {
-        epigraph_passkey::Verifier::new(epigraph_passkey::RelyingParty {
+        epigraph_passkey::Verifier::new(epigraph_passkey::PasskeyConfig {
             rp_id: soft_authenticator::RP_ID.into(),
             origin: soft_authenticator::ORIGIN.parse().unwrap(),
+            policy: epigraph_passkey::AttestationPolicy::SoftwareAllowed,
         })
         .unwrap()
     };

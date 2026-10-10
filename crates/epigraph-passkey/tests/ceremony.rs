@@ -11,8 +11,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use epigraph_passkey::{
-    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, RelyingParty,
-    StoredPasskey, Verifier,
+    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, StoredPasskey,
+    Verifier,
 };
 use serde_json::Value;
 use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
@@ -517,9 +517,8 @@ async fn evidence_reverifies_against_its_credential_only() {
     );
 }
 
-/// The offline verifier, built from the relying party alone (no attestation
-/// policy: it registers nothing), re-verifies what the ceremony's relying
-/// party verified, and refuses it under another origin or rp id and with a
+/// The offline verifier re-verifies what the ceremony's relying party
+/// verified, and refuses it under another origin or rp id and with a
 /// tampered signature. Mutations: `Verifier::reverify` answers Ok without
 /// verifying (the tampered case is accepted); `Verifier::new` ignores the
 /// configured origin (the other-origin verifier accepts).
@@ -534,9 +533,10 @@ async fn a_verifier_reverifies_what_the_ceremony_verified() {
         .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
         .expect("verifies");
     let verifier = |rp_id: &str, origin: &str| {
-        Verifier::new(RelyingParty {
+        Verifier::new(PasskeyConfig {
             rp_id: rp_id.into(),
             origin: origin.parse().unwrap(),
+            policy: AttestationPolicy::SoftwareAllowed,
         })
         .expect("verifier")
     };
@@ -568,6 +568,86 @@ async fn a_verifier_reverifies_what_the_ceremony_verified() {
         &bytes,
     ));
     assert!(v.reverify(&sig, &stored).is_err(), "a tampered signature");
+}
+
+/// The offline verifier runs a STORED registration again under ITS OWN
+/// attestation policy (final review F1-COR-02): an attested registration of
+/// an allowlisted model, with the state its ceremony was started with,
+/// re-verifies and yields exactly the stored row's columns; a software
+/// (`none`) registration that a software-policy ceremony admitted does not
+/// re-verify under the allowlist (the key an application-DSN holder would
+/// complete an enrollment with); nor does a registration paired with another
+/// ceremony's state (a challenge the state was not started with), nor one
+/// from another origin.
+///
+/// Mutation: `Verifier::reverify_registration` answers the stored columns
+/// without running the library -> the software and swapped cases are
+/// accepted.
+#[tokio::test]
+async fn a_verifier_reruns_a_stored_registration_under_its_own_policy() {
+    let att = TestAttestation::new("Allowlisted");
+    let api = allowlist(&att, &[MODEL]);
+    let verifier = Verifier::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [MODEL].into_iter().collect(),
+        },
+    })
+    .expect("verifier");
+
+    let (options, state) = start(&api);
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let response = att.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let stored = api
+        .finish_registration(&response, &state)
+        .expect("CALIBRATION: the API admits it");
+    let again = verifier
+        .reverify_registration(&response, &state.to_json())
+        .expect("a genuine attested registration re-verifies");
+    assert_eq!(again, stored, "the re-run yields the stored columns");
+
+    // A software key, admitted by a software-policy ceremony.
+    let soft = software();
+    let (options, soft_state) = start(&soft);
+    let soft_response = SoftAuthenticator::new(MODEL)
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    soft.finish_registration(&soft_response, &soft_state)
+        .expect("CALIBRATION: the software policy admits it");
+    assert!(
+        verifier
+            .reverify_registration(&soft_response, &soft_state.to_json())
+            .is_err(),
+        "a software registration does not re-verify under the allowlist"
+    );
+
+    // The genuine response with another ceremony's state.
+    let (_, other_state) = start(&api);
+    assert!(
+        verifier
+            .reverify_registration(&response, &other_state.to_json())
+            .is_err(),
+        "a registration paired with a state it was not made for"
+    );
+
+    // Another origin's verifier.
+    let elsewhere = Verifier::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: "https://auth.example.com:8443".parse().unwrap(),
+        policy: AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [MODEL].into_iter().collect(),
+        },
+    })
+    .expect("verifier");
+    assert!(
+        elsewhere
+            .reverify_registration(&response, &state.to_json())
+            .is_err(),
+        "another origin"
+    );
 }
 
 /// The assertion reports the backup-eligible flag the AUTHENTICATOR asserted,

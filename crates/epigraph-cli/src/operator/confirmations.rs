@@ -34,6 +34,20 @@
 //! 6. the asserted credential is that passkey;
 //! 7. the asserted backup-eligible flag does not exceed the stored one.
 //!
+//! For every stored PASSKEY (registered at or after `--since`), against the
+//! API's attestation policy (`EPIGRAPH_WEBAUTHN_AAGUIDS` /
+//! `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE`, or the software flag where the API
+//! runs with it; final review F1-COR-02, migration 160):
+//!
+//! 8. the registration response it was admitted with is stored;
+//! 9. it RE-VERIFIES against the ceremony state its enrollment stored, under
+//!    this policy (`epigraph_passkey::Verifier::reverify_registration`): an
+//!    application-DSN holder who completed a live enrollment with a key of its
+//!    own skipped the API's attestation check, and is caught here unless the
+//!    key is of an allowlisted model;
+//! 10. the re-run yields exactly the stored row (credential, serialized
+//!     credential and public key, AAGUID, format, flags).
+//!
 //! Then, across rows:
 //!
 //! * a challenge asserted MORE THAN ONCE (over every asserted ticket and act,
@@ -91,6 +105,9 @@ pub enum Subject {
     AdminAct,
     /// An `elevation_sessions` row (migration 125).
     ElevationSession,
+    /// A `person_authenticators` row (migration 124), checked by its stored
+    /// registration (migration 160).
+    Passkey,
 }
 
 impl Subject {
@@ -101,6 +118,7 @@ impl Subject {
             Self::ElevationTicket => "elevation_ticket",
             Self::AdminAct => "admin_act",
             Self::ElevationSession => "elevation_session",
+            Self::Passkey => "passkey",
         }
     }
 }
@@ -123,7 +141,8 @@ pub struct Finding {
     /// `challenge_not_stored`, `challenge_not_bound`, `credential_unknown`,
     /// `credential_not_the_persons`, `assertion_does_not_verify`,
     /// `credential_mismatch`, `backup_eligibility_changed`,
-    /// `challenge_reused`, `session_unconfirmed`.
+    /// `challenge_reused`, `session_unconfirmed`, `registration_not_stored`,
+    /// `registration_does_not_verify`, `registration_mismatch`.
     pub reason: &'static str,
     /// What exactly, for the operator.
     pub detail: String,
@@ -141,6 +160,8 @@ pub struct Report {
     pub acts_checked: usize,
     /// Elevation sessions checked for their confirmation.
     pub sessions_checked: usize,
+    /// Stored passkeys whose registration was re-run.
+    pub passkeys_checked: usize,
     /// Refused assertions seen (not verified; part of the repetition check).
     pub refused_seen: usize,
     /// Everything that did not verify.
@@ -216,6 +237,78 @@ const ACTS: &str = "\
       LEFT JOIN public.person_authenticators a ON a.id = x.authenticator_id \
      WHERE x.outcome IS NOT NULL";
 
+/// One stored passkey, with the registration it was admitted with and the
+/// ceremony state its enrollment stored.
+#[derive(Debug, sqlx::FromRow)]
+struct Registered {
+    id: Uuid,
+    person: Uuid,
+    created_at: DateTime<Utc>,
+    credential_id: Vec<u8>,
+    passkey: Value,
+    aaguid: Uuid,
+    attestation_format: String,
+    user_verified: bool,
+    backup_eligible: bool,
+    registration: Option<Value>,
+    challenge_state: Option<Value>,
+}
+
+/// Every passkey registered at or after `$1`. `registration` is read through
+/// `to_jsonb(a)` so a database without migration 160 answers NULL (and every
+/// passkey is reported as not re-verifiable) instead of failing the run.
+const PASSKEYS: &str = "\
+    SELECT a.id, a.person_agent_id AS person, a.created_at, a.credential_id, a.passkey, \
+           a.aaguid, a.attestation_format, a.user_verified, a.backup_eligible, \
+           to_jsonb(a) -> 'registration' AS registration, e.challenge_state \
+      FROM public.person_authenticators a \
+      LEFT JOIN public.passkey_enrollments e ON e.id = a.enrollment_id \
+     WHERE ($1::timestamptz IS NULL OR a.created_at >= $1) \
+     ORDER BY a.created_at, a.id";
+
+/// The per-passkey checks (module docs, 8-10), in order.
+fn check_registration(verifier: &Verifier, row: &Registered) -> Result<(), Failure> {
+    let Some(registration) = row.registration.as_ref().filter(|r| !r.is_null()) else {
+        return Err(fail(
+            "registration_not_stored",
+            "no registration response is stored for this passkey, so what admitted it cannot \
+             be re-checked",
+        ));
+    };
+    let Some(state) = row.challenge_state.as_ref() else {
+        return Err(fail(
+            "challenge_state_malformed",
+            "its enrollment stored no ceremony state",
+        ));
+    };
+    let again = verifier
+        .reverify_registration(registration, state)
+        .map_err(|e| fail("registration_does_not_verify", e.to_string()))?;
+    let stored = (
+        row.credential_id.as_slice(),
+        &row.passkey,
+        row.aaguid,
+        row.attestation_format.as_str(),
+        row.user_verified,
+        row.backup_eligible,
+    );
+    let rerun = (
+        again.credential_id.as_slice(),
+        &again.passkey,
+        again.aaguid,
+        again.attestation_format.as_str(),
+        again.user_verified,
+        again.backup_eligible,
+    );
+    if stored != rerun {
+        return Err(fail(
+            "registration_mismatch",
+            "the stored registration verifies, but not to the credential this row stores",
+        ));
+    }
+    Ok(())
+}
+
 /// Why a confirmation does not verify: `(reason, detail)`.
 type Failure = (&'static str, String);
 
@@ -236,7 +329,7 @@ fn stored_challenge(row: &Asserted) -> Result<Vec<u8>, Failure> {
             .get("ceremony")
             .cloned()
             .ok_or_else(|| fail("challenge_state_malformed", "no stored act ceremony"))?,
-        Subject::ElevationTicket | Subject::ElevationSession => state.clone(),
+        Subject::ElevationTicket | Subject::ElevationSession | Subject::Passkey => state.clone(),
     };
     AuthenticationState::from_json(ceremony)
         .challenge()
@@ -371,7 +464,7 @@ pub async fn verify(
         }
         match row.subject() {
             Subject::AdminAct => report.acts_checked += 1,
-            Subject::ElevationTicket | Subject::ElevationSession => {
+            Subject::ElevationTicket | Subject::ElevationSession | Subject::Passkey => {
                 report.elevations_checked += 1;
             }
         }
@@ -393,6 +486,25 @@ pub async fn verify(
                 person: row.person,
                 authenticator_id: row.authenticator_id,
                 at: row.asserted_at,
+                reason,
+                detail,
+            });
+        }
+    }
+
+    let passkeys: Vec<Registered> = sqlx::query_as(PASSKEYS)
+        .bind(since)
+        .fetch_all(&mut *conn)
+        .await?;
+    for p in &passkeys {
+        report.passkeys_checked += 1;
+        if let Err((reason, detail)) = check_registration(verifier, p) {
+            report.findings.push(Finding {
+                subject: Subject::Passkey,
+                id: p.id,
+                person: p.person,
+                authenticator_id: Some(p.id),
+                at: p.created_at,
                 reason,
                 detail,
             });
@@ -494,11 +606,12 @@ pub fn describe(f: &Finding) -> String {
 #[must_use]
 pub fn summary(r: &Report) -> String {
     format!(
-        "SUMMARY\televations_checked={}\tacts_checked={}\tsessions_checked={}\trefused_seen={}\t\
-         unverified={}\trecorded={}",
+        "SUMMARY\televations_checked={}\tacts_checked={}\tsessions_checked={}\t\
+         passkeys_checked={}\trefused_seen={}\tunverified={}\trecorded={}",
         r.elevations_checked,
         r.acts_checked,
         r.sessions_checked,
+        r.passkeys_checked,
         r.refused_seen,
         r.findings.len(),
         r.recorded,

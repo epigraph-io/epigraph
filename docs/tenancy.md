@@ -940,9 +940,13 @@ scopes; arming is an operator step (`docs/deploy.md`).
   maintenance DSN can write the rows directly. `epigraph-operator
   verify-confirmations` re-verifies every stored confirmation offline (the
   signature against the stored public key, the act binding, a replayed
-  evidence object, a session no confirmed ticket opened) and records each
-  finding. It does not detect: an assertion phished from the person's real
-  passkey over a challenge the forger chose; a maintenance holder editing or
+  evidence object, a session no confirmed ticket opened) and re-runs every
+  passkey's stored registration under the API's attestation policy (a
+  passkey completed through the application DSN with a key the allowlist
+  refuses, or with no registration stored), and records each finding. It
+  does not detect: a forged completion with an authenticator of an
+  allowlisted model (or any key under the software policy); an assertion
+  phished from the person's real passkey over a challenge the forger chose; a maintenance holder editing or
   deleting the ceremony rows or the trail (the append-only guards bind every
   login a superuser has not disabled); a signature counter going back across
   confirmations.

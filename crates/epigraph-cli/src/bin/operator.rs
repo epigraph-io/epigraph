@@ -249,9 +249,12 @@ enum Command {
     /// Re-verify every stored passkey confirmation (elevation tickets and
     /// admin acts) offline, against the passkey's public key and the relying
     /// party in EPIGRAPH_WEBAUTHN_RP_ID / EPIGRAPH_WEBAUTHN_ORIGIN (the values
-    /// the ceremonies ran under). Each confirmation that does not verify is
-    /// printed and recorded once as `platform.confirmation_unverified`; exit 2
-    /// when there is any.
+    /// the ceremonies ran under), and re-run every stored passkey
+    /// REGISTRATION under the API's attestation policy (the same
+    /// EPIGRAPH_WEBAUTHN_AAGUIDS / EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE, or
+    /// EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION where the API runs with
+    /// it). Each one that does not verify is printed and recorded once as
+    /// `platform.confirmation_unverified`; exit 2 when there is any.
     VerifyConfirmations {
         /// Only confirmations asserted at or after this instant (RFC 3339).
         #[arg(long)]
@@ -567,15 +570,26 @@ async fn main_inner() -> anyhow::Result<i32> {
     // The relying party, before any connection is made: without it nothing
     // can be verified, and a run that verified nothing must not exit 0.
     let verifier = if let Command::VerifyConfirmations { .. } = &cli.command {
-        let rp = epigraph_passkey::RelyingParty::from_env()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "verify-confirmations needs {} and {}: the relying party the ceremonies ran \
-                 under (the API's values)",
-                epigraph_passkey::config::ENV_RP_ID,
-                epigraph_passkey::config::ENV_ORIGIN
-            )
-        })?;
-        Some(epigraph_passkey::Verifier::new(rp)?)
+        // The WHOLE passkey configuration the API runs with: the relying
+        // party re-verifies stored assertions, and the attestation policy
+        // re-runs stored registrations (final review F1-COR-02).
+        let config = epigraph_passkey::PasskeyConfig::from_env()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "verify-confirmations needs the API's passkey configuration (the relying \
+                     party AND its attestation policy, which re-runs every stored \
+                     registration): {e}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verify-confirmations needs {} and {}: the relying party the ceremonies ran \
+                     under (the API's values), with the API's attestation policy",
+                    epigraph_passkey::config::ENV_RP_ID,
+                    epigraph_passkey::config::ENV_ORIGIN
+                )
+            })?;
+        Some(epigraph_passkey::Verifier::new(config)?)
     } else {
         None
     };

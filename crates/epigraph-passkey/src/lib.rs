@@ -577,28 +577,28 @@ impl Passkeys {
     }
 }
 
-/// A relying party that only RE-VERIFIES stored assertions: the offline
-/// confirmation verifier's (`epigraph-operator verify-confirmations`). It is
-/// built from the rp id and the origin alone and offers
-/// [`Verifier::reverify`] and nothing else, so it can start no ceremony and
-/// register nothing (the attestation policy, which only registration reads,
-/// is therefore never configured for it).
+/// A relying party that only RE-VERIFIES what ceremonies stored: the offline
+/// confirmation verifier's (`epigraph-operator verify-confirmations`). It
+/// offers [`Verifier::reverify`] (a stored assertion) and
+/// [`Verifier::reverify_registration`] (a stored registration) and nothing
+/// else, so it can start no ceremony and register nothing.
+///
+/// It is built from the API's WHOLE passkey configuration, the attestation
+/// policy included: a stored registration is run again under THIS policy
+/// (its roots and AAGUID allowlist spliced over whatever the stored state
+/// carries, as [`Passkeys::finish_registration`] does), so a registration the
+/// API's policy would have refused does not re-verify, whoever stored it.
 #[derive(Debug)]
 pub struct Verifier(Passkeys);
 
 impl Verifier {
-    /// A verifier for `rp`.
+    /// A verifier for `config` (the values the API's ceremonies ran under).
     ///
     /// # Errors
-    /// [`PasskeyError::Config`]: the origin does not belong to the rp id.
-    pub fn new(rp: RelyingParty) -> Result<Self, PasskeyError> {
-        Passkeys::new(PasskeyConfig {
-            rp_id: rp.rp_id,
-            origin: rp.origin,
-            // Read only by a registration, which this type cannot start.
-            policy: AttestationPolicy::SoftwareAllowed,
-        })
-        .map(Self)
+    /// [`PasskeyError::Config`]: the origin does not belong to the rp id, or a
+    /// root certificate does not parse.
+    pub fn new(config: PasskeyConfig) -> Result<Self, PasskeyError> {
+        Passkeys::new(config).map(Self)
     }
 
     /// [`Passkeys::reverify`]: `evidence` against the credential `snapshot`,
@@ -613,6 +613,26 @@ impl Verifier {
         snapshot: &StoredPasskey,
     ) -> Result<Assertion, PasskeyError> {
         self.0.reverify(evidence, snapshot)
+    }
+
+    /// Run a stored registration again: `registration` (the authenticator's
+    /// response, as the API received it) against `state` (the ceremony state
+    /// its enrollment was started with), under this verifier's rp id, origin
+    /// and attestation policy. The caller compares the result with the
+    /// stored passkey.
+    ///
+    /// # Errors
+    /// As [`Passkeys::finish_registration`]: the registration does not verify
+    /// under this policy (another origin, a challenge the state was not
+    /// started with, an attestation that is not allowlisted, a state started
+    /// under the other policy, ...), or is malformed.
+    pub fn reverify_registration(
+        &self,
+        registration: &Value,
+        state: &Value,
+    ) -> Result<RegisteredPasskey, PasskeyError> {
+        self.0
+            .finish_registration(registration, &RegistrationState::from_json(state.clone()))
     }
 }
 

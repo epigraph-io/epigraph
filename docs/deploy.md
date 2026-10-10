@@ -2273,9 +2273,20 @@ write the rows directly. That is not preventable in this stack; this verb
 makes it DETECTABLE.
 
 `epigraph-operator verify-confirmations [--since <RFC3339>] [--json]`, on the
-maintenance DSN, with `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`
+maintenance DSN, with the API's WHOLE passkey configuration:
+`EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, and the attestation
+policy (`EPIGRAPH_WEBAUTHN_AAGUIDS` and `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE`,
+or `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` where the API runs with it),
 set to the values the API's ceremonies ran under (it refuses to run without
-them: exit 1). For every CONFIRMED ticket and act it re-verifies the stored
+them: exit 1). For every passkey it re-runs the REGISTRATION the passkey was
+admitted with (stored since migration 160) against the ceremony state its
+enrollment stored, under that attestation policy, and checks the result is
+the stored credential: a passkey completed through the application DSN past
+the API's attestation check is flagged (`registration_does_not_verify`, or
+`registration_not_stored` for a completion that stored none: 124's
+seven-argument form, which an API binary older than 160 still calls). It does
+not catch a forger holding an authenticator of an allowlisted model, nor
+anything under the software policy. For every CONFIRMED ticket and act it re-verifies the stored
 evidence against the confirming passkey's stored public key, the rp id and the
 origin, and checks that the evidence's challenge is the row's own (an act's is
 recomputed from the act id, its stored args digest and its stored nonce),
@@ -2288,18 +2299,30 @@ not verified.
 - Exit 0: everything checked verifies. Exit 2: at least one finding; each is
   printed and recorded ONCE as a `platform.confirmation_unverified` security
   event attributed to the person (a rerun reports it again and records
-  nothing more). Exit 1: no relying party configured, or a failure.
+  nothing more). Exit 1: no relying party, or no attestation policy (neither
+  the allowlist variables nor the software flag), configured; or a failure.
+  A timer or runbook step that passed only the rp id and origin exits 1 from
+  migration 160's release on: give it the API's attestation variables too.
 - A wrong `EPIGRAPH_WEBAUTHN_ORIGIN` or `_RP_ID` makes every genuine
-  confirmation fail (`assertion_does_not_verify`) and records a row for each:
-  check the two values against the API's before the first run.
+  confirmation fail (`assertion_does_not_verify`) and records a row for each;
+  a wrong or changed `EPIGRAPH_WEBAUTHN_AAGUIDS` / `_ATTESTATION_CA_FILE`
+  makes every genuine passkey fail (`registration_does_not_verify`). Check
+  the values against the API's before the first run.
+- A passkey enrolled BEFORE migration 160 (or by an API build older than it)
+  has no stored registration and is reported `registration_not_stored`. That
+  finding is about what can be re-checked, not evidence of a forgery: the
+  remedy is to revoke the passkey (`epigraph-operator revoke-passkey`) and
+  enroll it again, not to rotate a DSN.
 - Before migration 130 the acts are skipped; the elevations are verified.
 
 When to run it: before the FIRST real elevation (with the check that only the
 request units hold the application DSN, a precondition of opening the
 recorder gate), after every admin session, and on a timer. A finding means a
-confirmation nobody's passkey made: end the person's elevations
-(`end-elevation --person`), treat the application or maintenance DSN as
-compromised, and rotate it.
+confirmation nobody's passkey made (or a passkey the API's attestation
+policy would have refused): end the person's elevations (`end-elevation
+--person`), treat the application or maintenance DSN as compromised, and
+rotate it. The exception is `registration_not_stored` on a passkey older than
+migration 160 (above).
 
 Deploy: `epigraph-operator` from the same commit; nothing else. Rollback: the
 previous binary (the recorded findings stay).
@@ -2328,7 +2351,7 @@ later therefore opens the gate at its migrate step. So the preconditions below
 come BEFORE the deploy that carries 132, not before "the first elevation":
 
 1. `epigraph-operator verify-confirmations` (with the API's relying-party
-   values) exits 0 on the target database.
+   values and attestation policy) exits 0 on the target database.
 2. Only the request units hold the application DSN (checked on the host; the
    offline verifier detects a confirmation forged through it, it cannot stop
    one).

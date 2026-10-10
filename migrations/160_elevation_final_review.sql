@@ -1,11 +1,14 @@
 -- Migration 160: the elevation stack's final-review corrections (124-132 are
--- applied and immutable, so each correction re-bodies a function here; the
--- slot is the first after the drain block 140-159).
+-- applied and immutable, so each correction lands here; the slot is the
+-- first after the drain block 140-159).
 --
--- Each section is one decision. No section creates a table or changes a
--- policy or a grant: `CREATE OR REPLACE` keeps every re-bodied function's
--- owner (the maintenance role) and its ACL, which 124's, 125's and 130's
--- registers pin.
+-- Each section is one decision. Sections 1-3 only re-body functions:
+-- `CREATE OR REPLACE` keeps each one's owner (the maintenance role) and its
+-- ACL, which 124's, 125's and 130's registers pin. Section 4 ADDS objects:
+-- a nullable column and its CHECK on `person_authenticators`, a trigger and
+-- its function, and an eight-argument overload of 124's completion definer,
+-- owned by the maintenance role with EXECUTE granted to the application and
+-- maintenance roles. No section creates a table or changes a policy.
 --
 -- ===================================================================
 -- 1. A MAINTENANCE ENROLLMENT ADMITS ONLY A FIRST PASSKEY, WHEN IT COMPLETES
@@ -65,6 +68,34 @@
 -- without the role the gate stays closed. Who may still replace the gate
 -- itself (a maintenance member holding CREATE, a superuser) is unchanged:
 -- `epigraph-tenancy-backfill verify` and the deploy preconditions cover it.
+--
+-- ===================================================================
+-- 4. A PASSKEY KEEPS THE REGISTRATION THAT ADMITTED IT, FOR THE VERIFIER
+--
+-- 124 records what the API says its WebAuthn library verified (the
+-- credential, the attestation's format and model, user verification) and
+-- cannot check any of it. Its header left detecting a forged completion to
+-- the offline verifier, but the verifier re-checked only ASSERTIONS: a
+-- holder of the application DSN who learned a live enrollment id could
+-- complete it with a key of its own (the attestation allowlist lives only in
+-- the API's code), and every ticket and act that key later confirmed
+-- re-verified clean.
+--
+-- `person_authenticators.registration` keeps the authenticator's raw
+-- registration response (the `PublicKeyCredential` JSON, attestation object
+-- and client data included), and the enrollment keeps the ceremony state it
+-- was started with, so `epigraph-operator verify-confirmations` can run the
+-- registration again under the API's own attestation policy and compare the
+-- result with the stored row. A completion with no stored registration (the
+-- seven-argument form, which an older API binary still calls) is reported,
+-- not trusted. The new eight-argument
+-- `epigraph_complete_passkey_enrollment` is the API's; it refuses a missing
+-- registration. The column never changes after the insert.
+--
+-- WHAT IT STILL CANNOT SEE: a forger holding an authenticator of an
+-- allowlisted model produces a registration that verifies (over a challenge
+-- it chose, since the application DSN also writes the ceremony state); and
+-- under the software policy (tests and development) any key verifies.
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/160-undo.sql` restores each re-bodied function to the
@@ -226,3 +257,86 @@ SET search_path = public, pg_temp AS $$
                            ELSE false
                       END)
 $$;
+
+-- ===================================================================
+-- 4. The stored registration
+-- ===================================================================
+ALTER TABLE public.person_authenticators ADD COLUMN IF NOT EXISTS registration jsonb;
+ALTER TABLE public.person_authenticators
+    ADD CONSTRAINT person_authenticators_registration_shape
+    CHECK (registration IS NULL OR jsonb_typeof(registration) = 'object');
+
+-- BEFORE UPDATE: the stored registration never changes (124's update guard
+-- predates the column and does not list it).
+CREATE OR REPLACE FUNCTION public.epigraph_person_authenticators_registration_fixed()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF NEW.registration IS DISTINCT FROM OLD.registration THEN
+        RAISE EXCEPTION 'ELV03: passkey %: the registration it was admitted with never changes; '
+                        'nothing was changed', OLD.id
+            USING ERRCODE = 'ELV03';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_person_authenticators_registration_fixed()
+    FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS person_authenticators_registration_fixed
+    ON public.person_authenticators;
+CREATE TRIGGER person_authenticators_registration_fixed
+    BEFORE UPDATE ON public.person_authenticators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_person_authenticators_registration_fixed();
+
+-- 124's completion plus the registration response (required). App-callable,
+-- as 124's form is.
+CREATE OR REPLACE FUNCTION public.epigraph_complete_passkey_enrollment(
+    p_enrollment uuid, p_credential_id bytea, p_passkey jsonb, p_aaguid uuid,
+    p_attestation_format text, p_user_verified boolean, p_backup_eligible boolean,
+    p_registration jsonb)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_person uuid;
+    v_label  text;
+    v_id     uuid;
+BEGIN
+    IF p_registration IS NULL OR jsonb_typeof(p_registration) <> 'object' THEN
+        RAISE EXCEPTION 'epigraph_complete_passkey_enrollment: the registration response the '
+                        'passkey was verified from is required'
+            USING ERRCODE = '22004';
+    END IF;
+    SELECT en.person_agent_id, en.label INTO v_person, v_label
+      FROM public.passkey_enrollments en WHERE en.id = p_enrollment;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'ELV04: no enrollment %', p_enrollment
+            USING ERRCODE = 'ELV04';
+    END IF;
+    INSERT INTO public.person_authenticators (person_agent_id, credential_id, passkey, aaguid,
+                                              attestation_format, user_verified,
+                                              backup_eligible, label, enrollment_id,
+                                              registration)
+    VALUES (v_person, p_credential_id, p_passkey, p_aaguid, p_attestation_format,
+            p_user_verified, p_backup_eligible, v_label, p_enrollment, p_registration)
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(
+    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb) FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_person_authenticators_registration_fixed() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, '
+                'uuid, text, boolean, boolean, jsonb) OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(uuid, '
+                'bytea, jsonb, uuid, text, boolean, boolean, jsonb) TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(uuid, '
+                'bytea, jsonb, uuid, text, boolean, boolean, jsonb) TO epigraph_app';
+    END IF;
+END $$;
