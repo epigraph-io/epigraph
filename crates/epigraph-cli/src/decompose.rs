@@ -300,6 +300,58 @@ pub fn check_publicly_decomposable(visibility: &str) -> Result<(), Ineligible> {
 }
 
 // =============================================================================
+// ATOM CREATE BODY: what `decompose_claims` POSTs to `/api/v1/claims`
+// =============================================================================
+
+/// The parent an atom is being written for, as the submit closure of
+/// `run_decomposition_batches` / `persist_planned` receives it.
+///
+/// A struct rather than two adjacent `Uuid` arguments: the closure needs
+/// both the parent's id (the atom POST names it in `derived_from`, which
+/// records the atom's derivation evidence) and its author (atoms inherit it
+/// as `agent_id`), and a swapped pair of bare `Uuid`s would compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomParent {
+    /// The compound claim being decomposed.
+    pub claim_id: uuid::Uuid,
+    /// Its author, which the atom inherits.
+    pub agent_id: uuid::Uuid,
+}
+
+/// The `derived_from.method` every `decompose_claims` atom names.
+pub const DECOMPOSE_DERIVATION_METHOD: &str = "decompose_claims";
+
+/// The JSON body `decompose_claims` POSTs to `/api/v1/claims` for one atom.
+///
+/// A pure function, so the wire shape is testable: the API's
+/// `CreateClaimRequest` has no `deny_unknown_fields`, so a misspelt key here
+/// (or a swapped parent id / author) is silently dropped with a 200, and the
+/// atom is born with `evidence_ids=[]` again (backlog 3590a2d8).
+///
+/// * `agent_id` is the PARENT's author — atoms inherit it.
+/// * `if_not_exists=true`: an atom whose text already exists for that author
+///   dedups onto the existing claim, and edges are re-wired idempotently.
+/// * methodology/evidence_type belong in `properties` (JSONB); top-level they
+///   were unknown fields and silently dropped.
+/// * `derived_from` names the parent: the API records one `document`
+///   evidence row carrying the parent's text, in the atom's own transaction.
+///   Provenance, not belief: no mass function, truth stays 0.5 (U041).
+pub fn atom_create_body(atom_text: &str, generality: i64, parent: AtomParent) -> Value {
+    serde_json::json!({
+        "content": atom_text,
+        "agent_id": parent.agent_id,
+        "initial_truth": 0.5,
+        "if_not_exists": true,
+        "properties": {
+            "methodology": "inductive_generalization",
+            "evidence_type": "logical"
+        },
+        "labels": ["atom", format!("generality:{generality}")],
+        "derived_from": {"claim_id": parent.claim_id, "method": DECOMPOSE_DERIVATION_METHOD},
+    })
+}
+
+// =============================================================================
 // PLAN FILE: what `--plan` writes and `--apply-plan` persists
 // =============================================================================
 
@@ -423,13 +475,12 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, AtomParent, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps,
-    Priority, Selection,
+    verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
 mod db_writes {
-    use super::Decomposition;
+    use super::{AtomParent, Decomposition};
     use epigraph_db::{ClaimRepository, EdgeRepository};
     use sqlx::PgPool;
     use std::sync::Arc;
@@ -545,21 +596,6 @@ mod db_writes {
             edges_created: edges,
             skipped_singletons: 0,
         })
-    }
-
-    /// The parent an atom is being written for, as the submit closure of
-    /// [`run_decomposition_batches`] / [`persist_planned`] receives it.
-    ///
-    /// A struct rather than two adjacent `Uuid` arguments: the closure needs
-    /// both the parent's id (the atom POST names it in `derived_from`, which
-    /// records the atom's derivation evidence) and its author (atoms inherit it
-    /// as `agent_id`), and a swapped pair of bare `Uuid`s would compile.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct AtomParent {
-        /// The compound claim being decomposed.
-        pub claim_id: Uuid,
-        /// Its author, which the atom inherits.
-        pub agent_id: Uuid,
     }
 
     /// One undecomposed compound claim, as [`run_decomposition_batches`] needs

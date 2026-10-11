@@ -96,7 +96,7 @@
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
+    atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
     run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
     BatchClaim, EligibilityFilters, PlanGaps, Priority,
 };
@@ -577,10 +577,10 @@ async fn resolve_token(
 /// on write, and one derivation evidence row naming `parent` (no DS mass; see
 /// the module doc's evidence policy).
 ///
-/// methodology/evidence_type belong in `properties` (JSONB); top-level they
-/// were unknown fields and silently dropped. `if_not_exists=true`: when a
-/// prior run already decomposed the same parent, identical atom text produces
-/// the same content_hash. Without this flag the API returns 409; with it,
+/// The body is [`atom_create_body`] (pure, unit-tested in
+/// `tests/decompose_atom_create_body.rs`). `if_not_exists=true`: when a prior
+/// run already decomposed the same parent, identical atom text produces the
+/// same content_hash. Without this flag the API returns 409; with it,
 /// create_or_get returns the existing claim ID so persist_decomposition can
 /// re-wire edges idempotently.
 async fn submit_atom(
@@ -599,21 +599,7 @@ async fn submit_atom(
     let resp = match http
         .post(&url)
         .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "content": atom_text,
-            "agent_id": parent.agent_id,
-            "initial_truth": 0.5,
-            "if_not_exists": true,
-            "properties": {
-                "methodology": "inductive_generalization",
-                "evidence_type": "logical"
-            },
-            "labels": ["atom", format!("generality:{generality}")],
-            // Derivation provenance (U041): the API records one `document`
-            // evidence row carrying the parent's text, in the atom's own
-            // transaction. No belief mass — see the module doc.
-            "derived_from": {"claim_id": parent.claim_id, "method": "decompose_claims"},
-        }))
+        .json(&atom_create_body(&atom_text, generality, parent))
         .send()
         .await
     {
