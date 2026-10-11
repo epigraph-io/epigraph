@@ -27,8 +27,9 @@
 //! both of its attempts: the first, and the retry after a 401 and a refresh.
 //! The refresh itself is not the probe's: its one introspection call
 //! (display only) queues like a page's call, so a probe that has to refresh
-//! while the permits are held can wait up to one upstream deadline for it,
-//! and then still answers `Unknown` without sending the retry.
+//! while the permits are held can wait up to one upstream deadline for it.
+//! The retry is then sent only if a permit is free at that moment;
+//! otherwise the answer is `Unknown` and the retry is not sent.
 //!
 //! The two kinds of busy differ in reach. The viewer's own slots are that
 //! viewer's alone. The global permits are shared by every viewer, and all
