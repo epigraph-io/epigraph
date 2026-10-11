@@ -1700,6 +1700,102 @@ async fn a_restarted_ceremony_records_no_passkey_against_its_old_state(pool: PgP
     assert_eq!(report["passkeys_checked"], serde_json::json!(1), "{report}");
 }
 
+/// A GENUINE REGISTRATION STORED BESIDE ANOTHER CREDENTIAL IS FLAGGED (final
+/// review F2-TST-01: the verifier's check 10). A forger holding the
+/// application DSN replays a genuine, ALLOWLISTED registration R and the
+/// ceremony state S it was made over (the state carries no person, so any
+/// enrollment's will do) onto a live enrollment, and completes it with the
+/// credential of a software key of its own. R re-verifies under the API's
+/// allowlist, so only the comparison of the re-run with the STORED row (the
+/// credential every later assertion is checked against) catches it:
+/// `registration_mismatch`, exit 2, recorded once.
+///
+/// Verified to fail with that comparison skipped (`if stored != rerun &&
+/// false`): exit 0, nothing flagged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_genuine_registration_stored_beside_another_credential_is_flagged(pool: PgPool) {
+    use soft_authenticator::{ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
+    let att = TestAttestation::new("Allowlisted");
+    let config = |policy| epigraph_passkey::PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy,
+    };
+    let allowlist_rp =
+        epigraph_passkey::Passkeys::new(config(epigraph_passkey::AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [ATTESTED_MODEL].into_iter().collect(),
+        }))
+        .expect("the API's relying party");
+    let (v, _) = fixture::seed_human_operator(&pool, "victim enrollment").await;
+    let enrollment = open_enrollment(&pool, v).await;
+
+    // The genuine registration R over S (from any ceremony under the API's
+    // policy).
+    let (options, s) = allowlist_rp
+        .start_registration(v, "genuine", "Genuine")
+        .expect("start");
+    let mut genuine = SoftAuthenticator::new(ATTESTED_MODEL).hardware();
+    let r = att.rewrap(
+        &genuine
+            .register(ORIGIN, options, ClientUv::AsRequested)
+            .await,
+    );
+    allowlist_rp
+        .finish_registration(&r, &s)
+        .expect("CALIBRATION: R is genuine under the allowlist");
+
+    // The forger's own software key.
+    let soft = epigraph_passkey::Passkeys::new(config(
+        epigraph_passkey::AttestationPolicy::SoftwareAllowed,
+    ))
+    .expect("the forger's relying party");
+    let (f_options, f_state) = soft
+        .start_registration(v, "forged", "Forged")
+        .expect("start");
+    let f_response = SoftAuthenticator::new(ATTESTED_MODEL)
+        .register(ORIGIN, f_options, ClientUv::AsRequested)
+        .await;
+    let forged_key = soft
+        .finish_registration(&f_response, &f_state)
+        .expect("the forger's key");
+
+    app_store_state(&pool, enrollment, s.to_json()).await;
+    let forged = app_complete(&pool, enrollment, &forged_key, &r, &s.to_json())
+        .await
+        .expect("CALIBRATION: the database admits the replayed completion");
+
+    let ca = std::env::temp_dir().join(format!("verify-ca-{}.pem", Uuid::new_v4()));
+    std::fs::write(&ca, att.root_pem()).expect("the CA file");
+    let model = ATTESTED_MODEL.to_string();
+    let policy = [
+        ("EPIGRAPH_WEBAUTHN_AAGUIDS", model.as_str()),
+        (
+            "EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE",
+            ca.to_str().unwrap(),
+        ),
+    ];
+    let run = run_verify_with(&pool, &["--json"], Some(ORIGIN), &policy).await;
+    let again = run_verify_with(&pool, &["--json"], Some(ORIGIN), &policy).await;
+    let _ = std::fs::remove_file(&ca);
+    assert_eq!(run.code, 2, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(report["passkeys_checked"], serde_json::json!(1), "{report}");
+    assert_eq!(
+        findings_of(&report),
+        vec![(
+            "passkey".to_string(),
+            forged,
+            "registration_mismatch".to_string()
+        )],
+        "{report}"
+    );
+    assert_eq!(again.code, 2, "{}", again.show());
+    let rows = recorded(&pool).await;
+    assert_eq!(rows.len(), 1, "recorded once across two runs: {rows:?}");
+    assert_eq!(rows[0].3, "registration_mismatch");
+}
+
 /// THE APPLICATION-DSN FORGERY IS FLAGGED (elevation plan EL-13): a ticket
 /// confirmed through the definer with evidence that does not verify is
 /// reported `assertion_does_not_verify` (exit 2), the genuine elevation
