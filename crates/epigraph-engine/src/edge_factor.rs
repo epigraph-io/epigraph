@@ -897,7 +897,13 @@ async fn compute_combined_belief(
         warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
     }
 
-    let combined = if all_rows.len() == 1 {
+    // `fold_conflict` is the conflict the fold SAW. Since U025 every
+    // `combine_multiple` step is Dempster, which normalises conflict out of
+    // the combined mass (`combined.mass_of_conflict()` is 0), so the
+    // multi-BBA arm takes it from the per-step reports via
+    // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
+    // A single BBA is not folded: its own empty-set mass is the conflict.
+    let (combined, fold_conflict) = if all_rows.len() == 1 {
         let r = &all_rows[0];
         let mf = parse_stored_bba(frame, &r.masses)?;
         let reliability = effective_source_strength(
@@ -906,7 +912,9 @@ async fn compute_combined_belief(
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
-        combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
+        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        let k = d.mass_of_conflict();
+        (d, k)
     } else {
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
@@ -921,9 +929,10 @@ async fn compute_combined_belief(
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(d);
         }
-        let (c, _) = combination::combine_multiple(&mass_fns, 0.9)
+        let (c, reports) = combination::combine_multiple(&mass_fns, 0.9)
             .map_err(|e| format!("combine_multiple: {e}"))?;
-        c
+        let k = combination::fold_conflict(&c, &reports);
+        (c, k)
     };
 
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
@@ -951,7 +960,7 @@ async fn compute_combined_belief(
     let bel = measures::belief(&combined, &target);
     let pl = measures::plausibility(&combined, &target);
     let betp = measures::pignistic_probability(&combined, hypothesis_index);
-    let conflict = combined.mass_of_conflict();
+    let conflict = fold_conflict;
     let missing = combined.mass_of_missing();
 
     // CDST classification — a verdict on the COMBINED belief via the

@@ -309,7 +309,7 @@ pub async fn assess_claim(
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
     for_combination.extend(group_results);
 
-    // Standard adaptive combination
+    // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
     let (combined, reports) = if for_combination.len() <= 1 {
         (
@@ -335,7 +335,8 @@ pub async fn assess_claim(
 
     let (final_bel, final_pl, final_betp, m_missing) =
         super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
+    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
+    let m_empty = combination::fold_conflict(&combined, &reports);
 
     // Update claim's belief, plausibility, and pignistic probability
     epigraph_db::MassFunctionRepository::update_claim_belief(

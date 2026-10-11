@@ -1081,7 +1081,7 @@ pub struct SubmitDsEvidenceParams {
                        label: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, \
                        Inagaki. It is validated (an unknown name is refused), stored on the BBA and \
                        echoed as method_used, but the claim's belief is always recomputed by the \
-                       shared adaptive combine that recompute_beliefs uses, whatever this says. Any \
+                       shared Dempster fold that recompute_beliefs uses, whatever this says. Any \
                        value other than Dempster adds an entry to the response's warnings."
     )]
     pub combination_method: Option<String>,
