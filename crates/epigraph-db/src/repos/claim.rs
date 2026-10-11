@@ -892,6 +892,11 @@ impl ClaimRepository {
         // falls back to its own personal group, which its operator does not
         // write: refused here by name (OPL02, 122 section 1b) rather than by
         // the trigger after the caller built the whole write.
+        //
+        // For an allowlisted author (migration 149) this is quiet: the door
+        // reads links only. Its as-itself write lands in its own personal
+        // group, and the claims trigger's writer scope is the refusal (OPL02).
+        // The allowlist does not re-home the agent's own authorship.
         crate::repos::AgentRepository::require_operator_scope(conn, agent_id, group).await?;
         Ok(TenancyDecl::public(group))
     }

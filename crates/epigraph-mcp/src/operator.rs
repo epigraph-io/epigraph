@@ -45,8 +45,10 @@
 //! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
 //! "caller is the operator of the claim's author" for every linked agent. And
 //! both refuse a signer that is a registered HUMAN operator (migration 122),
-//! operating anyone or not: principal-less callers and admin-borrowed writes
-//! are written as the signer, so each would author claims as that person.
+//! operating anyone or not, or the agent of an OAuth client on the
+//! author-binding allowlist (migration 149): principal-less callers and
+//! admin-borrowed writes are written as the signer, so each would author
+//! claims as that person, or as a bound agent of that person.
 //!
 //! ## Why the gate stays strict after batch HTTP-id
 //!
@@ -79,7 +81,10 @@
 
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
-use epigraph_db::{AgentRepository, AuthorOperator, OperatorLinkOutcome};
+use epigraph_db::{
+    AgentRepository, AuthorOperator, OperatorLinkOutcome, CLIENT_ALLOWLIST_BINDING,
+    HUMAN_OPERATOR_BINDING,
+};
 use uuid::Uuid;
 
 /// Refuse `--operator-id` / `EPIGRAPH_OPERATOR_ID` on an HTTP listener, and on a
@@ -129,10 +134,12 @@ pub fn check_operator_transport(
 /// Refuse to serve HTTP when this process's signer agent already has an
 /// operator link of either kind (see the module doc for why the author record,
 /// retired links included, is the predicate), is itself some agent's
-/// OPERATOR (migration 107 section 9), or is a registered HUMAN operator
-/// (migration 122): principal-less callers and admin-borrowed writes are
-/// written as the signer, so a human signer would put every such caller's
-/// words in that person's mouth, before it operates any agent.
+/// OPERATOR (migration 107 section 9), is a registered HUMAN operator
+/// (migration 122), or is the agent of an allowlisted OAuth client (migration
+/// 149): principal-less callers and admin-borrowed writes are written as the
+/// signer, so a human signer would put every such caller's words in that
+/// person's mouth, before it operates any agent, and an allowlisted signer
+/// would write them as a bound agent of that person.
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -190,10 +197,11 @@ pub async fn refuse_operated_http_signer(
                  human operator (is migration 122 applied?): {e}"
             )
         })?;
-    if binding.as_deref() == Some("human_operator") {
-        return Err(human_http_signer_reason(agent_id));
+    match binding.as_deref() {
+        Some(HUMAN_OPERATOR_BINDING) => Err(human_http_signer_reason(agent_id)),
+        Some(CLIENT_ALLOWLIST_BINDING) => Err(allowlisted_http_signer_reason(agent_id)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// The refusal text for a signer that is a registered HUMAN OPERATOR
@@ -204,6 +212,18 @@ fn human_http_signer_reason(agent_id: Uuid) -> String {
          principal-less caller of this listener, and every admin-borrowed write, is written as \
          the signer, so each would author claims as that human. Run the listener under a \
          different --agent-key; a listener's signer is never a person."
+    )
+}
+
+/// The refusal text for a signer that is the agent of an OAuth client on the
+/// author-binding allowlist (migration 149), and so bound to a human operator.
+fn allowlisted_http_signer_reason(agent_id: Uuid) -> String {
+    format!(
+        "this HTTP listener's signer agent {agent_id} is the agent of an allowlisted OAuth \
+         client, bound to a registered human operator (migration 149). Every principal-less \
+         caller of this listener, and every admin-borrowed write, is written as the signer, so \
+         each would write as a bound agent of that human. Run the listener under a different \
+         --agent-key."
     )
 }
 
@@ -307,14 +327,20 @@ async fn refuse_operator_http_signer(
 }
 
 /// The human half of [`refuse_linked_http_signer`]: refuse while this server's
-/// signer is a registered human operator (migration 122). Fails closed.
+/// signer is a registered human operator (migration 122), or the agent of an
+/// allowlisted OAuth client (migration 149). Fails closed.
 async fn refuse_human_http_signer(
     server: &EpiGraphMcpFull,
     agent_id: Uuid,
 ) -> Result<(), McpError> {
     match AgentRepository::author_binding_pool(&server.pool, agent_id).await {
-        Ok(b) if b.as_deref() == Some("human_operator") => {
+        Ok(b) if b.as_deref() == Some(HUMAN_OPERATOR_BINDING) => {
             let reason = human_http_signer_reason(agent_id);
+            tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
+            Err(internal_error(format!("refused: {reason}")))
+        }
+        Ok(b) if b.as_deref() == Some(CLIENT_ALLOWLIST_BINDING) => {
+            let reason = allowlisted_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
             Err(internal_error(format!("refused: {reason}")))
         }
@@ -341,12 +367,18 @@ async fn refuse_human_http_signer(
 /// its refusals are that definer's: `RVK01` (the OPERATOR's own membership of
 /// its own group is only revoked) and `RVK02` (the group under the operator's
 /// personal did_key is not the operator's own). Both are deliberate refusals,
-/// not faults, and each gets its own text; everything else keeps the
-/// EXECUTE-grant hint, because on a stdio host the usual cause is an
-/// `epigraph_app` DSN (`42501`).
+/// not faults, and each gets its own text. So does migration 149's link guard
+/// (the signer is the agent of an allowlisted HTTP OAuth client, which a link
+/// would make stdio-only). Everything else keeps the EXECUTE-grant hint,
+/// because on a stdio host the usual cause is an `epigraph_app` DSN (`42501`).
 pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) -> String {
     link_refusal_text_for(agent, operator, None, e)
 }
+
+/// The stable fragment of migration 149's link-guard message
+/// (`epigraph_operator_links_refuse_allowlisted_agent`); the guard's SQLSTATE
+/// (55000) is shared with other link refusals, so the text decides.
+const ALLOWLIST_LINK_REFUSAL: &str = "on the author-binding allowlist";
 
 /// [`link_refusal_text`] for a process that knows its LLM identity
 /// (`--agent-model` + prompt hash): the printed fix then names that identity
@@ -379,6 +411,14 @@ pub fn link_refusal_text_for(
              operator's personal did_key is not the operator's own (migration 105, RVK02: a \
              squatted key). An operator must inspect and remove the squatting group. \
              Database: {message}"
+        ),
+        allowlisted if allowlisted.to_string().contains(ALLOWLIST_LINK_REFUSAL) => format!(
+            "refused to record agent {agent} as operated by {operator}: this signer agent is \
+             also the agent of an OAuth client on the author-binding allowlist (migration 149), \
+             and a link would make it stdio-only, ending that client's HTTP access. Revoke the \
+             allowance first (`epigraph-operator revoke-author-binding-client --client <id> \
+             --reason <text> --apply`), or run this stdio process under a different key. \
+             Database: {allowlisted}"
         ),
         other => format!(
             "could not record agent {agent} as operated by {operator} \
@@ -658,6 +698,28 @@ mod tests {
             llm.contains("--agent-model model-m --agent-system-prompt-hash abcd")
                 && !llm.contains(&format!("--agent {a}")),
             "{llm}"
+        );
+    }
+
+    /// Migration 149's link guard refuses to link the agent of an allowlisted
+    /// OAuth client (a link would make it stdio-only). A stdio process on such
+    /// a signer is told THAT, and the remedy, not the EXECUTE-grant hint.
+    #[test]
+    fn an_allowlisted_signers_link_refusal_names_the_allowlist_not_the_grant() {
+        let (a, o) = (Uuid::new_v4(), Uuid::new_v4());
+        let text = super::link_refusal_text(
+            a,
+            o,
+            &epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "agent {a} is the agent of OAuth client c, which is on the author-binding \
+                     allowlist; a linked agent is stdio-only"
+                )),
+            },
+        );
+        assert!(
+            text.contains("revoke-author-binding-client") && !text.contains("EXECUTE-able"),
+            "{text}"
         );
     }
 }

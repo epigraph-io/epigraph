@@ -9,8 +9,17 @@ use sqlx::PgPool;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-/// The head before 160.
-const BEFORE_160: i64 = 144;
+/// The head before 160: the highest migration below it, read from the
+/// migrator so a later-merged predecessor (148, 149) moves it.
+fn before_160() -> i64 {
+    MIGRATOR
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| *v < 160)
+        .max()
+        .expect("a migration precedes 160")
+}
 
 fn up_to(max: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -74,15 +83,16 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
-/// `docs/runbooks/160-undo.sql`, applied to a database that went 144 -> 160,
-/// returns its catalog (every function body, owner and ACL included) to the
-/// same database's at 144. A second run changes nothing.
+/// `docs/runbooks/160-undo.sql`, applied to a database that went from the
+/// head before 160 to 160, returns its catalog (every function body, owner and
+/// ACL included) to the same database's before 160. A second run changes
+/// nothing.
 ///
 /// Verified to fail: the undo's restoration of 124's completion guard
 /// removed -> 160's body (md5) is left behind.
 #[sqlx::test(migrations = false)]
-async fn the_160_rollback_returns_the_catalog_to_144(pool: PgPool) {
-    migrate(&pool, &up_to(BEFORE_160)).await;
+async fn the_160_rollback_returns_the_catalog_to_the_head_before_it(pool: PgPool) {
+    migrate(&pool, &up_to(before_160())).await;
     let before = catalog(&pool).await;
     migrate(&pool, &up_to(160)).await;
     assert_ne!(
@@ -101,7 +111,7 @@ async fn the_160_rollback_returns_the_catalog_to_144(pool: PgPool) {
     let lost: Vec<&String> = before.difference(&after).collect();
     assert!(
         left.is_empty() && lost.is_empty(),
-        "the catalog is not 144's after the undo; left behind: {left:?}; lost: {lost:?}"
+        "the catalog is not the pre-160 head's after the undo; left behind: {left:?}; lost: {lost:?}"
     );
 }
 

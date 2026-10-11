@@ -1378,7 +1378,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
-         NULL) for the NAMED agent; 122 section 5 records the one bit it adds (human-ness).",
+         'client_allowlist' (migration 149) / NULL) for the NAMED agent; 122 section 5 records \
+         the one bit it adds (human-ness), and 149 one more (allowlisted-ness).",
     ),
     (
         "agent.rs",
@@ -1466,6 +1467,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          row security and no policy, as `find_root_by_canonical` records, so there is nothing \
          for a viewer to filter; the ingest entry points call it on the plan walk's own \
          transaction to decide which existing rows need the caller's authority.",
+    ),
+    (
+        "system_agent.rs",
+        "lookup",
+        "READ of migration 148's `system_agents` row for one role, with \
+         `epigraph_operator_binding_armed()`: an AUTHORITY record mapping a system role to an \
+         agent, not a corpus row. It has no `visibility` / `owner_group_id` and no row security \
+         by design, and the workflow-ingest resolvers read it on the system-agent-stamped \
+         connection, so there is nothing for a viewer to filter.",
+    ),
+    (
+        "system_agent.rs",
+        "registered_agent_ids",
+        "READ of every `system_agents.agent_id` (migration 148; one row per system role): the \
+         author-name loops' check that a document never adopts a registered system agent as its \
+         author. An authority record with no tenancy columns and no row security; nothing for \
+         a viewer to filter.",
     ),
     (
         "claim.rs",

@@ -1526,8 +1526,15 @@ arming is one-way and every step before it must leave no live writer unbound.
    (`docs/tenancy.md`, "Existing rows").
 8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
    fleet host change (pass the operator id; run `link` at every spawn, on a
-   maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
-   (census), then `--apply`. Before `--apply`, confirm no request unit or
+   maintenance DSN). **Register the workflow-ingest system agent BEFORE
+   arming** (migration 148): `epigraph-operator register-system-agent --role
+   workflow-ingest --agent <id> --reason <text>` (dry run: check the `AGENT`
+   line reads `key=LEGACY`), then `--apply`; do it BEFORE rotating that agent's
+   key, and only once every API and MCP binary (including any container image
+   that embeds the stdio MCP server) is at or above 148. Once armed, an
+   unregistered system agent refuses every workflow write; the census prints
+   `SYSTEM-AGENT-UNREGISTERED` while one is missing. Then **arm**:
+   `epigraph-operator arm-operator-binding` (census), then `--apply`. Before `--apply`, confirm no request unit or
    stdio MCP config connects on a privileged DSN: once armed, such a unit
    refuses to start (operator ruling OQ-7 (b); "The custodian role", step 4).
    A unit ALREADY RUNNING on a privileged DSN when you arm does not wait for

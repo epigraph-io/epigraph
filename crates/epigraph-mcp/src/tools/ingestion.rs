@@ -869,18 +869,49 @@ pub async fn do_ingest_document(
     } else {
         &extraction.source.authors
     };
+    // Migration 148: a document never names a system identity as its author.
+    // The legacy public-constant key is refused before the lookup (so it is
+    // never adopted, and never re-minted after a rotation), and an author that
+    // resolves to a REGISTERED system agent under any other key is skipped
+    // after it. One registry read per document, and none without authors.
+    let registered_system_agents = if authors.is_empty() {
+        Vec::new()
+    } else {
+        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
+            .await
+            .map_err(internal_error)?
+    };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
         }
         let (_did, pub_key_bytes) =
             epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        let agent_uuid = if let Some(existing) =
+        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
+            tracing::warn!(
+                target: "ingest.authors",
+                author_index = idx,
+                "skipping an author whose name derives a system agent's legacy key: a document \
+                 cannot name a system identity as its author (migration 148)"
+            );
+            continue;
+        }
+        let agent_uuid: Uuid = if let Some(existing) =
             AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
                 .await
                 .map_err(internal_error)?
         {
-            existing.id.into()
+            let id: Uuid = existing.id.into();
+            if registered_system_agents.contains(&id) {
+                tracing::warn!(
+                    target: "ingest.authors",
+                    author_index = idx,
+                    "skipping an author that resolves to a registered system agent: a document \
+                     cannot name a system identity as its author (migration 148)"
+                );
+                continue;
+            }
+            id
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
             let created = AgentRepository::create_conn(&mut tx, &author_agent)
@@ -1707,18 +1738,49 @@ pub async fn do_ingest_document_spine(
     } else {
         &extraction.source.authors
     };
+    // Migration 148: a document never names a system identity as its author.
+    // The legacy public-constant key is refused before the lookup (so it is
+    // never adopted, and never re-minted after a rotation), and an author that
+    // resolves to a REGISTERED system agent under any other key is skipped
+    // after it. One registry read per document, and none without authors.
+    let registered_system_agents = if authors.is_empty() {
+        Vec::new()
+    } else {
+        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
+            .await
+            .map_err(internal_error)?
+    };
     for (idx, author) in authors.iter().enumerate() {
         if author.name.is_empty() {
             continue;
         }
         let (_did, pub_key_bytes) =
             epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        let agent_uuid = if let Some(existing) =
+        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
+            tracing::warn!(
+                target: "ingest.authors",
+                author_index = idx,
+                "skipping an author whose name derives a system agent's legacy key: a document \
+                 cannot name a system identity as its author (migration 148)"
+            );
+            continue;
+        }
+        let agent_uuid: Uuid = if let Some(existing) =
             AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
                 .await
                 .map_err(internal_error)?
         {
-            existing.id.into()
+            let id: Uuid = existing.id.into();
+            if registered_system_agents.contains(&id) {
+                tracing::warn!(
+                    target: "ingest.authors",
+                    author_index = idx,
+                    "skipping an author that resolves to a registered system agent: a document \
+                     cannot name a system identity as its author (migration 148)"
+                );
+                continue;
+            }
+            id
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
             AgentRepository::create_conn(&mut tx, &author_agent)
