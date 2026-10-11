@@ -2533,6 +2533,69 @@ async fn an_elevated_read_is_attributed_by_the_ids_its_request_names(pool: PgPoo
     assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
 }
 
+/// A second maintenance enrollment of a person who has since registered a
+/// passkey is refused at its finish as a 409 the person can act on, not a
+/// 500 (final review F2-COR-03): migration 160 tests a maintenance
+/// enrollment's "first passkey only" rule when it COMPLETES (`ELV10`), so
+/// two enrollments opened while the person held none both reach the finish.
+/// The first registers; the second is refused `passkey_already_held`,
+/// pointing at the `passkey.register` act, and nothing is recorded.
+///
+/// Verified to fail with the ELV10 arm removed from `enroll_finish` (the
+/// code before this test): 500 `internal_error`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_maintenance_enrollment_is_refused_at_its_finish_as_a_conflict(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let (person, _) = fixture::seed_human_operator(&pool, "two enrollments").await;
+    let open = || {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+                let id: Uuid = sqlx::query_scalar(
+                    "SELECT public.epigraph_create_passkey_enrollment($1, 'f2 test', 'key')",
+                )
+                .bind(person)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("open the enrollment");
+                (conn, id)
+            })
+            .await
+        }
+    };
+    let (first, second) = (open().await, open().await);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    async fn finish(s: &Server, auth: &mut SoftAuthenticator, id: Uuid) -> (StatusCode, Value) {
+        let base = format!("/elevate/enroll/{id}");
+        let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
+        assert_eq!(status, StatusCode::OK, "enrollment challenge: {options}");
+        let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        s.post(&format!("{base}/finish"), None, &response).await
+    }
+    let (status, body) = finish(&s, &mut auth, first).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the first registers: {body}"
+    );
+    let (status, body) = finish(&s, &mut auth, second).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!("passkey_already_held"), "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("passkey.register")),
+        "the refusal names the way forward: {body}"
+    );
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM person_authenticators WHERE person_agent_id = $1")
+            .bind(person)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(held, 1, "nothing more was recorded");
+}
+
 /// An elevated response the recorder cannot buffer (larger than
 /// `MAX_RECORDED_BODY`) is WITHHELD, never streamed past the scan unrecorded
 /// (final review F1-TST-06): an extension route answering one byte more than

@@ -430,6 +430,16 @@ pub async fn enroll_finish(
                 "subject_not_eligible",
                 "the principal of this enrollment may no longer hold a passkey",
             ),
+            // Migration 160: a maintenance enrollment admits only a FIRST
+            // passkey, tested when it completes. Nothing was written.
+            Some("ELV10") => json_error(
+                StatusCode::CONFLICT,
+                "passkey_already_held",
+                "this person already holds a passkey, so this enrollment cannot add another: \
+                 a later passkey is enrolled on a confirmed passkey.register act (propose it \
+                 while elevated, confirm it with the existing passkey); for a lost passkey, \
+                 the operator revokes it first",
+            ),
             // Migration 160: the ceremony was restarted after this
             // registration was verified. Nothing was written.
             Some("ELV11") => json_error(
