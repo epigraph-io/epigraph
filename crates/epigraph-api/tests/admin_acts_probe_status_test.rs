@@ -19,6 +19,10 @@
 //! an ordinary viewer holding exactly the scopes the Explorer asks for, with
 //! no admin scope and no elevation. `list_acts` lists the caller's OWN acts
 //! only, so an ordinary viewer gets an empty listing, not a refusal.
+//!
+//! The fields of a listed act, which the Explorer's acts page decodes, are
+//! pinned by `elevation_ceremony.rs::a_listed_act_carries_every_field_the_explorer_decodes`
+//! (proposing an act needs that file's passkey ceremony).
 
 mod common;
 

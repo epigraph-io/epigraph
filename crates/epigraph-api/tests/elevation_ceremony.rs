@@ -3131,6 +3131,72 @@ async fn a_person_lists_only_their_own_acts_over_http(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// The listed act's wire shape, field by field, as the Explorer's admin-acts
+/// page decodes it (`services/explorer/src/upstream/acts.rs::ListedAct`: no
+/// serde default on `id`, `kind`, `target_type`, `target_id`, `reason`,
+/// `proposed_at`, `expires_at`, `path`). The Explorer's own tests decode hand
+/// copies of this shape, and the probe test pins only the empty envelope, so
+/// a renamed or retyped field here would pass both and fail `/acts` for every
+/// viewer who has an act. Read the way the Explorer reads it: its exact
+/// request (`?mine&limit=50`), its scopes, unelevated.
+///
+/// Mutation: `#[serde(rename = "why")]` on `ProposedAct::reason` -> red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_listed_act_carries_every_field_the_explorer_decodes(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder-x", &mut SoftAuthenticator::new(MODEL)).await;
+    let x = person(&pool, "grantee-x").await;
+    let (_, p_elevated) = elevated_token(&pool, &s, &p).await;
+    let (status, proposed) = s
+        .propose(
+            &p_elevated,
+            "role.grant",
+            &grant_act_args(x.person, "x"),
+            "explorer shape",
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{proposed}");
+    let act: Uuid = proposed["act_id"].as_str().unwrap().parse().unwrap();
+
+    let explorer = s.scoped_token(&p, None, &["claims:read", "audit:read"]);
+    let (status, body) = s.get("/api/v1/admin/acts?mine&limit=50", &explorer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = body["acts"].as_array().expect("acts array");
+    assert_eq!(listed.len(), 1, "{body}");
+    let a = listed[0].as_object().expect("an act is an object");
+
+    let string = |field: &str| -> &str {
+        a.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("`{field}` must be a string: {body}"))
+    };
+    let uuid = |field: &str| -> Uuid {
+        string(field)
+            .parse()
+            .unwrap_or_else(|e| panic!("`{field}` must be a uuid ({e}): {body}"))
+    };
+    let instant = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(string(field))
+            .unwrap_or_else(|e| panic!("`{field}` must be RFC 3339 ({e}): {body}"))
+    };
+
+    assert_eq!(uuid("id"), act);
+    assert_eq!(string("kind"), "role.grant");
+    assert!(!string("target_type").is_empty(), "{body}");
+    let _ = uuid("target_id");
+    assert_eq!(string("reason"), "explorer shape");
+    assert!(instant("expires_at") > instant("proposed_at"), "{body}");
+    assert_eq!(string("path"), format!("/elevate/act/{act}"));
+    // Unasserted and unexecuted: each optional field is null or absent, the
+    // two forms the Explorer's `#[serde(default)]` accepts.
+    for field in ["asserted_at", "outcome", "refusal", "consumed_at"] {
+        assert!(
+            matches!(a.get(field), None | Some(Value::Null)),
+            "`{field}` must be null or absent on a pending act: {body}"
+        );
+    }
+}
+
 // =====================================================================
 // EL-12b: the admin-act confirmation, /elevate/act/:id
 // =====================================================================
