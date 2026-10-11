@@ -2358,7 +2358,13 @@ later therefore opens the gate at its migrate step. So the preconditions below
 come BEFORE the deploy that carries 132, not before "the first elevation":
 
 1. `epigraph-operator verify-confirmations` (with the API's relying-party
-   values and attestation policy) exits 0 on the target database.
+   values and attestation policy) exits 0 on the target database. On a
+   database the stack has not reached yet (no 124/125: the first deploy of
+   it) there is nothing to verify, since no passkey, ticket or act can exist,
+   and the verb exits 1 on the missing tables; there this precondition is met
+   by construction, and the first run that must exit 0 is the one right after
+   the migrate step, before the first enrollment (step 6 of "The elevation
+   stack as a whole").
 2. Only the request units hold the application DSN (checked on the host; the
    offline verifier detects a confirmation forged through it, it cannot stop
    one).
@@ -2417,7 +2423,9 @@ BEFORE the deploy that carries them:
 4. Admin-scope enforcement stays UNARMED (128's switch); arming is the
    separate step below.
 5. Record the deployed commit.
-6. Enroll the operator's passkey (`epigraph-operator passkey-enroll`, then the
+6. Run `verify-confirmations` (it must exit 0: nothing is enrolled yet, and
+   on a first deploy of the stack this is precondition 1's first run). Then
+   enroll the operator's passkey (`epigraph-operator passkey-enroll`, then the
    ceremony on the operator's device at the relying party's host), elevate
    once through the CLI path, read one row of another group, and confirm its
    `elevated_access` row. Run `verify-confirmations` after every admin session
