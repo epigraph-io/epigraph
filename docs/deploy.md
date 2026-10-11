@@ -421,6 +421,50 @@ the mechanical requirement is (1)-(3) above, not a particular release count.
 `docs/runbooks/084-undo.sql` recreates the EMPTY SHAPE only; read it before
 applying 084 to anything you cannot rebuild.
 
+### 1e. `POST /api/v1/claims/batch` now persists its claims
+
+Each item goes through the same code as `POST /api/v1/claims`, on its own
+transaction. Before this change the route returned ids that named no row.
+
+- An item may carry any `POST /api/v1/claims` field. An item without
+  `agent_id` is authored by the caller. `truth_value` is still accepted as
+  `initial_truth`, but giving both is refused.
+- `if_not_exists: true` makes re-running a batch safe: matched items return
+  the existing id with `was_created: false` and are counted in the new
+  `existing` field.
+- A matched item writes nothing. Its `AUTHORED`, `HAS_TRACE` (`trace_id`)
+  and `DERIVED_FROM` (`evidence_id`) edges and its "create" provenance row
+  are written only for a claim the call created. This also changes
+  `POST /api/v1/claims` with `if_not_exists: true`, which used to write those
+  edges onto whatever claim it matched, including another agent's. A client
+  that relied on a re-run attaching new evidence to an existing claim must
+  link it with `POST /api/v1/edges`.
+- Each failed item's result carries `status` (the code the single route would
+  return, e.g. 400 or 409) next to `error`.
+- The request now needs an authenticated agent with `claims:write`, the same
+  as the single route.
+- Still no `ClaimSubmitted` event, the same as `POST /api/v1/claims`.
+- Once operator binding is armed (migration 122), the database checks each
+  item as it checks a single claim. An item naming an author the caller may
+  not write as, and any item from an unbound caller, is refused in its own
+  slot with 403 (`OPL01`/`OPL02`), and the other items are unaffected.
+- A public item is always owned by the token agent's personal group.
+  `group_id` does not change that: it is ignored unless `privacy_tier` is
+  `fully_private`, which also needs `encrypted_content` and
+  `encryption_epoch` and a caller that is a member of the group. That is the
+  only way to choose an item's owner group. So under an armed binding an
+  allowlisted service client's public items are refused with `OPL02`, because
+  its personal group is not a group its operator writes, and sending
+  `group_id` on a public item does not avoid it. Without an armed binding, a
+  public item sent with `group_id` lands in the caller's personal group, not
+  in the named one. Fleet agents can't call this route over HTTP, because
+  their token mint is refused.
+- A batch embeds its items one after another, so a large public batch can
+  take tens of seconds. The rate limiter counts the request, not its items.
+
+Clients that relied on the old behaviour see real rows, and the response ids
+now name them.
+
 #### One route needs more than a token
 
 | Route | Was | Now | Failure if you get it wrong |
