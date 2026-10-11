@@ -599,3 +599,132 @@ async fn derived_from_on_a_dedup_hit_of_a_claim_the_caller_does_not_own() {
          lineage={lineage}"
     );
 }
+
+/// The production parent: a PUBLIC claim owned by ANOTHER agent's group (the
+/// legacy imports `decompose_claims` decomposes belong to a bulk-import agent,
+/// not to the service client that posts the atoms). The parent read goes
+/// through the caller's stamped transaction, so a visibility predicate that
+/// admitted only the caller's own groups would refuse every real parent, and
+/// the 400 would abort a whole decompose run.
+///
+/// And one row per PARENT: the same atom text stated by a second, different
+/// parent gets its own row (each derivation is separate provenance), while a
+/// repeat from the second parent adds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_from_a_foreign_public_parent_and_then_a_second_parent_records_one_row_each() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let agent = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, client_row) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{addr}/api/v1/claims");
+    let run = Uuid::new_v4();
+
+    // P1: public, owned by a third agent's group, never touched by the caller.
+    let legacy_importer = common::seed_system_agent(&pool).await;
+    let p1_text =
+        format!("U041 legacy parent {run}: the pulley is frictionless. The string is massless.");
+    let p1 = common::seed_claim_with_agent(&pool, &p1_text, legacy_importer).await;
+    let caller_agent: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client_row)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let caller_group = common::personal_group_of(&pool, caller_agent).await;
+    let (vis, owner): (String, Uuid) =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(p1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(vis, "public", "fixture: the foreign parent is public");
+    assert_ne!(
+        owner, caller_group,
+        "fixture: the foreign parent must NOT be owned by the caller"
+    );
+
+    // P2: a different public parent with DIFFERENT text that states the same
+    // atom. (Rows are keyed on the parent's text hash: two parents with
+    // byte-identical text share one row — documented on
+    // `EvidenceRepository::record_derivation_conn`.)
+    let p2_text =
+        format!("U041 second parent {run}: the string is massless. The masses hang freely.");
+    let (st, body) = post_claim(
+        &client,
+        &endpoint,
+        &token,
+        serde_json::json!({ "content": p2_text, "agent_id": agent }),
+    )
+    .await;
+    assert!(st.is_success(), "seeding P2 failed: {st} {body}");
+    let p2 = id_of(&body);
+
+    let atom_text = format!("U041 shared atom {run}: the string is massless.");
+    let atom_from = |parent: Uuid| {
+        serde_json::json!({
+            "content": atom_text,
+            "agent_id": agent,
+            "initial_truth": 0.5,
+            "if_not_exists": true,
+            "labels": ["atom", "generality:0"],
+            "derived_from": {"claim_id": parent, "method": "decompose_claims"},
+        })
+    };
+
+    let (st, body) = post_claim(&client, &endpoint, &token, atom_from(p1)).await;
+    assert!(
+        st.is_success(),
+        "derived_from a foreign-owned PUBLIC parent must be accepted (it is \
+         every production parent); got {st} {body}"
+    );
+    let atom = id_of(&body);
+    let named = |rows: &[(Uuid, String, serde_json::Value, Option<String>)]| {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter_map(|(_, _, p, _)| p["derived_from_claim"].as_str().map(str::to_string))
+            .collect();
+        v.sort();
+        v
+    };
+    let rows = evidence_rows(&pool, atom).await;
+    assert_eq!(
+        named(&rows),
+        vec![p1.to_string()],
+        "exactly one row, naming the foreign parent; got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].3.as_deref(),
+        Some(p1_text.as_str()),
+        "the row carries the foreign parent's text"
+    );
+
+    let (st, body) = post_claim(&client, &endpoint, &token, atom_from(p2)).await;
+    assert!(st.is_success(), "second-parent POST failed: {st} {body}");
+    assert_eq!(id_of(&body), atom, "the second parent's atom dedups");
+    let mut want = vec![p1.to_string(), p2.to_string()];
+    want.sort();
+    let rows = evidence_rows(&pool, atom).await;
+    assert_eq!(
+        named(&rows),
+        want,
+        "a second, different parent stating the same atom gets its own row; got {rows:?}"
+    );
+
+    let (st, body) = post_claim(&client, &endpoint, &token, atom_from(p2)).await;
+    assert!(
+        st.is_success(),
+        "repeat second-parent POST failed: {st} {body}"
+    );
+    assert_eq!(
+        evidence_rows(&pool, atom).await.len(),
+        2,
+        "repeating the second parent adds nothing"
+    );
+}

@@ -276,7 +276,17 @@ impl EvidenceRepository {
     /// `content_hash` is BLAKE3 of the parent text, and migration 001's
     /// `evidence_content_hash_claim_unique` makes the INSERT a no-op when the
     /// same text is already evidence on the claim — a re-applied plan line or
-    /// a concurrent duplicate request. `properties` is the serialized
+    /// a concurrent duplicate request. A second parent with DIFFERENT text
+    /// gets its own row, so an atom stated by two parents names both.
+    ///
+    /// The key is the parent's TEXT, not its id, and that has two known
+    /// consequences: two parents with byte-identical text (legacy imports
+    /// labelled `deduped` can be) share ONE row, naming whichever parent came
+    /// first; and an existing evidence row on the claim whose raw text equals
+    /// the parent's suppresses the derivation row ([`DerivationEvidence::AlreadyPresent`]).
+    /// Keying on `properties->>'derived_from_claim'` instead would break the
+    /// `content_hash` = BLAKE3(`raw_content`) convention every evidence row
+    /// follows. `properties` is the serialized
     /// [`EvidenceType::Document`] plus the two derivation keys, so every reader
     /// that parses `properties` as an [`EvidenceType`] still does.
     ///
