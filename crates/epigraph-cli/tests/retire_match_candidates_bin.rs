@@ -143,36 +143,56 @@ async fn promoted_candidate(pool: &PgPool, a: Uuid, b: Uuid) -> Uuid {
     .expect("the promoted candidate")
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
-    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
-    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
-    let operator = seed_agent(&pool).await;
-    let a = viewer_fixture::seed_public_claim(&pool, operator, "u043 cli a").await;
-    let b = viewer_fixture::seed_public_claim(&pool, operator, "u043 cli b").await;
-    let candidate = promoted_candidate(&pool, a, b).await;
+/// A candidate between `a` and `b` in `status`, with NO matcher edge between
+/// them: retiring it withdraws nothing.
+async fn edgeless_candidate(pool: &PgPool, a: Uuid, b: Uuid, status: &str) -> Uuid {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    sqlx::query_scalar(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status) \
+         VALUES ($1, $2, 0.9, '{}'::jsonb, $3) RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+    .expect("the edgeless candidate")
+}
 
-    // b: backed by a BBA, its cache since overwritten by a BP apply.
-    let d = seed_surviving_bba_and_derive(&pool, b, operator).await;
-    // a: no BBA on any frame, and a cache only the factor graph can have written.
-    for claim in [a, b] {
-        sqlx::query(
-            "UPDATE claims SET belief = COALESCE(belief, 0.5), \
-                               plausibility = COALESCE(plausibility, 0.95), \
-                               pignistic_prob = $2 WHERE id = $1",
-        )
-        .bind(claim)
-        .bind(POISONED_BETP)
-        .execute(&pool)
+/// Simulate a past `bp/propagate` with `apply_updates: true` on `claim`. A
+/// claim with no BBA gets a cache only the factor graph can have written.
+async fn poison_betp(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET belief = COALESCE(belief, 0.5), \
+                           plausibility = COALESCE(plausibility, 0.95), \
+                           pignistic_prob = $2 WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(POISONED_BETP)
+    .execute(pool)
+    .await
+    .expect("simulate a BP-written value");
+}
+
+async fn status_of(pool: &PgPool, candidate: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(candidate)
+        .fetch_one(pool)
         .await
-        .expect("simulate a BP-written value");
-    }
+        .expect("candidate")
+}
 
+/// Run `retire_match_candidates --apply` over `candidates` as the non-superuser
+/// LOGIN roles; returns (exit code, stdout, stderr).
+async fn run_retire_apply(pool: &PgPool, candidates: &[Uuid]) -> (Option<i32>, String, String) {
+    let (app_role, app_url) = create_login(pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(pool, "epigraph_maintenance").await;
     let dir = std::env::temp_dir();
     let tag = Uuid::new_v4().simple().to_string();
     let ids = dir.join(format!("u043-ids-{tag}.txt"));
     let dump = dir.join(format!("u043-dump-{tag}.json"));
-    std::fs::write(&ids, format!("{candidate}\n")).expect("write the ids file");
+    let body: String = candidates.iter().map(|c| format!("{c}\n")).collect();
+    std::fs::write(&ids, body).expect("write the ids file");
     let out = Command::new(RETIRE)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -187,18 +207,37 @@ async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
         .current_dir(&dir)
         .output()
         .expect("run the binary");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let _ = std::fs::remove_file(&ids);
     let _ = std::fs::remove_file(&dump);
-    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    drop_login(pool, &app_role).await;
+    drop_login(pool, &maint_role).await;
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
 
-    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
-        .bind(candidate)
-        .fetch_one(&pool)
-        .await
-        .expect("candidate");
-    assert_eq!(status, "stale", "CALIBRATION: the retirement applied");
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
+    let operator = seed_agent(&pool).await;
+    let a = viewer_fixture::seed_public_claim(&pool, operator, "u043 cli a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, operator, "u043 cli b").await;
+    let candidate = promoted_candidate(&pool, a, b).await;
+
+    // b: backed by a BBA, its cache since overwritten by a BP apply.
+    let d = seed_surviving_bba_and_derive(&pool, b, operator).await;
+    // a: no BBA on any frame, and a cache only the factor graph can have written.
+    poison_betp(&pool, a).await;
+    poison_betp(&pool, b).await;
+
+    let (code, stdout, stderr) = run_retire_apply(&pool, &[candidate]).await;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "stale",
+        "CALIBRATION: the retirement applied"
+    );
 
     let after = betp_of(&pool, b)
         .await
@@ -217,11 +256,95 @@ async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
         !stdout.contains("bp/propagate reloads"),
         "the printed follow-up must no longer send the operator to bp/propagate:\n{stdout}"
     );
-    assert!(
-        stdout.contains("re-derived"),
-        "the run reports the re-derivation it did:\n{stdout}"
-    );
+    // The report itself, not the no-op branch's "no belief was re-derived".
+    for line in [
+        "Belief re-derived on the 2 affected endpoint(s)",
+        "recomputed:                   1",
+        "cache cleared (no BBA backs): 1",
+    ] {
+        assert!(
+            stdout.contains(line),
+            "the run reports the re-derivation it did ({line:?}):\n{stdout}"
+        );
+    }
+}
 
-    drop_login(&pool, &app_role).await;
-    drop_login(&pool, &maint_role).await;
+/// The re-derivation is per pair, like the online path's `withdrew` guard: a
+/// batch mixing a promoted pair with a pending one (the binary stales both,
+/// after its "not currently 'promoted'" NOTE) must re-derive only the endpoints
+/// of the pair it withdrew something from. The pending pair's endpoints fed no
+/// cache, and with no BBA behind them a re-derivation would CLEAR them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_apply_rederives_only_the_pairs_it_withdrew_from(pool: PgPool) {
+    let operator = seed_agent(&pool).await;
+    let a = viewer_fixture::seed_public_claim(&pool, operator, "u043 mixed a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, operator, "u043 mixed b").await;
+    let c = viewer_fixture::seed_public_claim(&pool, operator, "u043 mixed c").await;
+    let e = viewer_fixture::seed_public_claim(&pool, operator, "u043 mixed e").await;
+    let promoted = promoted_candidate(&pool, a, b).await;
+    let pending = edgeless_candidate(&pool, c, e, "pending").await;
+
+    let d = seed_surviving_bba_and_derive(&pool, b, operator).await;
+    for claim in [a, b, c, e] {
+        poison_betp(&pool, claim).await;
+    }
+
+    let (code, stdout, stderr) = run_retire_apply(&pool, &[promoted, pending]).await;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        (
+            status_of(&pool, promoted).await,
+            status_of(&pool, pending).await
+        ),
+        ("stale".to_string(), "stale".to_string()),
+        "CALIBRATION: the binary stales the whole batch"
+    );
+    let after = betp_of(&pool, b)
+        .await
+        .unwrap_or_else(|| panic!("b keeps a cache: a BBA backs it\n{stdout}"));
+    assert!(
+        (after - d).abs() < 1e-9,
+        "CALIBRATION: the promoted pair is re-derived (expected {d}, found {after})\n{stdout}"
+    );
+    for claim in [c, e] {
+        assert_eq!(
+            betp_of(&pool, claim).await,
+            Some(POISONED_BETP),
+            "the pending pair withdrew nothing, so its endpoint {claim} must keep its cache\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Belief re-derived on the 2 affected endpoint(s)"),
+        "only the promoted pair's two endpoints are re-derived:\n{stdout}"
+    );
+}
+
+/// A run that withdrew nothing (a candidate marked promoted whose matcher edge
+/// is gone) re-derives nothing, even on an endpoint whose cache disagrees with
+/// its BBA: nothing this run removed fed that cache.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_apply_that_withdrew_nothing_rederives_nothing(pool: PgPool) {
+    let operator = seed_agent(&pool).await;
+    let a = viewer_fixture::seed_public_claim(&pool, operator, "u043 noop a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, operator, "u043 noop b").await;
+    let candidate = edgeless_candidate(&pool, a, b, "promoted").await;
+    seed_surviving_bba_and_derive(&pool, b, operator).await;
+    poison_betp(&pool, b).await;
+
+    let (code, stdout, stderr) = run_retire_apply(&pool, &[candidate]).await;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "stale",
+        "CALIBRATION: the retirement applied"
+    );
+    assert_eq!(
+        betp_of(&pool, b).await,
+        Some(POISONED_BETP),
+        "nothing this run removed fed b's cache\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Nothing was withdrawn, so no belief was re-derived."),
+        "{stdout}"
+    );
 }
