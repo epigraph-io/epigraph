@@ -181,8 +181,20 @@ pub struct CreateClaimRequest {
 pub struct DerivedFrom {
     /// The parent claim whose text the new claim was derived from.
     pub claim_id: Uuid,
-    /// The derivation that produced the claim (e.g. `decompose_claims`).
+    /// The derivation that produced the claim (e.g. `decompose_claims`):
+    /// 1-64 characters of `[a-z_]`, otherwise the request is refused with 400.
     pub method: String,
+}
+
+/// Longest accepted [`DerivedFrom::method`].
+#[cfg(feature = "db")]
+const DERIVATION_METHOD_MAX_LEN: usize = 64;
+
+/// A [`DerivedFrom::method`] is a short machine name: 1-64 bytes of `[a-z_]`.
+#[cfg(feature = "db")]
+fn is_derivation_method_name(method: &str) -> bool {
+    (1..=DERIVATION_METHOD_MAX_LEN).contains(&method.len())
+        && method.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// Claim response structure
@@ -449,10 +461,16 @@ pub async fn create_claim(
                 reason: "derived_from is only supported for privacy_tier=public".to_string(),
             });
         }
-        if d.method.trim().is_empty() {
+        // `method` lands verbatim in a public evidence row every viewer reads
+        // through lineage/provenance, so it is a short machine name
+        // (`decompose_claims`), never free text.
+        if !is_derivation_method_name(&d.method) {
             return Err(ApiError::ValidationError {
                 field: "derived_from.method".to_string(),
-                reason: "derived_from.method cannot be empty".to_string(),
+                reason: format!(
+                    "derived_from.method must be 1-{DERIVATION_METHOD_MAX_LEN} characters \
+                     of [a-z_]"
+                ),
             });
         }
     }
@@ -829,11 +847,7 @@ pub async fn create_claim(
     // exist without the claim (nor the claim, on this request, without it).
     if let Some(ref d) = request.derived_from {
         match epigraph_db::EvidenceRepository::record_derivation_conn(
-            &mut tx,
-            &viewer,
-            claim_uuid,
-            d.claim_id,
-            d.method.trim(),
+            &mut tx, &viewer, claim_uuid, d.claim_id, &d.method,
         )
         .await?
         {

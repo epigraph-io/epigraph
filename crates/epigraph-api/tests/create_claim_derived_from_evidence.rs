@@ -369,6 +369,51 @@ async fn derived_from_an_unavailable_parent_is_refused_without_writing_the_atom(
         "invisible, non-public and nonexistent parents must get one identical \
          answer (no existence oracle); got {answers:?}"
     );
+
+    // `method` lands verbatim in a public evidence row every viewer reads, so
+    // it is a short machine name, never free text. A valid parent, so only
+    // the method can be what is refused.
+    let public_parent = common::seed_claim_with_agent(
+        &pool,
+        &format!("U041 public parent for method checks {run}. Second sentence."),
+        agent,
+    )
+    .await;
+    for (label, method) in [
+        ("blank", "  ".to_string()),
+        (
+            "free text",
+            "Decomposed by hand, see https://x.example".to_string(),
+        ),
+        ("too long", "a".repeat(65)),
+    ] {
+        let content = format!("U041 bad-method atom {run} {label}.");
+        let (st, body) = post_claim(
+            &client,
+            &endpoint,
+            &token,
+            serde_json::json!({
+                "content": content,
+                "agent_id": agent,
+                "if_not_exists": true,
+                "derived_from": {"claim_id": public_parent, "method": method},
+            }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            reqwest::StatusCode::BAD_REQUEST,
+            "a {label} derived_from.method must be refused; got {st} {body}"
+        );
+        assert_eq!(
+            body["details"]["field"], "derived_from.method",
+            "the {label} method must be what is refused; body={body}"
+        );
+        assert!(
+            atom_absent(&pool, &content).await,
+            "the refused {label} request must not leave its atom committed"
+        );
+    }
 }
 
 /// The production shape of a dedup hit: `submit_atom` posts the PARENT's author
