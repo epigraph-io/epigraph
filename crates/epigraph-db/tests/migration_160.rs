@@ -5,7 +5,11 @@
 //! the migration as a whole promises: its undo returns the catalog to the
 //! head before it, and every function it re-bodies is restored by that undo.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
+use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -83,13 +87,59 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
+/// A passkey completed through 160's completion, its registration stored:
+/// `(passkey, registration)`.
+async fn registered_passkey(pool: &PgPool) -> (Uuid, serde_json::Value) {
+    let (person, _) = fixture::seed_human_operator(pool, "registered").await;
+    let enrollment: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'undo test', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("open the enrollment");
+        (conn, e)
+    })
+    .await;
+    let registration = serde_json::json!({ "id": "registration-under-test", "type": "public-key" });
+    let reg = registration.clone();
+    let passkey = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let state = serde_json::json!({ "rs": { "challenge": "undo" } });
+        sqlx::query("SELECT public.epigraph_set_passkey_enrollment_challenge($1, $2)")
+            .bind(enrollment)
+            .bind(&state)
+            .execute(&mut *conn)
+            .await
+            .expect("the ceremony state");
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_complete_passkey_enrollment($1, '\\x3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c'::bytea, \
+                    '{\"cred\": 1}'::jsonb, '00000000-0000-0000-0000-000000000000'::uuid, \
+                    'none', true, false, $2, $3)",
+        )
+        .bind(enrollment)
+        .bind(&reg)
+        .bind(&state)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("complete with a registration");
+        (conn, id)
+    })
+    .await;
+    (passkey, registration)
+}
+
 /// `docs/runbooks/160-undo.sql`, applied to a database that went from the
-/// head before 160 to 160, returns its catalog (every function body, owner and
-/// ACL included) to the same database's before 160. A second run changes
-/// nothing.
+/// head before 160 to 160 and holds one passkey with a stored registration,
+/// returns its catalog (every function body, owner and ACL included) to the
+/// same database's before 160, and first archives that registration into
+/// `security_events` (final review F2-TST-03: the evidence the offline
+/// verifier re-runs is kept, not dropped with the column). A second run
+/// changes nothing and archives nothing more.
 ///
 /// Verified to fail: the undo's restoration of 124's completion guard
-/// removed -> 160's body (md5) is left behind.
+/// removed -> 160's body (md5) is left behind; the archive INSERT replaced by
+/// a no-op -> no archived event.
 #[sqlx::test(migrations = false)]
 async fn the_160_rollback_returns_the_catalog_to_the_head_before_it(pool: PgPool) {
     migrate(&pool, &up_to(before_160())).await;
@@ -100,6 +150,7 @@ async fn the_160_rollback_returns_the_catalog_to_the_head_before_it(pool: PgPool
         before,
         "CALIBRATION: 160 changed the catalog"
     );
+    let (passkey, registration) = registered_passkey(&pool).await;
     for run in 1..=2 {
         sqlx::raw_sql(&read("docs/runbooks/160-undo.sql"))
             .execute(&pool)
@@ -112,6 +163,18 @@ async fn the_160_rollback_returns_the_catalog_to_the_head_before_it(pool: PgPool
     assert!(
         left.is_empty() && lost.is_empty(),
         "the catalog is not the pre-160 head's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let archived: Vec<(Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT details->>'passkey_id', details->'registration' FROM security_events \
+          WHERE event_type = 'platform.passkey_registration_archived'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the archive");
+    assert_eq!(
+        archived,
+        vec![(Some(passkey.to_string()), Some(registration))],
+        "one archived registration across two runs, carrying what was stored"
     );
 }
 
