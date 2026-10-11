@@ -18,7 +18,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, TestResponse};
 use epigraph_explorer::auth::flow::{Handoff, PendingLogin, MAX_PENDING_LOGINS};
-use epigraph_explorer::auth::{oauth, RefreshError, SessionId, SignedIn};
+use epigraph_explorer::auth::{oauth, random_token, RefreshError, SessionId, SignedIn};
 use epigraph_explorer::config::{
     ENV_CLIENT_ID, ENV_INSECURE_COOKIES, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL,
     ENV_TOKEN_TIMEOUT_MS, ENV_UPSTREAM_TIMEOUT_MS,
@@ -1848,6 +1848,48 @@ async fn redeeming_a_handoff_revokes_the_replaced_sessions_refresh_token() {
         "the replaced session's access token is revoked too"
     );
     assert_eq!(access_revocations_of(&app, "access-1").await, 0);
+    app.upstream.verify().await;
+}
+
+/// A redeem that is refused (an unknown, used or expired code: a second tab,
+/// a retried redeem, a stale popup) leaves the embed's existing session
+/// alone: the session is replaced only once a handoff has been validated.
+#[tokio::test]
+async fn a_refused_redeem_leaves_the_existing_session_alone() {
+    let app = app().await;
+    mount_revoke(&app, 0).await;
+    let old = app.state.sessions.create(
+        "a-old".into(),
+        "r-old".into(),
+        Utc::now() + Duration::hours(1),
+    );
+    let cookie = format!("epx_session={}", old.as_str());
+    // A token-shaped code no handoff holds, and one that is not even shaped
+    // like a code.
+    for code in [random_token(32), "nope".to_string()] {
+        let res = send_with(
+            &app,
+            Method::POST,
+            "/explorer/auth/redeem",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("origin", ORIGIN),
+                ("cookie", &cookie),
+            ],
+            &format!("code={code}"),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{code}: {}", res.body);
+        assert!(set_cookie(&res, "epx_session").is_none());
+        let kept = app
+            .state
+            .sessions
+            .get(&old)
+            .expect("the existing session is untouched");
+        assert_eq!(kept.refresh_token, "r-old");
+    }
+    assert_eq!(app.state.sessions.len(), 1);
+    assert_eq!(revocations_of(&app, "r-old").await, 0, "nothing revoked");
     app.upstream.verify().await;
 }
 
