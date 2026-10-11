@@ -1295,8 +1295,10 @@ restart.
   `elevated_access.rs` (section 3) and `epigraph-cli/tests/operator_admin_act_cli.rs`
   (section 4); the file as a whole in
   `migration_160.rs`. Sets `lock_timeout = '3s'`. Undo
-  (`docs/runbooks/160-undo.sql`, restores every re-bodied function; run it
-  FIRST, before 132-undo; it archives the stored registrations into
+  (`docs/runbooks/160-undo.sql`, restores every re-bodied function, the gate
+  only while it is 160's body, so a gate 132-undo closed stays closed; run it
+  after 132-undo, which runs FIRST, and before 131-undo; it archives the
+  stored registrations into
   `security_events` before dropping the column). **Deploy order:** after
   124-132 (sqlx would otherwise apply them out of order after 160), with the
   API binary that calls the nine-argument completion (an older one keeps

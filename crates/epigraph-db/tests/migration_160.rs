@@ -115,6 +115,44 @@ async fn the_160_rollback_returns_the_catalog_to_the_head_before_it(pool: PgPool
     );
 }
 
+/// 160-undo leaves a gate 132-undo closed CLOSED (final review F2-COR-01):
+/// the kill switch (132-undo, run FIRST) restores 125's `SELECT false`, and
+/// 160-undo, run after it (twice: it is idempotent), restores 132's readiness
+/// test only over 160's own body, so elevation stays closed. Calibration:
+/// the gate is open at 160 (the recorder is installed and maintenance-owned).
+///
+/// Verified to fail with 160-undo restoring 132's gate unconditionally (the
+/// code before this test): the gate reads true again after 160-undo.
+#[sqlx::test(migrations = false)]
+async fn the_160_undo_leaves_a_gate_132_undo_closed_closed(pool: PgPool) {
+    migrate(&pool, &up_to(160)).await;
+    let ready = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>("SELECT public.epigraph_elevated_access_ready()")
+            .fetch_one(&pool)
+            .await
+            .expect("the gate")
+    };
+    assert!(ready(pool.clone()).await, "CALIBRATION: open at 160");
+    sqlx::raw_sql(&read("docs/runbooks/132-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("132-undo applies");
+    assert!(
+        !ready(pool.clone()).await,
+        "CALIBRATION: 132-undo closes it"
+    );
+    for run in 1..=2 {
+        sqlx::raw_sql(&read("docs/runbooks/160-undo.sql"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("160-undo applies (run {run}): {e}"));
+        assert!(
+            !ready(pool.clone()).await,
+            "160-undo run {run} left the closed gate closed"
+        );
+    }
+}
+
 /// The functions a SQL text defines in `public` (`CREATE OR REPLACE
 /// FUNCTION public.<name>`), sorted, deduplicated.
 fn functions_in(sql: &str) -> Vec<String> {

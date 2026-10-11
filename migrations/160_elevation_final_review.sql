@@ -114,8 +114,9 @@
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/160-undo.sql` restores each re-bodied function to the
--- body it had before this file. Run it FIRST, before 132-undo and every other
--- elevation undo.
+-- body it had before this file (the gate only while it is this file's body,
+-- so a gate 132-undo closed stays closed). Run it after 132-undo (the kill
+-- switch, FIRST) and before every other elevation undo.
 
 SET LOCAL lock_timeout = '3s';
 

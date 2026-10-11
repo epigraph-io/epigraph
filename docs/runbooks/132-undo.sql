@@ -9,9 +9,10 @@
 -- redeems, and the elevated read arms (126) read as if no session existed.
 -- `CREATE OR REPLACE` keeps the owner and the ACL, as 132 did.
 --
--- ORDER: run this FIRST, before every other elevation undo (131 down to
--- 124). It needs no binary rolled back first: a recording build on a
--- gate-closed database serves every request unelevated.
+-- ORDER: run this FIRST, before every other elevation undo (160-undo, then
+-- 131 down to 124; 160-undo leaves the gate this script closes closed). It
+-- needs no binary rolled back first: a recording build on a gate-closed
+-- database serves every request unelevated.
 --
 -- WHAT IT LEAVES: every session, ticket, act and log row (ended or not), and
 -- 132's `_sqlx_migrations` row. Re-opening elevation is a NEW migration,

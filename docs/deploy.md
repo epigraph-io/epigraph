@@ -2389,7 +2389,10 @@ Taking 127 back out also closes the gate by itself (the readiness test reads
 the recorder; since migration 160 only a `SECURITY DEFINER` recorder owned by
 a member of `epigraph_maintenance` counts, so stubs that a login holding
 CREATE on `public` re-creates under the same names do not reopen it), but run
-160-undo and 132-undo first anyway.
+132-undo first anyway. `160-undo.sql`, which runs next, restores 132's gate
+only while the gate is 160's own body, so it leaves the gate 132-undo closed
+closed (run alone, it returns the gate to 132's readiness test: elevation
+stays open, as at 132).
 
 ## The elevation stack as a whole (migrations 124-132) — order, undo order, arming
 
@@ -2436,8 +2439,9 @@ mints them; admin reads need an elevation; admin writes are maintenance-CLI
 acts. The rollback is `disarm-admin-scopes --reason TEXT --apply` (no DDL).
 
 **Undo order.** Disarm first (if armed). Roll back the binaries, newest first.
-Then the undo scripts in reverse: `160-undo.sql` (the final-review
-corrections to 124-132), `132-undo.sql`, `131-undo.sql`,
+Then the undo scripts: `132-undo.sql` FIRST (the kill switch: every session
+stops being live), then `160-undo.sql` (the final-review corrections to
+124-132; it leaves the closed gate closed), then in reverse `131-undo.sql`,
 `130-undo.sql`, `129-undo.sql`, `128-undo.sql`, `127-undo.sql` (archives the
 log into `security_events` first), `126-undo.sql`, `125-undo.sql` (archives
 every ticket and session, their assertion evidence included, first),

@@ -12,7 +12,8 @@
 --   2. 130's `epigraph_consume_admin_act` (an act executes while its proposer
 --      holds SOME live role:platform-custodian assignment again).
 --   3. 132's `epigraph_elevated_access_ready` (the gate answers from the
---      existence of the recorder's names again, whoever owns them).
+--      existence of the recorder's names again, whoever owns them), ONLY
+--      while the gate is 160's body: a gate 132-undo closed stays closed.
 --   4. Archives every stored passkey registration into `security_events`
 --      as one `platform.passkey_registration_archived` event (the passkey
 --      id, its person and the registration: what the offline verifier
@@ -20,7 +21,10 @@
 --      immutability trigger and the nine-argument completion. The API
 --      binary that calls that form must be rolled back first.
 --
--- ORDER: run this FIRST, before 132-undo and every other elevation undo.
+-- ORDER: after 132-undo (the kill switch, which runs FIRST: this script
+-- leaves the gate it closed closed) and before every other elevation undo
+-- (131 down to 124). Run alone (132-undo not run), it returns the gate to
+-- 132's readiness test: elevation stays open, as it was at 132.
 -- Roll back first the API binary that calls 160's nine-argument completion
 -- (step 4 drops it; a build older than 160 calls 124's form); nothing else
 -- needs a binary rolled back.
@@ -136,7 +140,30 @@ END $$;
 REVOKE EXECUTE ON FUNCTION
     public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb) FROM PUBLIC;
 
--- 3. 132's recorder gate, verbatim.
+-- 3. 132's recorder gate, verbatim, but ONLY over 160's own body. A gate
+-- that is not 160's (125's `SELECT false`, which 132-undo, the kill switch,
+-- restores) is left as it is: restoring 132's readiness test over it would
+-- re-open elevation the operator closed.
+DO $u$
+BEGIN
+    IF (SELECT p.prosrc FROM pg_catalog.pg_proc p
+         WHERE p.oid = 'public.epigraph_elevated_access_ready()'::regprocedure)
+       = $b$
+    SELECT to_regclass('public.elevated_access') IS NOT NULL
+       AND EXISTS (
+               SELECT 1
+                 FROM pg_catalog.pg_proc p
+                WHERE p.oid = to_regprocedure(
+                          'public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])')
+                  AND p.prosecdef
+                  AND CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                                         WHERE r.rolname = 'epigraph_maintenance')
+                           THEN pg_catalog.pg_has_role(p.proowner, 'epigraph_maintenance',
+                                                       'MEMBER')
+                           ELSE false
+                      END)
+$b$ THEN
+        EXECUTE $f$
 CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -145,7 +172,13 @@ SET search_path = public, pg_temp AS $$
        AND to_regprocedure(
                'public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])'
            ) IS NOT NULL
-$$;
+$$
+        $f$;
+    ELSE
+        RAISE NOTICE '160-undo: the recorder gate is not 160''s body (closed by 132-undo, '
+                     'or re-bodied since); left as it is';
+    END IF;
+END $u$;
 
 -- 4. The stored registration: archived, then dropped.
 DO $$
