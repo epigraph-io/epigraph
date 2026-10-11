@@ -173,6 +173,92 @@ impl ElevatedAccessSlot {
     }
 }
 
+/// Every id the REQUEST names, in every spelling the route extractors accept
+/// (final review F2-SEC-02): axum's `Path` and `Query` percent-decode, and
+/// `Uuid`'s parser takes the simple (32 hex), braced and `urn:uuid:` forms as
+/// well as the hyphenated one, so a scan of the raw request text for the
+/// hyphenated form alone let a caller name a subject in a spelling the
+/// handler reads and the record does not attribute. Each path segment and
+/// each query key and value is percent-decoded first; the body is read as
+/// JSON (its strings and keys, escapes decoded) when it parses, and as text
+/// in any case. Errs toward the subject: a token that parses as an id is a
+/// candidate whether or not it names a row.
+fn request_ids_in(path: &str, query: Option<&str>, body: &[u8]) -> Vec<Uuid> {
+    let mut out = Vec::new();
+    for segment in path.split('/') {
+        ids_in_text(&percent_decoded(segment), &mut out);
+    }
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        ids_in_text(&key, &mut out);
+        ids_in_text(&value, &mut out);
+    }
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+        ids_in_json(&json, &mut out);
+    }
+    ids_in_text(&String::from_utf8_lossy(body), &mut out);
+    out
+}
+
+/// The ids in `text`: every hyphenated run (the response scan's grammar), and
+/// every token (split on anything but ASCII alphanumerics, `-`, `{`, `}` and
+/// `:`) that parses as a `Uuid` in any spelling. Each id once, appended to
+/// `out`.
+fn ids_in_text(text: &str, out: &mut Vec<Uuid>) {
+    let mut push = |id: Uuid| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    for id in candidate_ids_in(text.as_bytes()) {
+        push(id);
+    }
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || "-{}:".contains(c))) {
+        if let Ok(id) = Uuid::try_parse(token) {
+            push(id);
+        }
+    }
+}
+
+/// [`ids_in_text`] over every string and key of a JSON value.
+fn ids_in_json(value: &serde_json::Value, out: &mut Vec<Uuid>) {
+    match value {
+        serde_json::Value::String(s) => ids_in_text(s, out),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                ids_in_json(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                ids_in_text(key, out);
+                ids_in_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `segment` with every `%XX` escape decoded (as axum's `Path` decodes it);
+/// a malformed escape is kept as it is, invalid UTF-8 replaced.
+fn percent_decoded(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(u8::try_from(h * 16 + l).unwrap_or(b'?'));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn withheld(reason: &str) -> Response {
     tracing::error!(
         target: "elevation",
@@ -248,11 +334,7 @@ pub async fn record_elevated_access(
     // scan cannot read (a compressed or binary extension response), is still
     // attributed to the rows it was asked about. Errs toward the subject, as
     // the response scan does.
-    let mut request_ids = candidate_ids_in(parts.uri.path().as_bytes());
-    request_ids.extend(candidate_ids_in(
-        parts.uri.query().unwrap_or_default().as_bytes(),
-    ));
-    request_ids.extend(candidate_ids_in(&bytes));
+    let request_ids = request_ids_in(parts.uri.path(), parts.uri.query(), &bytes);
     let mut request = Request::from_parts(parts, Body::from(bytes));
     let slot = ElevatedAccessSlot::default();
     request.extensions_mut().insert(slot.clone());
@@ -356,9 +438,69 @@ pub async fn record_elevated_access(
 #[cfg(test)]
 mod tests {
     use super::{
-        elevated_write_refusal, mark_after_handler, ElevatedAccessSlot, ElevatedMark,
-        ELEVATED_NON_GET_ALLOWLIST,
+        elevated_write_refusal, mark_after_handler, request_ids_in, ElevatedAccessSlot,
+        ElevatedMark, ELEVATED_NON_GET_ALLOWLIST,
     };
+
+    /// Every spelling a route extractor reads an id from is attributed
+    /// (final review F2-SEC-02): the simple (32 hex), braced, `urn:uuid:` and
+    /// upper-case forms, a percent-encoded path segment or query value, a
+    /// `+`-for-space query value, and a JSON body string with escaped
+    /// hyphens. Calibration: a path that names no id yields none.
+    ///
+    /// Verified to fail with the request scanned for the hyphenated form
+    /// alone (the code before this test): every case but the plain one is
+    /// empty.
+    #[test]
+    fn every_spelling_of_a_request_id_is_a_candidate() {
+        let id = uuid::Uuid::parse_str("0a0a7ec0-3851-48b7-9d2a-2fc6d0d1bd57").unwrap();
+        let simple = id.simple().to_string();
+        let upper = id.hyphenated().to_string().to_uppercase();
+        let pct = id.hyphenated().to_string().replace('-', "%2D");
+        let cases: Vec<(String, Option<String>, Vec<u8>)> = vec![
+            (format!("/x/{}", id.hyphenated()), None, vec![]),
+            (format!("/x/{simple}"), None, vec![]),
+            (format!("/x/{pct}"), None, vec![]),
+            (
+                format!("/x/{}", id.braced())
+                    .replace('{', "%7B")
+                    .replace('}', "%7D"),
+                None,
+                vec![],
+            ),
+            (format!("/x/{}", id.urn()), None, vec![]),
+            (format!("/x/{upper}"), None, vec![]),
+            ("/x".into(), Some(format!("claim_id={simple}")), vec![]),
+            ("/x".into(), Some(format!("claim_id={pct}&n=1")), vec![]),
+            ("/x".into(), Some(format!("q=one+{simple}")), vec![]),
+            (
+                "/x".into(),
+                None,
+                format!(
+                    "{{\"claim_id\": \"{}\"}}",
+                    id.hyphenated().to_string().replace('-', "\\u002d")
+                )
+                .into_bytes(),
+            ),
+            (
+                "/x".into(),
+                None,
+                format!("{{\"ids\": [\"{simple}\"]}}").into_bytes(),
+            ),
+        ];
+        for (path, query, body) in &cases {
+            assert_eq!(
+                request_ids_in(path, query.as_deref(), body),
+                vec![id],
+                "path {path} query {query:?} body {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert!(
+            request_ids_in("/api/v1/claims", Some("limit=10"), b"").is_empty(),
+            "CALIBRATION: no id named, none found"
+        );
+    }
     use axum::http::{Method, StatusCode};
 
     /// A POISONED slot (a panic while it was held) is a failure to record:

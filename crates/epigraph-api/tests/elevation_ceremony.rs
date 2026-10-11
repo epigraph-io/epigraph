@@ -2533,6 +2533,83 @@ async fn an_elevated_read_is_attributed_by_the_ids_its_request_names(pool: PgPoo
     assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
 }
 
+/// Every spelling a REQUEST names its subject in attributes the elevated
+/// read to it (final review F2-SEC-02), not only a hyphenated path id: an
+/// extension route that extracts `Path<Uuid>` serves the simple and the
+/// percent-encoded spellings as the same row while answering a constant, and
+/// each read is recorded with the group of the private claim the request
+/// named, and B reads every row. Calibration: each request is served (200),
+/// so the handler accepted the spelling.
+///
+/// Verified to fail with the request's ids scanned in the hyphenated form
+/// alone (the code before this test): the simple and percent-encoded path
+/// rows carry no group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_is_attributed_by_every_spelling_its_request_names(pool: PgPool) {
+    let silent = RouterExtension::with_state(
+        "silent",
+        Router::new().route(
+            "/claims/:id",
+            get(
+                |State(_): State<EmbedderState>,
+                 axum::extract::Path(_id): axum::extract::Path<Uuid>| async move {
+                    Json(json!({ "ok": true }))
+                },
+            ),
+        ),
+        EmbedderState { marker: "silent" },
+    )
+    .expect("valid name");
+    let s = spawn_with_extensions(&pool, Some(software()), vec![silent]).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "f2-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "f2 B private claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+
+    let simple = claim.simple().to_string();
+    let pct = claim.hyphenated().to_string().replace('-', "%2D");
+    let requests: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "simple path",
+            format!("/api/v1/ext/silent/claims/{simple}"),
+            None,
+        ),
+        (
+            "percent-encoded path",
+            format!("/api/v1/ext/silent/claims/{pct}"),
+            None,
+        ),
+    ];
+    for (what, path, body) in &requests {
+        let mut req = s.http.get(s.url(path)).bearer_auth(&elevated);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "CALIBRATION: {what} is served"
+        );
+    }
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), requests.len(), "one row per request: {log:?}");
+    for ((what, _, _), row) in requests.iter().zip(&log) {
+        assert_eq!(
+            row.2,
+            vec![b_group],
+            "the {what} read is attributed to the group of the claim it named: {row:?}"
+        );
+    }
+    assert_eq!(
+        log_seen_by(&pool, b).await,
+        i64::try_from(requests.len()).unwrap(),
+        "B reads every row naming it"
+    );
+}
+
 /// A second maintenance enrollment of a person who has since registered a
 /// passkey is refused at its finish as a 409 the person can act on, not a
 /// 500 (final review F2-COR-03): migration 160 tests a maintenance
