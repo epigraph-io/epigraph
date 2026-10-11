@@ -401,7 +401,10 @@ pub fn conflict_coefficient(m1: &MassFunction, m2: &MassFunction) -> Result<f64,
 
 /// Which combination rule to use, selected adaptively based on conflict and open-world fraction
 ///
-/// This is the output of [`select_combination_rule`] and drives [`combine_multiple`].
+/// This is the output of [`select_combination_rule`]. It no longer drives
+/// [`combine_multiple`], which folds with Dempster's rule at every step
+/// (drain unit U025); it is kept as public API for callers that want the
+/// classification itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CombinationRule {
     /// Low conflict: Dempster normalization is safe
@@ -415,6 +418,10 @@ pub enum CombinationRule {
 }
 
 /// Select the appropriate combination rule based on conflict level and open-world fraction
+///
+/// Not used by [`combine_multiple`] (see its doc comment, drain unit U025):
+/// re-selecting per step from accumulated state made that fold non-monotone
+/// under supporting evidence.
 ///
 /// Decision boundaries:
 /// - K < 0.1: low conflict, Dempster normalization is safe
@@ -495,30 +502,89 @@ fn canonical_mass_cmp(a: &MassFunction, b: &MassFunction) -> std::cmp::Ordering 
     }
 }
 
-/// Combine multiple mass functions by pairwise adaptive folding
+/// Aggregate conflict seen across a `combine_multiple` fold.
 ///
-/// For each pairwise step, computes the conflict coefficient K and the
-/// open-world fraction of the accumulated result, then uses
-/// [`select_combination_rule`] to pick the best rule:
+/// Returns `K_total = 1 - prod(1 - K_i)` over the per-step conflict
+/// coefficients. For a fold of Dempster steps this is exactly the conflict
+/// mass the unnormalised conjunctive (TBM) combination of all inputs would
+/// carry on the empty set, so it is the order-independent "how much did the
+/// evidence disagree" signal that normalisation removes from the combined
+/// mass function itself (`combined.mass_of_conflict()` is 0 after Dempster).
 ///
-/// - Low K → Dempster (normalize away small conflict)
-/// - Moderate K → CDST conjunctive (preserve conflict info)
-/// - High K + open world → Yager open (redirect to ignorance)
-/// - High K + closed world → Inagaki (parametric redistribution)
+/// Returns 0.0 for an empty report list (single-source "fold").
+#[must_use]
+pub fn aggregate_conflict(reports: &[CombinationReport]) -> f64 {
+    let survived: f64 = reports
+        .iter()
+        .map(|r| 1.0 - r.conflict_k.clamp(0.0, 1.0))
+        .product();
+    (1.0 - survived).clamp(0.0, 1.0)
+}
+
+/// The conflict a `combine_multiple` call saw, given its result and reports.
+///
+/// With one or more fold steps this is [`aggregate_conflict`]; Dempster
+/// normalised the conflict out of `combined`, so reading
+/// `combined.mass_of_conflict()` would report 0. With no steps (a single
+/// input, returned as-is) there was no fold, and the input's own empty-set
+/// mass is the conflict. Every caller that caches or reports "mass on
+/// conflict" for a combined belief should read it through this function so
+/// the recompute, the write paths and the framed reads agree.
+#[must_use]
+pub fn fold_conflict(combined: &MassFunction, reports: &[CombinationReport]) -> f64 {
+    if reports.is_empty() {
+        combined.mass_of_conflict()
+    } else {
+        aggregate_conflict(reports)
+    }
+}
+
+/// Combine multiple mass functions by pairwise Dempster folding
+///
+/// Every pairwise step uses Dempster's rule (CDST conjunctive combination,
+/// then normalisation by `1 - K_c`). Dempster's rule is commutative and
+/// associative, so, unless a step hits total conflict (below), the result does
+/// not depend on the order of `masses`, and appending a BBA that supports a
+/// hypothesis can never lower that hypothesis's pignistic probability (the
+/// numerator only gains, the normaliser only shrinks). See
+/// `tests/supports_monotonicity.rs`.
+///
+/// History (drain unit U025, backlog 9d4821c1): this used to re-pick a rule
+/// per step via [`select_combination_rule`] (Dempster / CDST conjunctive /
+/// Yager-open / Inagaki). Because the choice depended on accumulated state and
+/// the inputs are re-sorted on every call, appending one BBA re-routed earlier
+/// steps; the result was non-monotone under supporting evidence, and the
+/// Inagaki arms seeded and then ratcheted mass on `(Omega, true)` on closed
+/// frames (claim f8cf28d0). [`select_combination_rule`] and
+/// [`CombinationRule`] are kept as public API but are no longer consulted here.
+///
+/// Conflict stays visible in the per-step [`CombinationReport::conflict_k`];
+/// use [`aggregate_conflict`] for the fold-level value. Mass on
+/// `(Omega, true)` intersects every positive element to the empty set, so it
+/// is treated as conflict and normalised away like any other conflict.
+///
+/// **Total conflict.** If a single step has `K_c ≈ 1` (Dempster undefined),
+/// that step alone falls back to Yager's closed-world rule (all conflict to
+/// Theta) and is reported as [`CombinationMethod::YagerClosed`], rather than
+/// failing the whole fold. That fallback is NOT associative: it resets the
+/// accumulated mass to Theta, discarding what was folded before it, so with
+/// categorical opposing inputs the outcome depends on where the fallback step
+/// falls in the fold (e.g. `[T=1, F=1]` folds to Theta, while adding a third
+/// `F=1` can fold to `F=1`). The canonical sort below keeps it deterministic
+/// for a given input multiset, and [`aggregate_conflict`] is then 1.0.
 ///
 /// The `_conflict_threshold` parameter is retained for backward compatibility
-/// but is no longer used; rule selection is fully adaptive.
+/// but is unused.
 ///
-/// Inputs are sorted via [`canonical_mass_cmp`] before folding so the result
-/// is independent of the caller's iteration order. Without the sort, the
-/// adaptive rule selection (which depends on accumulated state) made the fold
-/// non-commutative: reordering evidence could switch between Dempster,
-/// CdstConjunctive, and Inagaki rules and produce different final masses.
+/// Inputs are still sorted via [`canonical_mass_cmp`] before folding; with an
+/// associative rule this only makes the floating-point result bit-for-bit
+/// reproducible across caller iteration orders. When a total-conflict
+/// fallback step occurs, the sort is also what makes the (order-dependent)
+/// outcome independent of the caller's order.
 ///
 /// # Errors
 /// - `DsError::InsufficientSources` if `masses` is empty
 /// - `DsError::IncompatibleFrames` if any frames differ
-/// - `DsError::TotalConflict` if pairwise Dempster combination hits K ≈ 1.0
 pub fn combine_multiple(
     masses: &[MassFunction],
     _conflict_threshold: f64,
@@ -539,33 +605,14 @@ pub fn combine_multiple(
 
     for m in &sorted[1..] {
         let k = conflict_coefficient(&accumulated, m)?;
-        let owf = accumulated.open_world_fraction();
-        let rule = select_combination_rule(k, owf);
 
-        let (combined, method_used) = match rule {
-            CombinationRule::Dempster => {
-                let result = dempster_combine(&accumulated, m)?;
-                (result, CombinationMethod::Dempster)
-            }
-            CombinationRule::CdstConjunctive => {
-                let result = conjunctive_combine(&accumulated, m)?;
-                (result, CombinationMethod::Conjunctive)
-            }
-            CombinationRule::YagerOpen => {
-                // Route conflict to missing=(Omega,true) not vacuous=(empty,true).
-                // Vacuous is a neutral pass-through in cdst_intersect: it distributes
-                // to Theta in subsequent steps, inflating Pl regardless of refutation
-                // (the one-way ratchet). Missing creates genuine conflict with all
-                // positives, so Pl contracts correctly as contradicting evidence accumulates.
-                // Inagaki(γ=1.0) sends all conflict K to missing — equivalent semantics
-                // to YagerOpen's open-world intent but without the ratchet.
-                let result = inagaki_combine(&accumulated, m, 1.0)?;
-                (result, CombinationMethod::Inagaki)
-            }
-            CombinationRule::Inagaki => {
-                let result = inagaki_combine(&accumulated, m, 0.5)?;
-                (result, CombinationMethod::Inagaki)
-            }
+        let (combined, method_used) = match dempster_combine(&accumulated, m) {
+            Ok(result) => (result, CombinationMethod::Dempster),
+            Err(DsError::TotalConflict) => (
+                yager_closed_combine(&accumulated, m)?,
+                CombinationMethod::YagerClosed,
+            ),
+            Err(e) => return Err(e),
         };
 
         reports.push(CombinationReport {
@@ -1726,70 +1773,229 @@ mod tests {
         assert!(result.mass_of_conflict() < 1e-10);
     }
 
+    // U025 (backlog 9d4821c1): combine_multiple no longer re-selects a rule per
+    // step; every step is Dempster. The three tests below used to pin the
+    // adaptive selector's Inagaki / YagerOpen routing and now pin the
+    // replacement on the same inputs.
+
     #[test]
-    fn combine_multiple_uses_different_rules_for_high_conflict() {
+    fn combine_multiple_uses_dempster_for_high_conflict() {
         let frame = binary_frame();
         // Highly conflicting sources: K = 0.9 * 0.9 = 0.81
         let m1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.9).unwrap();
         let m2 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.9).unwrap();
 
-        let (_result, reports) = combine_multiple(&[m1, m2], 0.1).unwrap();
+        let (result, reports) = combine_multiple(&[m1, m2], 0.1).unwrap();
         assert_eq!(reports.len(), 1);
-        // K = 0.81 >= 0.5, and both sources are classical (owf=0), so Inagaki
-        assert_eq!(reports[0].method_used, CombinationMethod::Inagaki);
+        assert_eq!(reports[0].method_used, CombinationMethod::Dempster);
+        // Conflict is still reported even though it is normalised out of the mass.
+        assert!((reports[0].conflict_k - 0.81).abs() < 1e-12);
+        assert!(result.mass_of_conflict() < 1e-12);
+        // Closed-world inputs stay closed-world: nothing parked on (Omega, true).
+        assert!(result.mass_of_missing() < 1e-12);
+        // m({0}) = 0.9 * 0.1 / (1 - 0.81) = 0.09 / 0.19
+        let fe0 = FocalElement::positive(BTreeSet::from([0]));
+        assert!((result.mass_of(&fe0) - 0.09 / 0.19).abs() < 1e-12);
     }
 
     #[test]
-    fn combine_multiple_high_conflict_differs_from_pure_dempster() {
+    fn combine_multiple_high_conflict_equals_pure_dempster() {
         let frame = binary_frame();
         let m1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.9).unwrap();
         let m2 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.9).unwrap();
 
-        let (adaptive_result, _) = combine_multiple(&[m1.clone(), m2.clone()], 0.1).unwrap();
+        let (folded, _) = combine_multiple(&[m1.clone(), m2.clone()], 0.1).unwrap();
         let dempster_result = dempster_combine(&m1, &m2).unwrap();
 
-        // With K=0.81, adaptive selects Inagaki, not Dempster
-        // Results must differ
-        let fe0 = FocalElement::positive(BTreeSet::from([0]));
-        let adaptive_m0 = adaptive_result.mass_of(&fe0);
-        let dempster_m0 = dempster_result.mass_of(&fe0);
-        assert!(
-            (adaptive_m0 - dempster_m0).abs() > 1e-6,
-            "Adaptive ({adaptive_m0}) should differ from Dempster ({dempster_m0}) at high conflict"
-        );
+        for (fe, &mass) in dempster_result.masses() {
+            assert!(
+                (folded.mass_of(fe) - mass).abs() < 1e-12,
+                "combine_multiple diverged from dempster_combine on {fe:?}"
+            );
+        }
+        assert_eq!(folded.masses().len(), dempster_result.masses().len());
     }
 
     #[test]
-    fn combine_multiple_open_world_uses_inagaki_full() {
-        // Renamed: the adaptive selector now routes YagerOpen-regime to Inagaki(γ=1.0)
-        // to prevent the plausibility one-way ratchet (vacuous pass-through bug).
+    fn combine_multiple_open_world_input_uses_dempster() {
+        // The input that used to select YagerOpen (K_c = 0.54, owf = 0.3) now
+        // folds with Dempster like any other pair.
         let frame = binary_frame();
-        // positive({0})=0.6 × positive({1})=0.9 → K_c=0.54 ≥ 0.5, owf=0.3 > 0.03
-        // → select_combination_rule returns YagerOpen
         let mut masses1 = BTreeMap::new();
         masses1.insert(FocalElement::positive(BTreeSet::from([0])), 0.6);
         masses1.insert(FocalElement::negative(BTreeSet::from([0])), 0.3); // complement → owf
         masses1.insert(FocalElement::theta(&frame), 0.1);
         let m1 = MassFunction::new(frame.clone(), masses1).unwrap();
-
-        // Second source disagrees strongly
         let m2 = MassFunction::simple(frame, BTreeSet::from([1]), 0.9).unwrap();
 
         let k = conflict_coefficient(&m1, &m2).unwrap();
         assert!(
             k >= 0.5,
-            "test requires K≥0.5 to hit YagerOpen rule; got {k}"
+            "input must be in the old high-conflict regime; got {k}"
         );
-        assert!(m1.open_world_fraction() > 0.03, "test requires owf>0.03");
+        assert!(m1.open_world_fraction() > 0.03, "input must be open-world");
+        assert_eq!(
+            select_combination_rule(k, m1.open_world_fraction()),
+            CombinationRule::YagerOpen,
+            "the old selector would have routed this pair to YagerOpen"
+        );
 
-        // High owf+high K → YagerOpen rule selected, routed to Inagaki(γ=1.0) to avoid ratchet.
-        let (_result, reports) = combine_multiple(&[m1, m2], 0.1).unwrap();
-        assert_eq!(reports[0].method_used, CombinationMethod::Inagaki);
+        let (result, reports) = combine_multiple(&[m1.clone(), m2.clone()], 0.1).unwrap();
+        assert_eq!(reports[0].method_used, CombinationMethod::Dempster);
+        let expected = dempster_combine(&m1, &m2).unwrap();
+        for (fe, &mass) in expected.masses() {
+            assert!((result.mass_of(fe) - mass).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn combine_multiple_total_conflict_step_falls_back_to_yager_closed() {
+        // Two categorical, opposing BBAs: K = 1, Dempster is undefined. The
+        // fold must not fail (it would abort a whole claim recompute); that one
+        // step falls back to Yager closed-world (conflict -> Theta).
+        let frame = binary_frame();
+        let yes = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 1.0).unwrap();
+        let no = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 1.0).unwrap();
+        assert!(matches!(
+            dempster_combine(&yes, &no),
+            Err(DsError::TotalConflict)
+        ));
+
+        let (result, reports) = combine_multiple(&[yes, no], 0.9).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].method_used, CombinationMethod::YagerClosed);
+        assert!((reports[0].conflict_k - 1.0).abs() < 1e-12);
+        assert!((result.mass_of(&FocalElement::theta(&frame)) - 1.0).abs() < 1e-12);
+        assert!(result.mass_of_missing() < 1e-12);
+        assert!((aggregate_conflict(&reports) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn total_conflict_fallback_mid_fold_is_deterministic_across_caller_orders() {
+        // Three inputs where the YagerClosed fallback fires mid-fold. The
+        // fallback is not associative (it resets the accumulated mass to
+        // Theta), so a naive left fold gives different BetP(TRUE) for
+        // different input orders (0.25 vs 0.5 here). combine_multiple's
+        // canonical sort must make every caller order produce the SAME
+        // result, and the fold must report total conflict.
+        let frame = binary_frame();
+        let t1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 1.0).unwrap();
+        let f1 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 1.0).unwrap();
+        let f05 = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.5).unwrap();
+
+        // Precondition: the fold really is order-dependent without the sort.
+        let naive = |ms: [&MassFunction; 3]| -> f64 {
+            let mut acc = ms[0].clone();
+            for m in &ms[1..] {
+                acc = match dempster_combine(&acc, m) {
+                    Ok(r) => r,
+                    Err(DsError::TotalConflict) => yager_closed_combine(&acc, m).unwrap(),
+                    Err(e) => panic!("{e}"),
+                };
+            }
+            crate::measures::pignistic_probability(&acc, 0)
+        };
+        let a = naive([&t1, &f1, &f05]);
+        let b = naive([&f05, &t1, &f1]);
+        assert!(
+            (a - b).abs() > 0.1,
+            "precondition: naive fold should be order-dependent here ({a} vs {b})"
+        );
+
+        let orders: [[&MassFunction; 3]; 6] = [
+            [&t1, &f1, &f05],
+            [&t1, &f05, &f1],
+            [&f1, &t1, &f05],
+            [&f1, &f05, &t1],
+            [&f05, &t1, &f1],
+            [&f05, &f1, &t1],
+        ];
+        let (reference, ref_reports) = combine_multiple(&orders[0].map(Clone::clone), 0.9).unwrap();
+        assert!(
+            ref_reports
+                .iter()
+                .any(|r| r.method_used == CombinationMethod::YagerClosed),
+            "a step must hit total conflict: {ref_reports:?}"
+        );
+        assert!((aggregate_conflict(&ref_reports) - 1.0).abs() < 1e-12);
+
+        for order in &orders[1..] {
+            let (result, reports) = combine_multiple(&order.map(Clone::clone), 0.9).unwrap();
+            assert_eq!(
+                result.masses(),
+                reference.masses(),
+                "caller order changed the result of a fold with a fallback step"
+            );
+            assert_eq!(reports.len(), ref_reports.len());
+            assert!((aggregate_conflict(&reports) - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn aggregate_conflict_equals_unnormalised_conjunctive_conflict() {
+        // For a Dempster fold, 1 - prod(1 - K_i) must equal the empty-set mass
+        // of the unnormalised conjunctive (TBM) combination of all inputs.
+        // Checked against an independent computation, not against itself.
+        let frame = binary_frame();
+        let ms = [
+            MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.7).unwrap(),
+            MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.6).unwrap(),
+            MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.4).unwrap(),
+            MassFunction::simple(frame.clone(), BTreeSet::from([1]), 0.8).unwrap(),
+        ];
+        let (_, reports) = combine_multiple(&ms, 0.9).unwrap();
+        assert_eq!(reports.len(), 3);
+
+        let mut tbm = ms[0].clone();
+        for m in &ms[1..] {
+            tbm = conjunctive_combine(&tbm, m).unwrap();
+        }
+        let expected = tbm.mass_of_conflict();
+        let got = aggregate_conflict(&reports);
+        assert!(
+            expected > 0.5,
+            "inputs must actually conflict; got {expected}"
+        );
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "aggregate_conflict {got} != TBM conflict {expected}"
+        );
+        // It is not just the last step's K.
+        assert!(got > reports.last().unwrap().conflict_k + 1e-6);
+        assert_eq!(aggregate_conflict(&[]), 0.0);
+    }
+
+    #[test]
+    fn fold_conflict_reads_input_conflict_without_a_fold_and_aggregate_with_one() {
+        let frame = binary_frame();
+        // A single stored BBA that itself carries conflict mass (as a
+        // cautious-combined or TBM-stored row can): no fold, so its own
+        // empty-set mass is the conflict.
+        let mut raw = BTreeMap::new();
+        raw.insert(FocalElement::conflict(), 0.2);
+        raw.insert(FocalElement::positive(BTreeSet::from([0])), 0.5);
+        raw.insert(FocalElement::theta(&frame), 0.3);
+        let lone = MassFunction::from_raw(frame.clone(), raw);
+        let (c1, r1) = combine_multiple(std::slice::from_ref(&lone), 0.9).unwrap();
+        assert!(r1.is_empty());
+        assert!((fold_conflict(&c1, &r1) - 0.2).abs() < 1e-12);
+
+        // Two opposing BBAs: Dempster leaves 0 on the empty set, but the fold
+        // saw K = 0.56; fold_conflict must report the latter.
+        let a = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.8).unwrap();
+        let b = MassFunction::simple(frame, BTreeSet::from([1]), 0.7).unwrap();
+        let (c2, r2) = combine_multiple(&[a, b], 0.9).unwrap();
+        assert!(c2.mass_of_conflict() < 1e-12);
+        assert!((fold_conflict(&c2, &r2) - 0.56).abs() < 1e-12);
     }
 
     // ======== Plausibility ratchet regression ========
 
     /// Regression: plausibility must NOT be a one-way ratchet.
+    ///
+    /// U025: combine_multiple now folds with Dempster at every step, so the
+    /// routing pin below asserts Dempster (it used to assert Inagaki(γ=1.0));
+    /// the Pl assertions are unchanged and still hold.
     ///
     /// Scenario: accumulated BBA has high open_world_fraction (triggers YagerOpen path).
     /// A new supporting BBA is combined. Then a strongly contradicting BBA is combined.
@@ -1822,13 +2028,14 @@ mod tests {
 
         let fe_h0 = FocalElement::positive(h0.clone());
 
-        // Step 1: combine accumulated + support (triggers YagerOpen/Inagaki path)
+        // Step 1: combine accumulated + support (the old YagerOpen regime)
         let (after_support, reports1) = combine_multiple(&[accumulated, support], 0.1).unwrap();
-        // Pin the routing: if this ever reverts to YagerOpen the ratchet will silently return.
+        // Pin the routing (U025): one associative rule per step, never the
+        // vacuous-pass-through YagerOpen that caused the plausibility ratchet.
         assert_eq!(
             reports1[0].method_used,
-            CombinationMethod::Inagaki,
-            "YagerOpen-regime must route to Inagaki to prevent the plausibility ratchet"
+            CombinationMethod::Dempster,
+            "combine_multiple must fold with Dempster at every step (U025)"
         );
         let pl_after_support = plausibility(&after_support, &fe_h0);
 

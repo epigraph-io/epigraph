@@ -155,7 +155,9 @@ pub struct SubmitEvidenceRequest {
     /// `epigraph_engine::belief_query::get_perspective_belief`.
     #[serde(default)]
     pub evidence_type: Option<String>,
-    /// Conflict threshold for adaptive combination
+    /// Conflict K at or above which a `conflict.detected` event is emitted.
+    /// Since U025 it no longer selects a combination rule: `combine_multiple`
+    /// folds with Dempster at every step.
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Mass assignments: keys are comma-separated hypothesis indices, values are mass.
@@ -1304,7 +1306,7 @@ pub async fn submit_evidence(
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
     for_combination.extend(group_results);
 
-    // 10c. Standard adaptive combination on the now-independent set
+    // 10c. Dempster fold (`combine_multiple`, U025) on the now-independent set
     let (combined, reports) = if for_combination.len() <= 1 {
         (
             for_combination
@@ -1333,7 +1335,8 @@ pub async fn submit_evidence(
 
     let (final_bel, final_pl, final_betp, m_missing) =
         compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
+    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
+    let m_empty = combination::fold_conflict(&combined, &reports);
 
     // 12. Read old belief/plausibility before updating (for event payload)
     let old_row: Option<(Option<f64>, Option<f64>)> =
@@ -1596,7 +1599,7 @@ pub async fn submit_evidence(
             {
                 let (p_bel, p_pl, p_betp, p_m_missing) =
                     compute_hypothesis_belief(&p_combined, &ds_frame, h_idx);
-                let p_m_empty = p_combined.mass_of_empty();
+                let p_m_empty = combination::fold_conflict(&p_combined, &p_reports);
                 let p_k = p_reports.last().map(|r| r.conflict_k);
                 let p_method_str = p_reports.last().map(|r| format!("{:?}", r.method_used));
                 let p_method = p_method_str.as_deref();
@@ -1727,7 +1730,7 @@ pub async fn submit_evidence(
                         ) {
                             let (c_bel, c_pl, c_betp, c_m_missing) =
                                 compute_hypothesis_belief(&c_combined, &ds_frame, h_idx);
-                            let c_m_empty = c_combined.mass_of_empty();
+                            let c_m_empty = combination::fold_conflict(&c_combined, &c_reports);
                             let c_k = c_reports.last().map(|r| r.conflict_k);
                             let c_method_str =
                                 c_reports.last().map(|r| format!("{:?}", r.method_used));
@@ -2405,7 +2408,7 @@ pub async fn get_pignistic(
     }
 
     // Combine (or use single BBA if only one)
-    let (combined, _) = if masses.len() == 1 {
+    let (combined, reports) = if masses.len() == 1 {
         (masses.into_iter().next().unwrap(), vec![])
     } else {
         combination::combine_multiple(&masses, 0.3).map_err(|e| ApiError::InternalError {
@@ -2413,7 +2416,8 @@ pub async fn get_pignistic(
         })?
     };
 
-    let m_empty = combined.mass_of_empty();
+    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
+    let m_empty = combination::fold_conflict(&combined, &reports);
     let m_missing = combined.mass_of_missing();
 
     let hypotheses = frame_row
