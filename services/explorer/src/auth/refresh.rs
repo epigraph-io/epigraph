@@ -84,8 +84,14 @@ pub async fn refresh_session(
     ) {
         // The session ended while the refresh was in flight (housekeeping
         // purged it; it was replaced). Upstream has already rotated, so the
-        // refresh token just minted is live and nothing holds it any more.
-        oauth::revoke_abandoned(state, &tokens.refresh_token, "session ended during refresh").await;
+        // pair just minted is live and nothing holds it any more.
+        oauth::revoke_pair(
+            state,
+            &access_token,
+            &tokens.refresh_token,
+            "session ended during refresh",
+        )
+        .await;
         return Err(RefreshError::NoSession);
     }
     // Upstream may widen (or narrow) the scope on any refresh.
@@ -101,12 +107,15 @@ pub async fn refresh_session(
     Ok(access_token)
 }
 
-/// End session `id` and revoke the refresh token it holds, best effort, as
-/// logout does. It first waits out an in-flight refresh (the session's
-/// refresh lock), so the token revoked is the latest rotation, not one that
-/// was replaced a moment later. `held_by` names the path in the log line. A
-/// session that is already gone is a no-op. The caller must not hold this
-/// session's refresh lock.
+/// End session `id` and revoke both tokens it holds, best effort and at
+/// once ([`oauth::revoke_pair`]), as logout does: the refresh token, so the
+/// session cannot be renewed, and the access token, so it is refused
+/// upstream now instead of staying usable for the rest of its hour. It
+/// first waits out an in-flight refresh (the session's refresh lock), so
+/// the tokens revoked are the latest rotation, not ones that were replaced
+/// a moment later. `held_by` names the path in the log line. A session that
+/// is already gone is a no-op. The caller must not hold this session's
+/// refresh lock.
 pub async fn end_session_revoking(state: &AppState, id: &SessionId, held_by: &'static str) {
     let lock = state.sessions.refresh_lock(id);
     let _guard = match &lock {
@@ -114,13 +123,21 @@ pub async fn end_session_revoking(state: &AppState, id: &SessionId, held_by: &'s
         None => None,
     };
     if let Some(session) = state.sessions.remove(id) {
-        oauth::revoke_abandoned(state, &session.refresh_token, held_by).await;
+        oauth::revoke_pair(
+            state,
+            &session.access_token,
+            &session.refresh_token,
+            held_by,
+        )
+        .await;
     }
 }
 
 /// The refresh's outcome is unknown: drop the session (the caller holds its
 /// refresh lock) and revoke the refresh token it held. Revocation is best
 /// effort, as at logout, and presents the token to `/oauth/revoke` only.
+/// The session's access token is not revoked here: a refresh runs only once
+/// that token has been refused or is within a minute of expiry.
 ///
 /// What this guarantees is that the session ends and the held token is never
 /// sent to `/oauth/token` again. The revocation helps only when upstream did

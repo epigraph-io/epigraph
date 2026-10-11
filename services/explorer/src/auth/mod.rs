@@ -21,10 +21,10 @@
 //!   (`static/embed.js`).
 //! - `POST /auth/redeem` (Origin-checked) swaps that code for a new session
 //!   and the `SameSite=None; Partitioned` cookie the iframe can hold. A code
-//!   that expires unredeemed has its refresh token revoked (by housekeeping,
-//!   or by the late redeem).
-//! - `POST /auth/logout` (Origin-checked) revokes the refresh token upstream,
-//!   drops the session and clears both cookies.
+//!   that expires unredeemed has its tokens revoked (by housekeeping, or by
+//!   the late redeem).
+//! - `POST /auth/logout` (Origin-checked) revokes the session's refresh and
+//!   access tokens upstream, drops the session and clears both cookies.
 
 use axum::body::Bytes;
 use axum::extract::{Query, Request, State};
@@ -506,9 +506,15 @@ async fn redeem(
     let tokens = match held {
         Some(Ok(handoff)) => handoff.tokens,
         Some(Err(expired)) => {
-            // Too late: nothing will redeem this code again, so its refresh
-            // token is revoked now rather than left live upstream.
-            oauth::revoke_abandoned(&state, &expired.tokens.refresh_token, "expired handoff").await;
+            // Too late: nothing will redeem this code again, so its tokens
+            // are revoked now rather than left live upstream.
+            oauth::revoke_pair(
+                &state,
+                &expired.tokens.access_token,
+                &expired.tokens.refresh_token,
+                "expired handoff",
+            )
+            .await;
             return Err(handoff_refused());
         }
         None => return Err(handoff_refused()),

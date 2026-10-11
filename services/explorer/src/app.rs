@@ -227,9 +227,10 @@ const HOUSEKEEPING_REVOKE_CONCURRENCY: usize = 4;
 
 /// One housekeeping pass: purge sessions created more than
 /// `session_max_age` ago, expired pending logins and handoff codes, and
-/// expired cache entries, then revoke the refresh tokens the purged
-/// sessions and the expired handoffs still held (nothing will present them
-/// again; a session's may have been rotated recently and still be live).
+/// expired cache entries, then revoke the token pairs the purged sessions
+/// and the expired handoffs still held (nothing will present them again; a
+/// session's may have been rotated recently and still be live, and an
+/// unredeemed handoff's access token is under a minute old).
 /// The revocations are awaited, a few at a time, before the pass returns.
 pub async fn housekeep(state: &AppState, session_max_age: chrono::Duration) {
     let purged = state.sessions.purge_older_than(session_max_age);
@@ -241,17 +242,17 @@ pub async fn housekeep(state: &AppState, session_max_age: chrono::Duration) {
     }
     let abandoned = purged
         .into_iter()
-        .map(|s| (s.refresh_token, "purged session"))
+        .map(|s| (s.access_token, s.refresh_token, "purged session"))
         .chain(
             unredeemed
                 .into_iter()
-                .map(|t| (t.refresh_token, "expired handoff")),
+                .map(|t| (t.access_token, t.refresh_token, "expired handoff")),
         );
     futures::stream::iter(abandoned)
         .for_each_concurrent(
             HOUSEKEEPING_REVOKE_CONCURRENCY,
-            |(refresh_token, held_by)| async move {
-                auth::oauth::revoke_abandoned(state, &refresh_token, held_by).await;
+            |(access_token, refresh_token, held_by)| async move {
+                auth::oauth::revoke_pair(state, &access_token, &refresh_token, held_by).await;
             },
         )
         .await;

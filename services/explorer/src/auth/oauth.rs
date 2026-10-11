@@ -268,10 +268,26 @@ fn refresh_error(e: TokenError) -> RefreshError {
 }
 
 /// `POST /oauth/revoke` with the JSON body `{token, token_type_hint:
-/// "refresh_token"}` (JSON only upstream, `oauth/revoke.rs::revoke_endpoint`). Revoking the
-/// access token would only reach one API process's memory, so logout
-/// revokes the refresh token and lets the access token run out.
+/// "refresh_token"}` (JSON only upstream, `oauth/revoke.rs::revoke_endpoint`).
 pub async fn revoke_refresh_token(state: &AppState, refresh_token: &str) -> Result<(), TokenError> {
+    revoke(state, refresh_token, "refresh_token").await
+}
+
+/// `POST /oauth/revoke` with `{token, token_type_hint: "access_token"}`. On
+/// an API built from main this writes the token's id to a durable denylist
+/// that every API process, introspection and the MCP transport read
+/// (migration 141), so the token is refused from then on instead of
+/// running out its hour. An older build kept that list in one process's
+/// memory, where it reached only the process that answered.
+pub async fn revoke_access_token(state: &AppState, access_token: &str) -> Result<(), TokenError> {
+    revoke(state, access_token, "access_token").await
+}
+
+async fn revoke(
+    state: &AppState,
+    token: &str,
+    token_type_hint: &'static str,
+) -> Result<(), TokenError> {
     #[derive(Serialize)]
     struct RevokeRequest<'a> {
         token: &'a str,
@@ -284,8 +300,8 @@ pub async fn revoke_refresh_token(state: &AppState, refresh_token: &str) -> Resu
         .timeout(up.timeout())
         .header(ACCEPT, "application/json")
         .json(&RevokeRequest {
-            token: refresh_token,
-            token_type_hint: "refresh_token",
+            token,
+            token_type_hint,
         })
         .send()
         .await
@@ -308,6 +324,28 @@ pub async fn revoke_abandoned(state: &AppState, refresh_token: &str, held_by: &'
     if let Err(e) = revoke_refresh_token(state, refresh_token).await {
         tracing::warn!(error = %e, held_by, "revoking an abandoned refresh token failed");
     }
+}
+
+/// Revoke a token pair nothing will use again, both tokens at once and best
+/// effort ([`revoke_abandoned`] for the refresh token, the same for the
+/// access token). Ending a live session goes through this, so a signed-out
+/// session's access token is refused upstream at once rather than staying
+/// usable until it expires. An empty token is skipped.
+pub async fn revoke_pair(
+    state: &AppState,
+    access_token: &str,
+    refresh_token: &str,
+    held_by: &'static str,
+) {
+    let access = async {
+        if access_token.is_empty() {
+            return;
+        }
+        if let Err(e) = revoke_access_token(state, access_token).await {
+            tracing::warn!(error = %e, held_by, "revoking an abandoned access token failed");
+        }
+    };
+    tokio::join!(access, revoke_abandoned(state, refresh_token, held_by));
 }
 
 /// POST a form to `{api}/oauth/token` and return the 2xx body, or the

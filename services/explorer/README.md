@@ -678,9 +678,14 @@ if the login response's cookie starts `__Host-` and the startup log
   depth behind the `__Host-` prefix: on its own it cannot remove a cookie
   another host set with `Domain=`.
 - **Logout** is a `POST /auth/logout`, checked against Origin. It revokes the
-  refresh token upstream and drops the session. An already-issued access token
-  stays valid upstream until it expires (at most 1 hour), because the API's
-  access-token revocation is in-memory in one process.
+  session's refresh token and its access token upstream, at once and best
+  effort, and drops the session. On an API built from current main an
+  access-token revocation is durable and shared by every API process, so the
+  token is refused from then on. On an older build it reached only the one
+  process that answered, and elsewhere the token stayed valid until it
+  expired (at most 1 hour). A session replaced by a new sign-in in the same
+  browser, an unredeemed handoff and a session purged by housekeeping have
+  both tokens revoked the same way.
 - **Headers.** Every response carries:
 
   ```
@@ -725,8 +730,8 @@ if the login response's cookie starts `__Host-` and the startup log
 
   Until the redeem, the handoff holds the token set. A handoff never redeemed
   leaves no session: once its 60-second code expires, the next housekeeping
-  pass (every minute) revokes the refresh token it held. Sessions are also
-  dropped 30 days after sign-in, and their refresh tokens are revoked then.
+  pass (every minute) revokes the tokens it held. Sessions are also
+  dropped 30 days after sign-in, and their tokens are revoked then.
 
   **Which sites may frame the Explorer** is `EPIGRAPH_EXPLORER_FRAME_ANCESTORS`.
   Its default, `https://www.notion.so https://*.notion.so https://*.notion.site`,

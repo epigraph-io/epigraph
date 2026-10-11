@@ -1138,6 +1138,22 @@ async fn revocations_of(app: &TestApp, refresh_token: &str) -> usize {
         .count()
 }
 
+/// How many `POST /oauth/revoke` requests named `access_token` as an access
+/// token (`token_type_hint: "access_token"`).
+async fn access_revocations_of(app: &TestApp, access_token: &str) -> usize {
+    app.upstream
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/oauth/revoke")
+        .filter(|r| {
+            serde_json::from_slice::<Value>(&r.body).ok()
+                == Some(json!({"token": access_token, "token_type_hint": "access_token"}))
+        })
+        .count()
+}
+
 /// `/oauth/token` stalls past the token timeout ONCE for `r1`, then answers
 /// at once with a fresh pair, so a replay of `r1` would be seen (and would
 /// succeed quickly) rather than hang. `/oauth/revoke` accepts anything.
@@ -1311,8 +1327,11 @@ async fn post_logout(app: &TestApp, sid: Option<&SessionId>, origin: Option<&str
     send_with(app, Method::POST, "/explorer/auth/logout", &h, "").await
 }
 
+/// Logout revokes both tokens the session holds: the refresh token, so the
+/// session cannot be renewed, and the access token, so the API refuses it
+/// from now on instead of honouring it for the rest of its hour.
 #[tokio::test]
-async fn logout_revokes_the_refresh_token_and_clears_both_cookies() {
+async fn logout_revokes_both_tokens_and_clears_both_cookies() {
     let app = app().await;
     let sid = app
         .state
@@ -1323,6 +1342,16 @@ async fn logout_revokes_the_refresh_token_and_clears_both_cookies() {
         .and(header("content-type", "application/json"))
         .and(body_json(
             json!({"token": "r1", "token_type_hint": "refresh_token"}),
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .and(header("content-type", "application/json"))
+        .and(body_json(
+            json!({"token": "a1", "token_type_hint": "access_token"}),
         ))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
@@ -1348,6 +1377,7 @@ async fn logout_revokes_the_refresh_token_and_clears_both_cookies() {
     // Signed out already: still a clean redirect, nothing revoked.
     let res = post_logout(&app, None, Some(ORIGIN)).await;
     assert_eq!(res.status, StatusCode::SEE_OTHER);
+    app.upstream.verify().await;
 }
 
 #[tokio::test]
@@ -1376,10 +1406,11 @@ async fn logout_refuses_cross_origin_posts() {
 #[tokio::test]
 async fn logout_survives_a_failed_revocation() {
     let app = app().await;
+    // Both revocations are attempted, and both fail.
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
         .respond_with(ResponseTemplate::new(500))
-        .expect(1)
+        .expect(2)
         .mount(&app.upstream)
         .await;
     let sid = app.sign_in("a1");
@@ -1454,6 +1485,12 @@ async fn logout_during_a_refresh_revokes_the_rotated_token_once() {
         0,
         "logout waited for the refresh: the rotated-out token is not presented"
     );
+    assert_eq!(
+        access_revocations_of(&app, "a2").await,
+        1,
+        "and the access token revoked is the refreshed one"
+    );
+    assert_eq!(access_revocations_of(&app, "a1").await, 0);
     app.upstream.verify().await;
 }
 
@@ -1556,13 +1593,13 @@ async fn redeem_handoff(app: &TestApp, code: &str) -> TestResponse {
 }
 
 /// An embed sign-in whose handoff is never redeemed (the iframe was closed,
-/// the redeem POST was lost) leaves no live refresh token behind: the
-/// callback holds the minted tokens in the handoff, not in a session, and
-/// when the handoff expires housekeeping revokes the refresh token it held.
+/// the redeem POST was lost) leaves no live token behind: the callback holds
+/// the minted tokens in the handoff, not in a session, and when the handoff
+/// expires housekeeping revokes both tokens it held.
 #[tokio::test]
 async fn an_unredeemed_handoff_leaves_no_live_refresh_token() {
     let app = app().await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let code = popup_sign_in(&app, "claims:read").await;
     assert!(
         app.state.sessions.is_empty(),
@@ -1585,6 +1622,11 @@ async fn an_unredeemed_handoff_leaves_no_live_refresh_token() {
         "the expired handoff's refresh token is revoked"
     );
     assert_eq!(
+        access_revocations_of(&app, "access-1").await,
+        1,
+        "and its access token"
+    );
+    assert_eq!(
         token_posts_presenting(&app, "refresh-1").await,
         0,
         "and never presented to /oauth/token"
@@ -1593,6 +1635,7 @@ async fn an_unredeemed_handoff_leaves_no_live_refresh_token() {
     // Nothing is left to revoke on a later pass.
     explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
     assert_eq!(revocations_of(&app, "refresh-1").await, 1);
+    assert_eq!(access_revocations_of(&app, "access-1").await, 1);
 }
 
 /// The twin: redeeming the handoff creates exactly one session, from the
@@ -1643,7 +1686,7 @@ async fn a_redeemed_handoff_yields_exactly_one_session() {
 #[tokio::test]
 async fn redeeming_an_expired_handoff_revokes_its_tokens() {
     let app = app().await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let code = popup_sign_in(&app, "claims:read").await;
     expire_handoff(&app, &code);
 
@@ -1653,15 +1696,16 @@ async fn redeeming_an_expired_handoff_revokes_its_tokens() {
     assert!(app.state.sessions.is_empty());
     assert!(app.state.auth_flow.handoffs.is_empty());
     assert_eq!(revocations_of(&app, "refresh-1").await, 1);
+    assert_eq!(access_revocations_of(&app, "access-1").await, 1);
 }
 
 /// Housekeeping drops a session created longer ago than the maximum age.
-/// Its refresh token may have been rotated recently and still be live
-/// upstream, so it is revoked, not just forgotten.
+/// Its tokens may have been rotated recently and still be live upstream, so
+/// both are revoked, not just forgotten.
 #[tokio::test]
-async fn a_purged_session_revokes_its_refresh_token() {
+async fn a_purged_session_revokes_its_tokens() {
     let app = app().await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let sid =
         app.state
             .sessions
@@ -1671,11 +1715,13 @@ async fn a_purged_session_revokes_its_refresh_token() {
     explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
     assert!(app.state.sessions.get(&sid).is_some());
     assert_eq!(revocations_of(&app, "r-old").await, 0);
+    assert_eq!(access_revocations_of(&app, "a1").await, 0);
 
     // A negative limit makes every session too old.
     explorer_app::housekeep(&app.state, Duration::seconds(-1)).await;
     assert!(app.state.sessions.get(&sid).is_none());
     assert_eq!(revocations_of(&app, "r-old").await, 1);
+    assert_eq!(access_revocations_of(&app, "a1").await, 1);
 }
 
 /// Signing in again in a browser that already has a session replaces that
@@ -1684,7 +1730,7 @@ async fn a_purged_session_revokes_its_refresh_token() {
 #[tokio::test]
 async fn signing_in_again_revokes_the_replaced_sessions_refresh_token() {
     let app = app().await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let old = app.state.sessions.create(
         "a-old".into(),
         "r-old".into(),
@@ -1729,6 +1775,12 @@ async fn signing_in_again_revokes_the_replaced_sessions_refresh_token() {
         "the replaced session's refresh token is revoked"
     );
     assert_eq!(revocations_of(&app, "r-new").await, 0, "the new one is not");
+    assert_eq!(
+        access_revocations_of(&app, "a-old").await,
+        1,
+        "and so is its access token"
+    );
+    assert_eq!(access_revocations_of(&app, "a-new").await, 0);
     app.upstream.verify().await;
 }
 
@@ -1739,7 +1791,7 @@ async fn signing_in_again_revokes_the_replaced_sessions_refresh_token() {
 #[tokio::test]
 async fn redeeming_a_handoff_revokes_the_replaced_sessions_refresh_token() {
     let app = app().await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let old = app.state.sessions.create(
         "a-old".into(),
         "r-old".into(),
@@ -1779,6 +1831,12 @@ async fn redeeming_a_handoff_revokes_the_replaced_sessions_refresh_token() {
         0,
         "the redeemed one is not"
     );
+    assert_eq!(
+        access_revocations_of(&app, "a-old").await,
+        1,
+        "the replaced session's access token is revoked too"
+    );
+    assert_eq!(access_revocations_of(&app, "access-1").await, 0);
     app.upstream.verify().await;
 }
 
@@ -1799,7 +1857,7 @@ async fn a_session_refused_after_its_refresh_revokes_the_new_refresh_token() {
     .mount(&app.upstream)
     .await;
     mount_probe(&app, "a2", 401, 1).await;
-    mount_revoke(&app, 1).await;
+    mount_revoke(&app, 2).await;
     let sid = app
         .state
         .sessions
@@ -1817,6 +1875,11 @@ async fn a_session_refused_after_its_refresh_revokes_the_new_refresh_token() {
         revocations_of(&app, "r1").await,
         0,
         "r1 was rotated, not abandoned"
+    );
+    assert_eq!(
+        access_revocations_of(&app, "a2").await,
+        1,
+        "the refused access token is revoked with it"
     );
     app.upstream.verify().await;
 }
@@ -1873,6 +1936,14 @@ async fn a_session_ended_during_its_refresh_revokes_the_token_the_refresh_minted
         revocations_of(&app, "r1").await,
         1,
         "housekeeping revoked the token the session held when it was purged"
+    );
+    assert_eq!(
+        (
+            access_revocations_of(&app, "a2").await,
+            access_revocations_of(&app, "a1").await
+        ),
+        (1, 1),
+        "each pair is revoked whole: the minted one and the purged session's"
     );
     app.upstream.verify().await;
 }
@@ -2528,11 +2599,12 @@ async fn session_cookie_is_host_prefixed_at_root_when_secure() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     assert!(res.body.contains("started in this browser"), "{}", res.body);
 
-    // Logout reads the prefixed cookie and clears both prefixed entries.
+    // Logout reads the prefixed cookie, revokes the session's two tokens and
+    // clears both prefixed entries.
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(2)
         .mount(&app.upstream)
         .await;
     let res = send_with(
