@@ -2533,30 +2533,37 @@ async fn an_elevated_read_is_attributed_by_the_ids_its_request_names(pool: PgPoo
     assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
 }
 
-/// Every spelling a REQUEST names its subject in attributes the elevated
-/// read to it (final review F2-SEC-02), not only a hyphenated path id: an
-/// extension route that extracts `Path<Uuid>` serves the simple and the
-/// percent-encoded spellings as the same row while answering a constant, and
-/// each read is recorded with the group of the private claim the request
-/// named, and B reads every row. Calibration: each request is served (200),
-/// so the handler accepted the spelling.
+/// Every way a REQUEST names its subject attributes the elevated read to it
+/// (final review F2-SEC-02 and F2-TST-04), not only a hyphenated path id: an
+/// extension route that extracts `Path<Uuid>` (so it serves the simple and
+/// percent-encoded spellings as the same row) and one that reads its id from
+/// the query or the body, each answering a constant, are each recorded with
+/// the group of the private claim the request named, and B reads every row.
+/// Calibration: each request is served (200), so the handler accepted the
+/// spelling.
 ///
 /// Verified to fail with the request's ids scanned in the hyphenated form
-/// alone (the code before this test): the simple and percent-encoded path
-/// rows carry no group.
+/// alone (the simple and percent-encoded path rows carry no group), and with
+/// the query and body arms dropped (the path kept: the query and body rows
+/// carry no group).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_elevated_read_is_attributed_by_every_spelling_its_request_names(pool: PgPool) {
     let silent = RouterExtension::with_state(
         "silent",
-        Router::new().route(
-            "/claims/:id",
-            get(
-                |State(_): State<EmbedderState>,
-                 axum::extract::Path(_id): axum::extract::Path<Uuid>| async move {
-                    Json(json!({ "ok": true }))
-                },
+        Router::new()
+            .route(
+                "/claims/:id",
+                get(
+                    |State(_): State<EmbedderState>,
+                     axum::extract::Path(_id): axum::extract::Path<Uuid>| async move {
+                        Json(json!({ "ok": true }))
+                    },
+                ),
+            )
+            .route(
+                "/lookup",
+                get(|State(_): State<EmbedderState>| async move { Json(json!({ "ok": true })) }),
             ),
-        ),
         EmbedderState { marker: "silent" },
     )
     .expect("valid name");
@@ -2579,6 +2586,21 @@ async fn an_elevated_read_is_attributed_by_every_spelling_its_request_names(pool
             "percent-encoded path",
             format!("/api/v1/ext/silent/claims/{pct}"),
             None,
+        ),
+        (
+            "query",
+            format!("/api/v1/ext/silent/lookup?claim_id={claim}"),
+            None,
+        ),
+        (
+            "simple query",
+            format!("/api/v1/ext/silent/lookup?claim_id={simple}"),
+            None,
+        ),
+        (
+            "body",
+            "/api/v1/ext/silent/lookup".to_string(),
+            Some(json!({ "claim_id": claim })),
         ),
     ];
     for (what, path, body) in &requests {
