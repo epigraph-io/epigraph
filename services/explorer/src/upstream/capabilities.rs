@@ -23,16 +23,25 @@
 //! viewer's own slots or the global permits are all taken, it is not sent,
 //! and the answer is `Unknown` ([`UpstreamError::Busy`]). So a probe that was
 //! sent had its whole deadline in flight, and a timeout it meets is the
-//! API's, not the time it spent queued behind other calls.
+//! API's, not the time it spent queued behind other calls. That holds for
+//! both of its attempts: the first, and the retry after a 401 and a refresh.
+//! The refresh itself is not the probe's: its one introspection call
+//! (display only) queues like a page's call, so a probe that has to refresh
+//! while the permits are held can wait up to one upstream deadline for it,
+//! and then still answers `Unknown` without sending the retry.
 //!
 //! The two kinds of busy differ in reach. The viewer's own slots are that
 //! viewer's alone. The global permits are shared by every viewer, and all
 //! anonymous viewers share one per-viewer cap, so a few slow calls from other
-//! viewers can hold every global permit. While they do, every signed-in
-//! viewer's probe finds no permit and every page hides the feature, until
-//! the calls end. That costs only the nav item: the feature's own page still
-//! works when visited directly, and the same calls already slow every page.
-//! It is never remembered, so it ends when the calls do.
+//! viewers can hold every global permit. While they do, a signed-in
+//! viewer's probe finds no permit, so pages hide the feature until the calls
+//! end, but only while no fresh answer is remembered: a `Present` or
+//! `Absent` still within [`CAPABILITY_TTL`] is served without a probe
+//! ([`Capabilities::admin_acts`] reads it first), so held permits hide the
+//! item only on a cold start or once that TTL lapses during the load. That
+//! costs only the nav item: the feature's own page still works when visited
+//! directly, and the same calls already slow every page. It is never
+//! remembered, so it ends when the calls do.
 //!
 //! An `Unknown` is remembered only when the API itself caused it (5xx, 429,
 //! timeout, transport: [`is_api_side`]), and then only for
