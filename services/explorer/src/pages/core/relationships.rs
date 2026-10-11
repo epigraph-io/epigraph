@@ -454,6 +454,12 @@ mod tests {
         assert_eq!(fold("same_source"), "same_source");
         assert_eq!(heading("supports", EdgeDirection::Out), "Supports →");
         assert_eq!(heading("supports", EdgeDirection::In), "← Supported by");
+        assert_eq!(heading("asserts", EdgeDirection::Out), "Asserts →");
+        assert_eq!(heading("asserts", EdgeDirection::In), "← Asserted by");
+        assert_eq!(
+            lookup("asserts").map(|(_, r)| r.family),
+            Some(Family::Support)
+        );
         assert_eq!(heading("same_source", EdgeDirection::In), "← same source");
     }
 

@@ -633,6 +633,9 @@ mod tests {
         assert_eq!(relationship_family("SUPPORTS"), "support");
         assert_eq!(relationship_family("corroborates"), "support");
         assert_eq!(relationship_family("provides-evidence"), "support");
+        assert_eq!(relationship_family("asserts"), "support");
+        assert_eq!(relationship_family("ASSERTS"), "support");
+        assert_eq!(relationship_family("enables"), "support");
         assert_eq!(relationship_family("CONTRADICTS"), "refute");
         assert_eq!(relationship_family(" challenges "), "refute");
         assert_eq!(relationship_family("decomposes_to"), "structural");
