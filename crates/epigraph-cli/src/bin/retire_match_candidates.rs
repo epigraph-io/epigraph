@@ -25,11 +25,27 @@
 //! the batch shape — an ids file, a dry run, and the JSON undo dump.
 //!
 //! BELIEF IS RE-DERIVED IN THE SAME RUN. After the transaction commits, both
-//! endpoints of every retired pair are re-derived from the `mass_functions`
-//! that survive (`epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal`:
+//! endpoints of every pair the run actually withdrew something from (a matcher
+//! edge retracted, or a derived factor or bp_message deleted) are re-derived
+//! from the `mass_functions` that survive
+//! (`epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal`:
 //! recomputed on `binary_truth`, or the cache cleared when no BBA on any frame
-//! backs the claim), as the online retirement
-//! (`epigraph_engine::admin_cascade::apply_match_retire`) does. Earlier
+//! backs the claim), the same re-derivation the online retirement
+//! (`epigraph_engine::admin_cascade::apply_match_retire`) runs. A pair that
+//! withdrew nothing (a pending or already-retired candidate in a mixed batch)
+//! fed no cache and is left alone, as the online path's per-candidate guard
+//! leaves it.
+//!
+//! Two gaps to the online retirement remain, both older than the
+//! re-derivation: this binary does not delete matcher-edge-keyed
+//! `mass_functions` (`perspective_id` = the edge; the online path's
+//! `delete_edge_bbas`), so it passes `invalidated = 0` and a DS re-derivation
+//! would fold such a BBA back in (prod measured 0 of them on 2026-08-19); and
+//! neither the retirement nor the re-derivation writes a `security_events`
+//! audit row, where the online path records `cascade.admin_applied` and
+//! `cascade.belief_rederived`.
+//!
+//! Earlier
 //! revisions sent the operator to `POST /api/v1/bp/propagate` instead, on the
 //! grounds that a matcher promotion writes no `mass_functions` (measured on
 //! prod 2026-08-19: 716 `cross_source_matcher` edges, 715 derived `factors`,
@@ -82,9 +98,9 @@ struct Args {
     dump: PathBuf,
 
     /// Where to write the newline-separated affected claim ids (both endpoints
-    /// of every retired pair). `--apply` re-derives their belief itself; the
-    /// file is the record, and the input for a `recompute_claim_belief
-    /// --input` re-run should a re-derivation fail.
+    /// of every requested candidate), written before anything is applied.
+    /// `--apply` re-derives the belief of the subset whose pair it withdrew
+    /// something from, and prints that subset should a re-derivation fail.
     #[arg(long)]
     affected_out: Option<PathBuf>,
 
@@ -291,7 +307,12 @@ async fn main() -> anyhow::Result<()> {
     let mut bp_deleted = 0u64;
     let mut factors_deleted = 0u64;
     let mut edges_deleted = 0u64;
+    // The endpoints of the edges this run withdrew something from: the only
+    // claims whose cache a removed belief input can have fed. Per edge, not
+    // per batch, so a mixed batch leaves a pending pair's endpoints alone.
+    let mut withdrawn_endpoints: BTreeSet<Uuid> = BTreeSet::new();
     for e in &deleted {
+        let mut withdrew_here = 0u64;
         let eid_text = e.edge_id.to_string();
         let r = sqlx::query(
             "DELETE FROM bp_messages WHERE factor_id IN \
@@ -301,12 +322,14 @@ async fn main() -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await?;
         bp_deleted += r.rows_affected();
+        withdrew_here += r.rows_affected();
 
         let r = sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1")
             .bind(&eid_text)
             .execute(&mut *tx)
             .await?;
         factors_deleted += r.rows_affected();
+        withdrew_here += r.rows_affected();
 
         // Retraction, matching the online path (`MatchCandidateRepo::retire`).
         // This operator binary performs the same act, so it must not be the one
@@ -316,6 +339,11 @@ async fn main() -> anyhow::Result<()> {
             .execute(&mut *tx)
             .await?;
         edges_deleted += r.rows_affected();
+        withdrew_here += r.rows_affected();
+        if withdrew_here > 0 {
+            withdrawn_endpoints.insert(e.source_id);
+            withdrawn_endpoints.insert(e.target_id);
+        }
     }
 
     // Flip every requested (found) candidate to stale.
@@ -339,15 +367,15 @@ async fn main() -> anyhow::Result<()> {
     println!("  edges deleted:       {edges_deleted}");
     println!("  candidates -> stale: {candidates_staled}");
 
-    // Re-derive the endpoints' belief from the `mass_functions` that survive,
-    // as the online retirement does (see the module docs for why a BP
-    // propagate cannot do this). Only when the run withdrew something: a
-    // candidate that was never promoted fed no cache.
-    if bp_deleted + factors_deleted + edges_deleted == 0 {
+    // Re-derive the belief of the endpoints this run withdrew something from,
+    // from the `mass_functions` that survive, as the online retirement does
+    // (see the module docs for why a BP propagate cannot do this). A pair that
+    // withdrew nothing (never promoted, or retired already) fed no cache.
+    if withdrawn_endpoints.is_empty() {
         println!("\nNothing was withdrawn, so no belief was re-derived.");
         return Ok(());
     }
-    let endpoints: Vec<Uuid> = affected_claims.iter().copied().collect();
+    let endpoints: Vec<Uuid> = withdrawn_endpoints.into_iter().collect();
     let mut session = maint
         .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
         .await
@@ -371,9 +399,15 @@ async fn main() -> anyhow::Result<()> {
         for e in &report.errors {
             println!("  error: {e}");
         }
+        println!("  re-derived endpoint set (the failures are among these):");
+        for id in &endpoints {
+            println!("    {id}");
+        }
         anyhow::bail!(
-            "the retirement committed, but {} re-derivation(s) failed; re-run \
-             `recompute_claim_belief --input <the --affected-out file>` for them",
+            "the retirement committed, but {} re-derivation(s) failed. \
+             `recompute_claim_belief --input <a file of the ids above>` recomputes \
+             the endpoints a BBA backs; it does NOT clear the cache of an endpoint \
+             no BBA backs, which still holds the value the retired edge fed",
             report.errors.len()
         );
     }
