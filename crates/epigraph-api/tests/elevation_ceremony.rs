@@ -3482,9 +3482,18 @@ async fn the_act_ceremony_fails_closed_unconfigured_and_on_an_unknown_act(pool: 
 /// claim read is the holder's own public claim, so every route answers 200 on
 /// both tokens and the only difference is the elevation.
 ///
-/// The mutation it is aimed at: one of these routes registered where the
+/// The ego read also pins what an elevated viewer is served. The claim has
+/// one neighbour, a paper: an unrooted `derived` type, which the ego route
+/// withholds from every scoped viewer because there is no row to apply the
+/// viewer to. An elevated read is the custodian's always-true read
+/// (`Viewer::bypass_bind`), so it gets the paper, as a maintenance read does,
+/// and `total_edges` counts it; the unelevated read gets neither.
+///
+/// The mutations it is aimed at: one of these routes registered where the
 /// recorder layer does not wrap it, which `ViewerExtractor` answers with a
-/// 500 ("ELEVATED ACCESS NOT RECORDED") and no row.
+/// 500 ("ELEVATED ACCESS NOT RECORDED") and no row; and ego's unrooted arm
+/// keyed on `Viewer::is_bypass` (false for an elevated viewer), which drops
+/// the paper from the elevated read.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_explorer_read_routes_are_recorded_when_elevated_and_only_then(pool: PgPool) {
     let s = spawn(&pool, Some(software())).await;
@@ -3496,6 +3505,31 @@ async fn the_explorer_read_routes_are_recorded_when_elevated_and_only_then(pool:
     )
     .await;
     let claim = fixture::seed_public_claim(&pool, p.person, "explorer recorder claim").await;
+    let paper = Uuid::new_v4();
+    sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'Recorder Paper')")
+        .bind(paper)
+        .bind(format!("10.1234/{paper}"))
+        .execute(&pool)
+        .await
+        .expect("seed paper");
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'claim', 'paper', 'asserts')",
+    )
+    .bind(claim)
+    .bind(paper)
+    .execute(&pool)
+    .await
+    .expect("seed claim -> paper edge");
+    let ego_path = format!("/api/v1/claims/{claim}/ego");
+    let neighbours = |body: &Value| -> Vec<String> {
+        body["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .map(|n| n["id"].as_str().expect("node id").to_string())
+            .collect()
+    };
     let scopes = ["claims:read", "audit:read"];
     let reads = [
         (
@@ -3521,6 +3555,13 @@ async fn the_explorer_read_routes_are_recorded_when_elevated_and_only_then(pool:
     for (path, _) in &reads {
         let (status, body) = s.get(path, &plain).await;
         assert_eq!(status, StatusCode::OK, "unelevated {path}: {body}");
+        if *path == ego_path {
+            assert!(
+                !neighbours(&body).contains(&paper.to_string()),
+                "an unelevated read never gets the unrooted paper: {body}"
+            );
+            assert_eq!(body["total_edges"], 0, "nor counts it: {body}");
+        }
     }
     assert!(
         log_of(&pool).await.is_empty(),
@@ -3532,6 +3573,14 @@ async fn the_explorer_read_routes_are_recorded_when_elevated_and_only_then(pool:
     for (path, _) in &reads {
         let (status, body) = s.get(path, &elevated).await;
         assert_eq!(status, StatusCode::OK, "elevated {path}: {body}");
+        if *path == ego_path {
+            assert_eq!(
+                neighbours(&body),
+                vec![paper.to_string()],
+                "an elevated read gets the unrooted paper, as a maintenance read does: {body}"
+            );
+            assert_eq!(body["total_edges"], 1, "and counts it: {body}");
+        }
     }
 
     let mut surfaces: Vec<String> = log_of(&pool)

@@ -26,7 +26,7 @@
 //! type (claim, evidence, frame, context, perspective, community) on its own
 //! row, a `derived` type on the row it derives from (a trace's claim, an
 //! experiment's hypothesis), an unrooted `derived` type (a paper, an activity)
-//! not at all for anyone but a bypass viewer, and an `identity` type (agent)
+//! not at all for anyone but a bypass or elevated viewer, and an `identity` type (agent)
 //! shown. So an edge reaching this handler already points at something the
 //! viewer may see, and a non-claim neighbour is no longer emitted bare merely
 //! because it is not a claim.

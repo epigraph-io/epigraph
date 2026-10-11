@@ -54,8 +54,12 @@
 //!   its experiment's hypothesis claim.
 //! * **`derived`**, unrooted — every other type, including papers, activities
 //!   and any API-registered type: there is no single row to apply the viewer
-//!   to, so the neighbour is dropped for every viewer that is not bypassed.
-//!   Fail-closed by design; a bypass viewer still gets it.
+//!   to, so the neighbour is dropped for every scoped viewer. Fail-closed by
+//!   design. A bypass (maintenance) viewer and an elevated viewer still get
+//!   it: both read with the always-true predicate everywhere else in the
+//!   statement ([`Viewer::bypass_bind`]), and an elevated read is the
+//!   custodian's whole-corpus read, so withholding one tier from it alone
+//!   would make that read silently incomplete.
 //! * **`identity`** — `agent`: shown. Agents are rendered on public content by
 //!   design and carry no `owner_group_id`.
 //!
@@ -141,9 +145,11 @@ struct EvidenceHydrationRow {
 /// [`EgoRepository::edges`], one arm per tenancy tier (see the module doc).
 ///
 /// `{far_id}` / `{far_type}` are the far endpoint's id and type expressions;
-/// `{unrooted}` is `TRUE` for a bypass viewer and `FALSE` otherwise. Every
-/// marker resolves to the statement's one group bind, which `Viewer::splice`
-/// asserts, and for a bypass viewer every arm reduces to an existence check.
+/// `{unrooted}` is `TRUE` for a bypass or an elevated viewer
+/// ([`Viewer::bypass_bind`], the same always-true read the markers render for
+/// both shapes) and `FALSE` for a scoped one. Every marker resolves to the
+/// statement's one group bind, which `Viewer::splice` asserts, and for a
+/// bypass or elevated viewer every arm reduces to an existence check.
 const FAR_ENDPOINT_VISIBLE: &str = r#"
               AND (
                     -- identity tier
@@ -182,7 +188,7 @@ const FAR_ENDPOINT_VISIBLE: &str = r#"
                           JOIN experiments frx ON frx.id = fer.experiment_id
                           JOIN claims frh ON frh.id = frx.hypothesis_id
                          WHERE fer.id = {far_id} /* {VISIBILITY:frh} */))
-                    -- derived tier, unrooted: bypass only
+                    -- derived tier, unrooted: bypass or elevated only
                  OR ({unrooted} AND {far_type} NOT IN (
                         'agent', 'claim', 'evidence', 'frame', 'context',
                         'perspective', 'community', 'trace', 'experiment',
@@ -192,7 +198,11 @@ const FAR_ENDPOINT_VISIBLE: &str = r#"
 
 /// [`FAR_ENDPOINT_VISIBLE`] for one statement's far-endpoint expressions.
 fn far_endpoint_visible(viewer: &Viewer, far_id: &str, far_type: &str) -> String {
-    let unrooted = if viewer.is_bypass() { "TRUE" } else { "FALSE" };
+    let unrooted = if viewer.bypass_bind() {
+        "TRUE"
+    } else {
+        "FALSE"
+    };
     FAR_ENDPOINT_VISIBLE
         .replace("{far_id}", far_id)
         .replace("{far_type}", far_type)
