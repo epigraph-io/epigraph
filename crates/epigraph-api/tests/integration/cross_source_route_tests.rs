@@ -1710,3 +1710,91 @@ async fn retiring_an_unpromoted_candidate_leaves_endpoint_beliefs_alone(pool: Pg
         "no re-derivation ran, so none is audited: {json}"
     );
 }
+
+/// Move `claim` into a fresh team group nobody in the test belongs to, so only
+/// a bypass viewer can see it.
+async fn privatize_into_fresh_group(pool: &PgPool, claim: Uuid) {
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ('u043 hidden endpoint', 'did:test:u043:' || gen_random_uuid(), \
+                 decode(repeat('ab', 32), 'hex'), 'team') RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("seed a group");
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("privatize the claim");
+}
+
+/// The caller's view filters what it is TOLD, never what is REPAIRED. One
+/// endpoint of the promoted pair is a claim the retiring admin cannot see: the
+/// re-derivation (bypass viewer) must still repair it, and the
+/// `belief_cascade` the caller gets back must not name it. This separates
+/// `apply_match_retire`'s `admin_viewer` from its `caller`, which are both
+/// `&Viewer` and swap without a compile error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_repairs_a_hidden_endpoint_without_naming_it_to_the_caller(pool: PgPool) {
+    let (w, _) = viewer_fixture::seed_agent_with_group(&pool, "u043-hidden").await;
+    let other = insert_agent(&pool).await;
+    let a = insert_claim(&pool, w).await;
+    let b = insert_claim(&pool, other).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let promote = decide_bearer_token(w, Some(w), "agent");
+    let resp = post_decide(pool.clone(), candidate, &promote, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+
+    let d_a = seed_surviving_bba_and_derive(&pool, a, w).await;
+    let d_b = seed_surviving_bba_and_derive(&pool, b, other).await;
+    poison_betp(&pool, a).await;
+    poison_betp(&pool, b).await;
+    privatize_into_fresh_group(&pool, b).await;
+
+    let caller = epigraph_db::visibility::Viewer::resolve(&pool, w)
+        .await
+        .expect("resolve the caller's viewer");
+    let visible = epigraph_db::ClaimRepository::visible_claim_ids(&pool, &caller, &[a, b])
+        .await
+        .expect("visibility probe");
+    assert!(
+        visible.contains(&a) && !visible.contains(&b),
+        "CALIBRATION: the caller sees a and not b: {visible:?}"
+    );
+
+    let admin = admin_bearer_token(w, Some(w), "agent");
+    let json = retire_on(app_role_state(&pool, true).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "applied", "{json}");
+
+    for (claim, d) in [(a, d_a), (b, d_b)] {
+        let after = betp_of(&pool, claim)
+            .await
+            .expect("a BBA backs both endpoints");
+        assert!(
+            (after - d).abs() < 1e-9,
+            "the retirement must re-derive endpoint {claim} whether or not the caller sees it: \
+             expected {d}, found {after}: {json}"
+        );
+    }
+
+    let report = &json["belief_cascade"];
+    assert_eq!(
+        report["recomputed"],
+        serde_json::json!([a]),
+        "the caller is told about the endpoint it sees, and only that one: {json}"
+    );
+    let b_text = b.to_string();
+    for key in ["targets", "recomputed", "unbacked", "errors"] {
+        let named = report[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("belief_cascade.{key} is a list: {json}"))
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains(&b_text)));
+        assert!(
+            !named,
+            "belief_cascade.{key} must not name the hidden endpoint {b}: {json}"
+        );
+    }
+}
