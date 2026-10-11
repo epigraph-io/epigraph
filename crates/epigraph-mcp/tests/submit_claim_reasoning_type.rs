@@ -170,3 +170,77 @@ async fn every_distinct_mapped_reasoning_type_satisfies_the_check(pool: PgPool) 
         );
     }
 }
+
+/// The content-hash dedup branch also reaches the fix: re-submitting existing
+/// content still runs `write_submission`, which writes a NEW trace onto the
+/// existing claim. That second trace must carry the second submission's own
+/// methodology, not the first one's and not the statistical bucket.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_content_hash_resubmit_as_direct_observation_adds_an_observational_trace(pool: PgPool) {
+    let h = harness(pool).await;
+    let content = "u034: resubmitted as a direct observation";
+    let submit = |methodology: &'static str| {
+        let h = &h;
+        async move {
+            first_text(
+                &epigraph_mcp::tools::claims::submit_claim(
+                    &h.server,
+                    &h.viewer,
+                    SubmitClaimParams {
+                        // Distinct evidence per call: an identical resubmit's
+                        // evidence row hits evidence_content_hash_claim_unique.
+                        evidence_data: format!("observed under {methodology}"),
+                        ..params(content, methodology)
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("submit_claim({methodology:?}) failed: {e:?}")),
+            )
+        }
+    };
+
+    let first = submit("statistical_analysis").await;
+    let second = submit("direct_observation").await;
+    assert!(
+        first["deduplicated"].is_null(),
+        "the first submit must be a fresh insert: {first}"
+    );
+    assert_eq!(
+        second["claim_id"], first["claim_id"],
+        "identical content must resolve to the existing claim"
+    );
+    assert_eq!(
+        second["deduplicated"]["by"], "content_hash",
+        "the second submit must be answered through the content-hash branch: {second}"
+    );
+    let claim_id: Uuid = first["claim_id"]
+        .as_str()
+        .expect("claim_id")
+        .parse()
+        .expect("claim_id is a uuid");
+
+    let mut rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT reasoning_type, properties->>'submitted_methodology' \
+         FROM reasoning_traces WHERE claim_id = $1",
+    )
+    .bind(claim_id)
+    .fetch_all(&h.pool)
+    .await
+    .expect("read traces");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "observational".to_string(),
+                Some("direct_observation".to_string())
+            ),
+            (
+                "statistical".to_string(),
+                Some("statistical_analysis".to_string())
+            ),
+        ],
+        "each submission's trace must carry its own methodology"
+    );
+}
