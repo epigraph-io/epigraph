@@ -784,6 +784,7 @@ fn held_tokens(refresh_token: &str) -> oauth::TokenSet {
         expires_at: Utc::now() + Duration::hours(1),
         scope: Some("claims:read".into()),
         scope_widened: false,
+        elevated: false,
     }
 }
 
@@ -815,6 +816,7 @@ async fn proactive_refresh_rotates_and_stores_both_tokens() {
             .create("a1".into(), "r1".into(), Utc::now() + Duration::seconds(30));
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -825,6 +827,7 @@ async fn proactive_refresh_rotates_and_stores_both_tokens() {
     // The next refresh must present the ROTATED token, never r1 again.
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r2"),
         ("client_id", CLIENT_ID),
     ])
@@ -897,6 +900,7 @@ async fn concurrent_requests_after_expiry_refresh_exactly_once() {
     // Slow enough that every request arrives while the refresh is in flight.
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -939,6 +943,7 @@ async fn concurrent_upstream_401s_share_one_refresh() {
         .await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -970,6 +975,7 @@ async fn upstream_401_refreshes_then_retries_with_the_new_token() {
     mount_probe(&app, "a1", 401, 1).await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -999,6 +1005,7 @@ async fn second_401_after_a_real_refresh_ends_the_session() {
     mount_probe(&app, "a1", 401, 1).await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1160,6 +1167,7 @@ async fn access_revocations_of(app: &TestApp, access_token: &str) -> usize {
 async fn mount_lost_refresh(app: &TestApp) {
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1173,6 +1181,7 @@ async fn mount_lost_refresh(app: &TestApp) {
     .await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1286,6 +1295,7 @@ async fn a_token_call_may_outlast_the_data_timeout() {
     .await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1432,6 +1442,7 @@ async fn logout_during_a_refresh_revokes_the_rotated_token_once() {
     let app = app().await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1849,6 +1860,7 @@ async fn a_session_refused_after_its_refresh_revokes_the_new_refresh_token() {
     mount_probe(&app, "a1", 401, 1).await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -1893,6 +1905,7 @@ async fn a_session_ended_during_its_refresh_revokes_the_token_the_refresh_minted
     let app = app().await;
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "r1"),
         ("client_id", CLIENT_ID),
     ])
@@ -2088,6 +2101,7 @@ async fn a_token_wider_than_requested_is_flagged_on_the_session() {
     // The refreshed token carries exactly the requested scope: cleared.
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "refresh-1"),
         ("client_id", CLIENT_ID),
     ])
@@ -2286,6 +2300,99 @@ async fn identity_strip_flags_a_widened_token_as_a_warning() {
     );
 }
 
+/// A token carrying the elevation-only scope is refused at sign-in, never
+/// stored: the API issues that scope only through its elevate grant, which
+/// the Explorer never uses. No session is created, the viewer gets the
+/// sign-in failure page, and both tokens of the refused answer are revoked
+/// (nothing holds them). A merely wider token is still accepted
+/// (`identity_strip_flags_a_widened_token_as_a_warning`).
+#[tokio::test]
+async fn an_elevated_token_is_refused_at_sign_in_and_revoked() {
+    let app = app().await;
+    mount_revoke(&app, 2).await;
+    let started = start_login(&app, "").await;
+    let verifier = pending_verifier(&app, &started);
+    let mut elevated = token_json("access-1", "refresh-1");
+    elevated["scope"] = json!("claims:read audit:read platform:admin");
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(elevated))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+
+    let res = finish_login(&app, &started, "&code=c0de").await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.body);
+    assert!(
+        set_cookie(&res, "epx_session").is_none(),
+        "no session cookie"
+    );
+    assert!(app.state.sessions.is_empty(), "no session");
+    assert!(res.body.contains("elevated token"), "{}", res.body);
+    assert!(
+        !res.body.contains("platform:admin"),
+        "the page never names the scope"
+    );
+    assert_eq!(revocations_of(&app, "refresh-1").await, 1);
+    assert_eq!(access_revocations_of(&app, "access-1").await, 1);
+    app.upstream.verify().await;
+}
+
+/// A refresh answered with an elevated token ends the session, even while
+/// the old access token still has seconds left: upstream has rotated, so
+/// the refresh token the session holds is spent and must never be presented
+/// again (that reads as reuse), and the refused pair is revoked. Without the
+/// refusal the session would carry the elevated pair.
+#[tokio::test]
+async fn an_elevated_refresh_ends_the_session_and_revokes_the_pair() {
+    let app = app().await;
+    mount_revoke(&app, 2).await;
+    // 30 s left: inside the proactive window, still valid.
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() + Duration::seconds(30));
+    let mut elevated = token_json("a2", "r2");
+    elevated["scope"] = json!("claims:read platform:admin");
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(elevated))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    // No probe mock: neither token may reach a data route.
+
+    let res = app.get_as("/explorer/bff/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+    assert!(app.state.sessions.get(&sid).is_none(), "the session ended");
+    assert_eq!(revocations_of(&app, "r2").await, 1, "the refused pair");
+    assert_eq!(access_revocations_of(&app, "a2").await, 1);
+    assert_eq!(
+        revocations_of(&app, "r1").await,
+        0,
+        "the spent token is not presented anywhere"
+    );
+
+    // The next request is signed out and refreshes nothing.
+    let res = app.get_as("/explorer/bff/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        token_posts_presenting(&app, "r1").await,
+        1,
+        "never replayed"
+    );
+    app.upstream.verify().await;
+}
+
 /// Introspection is for the sign-in client only. When it fails, the client
 /// reads "unavailable" and everything else still renders: the scope and
 /// expiry come from the token response itself.
@@ -2374,6 +2481,7 @@ async fn introspect_is_called_once_per_token_not_per_page() {
     // The token is refreshed: the new token is introspected once.
     token_call(&[
         ("grant_type", "refresh_token"),
+        ("scope", "claims:read audit:read"),
         ("refresh_token", "refresh-1"),
         ("client_id", CLIENT_ID),
     ])

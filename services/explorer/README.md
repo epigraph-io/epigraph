@@ -601,7 +601,10 @@ if the login response's cookie starts `__Host-` and the startup log
   the answer was lost, and presenting it again would be read as reuse and
   revoke the whole token family. So the Explorer ends the session at once,
   under the session's refresh lock so no queued request replays the token,
-  and revokes the refresh token it held, best effort. The viewer is sent to
+  and revokes the refresh token it held, best effort. When upstream answered
+  with an elevated token, which the Explorer refuses, it has rotated and the
+  held token is spent: the session ends the same way, and both tokens of the
+  refused answer are revoked. The viewer is sent to
   sign in again. The cost: a viewer whose refresh falls inside an API
   restart is signed out rather than shown a degraded page. The token call
   has its own, longer timeout (`EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS`) to make
@@ -654,10 +657,14 @@ if the login response's cookie starts `__Host-` and the startup log
   A token wider than the scopes requested is flagged as a warning, "wider
   than requested". The API grants at most the scopes requested at sign-in,
   and a refresh issues the presented token's own scopes narrowed to what the
-  user is still granted, never more, so a wider token is not expected; an
-  API build from before that refresh fix widened tokens on refresh (see
-  Caveats). The strip is display only; no authorization decision reads it,
-  and the Explorer does not refuse such a token.
+  user is still granted and to the scopes the refresh asks for (the
+  Explorer asks for its two again on every refresh), never more, so a wider
+  token is not expected; an API build from before that refresh fix widened
+  tokens on refresh and ignores the refresh's scopes (see Caveats). The
+  strip is display only; no authorization decision reads it, and the
+  Explorer does not refuse a merely wider token. It does refuse an
+  **elevated** token, which it never asks for: sign-in fails, a refresh
+  ends the session, and both tokens of that answer are revoked.
 - **Session cookie.** At the root of a secure origin (the production
   topology, see Deploy) the session cookie is `__Host-epx_session` with
   `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` and a 30-day
@@ -791,7 +798,11 @@ if the login response's cookie starts `__Host-` and the startup log
   refreshed token with the user's **full** granted scopes, write scopes such
   as `claims:write` included, so against such a build every session held a
   write-capable credential although the Explorer only reads; the identity
-  strip's "wider than requested" warning is how that shows. Sessions live
+  strip's "wider than requested" warning is how that shows. A session
+  started against such a build keeps that wide refresh chain until sign-out,
+  even after the API is upgraded: the upgraded API then caps each refreshed
+  access token to the two scopes the Explorer asks for, but the refresh
+  credential itself keeps its scopes. Sessions live
   **only in process memory**: they are never written to
   disk and never logged (`Debug` output redacts them). Treat core dumps and
   memory access to this process as sensitive.

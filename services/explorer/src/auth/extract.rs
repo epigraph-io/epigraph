@@ -255,9 +255,10 @@ impl PageCtx {
 /// A session ends when upstream *refuses* the refresh
 /// ([`RefreshError::Rejected`], `NoSession`) once the token has expired, and
 /// whenever the refresh got no usable answer ([`RefreshError::Upstream`]:
-/// transport, timeout, 5xx), because the held refresh token may already be
-/// spent and must not be replayed; [`super::refresh_session`] has then already
-/// ended it. Falls back to the dev bearer, then to anonymous.
+/// transport, timeout, 5xx) or an answer the Explorer refused
+/// ([`RefreshError::Refused`]), because the held refresh token may already
+/// be (or is) spent and must not be replayed; [`super::refresh_session`] has
+/// then already ended it. Falls back to the dev bearer, then to anonymous.
 pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth {
     if let Some(id) = read_session_cookie(&state.config, headers) {
         if let Some(session) = state.sessions.get(&id) {
@@ -270,11 +271,11 @@ pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth 
             }
             match super::refresh_session(state, &id, &session.access_token).await {
                 Ok(access_token) => return RequestAuth::Session { id, access_token },
-                // No usable answer from `/oauth/token`: `refresh_session`
-                // ended the session and revoked its refresh token, so this
-                // request is signed out even if the access token has a few
-                // seconds left.
-                Err(e @ RefreshError::Upstream(_)) => {
+                // No usable answer from `/oauth/token`, or an answer the
+                // Explorer refused: `refresh_session` ended the session (its
+                // refresh token may be, or is, spent), so this request is
+                // signed out even if the access token has a few seconds left.
+                Err(e @ (RefreshError::Upstream(_) | RefreshError::Refused(_))) => {
                     tracing::info!(error = %e, "refresh outcome unknown; the session has ended");
                 }
                 Err(e) if session.expires_at > now => {

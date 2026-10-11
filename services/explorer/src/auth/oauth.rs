@@ -30,12 +30,23 @@ use crate::state::AppState;
 use crate::upstream::truncate_chars;
 
 /// The scopes the Explorer asks for: reading claims, and reading the
-/// security-event trail. The authorization server grants the intersection
-/// of this and what the user holds, so a user without `audit:read` signs in
-/// with `claims:read` alone. Upstream widens it to the user's full grant on
-/// the first refresh (oauth-auth.md §3); it is a statement of intent, not a
-/// boundary.
+/// security-event trail. The authorization server grants at most the
+/// intersection of this and what the user holds, so a user without
+/// `audit:read` signs in with `claims:read` alone. Every refresh asks for it
+/// again ([`refresh_grant`]), and an API built from current main never
+/// widens a token past what it was minted with on refresh. An older API
+/// build widened it to the user's full grant on the first refresh and
+/// ignores the refresh's `scope`; the identity strip warns about such a
+/// token ("token wider than requested", [`scope_widened`]) and the Explorer
+/// still uses it, except an elevated one ([`ELEVATION_ONLY_SCOPE`]), which
+/// it refuses.
 pub const SCOPE: &str = "claims:read audit:read";
+/// The scope an API built from main issues ONLY through its elevate grant
+/// (`epigraph_auth::ELEVATED_ONLY_SCOPE`), together with an elevation claim.
+/// The Explorer never asks for an elevated token, so a token response that
+/// carries this scope is refused, never stored: sign-in fails and a refresh
+/// ends the session (see [`refuse_elevated`]).
+pub const ELEVATION_ONLY_SCOPE: &str = "platform:admin";
 /// Largest token-endpoint body the BFF will buffer.
 const MAX_TOKEN_BODY: usize = 64 * 1024;
 /// `expires_in` is believed only up to this (upstream issues 1 h tokens).
@@ -55,6 +66,9 @@ pub struct TokenSet {
     pub scope: Option<String>,
     /// The response's `scope` names a scope [`SCOPE`] did not ask for.
     pub scope_widened: bool,
+    /// The response's `scope` carries [`ELEVATION_ONLY_SCOPE`]. Such a set
+    /// never leaves this module: [`refuse_elevated`] turns it into an error.
+    pub elevated: bool,
 }
 
 impl std::fmt::Debug for TokenSet {
@@ -63,6 +77,7 @@ impl std::fmt::Debug for TokenSet {
             .field("expires_at", &self.expires_at)
             .field("scope", &self.scope)
             .field("scope_widened", &self.scope_widened)
+            .field("elevated", &self.elevated)
             .finish_non_exhaustive()
     }
 }
@@ -119,6 +134,11 @@ pub enum TokenError {
     /// A 2xx whose body is not a usable token response.
     #[error("unexpected token endpoint response: {0}")]
     Decode(String),
+    /// A 2xx carrying an elevated token ([`ELEVATION_ONLY_SCOPE`]), which
+    /// the Explorer never asks for and never stores. Both tokens of the pair
+    /// have been revoked, best effort.
+    #[error("token endpoint issued an elevated token; refused")]
+    Elevated,
 }
 
 impl TokenError {
@@ -139,7 +159,7 @@ impl TokenError {
             TokenError::NotConfigured => 503,
             TokenError::Rejected { status: 403, .. } => 403,
             TokenError::Rejected { .. } => 400,
-            TokenError::Unavailable(_) | TokenError::Decode(_) => 502,
+            TokenError::Unavailable(_) | TokenError::Decode(_) | TokenError::Elevated => 502,
         }
     }
 
@@ -156,6 +176,10 @@ impl TokenError {
             TokenError::Rejected { .. } => "EpiGraph refused the sign-in. Please sign in again.",
             TokenError::Unavailable(_) | TokenError::Decode(_) => {
                 "EpiGraph's sign-in service is unavailable right now. Please try again shortly."
+            }
+            TokenError::Elevated => {
+                "EpiGraph issued an elevated token, which the Explorer does not accept, so the \
+                 sign-in was refused."
             }
         }
     }
@@ -219,7 +243,7 @@ pub async fn exchange_code(
         ],
     )
     .await?;
-    let tokens = token_set(body)?;
+    let tokens = refuse_elevated(state, token_set(body)?).await?;
     if tokens.refresh_token.is_empty() {
         tracing::warn!("token response carried no refresh token; the session ends when the access token expires");
     }
@@ -233,6 +257,19 @@ pub async fn exchange_code(
 /// `client_id` is sent when configured although upstream neither requires
 /// nor checks it today (`oauth/token.rs::handle_refresh_token`); it costs nothing and keeps
 /// working if refresh tokens are ever bound to their client.
+///
+/// `scope` is always [`SCOPE`]. An API built from main issues the presented
+/// token's scopes narrowed to the client's current grant AND to this, so the
+/// access token never carries more than the Explorer asked for, even on a
+/// refresh chain an older build minted wide (the chain's refresh token
+/// itself keeps its scopes). An older build ignores the field. A `scope`
+/// naming nothing the token holds is refused upstream (`invalid_scope`), which
+/// ends the session: a token holding neither scope authorizes nothing here.
+///
+/// An elevated answer ([`ELEVATION_ONLY_SCOPE`]) is refused and revoked like
+/// a sign-in's, and reported as [`RefreshError::Refused`]: upstream has
+/// already rotated, so the refresh token the session holds is spent and the
+/// caller ends the session.
 pub async fn refresh_grant(
     state: &AppState,
     refresh_token: &str,
@@ -243,12 +280,16 @@ pub async fn refresh_grant(
     let mut form = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
+        ("scope", SCOPE),
     ];
     if let Some(client_id) = state.config.client_id.as_deref() {
         form.push(("client_id", client_id));
     }
     let body = post_token_form(state, &form).await.map_err(refresh_error)?;
-    let mut tokens = token_set(body).map_err(refresh_error)?;
+    let tokens = token_set(body).map_err(refresh_error)?;
+    let mut tokens = refuse_elevated(state, tokens)
+        .await
+        .map_err(refresh_error)?;
     if tokens.refresh_token.is_empty() {
         // Not expected (upstream always rotates). Keeping the old token is
         // the only option left; if it was revoked, the next refresh fails
@@ -264,7 +305,29 @@ fn refresh_error(e: TokenError) -> RefreshError {
         TokenError::NotConfigured => RefreshError::Unavailable,
         TokenError::Rejected { message, .. } => RefreshError::Rejected(message),
         TokenError::Unavailable(m) | TokenError::Decode(m) => RefreshError::Upstream(m),
+        TokenError::Elevated => RefreshError::Refused("elevated token".into()),
     }
+}
+
+/// Refuse a token set carrying [`ELEVATION_ONLY_SCOPE`]: revoke both of its
+/// tokens upstream, best effort (nothing will hold them; on a refresh,
+/// upstream has already rotated, so they are the chain's only live pair),
+/// and return [`TokenError::Elevated`]. Any other set passes through
+/// unchanged, a merely wider one included (that one is shown, see
+/// [`scope_widened`]). Never logs a token.
+async fn refuse_elevated(state: &AppState, tokens: TokenSet) -> Result<TokenSet, TokenError> {
+    if !tokens.elevated {
+        return Ok(tokens);
+    }
+    tracing::warn!("token endpoint issued an elevated token; refused and revoked");
+    revoke_pair(
+        state,
+        &tokens.access_token,
+        &tokens.refresh_token,
+        "refused elevated token",
+    )
+    .await;
+    Err(TokenError::Elevated)
 }
 
 /// `POST /oauth/revoke` with the JSON body `{token, token_type_hint:
@@ -480,6 +543,9 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
     let scope_widened = scope
         .as_deref()
         .is_some_and(|granted| scope_widened(SCOPE, granted));
+    let elevated = scope
+        .as_deref()
+        .is_some_and(|granted| granted.split(' ').any(|s| s == ELEVATION_ONLY_SCOPE));
     if scope_widened {
         // A warning: the API intersects the requested scopes with the user's
         // grant at sign-in, and a refresh no longer widens a token past what
@@ -494,6 +560,7 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
         expires_at: Utc::now() + chrono::Duration::seconds(lifetime),
         scope,
         scope_widened,
+        elevated,
     })
 }
 
@@ -673,6 +740,48 @@ mod tests {
         ] {
             assert!(!token_set(narrow.to_vec()).unwrap().scope_widened);
         }
+    }
+
+    /// Only the exact elevation-only scope marks a token elevated; a token
+    /// that is merely wider than requested is not, and is still accepted.
+    #[test]
+    fn only_the_elevation_scope_marks_a_token_elevated() {
+        let set = |scope: &str| {
+            token_set(
+                serde_json::to_vec(&serde_json::json!({
+                    "access_token": "a", "expires_in": 60, "scope": scope
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(set("claims:read platform:admin").elevated);
+        assert!(set("platform:admin").elevated);
+        assert!(set("  claims:read   platform:admin ").elevated);
+        for not_elevated in [
+            "claims:read audit:read",
+            "claims:read claims:write",
+            "platform:admin2",
+            "xplatform:admin",
+            "platform:administer",
+            "",
+        ] {
+            let t = set(not_elevated);
+            assert!(!t.elevated, "{not_elevated:?}");
+        }
+        assert!(
+            set("claims:read claims:write").scope_widened,
+            "wider, not elevated: shown as a warning, still accepted"
+        );
+        assert_eq!(
+            refresh_error(TokenError::Elevated),
+            RefreshError::Refused("elevated token".into()),
+            "a refused refresh answer ends the session (see refresh_session)"
+        );
+        assert_eq!(TokenError::Elevated.page_status(), 502);
+        assert!(!TokenError::Elevated
+            .user_message()
+            .contains(ELEVATION_ONLY_SCOPE));
     }
 
     #[test]

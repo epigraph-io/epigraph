@@ -28,6 +28,13 @@ pub enum RefreshError {
     /// lost), so [`refresh_session`] has already ended the session.
     #[error("refresh failed: {0}")]
     Upstream(String),
+    /// Upstream answered, and the Explorer refused the answer (an elevated
+    /// token, [`oauth::ELEVATION_ONLY_SCOPE`]; it has revoked that pair).
+    /// Upstream rotated before answering, so the refresh token the session
+    /// holds is spent: [`refresh_session`] has already ended the session,
+    /// because presenting that token again would be read as reuse.
+    #[error("refresh refused: {0}")]
+    Refused(String),
 }
 
 /// Obtain a usable access token for `id`, given the token that just failed
@@ -49,6 +56,9 @@ pub enum RefreshError {
 ///   the whole rotation family. Ending it under the lock means a request
 ///   queued on the same session finds it gone (`NoSession`) instead of
 ///   replaying the token.
+/// - On [`RefreshError::Refused`] it **ends the session, still holding the
+///   lock**, for the same reason: the token it holds is spent. The refused
+///   pair has already been revoked; the spent token is not presented again.
 /// - On any other failure the session is left alone; the caller decides
 ///   (the upstream client drops it and reports `SessionExpired`).
 pub async fn refresh_session(
@@ -71,6 +81,11 @@ pub async fn refresh_session(
         Ok(tokens) => tokens,
         Err(e @ RefreshError::Upstream(_)) => {
             end_after_lost_refresh(state, id, &session.refresh_token, &e).await;
+            return Err(e);
+        }
+        Err(e @ RefreshError::Refused(_)) => {
+            tracing::warn!(error = %e, "refresh answer refused; ending the session");
+            state.sessions.remove(id);
             return Err(e);
         }
         Err(e) => return Err(e),

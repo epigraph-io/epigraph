@@ -425,13 +425,16 @@ impl<'a> Api<'a> {
             Ok(t) => t,
             // Upstream said no (invalid_grant, revoked, no such session),
             // or its answer to the refresh was lost (transport, timeout,
-            // 5xx) and the token it held may already be spent. Either way
-            // the session is over: `refresh_session` has already ended it on
-            // a lost answer, and removing it again is a no-op.
+            // 5xx) and the token it held may already be spent, or the
+            // Explorer refused the answer (an elevated token) and the token
+            // it held is spent. Either way the session is over:
+            // `refresh_session` has already ended it on a lost or refused
+            // answer, and removing it again is a no-op.
             Err(
                 e @ (auth::RefreshError::Rejected(_)
                 | auth::RefreshError::NoSession
-                | auth::RefreshError::Upstream(_)),
+                | auth::RefreshError::Upstream(_)
+                | auth::RefreshError::Refused(_)),
             ) => {
                 tracing::info!(error = %e, %path, upstream_reason = %reason, "upstream 401 and the refresh failed; ending session");
                 self.state.sessions.remove(id);
