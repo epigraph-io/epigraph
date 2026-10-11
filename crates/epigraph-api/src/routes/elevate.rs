@@ -360,6 +360,9 @@ pub async fn enroll_finish(
             )
         }
     };
+    // The state the registration is verified against; the completion refuses
+    // (ELV11) when the ceremony was restarted since (migration 160).
+    let verified_against = stored.clone();
     let registered = match rp.finish_registration(&response, &RegistrationState::from_json(stored))
     {
         Ok(r) => r,
@@ -391,6 +394,7 @@ pub async fn enroll_finish(
         user_verified: registered.user_verified,
         backup_eligible: registered.backup_eligible,
         registration: &response,
+        ceremony_state: &verified_against,
     };
     match PasskeyCeremony::complete(&mut conn, id, verified).await {
         Ok(passkey_id) => {
@@ -425,6 +429,14 @@ pub async fn enroll_finish(
                 StatusCode::FORBIDDEN,
                 "subject_not_eligible",
                 "the principal of this enrollment may no longer hold a passkey",
+            ),
+            // Migration 160: the ceremony was restarted after this
+            // registration was verified. Nothing was written.
+            Some("ELV11") => json_error(
+                StatusCode::CONFLICT,
+                "ceremony_restarted",
+                "the ceremony was restarted while this registration was being recorded; finish \
+                 the latest ceremony (the last challenge requested)",
             ),
             _ => internal("record the passkey", &err),
         },

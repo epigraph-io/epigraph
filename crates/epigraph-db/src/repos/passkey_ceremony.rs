@@ -64,6 +64,11 @@ pub struct VerifiedPasskey<'a> {
     /// `PublicKeyCredential` JSON the credential was verified from), kept so
     /// the offline verifier can run the registration again (migration 160).
     pub registration: &'a serde_json::Value,
+    /// The ceremony state the registration was verified against, as read
+    /// from the enrollment. The completion refuses (`ELV11`) when the
+    /// ceremony was restarted since, so a passkey is never recorded beside a
+    /// state its registration was not made over (migration 160).
+    pub ceremony_state: &'a serde_json::Value,
 }
 
 /// The ceremony half of migration 124's definers.
@@ -114,12 +119,15 @@ impl PasskeyCeremony {
 
     /// Record the passkey a verified ceremony registered, with the
     /// registration response it was verified from, consuming `enrollment`
-    /// (migration 160's eight-argument `epigraph_complete_passkey_enrollment`,
+    /// (migration 160's nine-argument `epigraph_complete_passkey_enrollment`,
     /// which writes `platform.passkey_registered`). Returns the passkey's id.
     ///
     /// # Errors
     /// `DbError::QueryFailed` carrying `ELV04` (not live, or no ceremony
-    /// started), `ELV01` (the subject is no longer eligible) or `ELV03`;
+    /// started), `ELV11` (the ceremony was restarted after the registration
+    /// was verified), `ELV01` (the subject is no longer eligible), `ELV10` (a
+    /// maintenance enrollment of a person who already holds a passkey) or
+    /// `ELV03`;
     /// `DbError::DuplicateKey` for a credential already registered.
     #[instrument(skip(conn, passkey))]
     pub async fn complete(
@@ -128,7 +136,8 @@ impl PasskeyCeremony {
         passkey: VerifiedPasskey<'_>,
     ) -> Result<Uuid, DbError> {
         let id: Uuid = sqlx::query_scalar(
-            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, $8)",
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, $8, \
+                    $9)",
         )
         .bind(enrollment)
         .bind(passkey.credential_id)
@@ -138,6 +147,7 @@ impl PasskeyCeremony {
         .bind(passkey.user_verified)
         .bind(passkey.backup_eligible)
         .bind(passkey.registration)
+        .bind(passkey.ceremony_state)
         .fetch_one(&mut *conn)
         .await?;
         Ok(id)

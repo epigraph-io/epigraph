@@ -1870,7 +1870,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // trigger keeps a passkey's stored registration fixed; under an APP owner
     // it still runs (it reads only the row), so the stake is the register's
     // consistency: every elevation definer is maintenance-owned. (160's
-    // eight-argument `epigraph_complete_passkey_enrollment` shares its name
+    // nine-argument `epigraph_complete_passkey_enrollment` shares its name
     // with 124's entry above, which checks every overload of it.)
     ("epigraph_person_authenticators_registration_fixed", 160),
 ];
@@ -2466,12 +2466,12 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             true,
         ),
         // 160: the API's completion now stores the registration response (the
-        // eight-argument overload, keyed on 160's trigger function, which
+        // nine-argument overload, keyed on 160's trigger function, which
         // exists exactly when it does); the trigger function is no one's to
         // call.
         (
             "epigraph_person_authenticators_registration_fixed",
-            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb)",
+            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb)",
             true,
         ),
         (

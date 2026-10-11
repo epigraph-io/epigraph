@@ -1282,9 +1282,12 @@ restart.
   gate (`elevated_access.rs::every_132_object_is_registered`). Section 4:
   `person_authenticators.registration` (nullable jsonb object, fixed after
   the insert by its own trigger) keeps the raw registration response a
-  passkey was admitted with, written by a new eight-argument
+  passkey was admitted with, written by a new nine-argument
   `epigraph_complete_passkey_enrollment` (app-callable, refuses a missing
-  registration; 124's seven-argument form stays), so `epigraph-operator
+  registration, and refuses `ELV11` unless the ceremony state the API
+  verified the registration against is still the enrollment's, so a
+  restarted ceremony never leaves a genuine passkey unverifiable; 124's
+  seven-argument form stays), so `epigraph-operator
   verify-confirmations` can re-run the registration under the API's
   attestation policy. Behaviour in
   `epigraph-db/tests/pending_admin_acts.rs` (sections 1, 2),
@@ -1295,7 +1298,7 @@ restart.
   FIRST, before 132-undo; it archives the stored registrations into
   `security_events` before dropping the column). **Deploy order:** after
   124-132 (sqlx would otherwise apply them out of order after 160), with the
-  API binary that calls the eight-argument completion (an older one keeps
+  API binary that calls the nine-argument completion (an older one keeps
   calling 124's form, whose passkeys the verifier reports as not
   re-verifiable).
   **Applied to throwaway databases only, NOT to any deployed database.**

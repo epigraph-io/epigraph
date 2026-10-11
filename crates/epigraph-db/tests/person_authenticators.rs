@@ -690,6 +690,67 @@ async fn an_enrollment_is_append_only(pool: PgPool) {
     );
 }
 
+/// The state [`set_challenge`] stores.
+const STARTED: &str = "{\"rs\": {\"challenge\": \"test-challenge\"}}";
+
+/// Migration 160's completion: the registration response stored, the
+/// ceremony state the API verified it against named.
+async fn complete_registered(
+    pool: &PgPool,
+    enrollment: Uuid,
+    n: u8,
+    registration: &'static str,
+    verified_against: &'static str,
+) -> Result<Uuid, sqlx::Error> {
+    as_app(pool, None, |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, \
+                    '{\"cred\": {\"counter\": 0}}'::jsonb, \
+                    '00000000-0000-0000-0000-000000000000'::uuid, 'none', true, true, \
+                    $3::jsonb, $4::jsonb)",
+        )
+        .bind(enrollment)
+        .bind(credential(n))
+        .bind(registration)
+        .bind(verified_against)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// A completion is recorded only over the ceremony state its registration
+/// was verified against (migration 160 section 4, final review F2-COR-04): a
+/// restarted ceremony overwrites the enrollment's state, and a completion
+/// naming the state it replaced is refused `ELV11` with nothing written (the
+/// enrollment stays live); naming the current state, it completes.
+///
+/// Verified to fail with 160's state comparison removed: the stale
+/// completion is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_completion_is_recorded_only_over_the_state_it_was_verified_against(pool: PgPool) {
+    let (human, _) = fixture::seed_human_operator(&pool, "human").await;
+    let e = enroll(&pool, human).await.expect("enroll");
+    set_challenge(&pool, e).await.expect("challenge");
+    let replaced = "{\"rs\": {\"challenge\": \"the first ceremony\"}}";
+    assert_code(
+        &complete_registered(&pool, e, 1, "{\"response\": 1}", replaced).await,
+        "ELV11",
+        "a completion over a replaced ceremony state",
+    );
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM person_authenticators WHERE person_agent_id = $1")
+            .bind(human)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(held, 0, "nothing was recorded");
+    complete_registered(&pool, e, 1, "{\"response\": 1}", STARTED)
+        .await
+        .expect("over the current state, it completes");
+}
+
 /// A passkey row is never edited: the only changes are one revoke (stamped
 /// now(), by the revoking login, with a reason) and its use (`last_used_at`
 /// now(), the counter never going back). A revoked passkey is final. The

@@ -6,7 +6,7 @@
 -- `CREATE OR REPLACE` keeps each one's owner (the maintenance role) and its
 -- ACL, which 124's, 125's and 130's registers pin. Section 4 ADDS objects:
 -- a nullable column and its CHECK on `person_authenticators`, a trigger and
--- its function, and an eight-argument overload of 124's completion definer,
+-- its function, and a nine-argument overload of 124's completion definer,
 -- owned by the maintenance role with EXECUTE granted to the application and
 -- maintenance roles. No section creates a table or changes a policy.
 --
@@ -88,9 +88,18 @@
 -- registration again under the API's own attestation policy and compare the
 -- result with the stored row. A completion with no stored registration (the
 -- seven-argument form, which an older API binary still calls) is reported,
--- not trusted. The new eight-argument
+-- not trusted. The new nine-argument
 -- `epigraph_complete_passkey_enrollment` is the API's; it refuses a missing
 -- registration. The column never changes after the insert.
+--
+-- It also takes the ceremony state the API verified the registration
+-- against, and refuses ELV11 (nothing recorded) unless that is still the
+-- enrollment's stored state, read under the enrollment's row lock. A
+-- ceremony restarted between the API's read and its completion (a second
+-- tab's challenge request overwrites the state) would otherwise record a
+-- genuine passkey beside a state its registration was not made over, and the
+-- verifier, which re-runs the registration against the enrollment's final
+-- state, would report it as a forgery.
 --
 -- WHAT IT STILL CANNOT SEE: a forger holding an authenticator of an
 -- allowlisted model produces a registration that verifies (over a challenge
@@ -289,18 +298,19 @@ CREATE TRIGGER person_authenticators_registration_fixed
     BEFORE UPDATE ON public.person_authenticators
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_person_authenticators_registration_fixed();
 
--- 124's completion plus the registration response (required). App-callable,
--- as 124's form is.
+-- 124's completion plus the registration response and the ceremony state it
+-- was verified against (both required). App-callable, as 124's form is.
 CREATE OR REPLACE FUNCTION public.epigraph_complete_passkey_enrollment(
     p_enrollment uuid, p_credential_id bytea, p_passkey jsonb, p_aaguid uuid,
     p_attestation_format text, p_user_verified boolean, p_backup_eligible boolean,
-    p_registration jsonb)
+    p_registration jsonb, p_ceremony_state jsonb)
 RETURNS uuid
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_person uuid;
     v_label  text;
+    v_state  jsonb;
     v_id     uuid;
 BEGIN
     IF p_registration IS NULL OR jsonb_typeof(p_registration) <> 'object' THEN
@@ -308,11 +318,25 @@ BEGIN
                         'passkey was verified from is required'
             USING ERRCODE = '22004';
     END IF;
-    SELECT en.person_agent_id, en.label INTO v_person, v_label
-      FROM public.passkey_enrollments en WHERE en.id = p_enrollment;
+    IF p_ceremony_state IS NULL THEN
+        RAISE EXCEPTION 'epigraph_complete_passkey_enrollment: the ceremony state the '
+                        'registration was verified against is required'
+            USING ERRCODE = '22004';
+    END IF;
+    -- Locked, so a restart of the ceremony (which updates this row) waits
+    -- for the completion and then finds the enrollment consumed.
+    SELECT en.person_agent_id, en.label, en.challenge_state INTO v_person, v_label, v_state
+      FROM public.passkey_enrollments en WHERE en.id = p_enrollment FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'ELV04: no enrollment %', p_enrollment
             USING ERRCODE = 'ELV04';
+    END IF;
+    IF v_state IS DISTINCT FROM p_ceremony_state THEN
+        RAISE EXCEPTION 'ELV11: enrollment %: the ceremony was restarted after this '
+                        'registration was verified, so it is not the enrollment''s ceremony; '
+                        'nothing was recorded', p_enrollment
+            USING ERRCODE = 'ELV11',
+                  HINT = 'Finish the latest ceremony (the last challenge requested).';
     END IF;
     INSERT INTO public.person_authenticators (person_agent_id, credential_id, passkey, aaguid,
                                               attestation_format, user_verified,
@@ -324,19 +348,19 @@ BEGIN
     RETURN v_id;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(
-    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb) FROM PUBLIC;
+    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb) FROM PUBLIC;
 
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_person_authenticators_registration_fixed() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, '
-                'uuid, text, boolean, boolean, jsonb) OWNER TO epigraph_maintenance';
+                'uuid, text, boolean, boolean, jsonb, jsonb) OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(uuid, '
-                'bytea, jsonb, uuid, text, boolean, boolean, jsonb) TO epigraph_maintenance';
+                'bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_complete_passkey_enrollment(uuid, '
-                'bytea, jsonb, uuid, text, boolean, boolean, jsonb) TO epigraph_app';
+                'bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb) TO epigraph_app';
     END IF;
 END $$;

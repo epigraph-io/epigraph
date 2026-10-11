@@ -135,7 +135,7 @@ fn functions_in(sql: &str) -> Vec<String> {
 
 /// The functions 160 CREATES, with the statement its undo drops each with.
 /// (`epigraph_complete_passkey_enrollment` keeps 124's seven-argument form;
-/// 160 adds the eight-argument overload.)
+/// 160 adds the nine-argument overload.)
 const NEW_IN_160: &[(&str, &str)] = &[
     (
         "epigraph_person_authenticators_registration_fixed",
@@ -144,7 +144,7 @@ const NEW_IN_160: &[(&str, &str)] = &[
     (
         "epigraph_complete_passkey_enrollment",
         "DROP FUNCTION IF EXISTS public.epigraph_complete_passkey_enrollment(\n    \
-         uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb);",
+         uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb);",
     ),
 ];
 

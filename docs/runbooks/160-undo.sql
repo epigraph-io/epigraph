@@ -17,11 +17,11 @@
 --      as one `platform.passkey_registration_archived` event (the passkey
 --      id, its person and the registration: what the offline verifier
 --      re-checks, which an undo must not erase), then drops the column, its
---      immutability trigger and the eight-argument completion. The API
+--      immutability trigger and the nine-argument completion. The API
 --      binary that calls that form must be rolled back first.
 --
 -- ORDER: run this FIRST, before 132-undo and every other elevation undo.
--- Roll back first the API binary that calls 160's eight-argument completion
+-- Roll back first the API binary that calls 160's nine-argument completion
 -- (step 4 drops it; a build older than 160 calls 124's form); nothing else
 -- needs a binary rolled back.
 --
@@ -170,7 +170,7 @@ BEGIN
     RAISE NOTICE '160-undo: archived % passkey registration(s) into security_events', v_rows;
 END $$;
 DROP FUNCTION IF EXISTS public.epigraph_complete_passkey_enrollment(
-    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb);
+    uuid, bytea, jsonb, uuid, text, boolean, boolean, jsonb, jsonb);
 DROP TRIGGER IF EXISTS person_authenticators_registration_fixed
     ON public.person_authenticators;
 DROP FUNCTION IF EXISTS public.epigraph_person_authenticators_registration_fixed();

@@ -1407,7 +1407,7 @@ async fn open_enrollment(pool: &PgPool, person: Uuid) -> Uuid {
 /// who knows a live enrollment id stores a ceremony state of its own and
 /// completes the enrollment through the definers, past the API and its
 /// attestation allowlist, with a SOFTWARE key (`none` attestation); `with_
-/// registration` stores the registration response (the eight-argument form)
+/// registration` stores the registration response (the nine-argument form)
 /// or not (124's seven-argument form). Returns the passkey id.
 async fn forged_completion(pool: &PgPool, person: Uuid, with_registration: bool) -> Uuid {
     use soft_authenticator::{ClientUv, SoftAuthenticator, ORIGIN, RP_ID};
@@ -1437,7 +1437,7 @@ async fn forged_completion(pool: &PgPool, person: Uuid, with_registration: bool)
         let id: Uuid = if with_registration {
             sqlx::query_scalar(
                 "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, \
-                        $8)",
+                        $8, $9)",
             )
             .bind(enrollment)
             .bind(&reg.credential_id)
@@ -1447,6 +1447,7 @@ async fn forged_completion(pool: &PgPool, person: Uuid, with_registration: bool)
             .bind(reg.user_verified)
             .bind(reg.backup_eligible)
             .bind(&response)
+            .bind(state.to_json())
             .fetch_one(&mut *conn)
             .await
         } else {
@@ -1580,6 +1581,123 @@ async fn a_passkey_completed_past_the_api_is_flagged(pool: PgPool) {
         got, want,
         "CALIBRATION: under the software policy the forged key re-verifies"
     );
+}
+
+/// Complete `enrollment` on the unstamped application as the API does, with
+/// the registration `reg` was verified from and the ceremony state it was
+/// verified against; the passkey or the refusal.
+async fn app_complete(
+    pool: &PgPool,
+    enrollment: Uuid,
+    reg: &epigraph_passkey::RegisteredPasskey,
+    response: &serde_json::Value,
+    verified_against: &serde_json::Value,
+) -> Result<Uuid, sqlx::Error> {
+    let (reg, response, verified_against) =
+        (reg.clone(), response.clone(), verified_against.clone());
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query_scalar(
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, $3, $4, $5, $6, $7, \
+                    $8, $9)",
+        )
+        .bind(enrollment)
+        .bind(&reg.credential_id)
+        .bind(&reg.passkey)
+        .bind(reg.aaguid)
+        .bind(&reg.attestation_format)
+        .bind(reg.user_verified)
+        .bind(reg.backup_eligible)
+        .bind(&response)
+        .bind(&verified_against)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// Store `state` as `enrollment`'s ceremony state on the unstamped
+/// application (the API's challenge step; a restart overwrites it).
+async fn app_store_state(pool: &PgPool, enrollment: Uuid, state: serde_json::Value) {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_passkey_enrollment_challenge($1, $2)")
+            .bind(enrollment)
+            .bind(&state)
+            .execute(&mut *conn)
+            .await
+            .expect("the app stores the state");
+        (conn, ())
+    })
+    .await;
+}
+
+/// A RESTARTED CEREMONY RECORDS NO PASSKEY AGAINST ITS OLD STATE (final review
+/// F2-COR-04). The API reads the enrollment's ceremony state S1, verifies a
+/// GENUINE registration against it, and completes; a restart of the ceremony
+/// (a second tab's challenge request) can store S2 in between. The passkey
+/// must not be recorded beside S2: the offline verifier re-runs the stored
+/// registration against the enrollment's FINAL state, so it would report a
+/// genuine passkey `registration_does_not_verify` (exit 2, the response to
+/// which is rotating a DSN). The completion is refused instead (ELV11,
+/// nothing recorded), the verifier finds nothing, and the registration
+/// verified against the current state S2 completes and re-verifies clean.
+///
+/// Verified to fail with 160's state comparison removed from the
+/// completion (the S1 completion is admitted and the verifier flags it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_restarted_ceremony_records_no_passkey_against_its_old_state(pool: PgPool) {
+    use soft_authenticator::{ClientUv, SoftAuthenticator, ORIGIN, RP_ID};
+    let (p, _) = fixture::seed_human_operator(&pool, "restarted").await;
+    let enrollment = open_enrollment(&pool, p).await;
+    let rp = epigraph_passkey::Passkeys::new(epigraph_passkey::PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: epigraph_passkey::AttestationPolicy::SoftwareAllowed,
+    })
+    .expect("the relying party");
+    let (options1, s1) = rp.start_registration(p, "p", "P").expect("start");
+    app_store_state(&pool, enrollment, s1.to_json()).await;
+    let mut auth = SoftAuthenticator::new(ATTESTED_MODEL);
+    let response1 = auth.register(ORIGIN, options1, ClientUv::AsRequested).await;
+    let reg1 = rp
+        .finish_registration(&response1, &s1)
+        .expect("CALIBRATION: the registration is genuine against S1");
+    // The restart lands between the API's read of S1 and its completion.
+    let (options2, s2) = rp.start_registration(p, "p", "P").expect("restart");
+    app_store_state(&pool, enrollment, s2.to_json()).await;
+    let stale = app_complete(&pool, enrollment, &reg1, &response1, &s1.to_json()).await;
+
+    let run = run_verify(&pool, &["--json"], Some(ORIGIN)).await;
+    assert_eq!(
+        findings_of(&report_of(&run)),
+        vec![],
+        "a genuine registration is never flagged: {}",
+        run.show()
+    );
+    let err = stale.expect_err("a completion against a replaced ceremony state is refused");
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code().map(|c| c.into_owned()));
+    assert_eq!(code.as_deref(), Some("ELV11"), "{err}");
+    let held: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM person_authenticators WHERE person_agent_id = $1")
+            .bind(p)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(held, 0, "nothing was recorded");
+
+    let response2 = auth.register(ORIGIN, options2, ClientUv::AsRequested).await;
+    let reg2 = rp
+        .finish_registration(&response2, &s2)
+        .expect("genuine against S2");
+    app_complete(&pool, enrollment, &reg2, &response2, &s2.to_json())
+        .await
+        .expect("the completion verified against the current state is recorded");
+    let run = run_verify(&pool, &["--json"], Some(ORIGIN)).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(report["passkeys_checked"], serde_json::json!(1), "{report}");
 }
 
 /// THE APPLICATION-DSN FORGERY IS FLAGGED (elevation plan EL-13): a ticket
