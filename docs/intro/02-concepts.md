@@ -110,7 +110,10 @@ everywhere. Three seed strategies are in use today:
   (see [`crates/epigraph-ingest-executor/src/system_agent.rs`](../../crates/epigraph-ingest-executor/src/system_agent.rs)).
   The same string always produces the same agent across processes,
   so the get-or-create lookup is idempotent. Container restart, fresh
-  deploy, parallel host — all the same agent UUID.
+  deploy, parallel host — all the same agent UUID. That string is only
+  the LEGACY seed: once a deployment registers its system agent in the
+  `system_agents` registry (migration 148), the registry is
+  authoritative and the agent's key can be rotated to a secret one.
 - **LLM-driven agents (planned, tracked in [issue #166](https://github.com/epigraph-io/epigraph/issues/166))** —
   the seed is a hash of `(model identifier, system prompt)` so the same
   model+prompt pair resolves to the same agent identity across sessions.

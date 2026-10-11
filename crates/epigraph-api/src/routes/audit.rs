@@ -64,13 +64,22 @@ pub struct SecurityEventResponse {
 ///
 /// # Per-principal scoping: the viewer's stamped connection
 ///
-/// The rows a caller may read are decided by the `security_events_read` RLS
-/// policy (migration 083): its own rows (`agent_id` = the session principal),
-/// or every row, unattributed ones included, for a live instance admin. Both
-/// arms read the session's STAMPED principal, so the read runs on
-/// `AppState::read_as(&viewer)` and is finished with `finish_scoped_read`. On
-/// the unstamped application pool every arm is false and the route answered
-/// `[]` to every caller, the owner of the rows included, with a 200.
+/// The rows a caller may read are decided by two RLS policies:
+///
+/// - `security_events_read` (077, recreated by 083 and by 129): the caller's
+///   own rows (`agent_id` = the session principal), plus every row,
+///   unattributed ones included, through its admin arm. Since 129 that arm
+///   follows the admin-scope switch (128): unarmed, it admits a live platform
+///   custodian (123's instance-admin answer); armed, only an elevated
+///   session.
+/// - `security_events_elevated_read` (126): every row for an elevated
+///   session.
+///
+/// Every arm reads the session's STAMPED principal (and, for the elevated
+/// arms, its elevation), so the read runs on `AppState::read_as(&viewer)` and
+/// is finished with `finish_scoped_read`. On the unstamped application pool
+/// every arm is false and the route answered `[]` to every caller, the owner
+/// of the rows included, with a 200.
 ///
 /// The query parameters are filters within that set and never widen it: an
 /// `agent_id` naming another agent narrows a non-admin caller's answer to
@@ -96,7 +105,8 @@ pub async fn query_security_events(
     // and this branch is unreachable. It is written as a refusal anyway because
     // the previous `if let Some(..)` with no `else` made the handler's
     // correctness depend on which router chain it happened to be registered on,
-    // and it is the caller-facing end of a read policy 083 widens.
+    // and it is the caller-facing end of read policies that widen past the
+    // caller's own rows (083's admin arm as 129 recreates it, and 126's).
     let Some(axum::Extension(ref auth)) = auth_ctx else {
         return Err(ApiError::Unauthorized {
             reason: "authentication required".to_string(),

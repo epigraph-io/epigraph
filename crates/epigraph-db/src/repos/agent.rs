@@ -8,6 +8,20 @@ use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
+/// [`AgentRepository::author_binding`]'s label for an agent that IS a
+/// registered human operator (migration 122, arm (a)).
+pub const HUMAN_OPERATOR_BINDING: &str = "human_operator";
+
+/// [`AgentRepository::author_binding`]'s label for an agent holding a LIVE
+/// operator link to a registered human (migration 122, arm (b)).
+pub const LIVE_LINK_BINDING: &str = "live_link";
+
+/// [`AgentRepository::author_binding`]'s label for the agent of an OAuth
+/// client on the author-binding allowlist (migration 149, arm (c)). Such an
+/// agent is BOUND to a human but not OPERATED: it holds no link record, so it
+/// keeps its HTTP token and viewer.
+pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
+
 /// One ACTING operator link: the operator's agent id and the id of the
 /// operator's personal group, which owns the operated agent's new claims.
 ///
@@ -1487,6 +1501,11 @@ impl AgentRepository {
     /// the caller's connection, so it answers the same on an unstamped
     /// `epigraph_app` session as on a maintenance one.
     ///
+    /// For an allowlisted author (migration 149) this passes, and the early
+    /// [`Self::require_operator_scope`] is quiet too, because the membership
+    /// door reads links only. Its as-itself write lands in its own personal
+    /// group, and the claims trigger's writer scope is the refusal (`OPL02`).
+    ///
     /// # Errors
     /// [`DbError::OperatorLinkRequired`] for an unbound author once armed;
     /// `DbError::QueryFailed` if the function is absent (a database that has
@@ -1570,9 +1589,11 @@ impl AgentRepository {
         Ok(())
     }
 
-    /// How `agent_id` is bound to a human operator (migration 122):
-    /// `Some("live_link")`, `Some("human_operator")`, or `None` (unbound).
-    /// Independent of arming and of the valve.
+    /// How `agent_id` is bound to a human operator (migration 122, widened by
+    /// migration 149): `Some("human_operator")` ([`HUMAN_OPERATOR_BINDING`]),
+    /// `Some("live_link")` ([`LIVE_LINK_BINDING`]), `Some("client_allowlist")`
+    /// ([`CLIENT_ALLOWLIST_BINDING`], the agent of an allowlisted OAuth
+    /// client), or `None` (unbound). Independent of arming and of the valve.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the function is absent or the read fails.

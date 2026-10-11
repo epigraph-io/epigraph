@@ -7,6 +7,15 @@
 //! `--apply` or rolls it back otherwise, so a dry run prints exactly what the
 //! definer did.
 //!
+//! # Registered system agents are always excluded
+//!
+//! Migration 148 refuses a RETIRED link of a registered system agent (it would
+//! never be bindable again), and the definer's insert is inside one call, so
+//! one such agent among the candidates would abort the whole tie. The command
+//! therefore adds every `system_agents` agent to the exclusion list
+//! ([`registered_system_agents`]) and names each one; the definer then reports
+//! it `skipped:excluded`. A database below 148 has none.
+//!
 //! # The quiet window
 //!
 //! A retired link is permanent and never promoted, and once operator binding is
@@ -29,6 +38,36 @@ pub struct Options {
     /// `recent_writer` (skipped). `None` disables the window.
     pub quiet_since: Option<DateTime<Utc>>,
     pub apply: bool,
+}
+
+/// Every registered system agent (migration 148), or none on a database
+/// without the registry.
+///
+/// # Errors
+/// A statement failed.
+pub async fn registered_system_agents(conn: &mut PgConnection) -> anyhow::Result<Vec<Uuid>> {
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.system_agents') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !present {
+        return Ok(Vec::new());
+    }
+    Ok(epigraph_db::SystemAgentRepository::registered_agent_ids(&mut *conn).await?)
+}
+
+/// Add `system_agents` to `exclude` (deduplicated); returns the ids it added
+/// that were not already excluded.
+#[must_use]
+pub fn exclude_system_agents(exclude: &mut Vec<Uuid>, system_agents: &[Uuid]) -> Vec<Uuid> {
+    let mut added = Vec::new();
+    for id in system_agents {
+        if !exclude.contains(id) {
+            exclude.push(*id);
+            added.push(*id);
+        }
+    }
+    added
 }
 
 /// One `(agent, outcome)` per candidate, as the definer returned them.

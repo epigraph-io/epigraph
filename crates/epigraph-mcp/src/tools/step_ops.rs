@@ -103,7 +103,8 @@ async fn require_authority_over(
 ///
 /// # One stamped transaction, not five pool checkouts
 ///
-/// The step claim is authored by `workflow-ingest-system` and owned by that
+/// The step claim is authored by the registered workflow-ingest system agent
+/// (migration 148) and owned by that
 /// agent's personal group, so on the unstamped pool its INSERT is refused on a
 /// cleanly-migrated schema. The stamp is therefore the system agent's — see
 /// [`crate::claim_helper::begin_system_ingest_stamped_tx`] — not

@@ -4,7 +4,8 @@
 //! # The measurement that bounds this module
 //!
 //! Every write a workflow mutation makes is authored by, and stamped from,
-//! `workflow-ingest-system` (`claim_helper::begin_system_ingest_stamped_tx`),
+//! the registered workflow-ingest system agent
+//! (`claim_helper::begin_system_ingest_stamped_tx`),
 //! and before batch H-b nothing on that path asked whether the CALLER had any
 //! authority over the workflow it named: any `claims:write` caller could
 //! `add_step` / `delete_step` on any workflow (the e2e `delete_step` arm drove a

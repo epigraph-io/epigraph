@@ -115,6 +115,9 @@ const CLOSED: &[&str] = &[
     "_sqlx_migrations",
     "agent_capabilities",
     "agent_keys",
+    // Migration 149: an authority table (which client's agent writes for which
+    // human), written only through maintenance definers.
+    "author_binding_clients",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
@@ -122,6 +125,11 @@ const CLOSED: &[&str] = &[
     "refresh_tokens",
     // Migration 141: written only through `epigraph_access_token_revoke`.
     "revoked_access_tokens",
+    // Migration 148: the system-agent registry, written only by a maintenance
+    // session (its definer or a guarded direct INSERT). It has a writer, so it
+    // is not in NO_WRITE; its INSERT and column-level grants are pinned in
+    // `schema_contract.rs::migration_148_system_agent_registry_keeps_owner_grants_and_acl`.
+    "system_agents",
     "tenancy_backfill_progress",
     "tenancy_exempt",
     "tenancy_transcription_log",
@@ -135,6 +143,9 @@ const CLOSED: &[&str] = &[
 /// table-level one.
 const NO_WRITE: &[&str] = &[
     "agent_capabilities",
+    // Migration 149: written only through maintenance definers; the
+    // application role holds SELECT only.
+    "author_binding_clients",
     "authorization_votes",
     "authorizers",
     "entity_merge_candidates",

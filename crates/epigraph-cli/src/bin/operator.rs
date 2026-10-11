@@ -17,6 +17,10 @@
 //! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
 //! recent writers refused it. `verify-confirmations` exits 2 when at least one
 //! stored confirmation does not verify (each is recorded).
+//! `allow-author-binding-client` exits 3 when the allowance is recorded but
+//! does not bind (ALLOWED-BUT-INEFFECTIVE); `revoke-author-binding-client`
+//! exits 1 when no allowance row names the client (NOT-ALLOWED: nothing to
+//! revoke, usually a mistyped id).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -57,11 +61,14 @@
 //!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
 //!     epigraph-operator list-elevations [--person <uuid>] [--live]
 //!     epigraph-operator verify-confirmations [--since <RFC3339>] [--json]
+//!     epigraph-operator allow-author-binding-client --client <uuid> --operator <uuid> \
+//!         --reason TEXT [--revoke-foreign-writes] [--apply]
+//!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, client_scope, confirmations, custodian, elevation, hide, human,
-    legacy, link, passkey, reown, reown_linked, reverse,
+    self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
+    elevation, hide, human, legacy, link, passkey, reown, reown_linked, reverse, system_agent,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -288,12 +295,74 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Register the agent that IS a system role (migration 148), e.g. the
+    /// workflow-ingest system agent. IMMUTABLE once applied: no revoke, no
+    /// re-point. Register BEFORE rotating the agent's key and BEFORE arming.
+    RegisterSystemAgent {
+        /// The role (`workflow-ingest`).
+        #[arg(long)]
+        role: String,
+        /// The agent id that is that role's system agent.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on the registry row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+        /// Apply although the agent's current key is NOT the role's legacy
+        /// public-constant key (an agent that never held it). Without it,
+        /// `--apply` refuses such an agent: the registration would protect the
+        /// new key and leave the legacy one free to be re-created.
+        #[arg(long)]
+        key_not_legacy_ok: bool,
+    },
     /// Revoke a human operator's registration. Final for that row: every agent
     /// live-linked to the human stops authoring (OPL01).
     RevokeHumanOperator {
         /// The human's agent id.
         #[arg(long)]
         agent: Uuid,
+        /// Recorded on the row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Allow ONE service or agent OAuth client's agent to write as a bound
+    /// agent of a registered human operator (migration 149's author-binding
+    /// allowlist), without linking it: the client keeps its HTTP token. The
+    /// client must be active, have minted at least once, and be its agent's
+    /// only non-revoked client. Exits 3 when the allowance is recorded but
+    /// does not bind (ALLOWED-BUT-INEFFECTIVE).
+    AllowAuthorBindingClient {
+        /// The OAuth client (`oauth_clients.id`, a `service` or `agent` client).
+        #[arg(long)]
+        client: Uuid,
+        /// The registered human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Recorded on the registry row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Also revoke every writer/admin row the client's agent holds in a
+        /// group its operator does not write (listed as FOREIGN-WRITE either way).
+        #[arg(long)]
+        revoke_foreign_writes: bool,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Revoke a client's author-binding allowance. Final for that client:
+    /// mint a new client to allow again. Prints ALREADY-REVOKED (exit 0) for
+    /// a revoked allowance, and NOT-ALLOWED (exit 1) when no allowance row
+    /// names the client.
+    RevokeAuthorBindingClient {
+        /// The OAuth client (`oauth_clients.id`).
+        #[arg(long)]
+        client: Uuid,
         /// Recorded on the row and in the audit row.
         #[arg(long)]
         reason: String,
@@ -587,6 +656,13 @@ async fn main_inner() -> anyhow::Result<i32> {
             anyhow::bail!("--batch-size must be at least 1");
         }
     }
+    // The role vocabulary, before any connection: a typo is refused by this
+    // tool with the valid values, not by the table's CHECK.
+    let system_role = if let Command::RegisterSystemAgent { role, .. } = &cli.command {
+        Some(system_agent::parse_role(role)?)
+    } else {
+        None
+    };
     let db = operator::connect().await?;
     eprintln!(
         "epigraph-operator: connected as {} (member of epigraph_maintenance)",
@@ -909,6 +985,42 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        Command::RegisterSystemAgent {
+            role: _,
+            agent,
+            reason,
+            apply,
+            key_not_legacy_ok,
+        } => {
+            let role = system_role.expect("parsed above for this command");
+            let Some(identity) = system_agent::identity(&mut conn, role, agent).await? else {
+                anyhow::bail!("agent {agent} does not exist; nothing was registered");
+            };
+            for line in system_agent::describe_identity(&identity) {
+                println!("{line}");
+            }
+            let outcome = system_agent::register(
+                &mut conn,
+                role,
+                &identity,
+                &reason,
+                apply,
+                key_not_legacy_ok,
+            )
+            .await?;
+            println!(
+                "{}{}\trole={role}\tagent={agent}",
+                if apply { "" } else { "WOULD BE " },
+                match outcome {
+                    system_agent::Outcome::Registered => "REGISTERED",
+                    system_agent::Outcome::AlreadyRegistered => "ALREADY-REGISTERED",
+                }
+            );
+            if !apply {
+                println!("DRY RUN: the registration and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
         Command::RevokeHumanOperator {
             agent,
             reason,
@@ -924,6 +1036,43 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");
             }
             Ok(0)
+        }
+        Command::AllowAuthorBindingClient {
+            client,
+            operator: op,
+            reason,
+            revoke_foreign_writes,
+            apply,
+        } => {
+            let outcome =
+                binding_client::allow(&mut conn, client, op, &reason, revoke_foreign_writes, apply)
+                    .await?;
+            for line in binding_client::describe(&outcome, apply) {
+                println!("{line}");
+            }
+            if !apply {
+                println!("DRY RUN: the allowance and its audit row were rolled back.");
+            }
+            Ok(if outcome.effective() { 0 } else { 3 })
+        }
+        Command::RevokeAuthorBindingClient {
+            client,
+            reason,
+            apply,
+        } => {
+            let outcome = binding_client::revoke(&mut conn, client, &reason, apply).await?;
+            println!(
+                "{}",
+                binding_client::describe_revoke(client, &outcome, apply)
+            );
+            if !apply {
+                println!("DRY RUN: the revocation and its audit row were rolled back.");
+            }
+            Ok(if outcome == binding_client::RevokeOutcome::NotAllowed {
+                1
+            } else {
+                0
+            })
         }
         Command::Link {
             agent,
@@ -973,10 +1122,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             if !no_quiet_window && quiet_days <= 0 {
                 anyhow::bail!("--quiet-days must be at least 1 (or pass --no-quiet-window)");
             }
-            let exclude = match exclude_agents_file {
+            let mut exclude = match exclude_agents_file {
                 Some(f) => operator::read_ids_file(&f)?,
                 None => Vec::new(),
             };
+            let system_agents = legacy::registered_system_agents(&mut conn).await?;
+            for id in legacy::exclude_system_agents(&mut exclude, &system_agents) {
+                println!(
+                    "AUTO-EXCLUDED\t{id}\tregistered system agent (migration 148: a retired \
+                     link would leave it unbindable)"
+                );
+            }
             let opts = legacy::Options {
                 operator: op,
                 exclude,

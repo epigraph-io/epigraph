@@ -320,6 +320,28 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
         .expect("human operator registry row");
 }
 
+/// Register `agent` as the workflow-ingest system agent (migration 148)
+/// through the REAL path: `epigraph_register_system_agent` on a session
+/// downgraded to `epigraph_maintenance`, so every guard, the key snapshot and
+/// the audit trigger run exactly as the operator CLI's call does. Returns
+/// `registered_now`. Panics on a refusal; a test that expects one calls the
+/// definer itself.
+pub async fn register_system_agent(pool: &PgPool, agent: Uuid) -> bool {
+    as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let now: bool = sqlx::query_scalar(
+            "SELECT registered_now FROM public.epigraph_register_system_agent($1, $2, $3)",
+        )
+        .bind(epigraph_db::SystemAgentRole::WorkflowIngest.as_str())
+        .bind(agent)
+        .bind("test fixture")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role registers the workflow-ingest system agent");
+        (conn, now)
+    })
+    .await
+}
+
 /// Open migration 125's recorder gate, `epigraph_elevated_access_ready()`, on
 /// a test database CUT BEFORE migration 132, standing in for 132.
 ///

@@ -439,8 +439,10 @@ mod tests {
             .with_state(state)
     }
 
-    /// Insert a system agent (mirrors `get_or_create_system_agent` but without
-    /// going through the public API) and return its id.
+    /// Find or insert an agent holding the all-zero key, straight into `agents`,
+    /// to stand in as a system author for these unit tests. It is NOT the
+    /// registered workflow-ingest agent and never goes through
+    /// `get_or_create_system_agent` (migration 148's registry).
     async fn ensure_system_agent(pool: &PgPool) -> Uuid {
         let pub_key = vec![0u8; 32];
         if let Some(id) =

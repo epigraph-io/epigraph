@@ -250,6 +250,8 @@ async fn create_challenge_binds_the_authenticated_caller(pool: PgPool) {
             .await
             .expect("the system agent")
     };
+    // Migration 148: registered before arming, as the deploy order does.
+    assert!(viewer_fixture::register_system_agent(&pool, system).await);
     link_live(&pool, system, a).await;
     install_orphan_policy_and_arm(&pool).await;
     let state = app_role_state(&pool).await;
