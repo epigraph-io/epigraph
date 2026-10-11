@@ -366,13 +366,13 @@ pub async fn submit_ds_evidence(
     // second, divergent implementation. Backlog 2bffdfdc: the old inline
     // combine here used raw stored masses with no dynamic reliability
     // discount and a fixed-method pairwise loop, while `recompute_beliefs`
-    // applies the issue-197 discount chain and adaptive rule selection —
+    // applies the issue-197 discount chain and `combine_multiple` —
     // same BBA rows, two different answers. Delegating here makes the two
     // tools compute identically by construction.
     //
     // `params.combination_method` and `params.gamma` do not influence the
-    // stored/returned belief: the shared recompute always resolves the method
-    // adaptively (via `combine_multiple`). This is the accepted consequence of
+    // stored/returned belief: the shared recompute always folds with Dempster
+    // (via `combine_multiple`, since U025). This is the accepted consequence of
     // unification; both are deprecated and warned about (backlog 82dcff9d).
     //
     // `params.hypothesis_index` DOES: it is stored in `claim_frames` just above,
@@ -585,7 +585,7 @@ fn deprecated_parameter_warnings(method: CombinationMethod, gamma: Option<f64>) 
         out.push(format!(
             "combination_method={method:?} is deprecated: it was stored on the BBA and is \
              echoed as method_used, but it did not change the returned belief. The claim's \
-             belief is always recomputed by the shared adaptive combine (the one \
+             belief is always recomputed by the shared Dempster fold (the one \
              recompute_beliefs uses)."
         ));
     }

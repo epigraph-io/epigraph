@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::state::AppState;
+#[cfg(not(feature = "db"))]
 use epigraph_core::{AgentId, Claim, TruthValue};
 
 // =============================================================================
@@ -30,6 +31,7 @@ const MAX_CLAIM_CONTENT_LENGTH: usize = 65_536;
 
 /// Default truth value for claims that omit the field.
 /// 0.5 represents maximum uncertainty: neither true nor false.
+#[cfg(not(feature = "db"))]
 const DEFAULT_TRUTH_VALUE: f64 = 0.5;
 
 // =============================================================================
@@ -37,6 +39,7 @@ const DEFAULT_TRUTH_VALUE: f64 = 0.5;
 // =============================================================================
 
 /// Request body for batch claim creation
+#[cfg(not(feature = "db"))]
 #[derive(Debug, Deserialize)]
 pub struct BatchClaimRequest {
     /// Array of claim items to create
@@ -44,6 +47,7 @@ pub struct BatchClaimRequest {
 }
 
 /// A single claim item within a batch request
+#[cfg(not(feature = "db"))]
 #[derive(Debug, Deserialize)]
 pub struct BatchClaimItem {
     /// The statement content of the claim
@@ -55,9 +59,12 @@ pub struct BatchClaimItem {
 /// Response for a batch claim creation request
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BatchClaimResponse {
-    /// Number of claims successfully created
+    /// Number of items that inserted a new claim
     pub created: usize,
-    /// Number of claims that failed validation
+    /// Number of `if_not_exists` items that matched an existing claim
+    #[serde(default)]
+    pub existing: usize,
+    /// Number of items that failed
     pub failed: usize,
     /// Per-item results in the same order as the request
     pub results: Vec<BatchClaimResult>,
@@ -68,15 +75,166 @@ pub struct BatchClaimResponse {
 pub struct BatchClaimResult {
     /// Index of this item in the original request array
     pub index: usize,
-    /// The ID of the created claim, if successful
+    /// The claim id, when the item succeeded
     pub claim_id: Option<Uuid>,
-    /// Error message, if validation failed
+    /// Whether this item inserted a row (false on an `if_not_exists` match)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_created: Option<bool>,
+    /// The HTTP status the single-claim route would have answered, when the item failed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Error message, when the item failed
     pub error: Option<String>,
+}
+
+/// Turn one batch item into the request `POST /api/v1/claims` takes.
+///
+/// A batch item IS a `CreateClaimRequest` with two conveniences, so a field
+/// added to that type later reaches batch with no change here:
+///
+/// * `agent_id` defaults to the caller's own agent when the item omits it.
+///   An item that names one keeps it, with exactly the single route's
+///   semantics (recorded as the author; the key and the owning group still
+///   come from the token).
+/// * `truth_value`, this route's original key, is accepted as
+///   `initial_truth`. Giving both is refused rather than guessed.
+///
+/// # Errors
+/// A human-readable reason, reported in the item's result slot.
+pub fn batch_item_to_create_request(
+    mut item: serde_json::Value,
+    caller_agent_id: uuid::Uuid,
+) -> Result<crate::routes::claims::CreateClaimRequest, String> {
+    let obj = item
+        .as_object_mut()
+        .ok_or_else(|| "each batch item must be a JSON object".to_string())?;
+    if let Some(truth) = obj.remove("truth_value") {
+        if obj.contains_key("initial_truth") {
+            return Err("give either truth_value or initial_truth, not both".to_string());
+        }
+        obj.insert("initial_truth".to_string(), truth);
+    }
+    obj.entry("agent_id")
+        .or_insert_with(|| serde_json::Value::String(caller_agent_id.to_string()));
+    serde_json::from_value(item).map_err(|e| format!("invalid batch item: {e}"))
 }
 
 // =============================================================================
 // HANDLERS
 // =============================================================================
+
+/// Request body for `POST /api/v1/claims/batch` (db build). Each item is
+/// decoded by [`batch_item_to_create_request`], so it takes every field
+/// `POST /api/v1/claims` takes.
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
+pub struct BatchClaimRequest {
+    pub claims: Vec<serde_json::Value>,
+}
+
+/// Create up to [`MAX_BATCH_SIZE`] claims, each through the exact path
+/// `POST /api/v1/claims` takes (`create_claim_core`), on its own transaction.
+///
+/// * An item that omits `agent_id` is authored by the caller.
+/// * `if_not_exists: true` makes a re-run return the existing ids
+///   (`was_created: false`, counted in `existing`).
+/// * A failing item reports the single route's status and message in its
+///   slot; the other items are unaffected.
+/// * No event is published, the same as `POST /api/v1/claims`.
+///
+/// # Errors
+/// Whole-request: 401 with no authenticated agent, 403 without
+/// `claims:write`, 400 above [`MAX_BATCH_SIZE`] items.
+#[cfg(feature = "db")]
+pub async fn batch_create_claims(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(request): Json<BatchClaimRequest>,
+) -> Result<Json<BatchClaimResponse>, ApiError> {
+    use axum::response::IntoResponse;
+
+    let Some(axum::Extension(auth)) = auth_ctx.as_ref() else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create claims".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
+    let Some(caller_agent_id) = auth.agent_id else {
+        return Err(ApiError::Unauthorized {
+            reason:
+                "token carries no agent_id; re-authenticate to obtain a token bound to a principal"
+                    .to_string(),
+        });
+    };
+    if request.claims.len() > MAX_BATCH_SIZE {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "Batch size {} exceeds maximum of {}",
+                request.claims.len(),
+                MAX_BATCH_SIZE
+            ),
+        });
+    }
+
+    let (mut created, mut existing, mut failed) = (0usize, 0usize, 0usize);
+    let mut results = Vec::with_capacity(request.claims.len());
+    for (index, item) in request.claims.into_iter().enumerate() {
+        let outcome = match batch_item_to_create_request(item, caller_agent_id) {
+            Err(reason) => Err(ApiError::ValidationError {
+                field: format!("claims[{index}]"),
+                reason,
+            }),
+            Ok(req) if req.content.len() > MAX_CLAIM_CONTENT_LENGTH => {
+                Err(ApiError::ValidationError {
+                    field: format!("claims[{index}].content"),
+                    reason: format!(
+                        "Content too long: {} bytes, maximum is {} bytes",
+                        req.content.len(),
+                        MAX_CLAIM_CONTENT_LENGTH
+                    ),
+                })
+            }
+            Ok(req) => {
+                crate::routes::claims::create_claim_core(&state, &viewer, Some(auth), req).await
+            }
+        };
+        match outcome {
+            Ok(resp) => {
+                if resp.was_created {
+                    created += 1;
+                } else {
+                    existing += 1;
+                }
+                results.push(BatchClaimResult {
+                    index,
+                    claim_id: Some(resp.id),
+                    was_created: Some(resp.was_created),
+                    status: None,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                let message = e.to_string();
+                let status = e.into_response().status().as_u16();
+                results.push(BatchClaimResult {
+                    index,
+                    claim_id: None,
+                    was_created: None,
+                    status: Some(status),
+                    error: Some(message),
+                });
+            }
+        }
+    }
+    Ok(Json(BatchClaimResponse {
+        created,
+        existing,
+        failed,
+        results,
+    }))
+}
 
 /// Import multiple claims in a single batch request
 ///
@@ -112,6 +270,7 @@ pub struct BatchClaimResult {
 ///
 /// - 400 Bad Request: Batch exceeds MAX_BATCH_SIZE
 /// - 200 OK: Batch processed (check per-item results for individual errors)
+#[cfg(not(feature = "db"))]
 pub async fn batch_create_claims(
     State(state): State<AppState>,
     Json(request): Json<BatchClaimRequest>,
@@ -145,6 +304,8 @@ pub async fn batch_create_claims(
                 results.push(BatchClaimResult {
                     index,
                     claim_id: None,
+                    was_created: None,
+                    status: Some(400),
                     error: Some(error_msg),
                 });
                 failed_count += 1;
@@ -161,6 +322,8 @@ pub async fn batch_create_claims(
             results.push(BatchClaimResult {
                 index: *index,
                 claim_id: Some(claim_uuid),
+                was_created: Some(true),
+                status: None,
                 error: None,
             });
             created_count += 1;
@@ -206,6 +369,7 @@ pub async fn batch_create_claims(
 
     Ok(Json(BatchClaimResponse {
         created: created_count,
+        existing: 0,
         failed: failed_count,
         results,
     }))
@@ -219,6 +383,7 @@ pub async fn batch_create_claims(
 ///
 /// Returns Ok(Claim) on success, or Err(String) with a human-readable
 /// error message on validation failure.
+#[cfg(not(feature = "db"))]
 fn validate_batch_item(item: &BatchClaimItem) -> Result<Claim, String> {
     // 1. Content must not be empty
     if item.content.trim().is_empty() {
@@ -909,5 +1074,122 @@ mod tests {
             0,
             "Oversized batch rejection must not store any claims"
         );
+    }
+}
+
+#[cfg(test)]
+mod item_decoding_tests {
+    use super::batch_item_to_create_request;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_legacy_item_gets_the_callers_agent_and_its_truth_value() {
+        let caller = Uuid::new_v4();
+        let req = batch_item_to_create_request(json!({"content": "c", "truth_value": 0.6}), caller)
+            .expect("legacy shape decodes");
+        assert_eq!(req.agent_id, caller);
+        assert_eq!(req.initial_truth, Some(0.6));
+        assert_eq!(req.content, "c");
+        assert!(!req.if_not_exists);
+    }
+
+    #[test]
+    fn an_explicit_agent_and_every_single_claim_field_pass_through() {
+        let caller = Uuid::new_v4();
+        let named = Uuid::new_v4();
+        let trace = Uuid::new_v4();
+        let evidence = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let content_hash = "a".repeat(64);
+        let req = batch_item_to_create_request(
+            json!({
+                "content": "c", "agent_id": named, "initial_truth": 0.7, "trace_id": trace,
+                "content_hash": content_hash,
+                "properties": {"source_uri": "doi:10.1/x", "page": 3},
+                "evidence_id": evidence,
+                "privacy_tier": "fully_private",
+                "group_id": group,
+                "encrypted_content": "ciphertext-base64",
+                "encryption_epoch": 2,
+                "labels": ["a", "b"], "if_not_exists": true
+            }),
+            caller,
+        )
+        .expect("full shape decodes");
+        // Destructuring with no `..` makes this exhaustive at compile time: a
+        // field added to `CreateClaimRequest` later fails to compile here
+        // until this test is updated to cover it, so "every single claim
+        // field" can't quietly go false again.
+        let crate::routes::claims::CreateClaimRequest {
+            content,
+            agent_id,
+            trace_id,
+            initial_truth,
+            content_hash: got_content_hash,
+            properties,
+            evidence_id,
+            privacy_tier,
+            group_id,
+            encrypted_content,
+            encryption_epoch,
+            labels,
+            if_not_exists,
+        } = req;
+        assert_eq!(content, "c");
+        assert_eq!(agent_id, named, "an item that names an author keeps it");
+        assert_eq!(initial_truth, Some(0.7));
+        assert_eq!(trace_id, Some(trace));
+        assert_eq!(got_content_hash, Some(content_hash));
+        assert_eq!(
+            properties,
+            Some(json!({"source_uri": "doi:10.1/x", "page": 3}))
+        );
+        assert_eq!(evidence_id, Some(evidence));
+        assert_eq!(privacy_tier, Some("fully_private".to_string()));
+        assert_eq!(group_id, Some(group));
+        assert_eq!(encrypted_content, Some("ciphertext-base64".to_string()));
+        assert_eq!(encryption_epoch, Some(2));
+        assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
+        assert!(if_not_exists);
+    }
+
+    #[test]
+    fn both_truth_keys_is_refused() {
+        let err = batch_item_to_create_request(
+            json!({"content": "c", "truth_value": 0.6, "initial_truth": 0.6}),
+            Uuid::new_v4(),
+        )
+        .err()
+        .expect("ambiguous truth is an error");
+        assert!(
+            err.contains("truth_value") && err.contains("initial_truth"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_item_is_refused() {
+        let err = batch_item_to_create_request(json!("just a string"), Uuid::new_v4())
+            .err()
+            .expect("non-object is an error");
+        assert!(err.contains("JSON object"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_content_is_refused_by_the_shared_request_type() {
+        let err = batch_item_to_create_request(json!({"truth_value": 0.5}), Uuid::new_v4())
+            .err()
+            .expect("content is required by CreateClaimRequest");
+        assert!(err.contains("content"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_agent_id_is_refused_not_replaced() {
+        let caller = Uuid::new_v4();
+        let err = batch_item_to_create_request(json!({"content": "c", "agent_id": "nope"}), caller)
+            .err()
+            .expect("a present-but-invalid agent_id must not fall back to the caller");
+        assert!(err.contains("invalid batch item"), "{err}");
     }
 }

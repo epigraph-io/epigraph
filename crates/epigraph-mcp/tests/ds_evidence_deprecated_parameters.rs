@@ -4,7 +4,7 @@
 //!
 //! Default taken from the brief: deprecate rather than honour. Honouring a
 //! per-call method would re-introduce the second, divergent combine that
-//! backlog 2bffdfdc removed in favour of the shared adaptive recompute.
+//! backlog 2bffdfdc removed in favour of the shared recompute.
 //!
 //! Params are built from JSON so this file compiles against the pre-fix types
 //! and the revert run FAILS on the assertions, not on the build.
@@ -132,6 +132,12 @@ async fn a_non_default_method_and_any_gamma_are_warned_about_and_change_nothing(
     assert!(
         warnings[0].contains("combination_method=YagerOpen") && warnings[0].contains("deprecated"),
         "{warnings:?}"
+    );
+    // U025: the recompute it points the caller at is a Dempster fold now, not
+    // an adaptive per-step rule selection.
+    assert!(
+        warnings[0].contains("shared Dempster fold") && !warnings[0].contains("adaptive"),
+        "the warning must name the Dempster fold: {warnings:?}"
     );
     assert!(
         warnings[1].contains("gamma=0.4") && warnings[1].contains("not change"),

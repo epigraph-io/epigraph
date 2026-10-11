@@ -644,7 +644,13 @@ pub async fn auto_wire_ds_update(
         .flatten()
     };
 
-    let combined = if all_rows.len() <= 1 {
+    // The second value is the conflict the fold SAW. Since U025 every
+    // `combine_multiple` step is Dempster, which normalises conflict out of
+    // the combined mass, so the multi-BBA arm reads it from the per-step
+    // reports (`aggregate_conflict`), exactly as the recompute path
+    // (`edge_factor::compute_combined_belief`) does; otherwise this write and
+    // the next recompute would disagree on `claims.mass_on_empty`.
+    let (combined, fold_conflict) = if all_rows.len() <= 1 {
         // Single BBA — still apply discount
         let r = all_rows
             .first()
@@ -656,7 +662,9 @@ pub async fn auto_wire_ds_update(
             &calibration,
         );
         let mf = parse_stored_bba(&frame, &r.masses)?;
-        combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
+        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        let k = d.mass_of_conflict();
+        (d, k)
     } else {
         // Multiple BBAs — discount each via the helper, then combine.
         let mut mass_fns = Vec::with_capacity(all_rows.len());
@@ -672,12 +680,14 @@ pub async fn auto_wire_ds_update(
                 combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
             mass_fns.push(discounted);
         }
-        let (combined, _reports) = combination::combine_multiple(&mass_fns, 0.9)
+        let (combined, reports) = combination::combine_multiple(&mass_fns, 0.9)
             .map_err(|e| format!("combine_multiple: {e}"))?;
-        combined
+        let k = combination::fold_conflict(&combined, &reports);
+        (combined, k)
     };
 
-    let (bel, pl, mut betp, conflict, missing) = compute_measures(&combined);
+    let (bel, pl, mut betp, _, missing) = compute_measures(&combined);
+    let conflict = fold_conflict;
 
     // Monotonicity clamp: supports=true evidence must not lower pignistic_prob.
     //
