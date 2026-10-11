@@ -417,6 +417,145 @@ async fn a_probe_never_waits_for_a_global_permit_another_viewer_holds() {
     app.upstream.verify().await;
 }
 
+/// The probe's retry after a refresh never queues for a permit either. The
+/// first attempt finds the only global permit free and is sent with an
+/// expired token: upstream answers 401, and the session refreshes. The
+/// refresh's one introspection call (display only) runs like a page's call,
+/// so it takes the permit and answers after a delay. An anonymous caller's
+/// slow call queues for that permit meanwhile and takes it the moment the
+/// introspection releases it. The retry, like the first attempt, must not
+/// wait for the permit: it is not sent, the answer is unknown at once, and
+/// nothing is remembered. (A retry that queued would be sent only when the
+/// slow call ended, about a second later.)
+#[tokio::test]
+async fn a_probes_retry_after_a_refresh_never_waits_for_a_global_permit() {
+    const INTROSPECT_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    let app = spawn_with(
+        &[
+            (ENV_UPSTREAM_CONCURRENCY, "1"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "1000"),
+        ],
+        Router::new(),
+    )
+    .await;
+    probe()
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": "Unauthorized", "message": "token expired"})),
+        )
+        .expect(1)
+        .named("first probe, expired token")
+        .mount(&app.upstream)
+        .await;
+    // One probe with the refreshed token in all: the calibration's.
+    probe()
+        .and(header("authorization", "Bearer tok2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acts": []})))
+        .expect(1)
+        .named("probe with the refreshed token")
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "tok2",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "refresh-2",
+            "scope": "claims:read"
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"active": true, "sub": TARGET}))
+                .set_delay(INTROSPECT_DELAY),
+        )
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let viewer = app.state.api(&app.session_auth(&sid, "tok"));
+    let other = app.state.api(&RequestAuth::Anonymous);
+    assert_eq!(app.state.upstream.available_permits(), 1);
+
+    let probe = async {
+        let started = std::time::Instant::now();
+        let cap = app.state.capabilities.admin_acts(&viewer).await;
+        (cap, started.elapsed())
+    };
+    let slow = async {
+        // Observe, not sleep: start once the introspection is in flight (it
+        // holds the only permit), so this call queues for the permit.
+        let waited = std::time::Instant::now();
+        while !app
+            .upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path() == "/oauth/introspect")
+        {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(2),
+                "the refresh never introspected"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        other.stats().await
+    };
+    let ((cap, took), _slow) = tokio::join!(probe, slow);
+
+    assert_eq!(cap, Capability::Unknown);
+    assert!(
+        took < INTROSPECT_DELAY + std::time::Duration::from_millis(300),
+        "the retry waited for a global permit: the probe took {took:?}"
+    );
+    assert_eq!(
+        app.state.capabilities.cached_admin_acts(),
+        None,
+        "a held global permit is not remembered as the API's unknown"
+    );
+    assert_eq!(
+        probe_calls(&app).await.len(),
+        1,
+        "only the 401'd attempt was sent; the retry was not"
+    );
+    assert_eq!(
+        app.state
+            .sessions
+            .get(&sid)
+            .expect("the session survives")
+            .access_token,
+        "tok2",
+        "the refresh itself went through"
+    );
+
+    // CALIBRATION: with the permit free again the same viewer's probe is
+    // sent with the refreshed token and answers, so the arm above was the
+    // held permit, not a broken refresh or probe.
+    assert_eq!(app.state.upstream.available_permits(), 1);
+    assert_eq!(
+        app.state.capabilities.admin_acts(&viewer).await,
+        Capability::Present
+    );
+    assert_eq!(probe_calls(&app).await.len(), 2);
+    app.upstream.verify().await;
+}
+
 /// The app's capability memory is built with the documented lifetimes: five
 /// minutes for a present/absent answer, thirty seconds for an API-side
 /// unknown. Pinned as values, so neither a never-expiring cache (an "absent"
