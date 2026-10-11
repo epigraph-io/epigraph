@@ -2600,10 +2600,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "query",
         "READ of `security_events` for `GET /api/v1/audit/security`. The table has no \
          `visibility` or `owner_group_id` column (it is not in migration 062's tier_a array), so \
-         there is no in-query predicate for a viewer to splice. Its row narrowing is the \
-         `security_events_read` RLS policy (migration 083), keyed on the session's STAMPED \
-         principal: the agent's own rows, or every row for a live instance admin. So the caller \
-         must pass its `AppState::read_as` connection, which \
+         there is no in-query predicate for a viewer to splice. Its row narrowing is RLS keyed \
+         on the session's STAMPED principal: `security_events_read` (083, recreated by 129) \
+         admits the agent's own rows, and every row through an admin arm that follows 128's \
+         switch (unarmed: a live platform custodian; armed: an elevated session only), and \
+         126's `security_events_elevated_read` admits every row for an elevated session. So \
+         the caller must pass its `AppState::read_as` connection, which \
          `routes/audit.rs::query_security_events` does and \
          `epigraph-api/tests/audit_security_route_test.rs` pins on the application role; on an \
          unstamped application connection it returns no rows (fails closed). \
