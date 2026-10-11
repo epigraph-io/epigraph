@@ -102,6 +102,18 @@ async fn post_claim(
     (status, json)
 }
 
+/// A non-default `initial_truth`, so a write that resets or recomputes truth
+/// is visible.
+const ATOM_TRUTH: f64 = 0.37;
+
+async fn mass_function_count(pool: &PgPool, claim_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("count mass functions")
+}
+
 fn id_of(body: &serde_json::Value) -> Uuid {
     body.get("id")
         .and_then(serde_json::Value::as_str)
@@ -140,13 +152,19 @@ async fn create_claim_with_derived_from_records_derivation_evidence() {
     assert!(st.is_success(), "seeding the parent failed: {st} {body}");
     let parent = id_of(&body);
 
-    // Atom, exactly the shape decompose_claims::submit_atom posts.
+    // Atom: the shape `epigraph_cli::decompose::atom_create_body` builds
+    // (pinned against this crate's `CreateClaimRequest` in epigraph-cli's
+    // `tests/decompose_atom_create_body.rs`), except `initial_truth`, which is
+    // deliberately NOT the 0.5 default so "truth untouched" below can fail.
     let atom_req = serde_json::json!({
         "content": format!("U041 atom {run}: the heavier mass accelerates downward."),
         "agent_id": agent,
-        "initial_truth": 0.5,
+        "initial_truth": ATOM_TRUTH,
         "if_not_exists": true,
-        "properties": {"methodology": "inductive_generalization"},
+        "properties": {
+            "methodology": "inductive_generalization",
+            "evidence_type": "logical"
+        },
         "labels": ["atom", "generality:0"],
         "derived_from": {"claim_id": parent, "method": "decompose_claims"},
     });
@@ -190,15 +208,22 @@ async fn create_claim_with_derived_from_records_derivation_evidence() {
         "raw_content is the parent's text — the passage the atom was derived from"
     );
 
-    // Provenance, not belief: the truth value is what the request asked for.
+    // Provenance, not belief: the truth value is what the request asked for,
+    // and no mass function exists for the atom (option B, rejected, would
+    // write one).
     let truth: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
         .bind(atom)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert!(
-        (truth - 0.5).abs() < 1e-9,
-        "derivation evidence must not move belief; truth={truth}"
+        (truth - ATOM_TRUTH).abs() < 1e-9,
+        "derivation evidence must not move belief; truth={truth}, asked {ATOM_TRUTH}"
+    );
+    assert_eq!(
+        mass_function_count(&pool, atom).await,
+        0,
+        "derivation evidence must not write a mass function for the atom"
     );
 
     // The row is visible where the report looked: the lineage read that
@@ -331,11 +356,37 @@ async fn derived_from_an_unavailable_parent_is_refused_without_writing_the_atom(
     // (c) Nonexistent.
     let missing = Uuid::new_v4();
 
+    // (d) Public and visible, but RETIRED: its text is no longer the graph's
+    // statement, so it must not become an atom's evidence.
+    let retired = common::seed_claim_with_agent(
+        &pool,
+        &format!("U041 retired parent {run}. Second sentence."),
+        agent,
+    )
+    .await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (vis, current): (String, bool) =
+        sqlx::query_as("SELECT visibility, is_current FROM claims WHERE id = $1")
+            .bind(retired)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (vis.as_str(), current),
+        ("public", false),
+        "fixture: the retired parent is public and not current"
+    );
+
     let mut answers = Vec::new();
     for (label, parent) in [
         ("invisible", invisible),
         ("caller-private", own_private),
         ("nonexistent", missing),
+        ("retired", retired),
     ] {
         let content = format!("U041 refused atom {run} {label}.");
         let (st, body) = post_claim(
@@ -366,8 +417,8 @@ async fn derived_from_an_unavailable_parent_is_refused_without_writing_the_atom(
     }
     assert!(
         answers.windows(2).all(|w| w[0] == w[1]),
-        "invisible, non-public and nonexistent parents must get one identical \
-         answer (no existence oracle); got {answers:?}"
+        "invisible, non-public, nonexistent and retired parents must get one \
+         identical answer (no existence oracle); got {answers:?}"
     );
 
     // `method` lands verbatim in a public evidence row every viewer reads, so
