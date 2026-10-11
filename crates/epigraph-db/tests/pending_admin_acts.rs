@@ -1681,6 +1681,117 @@ async fn an_act_executes_only_under_the_assignment_that_confirmed_it(pool: PgPoo
     assert_eq!(held, 0, "nothing granted");
 }
 
+/// An act confirmed under an assignment of an elevating role OTHER than the
+/// custodian executes (final review F2-TST-05; 160 section 2's second
+/// consequence): the consumer binds the act to the proposer's live
+/// ELEVATING assignment, whichever role it is, not to a custodian one. A
+/// second catalog role with `elevates = true` is seeded past the catalog's
+/// guard; its holder holds no custodian assignment (calibrated), has a live
+/// passkey and a confirmed act under that assignment, and the consumer,
+/// called directly on the maintenance role, spends it. Calibration: once
+/// that assignment ends, the same consumer refuses ELV08.
+///
+/// Verified to fail with 160's consumer also requiring a live
+/// `role:platform-custodian` assignment (130's defect): refused ELV08.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_executes_under_another_elevating_roles_assignment(pool: PgPool) {
+    let (node, _) = fixture::seed_agent_with_group(&pool, "steward role node").await;
+    without_triggers(
+        &pool,
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ('role:steward', true, false, $1, 'test: a second elevating role')",
+        node,
+    )
+    .await;
+    let (p, _) = human(&pool, "steward").await;
+    let key = passkey(&pool, p, 1).await;
+    without_triggers(
+        &pool,
+        "INSERT INTO role_assignments (role, holder_person_id, valid_from, reason) \
+         VALUES ('role:steward', $1, now() - interval '1 minute', 'test steward')",
+        p,
+    )
+    .await;
+    let (elevating, custodian): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT public.epigraph_live_elevating_assignment($1, clock_timestamp()), \
+                public.epigraph_live_role_assignment($1, 'role:platform-custodian', \
+                                                     clock_timestamp())",
+    )
+    .bind(p)
+    .fetch_one(&pool)
+    .await
+    .expect("the assignments");
+    let assignment = elevating.expect("CALIBRATION: the steward assignment elevates");
+    assert_eq!(custodian, None, "CALIBRATION: no custodian assignment");
+
+    let act_under = |assignment: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let mut conn = pool.acquire().await.expect("acquire");
+            sqlx::query("SET session_replication_role = replica")
+                .execute(&mut *conn)
+                .await
+                .expect("triggers off");
+            let act: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
+                "WITH a AS (SELECT public.epigraph_admin_act_args('role.end', \
+                                   jsonb_build_object('assignment', $3::text, \
+                                                      'reason', 'steward test')) AS args) \
+                 INSERT INTO pending_admin_acts \
+                        (kind, args, args_digest, target_type, target_id, reason, proposed_by, \
+                         elevation_id, assignment_id, expires_at, challenge_state, asserted_at, \
+                         outcome, assertion_evidence, authenticator_id) \
+                 SELECT 'role.end', a.args, public.epigraph_admin_act_digest(a.args), \
+                        'role_assignment', $3, 'steward test', $1, gen_random_uuid(), $3, \
+                        now() + interval '30 minutes', '{}'::jsonb, now(), 'confirmed', \
+                        '{\"fixture\": true}'::jsonb, $2 \
+                   FROM a RETURNING id",
+            )
+            .bind(p)
+            .bind(key)
+            .bind(assignment)
+            .fetch_one(&mut *conn)
+            .await;
+            sqlx::query("SET session_replication_role = DEFAULT")
+                .execute(&mut *conn)
+                .await
+                .expect("triggers on");
+            act.expect("a confirmed act under the assignment")
+        }
+    };
+    let consume = |act: Uuid| {
+        let pool = pool.clone();
+        async move {
+            maint(
+                &pool,
+                "SELECT public.epigraph_consume_admin_act($1, 'role.end', \
+                        (SELECT args_digest FROM pending_admin_acts WHERE id = $1), $2, \
+                        '{}'::jsonb)",
+                &[Some(act), Some(p)],
+            )
+            .await
+        }
+    };
+
+    let act = act_under(assignment).await;
+    consume(act)
+        .await
+        .expect("an act confirmed under another elevating role's assignment executes");
+    assert!(act_consumed(&pool, act).await, "the act is spent");
+
+    let stale = act_under(assignment).await;
+    without_triggers(
+        &pool,
+        "UPDATE role_assignments SET valid_to = now() WHERE id = $1",
+        assignment,
+    )
+    .await;
+    assert_code(
+        &consume(stale).await,
+        "ELV08",
+        "CALIBRATION: under an ended assignment",
+    );
+}
+
 // =====================================================================
 // THE CANONICAL FORM: the CLI's (Rust) and the database's agree.
 // =====================================================================
