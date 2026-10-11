@@ -720,6 +720,60 @@ async fn complete_registered(
     .await
 }
 
+/// A passkey's stored registration never changes after the insert
+/// (migration 160 section 4, final review F2-TST-02): it is the evidence the
+/// offline verifier re-runs, and the maintenance role holds UPDATE on the
+/// table, so a maintenance session swapping it, or nulling it to read as
+/// "not stored", is refused `ELV03` by 160's own trigger (its message, not
+/// 124's guard, which predates the column), and the row keeps the original.
+/// Calibration: a well-formed use of the same row lands.
+///
+/// Verified to fail with 160's `registration_fixed` test made a no-op
+/// (`IF false`): both edits land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_passkeys_stored_registration_never_changes(pool: PgPool) {
+    let (human, _) = fixture::seed_human_operator(&pool, "human").await;
+    let e = enroll(&pool, human).await.expect("enroll");
+    set_challenge(&pool, e).await.expect("challenge");
+    let key = complete_registered(&pool, e, 1, "{\"response\": \"original\"}", STARTED)
+        .await
+        .expect("complete with a registration");
+    for (sql, what) in [
+        (
+            "UPDATE person_authenticators SET registration = '{\"response\": \"swapped\"}'::jsonb, \
+                    last_used_at = now() WHERE id = $1",
+            "a swapped registration",
+        ),
+        (
+            "UPDATE person_authenticators SET registration = NULL, last_used_at = now() \
+              WHERE id = $1",
+            "a nulled registration",
+        ),
+    ] {
+        let r = maint_exec(&pool, sql, key).await;
+        assert_code(&r, "ELV03", what);
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("the registration it was admitted with never changes"),
+            "{what}: refused by 160's trigger: {msg}"
+        );
+    }
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT registration FROM person_authenticators WHERE id = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .expect("the row");
+    assert_eq!(stored, Some(serde_json::json!({ "response": "original" })));
+    maint_exec(
+        &pool,
+        "UPDATE person_authenticators SET last_used_at = now(), sign_count = 1 WHERE id = $1",
+        key,
+    )
+    .await
+    .expect("CALIBRATION: a use of the same row lands");
+}
+
 /// A completion is recorded only over the ceremony state its registration
 /// was verified against (migration 160 section 4, final review F2-COR-04): a
 /// restarted ceremony overwrites the enrollment's state, and a completion
