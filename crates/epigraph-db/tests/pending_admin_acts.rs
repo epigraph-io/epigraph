@@ -1391,6 +1391,56 @@ async fn concurrent_maintenance_completions_of_one_person_serialise(pool: PgPool
     assert_eq!(live_passkeys(&pool, person).await, 1);
 }
 
+/// A maintenance completion whose snapshot predates the per-person wait is
+/// refused (final review F2-SEC-01): under REPEATABLE READ or SERIALIZABLE
+/// the snapshot is fixed at the transaction's first statement, so a second
+/// completion started before the first committed would not see the first's
+/// passkey after the lock and both would commit. Each such completion is
+/// refused `CUS06` (nothing written: the person holds the first passkey
+/// only). READ COMMITTED is the racing test above (ELV10).
+///
+/// Verified to fail with 160's isolation test removed: under either level
+/// the second completion commits and the person holds two passkeys.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_completion_under_a_fixed_snapshot_is_refused(pool: PgPool) {
+    use sqlx::Executor;
+    for (n, iso) in [(1_u8, "REPEATABLE READ"), (3, "SERIALIZABLE")] {
+        let (person, _) = human(&pool, &format!("snapshot {iso}")).await;
+        let e1 = open_enrollment(&pool, person, "key 1").await;
+        let e2 = open_enrollment(&pool, person, "key 2").await;
+        start_enrollment(&pool, e1).await;
+        start_enrollment(&pool, e2).await;
+
+        let mut late = pool.acquire().await.expect("acquire");
+        late.execute("SET SESSION AUTHORIZATION epigraph_app")
+            .await
+            .expect("as app");
+        late.execute(format!("BEGIN ISOLATION LEVEL {iso}").as_str())
+            .await
+            .expect("begin");
+        late.execute("SELECT 1").await.expect("take the snapshot");
+        try_complete(&pool, e1, n)
+            .await
+            .expect("the first completion commits under READ COMMITTED");
+        let r = sqlx::query_scalar::<_, Uuid>(COMPLETE)
+            .bind(e2)
+            .bind(credential(n + 1))
+            .fetch_one(&mut *late)
+            .await;
+        let _ = late.execute("ROLLBACK").await;
+        late.execute("RESET SESSION AUTHORIZATION")
+            .await
+            .expect("reset");
+        drop(late);
+        assert_code(
+            &r,
+            "CUS06",
+            &format!("a maintenance completion under {iso}"),
+        );
+        assert_eq!(live_passkeys(&pool, person).await, 1, "{iso}");
+    }
+}
+
 // =====================================================================
 // THE DATABASE BINDS AN ACT TO THE WRITE IT AUTHORIZES, WITHOUT THE CLI
 // (final review F1-TST-03; 130's binding for the supersede and register

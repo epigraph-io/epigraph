@@ -27,7 +27,13 @@
 -- transaction-scoped advisory lock on the person, so two completions of one
 -- person in flight at once serialise and the second reads the first's
 -- passkey; the enrollment row lock 124 takes does not serialise them (they
--- lock different enrollments). The break-glass is unchanged: once every
+-- lock different enrollments). The second reads the first's passkey only
+-- under READ COMMITTED, where the test after the wait takes a new snapshot;
+-- under REPEATABLE READ or SERIALIZABLE the snapshot predates the wait (and
+-- SSI does not protect a SERIALIZABLE completion racing a READ COMMITTED
+-- one), so a maintenance completion under any other level is refused
+-- `CUS06`, 123's code for the same pattern. The API completes under READ
+-- COMMITTED. The break-glass is unchanged: once every
 -- passkey of the person is revoked, a maintenance enrollment completes again.
 --
 -- ===================================================================
@@ -152,8 +158,19 @@ BEGIN
             USING ERRCODE = 'ELV04';
     END IF;
     IF v_enrollment.created_via = 'maintenance' THEN
-        -- Two completions of ONE person serialise here; the test below is a
-        -- new statement, so it reads whatever the first committed.
+        -- Two completions of ONE person serialise here; under READ COMMITTED
+        -- the test below is a new statement with a new snapshot, so it reads
+        -- whatever the first committed. Any other isolation level fixes the
+        -- snapshot at the transaction's first statement, before the wait, so
+        -- it is refused (F2-SEC-01).
+        IF current_setting('transaction_isolation') <> 'read committed' THEN
+            RAISE EXCEPTION 'CUS06: a maintenance enrollment completes only under READ '
+                            'COMMITTED (this transaction runs %): its snapshot would predate '
+                            'the wait for a concurrent completion of the same person',
+                            current_setting('transaction_isolation')
+                USING ERRCODE = 'CUS06',
+                      HINT = 'Complete it under READ COMMITTED (the default).';
+        END IF;
         PERFORM pg_advisory_xact_lock(hashtext('epigraph.person_passkeys'),
                                       hashtext(NEW.person_agent_id::text));
         IF public.epigraph_has_live_passkey(NEW.person_agent_id) THEN

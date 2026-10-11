@@ -1271,7 +1271,8 @@ restart.
   (`CREATE OR REPLACE`, owner and ACL kept), section 4 adds objects. Section 1: 124's `person_authenticators` insert guard
   refuses `ELV10` when a MAINTENANCE enrollment completes for a person who
   already holds a live passkey (130 tested only when an enrollment opened), under
-  a per-person advisory lock. Section 2: 130's `epigraph_consume_admin_act`
+  a per-person advisory lock, and only under READ COMMITTED (`CUS06`
+  otherwise: a fixed snapshot would predate the wait). Section 2: 130's `epigraph_consume_admin_act`
   executes an act only while the proposer's live elevating assignment IS the
   act's `assignment_id` (as confirmation and session liveness bind it), not
   merely while some custodian assignment is live. Section 3: 132's recorder
