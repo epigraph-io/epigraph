@@ -2333,6 +2333,14 @@ async fn identity_strip_flags_a_widened_token_as_a_warning() {
         "{s}"
     );
     assert!(
+        s[start..text_start].contains(
+            "title=\"This token carries scopes the Explorer did not request. EpiGraph should \
+             not issue a token wider than requested; signing out and in again asks for a fresh \
+             one.\""
+        ),
+        "the warning explains itself on hover: {s}"
+    );
+    assert!(
         !s.contains("<span class=\"identity-strip__note\">"),
         "no neutral note beside the warning: {s}"
     );

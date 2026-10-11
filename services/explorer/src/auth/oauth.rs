@@ -784,6 +784,60 @@ mod tests {
             .contains(ELEVATION_ONLY_SCOPE));
     }
 
+    /// The tripwire's log line is a WARN, not an info line an operator
+    /// filters out: captured with a scoped subscriber around the one call.
+    #[test]
+    fn a_widened_token_is_logged_as_a_warning() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logged = |body: &[u8]| -> String {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                // Other tests on other threads may have hit the callsite
+                // first, with no subscriber, and cached "never"; recompute
+                // every callsite's interest now that this one is live.
+                tracing::callsite::rebuild_interest_cache();
+                token_set(body.to_vec()).unwrap();
+            });
+            let out = capture.0.lock().unwrap().clone();
+            String::from_utf8(out).unwrap()
+        };
+
+        let out =
+            logged(br#"{"access_token":"a","expires_in":60,"scope":"claims:read claims:write"}"#);
+        let line = out
+            .lines()
+            .find(|l| l.contains("token wider than requested"))
+            .unwrap_or_else(|| panic!("the tripwire logged nothing: {out}"));
+        assert!(line.trim_start().starts_with("WARN"), "{line}");
+
+        // Calibration: the same capture sees no such line for a token as
+        // requested, so the line above is the tripwire's.
+        let out = logged(br#"{"access_token":"a","expires_in":60,"scope":"claims:read"}"#);
+        assert!(!out.contains("token wider than requested"), "{out}");
+        assert!(out.contains("tokens issued"), "the capture works: {out}");
+    }
+
     #[test]
     fn user_messages_never_carry_upstream_detail() {
         let e = TokenError::Rejected {
