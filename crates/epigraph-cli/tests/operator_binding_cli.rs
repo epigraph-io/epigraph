@@ -1131,3 +1131,971 @@ async fn link_records_the_llm_provenance_of_a_row_the_process_created(pool: PgPo
     assert_eq!(src.as_deref(), Some("mcp-llm-agent"));
     assert_eq!(link_row(&pool, agent).await, Some((human, false)));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// register-system-agent (migration 148) and the arm census's system roles
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_EVENT: &str = "operator.system_agent_registered";
+
+async fn registry_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM system_agents")
+        .fetch_one(pool)
+        .await
+        .expect("registry rows")
+}
+
+async fn system_audit_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM security_events WHERE event_type = $1")
+        .bind(SYSTEM_EVENT)
+        .fetch_one(pool)
+        .await
+        .expect("audit rows")
+}
+
+/// An agent holding the workflow-ingest role's LEGACY key, as every database
+/// created before migration 148 has one.
+async fn legacy_key_holder(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'workflow-ingest-system') \
+         RETURNING id",
+    )
+    .bind(
+        epigraph_db::SystemAgentRole::WorkflowIngest
+            .legacy_public_key()
+            .as_slice(),
+    )
+    .fetch_one(pool)
+    .await
+    .expect("legacy key holder")
+}
+
+fn register_args<'a>(agent: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec![
+        "register-system-agent",
+        "--role",
+        "workflow-ingest",
+        "--agent",
+        agent,
+        "--reason",
+        "the ingest identity",
+    ];
+    v.extend_from_slice(extra);
+    v
+}
+
+/// The dry run runs the definer and rolls it back (no row, no audit row);
+/// `--apply` records exactly one row and one audit row; a repeat is
+/// ALREADY-REGISTERED with no second audit row. The identity line comes first.
+///
+/// Kills: the dry run committing (its "nothing written" assertions would fail).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_dry_run_changes_nothing_and_apply_records_once(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await;
+    let s_str = s.to_string();
+
+    let dry = run_op(&pool, &register_args(&s_str, &[])).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!(
+            "AGENT\tid={s_str}\tdisplay_name=workflow-ingest-system"
+        )),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("link=none\tkey=LEGACY"),
+        "{}",
+        dry.show()
+    );
+    assert!(!dry.stdout.contains("WARNING"), "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!(
+            "WOULD BE REGISTERED\trole=workflow-ingest\tagent={s_str}"
+        )),
+        "{}",
+        dry.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0, "a dry run registers nothing");
+    assert_eq!(
+        system_audit_rows(&pool).await,
+        0,
+        "a dry run audits nothing"
+    );
+
+    let apply = run_op(&pool, &register_args(&s_str, &["--apply"])).await;
+    assert_eq!(apply.code, 0, "{}", apply.show());
+    assert!(
+        apply.stdout.contains(&format!(
+            "\nREGISTERED\trole=workflow-ingest\tagent={s_str}"
+        )),
+        "{}",
+        apply.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+    assert_eq!(system_audit_rows(&pool).await, 1);
+
+    let again = run_op(&pool, &register_args(&s_str, &["--apply"])).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again.stdout.contains("ALREADY-REGISTERED"),
+        "{}",
+        again.show()
+    );
+    assert_eq!(system_audit_rows(&pool).await, 1, "no second audit row");
+}
+
+/// A typo in `--role` is refused by the tool, BEFORE any connection, naming
+/// the valid roles. Kills: the client-side vocabulary check removed (the
+/// table's CHECK would then answer 23514 after connecting, also writing
+/// nothing, which is why the text and the missing "connected as" line are
+/// asserted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_refuses_an_unknown_role_before_the_database(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "register-system-agent",
+            "--role",
+            "workflow_ingest",
+            "--agent",
+            &s,
+            "--reason",
+            "x",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stderr
+            .contains("unknown system-agent role 'workflow_ingest'")
+            && r.stderr.contains("valid: workflow-ingest"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        !r.stderr.contains("23514")
+            && !r.stderr.contains("system_agents_role_known")
+            && !r.stderr.contains("connected as"),
+        "refused before the database: {}",
+        r.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}
+
+/// On a DSN that is not a maintenance login the command is refused and
+/// registers nothing. This is a regression test of the connect path
+/// (`operator::connect()`'s maintenance-membership refusal answers before any
+/// `register-system-agent` code runs); the definer's own refusal of an
+/// application-role caller is
+/// `register_on_an_app_role_connection_is_refused_by_the_definer`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_on_an_app_dsn_is_refused(pool: PgPool) {
+    let s = legacy_key_holder(&pool).await.to_string();
+    let role = format!("sysagent_probe_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD 'probe-only'"))
+        .execute(&pool)
+        .await
+        .expect("probe login");
+    sqlx::query(&format!("GRANT epigraph_app TO {role}"))
+        .execute(&pool)
+        .await
+        .expect("an application login");
+    let url = fixture::database_url_for(&pool).await;
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials in DATABASE_URL");
+    let app_url = format!("{scheme}://{role}:probe-only@{host}");
+    let out = Command::new(BIN)
+        .args(register_args(&s, &["--apply"]))
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, app_url)
+        .output()
+        .expect("spawn epigraph-operator");
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = sqlx::query(&format!("DROP OWNED BY {role}"))
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await;
+    assert_ne!(code, 0, "{stderr}");
+    assert!(stderr.contains("epigraph_maintenance"), "{stderr}");
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}
+
+/// The identity line before an immutable registration: a retired-linked agent
+/// shows `link=retired:` and the definer then refuses it; an agent whose key
+/// is not the legacy one shows `key=NOT-LEGACY` with a WARNING, and `--apply`
+/// REFUSES it (nothing called, nothing written) unless `--key-not-legacy-ok`.
+///
+/// Kills: the identity line missing or computed from the wrong key; the
+/// `--apply` refusal of a non-legacy key removed (the plain `--apply` lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_system_agent_prints_the_identity_line(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    let retired_s = retired.to_string();
+    let r = run_op(&pool, &register_args(&retired_s, &[])).await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!("link=retired:{human}")),
+        "{}",
+        r.show()
+    );
+    assert!(r.stderr.contains("retired operator link"), "{}", r.show());
+
+    let (fresh, _) = fixture::seed_agent_with_group(&pool, "secret-key").await;
+    let fresh_s = fresh.to_string();
+    let dry = run_op(&pool, &register_args(&fresh_s, &[])).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("key=NOT-LEGACY"), "{}", dry.show());
+    assert!(dry.stdout.contains("\nWARNING\t"), "{}", dry.show());
+
+    let refused = run_op(&pool, &register_args(&fresh_s, &["--apply"])).await;
+    assert_ne!(refused.code, 0, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("--key-not-legacy-ok"),
+        "{}",
+        refused.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+
+    let forced = run_op(
+        &pool,
+        &register_args(&fresh_s, &["--apply", "--key-not-legacy-ok"]),
+    )
+    .await;
+    assert_eq!(forced.code, 0, "{}", forced.show());
+    assert!(
+        forced.stdout.contains("\nREGISTERED\t"),
+        "{}",
+        forced.show()
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+}
+
+/// The arm census names a system role with no registration, and stops naming
+/// it once registered. Report only: the dry run arms nothing either way.
+/// Kills: the `NOT EXISTS` inverted, or the line never printed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_names_an_unregistered_system_role(pool: PgPool) {
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains("SYSTEM-AGENT-UNREGISTERED\tworkflow-ingest\t"),
+        "{}",
+        r.show()
+    );
+    let s = legacy_key_holder(&pool).await;
+    assert!(fixture::register_system_agent(&pool, s).await);
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        !r.stdout.contains("SYSTEM-AGENT-UNREGISTERED"),
+        "{}",
+        r.show()
+    );
+    assert!(!armed(&pool).await);
+}
+
+/// A >=148 tool against a database without the registry (a rehearsal database
+/// below 148) still runs the census and says so, instead of failing on 42P01.
+/// Kills: an unguarded registry read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_tolerates_a_database_without_the_registry(pool: PgPool) {
+    sqlx::query("DROP TABLE public.system_agents")
+        .execute(&pool)
+        .await
+        .expect("stand in for a database below 148");
+    let r = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("SYSTEM-AGENT-REGISTRY-ABSENT"),
+        "{}",
+        r.show()
+    );
+}
+
+/// `link-legacy-authors` never asks the definer to retire a REGISTERED system
+/// agent: it adds every `system_agents` agent to the exclusion list, names
+/// each one, and the tie runs for the other authors (migration 148 refuses a
+/// retired link of a registered system agent, which would otherwise abort the
+/// whole tie). Kills: the CLI exclusion missing (the run fails on the
+/// `operator_links` refusal and ties no one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_legacy_authors_excludes_a_registered_system_agent(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "system").await;
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    for (a, g) in [(s, s_group), (author, author_group)] {
+        insert_claim(&pool, a, g).await.expect("seed claim");
+    }
+    assert!(fixture::register_system_agent(&pool, s).await);
+    let human_s = human.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "link-legacy-authors",
+            "--operator",
+            &human_s,
+            "--no-quiet-window",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains(&format!("AUTO-EXCLUDED\t{s}\tregistered system agent")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("SKIPPED:excluded\t{s}")),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("LINKED-RETIRED\t{author}")),
+        "{}",
+        r.show()
+    );
+    assert_eq!(link_row(&pool, s).await, None, "S keeps its one link slot");
+    assert_eq!(link_row(&pool, author).await, Some((human, true)));
+}
+
+/// The `--apply` refusal of a non-legacy key holds at the moment the definer
+/// snapshots the key, not only at the identity line: an identity read before a
+/// concurrent rotation (here: a stale `key_is_legacy = true` for an agent whose
+/// key is not the legacy one) is refused inside the transaction and rolled
+/// back. Kills: the in-transaction re-check removed (the stale identity
+/// registers the rotated key).
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_refuses_a_key_that_stopped_being_legacy_after_the_identity_line(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity, Outcome};
+    let (s, _) = fixture::seed_agent_with_group(&pool, "rotated-meanwhile").await;
+    let stale = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let id = stale.clone();
+    let refused = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("the rotated key is refused at registration time");
+    assert!(e.to_string().contains("--key-not-legacy-ok"), "{e:#}");
+    assert_eq!(registry_rows(&pool).await, 0, "rolled back");
+    assert_eq!(system_audit_rows(&pool).await, 0, "its audit row with it");
+
+    let id = stale.clone();
+    let forced = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = register(&mut conn, role, &id, "x", true, true).await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        forced.expect("control: --key-not-legacy-ok registers it"),
+        Outcome::Registered
+    );
+    assert_eq!(registry_rows(&pool).await, 1);
+}
+
+/// `register` on an APPLICATION-role connection reaches the definer and is
+/// refused by its grant set (PostgreSQL's own text), registering nothing; the
+/// CLI surfaces that refusal rather than swallowing it. Kills: the error of
+/// the definer call dropped, or `register` committing anyway.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_on_an_app_role_connection_is_refused_by_the_definer(pool: PgPool) {
+    use epigraph_cli::operator::system_agent::{register, AgentIdentity};
+    let s = legacy_key_holder(&pool).await;
+    let identity = AgentIdentity {
+        id: s,
+        display_name: None,
+        key_kind: "ed25519".to_string(),
+        link: "none".to_string(),
+        key_is_legacy: true,
+    };
+    let role = epigraph_db::SystemAgentRole::WorkflowIngest;
+    let r = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = register(&mut conn, role, &identity, "x", true, false).await;
+        (conn, r)
+    })
+    .await;
+    let e = r.expect_err("the application role cannot register");
+    assert!(
+        format!("{e:#}").contains("permission denied for function epigraph_register_system_agent"),
+        "{e:#}"
+    );
+    assert_eq!(registry_rows(&pool).await, 0);
+    assert_eq!(system_audit_rows(&pool).await, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// allow-author-binding-client / revoke-author-binding-client (migration 149)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An OAuth client of `client_type` for `agent`, ACTIVE; returns its
+/// `oauth_clients.id`. A service client carries the legal fields its CHECK
+/// requires; an agent client is owned by a fresh human client.
+async fn client_for(pool: &PgPool, agent: Uuid, client_type: &str) -> Uuid {
+    let owner: Option<Uuid> = if client_type == "agent" {
+        Some(
+            sqlx::query_scalar(
+                "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                            status) \
+                 VALUES ($1, 'owner', 'human', ARRAY['claims:read'], 'active') RETURNING id",
+            )
+            .bind(format!("owner-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("owner client"),
+        )
+    } else {
+        None
+    };
+    sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, status, \
+                                    agent_id, owner_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'allowlist cli client', $2, ARRAY['claims:write'], 'active', $3, $4, \
+                 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("allowlist-cli-{}", Uuid::new_v4()))
+    .bind(client_type)
+    .bind(agent)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("client")
+}
+
+/// `(live rows, allowed events)` for `client`.
+async fn allowance_state(pool: &PgPool, client: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM author_binding_clients \
+                  WHERE client_id = $1 AND revoked_at IS NULL), \
+                (SELECT count(*) FROM security_events \
+                  WHERE event_type = 'platform.author_binding_client_allowed' \
+                    AND details->>'client_id' = $1::text)",
+    )
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("allowance state")
+}
+
+/// Live (unrevoked) membership rows `agent` holds in `group`.
+async fn live_writer_rows(pool: &PgPool, group: Uuid, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("live membership rows")
+}
+
+/// The allow command: a dry run writes nothing; `--apply` records one row and
+/// one audit event and prints the client, the pinned agent, the operator and
+/// the binding the agent now has; the writer rows the agent holds in groups
+/// its operator does not write are listed, and revoked on request in the same
+/// transaction; a re-run on a dead allowance (client suspended) says
+/// ALLOWED-BUT-INEFFECTIVE and exits non-zero; an agent-type client is warned
+/// about its private key; a human-type client is refused with nothing
+/// written; the revoke is a dry run first, then final.
+///
+/// Verified to fail: the effective-binding check removed from the binary (the
+/// suspended re-run exits 0). Should fail if the dry run committed (rows after
+/// the dry run).
+#[sqlx::test(migrations = "../../migrations")]
+async fn allow_and_revoke_an_author_binding_client(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "other-human").await;
+    make_human(&pool, other).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    // S holds a writer row in another human's group.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(other_group)
+    .bind(s)
+    .execute(&pool)
+    .await
+    .expect("foreign writer row");
+    let (client_s, human_s) = (client.to_string(), human.to_string());
+    let args = [
+        "allow-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--operator",
+        human_s.as_str(),
+        "--reason",
+        "the host writes for this human",
+    ];
+
+    let dry = run_op(&pool, &args).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("WOULD BE ALLOWED\t"), "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!("group={other_group}")),
+        "the foreign writer row is listed: {}",
+        dry.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client).await,
+        (0, 0),
+        "a dry run writes nothing"
+    );
+
+    let mut apply = args.to_vec();
+    apply.push("--apply");
+    let applied = run_op(&pool, &apply).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    for fragment in [
+        "ALLOWED\t".to_string(),
+        format!("client={client}"),
+        "type=service".to_string(),
+        format!("agent={s}"),
+        format!("operator={human}"),
+        "binding=client_allowlist".to_string(),
+        format!("FOREIGN-WRITE\tagent={s}\tgroup={other_group}"),
+    ] {
+        assert!(
+            applied.stdout.contains(&fragment),
+            "{fragment}: {}",
+            applied.show()
+        );
+    }
+    assert!(!applied.stdout.contains("WOULD BE"), "{}", applied.show());
+    assert!(
+        !applied.stdout.contains("WARNING"),
+        "a service client: {}",
+        applied.show()
+    );
+    assert_eq!(allowance_state(&pool, client).await, (1, 1));
+    // Without the flag the foreign writer row is listed and KEPT: revoking
+    // another human's group membership needs the operator's explicit consent.
+    assert!(
+        applied.stdout.contains(&format!(
+            "FOREIGN-WRITE\tagent={s}\tgroup={other_group}\ta writer/admin row in a group its \
+             operator does not write: KEPT"
+        )),
+        "{}",
+        applied.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        1,
+        "a plain --apply revokes no foreign writer row: {}",
+        applied.show()
+    );
+
+    // A dry run WITH the flag says what it would revoke, and revokes nothing.
+    let mut dry_revoke_foreign = args.to_vec();
+    dry_revoke_foreign.push("--revoke-foreign-writes");
+    let drf = run_op(&pool, &dry_revoke_foreign).await;
+    assert_eq!(drf.code, 0, "{}", drf.show());
+    assert!(
+        drf.stdout.contains(&format!("group={other_group}"))
+            && drf.stdout.contains("WOULD BE REVOKED"),
+        "{}",
+        drf.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        1,
+        "a dry run revokes nothing: {}",
+        drf.show()
+    );
+
+    // On request, the foreign writer row is revoked (same transaction).
+    let mut revoke_foreign = apply.clone();
+    revoke_foreign.push("--revoke-foreign-writes");
+    let rf = run_op(&pool, &revoke_foreign).await;
+    assert_eq!(rf.code, 0, "{}", rf.show());
+    assert!(rf.stdout.contains("ALREADY-ALLOWED\t"), "{}", rf.show());
+    assert!(
+        rf.stdout.contains(&format!(
+            "group={other_group}\ta writer/admin row in a group its operator does not write: \
+             REVOKED"
+        )),
+        "{}",
+        rf.show()
+    );
+    assert_eq!(
+        live_writer_rows(&pool, other_group, s).await,
+        0,
+        "{}",
+        rf.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client).await,
+        (1, 1),
+        "no second allowance"
+    );
+
+    // A dead allowance is not reported as fine.
+    let (s2, _) = fixture::seed_agent_with_group(&pool, "service-2").await;
+    let client2 = client_for(&pool, s2, "service").await;
+    let client2_s = client2.to_string();
+    let args2 = [
+        "allow-author-binding-client",
+        "--client",
+        client2_s.as_str(),
+        "--operator",
+        human_s.as_str(),
+        "--reason",
+        "second",
+        "--apply",
+    ];
+    assert_eq!(run_op(&pool, &args2).await.code, 0);
+    sqlx::query("UPDATE oauth_clients SET status = 'suspended' WHERE id = $1")
+        .bind(client2)
+        .execute(&pool)
+        .await
+        .expect("suspend");
+    let dead = run_op(&pool, &args2).await;
+    assert_ne!(dead.code, 0, "{}", dead.show());
+    assert!(
+        dead.stdout.contains("ALLOWED-BUT-INEFFECTIVE\t") && dead.stdout.contains("binding=-"),
+        "{}",
+        dead.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client2).await,
+        (1, 1),
+        "nothing new written"
+    );
+
+    // An agent-type client: the private-key warning.
+    let (a, _) = fixture::seed_agent_with_group(&pool, "agent-typed").await;
+    let agent_client = client_for(&pool, a, "agent").await;
+    let agent_client_s = agent_client.to_string();
+    let warned = run_op(
+        &pool,
+        &[
+            "allow-author-binding-client",
+            "--client",
+            agent_client_s.as_str(),
+            "--operator",
+            human_s.as_str(),
+            "--reason",
+            "x",
+        ],
+    )
+    .await;
+    assert_eq!(warned.code, 0, "{}", warned.show());
+    assert!(
+        warned.stdout.contains("WARNING") && warned.stdout.contains("private key"),
+        "{}",
+        warned.show()
+    );
+
+    // A human-type client: refused, nothing written.
+    let (h2, _) = fixture::seed_agent_with_group(&pool, "human-typed").await;
+    let human_client = client_for(&pool, h2, "human").await;
+    let human_client_s = human_client.to_string();
+    let refused = run_op(
+        &pool,
+        &[
+            "allow-author-binding-client",
+            "--client",
+            human_client_s.as_str(),
+            "--operator",
+            human_s.as_str(),
+            "--reason",
+            "x",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(refused.code, 0, "{}", refused.show());
+    assert_eq!(allowance_state(&pool, human_client).await, (0, 0));
+
+    // Revoke: dry run, then final.
+    let revoke = [
+        "revoke-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--reason",
+        "incident",
+    ];
+    let dry_revoke = run_op(&pool, &revoke).await;
+    assert_eq!(dry_revoke.code, 0, "{}", dry_revoke.show());
+    assert!(
+        dry_revoke.stdout.contains("WOULD BE REVOKED"),
+        "{}",
+        dry_revoke.show()
+    );
+    assert_eq!(
+        allowance_state(&pool, client).await.0,
+        1,
+        "a dry revoke changes nothing"
+    );
+    let mut revoke_apply = revoke.to_vec();
+    revoke_apply.push("--apply");
+    let revoked = run_op(&pool, &revoke_apply).await;
+    assert_eq!(revoked.code, 0, "{}", revoked.show());
+    assert!(
+        revoked.stdout.contains("REVOKED\t") && !revoked.stdout.contains("WOULD BE"),
+        "{}",
+        revoked.show()
+    );
+    assert_eq!(allowance_state(&pool, client).await.0, 0);
+    let binding: Option<String> = sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("binding");
+    assert_eq!(binding, None, "the revoke unbinds");
+}
+
+/// The revoke command never reports a no-op as done: a client with no
+/// allowance row (a mistyped id) exits non-zero and says NOT-ALLOWED, dry run
+/// or `--apply`, writing nothing; an already-revoked allowance says
+/// ALREADY-REVOKED with when and by whom, exits 0 (the end state holds) and
+/// writes no second audit row.
+///
+/// Verified to fail: the pre-fix binary (an unknown client exits 0 with
+/// NOT-ALLOWED; an already-revoked one prints the same NOT-ALLOWED).
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_unknown_or_revoked_client_is_not_reported_as_done(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let revoked_events = |pool: PgPool, client: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM security_events \
+              WHERE event_type = 'platform.author_binding_client_revoked' \
+                AND details->>'client_id' = $1::text",
+        )
+        .bind(client)
+        .fetch_one(&pool)
+        .await
+        .expect("revoke events")
+    };
+
+    // A mistyped id: no row names it.
+    let unknown = Uuid::new_v4().to_string();
+    for apply in [false, true] {
+        let mut argv = vec![
+            "revoke-author-binding-client",
+            "--client",
+            unknown.as_str(),
+            "--reason",
+            "incident",
+        ];
+        if apply {
+            argv.push("--apply");
+        }
+        let out = run_op(&pool, &argv).await;
+        assert_ne!(out.code, 0, "apply={apply}: {}", out.show());
+        assert!(
+            out.stdout
+                .contains(&format!("NOT-ALLOWED\tclient={unknown}"))
+                && !out.stdout.contains("REVOKED"),
+            "apply={apply}: {}",
+            out.show()
+        );
+    }
+    assert_eq!(
+        allowance_state(&pool, client).await.0,
+        1,
+        "the real allowance is untouched"
+    );
+
+    // Revoked once, then again.
+    let client_s = client.to_string();
+    let revoke = [
+        "revoke-author-binding-client",
+        "--client",
+        client_s.as_str(),
+        "--reason",
+        "incident",
+        "--apply",
+    ];
+    let first = run_op(&pool, &revoke).await;
+    assert_eq!(first.code, 0, "{}", first.show());
+    assert!(
+        first.stdout.contains(&format!("REVOKED\tclient={client}")),
+        "{}",
+        first.show()
+    );
+    assert_eq!(revoked_events(pool.clone(), client).await, 1);
+    let again = run_op(&pool, &revoke).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again
+            .stdout
+            .contains(&format!("ALREADY-REVOKED\tclient={client}\trevoked_at="))
+            && again.stdout.contains("\trevoked_by=")
+            && !again.stdout.contains("NOT-ALLOWED"),
+        "{}",
+        again.show()
+    );
+    assert_eq!(
+        revoked_events(pool.clone(), client).await,
+        1,
+        "no second revoke is recorded"
+    );
+}
+
+/// Allow `client` for `operator` on the harness (superuser) pool through the
+/// maintenance definer.
+async fn allow_direct(pool: &PgPool, client: Uuid, operator: Uuid) {
+    sqlx::query("SELECT * FROM public.epigraph_allow_author_binding_client($1, $2, 'test')")
+        .bind(client)
+        .bind(operator)
+        .execute(pool)
+        .await
+        .expect("allow");
+}
+
+/// The arm census sees an allowlisted AUTHOR whose recent claims sit in a
+/// group its operator does not write: before the allowance it is UNBOUND;
+/// after it, it is not UNBOUND but OUT-OF-SCOPE, and `--apply` refuses
+/// (REFUSED-OUT-OF-SCOPE, nothing armed) unless `--allow-unbound-writers`.
+///
+/// Verified to fail: the out-of-scope list not read by the `--apply` gate
+/// (the plain `--apply` arms).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_lists_an_allowlisted_author_outside_its_operators_groups(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    insert_claim(&pool, s, s_group).await.expect("S as itself");
+
+    let before = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        before.stdout.contains(&format!("UNBOUND\t{s}\t1 claim(s)")),
+        "CALIBRATION: {}",
+        before.show()
+    );
+    allow_direct(&pool, client, human).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&format!("UNBOUND\t{s}")),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout
+            .contains(&format!("OUT-OF-SCOPE\t{s}\t{s_group}\t1 claim(s)")),
+        "{}",
+        dry.show()
+    );
+    let refused = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stdout.contains("REFUSED-OUT-OF-SCOPE"),
+        "{}",
+        refused.show()
+    );
+    assert!(!armed(&pool).await, "a refused --apply must not arm");
+    let forced = run_op(
+        &pool,
+        &["arm-operator-binding", "--apply", "--allow-unbound-writers"],
+    )
+    .await;
+    assert_eq!(forced.code, 0, "{}", forced.show());
+    assert!(armed(&pool).await);
+}
+
+/// An allowlisted author whose recent claims all sit in its operator's group
+/// is in neither list, and `--apply` arms without an override.
+///
+/// Verified to fail: the census rewritten to read links only (S listed
+/// UNBOUND, `--apply` refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_passes_an_allowlisted_author_inside_its_operators_groups(pool: PgPool) {
+    let (human, human_group) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    insert_claim(&pool, s, human_group)
+        .await
+        .expect("S in its operator's group");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(!dry.stdout.contains(&s.to_string()), "{}", dry.show());
+    assert!(!dry.stdout.contains("OUT-OF-SCOPE"), "{}", dry.show());
+    let applied = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(armed(&pool).await, "{}", applied.show());
+}
+
+/// With an EMPTY allowlist the census output gains nothing: a live-linked
+/// agent whose recent claims sit outside its operator's groups is not listed
+/// OUT-OF-SCOPE (that gap predates the allowlist and is left alone), and the
+/// refusal is today's REFUSED line only.
+///
+/// Verified to fail: the out-of-scope list widened past the
+/// `client_allowlist` label (L is listed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_output_is_unchanged_with_an_empty_allowlist(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (l, l_group) = fixture::seed_agent_with_group(&pool, "linked").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    let (_, foreign_group) = fixture::seed_agent_with_group(&pool, "foreign").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, l, human)
+            .await
+            .expect("l -> human");
+    }
+    let _ = l_group;
+    insert_claim(&pool, l, foreign_group)
+        .await
+        .expect("L outside its operator's groups");
+    insert_claim(&pool, u, u_group).await.expect("U");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        dry.stdout.contains(&format!("UNBOUND\t{u}\t1 claim(s)")),
+        "CALIBRATION: {}",
+        dry.show()
+    );
+    assert!(!dry.stdout.contains("OUT-OF-SCOPE"), "{}", dry.show());
+    let refused = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(refused.stdout.contains("REFUSED\t"), "{}", refused.show());
+    assert!(
+        !refused.stdout.contains("REFUSED-OUT-OF-SCOPE"),
+        "{}",
+        refused.show()
+    );
+}

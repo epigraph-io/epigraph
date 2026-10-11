@@ -1629,6 +1629,439 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
     }
 }
 
+/// Migration 148 (the system-agent registry): its seven functions are SECURITY
+/// DEFINERs owned by `epigraph_maintenance` with an explicit ACL that excludes
+/// PUBLIC and the application role; `system_agents` is app-READABLE only and
+/// insert-only for the maintenance role, at table AND column level (a later
+/// column-level `GRANT INSERT (...) TO epigraph_app` is invisible to
+/// `has_table_privilege`); it has no row security by design; its constraints,
+/// triggers (including the TRUNCATE one) and the reserved-event policy exist.
+/// The owner is pinned because the harness migrates as a superuser, so a
+/// silently no-opped `OWNER TO` would pass every behavioural test; the two
+/// UNIQUE constraints are pinned here because no behavioural test can reach
+/// them while the role vocabulary has one value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_148_system_agent_registry_keeps_owner_grants_and_acl(pool: PgPool) {
+    for (name, signature, maintenance_executes) in [
+        (
+            "epigraph_register_system_agent",
+            "public.epigraph_register_system_agent(text, uuid, text)",
+            true,
+        ),
+        (
+            "epigraph_system_agents_guard_insert",
+            "public.epigraph_system_agents_guard_insert()",
+            false,
+        ),
+        (
+            "epigraph_system_agents_immutable",
+            "public.epigraph_system_agents_immutable()",
+            false,
+        ),
+        (
+            "epigraph_system_agents_audit",
+            "public.epigraph_system_agents_audit()",
+            false,
+        ),
+        (
+            "epigraph_agents_refuse_registered_system_key",
+            "public.epigraph_agents_refuse_registered_system_key()",
+            false,
+        ),
+        (
+            "epigraph_human_operators_refuse_system_agent",
+            "public.epigraph_human_operators_refuse_system_agent()",
+            false,
+        ),
+        (
+            "epigraph_operator_links_refuse_retired_system_agent",
+            "public.epigraph_operator_links_refuse_retired_system_agent()",
+            false,
+        ),
+    ] {
+        let (secdef, owner, vol, acl): (bool, String, String, Option<String>) = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = $1::regprocedure",
+        )
+        .bind(signature)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{signature} must exist (migration 148): {e}"));
+        assert!(secdef, "{name} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, "v", "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for role in ["public", "epigraph_app"] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert!(!can, "{role} must not EXECUTE {name}");
+        }
+        if maintenance_executes {
+            let can: bool = sqlx::query_scalar(
+                "SELECT has_function_privilege('epigraph_maintenance', $1, 'EXECUTE')",
+            )
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+            assert!(can, "the maintenance role registers through {name}");
+        }
+    }
+
+    for (role, privilege, column_level, expected) in [
+        ("epigraph_app", "SELECT", false, true),
+        ("epigraph_app", "INSERT", true, false),
+        ("epigraph_app", "UPDATE", true, false),
+        ("epigraph_app", "DELETE", false, false),
+        ("epigraph_app", "TRUNCATE", false, false),
+        ("epigraph_maintenance", "SELECT", false, true),
+        ("epigraph_maintenance", "INSERT", false, true),
+        ("epigraph_maintenance", "UPDATE", true, false),
+        ("epigraph_maintenance", "DELETE", false, false),
+        ("epigraph_maintenance", "TRUNCATE", false, false),
+    ] {
+        let sql = if column_level {
+            "SELECT has_any_column_privilege($1, 'public.system_agents', $2)"
+        } else {
+            "SELECT has_table_privilege($1, 'public.system_agents', $2)"
+        };
+        let can: bool = sqlx::query_scalar(sql)
+            .bind(role)
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .expect("table privilege");
+        assert_eq!(can, expected, "{role} {privilege} on system_agents");
+    }
+
+    let rls: bool = sqlx::query_scalar(
+        "SELECT relrowsecurity FROM pg_class WHERE oid = 'public.system_agents'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("relrowsecurity");
+    assert!(
+        !rls,
+        "system_agents has no row security, deliberately (migration 148 section 3)"
+    );
+
+    let constraints: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname::text, contype::text FROM pg_constraint \
+          WHERE conrelid = 'public.system_agents'::regclass ORDER BY conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("constraints");
+    for (name, kind) in [
+        ("system_agents_pkey", "p"),
+        ("system_agents_agent_unique", "u"),
+        ("system_agents_registered_key_unique", "u"),
+        ("system_agents_role_known", "c"),
+    ] {
+        assert!(
+            constraints.contains(&(name.to_string(), kind.to_string())),
+            "system_agents must keep {name} ({kind}): {constraints:?}"
+        );
+    }
+    let fk_restrict: bool = sqlx::query_scalar(
+        "SELECT confdeltype = 'r' AND confrelid = 'public.agents'::regclass FROM pg_constraint \
+          WHERE conrelid = 'public.system_agents'::regclass AND contype = 'f'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the agent FK");
+    assert!(fk_restrict, "agent_id REFERENCES agents ON DELETE RESTRICT");
+    let key_not_null: bool = sqlx::query_scalar(
+        "SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'public.system_agents'::regclass AND attname = 'registered_public_key'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("registered_public_key");
+    assert!(key_not_null, "registered_public_key is NOT NULL");
+
+    // pg_trigger.tgtype bits: 2 BEFORE, 4 INSERT, 8 DELETE, 16 UPDATE, 32 TRUNCATE.
+    for (table, trigger, bits) in [
+        ("public.system_agents", "system_agents_guard_insert", 2 | 4),
+        (
+            "public.system_agents",
+            "system_agents_immutable",
+            2 | 8 | 16,
+        ),
+        ("public.system_agents", "system_agents_no_truncate", 2 | 32),
+        ("public.system_agents", "system_agents_audit", 4),
+        (
+            "public.agents",
+            "agents_refuse_registered_system_key",
+            2 | 4 | 16,
+        ),
+        (
+            "public.human_operators",
+            "human_operators_refuse_system_agent",
+            2 | 4 | 16,
+        ),
+        (
+            "public.operator_links",
+            "operator_links_refuse_retired_system_agent",
+            2 | 4 | 16,
+        ),
+    ] {
+        let tgtype: Option<i16> = sqlx::query_scalar(
+            "SELECT tgtype FROM pg_trigger WHERE tgrelid = $1::regclass AND tgname = $2 \
+               AND NOT tgisinternal",
+        )
+        .bind(table)
+        .bind(trigger)
+        .fetch_optional(&pool)
+        .await
+        .expect("trigger");
+        let tgtype = tgtype.unwrap_or_else(|| panic!("{table} must carry {trigger}"));
+        assert_eq!(
+            i32::from(tgtype) & (2 | 4 | 8 | 16 | 32),
+            bits,
+            "{trigger} timing and events"
+        );
+    }
+    let no_inline_role_node: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.system_agents'::regclass \
+          AND tgname = 'system_agents_refuse_role_node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("no 123 trigger reuse");
+    assert_eq!(
+        no_inline_role_node, 0,
+        "the role-node rule is inline in the guard; a trigger on 123's function would block \
+         123's documented undo from dropping it"
+    );
+
+    let (permissive, cmd): (bool, String) = sqlx::query_as(
+        "SELECT polpermissive, polcmd::text FROM pg_policy \
+          WHERE polrelid = 'public.security_events'::regclass \
+            AND polname = 'security_events_system_agent_privileged'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the reserved-event policy exists");
+    assert!(!permissive, "the reserved-event policy is RESTRICTIVE");
+    assert_eq!(cmd, "a", "the reserved-event policy is FOR INSERT");
+}
+
+/// Migration 149 (the author-binding allowlist): every function it creates or
+/// re-bodies is a SECURITY DEFINER owned by `epigraph_maintenance` with an
+/// explicit ACL that excludes PUBLIC; the application role executes only the
+/// two re-bodied binding reads (never the read helper, the allow or the
+/// revoke); the registry is SELECT-only for the app and SELECT/INSERT plus the
+/// revocation columns for maintenance; the one-live-per-agent index is
+/// partial; and the five guard/audit triggers exist. Pinned here because the
+/// harness migrates as a superuser, so a silently no-opped `OWNER TO` or a
+/// PUBLIC grant would pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_149_author_binding_allowlist_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_allowlisted_operator",
+            "public.epigraph_allowlisted_operator(uuid)",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_author_binding",
+            "public.epigraph_author_binding(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_human_of",
+            "public.epigraph_human_of(uuid, boolean)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_author_binding_clients_guard_insert",
+            "public.epigraph_author_binding_clients_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_author_binding_clients_guard_update",
+            "public.epigraph_author_binding_clients_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_author_binding_clients_refuse_delete",
+            "public.epigraph_author_binding_clients_refuse_delete()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_author_binding_clients_audit",
+            "public.epigraph_author_binding_clients_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_allow_author_binding_client",
+            "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_revoke_author_binding_client",
+            "public.epigraph_revoke_author_binding_client(uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_operator_links_refuse_allowlisted_agent",
+            "public.epigraph_operator_links_refuse_allowlisted_agent()",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 149)"));
+        assert!(secdef, "{name} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+
+    for (role, privilege, expected) in [
+        ("epigraph_app", "SELECT", true),
+        ("epigraph_app", "INSERT", false),
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_app", "TRUNCATE", false),
+        ("epigraph_maintenance", "SELECT", true),
+        ("epigraph_maintenance", "INSERT", true),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+        ("epigraph_maintenance", "TRUNCATE", false),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+            .bind(role)
+            .bind("public.author_binding_clients")
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .expect("table privilege");
+        assert_eq!(
+            can, expected,
+            "{role} {privilege} on author_binding_clients"
+        );
+    }
+    for (col, expected) in [
+        ("revoked_at", true),
+        ("revoked_by", true),
+        ("revoked_reason", true),
+        ("client_id", false),
+        ("agent_id", false),
+        ("operator_id", false),
+        ("reason", false),
+        ("added_at", false),
+        ("added_by", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege('epigraph_maintenance', \
+             'public.author_binding_clients', $1, 'UPDATE')",
+        )
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .expect("column privilege");
+        assert_eq!(
+            can, expected,
+            "maintenance UPDATE of author_binding_clients.{col}"
+        );
+    }
+
+    let partial: Option<bool> = sqlx::query_scalar(
+        "SELECT i.indisunique AND i.indpred IS NOT NULL FROM pg_index i \
+           JOIN pg_class c ON c.oid = i.indexrelid \
+          WHERE c.relname = 'author_binding_clients_one_live_per_agent'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("index lookup");
+    assert_eq!(
+        partial,
+        Some(true),
+        "the one-live-allowance-per-agent index must exist, unique and partial"
+    );
+
+    for (table, trigger) in [
+        (
+            "author_binding_clients",
+            "author_binding_clients_guard_insert",
+        ),
+        (
+            "author_binding_clients",
+            "author_binding_clients_guard_update",
+        ),
+        (
+            "author_binding_clients",
+            "author_binding_clients_refuse_delete",
+        ),
+        ("author_binding_clients", "author_binding_clients_audit"),
+        ("operator_links", "operator_links_refuse_allowlisted_agent"),
+    ] {
+        let enabled: Option<String> = sqlx::query_scalar(
+            "SELECT t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+              WHERE c.relnamespace = 'public'::regnamespace AND c.relname = $1 \
+                AND t.tgname = $2 AND NOT t.tgisinternal",
+        )
+        .bind(table)
+        .bind(trigger)
+        .fetch_optional(&pool)
+        .await
+        .expect("trigger lookup");
+        assert_eq!(
+            enabled.as_deref(),
+            Some("O"),
+            "{table}.{trigger} must exist and fire"
+        );
+    }
+}
+
 /// Migration 140 redefines `epigraph_refresh_token_rotate` (the successor keeps
 /// the presented token's scopes, narrowed to the client's grant). `CREATE OR
 /// REPLACE` keeps the owner and ACL, and 140 re-asserts both; this pins them,

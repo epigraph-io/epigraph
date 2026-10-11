@@ -1496,6 +1496,17 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "DELETE FROM pending_admin_acts",
         "epigraph_consume_admin_act($",
         "record_custodial_act_on_act",
+        // Migration 148: which agent IS a system role is registered ONLY by
+        // the operator CLI (`epigraph-operator register-system-agent`, its
+        // library module allowed below), on the maintenance DSN, where the
+        // definer would SUCCEED: so "the app role gets 42501" is not the whole
+        // boundary. The bind-call shape, not the bare name, because
+        // `tenancy_backfill.rs` names the definer in its registers.
+        "epigraph_register_system_agent($",
+        "INSERT INTO system_agents",
+        "INSERT INTO public.system_agents",
+        "UPDATE system_agents",
+        "DELETE FROM system_agents",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1584,6 +1595,9 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         // 128: the operator's admin-scope arm / disarm verbs, on the
         // maintenance DSN.
         "epigraph-cli/src/operator/admin_scopes.rs",
+        // 148: the operator's system-agent registration, on the maintenance
+        // DSN.
+        "epigraph-cli/src/operator/system_agent.rs",
     ];
 
     let mut offenders: Vec<String> = Vec::new();

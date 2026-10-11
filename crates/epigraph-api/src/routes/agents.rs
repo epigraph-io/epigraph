@@ -190,6 +190,19 @@ pub async fn create_agent(
     }
 
     let public_key = parse_public_key(&request.public_key)?;
+    // Migration 148: the legacy public-constant key of a system role names a
+    // system identity. Creating it would mint a second holder of that identity
+    // (or, while the system agent still holds it, hand that agent back as a
+    // find-hit and provision a client for it), so it is refused before any
+    // insert and before any client provisioning.
+    if epigraph_db::is_reserved_author_key(&public_key) {
+        return Err(ApiError::ValidationError {
+            field: "public_key".to_string(),
+            reason: "this public key is a system agent's legacy public-constant key, \
+                     derivable by anyone; it cannot be registered as an agent"
+                .to_string(),
+        });
+    }
 
     let mut agent = Agent::new(public_key, request.display_name);
     if let Some(labels) = request.labels {
