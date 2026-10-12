@@ -128,8 +128,12 @@ pub async fn assess_claim(
     let claim_content = claim.content;
 
     // ── 2. Load calibration config ───────────────────────────────────────
-    let calibration_config = CalibrationConfig::load(std::path::Path::new("calibration.toml"))
-        .map_err(|e| ApiError::InternalError {
+    //
+    // Resolved like every other DS path (`CALIBRATION_PATH`, then the
+    // workspace root), not cwd-relative: `Path::new("calibration.toml")` only
+    // worked when the server happened to start in the repo root.
+    let calibration_config =
+        CalibrationConfig::from_workspace_root().map_err(|e| ApiError::InternalError {
             message: format!("Failed to load calibration.toml: {e}"),
         })?;
 

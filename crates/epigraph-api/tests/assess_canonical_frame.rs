@@ -20,6 +20,12 @@
 //!
 //! # Harness
 //!
+//! There is deliberately NO `set_current_dir` here. Cargo runs integration
+//! tests with the CRATE directory as cwd, and the handler used to load
+//! calibration from the cwd-relative `calibration.toml`, which failed there;
+//! it now resolves it like every other DS path. Every arm below is therefore
+//! also a pin on that.
+//!
 //! The handler is invoked directly as an `async fn`, on the `#[sqlx::test]`
 //! superuser pool with a public-only viewer. That is deliberate: this file pins
 //! the handler's FRAME and CACHE semantics, not its tenancy (the stamping of
@@ -42,19 +48,6 @@ use viewer_fixture::{public_viewer, seed_agent_with_group, seed_public_claim};
 
 // ── fixture ──
 
-/// The handler loaded calibration from the cwd-RELATIVE path
-/// `calibration.toml`, and cargo runs integration tests with the CRATE
-/// directory as cwd, so on main every call failed before reaching the code
-/// under test. Pinning cwd to the workspace root makes the arms below fail for
-/// the reasons they name rather than for that one.
-fn at_workspace_root() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        std::env::set_current_dir(root).expect("cd to the workspace root");
-    });
-}
-
 fn request(supports: bool, confidence: f64, source_url: Option<&str>) -> AssessClaimRequest {
     serde_json::from_value(serde_json::json!({
         "evidence_type": "empirical",
@@ -68,7 +61,6 @@ fn request(supports: bool, confidence: f64, source_url: Option<&str>) -> AssessC
 
 /// `Viewer` is not `Clone`, so each call resolves its own public viewer.
 async fn assess(pool: &PgPool, claim: Uuid, req: AssessClaimRequest) -> AssessClaimResponse {
-    at_workspace_root();
     let viewer = public_viewer(pool).await;
     let state = AppState::with_db(pool.clone(), ApiConfig::default());
     let Json(resp) = assess_claim(
