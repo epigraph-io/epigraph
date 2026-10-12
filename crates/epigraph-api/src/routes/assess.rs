@@ -1,9 +1,11 @@
 //! Single-call claim assessment endpoint.
 //!
 //! `POST /api/v1/claims/:id/assess` — computes a BBA from human-readable
-//! parameters, finds or creates a DS frame, submits the evidence through
-//! the standard combination pipeline, optionally generates an embedding,
-//! and returns the full belief update in one response.
+//! parameters, stores it on the canonical `claim_validity` frame (or an
+//! explicit `frame_id`), combines it with the claim's earlier assessments on
+//! that frame, refreshes the claim's cached belief under the
+//! one-frame-owns-the-cache rule, optionally generates an embedding, and
+//! returns the framed belief update in one response.
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -41,7 +43,8 @@ pub struct AssessClaimRequest {
     /// Optional journal name for reliability lookup.
     #[serde(default)]
     pub journal: Option<String>,
-    /// Optional source URL for auto frame scoping.
+    /// Optional source URL. Context only: it no longer selects or names a frame
+    /// (U027 retired the per-source `paper_validity_<slug>` frames).
     #[serde(default)]
     pub source_url: Option<String>,
     /// Optional supporting text stored as evidence context.
@@ -50,7 +53,8 @@ pub struct AssessClaimRequest {
     /// Optional uncertainty text parsed for uncertainty discount.
     #[serde(default)]
     pub uncertainty_text: Option<String>,
-    /// Explicit frame ID, or auto-create if absent.
+    /// Explicit frame ID. Defaults to the canonical `claim_validity` frame
+    /// (`["supported", "refuted", "uncertain"]`), created on first use.
     #[serde(default)]
     pub frame_id: Option<Uuid>,
     /// Fraction of total mass allocated to open-world ignorance, in [0, 0.5].
@@ -89,7 +93,7 @@ pub async fn assess_claim(
     Json(request): Json<AssessClaimRequest>,
 ) -> Result<Json<AssessClaimResponse>, ApiError> {
     use epigraph_ds::{combination, FrameOfDiscernment, MassFunction};
-    use epigraph_engine::bba::{build_bba_directed, BbaParams};
+    use epigraph_engine::bba::{build_bba_directed, remap_binary_bba_to_frame, BbaParams};
     use epigraph_engine::calibration::CalibrationConfig;
     use epigraph_engine::uncertainty::parse_uncertainty;
 
@@ -160,7 +164,13 @@ pub async fn assess_claim(
         }
     })?;
 
-    // ── 6. Find or create frame ──────────────────────────────────────────
+    // ── 6. Resolve the frame ─────────────────────────────────────────────
+    //
+    // U027: with no explicit frame this is ALWAYS the canonical
+    // `claim_validity` frame. It used to find-or-create
+    // `paper_validity_<slug of source_url>` (or `research_validity`), minting a
+    // 2-hypothesis frame per source (74 on prod by 2026-10-05) and panicking
+    // when a multi-byte char straddled the slug's 80-byte cut.
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
         let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
@@ -171,36 +181,12 @@ pub async fn assess_claim(
             })?;
         fid
     } else {
-        let frame_name = if let Some(ref url) = request.source_url {
-            let slug: String = url
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-                .to_lowercase();
-            // Truncate to reasonable length
-            let slug = if slug.len() > 80 { &slug[..80] } else { &slug };
-            format!("paper_validity_{slug}")
-        } else {
-            "research_validity".to_string()
-        };
-
-        match epigraph_db::FrameRepository::get_by_name(pool, &viewer, &frame_name).await? {
-            Some(existing) => existing.id,
-            None => {
-                let hypotheses = vec!["supported".to_string(), "unsupported".to_string()];
-                let new_frame = epigraph_db::FrameRepository::create(
-                    pool,
-                    &frame_name,
-                    Some("Auto-created frame for claim assessment"),
-                    &hypotheses,
-                )
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to create frame '{frame_name}': {e}"),
-                })?;
-                new_frame.id
-            }
-        }
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: format!("acquire connection: {e}"),
+        })?;
+        epigraph_engine::edge_factor::ensure_claim_validity_frame(&mut conn, &viewer)
+            .await
+            .map_err(|message| ApiError::InternalError { message })?
     };
 
     // Load the frame row for DS operations
@@ -218,28 +204,43 @@ pub async fn assess_claim(
             }
         })?;
 
-    // ── 7. Convert BBA to masses map (BTreeMap<String, f64>) ─────────────
+    // ── 7. Re-express the BBA on the frame, then as a masses map ─────────
+    //
+    // `build_bba_directed` builds on its own 2-way frame. Its ignorance key
+    // `"0,1"` read on a 3-way frame would mean {supported, refuted}, so the
+    // remap moves it onto the target's Theta.
+    let mass_function = remap_binary_bba_to_frame(&mass_function, &ds_frame).map_err(|e| {
+        ApiError::ValidationError {
+            field: "frame_id".to_string(),
+            reason: e.to_string(),
+        }
+    })?;
     let bba_json = mass_function.masses_to_json();
     let bba_map: BTreeMap<String, f64> =
         serde_json::from_value(bba_json.clone()).unwrap_or_default();
 
     // ── 8. Submit evidence through the combination pipeline ──────────────
-    // Store the mass function in DB
+    //
+    // Each call gets its OWN row, keyed by a fresh synthetic perspective (the
+    // ds_auto C-1 pattern). With agent and perspective both NULL every call
+    // shared one `UNIQUE NULLS NOT DISTINCT` key, so a call overwrote the
+    // previous one and repeated assessments never accumulated.
+    let call_perspective = Uuid::new_v4();
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, call_perspective, None)
+        .await?;
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         pool,
         claim_id,
         frame_id,
         None, // no agent_id for assess endpoint
-        None, // no perspective_id
+        Some(call_perspective),
         &bba_json,
         None,
         Some("discount"),
         None,
         // Untyped on purpose (bc06ec6f). `build_bba_directed` already sized
         // these masses with the request's type weight, so a typed row would be
-        // discounted by it a second time on any later fold. The row is also
-        // transient: the combined row stored below shares its
-        // (claim, frame, NULL, NULL) key and replaces it in this request.
+        // discounted by it a second time on any later fold.
         None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
@@ -343,22 +344,26 @@ pub async fn assess_claim(
     // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
     let m_empty = combination::fold_conflict(&combined, &reports);
 
-    // Update claim's belief, plausibility, and pignistic probability
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
-        claim_id,
-        epigraph_db::CachedBelief {
-            belief: final_bel,
-            plausibility: final_pl,
-            mass_on_empty: m_empty,
-            pignistic_prob: Some(final_betp),
-            mass_on_missing: m_missing,
-            belief_frame_id: None,
-        },
-    )
-    .await?;
+    // Refresh the claim's cached belief under the one-frame-owns-the-cache
+    // rule. This used to write the numbers above straight into the cache with
+    // `belief_frame_id: None`, NULLing the frame reference and clobbering a
+    // `binary_truth`-owned cache with this one frame's combination. Now
+    // `binary_truth` keeps the cache when the claim has a BBA there; otherwise
+    // the last frame by name owns it (legacy `paper_validity_*` and
+    // `research_validity` frames sort after `claim_validity`). The response
+    // still reports THIS frame's numbers, which may legitimately differ from
+    // the cache: the cache owner's recompute folds every row on its frame.
+    {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: format!("acquire connection: {e}"),
+        })?;
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, &viewer, claim_id)
+            .await
+            .map_err(|message| ApiError::InternalError { message })?;
+    }
 
-    // Store the combined result as a system mass function
+    // Conflict/method summary of this frame's fold, for the scoped-belief
+    // cache below (no combined mass_functions row is stored).
     let final_k = reports.last().map(|r| r.conflict_k);
     let used_cautious = !analysis.dependent_groups.is_empty();
     let final_method_str = if used_cautious {
@@ -372,20 +377,9 @@ pub async fn assess_claim(
     };
     let final_method = final_method_str.as_deref();
 
-    let combined_json = combined.masses_to_json();
-    let _ = epigraph_db::MassFunctionRepository::store(
-        pool,
-        claim_id,
-        frame_id,
-        None, // system-generated combined result
-        &combined_json,
-        final_k,
-        final_method,
-        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
-        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-    )
-    .await;
+    // No "combined result" mass_functions row is stored any more: it sat on the
+    // input BBA's key and overwrote it, and a recompute must never re-combine a
+    // combined row. The per-frame result is cached by the upsert below.
 
     // Store global scoped belief cache
     let _ = epigraph_db::ScopedBeliefRepository::upsert(
