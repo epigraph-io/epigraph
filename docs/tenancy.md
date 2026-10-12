@@ -308,9 +308,24 @@ locked are stepped over. Run one.
 2. **Phase 0** — mints a personal group, plus a live membership in it, for every
    claim author that lacks one (migration 057 documents ~1,198 orphan agents
    that have never authenticated).
-3. The entity arms: `claims`, `communities`, `perspectives`, `recall_events`,
-   `harvester_fragments`.
+3. The entity arms: `claims`, `communities`, `recall_events`,
+   `harvester_fragments`. (`--entity perspectives` is accepted and does
+   nothing; see below.)
 4. `settle_remaining`, then `verify`.
+
+**`perspectives` is not re-owned, and `verify` does not count it.** Every
+writer of `perspectives` (`PerspectiveRepository::create`,
+`ensure_evidence_perspective`, `ensure_edge_perspective`) declares
+`TenancyDecl::instance_wide()`, `('public', world)`, on purpose. 077's registry
+WITH CHECK admits exactly that declaration, as it does for `frames` and
+`contexts`. The backfill used to walk `perspectives` on `owner_agent_id` like
+`recall_events`. Since the DS auto-wire records an `owner_agent_id` on its
+per-evidence and per-edge perspectives, that walk made `verify --legacy-owner
+platform` fail after every perspective an operator-linked agent wrote, until a
+re-run moved the row into the operator's group, against the writer's
+declaration. A moved perspective stays `public`, so nobody lost read access. Its
+owner group can UPDATE it (117) where nobody could before. Rows an earlier run
+moved are left as they are.
 
 A fifth arm, **legacy `ownership` transcription**, ran between (3) and (4) until
 PR-22. It re-fired migration 071's write-through trigger over every `ownership`
