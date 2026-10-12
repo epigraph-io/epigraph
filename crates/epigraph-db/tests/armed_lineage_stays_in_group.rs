@@ -568,9 +568,10 @@ async fn a_reattributing_update_keeps_123s_refusal_text(pool: PgPool) {
 /// What 153 must NOT change, armed: the supersede act on the writer's own
 /// claim; a human's supersede of its own legacy (retired-linked) author's
 /// claim, the inherited author; the custodial supersede and any raw write on a
-/// privileged session; the dedup and consolidate shape (a first `supersedes`
-/// set while retiring the row) and a retired row naming a claim elsewhere; and
-/// a first `supersedes` within the row's own group.
+/// privileged session; the dedup and consolidate acts themselves (a first
+/// `supersedes` set while retiring the row), the dedup act pointing at a
+/// canonical in another group; and a first `supersedes` within the row's own
+/// group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_sanctioned_lineage_writes_are_unchanged(pool: PgPool) {
     let (a, ag) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -587,6 +588,7 @@ async fn the_sanctioned_lineage_writes_are_unchanged(pool: PgPool) {
     }
     let corpus = corpus_claim(&pool).await;
     let corpus2 = corpus_claim(&pool).await;
+    let corpus3 = corpus_claim(&pool).await;
     arm(&pool).await;
     let ga = [ag];
 
@@ -624,25 +626,57 @@ async fn the_sanctioned_lineage_writes_are_unchanged(pool: PgPool) {
         .await
         .expect("a privileged session's raw cross-group successor");
 
-    // The dedup / consolidate shape: a first supersedes set while retiring.
+    // The dedup act (`ClaimRepository::mark_duplicate_act_conn`, what the
+    // REST and MCP dedup routes run): a first supersedes set while retiring,
+    // here pointing an own duplicate at a world-owned canonical. `corpus3`
+    // has no successor of its own, so nothing but 153 could refuse it.
     let dup = as_app(&pool, a, &ga, |mut conn| async move {
         let r = insert_claim(&mut *conn, a, ag).await;
         (conn, r)
     })
     .await
     .expect("a duplicate");
-    update_as(
-        &pool,
-        a,
-        &ga,
-        "UPDATE claims SET supersedes = $2, is_current = false, embedding = NULL, \
-                           embedding_3072 = NULL WHERE id = $1",
-        dup,
-        Some(corpus2),
-    )
+    as_app(&pool, a, &ga, |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(corpus3),
+        )
+        .await;
+        (conn, r)
+    })
     .await
     .expect("the dedup act points a retired duplicate at a canonical elsewhere");
-    assert_eq!(row_of(&pool, dup).await, (ag, Some(corpus2), false));
+    assert_eq!(row_of(&pool, dup).await, (ag, Some(corpus3), false));
+
+    // The consolidate act (`ClaimRepository::consolidate_act_conn`): a new
+    // merged claim, each source pointed at it while retired.
+    let (s1, s2) = as_app(&pool, a, &ga, |mut conn| async move {
+        let s1 = insert_claim(&mut *conn, a, ag).await;
+        let s2 = insert_claim(&mut *conn, a, ag).await;
+        (conn, s1.and_then(|s1| s2.map(|s2| (s1, s2))))
+    })
+    .await
+    .expect("two sources");
+    let merged = as_app(&pool, a, &ga, |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::consolidate_act_conn(
+            &mut conn,
+            &[s1, s2],
+            "A's merged claim",
+            0.7,
+            epigraph_db::ConsolidateMode::Merge,
+            "merge",
+            a,
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the consolidate act")
+    .merged_id;
+    for s in [s1, s2] {
+        assert_eq!(row_of(&pool, s).await, (ag, Some(merged), false));
+    }
 
     // A first supersedes within the row's own group, the row staying current.
     let (x1, x2) = as_app(&pool, a, &ga, |mut conn| async move {
