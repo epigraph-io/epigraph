@@ -770,6 +770,14 @@ pub(crate) async fn create_claim_core(
             reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
         }
         };
+        // The check is serialized, not just made: without the constraint two
+        // concurrent requests both miss the find and both insert. The
+        // transaction-scoped lock (the same key `create_or_get` takes, so the
+        // two branches serialize against each other too) is held on `tx` until
+        // this handler commits, so a racer's find runs after this row is
+        // visible and answers 409 (backlog 00f1a517).
+        ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
+            .await?;
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
             viewer,
@@ -783,9 +791,10 @@ pub(crate) async fn create_claim_core(
         }
         match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
-            // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
-            // a concurrent writer wins the race between the check above and this
-            // INSERT, still surface 409 rather than a generic 500.
+            // Belt-and-suspenders: if a unique constraint on the pair is ever
+            // restored and a writer that bypassed the lock wins between the
+            // check above and this INSERT, still surface 409 rather than a
+            // generic 500.
             Err(epigraph_db::DbError::DuplicateKey { .. }) => return Err(dup_conflict()),
             Err(e) => return Err(e.into()),
         }
