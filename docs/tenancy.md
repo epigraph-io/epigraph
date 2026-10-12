@@ -565,7 +565,8 @@ meets the same refusal as the one-statement form. No repository or route
 re-opens a claim. A first `supersedes` on a claim that stays current is
 checked for its predecessor's owner group (migration 153, above). Every other
 claim UPDATE (content, truth value, labels,
-retiring a claim, a first `supersedes`, properties, embedding: the retire half
+retiring a claim, a first `supersedes` set while retiring the claim, properties,
+embedding: the retire half
 of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
 security alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
 that is the owner-group rule: an update needs the row readable and its owner
