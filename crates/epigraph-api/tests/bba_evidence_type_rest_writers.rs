@@ -4,7 +4,9 @@
 //! The caller's `evidence_type` is resolved through `calibration.toml
 //! [evidence_type_aliases]`. The combined row the handler caches beside the
 //! inputs (`source_agent_id IS NULL`) aggregates every input, so it has no
-//! single type and stays NULL.
+//! single type and stays NULL. An input sent without `evidence_type` stays
+//! NULL too: its masses are already discounted by `reliability`, and a type
+//! the writer invented would discount them again.
 #![cfg(feature = "db")]
 
 mod common;
@@ -92,6 +94,31 @@ async fn bbas(
     .expect("read BBAs")
 }
 
+/// POST one input BBA as `agent`, with `evidence_type` only when given.
+async fn post_evidence(addr: &SocketAddr, frame: Uuid, claim: Uuid, agent: Uuid, et: Option<&str>) {
+    let mut body = serde_json::json!({
+        "claim_id": claim,
+        "agent_id": agent,
+        "masses": {"0": 0.6, "0,1": 0.4},
+        "reliability": 1.0,
+        "assume_independent": true,
+    });
+    if let Some(et) = et {
+        body["evidence_type"] = serde_json::json!(et);
+    }
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/frames/{frame}/evidence"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .expect("evidence request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 201, "POST evidence ({et:?}): {body}");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_untyped(
     pool_opts: PgPoolOptions,
@@ -102,7 +129,11 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
         .await
         .expect("seeding pool");
     let owner = seed_agent(&pool).await;
-    let (a, b) = (seed_agent(&pool).await, seed_agent(&pool).await);
+    let (a, b, c) = (
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+    );
     let claim = seed_claim(&pool, owner, "bc06ec6f REST evidence typing").await;
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['TRUE','FALSE']::text[]) \
@@ -114,26 +145,8 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
     .expect("seed frame");
 
     let (addr, _shutdown) = spawn_app(&conn_opts).await;
-    let client = reqwest::Client::new();
-    for (agent, et) in [(a, "Observation"), (b, "testimony")] {
-        let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
-        let resp = client
-            .post(format!("http://{addr}/api/v1/frames/{frame}/evidence"))
-            .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "claim_id": claim,
-                "agent_id": agent,
-                "masses": {"0": 0.6, "0,1": 0.4},
-                "reliability": 1.0,
-                "evidence_type": et,
-                "assume_independent": true,
-            }))
-            .send()
-            .await
-            .expect("evidence request");
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.expect("json body");
-        assert_eq!(status, 201, "POST evidence ({et}): {body}");
+    for (agent, et) in [(a, Some("Observation")), (b, Some("testimony")), (c, None)] {
+        post_evidence(&addr, frame, claim, agent, et).await;
     }
 
     let rows = bbas(&pool, claim, frame).await;
@@ -150,6 +163,10 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
         typed.contains(&(b, Some("testimonial".to_string()))),
         "the `testimony` input must be stored as `testimonial`: {rows:?}"
     );
+    assert!(
+        typed.contains(&(c, None)),
+        "an input sent with no `evidence_type` must stay untyped: {rows:?}"
+    );
 
     // Non-vacuity: the combined system row exists, and it carries no type.
     let combined: Vec<_> = rows
@@ -160,5 +177,53 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
     assert_eq!(
         combined[0].2, None,
         "the combined row must stay untyped: {rows:?}"
+    );
+}
+
+/// A single input folds into a combined row whose `combination_method` is
+/// NULL (`reports.last()` is `None`): no agent, no perspective, no method. It
+/// must stay untyped like every other combined row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_single_input_fold_leaves_an_untyped_null_method_combined_row(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let owner = seed_agent(&pool).await;
+    let a = seed_agent(&pool).await;
+    let claim = seed_claim(&pool, owner, "bc06ec6f REST single-input fold").await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['TRUE','FALSE']::text[]) \
+         RETURNING id",
+    )
+    .bind(format!("bc06ec6f-rest-single-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+
+    let (addr, _shutdown) = spawn_app(&conn_opts).await;
+    post_evidence(&addr, frame, claim, a, Some("observation")).await;
+
+    let rows = bbas(&pool, claim, frame).await;
+    assert!(
+        rows.contains(&(
+            Some(a),
+            Some("discount".to_string()),
+            Some("empirical".to_string())
+        )),
+        "the input is stored typed: {rows:?}"
+    );
+    let combined: Vec<_> = rows
+        .iter()
+        .filter(|(agent, _, _)| agent.is_none())
+        .collect();
+    assert_eq!(combined.len(), 1, "one combined system row: {rows:?}");
+    assert_eq!(
+        (combined[0].1.as_deref(), combined[0].2.as_deref()),
+        (None, None),
+        "a single-input combined row has no method and no type: {rows:?}"
     );
 }
