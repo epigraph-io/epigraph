@@ -329,10 +329,20 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
     // A LAPSED assignment (past its valid_to, never ended) holds nothing, so
     // it does not block a link (review R2-OQ-TST-2).
     let (lapsing, _) = fixture::seed_human_operator(&pool, "lapsed-holder").await;
-    maint_insert(&pool, AUDITOR, lapsing, LIVE, Some("1 second"), Some(human))
-        .await
-        .expect("an auditor assignment for one second");
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    // Seeded already lapsed (CUS02 admits a window that began under a minute
+    // ago, and no guard refuses a past `valid_to`), not a one-second window
+    // and a sleep: a backward wall-clock step during the sleep would keep it
+    // live.
+    maint_insert(
+        &pool,
+        AUDITOR,
+        lapsing,
+        "-50 seconds",
+        Some("-10 seconds"),
+        Some(human),
+    )
+    .await
+    .expect("an auditor assignment that lapsed ten seconds ago");
     assert!(
         !holds_at(&pool, lapsing, AUDITOR, "now()").await,
         "PREMISE: the assignment has lapsed"
@@ -636,16 +646,18 @@ async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
     maint_insert(&pool, AUDITOR, future, "1 day", None, Some(custodian))
         .await
         .expect("an auditor from tomorrow");
+    // Seeded already lapsed, not a one-second window and a sleep (a backward
+    // wall-clock step during the sleep would keep it live).
     maint_insert(
         &pool,
         AUDITOR,
         lapsed,
-        LIVE,
-        Some("1 second"),
+        "-50 seconds",
+        Some("-10 seconds"),
         Some(custodian),
     )
     .await
-    .expect("an auditor for one second");
+    .expect("an auditor that lapsed ten seconds ago");
     let ended_asg = maint_insert(&pool, AUDITOR, ended, LIVE, None, Some(custodian))
         .await
         .expect("an auditor, ended below");
@@ -671,7 +683,6 @@ async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
             .await
             .expect("revoke the client");
     }
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let un_ended: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM role_assignments \
           WHERE holder_person_id = ANY($1) AND revoked_at IS NULL",
@@ -2766,14 +2777,22 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
         RoleAssignmentRepository::grant(&mut conn, AUDITOR, c, None, None, Some(a), "audit")
             .await
             .expect("an auditor");
+    // Seeded already past its `valid_to` (on the database clock), not a
+    // 1.5 s window and a sleep: a backward wall-clock step during the sleep
+    // would keep it live.
+    let (lapsed_from, lapsed_to): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT now() - interval '50 seconds', now() - interval '10 seconds'")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a window that has passed");
     let expiring = RoleAssignmentRepository::grant(
         &mut conn,
         CUSTODIAN,
         d,
-        None,
-        Some(chrono::Utc::now() + chrono::Duration::milliseconds(1500)),
+        Some(lapsed_from),
+        Some(lapsed_to),
         Some(a),
-        "expires in a moment",
+        "expired ten seconds ago",
     )
     .await
     .expect("a time-bounded custodian");
@@ -2792,10 +2811,6 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
     // triggers off: the guard refuses a holder's link, CUS01), so the act's
     // own link check is what refuses below.
     link_past_the_guard(&pool, f, a).await;
-    sqlx::query("SELECT pg_sleep(2)")
-        .execute(&mut *conn)
-        .await
-        .expect("let the time-bounded assignment expire");
     for (assignment, actor, what) in [
         (auditor, c, "an auditor assignment"),
         (expiring, d, "an assignment past its valid_to"),
