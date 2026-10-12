@@ -130,8 +130,12 @@ async fn the_operator_can_grant_on_the_maintenance_role_and_the_app_role_cannot(
          ROLE MEMBERSHIP, and a bypassing role would make every assertion below vacuous"
     );
 
+    // Back-dated 30 s (CUS02 admits a minute): `is_active` reads liveness in
+    // a later statement, and a grant stamped `now()` is not yet live across a
+    // backward wall-clock step.
     let assignment: Uuid = sqlx::query_scalar(
-        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, NULL, \
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, \
+                                          now() - interval '30 seconds', NULL, NULL, \
                                           'acceptance')",
     )
     .bind(agent)
