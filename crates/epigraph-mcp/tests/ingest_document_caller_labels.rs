@@ -555,6 +555,28 @@ async fn caller_labels_stay_off_spine_nodes_another_agent_wrote(pool: PgPool) {
     );
 }
 
+/// The published inputSchema is what an MCP client reads: both tools that take a
+/// typed extraction must advertise `labels` as an array of strings on it. The
+/// handler tests above build the params as Rust literals and never see it.
+#[test]
+fn published_extraction_schemas_advertise_caller_labels() {
+    let tools = EpiGraphMcpFull::all_tools_json();
+    for name in ["ingest_document_inline", "ingest_document_spine"] {
+        let tool = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        let labels = &tool["inputSchema"]["$defs"]["DocumentExtraction"]["properties"]["labels"];
+        assert_eq!(
+            (&labels["type"], &labels["items"]["type"]),
+            (&serde_json::json!("array"), &serde_json::json!("string")),
+            "{name}: DocumentExtraction.labels must be published as string[]; got {labels}"
+        );
+    }
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()
