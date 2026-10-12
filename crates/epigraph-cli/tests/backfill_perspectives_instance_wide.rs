@@ -17,8 +17,13 @@
 //! Verified to fail (on the tree before this change):
 //! * `verify --legacy-owner platform` exits 1 naming `perspectives`, for the
 //!   three rows the writers produced after the run;
-//! * `run --legacy-owner platform` moves all three into the operator's group;
-//! * the strict `verify` exits 1 on them as well.
+//! * `run --legacy-owner platform --entity perspectives` moves all three into
+//!   the operator's group;
+//! * dropping `perspectives` from `verify`'s skip list (the fix half alone)
+//!   fails both tests again.
+//!
+//! The strict `verify` assertion is not reached on the old tree (the platform
+//! one fails first); it rests on the same residual count, unfiltered.
 
 mod viewer_fixture;
 
