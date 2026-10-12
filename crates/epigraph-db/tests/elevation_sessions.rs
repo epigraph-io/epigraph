@@ -1282,12 +1282,20 @@ async fn the_live_assignment_must_be_the_stored_one(pool: PgPool) {
     let sid = elevated(&pool, &h).await;
     let q = holder(&pool, "grantor", 2).await;
     // Since 130 the grantor Q holds a passkey, so the grant rides a confirmed
-    // `role.grant` act (the fixture's stand-in).
+    // `role.grant` act (the fixture's stand-in). Back-dated like the fixture's
+    // grants (its liveness is read below), so the act states the same
+    // canonical `valid_from` the 130 guard recomputes from the row.
+    let from: String =
+        sqlx::query_scalar("SELECT public.epigraph_canonical_timestamp(now() - $1::interval)")
+            .bind(fixture::FIXTURE_GRANT_BACKDATE)
+            .fetch_one(&pool)
+            .await
+            .expect("the back-dated valid_from");
     let act = fixture::confirmed_act(
         &pool,
         "role.grant",
         &format!(
-            "{{\"role\": \"{CUSTODIAN}\", \"holder\": \"{}\", \"valid_from\": null, \
+            "{{\"role\": \"{CUSTODIAN}\", \"holder\": \"{}\", \"valid_from\": \"{from}\", \
              \"valid_to\": null, \"reason\": \"a second assignment\"}}",
             h.person
         ),
@@ -1295,12 +1303,14 @@ async fn the_live_assignment_must_be_the_stored_one(pool: PgPool) {
     )
     .await;
     sqlx::query(
-        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'a second assignment', $4)",
+        "SELECT public.epigraph_grant_role($1, $2, $5::timestamptz, NULL, $3, \
+                                          'a second assignment', $4)",
     )
     .bind(CUSTODIAN)
     .bind(h.person)
     .bind(q.person)
     .bind(act)
+    .bind(&from)
     .execute(&pool)
     .await
     .expect("a second assignment");
