@@ -91,6 +91,7 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
         sections,
         relationships: Vec::new(),
         source_text: Some(doc.source_text),
+        labels: Vec::new(),
     }
 }
 
@@ -175,6 +176,11 @@ pub async fn ingest_document(
 
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    // The label set is validated before ANY write, here in the handler: the walk
+    // runs detached, so a refusal there would reach only the server log after
+    // the caller was told `queued` and after `ensure_paper_node` wrote the
+    // `papers` row. The core re-derives (and re-checks) the same set.
+    ingest_claim_labels(&extraction, &doi)?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -297,6 +303,8 @@ pub async fn ingest_document_inline(
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    // Before any write, for the reason given in `ingest_document` above.
+    ingest_claim_labels(&extraction, &doi)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -509,9 +517,10 @@ pub async fn ingest_document_spine(
 /// `DocumentExtraction` without round-tripping through the file-path validation
 /// in `ingest_document`.
 #[allow(clippy::too_many_lines)]
-/// Add this document's `doi:` label to a claim the walk RESOLVED TO rather than
-/// created — returning `false`, with nothing changed, when that claim belongs to
-/// a group the ingesting agent cannot write.
+/// Add this document's labels (`doi:<doi>` and the caller's `labels`, see
+/// [`ingest_claim_labels`]) to a claim the walk RESOLVED TO rather than
+/// created — returning `false`, with nothing changed, when that claim belongs
+/// to a group the ingesting agent cannot write.
 ///
 /// # Why a refusal here is skipped rather than propagated
 ///
@@ -537,11 +546,11 @@ pub async fn ingest_document_spine(
 async fn label_resolved_claim(
     conn: &mut sqlx::PgConnection,
     claim_id: Uuid,
-    label: &str,
+    labels: &[String],
 ) -> Result<bool, McpError> {
     use sqlx::Acquire;
     let mut sp = conn.begin().await.map_err(internal_error)?;
-    match ClaimRepository::update_labels_conn(&mut sp, claim_id, &[label.to_string()], &[]).await {
+    match ClaimRepository::update_labels_conn(&mut sp, claim_id, labels, &[]).await {
         Ok(_) => {
             sp.commit().await.map_err(internal_error)?;
             Ok(true)
@@ -551,9 +560,9 @@ async fn label_resolved_claim(
             tracing::warn!(
                 target: "tenancy.scoped_write",
                 claim_id = %claim_id,
-                label = label,
+                labels = ?labels,
                 "ingest resolved to an existing claim owned by a group this agent cannot write; \
-                 its document label was NOT added (the paper still asserts it)"
+                 its document labels were NOT added (the paper still asserts it)"
             );
             Ok(false)
         }
@@ -765,17 +774,16 @@ pub async fn do_ingest_document(
     let pipeline_version = effective_pipeline_version(extraction);
     // Attached to every claim this paper asserts so `query_claims_by_label`
     // and `recompute_beliefs(labels=[...])` can address a paper's full claim
-    // set (backlog c9d12a95: neither could ever find it before this label
-    // existed).
-    let paper_label = format!("doi:{doi}");
+    // set (backlog c9d12a95: neither could ever find it before the `doi:`
+    // label existed), followed by the caller's own `extraction.labels`
+    // (backlog b6b5ac28: they were silently dropped before).
     // Validated ONCE, here, before the paper node or any claim is written.
-    // `doi` comes from the extraction's source metadata, and the per-claim
-    // `update_labels` call that applies this label runs INSIDE the plan walk —
-    // so a `$` in the DOI would fail the ingest partway through, with the paper
-    // row and some claims already landed. Refusing up front keeps the "reject
-    // and write nothing" contract the rest of this branch establishes.
-    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
-        .map_err(db_caller_error)?;
+    // `doi` and the caller labels come from the extraction, and the per-claim
+    // `update_labels` call that applies them runs INSIDE the plan walk — so a
+    // `$` in either would fail the ingest partway through, with the paper row
+    // and some claims already landed. Refusing up front keeps the "reject and
+    // write nothing" contract the rest of this branch establishes.
+    let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
     // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
@@ -1001,18 +1009,13 @@ pub async fn do_ingest_document(
         // shared across papers (convergence) picks up every paper's label —
         // when this author may write it; see `label_resolved_claim`.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &paper_label).await? {
+            if !label_resolved_claim(&mut tx, persisted_id, &claim_labels).await? {
                 converged_unlabelled += 1;
             }
         } else {
-            ClaimRepository::update_labels_conn(
-                &mut tx,
-                persisted_id,
-                std::slice::from_ref(&paper_label),
-                &[],
-            )
-            .await
-            .map_err(internal_error)?;
+            ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
+                .await
+                .map_err(internal_error)?;
         }
         if resolved_to_existing {
             let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
@@ -1441,6 +1444,31 @@ fn is_synthetic_key(key: &str) -> bool {
     key.starts_with(SYNTHETIC_KEY_PREFIX)
 }
 
+/// The full label set one ingest call applies to every claim it writes or
+/// resolves to: `doi:<doi>` first, then the caller's `extraction.labels`
+/// (deduplicated, order-preserving). With no caller labels this is exactly
+/// `[doi:<doi>]`, the set the writer applied before caller labels existed.
+///
+/// Validated HERE so every entry point fails closed before any write: the two
+/// detached handlers call it before `ensure_paper_node` writes the `papers`
+/// row (a refusal inside the spawned walk would reach only the server log,
+/// after the caller was told `queued`), and both cores call it again before
+/// their first write, for the callers that reach a core directly (the spine
+/// handler, the operator `ingest_document` CLI).
+fn ingest_claim_labels(
+    extraction: &DocumentExtraction,
+    doi: &str,
+) -> Result<Vec<String>, McpError> {
+    let mut labels = vec![format!("doi:{doi}")];
+    for label in &extraction.labels {
+        if !labels.contains(label) {
+            labels.push(label.clone());
+        }
+    }
+    epigraph_db::reject_unexpanded_labels(&labels).map_err(db_caller_error)?;
+    Ok(labels)
+}
+
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
 /// Priority: real DOI → arXiv id parsed from `uri` → `uri` → synthesized key.
@@ -1647,12 +1675,12 @@ pub async fn do_ingest_document_spine(
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
-    // See do_ingest_document: attached to every claim so label-based lookup
-    // (recompute_beliefs, query_claims_by_label) can find this paper's set,
-    // and validated here for the same reason — before the first write.
-    let paper_label = format!("doi:{doi}");
-    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
-        .map_err(db_caller_error)?;
+    // See do_ingest_document: `doi:<doi>` plus the caller's labels, attached to
+    // every claim so label-based lookup (recompute_beliefs,
+    // query_claims_by_label) can find this paper's set, and validated here for
+    // the same reason — before the first write. This is the spine handler's
+    // only label check: it calls this core synchronously.
+    let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
     // Atom planned IDs — skip these claims and any edges referencing them.
     let atom_planned_ids: HashSet<Uuid> = plan
@@ -1863,18 +1891,13 @@ pub async fn do_ingest_document_spine(
         // first); its label is skipped and disclosed, not allowed to abort the
         // spine. A node this walk CREATED is the author's own and must label.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &paper_label).await? {
+            if !label_resolved_claim(&mut tx, persisted_id, &claim_labels).await? {
                 converged_unlabelled += 1;
             }
         } else {
-            ClaimRepository::update_labels_conn(
-                &mut tx,
-                persisted_id,
-                std::slice::from_ref(&paper_label),
-                &[],
-            )
-            .await
-            .map_err(internal_error)?;
+            ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
+                .await
+                .map_err(internal_error)?;
         }
 
         if resolved_to_existing {
@@ -2209,6 +2232,7 @@ mod tests {
             sections: Vec::new(),
             relationships: Vec::new(),
             source_text: None,
+            labels: Vec::new(),
         }
     }
 
