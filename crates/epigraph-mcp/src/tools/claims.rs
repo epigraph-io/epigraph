@@ -2816,12 +2816,11 @@ mod tests {
     #[test]
     fn every_accepted_methodology_has_an_explicit_reasoning_type_in_the_check_set() {
         assert!(METHODOLOGY_VOCABULARY.len() >= 36, "vocabulary shrank");
-        for &(token, bucket, reasoning_type) in METHODOLOGY_VOCABULARY {
+        for &(token, _, reasoning_type) in METHODOLOGY_VOCABULARY {
             assert!(
                 ReasoningTraceRepository::REASONING_TYPES.contains(&reasoning_type),
                 "{token:?} maps to {reasoning_type:?}, which reasoning_type_valid refuses"
             );
-            assert_eq!(parse_methodology(token), Ok(bucket), "{token:?}");
             assert_eq!(
                 reasoning_type_for_submitted(token),
                 Some(reasoning_type),
@@ -2845,14 +2844,19 @@ mod tests {
         }
     }
 
-    /// The stored reasoning_type for every accepted token, written out
-    /// independently of the table so a moved row fails here. Exactly one
-    /// family (the observation family) differs from the enum-level
-    /// `ReasoningTraceRepository::reasoning_type_for(bucket)`.
+    /// The trust bucket and stored reasoning_type for every accepted token,
+    /// written out independently of the table (the buckets are the arms of
+    /// the pre-table `parse_methodology` match), so a moved or mis-edited row
+    /// fails here. Exactly one family (the observation family) differs from
+    /// the enum-level `ReasoningTraceRepository::reasoning_type_for(bucket)`.
     #[test]
     fn reasoning_type_table_rows() {
-        let expected: &[(&[&str], &str)] = &[
-            (&["bayesian_inference", "bayesian"], "statistical"),
+        let expected: &[(&[&str], Methodology, &str)] = &[
+            (
+                &["bayesian_inference", "bayesian"],
+                Methodology::BayesianInference,
+                "statistical",
+            ),
             (
                 &[
                     "deductive_logic",
@@ -2860,6 +2864,7 @@ mod tests {
                     "deductive_reasoning",
                     "theoretical_derivation",
                 ],
+                Methodology::Deductive,
                 "deductive",
             ),
             (
@@ -2869,19 +2874,22 @@ mod tests {
                     "meta_analysis",
                     "meta",
                 ],
+                Methodology::Inductive,
                 "inductive",
             ),
-            (&["abductive"], "abductive"),
+            (&["abductive"], Methodology::Abductive, "abductive"),
             (
                 &[
                     "statistical_analysis",
                     "statistical",
                     "statistical_inference",
                 ],
+                Methodology::Instrumental,
                 "statistical",
             ),
             (
                 &["computational", "computational_simulation"],
+                Methodology::Instrumental,
                 "statistical",
             ),
             (
@@ -2891,11 +2899,24 @@ mod tests {
                     "observational",
                     "experimental_observation",
                 ],
+                Methodology::Instrumental,
                 "observational",
             ),
-            (&["instrumental", "instrumental_measurement"], "statistical"),
-            (&["negative_result"], "statistical"),
-            (&["visual_inspection"], "statistical"),
+            (
+                &["instrumental", "instrumental_measurement"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["negative_result"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["visual_inspection"],
+                Methodology::VisualInspection,
+                "statistical",
+            ),
             (
                 &[
                     "extraction",
@@ -2904,20 +2925,28 @@ mod tests {
                     "legal_document_review",
                     "textbook_assertion",
                 ],
+                Methodology::Extraction,
                 "statistical",
             ),
             (
                 &["formal_proof", "proof", "mathematical_proof"],
+                Methodology::FormalProof,
                 "deductive",
             ),
             (
                 &["expert_elicitation", "expert", "testimonial", "heuristic"],
+                Methodology::Heuristic,
                 "abductive",
             ),
         ];
         let mut covered = 0;
-        for (tokens, want) in expected {
+        for (tokens, bucket, want) in expected {
             for token in *tokens {
+                assert_eq!(
+                    parse_methodology(token),
+                    Ok(*bucket),
+                    "{token:?} must stay in the {bucket:?} trust bucket"
+                );
                 assert_eq!(
                     reasoning_type_for_submitted(token),
                     Some(*want),
