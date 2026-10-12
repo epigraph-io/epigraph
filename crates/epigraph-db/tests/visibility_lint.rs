@@ -817,6 +817,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "lock_content_hash_agent",
+        "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
+         (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
+         no row for a viewer to filter. Both callers (create_or_get_signed and POST /claims' \
+         if_not_exists=false branch) follow it with find_by_content_hash_and_agent, which takes \
+         the caller's viewer.",
+    ),
+    (
+        "claim.rs",
         "update_trace_id_conn",
         "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
          authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
