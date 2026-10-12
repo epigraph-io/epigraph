@@ -341,8 +341,32 @@ pub struct NeighborRow {
     pub outgoing: bool,
 }
 
+/// Directional positive relationships: `src -[rel]-> dst` constrains `dst`
+/// (a floor from its supporter) but says nothing about `src`, so the row read
+/// from the source's side (`outgoing`) is skipped by [`build_cdst_sections`].
+///
+/// `corroborates` is NOT here: it is symmetric (idempotent on the unordered
+/// pair), so both sides keep it. Negative kinds and `frame_validates` keep
+/// both sides too (the Negative metric is unchanged; U080). `informs` and
+/// `supersedes` are left out because the neighbourhood query
+/// (`SheafRepository::get_claim_neighbor_betp_pairs`) never returns them;
+/// adding them is a separate change.
+pub const DIRECTIONAL_POSITIVE_RELATIONSHIPS: &[&str] =
+    &["supports", "elaborates", "specializes", "generalizes"];
+
+fn is_directional_positive(relationship: &str) -> bool {
+    DIRECTIONAL_POSITIVE_RELATIONSHIPS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(relationship))
+}
+
 /// Group neighbourhood rows by claim and build one CDST section per claim, in
 /// first-seen claim order. Restriction kinds come from `profile`.
+///
+/// Direction rule: an `outgoing` row of a [`DIRECTIONAL_POSITIVE_RELATIONSHIPS`]
+/// edge is skipped (a supporter is not constrained by its target), but the
+/// claim still gets a section, with `neighbor_count` 0 if nothing else
+/// reaches it.
 pub fn build_cdst_sections(
     rows: &[NeighborRow],
     profile: &RestrictionProfile,
@@ -355,6 +379,9 @@ pub fn build_cdst_sections(
             order.push(row.claim_id);
             (row.local, Vec::new())
         });
+        if row.outgoing && is_directional_positive(&row.relationship) {
+            continue;
+        }
         entry.1.push((
             row.neighbor,
             restriction_kind_with_profile(&row.relationship, profile),
