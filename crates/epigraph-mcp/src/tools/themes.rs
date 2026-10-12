@@ -63,6 +63,7 @@ const MCP_LIMIT_CAP: u32 = 500;
 pub async fn theme_cluster(
     server: &EpiGraphMcpFull,
     params: ThemeClusterParams,
+    _auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let wipe_first = params.wipe_first.unwrap_or(true);
 

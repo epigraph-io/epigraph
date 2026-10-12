@@ -2350,9 +2350,11 @@ impl EpiGraphMcpFull {
     async fn theme_cluster(
         &self,
         Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::themes::theme_cluster(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::themes::theme_cluster(self, params, auth).await
     }
 
     // ── RDF Triple Layer (3 tools) ──

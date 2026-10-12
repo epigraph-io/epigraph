@@ -32,7 +32,7 @@ async fn theme_cluster_skip_path_returns_summary() {
         wipe_first: None,
     };
 
-    let result = theme_cluster(&server, params).await.expect("tool ok");
+    let result = theme_cluster(&server, params, None).await.expect("tool ok");
     let body = common::first_text(&result);
 
     assert!(
@@ -99,7 +99,7 @@ async fn theme_cluster_caps_oversized_limit() {
         wipe_first: None,
     };
 
-    let result = theme_cluster(&server, params).await.expect("tool ok");
+    let result = theme_cluster(&server, params, None).await.expect("tool ok");
     let body = common::first_text(&result);
     assert!(body.get("themes_created").is_some());
 }
