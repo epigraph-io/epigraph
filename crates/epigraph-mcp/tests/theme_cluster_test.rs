@@ -28,7 +28,7 @@ async fn theme_cluster_skip_path_returns_summary() {
         limit: None,
         label_prefix: None,
         centroid_dim: None,
-        // None => engine receives the safe-by-default `wipe_first=true`.
+        // None => additive run (`wipe_first=false`, backlog 5abe23de).
         wipe_first: None,
     };
 
@@ -56,13 +56,14 @@ async fn theme_cluster_skip_path_returns_summary() {
         "summary must include centroid_dim: {body}"
     );
 
-    // The warning is only emitted when `wipe_first=false` AND
-    // `themes_created > 0`. On the default path (`wipe_first=true`) the field
-    // must never be present — additive-duplicate proliferation cannot happen.
-    assert!(
-        body.get("warning").is_none(),
-        "default wipe_first=true path must not emit the additive-mode warning: {body}"
-    );
+    // The additive-mode warning is emitted only when `themes_created > 0`;
+    // a run that created nothing has no duplicates to warn about.
+    if body["themes_created"] == 0 {
+        assert!(
+            body.get("warning").is_none(),
+            "a run that created no theme must not emit the additive-mode warning: {body}"
+        );
+    }
 
     // On the skip path the engine returns themes_created=0 and a non-empty
     // skipped_reason. We allow either branch (a CI DB containing leftover
