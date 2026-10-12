@@ -242,3 +242,57 @@ async fn embed_backfill_runs_both_legs_in_one_run(pool: PgPool) {
     assert!(claim_embedded);
     assert_eq!(goal_embedding_dims(&pool, wf).await, Some(1536));
 }
+
+/// One row the provider rejects must not stop the others, must stay NULL for
+/// the next run, and must make the run exit 2, the same contract the claims
+/// leg has. The mock enforces the real 8191-token input limit, so an
+/// over-long goal is a genuine provider refusal, not a test double.
+#[sqlx::test(migrations = "../../migrations")]
+async fn embed_backfill_workflow_failure_is_counted_and_exits_2(pool: PgPool) {
+    let too_long = "token ".repeat(20_000);
+    let rejected = seed_unembedded_workflow(&pool, &too_long).await;
+    let accepted = seed_unembedded_workflow(&pool, "A goal the provider accepts").await;
+
+    let run = run_bin(&pool, &["--allow-mock"]).await;
+    assert_eq!(
+        run.code,
+        Some(2),
+        "a failed workflow row must fail the run; stdout: {} stderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.has_line("embed_backfill: 1 workflows embedded, 1 failed"),
+        "stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr
+            .contains(&format!("workflow {rejected}: embedding failed")),
+        "the failed row is named; stderr: {}",
+        run.stderr
+    );
+    assert_eq!(goal_embedding_dims(&pool, accepted).await, Some(1536));
+    assert_eq!(goal_embedding_dims(&pool, rejected).await, None);
+}
+
+/// A row deleted between the select and the update writes nothing; it is a
+/// failure, not a success.
+#[sqlx::test(migrations = "../../migrations")]
+async fn workflow_leg_counts_a_vanished_row_as_failed(pool: PgPool) {
+    let provider = MockProvider::new(EmbeddingConfig::openai(1536));
+    let summary = epigraph_cli::embed_backfill::backfill_workflow_goal_embeddings(
+        &pool,
+        &provider,
+        vec![(Uuid::new_v4(), "goal of a row that no longer exists".into())],
+    )
+    .await;
+    assert_eq!(
+        summary,
+        epigraph_cli::embed_backfill::WorkflowBackfillSummary {
+            candidates: 1,
+            written: 0,
+            failed: 1
+        }
+    );
+}
