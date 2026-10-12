@@ -1453,11 +1453,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "ingest_anchors",
-        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
-         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
-         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
-         for a viewer to filter; the ingest entry points call it on the plan walk's own \
-         transaction to decide which existing rows need the caller's authority.",
+        "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
+         `resolve_ingest_parent` lookups by `canonical_name` (batch H-b review, H3's \
+         lineage-takeover fix). `workflows` has no row security and no policy, as \
+         `find_root_by_canonical` records, so there is nothing for a viewer to filter; the \
+         ingest entry points call it on the plan walk's own transaction to decide which \
+         existing rows need the caller's authority.",
+    ),
+    (
+        "workflow.rs",
+        "resolve_ingest_parent",
+        "READ of `workflows` only (U032): the row an ingest links as `parent_id`, the named \
+         parent at `generation - 1` or the lineage's predecessor. `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
+         own transaction so the row authority-checked is the row linked.",
     ),
     (
         "system_agent.rs",

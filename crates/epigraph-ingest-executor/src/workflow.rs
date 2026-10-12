@@ -135,8 +135,9 @@ pub struct WorkflowIngestExecutionResult {
     pub claims_skipped_dedup: usize,
     pub executes_edges_created: usize,
     /// `true` when this ingest inserted (or upserted) a `workflow → variant_of
-    /// → workflow` edge, i.e. when the extraction had `parent_canonical_name`
-    /// set. Idempotent re-ingests that hit the gate at step 1 return `false`
+    /// → workflow` edge, i.e. when a parent was resolved (the named
+    /// `parent_canonical_name` at `generation - 1`, or this lineage's
+    /// predecessor; see `WorkflowRepository::resolve_ingest_parent`). Idempotent re-ingests that hit the gate at step 1 return `false`
     /// (no insertion attempted) even when the edge already exists in the DB.
     pub variant_of_edge_created: bool,
     pub relationship_edges_created: usize,
@@ -257,12 +258,17 @@ pub async fn execute_workflow_ingest_plan(
     let system_agent_id = get_or_create_system_agent(&mut *conn).await?;
 
     // ── 3. Insert workflow row (idempotent) ──────────────────────────────
-    let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
-        WorkflowRepository::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1))
-            .await?
-    } else {
-        None
-    };
+    // The parent is resolved in ONE place, shared with the authority check
+    // (`WorkflowRepository::ingest_anchors`): the named parent at
+    // `generation - 1`, else this lineage's predecessor (U032). Before, a
+    // generation > 0 that named no parent was stored as a parentless root.
+    let parent_id = WorkflowRepository::resolve_ingest_parent(
+        &mut *conn,
+        canonical_name,
+        generation,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await?;
 
     WorkflowRepository::insert_root(
         &mut *conn,
@@ -277,8 +283,8 @@ pub async fn execute_workflow_ingest_plan(
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;
 
     // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────
-    // When a workflow is ingested with parent_canonical_name (generation > 0
-    // and the parent already exists), insert workflow → variant_of → parent
+    // When a parent was resolved above (the named parent, or this lineage's
+    // predecessor), insert workflow → variant_of → parent
     // so graph-traversal queries that don't know about workflows.parent_id
     // can still see the lineage. Idempotent on re-ingest via
     // create_if_not_exists.
