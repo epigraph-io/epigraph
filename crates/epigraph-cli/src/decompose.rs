@@ -228,6 +228,11 @@ pub enum Ineligible {
     Backlog,
     /// [`looks_atomic`] accepted it.
     LooksAtomic { sentences: usize, chars: usize },
+    /// Not `visibility = 'public'`. Atoms are POSTed with `if_not_exists`,
+    /// which the API allows only for the public tier, and their derivation
+    /// evidence copies the parent's text; decomposing a group-private parent
+    /// would republish it. Not overridable.
+    NotPublic { visibility: String },
 }
 
 impl std::fmt::Display for Ineligible {
@@ -241,6 +246,11 @@ impl std::fmt::Display for Ineligible {
                 f,
                 "looks atomic ({sentences} sentence, {chars} chars <= {ATOMIC_MAX_CHARS}; \
                  pass --include-short to decompose it)"
+            ),
+            Self::NotPublic { visibility } => write!(
+                f,
+                "visibility is `{visibility}`, not `public` (atoms are public and carry the \
+                 parent's text as derivation evidence; never decomposed)"
             ),
         }
     }
@@ -265,6 +275,80 @@ pub fn check_eligibility(
         });
     }
     Ok(())
+}
+
+/// The one eligibility rule no flag overrides: only a `visibility = 'public'`
+/// claim is decomposed.
+///
+/// Selection runs under a maintenance BYPASS viewer and so sees group-private
+/// claims, but every atom is POSTed public (`if_not_exists` is public-tier
+/// only) and records the parent's text as its derivation evidence (U041). A
+/// group-private parent would be republished as public atoms, and the API
+/// refuses its `derived_from` — which would abort a normal run. So it is
+/// skipped here and reported.
+///
+/// # Errors
+/// [`Ineligible::NotPublic`] for any other visibility.
+pub fn check_publicly_decomposable(visibility: &str) -> Result<(), Ineligible> {
+    if visibility == "public" {
+        Ok(())
+    } else {
+        Err(Ineligible::NotPublic {
+            visibility: visibility.to_string(),
+        })
+    }
+}
+
+// =============================================================================
+// ATOM CREATE BODY: what `decompose_claims` POSTs to `/api/v1/claims`
+// =============================================================================
+
+/// The parent an atom is being written for, as the submit closure of
+/// `run_decomposition_batches` / `persist_planned` receives it.
+///
+/// A struct rather than two adjacent `Uuid` arguments: the closure needs
+/// both the parent's id (the atom POST names it in `derived_from`, which
+/// records the atom's derivation evidence) and its author (atoms inherit it
+/// as `agent_id`), and a swapped pair of bare `Uuid`s would compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomParent {
+    /// The compound claim being decomposed.
+    pub claim_id: uuid::Uuid,
+    /// Its author, which the atom inherits.
+    pub agent_id: uuid::Uuid,
+}
+
+/// The `derived_from.method` every `decompose_claims` atom names.
+pub const DECOMPOSE_DERIVATION_METHOD: &str = "decompose_claims";
+
+/// The JSON body `decompose_claims` POSTs to `/api/v1/claims` for one atom.
+///
+/// A pure function, so the wire shape is testable: the API's
+/// `CreateClaimRequest` has no `deny_unknown_fields`, so a misspelt key here
+/// (or a swapped parent id / author) is silently dropped with a 200, and the
+/// atom is born with `evidence_ids=[]` again (backlog 3590a2d8).
+///
+/// * `agent_id` is the PARENT's author — atoms inherit it.
+/// * `if_not_exists=true`: an atom whose text already exists for that author
+///   dedups onto the existing claim, and edges are re-wired idempotently.
+/// * methodology/evidence_type belong in `properties` (JSONB); top-level they
+///   were unknown fields and silently dropped.
+/// * `derived_from` names the parent: the API records one `document`
+///   evidence row carrying the parent's text, in the atom's own transaction.
+///   Provenance, not belief: no mass function, truth stays 0.5 (U041).
+pub fn atom_create_body(atom_text: &str, generality: i64, parent: AtomParent) -> Value {
+    serde_json::json!({
+        "content": atom_text,
+        "agent_id": parent.agent_id,
+        "initial_truth": 0.5,
+        "if_not_exists": true,
+        "properties": {
+            "methodology": "inductive_generalization",
+            "evidence_type": "logical"
+        },
+        "labels": ["atom", format!("generality:{generality}")],
+        "derived_from": {"claim_id": parent.claim_id, "method": DECOMPOSE_DERIVATION_METHOD},
+    })
 }
 
 // =============================================================================
@@ -396,7 +480,7 @@ pub use db_writes::{
 
 #[cfg(feature = "db")]
 mod db_writes {
-    use super::Decomposition;
+    use super::{AtomParent, Decomposition};
     use epigraph_db::{ClaimRepository, EdgeRepository};
     use sqlx::PgPool;
     use std::sync::Arc;
@@ -419,7 +503,8 @@ mod db_writes {
     ///
     /// Atom claims are written through `submit_via` — a closure the caller
     /// supplies that goes through the CANONICAL claim-create path so signing,
-    /// provenance, DS auto-wire and embed-on-write are preserved. In the
+    /// derivation provenance and embed-on-write are preserved (that path
+    /// writes no DS mass function for an atom). In the
     /// binary this closure POSTs to the local API `/api/v1/claims` (or calls
     /// the in-process submit helper); in tests it is a fake that inserts a
     /// minimal claim row, letting us verify the edge/label wiring WITHOUT an
@@ -549,9 +634,10 @@ mod db_writes {
     /// wired to — is reachable from a test. `main` keeps only credential
     /// resolution and the HTTP submit closure.
     ///
-    /// `submit_via` receives `(atom_text, generality, parent_agent_id)`; atoms
-    /// inherit their parent compound claim's author, and the parent varies
-    /// across a batch, so the author cannot be captured once by the caller.
+    /// `submit_via` receives `(atom_text, generality, parent)`; atoms inherit
+    /// their parent compound claim's author and record it as their derivation
+    /// source, and the parent varies across a batch, so neither can be
+    /// captured once by the caller.
     ///
     /// A batch whose LLM call fails is logged and skipped (the run continues);
     /// a persist failure aborts the run.
@@ -565,7 +651,7 @@ mod db_writes {
         submit_via: F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
@@ -733,19 +819,22 @@ mod db_writes {
         submit_via: &F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
         for plan in planned {
-            let parent_agent_id = plan.agent_id;
+            let parent = AtomParent {
+                claim_id: plan.claim_id,
+                agent_id: plan.agent_id,
+            };
             match persist_decomposition(
                 pool,
                 viewer,
                 plan.claim_id,
                 &plan.decomposition(),
                 embedder.clone(),
-                move |atom_text, generality| submit_via(atom_text, generality, parent_agent_id),
+                move |atom_text, generality| submit_via(atom_text, generality, parent),
             )
             .await
             {
@@ -911,6 +1000,10 @@ mod db_writes {
                 if !taken.insert(r.id) {
                     continue;
                 }
+                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
+                    sel.skipped.push((r.id, why));
+                    continue;
+                }
                 match super::check_eligibility(&r.content, &r.labels, filters) {
                     // Past `--limit`: named, eligible, and NOT silently dropped.
                     Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
@@ -962,6 +1055,10 @@ mod db_writes {
             for r in page {
                 if sel.chosen.len() >= limit {
                     break;
+                }
+                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
+                    sel.skipped.push((r.id, why));
+                    continue;
                 }
                 match super::check_eligibility(&r.content, &r.labels, filters) {
                     Ok(()) => sel.chosen.push(r),
