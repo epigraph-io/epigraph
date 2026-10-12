@@ -473,6 +473,33 @@ mod tests {
     }
 
     #[test]
+    fn test_section_mixed_floor_shortfall_dominates_negative_distance() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.15; supporter 0.9 at Positive(0.8): floor 0.72 ->
+        // shortfall 0.57. Contradicter 0.9 at Negative(0.9): expected
+        // (1 - 0.9) * 0.9 = 0.09 -> distance 0.06. max(0.57, 0.06) = 0.57:
+        // a contradicter must not hide the floor shortfall.
+        // (The old all-neighbour average (0.72 + 0.09) / 2 = 0.405 gave
+        // |0.15 - 0.405| = 0.255.)
+        let section = compute_section(
+            id,
+            0.15,
+            0.1,
+            0.2,
+            &[
+                (0.9, RestrictionKind::Positive(0.8)),
+                (0.9, RestrictionKind::Negative(0.9)),
+            ],
+        );
+        assert!(
+            (section.consistency_radius - 0.57).abs() < 1e-9,
+            "mixed node radius should be max(0.57, 0.06) = 0.57, got {}",
+            section.consistency_radius
+        );
+        assert_eq!(section.neighbor_count, 2);
+    }
+
+    #[test]
     fn test_section_negative_only_unchanged() {
         let id = Uuid::new_v4();
         // Negative-only nodes keep the symmetric metric bit-for-bit:

@@ -858,6 +858,117 @@ mod tests {
         assert!((s.expected_betp - 0.84).abs() < 1e-9);
     }
 
+    #[test]
+    fn test_cdst_section_mixed_floor_shortfall_dominates_negative_distance() {
+        // The other direction of the mixed-node max: an under-supported node
+        // must not hide its floor shortfall behind a small Negative distance.
+        // Local [0.10, 0.20], BetP 0.15.
+        // Supporter [0.9, 0.9] Positive(0.8): floor 0.72 -> shortfall 0.62.
+        // Contradicter [0.9, 0.9] Negative(0.9): restricted
+        // [(1-0.9)*0.9, 1-0.9*0.9] = [0.09, 0.19], BetP 0.14 -> distance
+        // 0.01, Hausdorff max(0.01, 0.01) = 0.01.
+        // max(0.62, 0.01) = 0.62. (The old all-neighbour average
+        // [0.405, 0.555], BetP 0.48, gave |0.15 - 0.48| = 0.33.)
+        let local = EpistemicInterval::new(0.10, 0.20, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.9, 0.9, 0.0),
+                    RestrictionKind::Positive(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.9, 0.9, 0.0),
+                    RestrictionKind::Negative(0.9),
+                ),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.62).abs() < 1e-9,
+            "mixed node radius should be max(0.62, 0.01) = 0.62, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.62).abs() < 1e-9,
+            "mixed node interval_inconsistency should be max(0.62, 0.01) = 0.62, got {}",
+            s.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_frame_evidence_only_unchanged() {
+        // FrameEvidence neighbours (frame_validates) keep the symmetric metric
+        // bit-for-bit, like Negative ones. FE passes bel/pl through:
+        // neighbour [0.20, 0.40] -> restricted [0.20, 0.40], BetP 0.30;
+        // local [0.80, 0.90], BetP 0.85 -> radius 0.55;
+        // Hausdorff max(|0.80-0.20|, |0.90-0.40|) = 0.60.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let neighbors = vec![(
+            EpistemicInterval::new(0.20, 0.40, 0.0),
+            RestrictionKind::FrameEvidence(0.8),
+        )];
+        let s = compute_cdst_section(Uuid::new_v4(), local, &neighbors);
+        let expected = compute_cdst_expected(&neighbors).unwrap();
+        assert_eq!(
+            s.consistency_radius.to_bits(),
+            (local.betp() - expected.betp()).abs().to_bits(),
+            "FrameEvidence-only radius must stay |local_betp - expected_betp|"
+        );
+        assert_eq!(
+            s.interval_inconsistency.to_bits(),
+            local.hausdorff_distance(&expected).to_bits(),
+            "FrameEvidence-only interval_inconsistency must stay the Hausdorff distance"
+        );
+        assert!(
+            (s.consistency_radius - 0.55).abs() < 1e-9,
+            "got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.60).abs() < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_mixed_positive_and_frame_evidence() {
+        // FrameEvidence neighbours belong to the symmetric group, not the
+        // floor group, and are NOT dropped from it.
+        // Local [0.80, 0.90]; supporter [0.5, 0.5] Positive(0.8): floor 0.40,
+        // shortfall 0. FE neighbour [0.20, 0.40]: symmetric distance
+        // |0.85 - 0.30| = 0.55, Hausdorff 0.60. max(0, 0.55) = 0.55.
+        // (The old all-neighbour average [0.30, 0.50], BetP 0.40, gave
+        // |0.85 - 0.40| = 0.45; dropping FE from the group would give 0.)
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.5, 0.5, 0.0),
+                    RestrictionKind::Positive(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.20, 0.40, 0.0),
+                    RestrictionKind::FrameEvidence(0.8),
+                ),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.55).abs() < 1e-9,
+            "FE neighbour must set the symmetric term 0.55, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.60).abs() < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+        assert_eq!(s.neighbor_count, 2);
+    }
+
     // ── build_cdst_sections tests ────────────────────────────────────────
 
     fn weak() -> EpistemicInterval {
