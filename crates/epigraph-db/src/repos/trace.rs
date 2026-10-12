@@ -651,15 +651,25 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|x| x == "sql"))
             .collect();
         files.sort();
+        // Anchor on the constraint DDL in SQL text only: a header comment that
+        // discusses the constraint (121's does) must not be parsed as it.
+        const ANCHOR: &str = "ADD CONSTRAINT reasoning_type_valid CHECK";
+        let without_comments = |sql: String| -> String {
+            sql.lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let (path, sql) = files
             .iter()
             .rev()
-            .map(|p| (p, std::fs::read_to_string(p).expect("read migration")))
-            .find(|(_, sql)| sql.contains("ADD CONSTRAINT reasoning_type_valid"))
+            .map(|p| {
+                let sql = std::fs::read_to_string(p).expect("read migration");
+                (p, without_comments(sql))
+            })
+            .find(|(_, sql)| sql.contains(ANCHOR))
             .expect("some migration adds reasoning_type_valid");
-        let start = sql
-            .find("ADD CONSTRAINT reasoning_type_valid")
-            .expect("anchor present");
+        let start = sql.find(ANCHOR).expect("anchor present");
         let body = &sql[start..];
         let body = &body[..body.find(';').expect("statement terminator")];
         let mut in_check: Vec<&str> = body.split('\'').skip(1).step_by(2).collect();
