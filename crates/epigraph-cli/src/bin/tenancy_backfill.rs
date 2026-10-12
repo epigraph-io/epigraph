@@ -106,7 +106,13 @@
 //! agent-keyed arm (`recall_events`) is batched and cursored the same way
 //! instead of one unbounded UPDATE.
 //!
-//! # `perspectives` is an instance-wide registry, like `frames` and `contexts`
+//! # `perspectives` and `communities` are instance-wide registries, like `frames` and `contexts`
+//!
+//! Migration 077 names four instance-wide registries (`frames`, `contexts`,
+//! `perspectives`, `communities`) and gives them, and only them, a WITH CHECK
+//! arm that admits `('public', world)`. This binary stamps none of the four:
+//! `run` does not re-own a row and `verify` does not count a world-owned one as
+//! residue ([`INSTANCE_WIDE_REGISTRIES`]).
 //!
 //! Every writer of `perspectives` declares `TenancyDecl::instance_wide()`
 //! (`('public', world)`) on purpose: `PerspectiveRepository::create`,
@@ -120,6 +126,24 @@
 //! perspective an operator-linked agent wrote failed `verify` until a re-run
 //! moved it into the operator's group, against the writers' declaration.
 //! `--entity perspectives` is still accepted and does nothing.
+//!
+//! `communities` has one writer, `CommunityRepository::create`, and it declares
+//! the row instance-wide on purpose: the community's projected group (migration
+//! 068, id-preserving) "is not the owner of the registry row", because a
+//! community's directory entry is how others decide whether to join it. An
+//! earlier revision re-stamped every world-owned community to
+//! `('public', communities.id)`, and `verify` counted every world-owned
+//! community as residue in every mode, so each community created after a run
+//! failed the deploy pre-flight until a re-run moved it into its own group,
+//! against the writer's declaration. The plan assigns `communities` no
+//! derivation at all; that arm was this binary's own. `--entity communities` is
+//! still accepted and does nothing.
+//!
+//! Rows an earlier revision already moved (perspectives into an operator's
+//! group, communities into their own group) stay where they are. They are still
+//! `visibility = 'public'`, so no reader distinguishes them from world-owned
+//! rows; migrations 115 and 117 let their owner group DELETE or UPDATE them,
+//! where nobody could for a world-owned row.
 //!
 //! # `--legacy-owner operator|platform` (required on `run`)
 //!
@@ -162,11 +186,21 @@ const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
 
-/// What `run --entity perspectives` (and its dry run) says instead of walking
-/// the table. See the module doc, "`perspectives` is an instance-wide registry".
-const PERSPECTIVES_ARE_INSTANCE_WIDE: &str =
-    "perspectives is an instance-wide registry (its writers declare ('public', world)); \
-     nothing to stamp.";
+/// The instance-wide registries (migration 077 section 2b): their writers
+/// declare `('public', world)` on purpose, so this binary stamps none of them,
+/// `verify` does not count their world-owned rows, and `settle_remaining`
+/// settles their progress rows. See the module doc, "`perspectives` and
+/// `communities` are instance-wide registries".
+const INSTANCE_WIDE_REGISTRIES: &[&str] = &["frames", "contexts", "perspectives", "communities"];
+
+/// What `run --entity perspectives|communities` (and its dry run) says instead
+/// of walking `table`.
+fn instance_wide_note(table: &str) -> String {
+    format!(
+        "{table} is an instance-wide registry (its writers declare ('public', world)); \
+         nothing to stamp."
+    )
+}
 
 /// Resolve an agent's personal group, as a correlated scalar subquery over an
 /// `{agent}` expression the caller substitutes.
@@ -538,12 +572,16 @@ async fn run(
     }
 
     if dry_run {
-        if wants(Entity::Perspectives) {
-            println!("dry-run: {PERSPECTIVES_ARE_INSTANCE_WIDE}");
+        for (e, table) in [
+            (Entity::Communities, "communities"),
+            (Entity::Perspectives, "perspectives"),
+        ] {
+            if wants(e) {
+                println!("dry-run: {}", instance_wide_note(table));
+            }
         }
         for (e, table) in [
             (Entity::Claims, "claims"),
-            (Entity::Communities, "communities"),
             (Entity::RecallEvents, "recall_events"),
             (Entity::HarvesterFragments, "harvester_fragments"),
         ] {
@@ -580,13 +618,15 @@ async fn run(
             return Ok(end);
         }
     }
-    if wants(Entity::Communities) {
-        backfill_communities(pool).await?;
-    }
-    if wants(Entity::Perspectives) {
-        // No walk: see the module doc. A full run settles its progress row in
-        // `settle_remaining`, with `frames` and `contexts`.
-        println!("run: {PERSPECTIVES_ARE_INSTANCE_WIDE}");
+    // No walk for the registries: see the module doc. A full run settles their
+    // progress rows in `settle_remaining`, with `frames` and `contexts`.
+    for (e, table) in [
+        (Entity::Communities, "communities"),
+        (Entity::Perspectives, "perspectives"),
+    ] {
+        if wants(e) {
+            println!("run: {}", instance_wide_note(table));
+        }
     }
     if wants(Entity::RecallEvents) {
         let w = backfill_agent_keyed(
@@ -946,29 +986,6 @@ fn claims_batch_update_sql(mode: LegacyOwner) -> String {
     )
 }
 
-/// `communities` → `('public', communities.id)`.
-///
-/// Migration 068 projects each community onto a group **ID-preservingly**
-/// ("Project each community into a group, ID-PRESERVING so no mapping table is
-/// needed"), so the community's own id IS its group id. The join to `groups`
-/// is a guard, not a lookup: a community created after 068 ran has no projected
-/// group yet, and stamping a nonexistent group would trip the FK. Those are
-/// left for `verify` to name.
-async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
-    let n = sqlx::query(
-        "UPDATE communities c SET owner_group_id = g.id, visibility = 'public'
-           FROM groups g
-          WHERE g.id = c.id AND g.kind = 'community'
-            AND c.owner_group_id = $1",
-    )
-    .bind(WORLD)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    finish_entity(pool, "communities", n as i64).await?;
-    Ok(())
-}
-
 /// `recall_events` → the owner of its agent column.
 ///
 /// **One of the five entities the plan assigns no derivation at all** (the
@@ -1148,8 +1165,9 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
 ///   against `information_schema`: `frames` has `parent_frame_id`, `contexts`
 ///   has none. There is nothing to derive an owner from, so they stay
 ///   `('public', world)`.
-/// * **`perspectives`** has an `owner_agent_id`, but every writer declares the
-///   row instance-wide on purpose (module doc), so its world-owned rows are a
+/// * **`perspectives`** has an `owner_agent_id`, and **`communities`** a
+///   projected group of its own, but every writer of either declares the row
+///   instance-wide on purpose (module doc), so their world-owned rows are a
 ///   declaration, not residue, exactly as on `frames` and `contexts`.
 ///
 /// That is legal, and the constraint that says so is narrow enough to be worth
@@ -1232,7 +1250,8 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
     }
     for t in CLAIM_DERIVED
         .iter()
-        .chain(["edges", "frames", "contexts", "perspectives"].iter())
+        .chain(std::iter::once(&"edges"))
+        .chain(INSTANCE_WIDE_REGISTRIES.iter())
     {
         let n = residual_for(pool, t, Some(mode)).await?;
         // `rows_done` means ROWS DECLARED, not table size. An earlier revision
@@ -1242,7 +1261,7 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
             .fetch_one(pool)
             .await?;
         let done = total - n;
-        if n > 0 && !matches!(*t, "frames" | "contexts" | "perspectives" | "edges") {
+        if n > 0 && *t != "edges" && !INSTANCE_WIDE_REGISTRIES.contains(t) {
             tracing::warn!(
                 table = t,
                 residual = n,
@@ -2587,7 +2606,8 @@ async fn residual_for(
 /// over the rest. Offending ids are PRINTED, because a guard that says "3 rows
 /// are wrong" and not which ones cannot be acted on.
 ///
-/// `frames`, `contexts` and `perspectives` are exempt from the residual check
+/// The instance-wide registries ([`INSTANCE_WIDE_REGISTRIES`]: `frames`,
+/// `contexts`, `perspectives`, `communities`) are exempt from the residual check
 /// for the reason `settle_remaining` documents: a `('public', world)` row on
 /// those tables is a correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
@@ -2831,10 +2851,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     }
 
     for t in TIER_A {
-        if matches!(
-            *t,
-            "frames" | "contexts" | "perspectives" | "edges" | "claims" | "evidence"
-        ) {
+        if INSTANCE_WIDE_REGISTRIES.contains(t) || matches!(*t, "edges" | "claims" | "evidence") {
             continue;
         }
         let n = residual_for(pool, t, mode).await?;
@@ -2852,7 +2869,8 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     // so the tenancy gate is satisfied; operator binding wants them in the
     // operator's group, and `epigraph-operator reown-linked` moves them.
     // `perspectives` is not listed: its owner is not this binary's concern (the
-    // module doc, "`perspectives` is an instance-wide registry").
+    // module doc, "`perspectives` and `communities` are instance-wide
+    // registries").
     for (table, agent_col) in [("claims", "agent_id"), ("recall_events", "agent_id")] {
         let n = linked_author_personal_residue(pool, table, agent_col).await?;
         if n > 0 {
