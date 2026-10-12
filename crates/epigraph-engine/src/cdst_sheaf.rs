@@ -6,6 +6,8 @@
 //! - **ignorance_h1**: closed-world ignorance width mismatch
 //! - **open_world_h1**: open-world mass spread (frame incompleteness)
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,7 +15,10 @@ use crate::epistemic_interval::{
     restrict_epistemic_frame_evidence, restrict_epistemic_negative, restrict_epistemic_positive,
     EpistemicInterval,
 };
-use crate::sheaf::{restriction_kind_from_properties, RestrictionKind, RestrictionProfile};
+use crate::sheaf::{
+    restriction_kind_from_properties, restriction_kind_with_profile, RestrictionKind,
+    RestrictionProfile,
+};
 
 // ── Obstruction taxonomy ──────────────────────────────────────────────────
 
@@ -316,6 +321,53 @@ pub fn compute_cdst_section(
         ignorance_inconsistency: (local_interval.width() - expected_interval.width()).abs(),
         neighbor_count,
     }
+}
+
+/// One `(claim, neighbour)` row of a node's epistemic neighbourhood, as a
+/// DB consumer reads it (one row per incident edge, from each endpoint's
+/// side).
+#[derive(Debug, Clone)]
+pub struct NeighborRow {
+    /// The claim whose section this row contributes to.
+    pub claim_id: Uuid,
+    /// The claim's own interval (first-seen row per claim wins).
+    pub local: EpistemicInterval,
+    /// The interval at the other end of the edge.
+    pub neighbor: EpistemicInterval,
+    /// The edge relationship (case-insensitive).
+    pub relationship: String,
+    /// `true` when `claim_id` is the edge's SOURCE (the edge points away from
+    /// it), `false` when it is the target.
+    pub outgoing: bool,
+}
+
+/// Group neighbourhood rows by claim and build one CDST section per claim, in
+/// first-seen claim order. Restriction kinds come from `profile`.
+pub fn build_cdst_sections(
+    rows: &[NeighborRow],
+    profile: &RestrictionProfile,
+) -> Vec<CdstSheafSection> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut groups: HashMap<Uuid, (EpistemicInterval, Vec<(EpistemicInterval, RestrictionKind)>)> =
+        HashMap::new();
+    for row in rows {
+        let entry = groups.entry(row.claim_id).or_insert_with(|| {
+            order.push(row.claim_id);
+            (row.local, Vec::new())
+        });
+        entry.1.push((
+            row.neighbor,
+            restriction_kind_with_profile(&row.relationship, profile),
+        ));
+    }
+    order
+        .into_iter()
+        .filter_map(|id| {
+            groups
+                .remove(&id)
+                .map(|(local, neighbors)| compute_cdst_section(id, local, &neighbors))
+        })
+        .collect()
 }
 
 /// Compute the interval inconsistency for a single directed edge and classify it.
@@ -777,6 +829,159 @@ mod tests {
         assert!((s.interval_inconsistency - 0.31).abs() < 1e-9);
         // expected_betp stays the all-neighbour average for display.
         assert!((s.expected_betp - 0.84).abs() < 1e-9);
+    }
+
+    // ── build_cdst_sections tests ────────────────────────────────────────
+
+    fn weak() -> EpistemicInterval {
+        EpistemicInterval::new(0.1, 0.2, 0.0)
+    }
+    fn strong() -> EpistemicInterval {
+        EpistemicInterval::new(0.95, 1.0, 0.0)
+    }
+
+    /// Both endpoint rows of one edge `src -[rel]-> dst`, as the
+    /// neighbourhood query returns them.
+    fn edge_rows(
+        src: (Uuid, EpistemicInterval),
+        dst: (Uuid, EpistemicInterval),
+        rel: &str,
+    ) -> [NeighborRow; 2] {
+        [
+            NeighborRow {
+                claim_id: src.0,
+                local: src.1,
+                neighbor: dst.1,
+                relationship: rel.to_string(),
+                outgoing: true,
+            },
+            NeighborRow {
+                claim_id: dst.0,
+                local: dst.1,
+                neighbor: src.1,
+                relationship: rel.to_string(),
+                outgoing: false,
+            },
+        ]
+    }
+
+    fn section_of(sections: &[CdstSheafSection], id: Uuid) -> &CdstSheafSection {
+        sections
+            .iter()
+            .find(|s| s.node_id == id)
+            .unwrap_or_else(|| panic!("no section for {id}"))
+    }
+
+    #[test]
+    fn test_build_sections_skips_outgoing_supports() {
+        // A supporter is not constrained by its target: the SOURCE side of a
+        // directional positive edge contributes no neighbour.
+        // a (weak) supports b (strong): read from a's side, b would impose a
+        // floor 0.95 * 0.8 = 0.76 on a -> a spurious 0.66 (04b7055e's case).
+        // c (strong) supports d (weak): d is genuinely under-supported, 0.66.
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut rows = Vec::new();
+        rows.extend(edge_rows((a, weak()), (b, strong()), "supports"));
+        rows.extend(edge_rows((c, strong()), (d, weak()), "supports"));
+        let sections = build_cdst_sections(&rows, &sci());
+        assert_eq!(sections.len(), 4, "every claim with a row gets a section");
+
+        let sa = section_of(&sections, a);
+        assert_eq!(sa.neighbor_count, 0, "a supports-edge source has no floor");
+        assert!(
+            sa.consistency_radius < 1e-9,
+            "weak supporter must not be penalised by its strong target, got {}",
+            sa.consistency_radius
+        );
+        let sc = section_of(&sections, c);
+        assert_eq!(sc.neighbor_count, 0);
+        assert!(sc.consistency_radius < 1e-9);
+
+        let sb = section_of(&sections, b);
+        assert_eq!(sb.neighbor_count, 1);
+        assert!(
+            sb.consistency_radius < 1e-9,
+            "over-supported target is benign"
+        );
+        let sd = section_of(&sections, d);
+        assert_eq!(sd.neighbor_count, 1);
+        assert!(
+            (sd.consistency_radius - 0.66).abs() < 1e-9,
+            "under-supported target must still flag 0.66, got {}",
+            sd.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_build_sections_skips_every_directional_positive_kind_case_insensitively() {
+        for rel in ["elaborates", "specializes", "generalizes", "Supports"] {
+            let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+            let rows = edge_rows((a, weak()), (b, strong()), rel);
+            let sections = build_cdst_sections(&rows, &sci());
+            let sa = section_of(&sections, a);
+            assert_eq!(sa.neighbor_count, 0, "{rel}: source must be skipped");
+            assert!(
+                sa.consistency_radius < 1e-9,
+                "{rel}: got {}",
+                sa.consistency_radius
+            );
+            assert_eq!(section_of(&sections, b).neighbor_count, 1, "{rel}");
+        }
+    }
+
+    #[test]
+    fn test_build_sections_keeps_both_sides_of_symmetric_kinds() {
+        // corroborates is symmetric (unordered pair): the weak side IS
+        // constrained by the strong side, 0.95 * 0.8 - 0.1 = 0.66.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows((a, weak()), (b, strong()), "corroborates"),
+            &sci(),
+        );
+        let sa = section_of(&sections, a);
+        assert_eq!(sa.neighbor_count, 1);
+        assert!(
+            (sa.consistency_radius - 0.66).abs() < 1e-9,
+            "got {}",
+            sa.consistency_radius
+        );
+        assert_eq!(section_of(&sections, b).neighbor_count, 1);
+
+        // contradicts is kept on the source side too (Negative: unchanged,
+        // U080): [0.80, 0.95] vs [0.80, 0.95] at 0.9 -> 0.7125.
+        let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+        let iv = EpistemicInterval::new(0.80, 0.95, 0.0);
+        let sections = build_cdst_sections(&edge_rows((e, iv), (f, iv), "contradicts"), &sci());
+        for id in [e, f] {
+            let s = section_of(&sections, id);
+            assert_eq!(s.neighbor_count, 1);
+            assert!(
+                (s.consistency_radius - 0.7125).abs() < 1e-9,
+                "got {}",
+                s.consistency_radius
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_sections_uses_the_given_profile() {
+        // Regulatory supports factor 0.95: floor 0.95 * 0.95 = 0.9025 on d.
+        let (c, d) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows((c, strong()), (d, weak()), "supports"),
+            &RestrictionProfile::regulatory(),
+        );
+        let sd = section_of(&sections, d);
+        assert!(
+            (sd.consistency_radius - 0.8025).abs() < 1e-9,
+            "regulatory floor shortfall should be 0.8025, got {}",
+            sd.consistency_radius
+        );
     }
 
     // ── compute_cdst_cohomology tests ────────────────────────────────────

@@ -69,9 +69,10 @@ pub use bayesian::BayesianUpdater;
 pub use belief_query::{get_belief, BeliefInterval, BeliefQueryError};
 pub use bp::{run_bp, BpConfig, BpResult, FactorPotential};
 pub use cdst_sheaf::{
-    classify_obstruction, compute_cdst_cohomology, compute_cdst_edge_inconsistency,
-    compute_cdst_expected, compute_cdst_section, CdstSheafCohomology, CdstSheafObstruction,
-    CdstSheafSection, FrameEvidenceProposal, ObstructionKind,
+    build_cdst_sections, classify_obstruction, compute_cdst_cohomology,
+    compute_cdst_edge_inconsistency, compute_cdst_expected, compute_cdst_section,
+    CdstSheafCohomology, CdstSheafObstruction, CdstSheafSection, FrameEvidenceProposal,
+    NeighborRow, ObstructionKind,
 };
 pub use cospan::{
     compose_cdst_cospans, compose_cospans, BoundaryDetail, CdstCompositionResult,
