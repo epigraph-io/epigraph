@@ -453,8 +453,12 @@ the claim's version history. The supersede act declares no owner, so it
 inherits the predecessor's group and never meets this; a writer that writes
 both groups supersedes in place. A retired row may still name a claim in
 another group (the dedup and consolidate acts' shape), and a privileged
-session is not checked. Rows written before arming are not revisited; the
-audit query is in migration 153's header. With a principal
+session is not checked. The rule compares groups only: a writer of the
+predecessor's OWN group can still attach a second current successor there,
+with the same effect on that claim's inherited-author supersede. The world
+group has no writer memberships by design, which keeps the corpus out of that
+reach; `docs/deploy.md` (migration 153) checks it before arming. Rows written
+before arming are not revisited; the census is in the same section. With a principal
 equal to the author, or a privileged session, the author is the one checked.
 An APPLICATION session with NO principal (a write on an unstamped connection)
 is an unbound writer: refused `OPL01` once armed, so a path that forgot to

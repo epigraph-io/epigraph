@@ -2536,11 +2536,43 @@ reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
    unarmed database, and it may apply before or after any lower-numbered
    migration that does not re-body that function (sqlx applies every
    embedded, unapplied migration in version order).
-3. **Before arming,** count the current claims that already name a
-   predecessor in another group (the audit query in migration 153's header).
-   153 does not revisit them; each one blocks the custodial supersede of its
-   predecessor once armed, so revise or retire it on the maintenance DSN
-   first.
+3. **Before arming, census the dangling successors** 153 does not revisit
+   (read-only):
+
+   ```sql
+   SELECT (p.owner_group_id = '00000000-0000-0000-0000-000000000000') AS world_pred,
+          (s.owner_group_id IS DISTINCT FROM p.owner_group_id) AS cross_group,
+          count(*)
+     FROM claims s JOIN claims p ON p.id = s.supersedes
+    WHERE COALESCE(s.is_current, true) AND COALESCE(p.is_current, true)
+      AND s.id <> p.id
+    GROUP BY 1, 2;
+   ```
+
+   What blocks is ANOTHER CURRENT successor of a CURRENT predecessor, in any
+   group: 123's inherited-author rule needs "no other current successor", and
+   that rule is the only one that admits a supersede restating a claim under
+   its unbound or retired-linked author, the custodial supersede of a corpus
+   claim included (refused `OPL01` otherwise). So the `world_pred` rows are
+   custodial edits that would be refused once armed; revise or retire each
+   such successor on the maintenance DSN first. The other rows include benign
+   pairs (a same-author first `supersedes` within one group needs no inherited
+   rule). A current successor of an already-retired predecessor blocks
+   nothing. The `cross_group` rows are the shape 153 now refuses; migration
+   153's header carries that subset's count alone.
+4. **Before arming, confirm the world group has no live writer.** 153
+   compares groups only, so a writer of the world group could still attach a
+   current successor to a corpus claim in that group, with the same effect.
+   The world group has no memberships by design, but nothing enforces it.
+   Expect 0 rows:
+
+   ```sql
+   SELECT agent_id, role FROM group_memberships
+    WHERE group_id = '00000000-0000-0000-0000-000000000000'
+      AND revoked_at IS NULL AND role IN ('writer', 'admin');
+   ```
+
+   A row is a stop for arming until it is revoked or ruled on.
 
 **Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
 transaction: it restores 123's body of the function and re-asserts its owner.

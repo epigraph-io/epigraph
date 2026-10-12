@@ -1282,8 +1282,9 @@ restart.
   refusal is `OPL02`, already mapped everywhere); it may apply before or after
   any lower-numbered migration that does not re-body this function (sqlx
   applies every embedded, unapplied version in order); one that does must be
-  rebased onto this body. Count pre-existing cross-group current
-  successors (the query in the file's header) before arming.
+  rebased onto this body. Before arming, census the pre-existing dangling
+  current successors and confirm the world group has no live writer
+  (`docs/deploy.md`, migration 153, steps 3 and 4).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
