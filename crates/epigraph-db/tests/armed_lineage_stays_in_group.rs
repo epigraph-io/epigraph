@@ -111,19 +111,39 @@ where
     F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
     Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
 {
+    as_app_session(pool, Some(principal), groups, false, f).await
+}
+
+/// [`as_app`], with the principal optional (`None`: an UNSTAMPED session,
+/// a route that forgot its viewer) and the session's OPL01 valve
+/// (`epigraph.operator_link_enforcement = 'off'`) opened when `valve_open`.
+async fn as_app_session<F, Fut, T>(
+    pool: &PgPool,
+    principal: Option<Uuid>,
+    groups: &[Uuid],
+    valve_open: bool,
+    f: F,
+) -> T
+where
+    F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+{
     let set = groups
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    let principal = principal.map(|p| p.to_string()).unwrap_or_default();
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
         sqlx::query(
             "SELECT set_config('epigraph.principal_id', $1, false), \
                     set_config('epigraph.group_ids', $2, false), \
-                    set_config('epigraph.writable_group_ids', $2, false)",
+                    set_config('epigraph.writable_group_ids', $2, false), \
+                    set_config('epigraph.operator_link_enforcement', $3, false)",
         )
-        .bind(principal.to_string())
+        .bind(principal)
         .bind(&set)
+        .bind(if valve_open { "off" } else { "" })
         .execute(&mut *conn)
         .await
         .expect("stamp");
@@ -396,6 +416,80 @@ async fn a_lineage_does_not_move_between_groups_the_writer_writes(pool: PgPool) 
     }
     assert_eq!(row_of(&pool, own).await, (g1, None, true));
     assert_eq!(row_of(&pool, bs).await, (bg, None, true));
+}
+
+/// "Every refusal 123 makes keeps its code and text": on an UNSTAMPED
+/// application session (no principal), 123's no-principal refusal comes
+/// first. While the binding is enforced the INSERT of a cross-group successor
+/// is refused `OPL01`, which the valve relieves; with the session's valve open
+/// it then meets 153's `OPL02`, which the valve does not relieve.
+///
+/// Verified to fail: 153's INSERT/re-open check moved above the
+/// re-attribution check and the no-principal refusal -> the enforced session
+/// gets `OPL02` with 153's text instead of `OPL01`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unstamped_session_meets_123s_refusal_before_153s(pool: PgPool) {
+    let (a, ag) = fixture::seed_human_operator(&pool, "human-a").await;
+    let corpus = corpus_claim(&pool).await;
+    arm(&pool).await;
+
+    let enforced = as_app_session(&pool, None, &[ag], false, |mut conn| async move {
+        let r = insert_row(&mut *conn, a, ag, Some(corpus), true).await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&enforced).as_deref(),
+        Some("OPL01"),
+        "enforced, no principal: 123's refusal first, got {enforced:?}"
+    );
+    let text = enforced.as_ref().expect_err("refused").to_string();
+    assert!(
+        text.contains("carries no authenticated principal") && !text.contains(CROSS_GROUP),
+        "enforced, no principal: 123's text, got {text}"
+    );
+
+    let valve_open = as_app_session(&pool, None, &[ag], true, |mut conn| async move {
+        let r = insert_row(&mut *conn, a, ag, Some(corpus), true).await;
+        (conn, r)
+    })
+    .await;
+    assert_cross_group(&valve_open, "no principal, the session's valve open");
+    assert_eq!(successors_of(&pool, corpus).await, 0);
+}
+
+/// "Every refusal 123 makes keeps its code and text": an UPDATE that
+/// re-attributes a claim AND first-sets a cross-group `supersedes` is refused
+/// with 123's re-attribution text, not 153's.
+///
+/// Verified to fail: the first-set check without its same-author term ->
+/// 153's text wins.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reattributing_update_keeps_123s_refusal_text(pool: PgPool) {
+    let (a, ag) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let corpus = corpus_claim(&pool).await;
+    let own = insert_claim(&pool, a, ag).await.expect("A's own claim");
+    arm(&pool).await;
+
+    let r = as_app(&pool, a, &[ag], |mut conn| async move {
+        let r = sqlx::query("UPDATE claims SET agent_id = $2, supersedes = $3 WHERE id = $1")
+            .bind(own)
+            .bind(b)
+            .bind(corpus)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await;
+    assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{r:?}");
+    let text = r.as_ref().expect_err("refused").to_string();
+    assert!(
+        text.contains("does not re-attribute") && !text.contains(CROSS_GROUP),
+        "123's re-attribution text, got {text}"
+    );
+    assert_eq!(row_of(&pool, own).await, (ag, None, true));
 }
 
 /// What 153 must NOT change, armed: the supersede act on the writer's own
