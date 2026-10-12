@@ -736,6 +736,8 @@ What that means for callers:
   JSON-RPC `-32600` with `data.status = "moved"` for `recompute_beliefs`
   (-> `recompute_claim_belief`), `backfill_embeddings` (-> `embed_backfill`)
   and `sweep_semantic_duplicates` (-> the `sweep_semantic_duplicates` CLI).
+  `embed_backfill` also fills NULL `workflows.goal_embedding` (the workflow
+  write paths embed the goal best-effort), so one schedule covers both columns.
 * **No job runs in the server.** It builds no job pool and no maintenance pool,
   starts no job runner and no stale-job reaper. The queue is drained by
   `drain_jobs`.
