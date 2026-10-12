@@ -1279,10 +1279,11 @@ pub async fn update_with_evidence(
     // Compare pignistic-vs-pignistic. `get_belief_columns` reads the persisted
     // `pignistic_prob` column (distinct from `truth_value`; see claim.rs docs).
     // It is NULL for a claim with no prior DS state — in that case fall back to
-    // `truth_value` (`before`), which is the belief the fresh BBA is combined
-    // against. The monotonicity clamp in `auto_wire_ds_update` bounds BetP below
-    // by the prior column value for supports=true, so the warning is only ever
-    // reachable on the NULL-column (no-prior-DS-state) path.
+    // `truth_value` (`before`), which `auto_wire_ds_update` seeds as a BBA and
+    // the fresh evidence is combined against (backlog fc55465b). Its
+    // monotonicity clamp bounds a supports=true BetP below by that same prior,
+    // up to the combined plausibility, so the warning is reachable only when
+    // the prior sits above what the stored BBAs make plausible.
     let pre_pignistic =
         ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
