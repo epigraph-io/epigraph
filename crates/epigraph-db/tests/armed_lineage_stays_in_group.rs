@@ -66,17 +66,33 @@ async fn insert_row<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
+    insert_row_with(exec, author, "public", group, supersedes, current).await
+}
+
+/// [`insert_row`] with the claim's `visibility` given.
+async fn insert_row_with<'e, E>(
+    exec: E,
+    author: Uuid,
+    visibility: &str,
+    group: Uuid,
+    supersedes: Option<Uuid>,
+    current: bool,
+) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
                              visibility, owner_group_id, supersedes) \
-         VALUES ($1, $2, $3, 0.5, $4, $5, 'public', $6, $7)",
+         VALUES ($1, $2, $3, 0.5, $4, $5, $6, $7, $8)",
     )
     .bind(id)
     .bind(format!("lineage probe {id}"))
     .bind(id.as_bytes().repeat(2))
     .bind(author)
     .bind(current)
+    .bind(visibility)
     .bind(group)
     .bind(supersedes)
     .execute(exec)
@@ -416,6 +432,63 @@ async fn a_lineage_does_not_move_between_groups_the_writer_writes(pool: PgPool) 
     }
     assert_eq!(row_of(&pool, own).await, (g1, None, true));
     assert_eq!(row_of(&pool, bs).await, (bg, None, true));
+}
+
+/// 153 reads the predecessor's owner group in its SECURITY DEFINER frame
+/// (maintenance-owned, so `claims_tenancy` admits the read), so a
+/// GROUP-PRIVATE predecessor the writer cannot read is checked like any other:
+/// the INSERT and the first `SET supersedes` naming it are refused. A re-body
+/// that moved the read into an invoker helper would see no such row and fail
+/// open for exactly the private claims.
+///
+/// Verified to fail: the function body restored to 123's (no 153 check) ->
+/// the INSERT lands although the writer reads no such row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_predecessor_the_writer_cannot_read_is_checked_too(pool: PgPool) {
+    let (a, ag) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, bg) = fixture::seed_human_operator(&pool, "human-b").await;
+    let private = fixture::seed_group_claim(&pool, b, bg, "B's group-private claim").await;
+    arm(&pool).await;
+
+    // CALIBRATION: A's session reads no such row.
+    let seen: i64 = as_app(&pool, a, &[ag], |mut conn| async move {
+        let n = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+            .bind(private)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("count");
+        (conn, n)
+    })
+    .await;
+    assert_eq!(seen, 0, "A cannot read B's group-private claim");
+
+    let insert = as_app(&pool, a, &[ag], |mut conn| async move {
+        let r = insert_row_with(&mut *conn, a, "group", ag, Some(private), true).await;
+        (conn, r)
+    })
+    .await;
+    assert_cross_group(&insert, "an INSERT naming an unreadable private claim");
+
+    let plain = as_app(&pool, a, &[ag], |mut conn| async move {
+        let r = insert_row_with(&mut *conn, a, "group", ag, None, true).await;
+        (conn, r)
+    })
+    .await
+    .expect("a plain own group-private claim");
+    let first_set = update_as(
+        &pool,
+        a,
+        &[ag],
+        "UPDATE claims SET supersedes = $2 WHERE id = $1",
+        plain,
+        Some(private),
+    )
+    .await;
+    assert_cross_group(
+        &first_set,
+        "a first SET supersedes naming an unreadable private claim",
+    );
+    assert_eq!(successors_of(&pool, private).await, 0);
 }
 
 /// "Every refusal 123 makes keeps its code and text": on an UNSTAMPED
