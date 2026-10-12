@@ -150,6 +150,9 @@ BEGIN
     -- a claim another group owns, is the INSERT refused below in two
     -- statements. Same author only: a re-attribution is refused just below
     -- with its own text, and a re-open is checked with the INSERT.
+    -- `NOT epigraph_bypass()` here is defensive and unreachable: a privileged
+    -- same-author UPDATE has returned above, and the same-author term
+    -- excludes every other privileged UPDATE. Removing it changes nothing.
     IF TG_OP = 'UPDATE' AND NOT v_reopen AND NOT public.epigraph_bypass()
        AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id
        AND OLD.supersedes IS NULL AND NEW.supersedes IS NOT NULL
