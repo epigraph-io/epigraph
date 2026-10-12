@@ -103,8 +103,23 @@
 //! of a batch. Derived rows follow through 070's arm (d), which is a
 //! STATEMENT-level trigger: one UPDATE per derived table per batch, joined to
 //! the batch's transition table, however many claims the batch holds. The
-//! agent-keyed arms (`perspectives`, `recall_events`) are batched and cursored
-//! the same way instead of one unbounded UPDATE each.
+//! agent-keyed arm (`recall_events`) is batched and cursored the same way
+//! instead of one unbounded UPDATE.
+//!
+//! # `perspectives` is an instance-wide registry, like `frames` and `contexts`
+//!
+//! Every writer of `perspectives` declares `TenancyDecl::instance_wide()`
+//! (`('public', world)`) on purpose: `PerspectiveRepository::create`,
+//! `ensure_evidence_perspective` and `ensure_edge_perspective`. Migration 077's
+//! registry WITH CHECK admits exactly that declaration, and a perspective is a
+//! lens, or a per-evidence / per-edge key on `mass_functions`, not authored
+//! content. So `run` does not re-own a perspective and `verify` does not count
+//! a world-owned one as residue. An earlier revision walked `perspectives` as
+//! an agent-keyed arm on `owner_agent_id`; once the DS auto-wire began
+//! recording an `owner_agent_id` on the synthetic perspectives, every
+//! perspective an operator-linked agent wrote failed `verify` until a re-run
+//! moved it into the operator's group, against the writers' declaration.
+//! `--entity perspectives` is still accepted and does nothing.
 //!
 //! # `--legacy-owner operator|platform` (required on `run`)
 //!
@@ -146,6 +161,12 @@ const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
+
+/// What `run --entity perspectives` (and its dry run) says instead of walking
+/// the table. See the module doc, "`perspectives` is an instance-wide registry".
+const PERSPECTIVES_ARE_INSTANCE_WIDE: &str =
+    "perspectives is an instance-wide registry (its writers declare ('public', world)); \
+     nothing to stamp.";
 
 /// Resolve an agent's personal group, as a correlated scalar subquery over an
 /// `{agent}` expression the caller substitutes.
@@ -512,17 +533,17 @@ async fn run(
     // owner for their claims and the backfill stalls on batch 1.
     // Only the `operator` decision falls back to an author's personal group;
     // a `platform` run stamps live-linked authors to their operator only.
-    if mode == LegacyOwner::Operator
-        && (wants(Entity::Claims) || wants(Entity::Perspectives) || wants(Entity::RecallEvents))
-    {
+    if mode == LegacyOwner::Operator && (wants(Entity::Claims) || wants(Entity::RecallEvents)) {
         materialize_personal_groups(pool, dry_run).await?;
     }
 
     if dry_run {
+        if wants(Entity::Perspectives) {
+            println!("dry-run: {PERSPECTIVES_ARE_INSTANCE_WIDE}");
+        }
         for (e, table) in [
             (Entity::Claims, "claims"),
             (Entity::Communities, "communities"),
-            (Entity::Perspectives, "perspectives"),
             (Entity::RecallEvents, "recall_events"),
             (Entity::HarvesterFragments, "harvester_fragments"),
         ] {
@@ -563,18 +584,9 @@ async fn run(
         backfill_communities(pool).await?;
     }
     if wants(Entity::Perspectives) {
-        let w = backfill_agent_keyed(
-            pool,
-            "perspectives",
-            "owner_agent_id",
-            batch_size,
-            deadline,
-            mode,
-        )
-        .await?;
-        if let Some(end) = settle("perspectives", w)? {
-            return Ok(end);
-        }
+        // No walk: see the module doc. A full run settles its progress row in
+        // `settle_remaining`, with `frames` and `contexts`.
+        println!("run: {PERSPECTIVES_ARE_INSTANCE_WIDE}");
     }
     if wants(Entity::RecallEvents) {
         let w = backfill_agent_keyed(
@@ -957,15 +969,15 @@ async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `perspectives` / `recall_events` → the personal group of their agent column.
+/// `recall_events` → the owner of its agent column.
 ///
-/// **These are two of the five entities the plan assigns no derivation at all**
-/// (the others are `frames`, `contexts`, `communities`). Both agent columns are
-/// NULLABLE — `perspectives.owner_agent_id` is the hole 068's projection
-/// comment already documents, and `recall_events.agent_id` is annotated by 062
-/// as "keyed on the QUERYING agent, not on a claim". A NULL row therefore has
-/// no derivable owner and is left `('public', world)`: see `settle_remaining`
-/// for why that is legal.
+/// **One of the five entities the plan assigns no derivation at all** (the
+/// others are `frames`, `contexts`, `perspectives`, `communities`). The agent
+/// column is NULLABLE — `recall_events.agent_id` is annotated by 062 as "keyed
+/// on the QUERYING agent, not on a claim". A NULL row therefore has no
+/// derivable owner and is left `('public', world)`: see `settle_remaining` for
+/// why that is legal. `perspectives` used to be walked here too, on
+/// `owner_agent_id`; it is an instance-wide registry and is not (module doc).
 ///
 /// Batched and cursored like the claims arm (OB6: it used to be one unbounded
 /// UPDATE per table), with the owner resolved once per distinct agent of the
@@ -1136,6 +1148,9 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
 ///   against `information_schema`: `frames` has `parent_frame_id`, `contexts`
 ///   has none. There is nothing to derive an owner from, so they stay
 ///   `('public', world)`.
+/// * **`perspectives`** has an `owner_agent_id`, but every writer declares the
+///   row instance-wide on purpose (module doc), so its world-owned rows are a
+///   declaration, not residue, exactly as on `frames` and `contexts`.
 ///
 /// That is legal, and the constraint that says so is narrow enough to be worth
 /// naming: the "deferred strong CHECK `owner_group_id <> world`" is scoped to
@@ -1217,7 +1232,7 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
     }
     for t in CLAIM_DERIVED
         .iter()
-        .chain(["edges", "frames", "contexts"].iter())
+        .chain(["edges", "frames", "contexts", "perspectives"].iter())
     {
         let n = residual_for(pool, t, Some(mode)).await?;
         // `rows_done` means ROWS DECLARED, not table size. An earlier revision
@@ -1227,7 +1242,7 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
             .fetch_one(pool)
             .await?;
         let done = total - n;
-        if n > 0 && *t != "frames" && *t != "contexts" && *t != "edges" {
+        if n > 0 && !matches!(*t, "frames" | "contexts" | "perspectives" | "edges") {
             tracing::warn!(
                 table = t,
                 residual = n,
@@ -2544,7 +2559,6 @@ async fn residual_for(
     }
     let extra = match table {
         "claims" => author_filter(LegacyOwner::Platform, "t.agent_id"),
-        "perspectives" => author_filter(LegacyOwner::Platform, "t.owner_agent_id"),
         "recall_events" => author_filter(LegacyOwner::Platform, "t.agent_id"),
         "harvester_fragments" => "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
                                    JOIN claims c ON c.id = p.claim_id \
@@ -2573,9 +2587,9 @@ async fn residual_for(
 /// over the rest. Offending ids are PRINTED, because a guard that says "3 rows
 /// are wrong" and not which ones cannot be acted on.
 ///
-/// `frames` and `contexts` are exempt from the residual check for the reason
-/// `settle_remaining` documents: a `('public', world)` row on those tables is a
-/// correct declaration, not an undeclared one. `edges` is exempt from the
+/// `frames`, `contexts` and `perspectives` are exempt from the residual check
+/// for the reason `settle_remaining` documents: a `('public', world)` row on
+/// those tables is a correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
 /// No NON-superuser maintenance role may CREATE in schema `public` (review
 /// cp3: SEC-03).
@@ -2817,7 +2831,10 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     }
 
     for t in TIER_A {
-        if matches!(*t, "frames" | "contexts" | "edges" | "claims" | "evidence") {
+        if matches!(
+            *t,
+            "frames" | "contexts" | "perspectives" | "edges" | "claims" | "evidence"
+        ) {
             continue;
         }
         let n = residual_for(pool, t, mode).await?;
@@ -2834,11 +2851,9 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     // while that author has an operator link (any state). They are declared,
     // so the tenancy gate is satisfied; operator binding wants them in the
     // operator's group, and `epigraph-operator reown-linked` moves them.
-    for (table, agent_col) in [
-        ("claims", "agent_id"),
-        ("perspectives", "owner_agent_id"),
-        ("recall_events", "agent_id"),
-    ] {
+    // `perspectives` is not listed: its owner is not this binary's concern (the
+    // module doc, "`perspectives` is an instance-wide registry").
+    for (table, agent_col) in [("claims", "agent_id"), ("recall_events", "agent_id")] {
         let n = linked_author_personal_residue(pool, table, agent_col).await?;
         if n > 0 {
             eprintln!(

@@ -18,8 +18,9 @@
 //!   private claim is repaired, as before), otherwise it keeps its prior state.
 //!   Migration 122 replaced the OR join and the per-endpoint function calls
 //!   with equi-joins; this pins that nothing else changed.
-//! * `perspectives` / `recall_events`: the same per-row definition on their
-//!   agent column.
+//! * `recall_events`: the same per-row definition on its agent column.
+//!   (`perspectives` is an instance-wide registry the backfill does not
+//!   re-own: `backfill_perspectives_instance_wide.rs`.)
 //!
 //! Verified to fail:
 //! * `owner_group_sql`'s personal-group branch replaced by the canonical key

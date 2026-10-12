@@ -126,12 +126,15 @@ impl PerspectiveRepository {
         // function, not about the two synthetic constructors below it.
         //
         // (The reason first written here — "`owner_agent_id` is None on both
-        // synthetic paths, so it is not a reliable author" — is TRUE of
-        // `ensure_evidence_perspective` / `ensure_edge_perspective` and FALSE
-        // of `create`, whose `owner_agent_id` is frequently `Some`. Corrected
+        // synthetic paths, so it is not a reliable author" — is false of all
+        // three writers today: `create` takes the caller, and the DS auto-wire
+        // and the edge factor pass `Some(agent)` to
+        // `ensure_evidence_perspective` / `ensure_edge_perspective`. Corrected
         // in review: `progress.json`'s M4 finding is that an exemption whose
         // written reason is false is worse than an unannotated one, because the
-        // lint trains reviewers to read exactly these lines.)
+        // lint trains reviewers to read exactly these lines. The tenancy
+        // backfill does not re-own a perspective on that column either:
+        // `bin/tenancy_backfill.rs`, module doc.)
         //
         // A perspective is a LENS, not content: it is the frame through which
         // `scoped_belief` / `get_belief` combine mass functions, and belief
