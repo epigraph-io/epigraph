@@ -258,6 +258,20 @@ pub fn build_bba_directed(
     MassFunction::new(frame, masses).map_err(|e| BbaError::DsError(e.to_string()))
 }
 
+/// Re-express a BBA built by [`build_bba_directed`] (on its 2-way
+/// `["supported", "unsupported"]` frame) on `target`.
+///
+/// STUB: the naive JSON round trip the assess route used before U027.
+///
+/// # Errors
+/// Never, in this stub.
+pub fn remap_binary_bba_to_frame(
+    mf: &MassFunction,
+    target: &FrameOfDiscernment,
+) -> Result<MassFunction, BbaError> {
+    MassFunction::from_json_masses(target.clone(), &mf.masses_to_json()).map_err(BbaError::DsError)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -655,5 +669,103 @@ mod tests {
             (m_open - 0.03).abs() < 1e-9,
             "m_open: expected 0.03, got {m_open}"
         );
+    }
+
+    // ── remap onto a wider frame (U027) ────────────────────────────────
+
+    fn claim_validity() -> FrameOfDiscernment {
+        FrameOfDiscernment::new(
+            "claim_validity",
+            vec!["supported".into(), "refuted".into(), "uncertain".into()],
+        )
+        .unwrap()
+    }
+
+    /// The 2-way BBA's closed-world ignorance `{0,1}` is Theta on ITS frame;
+    /// on `claim_validity` the key `0,1` means {supported, refuted}, which is
+    /// a claim of knowledge, not ignorance. It must land on `{0,1,2}`, and
+    /// "uncertain" (a hypothesis) must receive nothing else.
+    #[test]
+    fn remap_binary_bba_to_frame_puts_ignorance_on_full_theta() {
+        let config = load_config();
+        let params = BbaParams {
+            evidence_type: "empirical".into(),
+            methodology: "instrumental".into(),
+            confidence: 0.6,
+            supports: true,
+            section_tier: None,
+            journal_reliability: None,
+            open_world_fraction: 0.05,
+            uncertainty: None,
+        };
+        let src = build_bba_directed(&params, &config).unwrap();
+        let src_theta = get_mass(&src, "0,1");
+        assert!(
+            src_theta > 0.0,
+            "CALIBRATION: the source BBA must carry ignorance"
+        );
+
+        let target = claim_validity();
+        let out = remap_binary_bba_to_frame(&src, &target).unwrap();
+
+        assert!((mass_sum(&out) - 1.0).abs() < 1e-9, "masses must sum to 1");
+        assert_eq!(
+            get_mass(&out, "0,1"),
+            0.0,
+            "no mass may stay on {{supported, refuted}}"
+        );
+        assert!(
+            (get_mass(&out, "0,1,2") - src_theta).abs() < 1e-12,
+            "ignorance -> Theta"
+        );
+        assert!((get_mass(&out, "0") - get_mass(&src, "0")).abs() < 1e-12);
+        assert!((get_mass(&out, "1") - get_mass(&src, "1")).abs() < 1e-12);
+        assert_eq!(
+            get_mass(&out, "2"),
+            0.0,
+            "uncertain is a hypothesis, not a sink"
+        );
+        assert!(
+            (get_mass(&out, "~") - get_mass(&src, "~")).abs() < 1e-12,
+            "open world kept"
+        );
+
+        // Ignorance spread over three hypotheses, not two: BetP(supported) is
+        // m{0} + theta/3 (+ the open-world share), strictly below the
+        // binary-frame value m{0} + theta/2.
+        let betp_out = epigraph_ds::measures::pignistic_probability(&out, 0);
+        let betp_src = epigraph_ds::measures::pignistic_probability(&src, 0);
+        assert!(
+            betp_out > get_mass(&src, "0") - 1e-12,
+            "BetP keeps the support mass"
+        );
+        assert!(
+            betp_out < betp_src,
+            "Theta now spans 3 hypotheses: {betp_out} vs {betp_src}"
+        );
+    }
+
+    /// On a 2-hypothesis target the remap is the identity on focal elements.
+    #[test]
+    fn remap_binary_bba_to_a_binary_frame_is_identity() {
+        let config = load_config();
+        let params = BbaParams {
+            evidence_type: "empirical".into(),
+            methodology: "instrumental".into(),
+            confidence: 0.6,
+            supports: false,
+            section_tier: None,
+            journal_reliability: None,
+            open_world_fraction: 0.05,
+            uncertainty: None,
+        };
+        let src = build_bba_directed(&params, &config).unwrap();
+        let target = FrameOfDiscernment::new(
+            "paper_validity_x",
+            vec!["supported".into(), "unsupported".into()],
+        )
+        .unwrap();
+        let out = remap_binary_bba_to_frame(&src, &target).unwrap();
+        assert_eq!(out.masses_to_json(), src.masses_to_json());
     }
 }
