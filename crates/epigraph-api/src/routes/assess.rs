@@ -235,11 +235,12 @@ pub async fn assess_claim(
         None,
         Some("discount"),
         None,
-        // The request's required evidence_type, as its canonical key (bc06ec6f).
-        // The combined row stored below shares this row's key and replaces it.
-        calibration_config
-            .canonical_evidence_type(&request.evidence_type)
-            .as_deref(),
+        // Untyped on purpose (bc06ec6f). `build_bba_directed` already sized
+        // these masses with the request's type weight, so a typed row would be
+        // discounted by it a second time on any later fold. The row is also
+        // transient: the combined row stored below shares its
+        // (claim, frame, NULL, NULL) key and replaces it in this request.
+        None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )

@@ -1,8 +1,9 @@
 //! `POST /api/v1/claims/:id/assess` must never leave a typed combined cache
 //! (backlog bc06ec6f). Its input BBA and its combined cache share one
 //! `mass_functions` key, so the cache replaces the input in the same request;
-//! the row that survives is the combined cache and must stay untyped even
-//! though the input now carries the request's canonical `evidence_type`.
+//! the row that survives is the combined cache and must stay untyped. The
+//! input is untyped too: its masses were already sized with the request's
+//! type weight.
 //!
 //! Its own binary because the handler reads `calibration.toml` relative to the
 //! working directory, so this test moves the process to the workspace root.
