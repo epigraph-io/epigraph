@@ -83,7 +83,8 @@ pub use epistemic_interval::{
     EpistemicInterval,
 };
 pub use error_mass::{
-    build_error_mass, ErrorBudget, ErrorMassResult, EvidenceDirection, ScopeLimitation,
+    build_error_mass, evidence_type_for_data_source, ErrorBudget, ErrorMassResult,
+    EvidenceDirection, ScopeLimitation,
 };
 pub use errors::EngineError;
 pub use evidence::{EvidenceType, EvidenceWeightConfig, EvidenceWeighter};

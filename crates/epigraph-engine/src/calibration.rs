@@ -329,6 +329,34 @@ impl CalibrationConfig {
         false
     }
 
+    /// The key a BBA writer stores in `mass_functions.evidence_type` for a
+    /// type it was handed (backlog bc06ec6f).
+    ///
+    /// Trimmed and lowercased. A canonical `[evidence_type_weights]` key is
+    /// returned as is; a DB-vocabulary tag (`observation`, `testimony`,
+    /// `reference`, ...) or relationship string resolves through
+    /// `[evidence_type_aliases]` to its canonical key. A key the calibration
+    /// does not know is KEPT, lowercased: per-frame `evidence_type_weights`
+    /// overrides and perspective `source_reliability` maps may key on it on
+    /// purpose, and both readers lowercase before looking it up. Blank input
+    /// is `None`, never a guess.
+    #[must_use]
+    pub fn canonical_evidence_type(&self, raw: &str) -> Option<String> {
+        let key = raw.trim().to_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        if self.evidence_type_weights.contains_key(&key) {
+            return Some(key);
+        }
+        if let Some(canonical) = self.evidence_type_aliases.get(&key) {
+            if self.evidence_type_weights.contains_key(canonical) {
+                return Some(canonical.clone());
+            }
+        }
+        Some(key)
+    }
+
     /// Synthetic `CalibrationConfig` for the Phase 2 helper's failure
     /// path. Returned when `from_workspace_root()` fails (missing
     /// `calibration.toml`, malformed TOML, …) so the combine path can
@@ -373,6 +401,18 @@ impl CalibrationConfig {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// [`CalibrationConfig::canonical_evidence_type`] against the process-wide
+/// calibration ([`CalibrationConfig::cached`]), for writers that hold no
+/// config of their own. `None` in, `None` out.
+///
+/// If `calibration.toml` could not be loaded, the cached fallback has no
+/// weights and no aliases, so a tag is stored trimmed and lowercased but
+/// unresolved: exactly what the writers stored before, minus the case.
+#[must_use]
+pub fn canonical_evidence_type(raw: Option<&str>) -> Option<String> {
+    CalibrationConfig::cached().canonical_evidence_type(raw?)
+}
 
 #[cfg(test)]
 mod tests {
@@ -727,5 +767,41 @@ mod tests {
                 "missing journal: {name}"
             );
         }
+    }
+
+    /// Backlog bc06ec6f: the key a BBA writer stores in
+    /// `mass_functions.evidence_type`. Canonical keys pass through, DB-vocab
+    /// tags resolve through `[evidence_type_aliases]`, both case-insensitively.
+    #[test]
+    fn canonical_evidence_type_resolves_aliases_case_insensitively() {
+        let cfg = load_config();
+        let c = |raw: &str| cfg.canonical_evidence_type(raw);
+        assert_eq!(c("empirical").as_deref(), Some("empirical"));
+        assert_eq!(c(" Logical ").as_deref(), Some("logical"));
+        assert_eq!(c("observation").as_deref(), Some("empirical"));
+        assert_eq!(c("Testimony").as_deref(), Some("testimonial"));
+        assert_eq!(c("reference").as_deref(), Some("logical"));
+        assert_eq!(c("document").as_deref(), Some("logical"));
+        assert_eq!(c("computation").as_deref(), Some("statistical"));
+        assert_eq!(c("supports").as_deref(), Some("derived_support"));
+    }
+
+    /// A key the calibration does not know is kept (trimmed, lowercased: every
+    /// reader lowercases), because per-frame overrides and perspective maps may
+    /// key on it deliberately. Blank input is "no type".
+    #[test]
+    fn canonical_evidence_type_keeps_unknown_keys_and_drops_blank() {
+        let cfg = load_config();
+        assert_eq!(
+            cfg.canonical_evidence_type(" Western_Clinical ").as_deref(),
+            Some("western_clinical")
+        );
+        assert_eq!(cfg.canonical_evidence_type(""), None);
+        assert_eq!(cfg.canonical_evidence_type("   "), None);
+        assert_eq!(canonical_evidence_type(None), None);
+        assert_eq!(
+            canonical_evidence_type(Some("Observation")).as_deref(),
+            Some("empirical")
+        );
     }
 }
