@@ -1697,7 +1697,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 `epigraph-operator` (the role verbs and `custodial-supersede`),
 `epigraph-api` (privatization records a custodial act and reads the
 assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
-one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
+one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first.
+Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
 ended after 123), drops 123's triggers, re-applies 083's and 122's function
@@ -2516,3 +2517,63 @@ narrowing `scope`) widened the chain to everything the client is granted.
    Rollback: re-run 118's `CREATE OR REPLACE FUNCTION
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
+
+## A lineage stays in its owner group (migration 153) — deploy order and rollback
+
+Once the operator binding is armed, an application session may not leave a
+CURRENT claim naming `supersedes` in a different owner group than that
+predecessor: at the insert, at a re-open, or when `supersedes` is first set on
+a claim that stays current. Refused `OPL02` (never relieved by the
+`operator_link_enforcement` valve). Privileged sessions, the supersede act
+(which inherits the predecessor's group), retired rows (the dedup and
+consolidate acts) and an unarmed database are unchanged. The rule and its
+reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
+
+1. **Preconditions.** Migration 123 applied. No binary change is needed: the
+   refusal is `OPL02`, which every surface already maps.
+2. **Migrate 153** (`epigraph-migrate`, migration DSN): one `CREATE OR
+   REPLACE` of the claims binding trigger function. It changes no write on an
+   unarmed database, and it may apply before or after any lower-numbered
+   migration that does not re-body that function (sqlx applies every
+   embedded, unapplied migration in version order).
+3. **Before arming, census the dangling successors** 153 does not revisit
+   (read-only):
+
+   ```sql
+   SELECT (p.owner_group_id = '00000000-0000-0000-0000-000000000000') AS world_pred,
+          (s.owner_group_id IS DISTINCT FROM p.owner_group_id) AS cross_group,
+          count(*)
+     FROM claims s JOIN claims p ON p.id = s.supersedes
+    WHERE COALESCE(s.is_current, true) AND COALESCE(p.is_current, true)
+      AND s.id <> p.id
+    GROUP BY 1, 2;
+   ```
+
+   What blocks is ANOTHER CURRENT successor of a CURRENT predecessor, in any
+   group: 123's inherited-author rule needs "no other current successor", and
+   that rule is the only one that admits a supersede restating a claim under
+   its unbound or retired-linked author, the custodial supersede of a corpus
+   claim included (refused `OPL01` otherwise). So the `world_pred` rows are
+   custodial edits that would be refused once armed; revise or retire each
+   such successor on the maintenance DSN first. The other rows include benign
+   pairs (a same-author first `supersedes` within one group needs no inherited
+   rule). A current successor of an already-retired predecessor blocks
+   nothing. The `cross_group` rows are the shape 153 now refuses; migration
+   153's header carries that subset's count alone.
+4. **Before arming, confirm the world group has no live writer.** 153
+   compares groups only, so a writer of the world group could still attach a
+   current successor to a corpus claim in that group, with the same effect.
+   The world group has no memberships by design, but nothing enforces it.
+   Expect 0 rows:
+
+   ```sql
+   SELECT agent_id, role FROM group_memberships
+    WHERE group_id = '00000000-0000-0000-0000-000000000000'
+      AND revoked_at IS NULL AND role IN ('writer', 'admin');
+   ```
+
+   A row is a stop for arming until it is revoked or ruled on.
+
+**Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
+transaction: it restores 123's body of the function and re-asserts its owner.
+Run it before `123-undo.sql`.

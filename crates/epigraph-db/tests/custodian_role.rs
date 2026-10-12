@@ -3025,7 +3025,16 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
     );
 
     // A later migration that re-bodies 123's functions is undone before this
-    // one (docs/deploy.md): 130 adds act-taking overloads of 123's definers.
+    // one (docs/deploy.md): 153 re-bodies 123's claims trigger function, and
+    // 130 adds act-taking overloads of 123's definers.
+    let undo_153 = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/153-undo.sql"),
+    )
+    .expect("153-undo.sql");
+    sqlx::raw_sql(&undo_153)
+        .execute(&pool)
+        .await
+        .expect("153's undo applies first");
     let undo_130 = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/130-undo.sql"),
     )

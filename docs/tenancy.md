@@ -437,8 +437,28 @@ claim that retired duplicates point at still works. No claim names ITSELF in
 armed, an application session may not clear `claims.supersedes`, nor re-point
 it on a claim that stays current (`OPL02`); setting it on a claim that had
 none, and re-pointing it while retiring the claim in the same statement (the
-dedup and consolidate acts), are unchanged; re-opening such a claim later is
-checked as an insert ("Scope" below). With a principal
+dedup and consolidate acts), are unchanged, except that a claim that stays
+current never names a predecessor in another owner group (below); re-opening
+such a claim later is checked as an insert ("Scope" below).
+
+**A lineage stays in its owner group (`OPL02`, migration 153).** Once armed, on
+every session but a privileged one, a claim that is CURRENT after the
+statement and names `supersedes` must be owned by the same group as that
+predecessor: at its insert, at a re-open, and when `supersedes` is first set
+on a claim that stays current. Before 153 a writer could declare its own
+group on a claim naming, say, a world-owned corpus claim it cannot retire;
+that current successor blocked the corpus claim's custodial supersede (the
+inherited-author rule needs "no other current successor") and showed up in
+the claim's version history. The supersede act declares no owner, so it
+inherits the predecessor's group and never meets this; a writer that writes
+both groups supersedes in place. A retired row may still name a claim in
+another group (the dedup and consolidate acts' shape), and a privileged
+session is not checked. The rule compares groups only: a writer of the
+predecessor's OWN group can still attach a second current successor there,
+with the same effect on that claim's inherited-author supersede. The world
+group has no writer memberships by design, which keeps the corpus out of that
+reach; `docs/deploy.md` (migration 153) checks it before arming. Rows written
+before arming are not revisited; the census is in the same section. With a principal
 equal to the author, or a privileged session, the author is the one checked.
 An APPLICATION session with NO principal (a write on an unstamped connection)
 is an unbound writer: refused `OPL01` once armed, so a path that forgot to
@@ -546,8 +566,11 @@ since migration 123; before it the instance-admin exemption skipped the
 check). The inherited-author rules therefore hold across statements: retiring a successor, adding a second one and re-opening the
 first, or re-pointing a successor while retiring it and then re-opening it,
 meets the same refusal as the one-statement form. No repository or route
-re-opens a claim. Every other claim UPDATE (content, truth value, labels,
-retiring a claim, a first `supersedes`, properties, embedding: the retire half
+re-opens a claim. A first `supersedes` on a claim that stays current is
+checked for its predecessor's owner group (migration 153, above). Every other
+claim UPDATE (content, truth value, labels,
+retiring a claim, a first `supersedes` set while retiring the claim, properties,
+embedding: the retire half
 of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
 security alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
 that is the owner-group rule: an update needs the row readable and its owner
