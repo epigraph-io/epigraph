@@ -158,6 +158,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
+- **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)

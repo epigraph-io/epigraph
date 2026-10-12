@@ -7,8 +7,22 @@
 //! prefers CLAUDE_CODE_OAUTH_TOKEN — NEVER the Anthropic-SDK pay-per-token
 //! variant the V2 `_api.py`/`_openai.py` scripts used), parses with
 //! `epigraph_cli::decompose::parse_batch_response`, and persists atoms through
-//! the canonical API claim path so embedding + DS auto-wire + signing happen
-//! on write.
+//! the canonical API claim path so embedding, author-key signing and the
+//! atom's derivation evidence happen on write. NO DS mass function is written
+//! for an atom: `POST /api/v1/claims` has no DS auto-wire.
+//!
+//! # Evidence policy for atoms (U041, backlog 3590a2d8)
+//!
+//! Atoms carry derivation PROVENANCE, not derived BELIEF, until
+//! `decomposes_to` propagation exists. Each atom POST names its parent in
+//! `derived_from`, and the API records one `document` evidence row on the atom
+//! (the parent's text, `properties.derived_from_claim` = parent id) in the
+//! atom's own transaction, so `get_provenance` shows where it came from. The
+//! atom's truth stays at 0.5 until INDEPENDENT evidence arrives: its only
+//! warrant at birth is "the parent states it", and when the parent is itself
+//! evidence-free (the legacy 2026-02/03 imports) any belief given to the atom
+//! would be laundered from it. Only `visibility = 'public'` parents are
+//! selected ([`epigraph_cli::decompose::check_publicly_decomposable`]).
 //!
 //! Required: DATABASE_URL, and CLAUDE_CODE_OAUTH_TOKEN.
 //! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
@@ -82,9 +96,9 @@
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, BatchClaim,
-    EligibilityFilters, PlanGaps, Priority,
+    atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
+    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
+    BatchClaim, EligibilityFilters, PlanGaps, Priority,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -559,13 +573,14 @@ async fn resolve_token(
     })
 }
 
-/// Canonical atom create via `POST /api/v1/claims`: signing + DS + embed on
-/// write.
+/// Canonical atom create via `POST /api/v1/claims`: author-key signing, embed
+/// on write, and one derivation evidence row naming `parent` (no DS mass; see
+/// the module doc's evidence policy).
 ///
-/// methodology/evidence_type belong in `properties` (JSONB); top-level they
-/// were unknown fields and silently dropped. `if_not_exists=true`: when a
-/// prior run already decomposed the same parent, identical atom text produces
-/// the same content_hash. Without this flag the API returns 409; with it,
+/// The body is [`atom_create_body`] (pure, unit-tested in
+/// `tests/decompose_atom_create_body.rs`). `if_not_exists=true`: when a prior
+/// run already decomposed the same parent, identical atom text produces the
+/// same content_hash. Without this flag the API returns 409; with it,
 /// create_or_get returns the existing claim ID so persist_decomposition can
 /// re-wire edges idempotently.
 async fn submit_atom(
@@ -574,7 +589,7 @@ async fn submit_atom(
     token: String,
     atom_text: String,
     generality: i64,
-    parent_agent_id: uuid::Uuid,
+    parent: AtomParent,
 ) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
     // Diagnostic-only (backlog a422da87): build+log the URL BEFORE sending, so
     // a RelativeUrlWithoutBase-style construction bug is visible even if the
@@ -584,17 +599,7 @@ async fn submit_atom(
     let resp = match http
         .post(&url)
         .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "content": atom_text,
-            "agent_id": parent_agent_id,
-            "initial_truth": 0.5,
-            "if_not_exists": true,
-            "properties": {
-                "methodology": "inductive_generalization",
-                "evidence_type": "logical"
-            },
-            "labels": ["atom", format!("generality:{generality}")],
-        }))
+        .json(&atom_create_body(&atom_text, generality, parent))
         .send()
         .await
     {
@@ -767,8 +772,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
             let embedder = epigraph_cli::embedding_service();
-            let submit = move |t: String, g: i64, a: uuid::Uuid| {
-                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a)
+            let submit = move |t: String, g: i64, p: AtomParent| {
+                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
             let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
             for (id, why) in &totals.failed {
@@ -870,7 +875,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 llm.as_ref(),
                 cli.batch_size,
                 embedder,
-                move |t, g, a| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a),
+                move |t, g, p| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p),
             )
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);
@@ -905,15 +910,21 @@ fn report_selection(
     explicit: bool,
     priority: PriorityArg,
 ) {
+    use epigraph_cli::decompose::Ineligible;
     let backlog = sel
         .skipped
         .iter()
-        .filter(|(_, w)| matches!(w, epigraph_cli::decompose::Ineligible::Backlog))
+        .filter(|(_, w)| matches!(w, Ineligible::Backlog))
         .count();
-    let atomic = sel.skipped.len() - backlog;
+    let not_public = sel
+        .skipped
+        .iter()
+        .filter(|(_, w)| matches!(w, Ineligible::NotPublic { .. }))
+        .count();
+    let atomic = sel.skipped.len() - backlog - not_public;
     eprintln!(
         "selection: priority={priority:?}{} scanned={} chosen={} skipped_backlog={backlog} \
-         skipped_looks_atomic={atomic}",
+         skipped_looks_atomic={atomic} skipped_not_public={not_public}",
         if explicit { " (ids-file order)" } else { "" },
         sel.scanned,
         sel.chosen.len(),

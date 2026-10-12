@@ -12,7 +12,11 @@
 //! invisible; an id naming no row contributes nothing, so those payloads were
 //! POSTed to every active external subscription with no tenancy decision made.
 //! What has to be asserted is therefore the EFFECT — nothing entered the bus that
-//! feeds the fan-out — with the import itself still working.
+//! feeds the fan-out — with the import itself still working. Now that the handler
+//! persists each item through `create_claim_core` (issue #477), the property is
+//! the same one `POST /api/v1/claims` already holds: the single-claim route
+//! never publishes `ClaimSubmitted` either, so a batch of single-claim writes
+//! inherits the silence rather than needing a suppression of its own.
 //!
 //! # Why this drives the handler rather than the route
 //!
@@ -30,6 +34,8 @@
 
 use axum::extract::State;
 use axum::Json;
+use epigraph_api::middleware::bearer::ViewerExtractor;
+use uuid::Uuid;
 
 async fn state() -> epigraph_api::AppState {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -41,17 +47,36 @@ async fn state() -> epigraph_api::AppState {
     epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default())
 }
 
+/// Insert a system agent the same way `tests/common::seed_system_agent` does,
+/// without pulling in the whole `common` module for one INSERT.
+async fn seed_agent(pool: &sqlx::PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(id)
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed system agent");
+    id
+}
+
 fn two_valid_and_one_invalid() -> serde_json::Value {
+    let a = format!("batch import A {}", Uuid::new_v4());
+    let b = format!("batch import B {}", Uuid::new_v4());
     serde_json::json!({
         "claims": [
-            { "content": "batch import A", "truth_value": 0.6 },
+            { "content": a, "truth_value": 0.6 },
             { "content": "", "truth_value": 0.5 },
-            { "content": "batch import B", "truth_value": 0.8 }
+            { "content": b, "truth_value": 0.8 }
         ]
     })
 }
 
-/// The import succeeds and publishes nothing.
+/// The import succeeds, persists its claims, and publishes nothing.
 ///
 /// Both halves matter. The `created == 2` assertion is the over-suppression
 /// control: a "fix" that made the handler reject everything would also publish
@@ -65,33 +90,58 @@ async fn a_batch_import_creates_its_claims_and_publishes_no_event() {
         "fixture precondition: a fresh AppState has an empty bus"
     );
 
+    let agent = seed_agent(&state.db_pool).await; // same INSERT as tests/common's seed_system_agent
+    let viewer = epigraph_db::visibility::Viewer::resolve(&state.db_pool, agent)
+        .await
+        .expect("viewer");
+    let auth = epigraph_api::middleware::bearer::AuthContext {
+        client_id: uuid::Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Agent,
+        scopes: vec!["claims:write".to_string()],
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+    };
     let request: epigraph_api::routes::batch::BatchClaimRequest =
         serde_json::from_value(two_valid_and_one_invalid()).expect("request body parses");
 
-    let response =
-        epigraph_api::routes::batch::batch_create_claims(State(state.clone()), Json(request))
-            .await
-            .expect("a batch with one invalid item is a partial success, not an error");
+    let response = epigraph_api::routes::batch::batch_create_claims(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        Some(axum::Extension(auth)),
+        Json(request),
+    )
+    .await
+    .expect("a batch with one invalid item is a partial success, not an error");
 
     assert_eq!(response.0.created, 2, "the two valid items were imported");
     assert_eq!(response.0.failed, 1);
-    assert_eq!(
-        response
-            .0
-            .results
-            .iter()
-            .filter(|r| r.claim_id.is_some())
-            .count(),
-        2,
-        "and the caller was told their ids"
-    );
+    let ids: Vec<Uuid> = response
+        .0
+        .results
+        .iter()
+        .filter_map(|r| r.claim_id)
+        .collect();
+    assert_eq!(ids.len(), 2, "and the caller was told their ids");
+
+    for id in &ids {
+        let found: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.db_pool)
+            .await
+            .expect("query claims");
+        assert!(found, "returned id {id} must name a real claims row");
+    }
 
     assert_eq!(
         state.event_bus.history_size(),
         0,
-        "a batch-imported claim has no `claims` row, so announcing it would send \
-         an id the fan-out cannot make a tenancy decision about; nothing may \
-         reach the bus that feeds it"
+        "a batch item now persists through `create_claim_core`, which does not \
+         publish either; nothing may reach the bus that feeds the webhook fan-out"
     );
 }
 
