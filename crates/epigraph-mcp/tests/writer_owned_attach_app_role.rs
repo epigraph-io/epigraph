@@ -219,6 +219,113 @@ async fn update_with_evidence_attaches_writer_owned_rows_to_a_world_claim(pool: 
     assert_eq!(n, 1, "the refused labelled call wrote nothing");
 }
 
+/// The truth_value seed (backlog fc55465b, drain U026) on the application
+/// role. A claim in the server agent's own group, AUTHORED BY ANOTHER AGENT,
+/// with truth 0.85 and no BBA: the seed row is attributed to the claim's author
+/// while the session's principal is the server agent, so this pins that
+/// `mass_functions`' policies and `epigraph_attach_writer_owner` admit it (they
+/// key on the owning group, not on `source_agent_id`). The row inherits the
+/// claim's group, and the combine sees it: {T 0.7} ⊕ {T e} leaves
+/// m(Θ) = 0.3(1-e), so BetP = 1 - 0.15(1-e).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_seeds_a_writable_claim_by_another_author(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let claim = seed_claim(&pool, "a team claim a colleague wrote", 0.85).await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the claim into the server agent's group");
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("author");
+    assert_ne!(
+        author, agent,
+        "fixture: the claim's author is not the caller"
+    );
+
+    let res = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(
+            claim,
+            "an observation supporting a colleague's claim",
+            vec![],
+        ),
+        None,
+    )
+    .await
+    .expect("a group writer adds evidence to a colleague's claim on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], true);
+
+    let seeds: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, source_agent_id FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_all(&pool)
+    .await
+    .expect("seed rows");
+    assert_eq!(seeds.len(), 1, "one seed row: {seeds:?}");
+    assert_eq!(seeds[0].1, Some(author), "attributed to the claim's author");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", seeds[0].0).await,
+        (group, "public".into(), false),
+        "the seed is a claim-owned row, not a writer-owned one"
+    );
+    let ev = parse_uuid_field(&body, "evidence_id");
+    let masses: serde_json::Value =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE evidence_id = $1")
+            .bind(ev)
+            .fetch_one(&pool)
+            .await
+            .expect("the evidence's BBA");
+    let e = masses["0"].as_f64().expect("a supporting evidence BBA");
+    let betp = body["pignistic_prob"].as_f64().expect("pignistic_prob");
+    assert!(
+        (betp - (1.0 - 0.15 * (1.0 - e))).abs() < 1e-9,
+        "the seed participates in the combine: BetP {betp}, evidence mass {e}"
+    );
+}
+
+/// A non-owner attaching to a PUBLIC claim does not seed it (scope Q2): the
+/// seed would be a row attributed to the claim's author but written, and
+/// owned, by the caller's group. The clamp's `truth_value` fallback still
+/// applies to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_does_not_seed_a_world_claim_it_does_not_own(pool: PgPool) {
+    let (server, _agent, _group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let claim = seed_claim(&pool, "a world claim with an authored truth", 0.85).await;
+    memberless_owner(&pool, claim).await;
+
+    let res = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(claim, "an observation on someone else's claim", vec![]),
+        None,
+    )
+    .await
+    .expect("a non-owner attaches evidence on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], false);
+
+    let seeds: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count seeds");
+    assert_eq!(seeds, 0, "a foreign attach writes no seed");
+}
+
 /// W11: on a world claim whose cache carries an older frameless value, the
 /// evidence lands but the cache is not overwritten, and the response says so
 /// instead of presenting the call's combination as the claim's cache.
@@ -465,6 +572,103 @@ async fn report_workflow_outcome_on_a_world_workflow_claim_leaves_its_truth_alon
     assert!(
         (truth - 0.5).abs() < 1e-12,
         "the workflow claim's truth stays its owner's"
+    );
+}
+
+/// A clean successful outcome report, as the two seed cases below send it.
+fn clean_outcome(wf: Uuid) -> ReportWorkflowOutcomeParams {
+    ReportWorkflowOutcomeParams {
+        workflow_id: wf.to_string(),
+        success: true,
+        execution_log: vec![StepExecution {
+            step_index: 0,
+            planned: "build".into(),
+            actual: "build".into(),
+            deviated: false,
+            deviation_reason: None,
+        }],
+        outcome_details: "ran clean".into(),
+        quality: Some(0.9),
+        goal_text: None,
+    }
+}
+
+/// A legacy flat workflow claim with an authored truth_value of 0.85 and no
+/// BBA (`seed_workflow_claim` writes 0.5, the vacuous seed, which would make
+/// both cases below pass whether or not the gate exists).
+async fn workflow_claim_with_truth(pool: &PgPool, goal: &str) -> Uuid {
+    let wf = seed_workflow_claim(pool, goal, &["build", "test"]).await;
+    sqlx::query("UPDATE claims SET truth_value = 0.85 WHERE id = $1")
+        .bind(wf)
+        .execute(pool)
+        .await
+        .expect("author a truth_value");
+    wf
+}
+
+async fn seed_count(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count seeds")
+}
+
+/// The truth_value seed (backlog fc55465b, drain U026) through
+/// report_workflow_outcome: a workflow claim in the server agent's own group,
+/// authored by another agent, with truth 0.85 and no BBA, gets exactly one
+/// seed row before its outcome evidence is combined.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_seeds_a_writable_workflow_claim(pool: PgPool) {
+    let (server, _agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "ship a team workflow").await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the workflow claim into the server agent's group");
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("reporting on a team workflow lands on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], true, "{body}");
+    assert_eq!(seed_count(&pool, wf).await, 1, "one seed row: {body}");
+}
+
+/// A non-owner reporting on a SHARED workflow claim does not seed it (scope
+/// Q2), exactly as update_with_evidence's foreign attach does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_does_not_seed_a_world_workflow_claim(pool: PgPool) {
+    let (server, _agent, _group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "ship a shared workflow").await;
+    memberless_owner(&pool, wf).await;
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("reporting on a shared workflow lands on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], false, "{body}");
+    assert_eq!(
+        seed_count(&pool, wf).await,
+        0,
+        "a foreign report writes no seed"
     );
 }
 
