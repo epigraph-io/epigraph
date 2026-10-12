@@ -179,9 +179,13 @@ impl TenancyDecl {
     /// `frames`, `contexts`, `perspectives` and `communities` are instance-wide
     /// registries — a frame is a shared hypothesis space, and giving it an
     /// owner group would make Dempster-Shafer mass functions unreadable across
-    /// groups for no gain. `perspectives.owner_agent_id` is `Option<Uuid>` and
-    /// is `None` on both synthetic-perspective paths, so there is no author to
-    /// derive from even where the column exists.
+    /// groups for no gain. `perspectives.owner_agent_id` is attribution, not
+    /// ownership: `create` and both synthetic-perspective paths
+    /// (`ensure_evidence_perspective` from the DS auto-wire,
+    /// `ensure_edge_perspective` from the edge factor) record the writing agent
+    /// there, and the row is still declared instance-wide. The tenancy
+    /// backfill and its `verify` treat a world-owned perspective as a
+    /// declaration for that reason (`bin/tenancy_backfill.rs`, module doc).
     ///
     /// This construction preserves the value those rows already carried under
     /// migration 062's `DEFAULT`. What changes is that it is now *chosen at the
