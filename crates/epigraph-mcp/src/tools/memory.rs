@@ -255,7 +255,12 @@ pub async fn memorize(
                     confidence,
                     weight: 0.6,
                     supports: true,
-                    evidence_type: None,
+                    // The evidence row this call wrote above is
+                    // `EvidenceType::Testimony` (DB tag `testimony`), and DS runs
+                    // only on first create, when that row always exists. ds_auto
+                    // resolves the tag to its canonical key, `testimonial`, whose
+                    // calibrated weight is the 0.6 stored above (bc06ec6f).
+                    evidence_type: Some("testimony"),
                 },
                 /* persist_truth_from_pignistic */ false,
                 "memorize",

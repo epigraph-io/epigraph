@@ -19,8 +19,8 @@ use common::*;
 use epigraph_mcp::tools;
 use epigraph_mcp::tools::ds_auto::{auto_wire_ds_batch, auto_wire_ds_update, BatchDsEntry};
 use epigraph_mcp::types::{
-    ReportWorkflowOutcomeParams, StepExecution, SubmitClaimParams, SubmitDsEvidenceParams,
-    UpdateWithEvidenceParams,
+    MemorizeParams, ReportWorkflowOutcomeParams, StepExecution, SubmitClaimParams,
+    SubmitDsEvidenceParams, UpdateWithEvidenceParams,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -43,6 +43,50 @@ async fn claim_id_by_content(pool: &PgPool, content: &str) -> Uuid {
         .fetch_one(pool)
         .await
         .expect("claim row")
+}
+
+/// `memorize` writes its own evidence row as `EvidenceType::Testimony`
+/// (DB tag `testimony`) in the same transaction as the BBA. That row is the
+/// caller's own evidence, so the BBA carries its alias-resolved canonical type,
+/// `testimonial`. It used to store NULL.
+#[sqlx::test(migrations = "../../migrations")]
+async fn memorize_types_its_bba_from_its_own_testimony_evidence(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let content = format!("bc06ec6f memorize typing {}", Uuid::new_v4());
+
+    tools::memory::memorize(
+        &server,
+        &viewer,
+        MemorizeParams {
+            content: content.clone(),
+            confidence: Some(0.7),
+            tags: None,
+            novelty_threshold: None,
+        },
+        None,
+    )
+    .await
+    .expect("memorize");
+
+    let claim_id = claim_id_by_content(&pool, &content).await;
+    // Non-vacuity: the evidence row the type comes from is the one memorize wrote.
+    let ev_types: Vec<String> =
+        sqlx::query_scalar("SELECT evidence_type FROM evidence WHERE claim_id = $1")
+            .bind(claim_id)
+            .fetch_all(&pool)
+            .await
+            .expect("evidence rows");
+    assert_eq!(
+        ev_types,
+        vec!["testimony".to_string()],
+        "memorize's own evidence row"
+    );
+    assert_eq!(
+        auto_wire_types(&pool, claim_id).await,
+        vec![Some("testimonial".to_string())],
+        "memorize's BBA must carry the canonical type of its own evidence row"
+    );
 }
 
 /// `submit_claim` accepts its `evidence_type` case-insensitively
