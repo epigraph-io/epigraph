@@ -41,14 +41,21 @@ pub struct CdstSheafSection {
 
     // Scalar backward-compat fields
     pub local_betp: f64,
+    /// BetP of `expected_interval` (all-neighbour average; display only).
     pub expected_betp: f64,
+    /// Node inconsistency: the max of the Positive-group Bel-floor shortfall
+    /// and the Negative/FrameEvidence-group `|local_betp − expected_betp|`.
+    /// Equals `|local_betp − expected_betp|` only for a node with no Positive
+    /// neighbour. See [`compute_cdst_section`].
     pub consistency_radius: f64,
 
     // Interval fields
     pub local_interval: EpistemicInterval,
+    /// All-neighbour average of the restricted neighbour intervals.
     pub expected_interval: EpistemicInterval,
 
-    /// Hausdorff distance between local and expected intervals.
+    /// The max of the Positive-group Bel-floor shortfall and the Hausdorff
+    /// distance to the Negative/FrameEvidence group's expected interval.
     pub interval_inconsistency: f64,
 
     // Open-world decomposition
@@ -228,6 +235,28 @@ pub fn compute_cdst_expected(
 }
 
 /// Build a CDST sheaf section for a single node.
+///
+/// The neighbours are scored in two groups:
+/// - **Positive** (`supports`-like) neighbours are a one-sided Bel FLOOR, the
+///   node twin of the Positive arm of
+///   [`compute_cdst_edge_inconsistency_with_properties`]: each supporter
+///   commits the node to at least `restrict_epistemic_positive(n, f).bel`, so
+///   the binding floor is the MAX over supporters and only the node's bel
+///   sitting below it counts. Over-support (a hub corroborated above a weak
+///   supporter's discounted floor) is benign and scores 0. With this, a
+///   Positive-only node's radius equals its worst incoming supports-edge
+///   shortfall.
+/// - **Other** (Negative / FrameEvidence) neighbours keep the symmetric
+///   metric over their own average: Hausdorff distance for
+///   `interval_inconsistency` and `|local_betp − expected_betp|` for
+///   `consistency_radius`. A node with only such neighbours is scored exactly
+///   as before.
+///
+/// `consistency_radius` and `interval_inconsistency` are each the max of the
+/// two groups' terms (0 for an empty group). `expected_interval` /
+/// `expected_betp` stay the all-neighbour average for display, so the radius
+/// is no longer `|local_betp − expected_betp|` when Positive neighbours are
+/// present.
 pub fn compute_cdst_section(
     node_id: Uuid,
     local_interval: EpistemicInterval,
@@ -236,9 +265,38 @@ pub fn compute_cdst_section(
     let expected = compute_cdst_expected(neighbors);
     let expected_interval = expected.unwrap_or(local_interval);
 
-    let interval_inconsistency = local_interval.hausdorff_distance(&expected_interval);
     let local_betp = local_interval.betp();
     let expected_betp = expected_interval.betp();
+
+    // Positive group: max Bel floor over supporters, one-sided shortfall.
+    let positive_shortfall = neighbors
+        .iter()
+        .filter_map(|(interval, kind)| match kind {
+            RestrictionKind::Positive(factor) => {
+                Some(restrict_epistemic_positive(interval, *factor).bel)
+            }
+            _ => None,
+        })
+        .reduce(f64::max)
+        .map_or(0.0, |floor| (floor - local_interval.bel).max(0.0));
+
+    // Other group (Negative / FrameEvidence): the symmetric metric over the
+    // group's own average. Order-preserving filter, so a node with no
+    // Positive neighbour gets bit-for-bit the pre-split values.
+    let others: Vec<(EpistemicInterval, RestrictionKind)> = neighbors
+        .iter()
+        .filter(|(_, k)| !matches!(k, RestrictionKind::Positive(_)))
+        .copied()
+        .collect();
+    let (other_hausdorff, other_radius) = compute_cdst_expected(&others).map_or((0.0, 0.0), |e| {
+        (
+            local_interval.hausdorff_distance(&e),
+            (local_betp - e.betp()).abs(),
+        )
+    });
+
+    let interval_inconsistency = positive_shortfall.max(other_hausdorff);
+    let consistency_radius = positive_shortfall.max(other_radius);
 
     let neighbor_count = neighbors
         .iter()
@@ -249,7 +307,7 @@ pub fn compute_cdst_section(
         node_id,
         local_betp,
         expected_betp,
-        consistency_radius: (local_betp - expected_betp).abs(),
+        consistency_radius,
         local_interval,
         expected_interval,
         interval_inconsistency,

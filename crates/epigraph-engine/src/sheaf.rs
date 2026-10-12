@@ -130,9 +130,12 @@ pub struct SheafSection {
     pub node_id: Uuid,
     /// Actual pignistic probability at this node.
     pub local_betp: f64,
-    /// Expected BetP from neighborhood restriction maps.
+    /// Expected BetP from neighborhood restriction maps (all-neighbour
+    /// average; display only).
     pub expected_betp: f64,
-    /// |local - expected|: how inconsistent this node is.
+    /// How inconsistent this node is: the max of the Positive-group floor
+    /// shortfall and the Negative-group `|local - expected|`. See
+    /// [`compute_section`].
     pub consistency_radius: f64,
     /// Number of epistemic neighbors contributing.
     pub neighbor_count: usize,
@@ -176,6 +179,17 @@ pub fn compute_expected_betp(neighbors: &[(f64, RestrictionKind)]) -> Option<f64
 }
 
 /// Build a sheaf section for a single node.
+///
+/// `consistency_radius` is the max of two terms:
+/// - **Positive** neighbours are a one-sided floor (the node twin of
+///   [`compute_edge_inconsistency`]'s Positive arm): the node must be at least
+///   `max(neighbor_betp * factor)` over its supporters, and only a shortfall
+///   below that floor counts. Over-support is benign and scores 0.
+/// - **Negative** neighbours keep the symmetric `|local_betp − expected|`
+///   over their own average, so a node with no Positive neighbour is scored
+///   exactly as before.
+///
+/// `expected_betp` stays the all-neighbour average for display.
 pub fn compute_section(
     node_id: Uuid,
     local_betp: f64,
@@ -184,7 +198,28 @@ pub fn compute_section(
     neighbors: &[(f64, RestrictionKind)],
 ) -> SheafSection {
     let expected = compute_expected_betp(neighbors);
-    let consistency_radius = expected.map_or(0.0, |e| (local_betp - e).abs());
+
+    let positive_shortfall = neighbors
+        .iter()
+        .filter_map(|&(neighbor_betp, kind)| match kind {
+            RestrictionKind::Positive(factor) => Some(neighbor_betp * factor),
+            _ => None,
+        })
+        .reduce(f64::max)
+        .map_or(0.0, |floor| {
+            if local_betp < floor {
+                floor - local_betp
+            } else {
+                0.0
+            }
+        });
+    let others: Vec<(f64, RestrictionKind)> = neighbors
+        .iter()
+        .filter(|(_, k)| !matches!(k, RestrictionKind::Positive(_)))
+        .copied()
+        .collect();
+    let other_radius = compute_expected_betp(&others).map_or(0.0, |e| (local_betp - e).abs());
+    let consistency_radius = positive_shortfall.max(other_radius);
     let neighbor_count = neighbors
         .iter()
         .filter(|(_, k)| {
