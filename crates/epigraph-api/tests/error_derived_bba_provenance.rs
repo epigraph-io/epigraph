@@ -1,9 +1,13 @@
 //! `POST /api/v1/experiments/:eid/results/:rid/analyze` writes an
-//! `error_derived` BBA through `MassFunctionRepository::store`, which had no
-//! `evidence_type` parameter (backlog bc06ec6f). Its type now comes from the
-//! result's `data_source`: `instrument` is a direct measurement
-//! (`empirical`); `literature` does not say what kind of support the cited
-//! value is, so it stays NULL.
+//! `error_derived` BBA through `MassFunctionRepository::store` (backlog
+//! bc06ec6f). The row stays untyped for every `data_source`.
+//!
+//! `experiment_results.data_source` is declared by whoever submits the result
+//! and is checked only against a CHECK list. Typing the BBA from it would let
+//! the submitter lift the row from the 0.5 unknown-type weight to the
+//! calibrated weight of `empirical` (1.0) or `statistical` (0.9). A
+//! caller-declared type must not raise a BBA's weight above what the writer
+//! could already assign, so the type waits for a server-side derivation.
 #![cfg(feature = "db")]
 
 mod common;
@@ -167,8 +171,11 @@ async fn error_derived_type(pool: &PgPool, claim: Uuid, frame: Uuid) -> Option<S
     derived[0].2.clone()
 }
 
+/// An `instrument` result is the case typing would have raised: `empirical`
+/// carries the top calibrated weight. The submitter declares `data_source`,
+/// so it does not type the row.
 #[sqlx::test(migrations = "../../migrations")]
-async fn analyze_types_an_instrument_result_empirical(
+async fn analyze_does_not_type_an_instrument_result_from_its_declared_data_source(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -177,10 +184,7 @@ async fn analyze_types_an_instrument_result_empirical(
         .await
         .expect("seeding pool");
     let (claim, frame) = analyze_with_data_source(&pool, &conn_opts, "instrument").await;
-    assert_eq!(
-        error_derived_type(&pool, claim, frame).await.as_deref(),
-        Some("empirical")
-    );
+    assert_eq!(error_derived_type(&pool, claim, frame).await, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

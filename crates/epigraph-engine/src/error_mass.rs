@@ -167,24 +167,6 @@ pub fn build_error_mass(budget: &ErrorBudget) -> Result<ErrorMassResult, String>
     })
 }
 
-/// The canonical evidence type of an error-derived BBA, read off the
-/// `experiment_results.data_source` it was built from (backlog bc06ec6f).
-///
-/// Only sources that state what kind of support they are get a type:
-/// `instrument` is a direct measurement (`empirical`); `simulation` and
-/// `computed` are computational results, which `calibration.toml` files under
-/// `statistical` (its `computation` alias). `manual` (hand-entered values of
-/// unstated origin) and `literature` (a value cited from a paper, whose kind of
-/// support the row does not record) return `None`: the writer does not know.
-#[must_use]
-pub fn evidence_type_for_data_source(data_source: &str) -> Option<&'static str> {
-    match data_source.trim().to_lowercase().as_str() {
-        "instrument" => Some("empirical"),
-        "simulation" | "computed" => Some("statistical"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,31 +338,5 @@ mod tests {
             let result = build_error_mass(&budget).unwrap();
             assert_masses_sum_to_one(&result);
         }
-    }
-
-    /// Backlog bc06ec6f: the evidence type an `error_derived` BBA carries is
-    /// read off the result's `data_source` only where the source says what
-    /// kind of support it is. `manual` and `literature` do not, so no type.
-    #[test]
-    fn evidence_type_for_data_source_types_only_what_the_source_states() {
-        assert_eq!(
-            evidence_type_for_data_source("instrument"),
-            Some("empirical")
-        );
-        assert_eq!(
-            evidence_type_for_data_source("simulation"),
-            Some("statistical")
-        );
-        assert_eq!(
-            evidence_type_for_data_source("computed"),
-            Some("statistical")
-        );
-        assert_eq!(
-            evidence_type_for_data_source("Instrument"),
-            Some("empirical")
-        );
-        assert_eq!(evidence_type_for_data_source("manual"), None);
-        assert_eq!(evidence_type_for_data_source("literature"), None);
-        assert_eq!(evidence_type_for_data_source("anything else"), None);
     }
 }

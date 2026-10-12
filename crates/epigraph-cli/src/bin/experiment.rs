@@ -509,8 +509,10 @@ async fn analyze(
         &masses_json,
         None,
         Some("error_derived"),
-        // The result's data_source says what kind of support it is, or nothing (bc06ec6f).
-        epigraph_engine::evidence_type_for_data_source(&result.data_source),
+        // Untyped on purpose (bc06ec6f): the only type source in scope is the
+        // submitter-declared `data_source`, and typing from it would raise the
+        // row above the 0.5 unknown-type weight.
+        None,
         "unknown", // experiment-derived; no evidence-DOI vs paper comparison (issue #197)
         None,      // error-derived BBA has no evidence row (issue #197 Phase 3)
     )
