@@ -13,8 +13,9 @@
 //!
 //! Drives the cores (`do_ingest_document`, `do_ingest_document_spine`) directly
 //! for the content assertions — the detached handlers `tokio::spawn` the walk,
-//! which would make a label read race the write. The one handler test
-//! (`ingest_document_inline`) asserts only what the handler does synchronously.
+//! which would make a label read race the write. The two handler tests
+//! (`ingest_document_inline`, and the file-path `ingest_document`) assert only
+//! what the handler does synchronously.
 //!
 //! Deliberately does NOT use `tests/common`: that helper DROPs
 //! `uq_claims_content_hash_agent` (see `verify_claim_after_document_ingest.rs`).
@@ -27,9 +28,9 @@ use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::ingestion::{
-    do_ingest_document, do_ingest_document_spine, ingest_document_inline,
+    do_ingest_document, do_ingest_document_spine, ingest_document, ingest_document_inline,
 };
-use epigraph_mcp::types::IngestDocumentInlineParams;
+use epigraph_mcp::types::{IngestDocumentInlineParams, IngestDocumentParams};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -269,6 +270,99 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 }
 
+/// A fixture file under the current directory (the file-path handler refuses a
+/// path outside it), removed on drop so a failed assertion leaves nothing behind.
+/// Integration tests run with the package root as the current directory.
+struct CwdFixture(std::path::PathBuf);
+
+impl CwdFixture {
+    fn write(extraction: &DocumentExtraction) -> Self {
+        let path = std::env::current_dir()
+            .expect("current dir")
+            .join(format!("u035-fixture-{}.json", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            serde_json::to_string(extraction).expect("serialize fixture"),
+        )
+        .expect("write fixture");
+        Self(path)
+    }
+
+    fn params(&self) -> IngestDocumentParams {
+        IngestDocumentParams {
+            file_path: self.0.display().to_string(),
+        }
+    }
+}
+
+impl Drop for CwdFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The FILE-PATH handler is the second detached entry point: it too writes the
+/// `papers` row synchronously and answers `queued` before the walk runs, so it
+/// needs its own synchronous label check (a refusal inside the walk would reach
+/// only the server log). Same shape as the inline test above, positive control
+/// first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn file_path_ingest_refuses_an_unexpanded_caller_label_before_the_paper_node(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+
+    let ok_doi = "10.9999/u035-file-control";
+    let ok_file = CwdFixture::write(&extraction_with(
+        "U035 File Control",
+        ok_doi,
+        "File control thesis for the label refusal.",
+        "File control",
+        "A file-path control paragraph whose labels are well formed.",
+        "File-path control labels are well formed.",
+        Some(&["stage:ok"]),
+    ));
+    let ok = ingest_document(&server, &viewer, ok_file.params(), None)
+        .await
+        .expect("a well-formed caller label is accepted from a file");
+    let ok_json: serde_json::Value = serde_json::from_str(&result_text(&ok)).expect("JSON");
+    assert_eq!(
+        ok_json["status"], "queued",
+        "control must be queued: {ok_json}"
+    );
+    assert_eq!(
+        papers_with_doi(&pool, ok_doi).await,
+        1,
+        "control wrote its paper row"
+    );
+
+    let bad_doi = "10.9999/u035-file-refused";
+    let bad_file = CwdFixture::write(&extraction_with(
+        "U035 File Refused",
+        bad_doi,
+        "File refused thesis.",
+        "File refused",
+        "A file-path paragraph whose caller label is an unexpanded variable.",
+        "Unexpanded variables in a file are not labels.",
+        Some(&["stage:$STAGE"]),
+    ));
+    let err = ingest_document(&server, &viewer, bad_file.params(), None)
+        .await
+        .expect_err("an unexpanded caller label must be refused by the handler, not queued");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("$STAGE"),
+        "the refusal must be the label check naming the offending label, got: {msg}"
+    );
+    assert_eq!(
+        papers_with_doi(&pool, bad_doi).await,
+        0,
+        "a refused ingest must not leave its papers row behind"
+    );
+
+    // Let the control's detached walk finish before teardown (as the inline test).
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+}
+
 /// The spine handler calls its core synchronously, so the in-core check is the
 /// only gate: an unexpanded caller label must be refused with nothing written.
 #[sqlx::test(migrations = "../../migrations")]
@@ -374,6 +468,38 @@ async fn caller_labels_reach_a_converged_atom(pool: PgPool) {
             labels.contains(&want),
             "converged atom is missing {want:?}: {labels:?}"
         );
+    }
+}
+
+/// The spine core's RESOLVED arm, the mirror of the converged-atom test above.
+/// Spine nodes are document-scoped (keyed on title, path and text), so they
+/// converge only when the same document is spined again: the second run must
+/// reuse every node and ADD its caller label to each, keeping the first run's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn caller_labels_reach_spine_nodes_a_rerun_resolves_to(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    do_ingest_document_spine(&server, &viewer, &extraction(Some(&["stage:a"])), None)
+        .await
+        .expect("first spine run");
+    do_ingest_document_spine(&server, &viewer, &extraction(Some(&["stage:b"])), None)
+        .await
+        .expect("second spine run");
+
+    for (what, content) in [
+        ("thesis (level 0)", THESIS),
+        ("section (level 1)", SECTION),
+        ("paragraph (level 2)", PARAGRAPH),
+    ] {
+        // Exactly one row: the second run resolved to the first run's node.
+        let id = only_claim_with_content(&pool, content).await;
+        let labels = labels_of(&pool, id).await;
+        for want in [format!("doi:{DOI}"), "stage:a".into(), "stage:b".into()] {
+            assert!(
+                labels.contains(&want),
+                "{what}: the re-run resolved to this node but it is missing {want:?}: {labels:?}"
+            );
+        }
     }
 }
 
