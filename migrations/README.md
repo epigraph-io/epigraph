@@ -1263,6 +1263,28 @@ restart.
   workflow-ingest identity is kept off the allowlist only by the operator's
   care (the allow command's agent-client warning). **Applied to throwaway databases only,
   NOT to any deployed database.**
+- **153**: public `armed_lineage_stays_in_group` — once the operator binding
+  is armed, a non-privileged session leaves no CURRENT claim naming
+  `supersedes` in a different owner group than that predecessor (`OPL02`): at
+  the insert, at a re-open, and at a first `SET supersedes` on a claim that
+  stays current. 074 fills only an undeclared owner from the predecessor, so a
+  declared own-group successor could squat a claim the writer cannot retire
+  (the world-owned corpus included) and block its custodial supersede (123's
+  inherited-author rule needs "no other current successor"). Re-bodies 123's
+  `epigraph_claims_require_operator_binding` (`CREATE OR REPLACE`, same
+  signature, owner re-asserted; still registered at 122 in
+  `tenancy_backfill.rs`); every refusal 123 makes keeps its code and text.
+  Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/armed_lineage_stays_in_group.rs`. Undo:
+  `docs/runbooks/153-undo.sql` (restores 123's body; run it before
+  `123-undo.sql`). Checked before claiming: no open PR branch and no remote
+  branch carries a `153`. **Deploy order:** none against the binaries (the
+  refusal is `OPL02`, already mapped everywhere); it may apply before or after
+  any lower-numbered migration that does not re-body this function (sqlx
+  applies every embedded, unapplied version in order); one that does must be
+  rebased onto this body. Count pre-existing cross-group current
+  successors (the query in the file's header) before arming.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
