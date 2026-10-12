@@ -163,8 +163,11 @@ impl ReasoningTraceRepository {
     /// enum-level arm instead would relabel every statistical ingest.
     ///
     /// `submitted_methodology`, when `Some`, is recorded verbatim at
-    /// `properties.submitted_methodology`, so the caller's own word survives
-    /// even where the 6-value CHECK forces a coarse `reasoning_type`.
+    /// `properties.submitted_methodology`, so the submitted word survives
+    /// even where the 6-value CHECK forces a coarse `reasoning_type`. It is
+    /// whatever string the caller passes here: a caller that filled in a
+    /// default (the MCP batch and backlog-resolution paths do) records that
+    /// default, not an absence.
     ///
     /// # Errors
     /// `DbError::InvalidData` if `reasoning_type` is not in

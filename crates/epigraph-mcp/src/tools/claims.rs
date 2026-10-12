@@ -647,7 +647,10 @@ async fn write_submission(
     // The trace's reasoning_type comes from the SUBMITTED string, not the
     // coarser `methodology` bucket, so a direct observation is stored as
     // `observational` rather than `statistical` (backlog e207bb6d). The string
-    // itself is kept verbatim at `properties.submitted_methodology`.
+    // itself is kept verbatim at `properties.submitted_methodology`. It is the
+    // EFFECTIVE string, defaults included: a `batch_submit_claims` entry that
+    // omitted `methodology` records `BATCH_DEFAULT_METHODOLOGY`, and a
+    // `resolve_backlog_item` call without one records `expert_elicitation`.
     let reasoning_type = trace_reasoning_type(&params.methodology, *methodology);
     ReasoningTraceRepository::create_with_reasoning_type(
         &mut *conn,
