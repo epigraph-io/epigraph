@@ -545,24 +545,14 @@ pub async fn promote_hypothesis(
         message: format!("{e}"),
     })?;
 
+    // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
+    // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
     if let Some(latest) = mass_rows.last() {
-        sqlx::query(
-            r#"
-            INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k, combination_method)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id) DO UPDATE
-            SET masses = EXCLUDED.masses, conflict_k = EXCLUDED.conflict_k, created_at = NOW()
-            "#,
-        )
-        .bind(id)
-        .bind(rv_frame.0)
-        .bind(latest.source_agent_id)
-        .bind(&latest.masses)
-        .bind(latest.conflict_k)
-        .bind(latest.combination_method.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::InternalError { message: format!("Failed to copy mass function: {e}") })?;
+        epigraph_db::MassFunctionRepository::copy_to_frame(&mut *tx, latest, rv_frame.0)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to copy mass function: {e}"),
+            })?;
     }
 
     // 2. Add to research_validity frame

@@ -189,6 +189,44 @@ impl MassFunctionRepository {
         .await
     }
 
+    /// Copy a stored BBA onto another frame for the same claim, keeping every
+    /// provenance column: `source_agent_id`, `masses`, `conflict_k`,
+    /// `combination_method`, `source_strength`, `evidence_type`,
+    /// `locality_tag` and `evidence_id` (backlog bc06ec6f).
+    ///
+    /// Hypothesis promotion (`hypothesis_assessment` → `research_validity`)
+    /// used a raw INSERT of `claim_id, frame_id, source_agent_id, masses,
+    /// conflict_k, combination_method` only, so the promoted BBA lost its type,
+    /// its reliability, its locality and its evidence link, and was then
+    /// combined at the 0.5 unknown-type weight. `perspective_id` is not copied, exactly as before:
+    /// the copy lands under the (claim, frame, agent, NULL) key, so re-promoting
+    /// re-states one row instead of adding another.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, row), fields(claim_id = %row.claim_id, from = %row.frame_id))]
+    pub async fn copy_to_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        row: &MassFunctionRow,
+        target_frame_id: Uuid,
+    ) -> Result<Uuid, DbError> {
+        Self::store_with_perspective(
+            executor,
+            row.claim_id,
+            target_frame_id,
+            row.source_agent_id,
+            None,
+            &row.masses,
+            row.conflict_k,
+            row.combination_method.as_deref(),
+            row.source_strength,
+            row.evidence_type.as_deref(),
+            &row.locality_tag,
+            row.evidence_id,
+        )
+        .await
+    }
+
     /// Store a mass function with an optional perspective association
     ///
     /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
