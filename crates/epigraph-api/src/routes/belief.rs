@@ -1468,6 +1468,7 @@ pub async fn submit_evidence(
         &combined_json,
         final_k,
         final_method,
+        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
         None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
     )

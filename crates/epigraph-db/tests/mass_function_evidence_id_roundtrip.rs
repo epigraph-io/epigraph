@@ -158,6 +158,7 @@ async fn store_wrapper_threads_evidence_id_none(pool: PgPool) {
         &masses,
         None,
         Some("test"),
+        None, // evidence_type
         "unknown",
         None,
     )

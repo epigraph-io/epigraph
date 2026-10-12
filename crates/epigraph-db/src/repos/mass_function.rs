@@ -147,6 +147,15 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT to update existing entries.
     ///
+    /// `evidence_type` is the canonical evidence-type key the caller KNOWS for
+    /// this BBA, or `None` when it does not (backlog bc06ec6f). It is a
+    /// required parameter so every caller has to decide: this wrapper used to
+    /// hard-code `None`, which is how every `store()` writer (praxis
+    /// `interview_extraction`, the `error_derived` experiment loop) wrote
+    /// untyped BBAs. A combined system row (`source_agent_id = None`, the
+    /// result of folding several inputs) has no single type and must pass
+    /// `None`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
@@ -159,7 +168,8 @@ impl MassFunctionRepository {
         masses_json: &serde_json::Value,
         conflict_k: Option<f64>,
         combination_method: Option<&str>,
-        locality_tag: &str,        // 'intra' | 'cross' | 'unknown' (issue #197)
+        evidence_type: Option<&str>, // canonical evidence-type key, None when unknown (bc06ec6f)
+        locality_tag: &str,          // 'intra' | 'cross' | 'unknown' (issue #197)
         evidence_id: Option<Uuid>, // FK to evidence(id), NULL for non-evidence BBAs (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
         Self::store_with_perspective(
@@ -172,7 +182,7 @@ impl MassFunctionRepository {
             conflict_k,
             combination_method,
             None,
-            None,
+            evidence_type,
             locality_tag,
             evidence_id,
         )
@@ -1029,6 +1039,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1042,6 +1053,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1123,6 +1135,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1137,6 +1150,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1178,6 +1192,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1193,6 +1208,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1270,6 +1286,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )

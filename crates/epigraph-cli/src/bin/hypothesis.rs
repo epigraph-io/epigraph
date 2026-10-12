@@ -268,6 +268,7 @@ async fn create(
         &vacuous_masses,
         None,
         Some("prior"),
+        None,      // vacuous prior: not evidence, so no evidence type (bc06ec6f)
         "unknown", // vacuous prior; no evidence yet (issue #197)
         None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
