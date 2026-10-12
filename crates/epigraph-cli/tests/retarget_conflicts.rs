@@ -305,6 +305,7 @@ async fn snapshot(pool: &PgPool, w: &World) -> Vec<(String, i64)> {
     let (events, _) = epigraph_api::routes::events::global_event_store()
         .list(&epigraph_api::routes::events::EventFilter {
             since: None,
+            after_id: None,
             event_type: None,
             limit: Some(1000),
             offset: None,

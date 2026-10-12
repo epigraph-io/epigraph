@@ -390,3 +390,44 @@ async fn a_same_timestamp_block_larger_than_the_page_is_fully_delivered() {
         "took {calls} calls to drain a 250-row block at limit 100"
     );
 }
+
+/// `after_id` is a tiebreaker WITHIN a `since` cursor. Alone it names no
+/// position, and silently ignoring it would hand a misconfigured poller the
+/// "recent events" view — the newest rows, not the next ones — which is the
+/// very skip this cursor exists to prevent. It is rejected instead, while the
+/// same request WITH `since` is accepted (so the 400 is about the pairing,
+/// not about the parameter).
+#[tokio::test(flavor = "multi_thread")]
+async fn after_id_without_since_is_rejected() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let client = reqwest::Client::new();
+    let after = Uuid::new_v4().to_string();
+
+    let alone = client
+        .get(format!("http://{addr}/api/v1/events"))
+        .query(&[("after_id", after.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alone.status().as_u16(), 400, "after_id without since");
+    let body: Value = alone.json().await.unwrap();
+    assert_eq!(
+        body["details"]["field"], "after_id",
+        "the 400 must name the offending parameter; body was {body}"
+    );
+
+    let paired = client
+        .get(format!("http://{addr}/api/v1/events"))
+        .query(&[
+            ("after_id", after.as_str()),
+            ("since", cursor_param(past_base()).as_str()),
+        ])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paired.status().as_u16(), 200, "after_id with since");
+}

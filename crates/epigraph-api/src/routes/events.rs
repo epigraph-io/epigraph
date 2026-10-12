@@ -113,14 +113,15 @@ impl EventStore {
                         return false;
                     }
                 }
-                if let Some(since) = filter.since {
-                    if e.created_at < since {
-                        return false;
-                    }
-                }
-                true
+                filter.admits(e.created_at, e.id)
             })
             .collect();
+        // Under a cursor, keyset order so `offset`/`limit` page exactly like
+        // the table. Without one, insertion (= graph_version) order as before.
+        let mut filtered = filtered;
+        if filter.since.is_some() {
+            filtered.sort_by_key(|e| (e.created_at, e.id));
+        }
 
         let total = filtered.len();
         let offset = filter.offset.unwrap_or(0);
@@ -163,14 +164,38 @@ impl Default for EventStore {
 /// Query parameters for `GET /api/v1/events`.
 #[derive(Debug, Deserialize)]
 pub struct EventFilter {
-    /// Only return events created at or after this timestamp
+    /// Only return events created at or after this timestamp (INCLUSIVE, and
+    /// NOT commit-ordered — see [`list_events`]).
     pub since: Option<DateTime<Utc>>,
+    /// Keyset tiebreaker for `since`: with both set, only events whose
+    /// `(created_at, id)` is strictly greater than `(since, after_id)` are
+    /// returned. The correct polling cursor is the pair
+    /// `(since = last.created_at, after_id = last.id)`. Rejected (400) without
+    /// `since`.
+    pub after_id: Option<Uuid>,
     /// Only return events of this type
     pub event_type: Option<String>,
     /// Maximum number of events to return (default 100, max 1000)
     pub limit: Option<usize>,
     /// Number of events to skip for pagination
     pub offset: Option<usize>,
+}
+
+impl EventFilter {
+    /// Whether an event at `(created_at, id)` lies at or after this filter's
+    /// cursor. The in-process mirror of the predicate
+    /// `epigraph_db::EventRepository::list` applies in SQL — inclusive
+    /// `created_at >= since` without `after_id`, the strict keyset
+    /// `(created_at, id) > (since, after_id)` with it — so both halves of the
+    /// `list_events` merge page identically. No `since`: everything is
+    /// admitted (`after_id` alone is rejected by the handler).
+    pub fn admits(&self, created_at: DateTime<Utc>, id: Uuid) -> bool {
+        match (self.since, self.after_id) {
+            (None, _) => true,
+            (Some(since), None) => created_at >= since,
+            (Some(since), Some(after)) => (created_at, id) > (since, after),
+        }
+    }
 }
 
 /// Response body for `GET /api/v1/events`.
@@ -265,6 +290,12 @@ pub async fn list_events(
     // 401 branches — runs identically in both. Under `not(db)` the value is a
     // `NoDbViewer` unit and nothing reads it.
     let _ = &viewer;
+    if filter.after_id.is_some() && filter.since.is_none() {
+        return Err(ApiError::ValidationError {
+            field: "after_id".to_string(),
+            reason: "after_id is a tiebreaker for since and requires it".to_string(),
+        });
+    }
     #[cfg(feature = "db")]
     {
         let limit = filter.limit.unwrap_or(100).min(1000);
@@ -273,12 +304,21 @@ pub async fn list_events(
         // 1. Pull from the persisted events table. Overfetch (limit + offset)
         //    plus headroom so dedup against the in-memory store doesn't
         //    starve the page. We still apply the final limit/offset post-merge.
+        //    With `since` the cursor goes INTO the SQL, so the rows returned
+        //    are the OLDEST after it; filtering the newest `overfetch` rows
+        //    afterwards (the pre-U045 shape) lost the oldest whenever more
+        //    than `overfetch` events sat after the cursor.
         let overfetch = (limit.saturating_add(offset)).saturating_mul(2).max(limit);
+        let cursor = filter.since.map(|since| epigraph_db::EventCursor {
+            since,
+            after_id: filter.after_id,
+        });
         let rows = epigraph_db::EventRepository::list(
             &_state.db_pool,
             &viewer,
             filter.event_type.as_deref(),
             None, // actor_id — not part of the public filter
+            cursor,
             overfetch as i64,
         )
         .await
@@ -303,6 +343,7 @@ pub async fn list_events(
         //    pass a large limit here and re-page after merging.
         let in_mem_filter = EventFilter {
             since: filter.since,
+            after_id: filter.after_id,
             event_type: filter.event_type.clone(),
             limit: Some(usize::MAX),
             offset: None,
@@ -315,12 +356,9 @@ pub async fn list_events(
         retain_visible_events(&_state.db_pool, &viewer, &mut in_mem).await?;
         events.extend(in_mem);
 
-        // 3. Defensive since-filter on the merged set. The DB query above
-        //    didn't narrow by `since`, so persisted events older than the
-        //    cutoff need to be dropped here.
-        if let Some(since) = filter.since {
-            events.retain(|e| e.created_at >= since);
-        }
+        // 3. Defensive cursor filter on the merged set. Both halves already
+        //    applied it; kept so the page cannot depend on either one alone.
+        events.retain(|e| filter.admits(e.created_at, e.id));
 
         // 4. Dedup by event id. Persisted rows are first in the vec, so
         //    `retain` keeps the persisted copy when the same id appears in
@@ -328,10 +366,10 @@ pub async fn list_events(
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         events.retain(|e| seen.insert(e.id));
 
-        // 5. Sort by `created_at` ascending. ASC matches the natural
-        //    polling semantics of `since`-based subscribers (oldest-first
-        //    so the next `since` cursor is just the last event's `created_at`).
-        events.sort_by_key(|e| e.created_at);
+        // 5. Sort by the keyset `(created_at, id)` ascending: oldest first,
+        //    and the same total order the SQL cursor uses, so the next cursor
+        //    is the last event's `(created_at, id)`.
+        events.sort_by_key(|e| (e.created_at, e.id));
 
         // 6. Apply offset + limit to the merged, sorted, deduped set.
         let total = events.len();
@@ -616,12 +654,18 @@ pub async fn graph_snapshot(
 
         // Fetch all events up to version via the event list (filter by version not yet in repo,
         // so we fetch all and filter client-side for now)
-        let rows =
-            epigraph_db::EventRepository::list(&_state.db_pool, &viewer, None, None, version + 1)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to fetch events for snapshot: {e}"),
-                })?;
+        let rows = epigraph_db::EventRepository::list(
+            &_state.db_pool,
+            &viewer,
+            None,
+            None,
+            None,
+            version + 1,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch events for snapshot: {e}"),
+        })?;
         let events: Vec<GraphEvent> = rows
             .into_iter()
             .filter(|r| r.graph_version <= version)

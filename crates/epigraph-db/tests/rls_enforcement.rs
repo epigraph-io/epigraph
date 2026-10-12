@@ -2726,7 +2726,7 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
         viewer: &Viewer,
         actor: Uuid,
     ) -> std::collections::HashSet<Uuid> {
-        EventRepository::list(pool, viewer, None, Some(actor), 100)
+        EventRepository::list(pool, viewer, None, Some(actor), None, 100)
             .await
             .expect("EventRepository::list")
             .into_iter()
