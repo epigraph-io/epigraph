@@ -2037,7 +2037,10 @@ async fn no_session_is_live_until_132_opens_the_gate(pool: PgPool) {
     let secret = [b'g'; 32];
     let t = ticket(&pool, &g, "grant", Some(&secret)).await;
     let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
-    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+    assert_eq!(
+        r.0, "confirmed",
+        "CALIBRATION: the grant ceremony confirms: {r:?}"
+    );
 
     let reads_b = || {
         let pool = pool.clone();
@@ -2283,7 +2286,10 @@ async fn a_privileged_login_is_never_elevated(pool: PgPool) {
     let secret = [b'p'; 32];
     let t = ticket(&pool, &g, "grant", Some(&secret)).await;
     let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
-    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+    assert_eq!(
+        r.0, "confirmed",
+        "CALIBRATION: the grant ceremony confirms: {r:?}"
+    );
     for login in [None, Some("epigraph_maintenance"), Some(BYPASSRLS_PROBE)] {
         let status = redeem_as_login(&pool, login, t, &secret, g.client).await;
         assert_eq!(
