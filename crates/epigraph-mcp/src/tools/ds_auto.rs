@@ -393,6 +393,9 @@ pub async fn auto_wire_ds_for_claim(
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
+    // The canonical key, not the caller's spelling or DB-vocab tag (bc06ec6f).
+    let evidence_type = epigraph_engine::calibration::canonical_evidence_type(evidence_type);
+
     // Store BBA (perspective_id=NULL for auto-wired). source_strength is the
     // evidence-type reliability weight (used as Shafer's reliability discount
     // at combination time). Agent confidence is already encoded in the BBA's
@@ -407,9 +410,9 @@ pub async fn auto_wire_ds_for_claim(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(weight),  // source_strength = evidence-type reliability
-        evidence_type, // evidence_type
-        "unknown",     // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
+        Some(weight),             // source_strength = evidence-type reliability
+        evidence_type.as_deref(), // evidence_type (canonical key)
+        "unknown", // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
         None, // no evidence row in scope on the new-claim initial-write path (issue #197 Phase 3)
     )
     .await
@@ -544,6 +547,12 @@ pub async fn auto_wire_ds_update(
             .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
     }
 
+    // The canonical key: callers pass a DB-vocab tag of the evidence row they
+    // wrote or linked (`observation`, `reference`, ...) or a caller-cased
+    // canonical key; both resolve through the calibration alias map (bc06ec6f).
+    let evidence_type_str =
+        epigraph_engine::calibration::canonical_evidence_type(evidence_type_str);
+
     // Store BBA — use evidence_id as perspective_id so each evidence submission
     // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
     // source_strength = evidence-type reliability weight (used for Shafer
@@ -558,9 +567,9 @@ pub async fn auto_wire_ds_update(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(weight),      // source_strength = evidence-type reliability
-        evidence_type_str, // evidence_type
-        "unknown",         // ds_auto evidence path; locality not derived here (issue #197)
+        Some(weight),                 // source_strength = evidence-type reliability
+        evidence_type_str.as_deref(), // evidence_type (canonical key)
+        "unknown",   // ds_auto evidence path; locality not derived here (issue #197)
         evidence_id, // Phase 3: the FK to the evidence row that produced this BBA (issue #197)
     )
     .await
@@ -867,6 +876,10 @@ async fn wire_single_batch_entry(
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
+    // Ingest normalizes its tags already; canonicalize anyway so no batch
+    // caller can store a non-canonical spelling (bc06ec6f).
+    let evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(entry.evidence_type.as_deref());
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
         entry.claim_id,
@@ -877,9 +890,9 @@ async fn wire_single_batch_entry(
         None,
         Some("auto_wire"),
         Some(entry.weight), // source_strength = methodology weight (legacy fallback when evidence_type is None)
-        entry.evidence_type.as_deref(), // evidence_type → effective_source_strength / frame function
-        "unknown",                      // batch ds_auto path; no per-entry locality (issue #197)
-        None, // batch path predates per-claim evidence rows (issue #197 Phase 3)
+        evidence_type.as_deref(), // evidence_type → effective_source_strength / frame function
+        "unknown",          // batch ds_auto path; no per-entry locality (issue #197)
+        None,               // batch path predates per-claim evidence rows (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;

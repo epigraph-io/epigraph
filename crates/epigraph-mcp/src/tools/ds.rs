@@ -187,6 +187,11 @@ pub async fn submit_ds_evidence(
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
     let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+    // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
+    // caller's own key lowercased when the calibration does not know it
+    // (bc06ec6f). The vocabulary warning below still names what the caller sent.
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
 
     // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
     // recompute resolves is ACCEPTED and silently combined at the 0.5
@@ -344,8 +349,8 @@ pub async fn submit_ds_evidence(
         None,
         Some(&method_name),
         None,
-        calibrated_evidence_type, // NULL unless caller opted in (backlog a2b71568)
-        stored_locality_tag,      // "unknown" unless evidence_type was also supplied
+        stored_evidence_type.as_deref(), // NULL unless caller opted in (backlog a2b71568)
+        stored_locality_tag,             // "unknown" unless evidence_type was also supplied
         None, // manual DS submission has no evidence row in scope (issue #197 Phase 3)
     )
     .await

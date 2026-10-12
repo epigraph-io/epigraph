@@ -1222,7 +1222,9 @@ pub async fn submit_evidence(
         None,
         Some("discount"),
         Some(request.reliability),
-        request.evidence_type.as_deref(),
+        // Canonical key, or the caller's own key lowercased (bc06ec6f).
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref())
+            .as_deref(),
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
