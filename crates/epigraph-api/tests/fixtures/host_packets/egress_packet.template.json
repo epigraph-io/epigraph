@@ -1,0 +1,36 @@
+{
+  "claim": {
+    "content": "Allowing egress to {{HOST}}:{{PORT}} is safe for this deployment",
+    "initial_truth": 0.65,
+    "agent_id": "{{AUTHOR}}",
+    "properties": {
+      "approved_by": "{{APPROVER}}",
+      "host": "{{HOST}}",
+      "policy_type": "network_egress",
+      "port": {{PORT}},
+      "protocol": "https",
+      "via": "telegram /approvedomain"
+    },
+    "labels": ["policy", "policy:network", "policy:active", "egress:{{HOST}}:{{PORT}}"]
+  },
+  "evidence": [
+    {
+      "content_hash": "{{EVIDENCE_HASH}}",
+      "evidence_type": {
+        "type": "observation",
+        "observed_at": "{{OBSERVED_AT}}",
+        "method": "egress_approval",
+        "location": null
+      },
+      "raw_content": null,
+      "signature": null
+    }
+  ],
+  "reasoning_trace": {
+    "methodology": "deductive",
+    "explanation": "Approver {{APPROVER}} approved egress to {{HOST}}:{{PORT}}",
+    "confidence": 0.65,
+    "inputs": [{ "type": "evidence", "index": 0 }]
+  },
+  "signature": ""
+}
