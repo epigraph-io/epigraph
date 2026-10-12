@@ -59,6 +59,7 @@ async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports
         supports,
         None,
         None,
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");

@@ -82,6 +82,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         true, // supports
         Some("testimony"),
         Some(evidence_id),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");
@@ -161,6 +162,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true, // supports
         Some("empirical"),
         Some(ev_a),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("first update");
@@ -175,6 +177,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true,
         Some("empirical"),
         Some(ev_b),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("second update");
@@ -228,6 +231,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true,
         Some("empirical"),
         Some(ev_c),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("third update");

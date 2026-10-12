@@ -70,6 +70,7 @@ async fn writer_caches_the_fold_conflict_and_agrees_with_recompute(pool: sqlx::P
         true,
         Some("empirical"),
         None,
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");

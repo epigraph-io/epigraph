@@ -510,6 +510,8 @@ pub async fn auto_wire_ds_for_claim(
 /// `evidence_id` is passed as `perspective_id` so that each evidence submission
 /// gets its own BBA row rather than upsert-overwriting the previous one on the
 /// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
+///
+/// `seed_truth_prior` is accepted but not yet acted on (backlog fc55465b).
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
     conn: &mut sqlx::PgConnection,
@@ -521,7 +523,9 @@ pub async fn auto_wire_ds_update(
     supports: bool,
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
+    seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
+    let _ = seed_truth_prior; // inert until the truth_value seed lands
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
 

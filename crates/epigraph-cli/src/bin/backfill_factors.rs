@@ -209,6 +209,10 @@ async fn run_evidence_phase(
             true, // existing ingest semantics: evidence supports its claim
             Some(&evidence_type),
             Some(evidence_id),
+            // No truth_value seed: a factorless claim's truth_value may already
+            // be derived from the very evidence this backfills, so seeding it
+            // would count that evidence twice (drain U026, operator Q3).
+            false,
         )
         .await
         {

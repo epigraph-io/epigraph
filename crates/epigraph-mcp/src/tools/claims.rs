@@ -1332,6 +1332,7 @@ pub async fn update_with_evidence(
         params.supports,
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
+        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
     )
     .await
     .map_err(|e| {
