@@ -1817,6 +1817,10 @@ pub struct IngestDocumentSpineResponse {
     /// `labels`) were not added to them.
     /// See `IngestDocumentResponse::converged_claims_unlabelled`.
     pub converged_claims_unlabelled: usize,
+    /// Spine nodes this ingest resolved to that ANOTHER agent authored: they got
+    /// the document's `doi:` label but not the caller's `labels`.
+    /// See `IngestDocumentResponse::converged_claims_caller_labels_withheld`.
+    pub converged_claims_caller_labels_withheld: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -2147,6 +2151,15 @@ pub struct IngestDocumentResponse {
     /// edges against its `doi:` label set itself. Stated because an earlier
     /// summary described this field as the disclosure for every ingest path.
     pub converged_claims_unlabelled: usize,
+    /// Claims this ingest RESOLVED TO that another agent authored, which got the
+    /// document's `doi:` label but NOT the caller's `labels`: caller vocabulary
+    /// (a `resolved`, a `policy:` tag) is never written onto someone else's
+    /// claim by an ingest, even one the ingesting agent's group membership lets
+    /// it write. Disjoint from `converged_claims_unlabelled` (which counts rows
+    /// that got no label at all) and always 0 when the extraction carries no
+    /// `labels`. Reaches callers exactly as `converged_claims_unlabelled` does;
+    /// the detached tools log one WARN per claim (target `tenancy.scoped_write`).
+    pub converged_claims_caller_labels_withheld: usize,
     pub already_ingested: bool,
 }
 

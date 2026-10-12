@@ -570,6 +570,63 @@ async fn label_resolved_claim(
     }
 }
 
+/// The labels this ingest may merge onto a claim it RESOLVED TO: the full set
+/// ([`ingest_claim_labels`]) when the ingesting agent authored that claim, and
+/// only `doi:<doi>` (its first entry) otherwise.
+///
+/// # Why the caller's labels stop at another author's row
+///
+/// The resolved branch is reached by content, not by ownership: an atom
+/// converges onto ANY row with its `content_hash` (`ClaimRepository::create_conn`
+/// has no author filter), and a document-scoped node onto any row with its
+/// (title, path, text) id. The only check on the label write is RLS, and under
+/// D1 a writer of a TEAM group passes it on a colleague's claim owned by that
+/// team. `doi:<doi>` is safe there — its fixed prefix can never spell a
+/// workflow label. Caller vocabulary is not: `labels: ["resolved"]` on an atom
+/// restating a colleague's backlog item retired it with no `Resolves <id>:`
+/// trail, past [`crate::tools::claims`]'s retirement gate and the HTTP
+/// whole-mutation `require_owner_or_admin` bar on `update_labels`. MEASURED on
+/// `epigraph_app` (`tests/ingest_caller_labels_foreign_claim.rs`).
+///
+/// Author equality is deliberately narrower than `require_owner_or_admin`: an
+/// agent linked to the author's operator, or an admin, gets `doi:` only here
+/// and relabels through `update_labels`, which asks those questions. Fail
+/// closed: an author this walk cannot read (`None`) is treated as foreign.
+///
+/// With no caller labels the set is just `[doi:<doi>]` and no read is made, so
+/// the default ingest's behaviour and cost are unchanged.
+async fn labels_for_resolved_claim<'l>(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    known_author: Option<Uuid>,
+    agent_id: Uuid,
+    claim_labels: &'l [String],
+) -> Result<&'l [String], McpError> {
+    if claim_labels.len() <= 1 {
+        return Ok(claim_labels);
+    }
+    let author = match known_author {
+        Some(author) => Some(author),
+        None => ClaimRepository::get_agent_id(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(internal_error)?,
+    };
+    if author == Some(agent_id) {
+        return Ok(claim_labels);
+    }
+    tracing::warn!(
+        target: "tenancy.scoped_write",
+        claim_id = %claim_id,
+        author = ?author,
+        ingesting_agent = %agent_id,
+        withheld = ?&claim_labels[1..],
+        "ingest resolved to a claim another agent authored; the caller's labels were NOT \
+         added to it (only the document's doi: label is)"
+    );
+    Ok(&claim_labels[..1])
+}
+
 /// The write transaction a document ingest runs in.
 ///
 /// `Stamped` is the production shape: `begin_author_stamped_tx` from the
@@ -963,6 +1020,7 @@ pub async fn do_ingest_document(
     let mut embed_queue: Vec<(Uuid, String)> = Vec::new();
     let mut dedup_count = 0_usize;
     let mut converged_unlabelled = 0_usize;
+    let mut caller_labels_withheld = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
     // Tenancy declaration (PR-16), hoisted above the loop -- see
@@ -996,7 +1054,7 @@ pub async fn do_ingest_document(
         claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+        let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
             &claim,
             planned,
@@ -1009,8 +1067,19 @@ pub async fn do_ingest_document(
         // shared across papers (convergence) picks up every paper's label —
         // when this author may write it; see `label_resolved_claim`.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &claim_labels).await? {
+            let labels = labels_for_resolved_claim(
+                &mut tx,
+                viewer,
+                persisted_id,
+                known_author,
+                agent_id,
+                &claim_labels,
+            )
+            .await?;
+            if !label_resolved_claim(&mut tx, persisted_id, labels).await? {
                 converged_unlabelled += 1;
+            } else if labels.len() < claim_labels.len() {
+                caller_labels_withheld += 1;
             }
         } else {
             ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
@@ -1310,6 +1379,7 @@ pub async fn do_ingest_document(
         claims_ds_wired,
         ds_frame_id,
         converged_claims_unlabelled: converged_unlabelled,
+        converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })
 }
@@ -1448,6 +1518,8 @@ fn is_synthetic_key(key: &str) -> bool {
 /// resolves to: `doi:<doi>` first, then the caller's `extraction.labels`
 /// (deduplicated, order-preserving). With no caller labels this is exactly
 /// `[doi:<doi>]`, the set the writer applied before caller labels existed.
+/// `doi:<doi>` is always entry 0: [`labels_for_resolved_claim`] keeps only that
+/// entry for a resolved row another agent authored.
 ///
 /// Validated HERE so every entry point fails closed before any write: the two
 /// detached handlers call it before `ensure_paper_node` writes the `papers`
@@ -1530,9 +1602,14 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 
 /// Persist one planned claim, routing on the identity class the PLANNER chose.
 ///
-/// Returns `(persisted_id, resolved_to_existing)`. `resolved_to_existing` means
-/// the row was already there with its provenance (trace + evidence) written, so
-/// the caller must only wire the `asserts` edge and must NOT clobber it.
+/// Returns `(persisted_id, resolved_to_existing, known_author)`.
+/// `resolved_to_existing` means the row was already there with its provenance
+/// (trace + evidence) written, so the caller must only wire the `asserts` edge
+/// and must NOT clobber it. `known_author` is the row's author when this call
+/// already knows it without another read: the ingesting agent for a row it
+/// created, the existing row's author for an atom. It is `None` for a
+/// document-scoped node the walk resolved to (`ON CONFLICT (id) DO NOTHING`
+/// returns nothing about the existing row); see [`labels_for_resolved_claim`].
 ///
 /// Two classes, per `epigraph_ingest::common::ids`:
 ///
@@ -1568,7 +1645,7 @@ async fn persist_planned_claim(
     // the identical lookup, with a comment saying exactly that; the two
     // siblings now agree.
     decl: epigraph_core::TenancyDecl,
-) -> Result<(Uuid, bool), McpError> {
+) -> Result<(Uuid, bool, Option<Uuid>), McpError> {
     if planned.id_is_document_scoped() {
         let was_new = ClaimRepository::create_with_id_if_absent_conn(
             &mut *conn,
@@ -1588,7 +1665,7 @@ async fn persist_planned_claim(
         // and the trace write below leaves the node without trace/evidence, and
         // the retry takes the reuse branch. The old `already_had_trace` probe
         // covered that; closing it again would cost a SELECT per claim.
-        return Ok((planned.id, !was_new));
+        return Ok((planned.id, !was_new, was_new.then_some(agent_id)));
     }
 
     // Atom: `create` dedupes on content_hash and returns the existing row.
@@ -1616,6 +1693,7 @@ async fn persist_planned_claim(
     Ok((
         persisted_id,
         persisted_id != planned.id || persisted.trace_id.is_some() || persisted_author != agent_id,
+        Some(persisted_author),
     ))
 }
 
@@ -1853,6 +1931,7 @@ pub async fn do_ingest_document_spine(
     let mut para_new_count = 0_usize;
     let mut para_dedup_count = 0_usize;
     let mut converged_unlabelled = 0_usize;
+    let mut caller_labels_withheld = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
     // Hoisted, as above, and through the same never-minting helper.
@@ -1877,7 +1956,7 @@ pub async fn do_ingest_document_spine(
         claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+        let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
             &claim,
             planned,
@@ -1891,8 +1970,19 @@ pub async fn do_ingest_document_spine(
         // first); its label is skipped and disclosed, not allowed to abort the
         // spine. A node this walk CREATED is the author's own and must label.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &claim_labels).await? {
+            let labels = labels_for_resolved_claim(
+                &mut tx,
+                viewer,
+                persisted_id,
+                known_author,
+                agent_id,
+                &claim_labels,
+            )
+            .await?;
+            if !label_resolved_claim(&mut tx, persisted_id, labels).await? {
                 converged_unlabelled += 1;
+            } else if labels.len() < claim_labels.len() {
+                caller_labels_withheld += 1;
             }
         } else {
             ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
@@ -2083,6 +2173,7 @@ pub async fn do_ingest_document_spine(
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,
+        converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: para_new_count == 0 && para_dedup_count > 0,
     })
 }

@@ -503,6 +503,58 @@ async fn caller_labels_reach_spine_nodes_a_rerun_resolves_to(pool: PgPool) {
     }
 }
 
+/// The document-scoped half of the author rule. A spine node is resolved by its
+/// (title, path, text) id, so a SECOND agent spining the same document reaches
+/// the first agent's nodes; nothing on that conflict path returns the existing
+/// row's author, so the walk reads it (`labels_for_resolved_claim`). That agent
+/// must add the document's `doi:` label but not its own caller labels.
+///
+/// Two servers with generated signers are two agents. This file's pool is the
+/// `#[sqlx::test]` superuser, so RLS admits the cross-agent write, as the
+/// operator CLI's privileged pool does; that is the arm where only the author
+/// check stands between caller vocabulary and another agent's node
+/// (`ingest_caller_labels_foreign_claim.rs` covers the RLS-admitted team arm
+/// for atoms on `epigraph_app`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn caller_labels_stay_off_spine_nodes_another_agent_wrote(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let first = make_server(pool.clone()).await;
+    let second = make_server(pool.clone()).await;
+    assert_ne!(
+        first.server_agent_id().await.expect("first agent"),
+        second.server_agent_id().await.expect("second agent"),
+        "the two servers must be two agents, or this test proves nothing"
+    );
+    do_ingest_document_spine(&first, &viewer, &extraction(Some(&["stage:a"])), None)
+        .await
+        .expect("first agent's spine");
+    let result = do_ingest_document_spine(&second, &viewer, &extraction(Some(&["stage:b"])), None)
+        .await
+        .expect("second agent's spine");
+
+    for (what, content) in [
+        ("thesis (level 0)", THESIS),
+        ("section (level 1)", SECTION),
+        ("paragraph (level 2)", PARAGRAPH),
+    ] {
+        let id = only_claim_with_content(&pool, content).await;
+        let labels = labels_of(&pool, id).await;
+        assert!(
+            !labels.iter().any(|l| l == "stage:b"),
+            "{what}: the second agent's caller label reached the first agent's node: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "stage:a") && labels.contains(&format!("doi:{DOI}")),
+            "{what}: the author's own label and the document's doi: label must stay: {labels:?}"
+        );
+    }
+    let json: serde_json::Value = serde_json::from_str(&result_text(&result)).expect("JSON");
+    assert_eq!(
+        json["converged_claims_caller_labels_withheld"], 3,
+        "all three resolved nodes must be disclosed: {json}"
+    );
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()
