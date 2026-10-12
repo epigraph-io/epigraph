@@ -679,32 +679,34 @@ mod tests {
         );
     }
 
+    /// Every arm of the enum-level mapping, written out independently (these
+    /// are the arms of the pre-refactor private `methodology_to_db_string`,
+    /// which ingestion, `memorize`, the HTTP routes and the packet submit
+    /// route all persist through), and each one admitted by the CHECK.
     #[test]
     fn every_enum_mapping_is_admitted_by_the_check() {
-        for m in [
-            Methodology::Deductive,
-            Methodology::Inductive,
-            Methodology::Abductive,
-            Methodology::Instrumental,
-            Methodology::Extraction,
-            Methodology::BayesianInference,
-            Methodology::VisualInspection,
-            Methodology::FormalProof,
-            Methodology::Heuristic,
-        ] {
+        let expected = [
+            (Methodology::Deductive, "deductive"),
+            (Methodology::FormalProof, "deductive"),
+            (Methodology::Inductive, "inductive"),
+            (Methodology::Abductive, "abductive"),
+            (Methodology::Heuristic, "abductive"),
+            // The hard constraint of backlog e207bb6d's fix: the enum-level
+            // Instrumental arm stays `statistical`, because ingestion lands a
+            // planned "statistical" step on Instrumental.
+            (Methodology::Instrumental, "statistical"),
+            (Methodology::Extraction, "statistical"),
+            (Methodology::BayesianInference, "statistical"),
+            (Methodology::VisualInspection, "statistical"),
+        ];
+        for (m, want) in expected {
             let stored = ReasoningTraceRepository::reasoning_type_for(m);
+            assert_eq!(stored, want, "{m:?} must be stored as {want:?}");
             assert!(
                 ReasoningTraceRepository::REASONING_TYPES.contains(&stored),
                 "{m:?} maps to {stored:?}, which reasoning_type_valid refuses"
             );
         }
-        // The hard constraint of backlog e207bb6d's fix: the enum-level
-        // Instrumental arm stays `statistical`, because ingestion lands a
-        // planned "statistical" step on Instrumental.
-        assert_eq!(
-            ReasoningTraceRepository::reasoning_type_for(Methodology::Instrumental),
-            "statistical"
-        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
