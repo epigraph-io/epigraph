@@ -1469,7 +1469,10 @@ pub async fn submit_evidence(
         None, // system-generated combined result
         &combined_json,
         final_k,
-        final_method,
+        // A lone BBA is not folded, so `final_method` is None; label the row
+        // anyway, or the combine-input readers cannot tell this cached copy
+        // from an agent-less input and fold it twice (backlog b5cb3efb).
+        final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
         None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
         None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
