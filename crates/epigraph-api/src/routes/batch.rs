@@ -1101,6 +1101,7 @@ mod item_decoding_tests {
         let trace = Uuid::new_v4();
         let evidence = Uuid::new_v4();
         let group = Uuid::new_v4();
+        let parent = Uuid::new_v4();
         let content_hash = "a".repeat(64);
         let req = batch_item_to_create_request(
             json!({
@@ -1112,7 +1113,8 @@ mod item_decoding_tests {
                 "group_id": group,
                 "encrypted_content": "ciphertext-base64",
                 "encryption_epoch": 2,
-                "labels": ["a", "b"], "if_not_exists": true
+                "labels": ["a", "b"], "if_not_exists": true,
+                "derived_from": {"claim_id": parent, "method": "decompose_claims"}
             }),
             caller,
         )
@@ -1135,6 +1137,7 @@ mod item_decoding_tests {
             encryption_epoch,
             labels,
             if_not_exists,
+            derived_from,
         } = req;
         assert_eq!(content, "c");
         assert_eq!(agent_id, named, "an item that names an author keeps it");
@@ -1152,6 +1155,9 @@ mod item_decoding_tests {
         assert_eq!(encryption_epoch, Some(2));
         assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
         assert!(if_not_exists);
+        let derived_from = derived_from.expect("derived_from passes through");
+        assert_eq!(derived_from.claim_id, parent);
+        assert_eq!(derived_from.method, "decompose_claims");
     }
 
     #[test]
