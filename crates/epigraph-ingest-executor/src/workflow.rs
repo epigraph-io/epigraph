@@ -224,6 +224,32 @@ pub async fn execute_workflow_ingest_plan(
         }
     }
 
+    // ── 0b. Pre-flight: refuse a content-less generation (U032) ─────────
+    // `WorkflowExtraction::phases` is `#[serde(default)]` and unknown keys are
+    // ignored, so a payload whose steps sit under an unrecognised key parses
+    // as `phases: []`. As a NEW generation (> 0) that committed the thesis
+    // alone, and `improve_workflow_hierarchy` mints `max + 1` on every call,
+    // so each agent retry minted another empty generation (backlog 28fb40c4 /
+    // 1e6872e7). A plan with no claims at all is refused at every generation:
+    // it writes a bare row that the `executes`-edge gate below never treats as
+    // processed. Generation 0 with a thesis and no steps stays legal: that is
+    // the `store_workflow` / `POST /workflows` `steps: []` scaffold `add_step`
+    // fills in place. Runs AFTER the blank-content check (callers assert on
+    // that error for a blank thesis over a step-less phase) and BEFORE the
+    // idempotency gate, so a re-ingest of an empty plan is refused too rather
+    // than reported `already_ingested`.
+    {
+        let level2 = plan.claims.iter().filter(|c| c.level == 2).count();
+        if plan.claims.is_empty() || (generation > 0 && level2 == 0) {
+            return Err(IngestExecutorError::EmptyGeneration {
+                canonical_name: canonical_name.clone(),
+                generation,
+                level2,
+                claims: plan.claims.len(),
+            });
+        }
+    }
+
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
     if let Some(existing_id) =
         WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation).await?

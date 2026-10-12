@@ -2103,7 +2103,9 @@ pub struct DeleteStepRequest {
 /// Map a workflow-ingest executor error. Migration 105's personal-group
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
-/// detail logged and kept out of the body. Everything else stays a 500.
+/// detail logged and kept out of the body. A content-less generation
+/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
+/// else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2115,6 +2117,13 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
             if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
+        }
+        // U032: a content-less generation is the caller's payload error: 400,
+        // not a 500 that invites the retry loop that minted the stubs.
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
         }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),

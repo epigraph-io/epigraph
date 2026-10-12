@@ -338,3 +338,32 @@ async fn improve_with_no_steps_is_invalid_params_and_mints_no_generation(pool: s
         .expect("the parent exists");
     assert_eq!(max_after, max_before, "no generation was minted");
 }
+
+/// U032: an agent reads the tool descriptions, so they must say a step-less
+/// generation is refused (and that retrying it is pointless) and how a parent
+/// is resolved.
+#[test]
+fn the_tool_descriptions_state_the_step_less_refusal_and_parent_linking() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::static_tools();
+    let describe = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref().map(str::to_string))
+            .unwrap_or_else(|| panic!("tool {name} has a description"))
+    };
+    let improve = describe("improve_workflow_hierarchy");
+    assert!(
+        improve.contains("an extraction with no steps")
+            && improve.contains("mints no generation")
+            && improve.contains("rather than retrying"),
+        "{improve}"
+    );
+    let ingest = describe("ingest_workflow");
+    assert!(
+        ingest.contains("A generation above 0 with no steps is refused")
+            && ingest.contains("highest existing generation of this canonical_name below it")
+            && ingest.contains("Generation 0 with a thesis and no steps is accepted"),
+        "{ingest}"
+    );
+}

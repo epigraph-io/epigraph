@@ -153,6 +153,11 @@ pub fn executor_caller_error(
         {
             db_caller_error(db)
         }
+        // U032: the caller's payload plans a content-less generation. A caller
+        // error, so an agent stops retrying (the retry loop minted the stubs).
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            invalid_params(format!("{context}: {e}"))
+        }
         other => internal_error(format!("{context}: {other}")),
     }
 }
