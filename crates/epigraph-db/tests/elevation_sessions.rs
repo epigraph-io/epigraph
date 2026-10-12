@@ -3086,7 +3086,17 @@ async fn a_backward_clock_step_refuses_a_grant_stamped_now(pool: PgPool) {
     .expect("PREMISE: the first custodian is granted at bootstrap");
     let _key = passkey(&pool, person, 1).await;
     let (fam, _) = family(&pool, client).await;
-    clock_steps_back_after_grant(&pool, assignment, 5).await;
+    // Anchored on the READ, not the grant: a grant stamped `now()` with the
+    // step landing just before the ticket, however long the setup above took
+    // on a loaded host (shifting the stored value by 5 s would leave this
+    // control green only while setup stays under 5 s).
+    without_triggers(
+        &pool,
+        "UPDATE role_assignments SET valid_from = clock_timestamp() + interval '5 seconds' \
+          WHERE id = $1",
+        assignment,
+    )
+    .await;
     let r = create_ticket(&pool, Some(person), client, fam, "connector", None).await;
     let err = r.expect_err("CALIBRATION: a grant stamped now() is not live across a 5 s step");
     assert!(
