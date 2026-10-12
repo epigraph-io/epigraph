@@ -1697,7 +1697,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 `epigraph-operator` (the role verbs and `custodial-supersede`),
 `epigraph-api` (privatization records a custodial act and reads the
 assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
-one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
+one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first.
+Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
 ended after 123), drops 123's triggers, re-applies 083's and 122's function
@@ -2516,3 +2517,31 @@ narrowing `scope`) widened the chain to everything the client is granted.
    Rollback: re-run 118's `CREATE OR REPLACE FUNCTION
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
+
+## A lineage stays in its owner group (migration 153) — deploy order and rollback
+
+Once the operator binding is armed, an application session may not leave a
+CURRENT claim naming `supersedes` in a different owner group than that
+predecessor: at the insert, at a re-open, or when `supersedes` is first set on
+a claim that stays current. Refused `OPL02` (never relieved by the
+`operator_link_enforcement` valve). Privileged sessions, the supersede act
+(which inherits the predecessor's group), retired rows (the dedup and
+consolidate acts) and an unarmed database are unchanged. The rule and its
+reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
+
+1. **Preconditions.** Migration 123 applied. No binary change is needed: the
+   refusal is `OPL02`, which every surface already maps.
+2. **Migrate 153** (`epigraph-migrate`, migration DSN): one `CREATE OR
+   REPLACE` of the claims binding trigger function. It changes no write on an
+   unarmed database, and it may apply before or after any lower-numbered
+   migration that does not re-body that function (sqlx applies every
+   embedded, unapplied migration in version order).
+3. **Before arming,** count the current claims that already name a
+   predecessor in another group (the audit query in migration 153's header).
+   153 does not revisit them; each one blocks the custodial supersede of its
+   predecessor once armed, so revise or retire it on the maintenance DSN
+   first.
+
+**Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
+transaction: it restores 123's body of the function and re-asserts its owner.
+Run it before `123-undo.sql`.
