@@ -318,3 +318,137 @@ async fn a_kind_with_shell_syntax_costs_its_label_not_the_whole_ingest(pool: PgP
             .expect("count corrupt labels");
     assert_eq!(corrupt, 0, "no label may carry unexpanded shell syntax");
 }
+
+// ── U032: a new generation links to its lineage predecessor ─────────────────
+//
+// Before U032 the executor resolved `parent_id` ONLY from
+// `parent_canonical_name` (`find_root_by_canonical(parent, generation - 1)`),
+// so a generation > 0 ingested without naming a parent — or naming its own
+// lineage at a generation that is missing — was stored as a parentless root
+// with no `variant_of` edge, even when lower generations of the same
+// `canonical_name` existed. The authority layer (`ingest_anchors`) already
+// treats such an ingest as a generation of THAT lineage; the linkage did not.
+
+async fn exec(
+    pool: &PgPool,
+    extraction: &WorkflowExtraction,
+) -> epigraph_ingest_executor::WorkflowIngestExecutionResult {
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
+    epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        extraction,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "ingest of {} gen {} failed: {e}",
+            extraction.source.canonical_name, extraction.source.generation
+        )
+    })
+}
+
+/// Generation `generation` of `canonical_name`, naming no parent, with a step
+/// text distinct per generation so each generation plans its own step claim.
+fn generation_of(canonical_name: &str, generation: u32) -> WorkflowExtraction {
+    let mut x = build_minimal_workflow_extraction(canonical_name);
+    x.source.generation = generation;
+    x.source.parent_canonical_name = None;
+    x.phases[0].steps[0].compound = format!("Invoke executor for generation {generation}");
+    x
+}
+
+async fn parent_of(pool: &PgPool, workflow_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    sqlx::query_scalar("SELECT parent_id FROM workflows WHERE id = $1")
+        .bind(workflow_id)
+        .fetch_one(pool)
+        .await
+        .expect("workflow row")
+}
+
+async fn variant_of_edges(pool: &PgPool, source: uuid::Uuid, target: uuid::Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges \
+         WHERE source_id = $1 AND source_type = 'workflow' \
+           AND target_id = $2 AND target_type = 'workflow' \
+           AND relationship = 'variant_of'",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .expect("variant_of count")
+}
+
+/// A generation > 0 that names no parent is a generation of its own lineage
+/// and must link to the generation below it, with the `variant_of` edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_generation_without_a_parent_name_links_to_its_predecessor(pool: PgPool) {
+    let r0 = exec(&pool, &generation_of("u032-lineage", 0)).await;
+    let r1 = exec(&pool, &generation_of("u032-lineage", 1)).await;
+
+    assert_eq!(
+        parent_of(&pool, r1.workflow_id).await,
+        Some(r0.workflow_id),
+        "generation 1 of an existing lineage must link to generation 0, not be a parentless root"
+    );
+    assert!(
+        r1.variant_of_edge_created,
+        "a resolved parent must also get its variant_of edge"
+    );
+    assert_eq!(
+        variant_of_edges(&pool, r1.workflow_id, r0.workflow_id).await,
+        1
+    );
+}
+
+/// Naming its OWN lineage as the parent at a generation that does not exist
+/// (a gap) falls back to the predecessor, and the predecessor is the highest
+/// generation BELOW the new one — not the lineage head, which may be above it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_gap_filling_generation_links_to_the_generation_below_not_the_head(pool: PgPool) {
+    let r0 = exec(&pool, &generation_of("u032-gap", 0)).await;
+    let r3 = exec(&pool, &generation_of("u032-gap", 3)).await;
+
+    // Gen 2, naming its own lineage: gen 1 does not exist.
+    let mut g2 = generation_of("u032-gap", 2);
+    g2.source.parent_canonical_name = Some("u032-gap".to_string());
+    let r2 = exec(&pool, &g2).await;
+
+    assert_eq!(
+        parent_of(&pool, r2.workflow_id).await,
+        Some(r0.workflow_id),
+        "gen 2 must link to gen 0 (the generation below it), never to the head gen 3"
+    );
+    assert_eq!(
+        variant_of_edges(&pool, r2.workflow_id, r3.workflow_id).await,
+        0
+    );
+    assert_eq!(
+        variant_of_edges(&pool, r2.workflow_id, r0.workflow_id).await,
+        1
+    );
+    // And gen 3, ingested parentless over the gap, linked to gen 0 too.
+    assert_eq!(parent_of(&pool, r3.workflow_id).await, Some(r0.workflow_id));
+}
+
+/// Over-correction guard: a lineage may legitimately START above generation 0
+/// (the `improve_workflow_hierarchy_test` fixture shape), and a fork naming a
+/// DIFFERENT lineage at a missing generation links nothing (it is the caller's
+/// own new lineage — `a_fork_under_a_new_name_needs_authority_over_the_linked_parent`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lineage_may_start_above_generation_zero(pool: PgPool) {
+    let r1 = exec(&pool, &generation_of("u032-starts-at-one", 1)).await;
+    assert_eq!(parent_of(&pool, r1.workflow_id).await, None);
+    assert!(!r1.variant_of_edge_created);
+
+    exec(&pool, &generation_of("u032-other-lineage", 0)).await;
+    let mut fork = generation_of("u032-fork", 5);
+    fork.source.parent_canonical_name = Some("u032-other-lineage".to_string());
+    let rf = exec(&pool, &fork).await;
+    assert_eq!(
+        parent_of(&pool, rf.workflow_id).await,
+        None,
+        "a cross-lineage parent at a missing generation must not fall back to anything"
+    );
+}
