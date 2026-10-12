@@ -979,17 +979,47 @@ mod tests {
         );
         assert_eq!(section_of(&sections, b).neighbor_count, 1);
 
-        // contradicts is kept on the source side too (Negative: unchanged,
-        // U080): [0.80, 0.95] vs [0.80, 0.95] at 0.9 -> 0.7125.
-        let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+        // Negative kinds are kept on the source side too (unchanged, U080).
+        // [0.80, 0.95] vs [0.80, 0.95], local BetP 0.875:
+        // - contradicts f = 0.9: restricted [0.045, 0.28], BetP 0.1625 -> 0.7125.
+        // - refutes f = 0.8 (Q2: treated symmetric): restricted
+        //   [(1-0.95)*0.8, 1-0.80*0.8] = [0.04, 0.36], BetP 0.20 -> 0.675.
         let iv = EpistemicInterval::new(0.80, 0.95, 0.0);
-        let sections = build_cdst_sections(&edge_rows((e, iv), (f, iv), "contradicts"), &sci());
+        for (rel, want) in [("contradicts", 0.7125), ("refutes", 0.675)] {
+            let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+            let sections = build_cdst_sections(&edge_rows((e, iv), (f, iv), rel), &sci());
+            for id in [e, f] {
+                let s = section_of(&sections, id);
+                assert_eq!(s.neighbor_count, 1, "{rel}: both sides must be kept");
+                assert!(
+                    (s.consistency_radius - want).abs() < 1e-9,
+                    "{rel}: expected {want}, got {}",
+                    s.consistency_radius
+                );
+            }
+        }
+
+        // frame_validates keeps both sides: FE passes bel/pl through, so
+        // [0.80, 0.90] (BetP 0.85) and [0.20, 0.40] (BetP 0.30) each score
+        // |0.85 - 0.30| = 0.55 against the other.
+        let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows(
+                (e, EpistemicInterval::new(0.80, 0.90, 0.0)),
+                (f, EpistemicInterval::new(0.20, 0.40, 0.0)),
+                "frame_validates",
+            ),
+            &sci(),
+        );
         for id in [e, f] {
             let s = section_of(&sections, id);
-            assert_eq!(s.neighbor_count, 1);
+            assert_eq!(
+                s.neighbor_count, 1,
+                "frame_validates: both sides must be kept"
+            );
             assert!(
-                (s.consistency_radius - 0.7125).abs() < 1e-9,
-                "got {}",
+                (s.consistency_radius - 0.55).abs() < 1e-9,
+                "frame_validates: expected 0.55, got {}",
                 s.consistency_radius
             );
         }
