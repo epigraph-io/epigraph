@@ -411,7 +411,10 @@ impl EventRepository {
     /// commit-ordered cursor is a change to the events API's contract, not to
     /// this helper. A consumer that must not miss events should re-read an
     /// overlap window behind its cursor (the endpoint's `since` is inclusive)
-    /// and dedupe by event id.
+    /// and dedupe by event id. The window is named by `epigraph-api`'s
+    /// `routes::events::EVENTS_SINCE_OVERLAP_SECS`, and that route's
+    /// `list_events` doc states the cursor contract and the trigger for a
+    /// commit-ordered cursor.
     ///
     /// Uses runtime `sqlx::query` (not the compile-time macro) to avoid
     /// adding offline-data churn for callers in transactional contexts.

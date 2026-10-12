@@ -13,8 +13,10 @@
 //!
 //! The in-memory `EventStore` uses a module-level `OnceLock` so that all
 //! handlers share the same store without modifying `AppState`. Each event
-//! receives a monotonically increasing `graph_version`, making it trivial
-//! to request "all events since version N" for incremental synchronisation.
+//! receives a monotonically increasing `graph_version`, which orders
+//! [`graph_snapshot`]. Incremental synchronisation through
+//! `GET /api/v1/events` is by the `(since, after_id)` cursor instead, and that
+//! cursor is NOT commit-ordered: see [`list_events`] for the contract.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -237,13 +239,57 @@ const MAX_EVENT_TYPE_LENGTH: usize = 200;
 /// Maximum payload size in bytes (64 KB, matching claim content limits).
 const MAX_PAYLOAD_SIZE: usize = 65_536;
 
+/// How far, in seconds, a `since` poller must re-read BEHIND its cursor (and
+/// dedupe by event id) to catch events that became visible after it polled
+/// but carry an earlier `created_at` — see [`list_events`], "Cursor contract".
+///
+/// Meant to be the longest expected write transaction. 300 s is PROVISIONAL
+/// (drain U045, operator question Q3): it covers normal MCP/REST write
+/// transactions but NOT a large whole-document ingest, whose transaction can
+/// run longer than any fixed window. That is why this is a stopgap and not a
+/// commit-ordered cursor; the trigger for replacing it is in [`list_events`].
+pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/v1/events` - Paginated, filterable event log.
 ///
-/// Returns events ordered by `graph_version` (ascending). Supports
-/// filtering by `event_type` and `since` timestamp, with `limit`/`offset`
-/// pagination.
+/// Returns events ordered by `(created_at, id)` ascending — NOT by
+/// `graph_version`. Supports filtering by `event_type` and the
+/// `(since, after_id)` cursor, with `limit`/`offset` pagination.
+///
+/// # Cursor contract
+///
+/// * `since` alone is INCLUSIVE (`created_at >= since`): re-polling with the
+///   last event's `created_at` re-serves it, and every event sharing that
+///   timestamp. Kept for compatibility.
+/// * The correct polling cursor is the pair
+///   `(since = last.created_at, after_id = last.id)`, which returns events
+///   whose `(created_at, id)` is strictly greater. It pages through a block of
+///   events that share one `created_at` (one transaction stamps all of its
+///   events with the same `NOW()`), which `since` alone cannot. `after_id`
+///   without `since` is a 400.
+/// * With a cursor the page is the OLDEST matching events after it (the
+///   cursor is applied in SQL, not to an already-truncated newest-N window).
+///
+/// **The cursor is NOT commit-ordered.** An event's `created_at` is its
+/// transaction's START time and it becomes visible only at COMMIT, so an event
+/// can appear after a poll carrying a timestamp behind a cursor that already
+/// moved past it (`epigraph_db::EventRepository::publish_or_log_conn`, "An
+/// event's `created_at` is NOT its visibility order"). A consumer that must
+/// not miss events re-reads an overlap window of
+/// [`EVENTS_SINCE_OVERLAP_SECS`] behind its cursor (`since = cursor - W`,
+/// paging with `after_id` until a page comes back short) and dedupes by `id`.
+/// That window is a stopgap: a transaction longer than it can still be missed.
+///
+/// **Trigger for a commit-ordered cursor** (drain U045 option (a): an `xid8`
+/// column set from `pg_current_xact_id()` and a `pg_snapshot_xmin` watermark
+/// behind an opaque `after` cursor): the first consumer of
+/// transactionally-published event types — a `claim.created` follower, a sync
+/// client, or a webhook relay reading `events`. Today's only `since` poller
+/// (epiclaw-host's synthesis watcher) reads `synthesis.*` events, which are
+/// written by autocommit `POST /api/v1/events`, so its race window is one
+/// statement.
 ///
 /// # Tenancy (PR-09)
 ///
