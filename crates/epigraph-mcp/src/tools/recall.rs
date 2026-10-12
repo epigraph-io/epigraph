@@ -122,8 +122,11 @@ pub struct RecallWithContextParams {
     pub corroborates_limit: Option<u32>,
     /// Max epistemic-edge neighbours returned **per relationship** per hit
     /// (supports / refutes / contradicts / specializes / elaborates / cites).
-    /// Default 4. Per-relationship rather than per-hit so a claim with many
-    /// `supports` edges cannot crowd out its single `refutes`.
+    /// Default 4, minimum 1 (0 is raised to 1). Per-relationship rather than
+    /// per-hit so a claim with many `supports` edges cannot crowd out its single
+    /// `refutes`. The floor keeps `epistemic_edges_total` honest: the total rides
+    /// on the returned rows, so a cap of 0 would report `total: 0,
+    /// truncated: false` for a hit that has visible neighbours.
     pub epistemic_limit: Option<u32>,
     pub neighbor_paragraphs_limit: Option<u32>,
     /// When `true`, run the diverse retrieval pipeline before structural
@@ -216,11 +219,12 @@ pub struct RecallWithContextParams {
     /// be exhaustive.
     ///
     /// **Boundary: the window constrains top-level HITS, not their CONTEXT.**
-    /// `atoms`, `siblings`, `corroborates`, `neighbor_paragraphs`, `section`
-    /// and `paper` are deliberately NOT filtered. A two-year-old supporting
-    /// paragraph is legitimate evidence for a claim created yesterday;
-    /// dropping it would remove the caller's ability to see *why* a recent
-    /// hit is believed, which is the opposite of what this parameter is for.
+    /// `atoms`, `siblings`, `corroborates`, `epistemic_edges`,
+    /// `neighbor_paragraphs`, `section` and `paper` are deliberately NOT
+    /// filtered. A two-year-old supporting paragraph is legitimate evidence
+    /// for a claim created yesterday; dropping it would remove the caller's
+    /// ability to see *why* a recent hit is believed, which is the opposite of
+    /// what this parameter is for.
     /// "What changed since T" is a question about hits; the reasons a hit is
     /// believed are older than the change by construction.
     ///
@@ -559,6 +563,16 @@ pub struct RecallHit {
     pub corroborates: Vec<CorroboratesEdge>,
     pub corroborates_total: usize,
     pub corroborates_truncated: bool,
+    /// Epistemic-edge neighbours (supports / refutes / contradicts / specializes /
+    /// elaborates / cites), capped at `epistemic_limit` PER RELATIONSHIP. `direction`
+    /// is from this paragraph's view: incoming `refutes` = "is refuted by".
+    /// Always serialized (like `corroborates`), so an empty list means "none
+    /// visible", not "not computed" (backlog 922a1e54).
+    pub epistemic_edges: Vec<EpistemicEdgeNeighbor>,
+    /// Every epistemic neighbour visible to the caller, across relationships,
+    /// before the per-relationship cap.
+    pub epistemic_edges_total: usize,
+    pub epistemic_edges_truncated: bool,
     pub neighbor_paragraphs: Vec<NeighborParagraph>,
     pub neighbor_paragraphs_total: usize,
     pub neighbor_paragraphs_truncated: bool,
@@ -696,7 +710,7 @@ pub async fn recall_with_context(
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
     let corroborates_limit = params.corroborates_limit.unwrap_or(4);
-    let epistemic_limit = params.epistemic_limit.unwrap_or(4);
+    let epistemic_limit = params.epistemic_limit.unwrap_or(4).max(1);
     let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
@@ -1310,6 +1324,18 @@ async fn recall_with_context_post_embed(
             .unwrap_or(corroborates.len());
         let corroborates_truncated = corroborates_total > corroborates.len();
 
+        let epistemic_edges = ctx
+            .epistemic_edges_by_paragraph
+            .get(&paragraph_id)
+            .cloned()
+            .unwrap_or_default();
+        let epistemic_edges_total = ctx
+            .epistemic_edges_total_by_paragraph
+            .get(&paragraph_id)
+            .copied()
+            .unwrap_or(epistemic_edges.len());
+        let epistemic_edges_truncated = epistemic_edges_total > epistemic_edges.len();
+
         let (neighbor_paragraphs, neighbor_paragraphs_total, neighbor_paragraphs_truncated) =
             assemble_neighbor_paragraphs(
                 paragraph_id,
@@ -1341,6 +1367,9 @@ async fn recall_with_context_post_embed(
             corroborates,
             corroborates_total,
             corroborates_truncated,
+            epistemic_edges,
+            epistemic_edges_total,
+            epistemic_edges_truncated,
             neighbor_paragraphs,
             neighbor_paragraphs_total,
             neighbor_paragraphs_truncated,
@@ -1984,6 +2013,19 @@ pub async fn fetch_batched_context(
     // Direction is part of the payload because it carries the meaning: an
     // incoming `refutes` means "is refuted by", which is the opposite claim
     // about credibility from an outgoing one.
+    //
+    // Three predicates beyond the neighbour claim's visibility, all applied in
+    // `neighbors` / `joined` — BEFORE the window functions, so `total` (and the
+    // hit's `epistemic_edges_truncated`) never counts a row the caller cannot see:
+    //   * the EDGE's own tenancy, verbatim from `ClaimRepository::dispute_batch`.
+    //     Migration 070 honours a `('group', G)` edge between two public claims,
+    //     so the neighbour's visibility alone would disclose another group's
+    //     private assertion that two public claims are related;
+    //   * `EDGE_IN_FORCE` (`epigraph_db::repos::edge`), inlined because
+    //     `query!` needs a literal: a retracted edge (`delete_edge` sets
+    //     `valid_to`) is not live argument;
+    //   * neighbour `is_current`, as `dispute_batch` joins `src.is_current`: a
+    //     superseded claim is not live argument either.
     {
         let relationships: Vec<String> = EPISTEMIC_EDGE_RELATIONSHIPS
             .iter()
@@ -1996,17 +2038,28 @@ pub async fn fetch_batched_context(
                        e.relationship, 'outgoing' AS direction
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
+                  AND ($4::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($5::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($5::uuid[]))))
                 UNION ALL
                 SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
                        e.relationship, 'incoming' AS direction
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
+                  AND ($4::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($5::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($5::uuid[]))))
             ),
             joined AS (
                 SELECT n.paragraph_id, n.neighbor_id, n.relationship, n.direction,
                        c.content, c.truth_value
                 FROM neighbors n
                 JOIN claims c ON c.id = n.neighbor_id
+                  AND c.is_current
                   AND ($4::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($5::uuid[]))
             ),
@@ -2459,7 +2512,7 @@ pub mod __test_only {
         let min_truth = params.min_truth.unwrap_or(0.3);
         let siblings_limit = params.siblings_limit.unwrap_or(8);
         let corroborates_limit = params.corroborates_limit.unwrap_or(4);
-        let epistemic_limit = params.epistemic_limit.unwrap_or(4);
+        let epistemic_limit = params.epistemic_limit.unwrap_or(4).max(1);
         let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
         // Mirror the real entry: resolve + existence-check the lens up front so
         // integration tests exercise the same validation path.
