@@ -374,12 +374,82 @@ mod tests {
     }
 
     #[test]
-    fn test_section_high_radius_when_stale() {
+    fn test_section_over_support_is_consistent() {
         let id = Uuid::new_v4();
-        // Node BetP=0.9 but supporter has BetP=0.3
-        // Expected: 0.3 * 0.8 = 0.24 → radius = |0.9 - 0.24| = 0.66
+        // Node BetP=0.9, supporter BetP=0.3. A supports edge is a one-sided
+        // floor: the node must be at least 0.3 * 0.8 = 0.24, and 0.9 is above
+        // it, so this over-support is benign corroboration: radius 0.
+        // (The symmetric |0.9 - 0.24| = 0.66 this test used to pin was the
+        // I043 bug, the node twin of compute_edge_inconsistency's floor.)
         let section = compute_section(id, 0.9, 0.7, 0.95, &[(0.3, RestrictionKind::Positive(0.8))]);
-        assert!((section.consistency_radius - 0.66).abs() < 1e-9);
+        assert!(
+            section.consistency_radius < 1e-9,
+            "over-support must have radius 0, got {}",
+            section.consistency_radius
+        );
+        assert_eq!(section.neighbor_count, 1);
+    }
+
+    #[test]
+    fn test_section_under_support_still_flags() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.1 under a supporter at 0.8: floor 0.64 -> shortfall 0.54.
+        let section = compute_section(
+            id,
+            0.1,
+            0.05,
+            0.15,
+            &[(0.8, RestrictionKind::Positive(0.8))],
+        );
+        assert!(
+            (section.consistency_radius - 0.54).abs() < 1e-9,
+            "under-support shortfall should be 0.54, got {}",
+            section.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_section_floor_is_max_over_supporters() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.55; supporters 0.9 (floor 0.72) and 0.1 (floor 0.08).
+        // Binding floor is the max: radius 0.72 - 0.55 = 0.17, which equals
+        // the worst compute_edge_inconsistency over the supports edges.
+        // (A mean floor 0.40 would give 0; the old symmetric metric 0.15.)
+        let section = compute_section(
+            id,
+            0.55,
+            0.5,
+            0.6,
+            &[
+                (0.9, RestrictionKind::Positive(0.8)),
+                (0.1, RestrictionKind::Positive(0.8)),
+            ],
+        );
+        let worst_edge = compute_edge_inconsistency(0.9, 0.55, "supports")
+            .0
+            .max(compute_edge_inconsistency(0.1, 0.55, "supports").0);
+        assert!((worst_edge - 0.17).abs() < 1e-9);
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst supports-edge shortfall {}",
+            section.consistency_radius,
+            worst_edge
+        );
+    }
+
+    #[test]
+    fn test_section_negative_only_unchanged() {
+        let id = Uuid::new_v4();
+        // Negative-only nodes keep the symmetric metric bit-for-bit:
+        // expected = (1 - 0.8) * 0.9 = 0.18, radius |0.8 - 0.18| = 0.62.
+        let neighbors = [(0.8, RestrictionKind::Negative(0.9))];
+        let section = compute_section(id, 0.8, 0.7, 0.9, &neighbors);
+        let expected = compute_expected_betp(&neighbors).unwrap();
+        assert_eq!(
+            section.consistency_radius.to_bits(),
+            (0.8f64 - expected).abs().to_bits()
+        );
+        assert!((section.consistency_radius - 0.62).abs() < 1e-9);
     }
 
     #[test]
