@@ -284,3 +284,57 @@ async fn improve_workflow_hierarchy_rejects_empty_thesis(pool: sqlx::PgPool) {
         "error should describe the blank content problem; got: {err_msg}"
     );
 }
+
+/// U032 (backlog 28fb40c4 / 1e6872e7): `improve_workflow_hierarchy` mints
+/// `max(generation) + 1` on EVERY call, so a payload whose steps were lost (an
+/// unrecognised key parses as `phases: []`) used to commit a step-less
+/// generation per attempt — the 7 empty stubs of the weekly-capability-audit
+/// lineage. It must be refused as INVALID_PARAMS (a caller error, so the agent
+/// stops retrying, not INTERNAL_ERROR, which invites a retry) and must mint
+/// nothing, however often it is retried.
+#[sqlx::test(migrations = "../../migrations")]
+async fn improve_with_no_steps_is_invalid_params_and_mints_no_generation(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let canonical = "test-improve-hier-no-steps";
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &viewer,
+        &parent_extraction(canonical),
+    )
+    .await
+    .expect("parent ingest");
+    let max_before = epigraph_db::WorkflowRepository::max_generation_by_canonical(&pool, canonical)
+        .await
+        .expect("max generation")
+        .expect("the parent exists");
+
+    let mut stepless = improved_extraction();
+    stepless.thesis = Some("A re-authoring whose steps were lost".to_string());
+    stepless.phases = vec![];
+    for _retry in 0..2 {
+        let err = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
+            &pool,
+            &viewer,
+            canonical,
+            stepless.clone(),
+        )
+        .await
+        .expect_err("a step-less new generation must be refused");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "a step-less generation is the caller's error; got {err:?}"
+        );
+        assert!(
+            err.message.contains("empty workflow generation"),
+            "the refusal must say why; got: {}",
+            err.message
+        );
+    }
+
+    let max_after = epigraph_db::WorkflowRepository::max_generation_by_canonical(&pool, canonical)
+        .await
+        .expect("max generation")
+        .expect("the parent exists");
+    assert_eq!(max_after, max_before, "no generation was minted");
+}

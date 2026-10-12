@@ -2576,6 +2576,29 @@ mod tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
+    /// U032: a step-less new generation (or an empty plan) is the caller's
+    /// payload error — 400 with the executor's reason, not a 500 that invites
+    /// a retry (the retry loop is what minted the empty generations).
+    #[test]
+    fn an_empty_generation_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("empty workflow generation")
+                    && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.

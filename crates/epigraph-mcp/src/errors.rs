@@ -234,6 +234,31 @@ mod tests {
         );
     }
 
+    /// U032: a step-less new generation (or an empty plan) is the CALLER's
+    /// payload error. As INTERNAL_ERROR it invited the very retry loop that
+    /// minted 7 empty generations in ~90 s; it must be INVALID_PARAMS and keep
+    /// the executor's reason text.
+    #[test]
+    fn an_empty_generation_is_invalid_params() {
+        let e = executor_caller_error(
+            "workflow ingest",
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("empty workflow generation")
+                && e.message.contains("weekly-capability-audit")
+                && e.message.contains("Nothing was written"),
+            "{}",
+            e.message
+        );
+    }
+
     /// The executor wraps the refusal in `IngestExecutorError::Repository`; the
     /// workflow-ingest and add_step tools must still surface it as the denial,
     /// and must keep every other executor failure a server fault.
