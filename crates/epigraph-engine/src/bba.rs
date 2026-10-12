@@ -259,17 +259,52 @@ pub fn build_bba_directed(
 }
 
 /// Re-express a BBA built by [`build_bba_directed`] (on its 2-way
-/// `["supported", "unsupported"]` frame) on `target`.
+/// `["supported", "unsupported"]` frame) on `target`, whose index 0 is
+/// "supported" and index 1 is "refuted"/"unsupported".
 ///
-/// STUB: the naive JSON round trip the assess route used before U027.
+/// A JSON round trip (`masses_to_json` then `from_json_masses(target, ..)`) is
+/// NOT this: it keeps the key `"0,1"`, which on a 3-hypothesis frame such as
+/// `claim_validity` means {supported, refuted}, a claim of knowledge, while on
+/// the source frame it was Theta, total closed-world ignorance. So:
+///
+/// - positive `{0}` -> `{0}`, positive `{1}` -> `{1}`;
+/// - the source's Theta `{0,1}` -> the target's Theta (all its hypotheses);
+/// - complement elements keep their meaning: `(empty, true)` (open-world
+///   vacuous) is unchanged, and `(source Theta, true)` (missing) becomes the
+///   target's missing element.
+///
+/// Further target hypotheses (e.g. `claim_validity`'s "uncertain") are
+/// hypotheses, not ignorance, and receive no mass beyond their share of Theta.
+/// On a 2-hypothesis target this is the identity on focal elements.
 ///
 /// # Errors
-/// Never, in this stub.
+/// `BbaError::DsError` if `target` has fewer than two hypotheses or the result
+/// fails `MassFunction` validation.
 pub fn remap_binary_bba_to_frame(
     mf: &MassFunction,
     target: &FrameOfDiscernment,
 ) -> Result<MassFunction, BbaError> {
-    MassFunction::from_json_masses(target.clone(), &mf.masses_to_json()).map_err(BbaError::DsError)
+    if target.hypothesis_count() < 2 {
+        return Err(BbaError::DsError(format!(
+            "cannot remap a binary BBA onto {} hypothesis(es)",
+            target.hypothesis_count()
+        )));
+    }
+    let source_theta = mf.frame().full_set();
+    let mut out: BTreeMap<FocalElement, f64> = BTreeMap::new();
+    for (fe, &m) in mf.masses() {
+        let subset = if fe.subset == source_theta {
+            target.full_set()
+        } else {
+            fe.subset.clone()
+        };
+        let mapped = FocalElement {
+            subset,
+            complement: fe.complement,
+        };
+        *out.entry(mapped).or_insert(0.0) += m;
+    }
+    MassFunction::new(target.clone(), out).map_err(|e| BbaError::DsError(e.to_string()))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
