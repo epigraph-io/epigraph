@@ -29,9 +29,11 @@
 //! which is the precondition each of these arms was previously trying to
 //! manufacture by mutating a shared one. **The DDL and the dedup DELETE are
 //! unchanged and every assertion is unchanged** — only their blast radius is.
-//! Note that the constraint is now PRESENT at test start (migration 013 runs),
-//! so the pre-107 arms must drop it explicitly; that explicit drop is what
-//! establishes the pre-107 fixture rather than an accident of shared state.
+//! Since migration 150 (backlog 00f1a517) the constraint is ABSENT at test
+//! start — 013 adds it and 150 drops it, matching the long-lived database — so
+//! the post-107 arms add it explicitly and the pre-107 arms still drop it
+//! explicitly; each fixture states its own precondition rather than inheriting
+//! one from shared state or migration order.
 //!
 //! Transactional rollback was rejected: a wrapping transaction cannot contain
 //! `ALTER TABLE` for a concurrent observer, and `ClaimRepository::create` takes
@@ -101,10 +103,10 @@ fn disposable_db_classification() {
 /// test exercises the pre-107 path. See docs/architecture/noun-claims-and-verb-edges.md
 /// for the rationale of running both pre- and post-107 fixtures.
 ///
-/// `IF EXISTS` is still the right spelling even though migration 013 now always
-/// leaves the constraint in place on the injected database: the helper states
-/// "afterwards the constraint is absent", which is the fixture's contract, not
-/// "a constraint was removed".
+/// `IF EXISTS` is the right spelling: from migration 150 the injected database
+/// already lacks the constraint, and the helper states "afterwards the
+/// constraint is absent", which is the fixture's contract, not "a constraint
+/// was removed".
 async fn drop_unique_constraint(pool: &PgPool) {
     sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
         .execute(pool)
@@ -139,13 +141,13 @@ async fn drop_unique_constraint(pool: &PgPool) {
 /// the constraint to be PRESENT, and still assert `DuplicateKey` /
 /// `was_created` false-on-second-call against it.
 ///
-/// # The ADD is now a fallback, and the helper proves its post-condition
+/// # The ADD is the normal path again, and the helper proves its post-condition
 ///
-/// Say plainly what the isolation changed: migration 013 creates
-/// `uq_claims_content_hash_agent` and no later migration drops it, so on the
-/// freshly-migrated per-test database the constraint is ALREADY there and the
-/// ALTER always takes the exception path. The ADD adds nothing; it is a
-/// fallback for a database that arrives without it. Because a helper whose
+/// Migration 013 creates `uq_claims_content_hash_agent` and migration 150 drops
+/// it again (backlog 00f1a517: the long-lived database never had it), so on
+/// the freshly-migrated per-test database the constraint is ABSENT and the
+/// ALTER really adds it. The exception path remains for a database that
+/// arrives with it (one migrated only to 013-149). Because a helper whose
 /// every statement can be swallowed cannot fail, the post-condition is
 /// asserted against `pg_constraint` at the end rather than assumed.
 ///
@@ -185,15 +187,11 @@ async fn add_unique_constraint(pool: &PgPool) {
 
     // Assert the POST-CONDITION rather than trusting the swallow.
     //
-    // On a freshly-migrated database migration 013 has already created this
-    // constraint, so the ALTER above always raises 42P07 and is always caught:
-    // the ADD is a fallback, not the normal path, and the helper can no longer
-    // fail by itself. That is fine for the post-107 arms — the constraint is
-    // genuinely present — but it means a future edit that renamed the
-    // constraint, named the wrong columns or targeted the wrong table would be
-    // swallowed identically and leave the arms asserting DuplicateKey against
-    // whatever 013 happens to provide. Checking pg_constraint closes that gap:
-    // the fixture now proves the precondition it claims to establish.
+    // On a database that already has this constraint the ALTER above raises
+    // 42P07 and is caught, so the helper cannot fail by itself there; a future
+    // edit that renamed the constraint, named the wrong columns or targeted the
+    // wrong table would be swallowed identically. Checking pg_constraint closes
+    // that gap: the fixture proves the precondition it claims to establish.
     let present: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_constraint
          WHERE conname = 'uq_claims_content_hash_agent'

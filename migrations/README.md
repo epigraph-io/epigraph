@@ -30,10 +30,25 @@ to run against non-disposable databases (see `db_is_disposable` /
 drift, and the ~169k duplicate rows that accumulated while `claims` was
 unconstrained, still need reconciling.
 
-**Do not "fix" this with a new migration that re-adds the constraint.** A bare
-`ADD CONSTRAINT` fails on the duplicates, and per the append-only rule above a
-failed migration panics the api binary on restart — turning silent drift into a
-deploy outage. Audit first:
+**Decided 2026-10-12 (backlog 00f1a517, drain U044, option C): the drift is
+accepted, and CI now has it too.** Migration 150 drops the constraint
+`IF EXISTS` (a no-op on the long-lived database), so no database carries it and
+green CI no longer proves a dedup guarantee production lacks. The contract is
+enforced in the application instead: `ClaimRepository::create_or_get_signed`
+and POST /claims (`if_not_exists=false`) take a transaction-scoped advisory
+lock on `(content_hash, agent_id)` (`ClaimRepository::lock_content_hash_agent`)
+before their find, so concurrent first creates serialize rather than both
+inserting. A writer that inserts into `claims` WITHOUT that lock (the
+deterministic-id ingest paths, raw-SQL fixtures) is not deduplicated by it.
+
+**Do not re-add the full constraint.** A bare `ADD CONSTRAINT` fails on the
+duplicates (most are supersession history, which a full UNIQUE would force us
+to delete), and per the append-only rule above a failed migration panics the
+api binary on restart — turning silent drift into a deploy outage. The future
+target is a partial unique index `(content_hash, agent_id) WHERE is_current`
+(`CREATE UNIQUE INDEX CONCURRENTLY` in a `-- no-transaction` file), and only
+after the live duplicate groups are reconciled with `mark_duplicate`; the
+repository's `DuplicateKey` catch arms stay for it. Audit first:
 
 ```bash
 python3 scripts/audit_claims_content_hash_agent.py     # read-only
@@ -1262,6 +1277,20 @@ restart.
   conjunct is absent and a client whose agent is the public-constant
   workflow-ingest identity is kept off the allowlist only by the operator's
   care (the allow command's agent-client warning). **Applied to throwaway databases only,
+  NOT to any deployed database.**
+- **150**: public `drop_uq_claims_content_hash_agent` (drain U044, backlog
+  00f1a517) — `ALTER TABLE claims DROP CONSTRAINT IF EXISTS
+  uq_claims_content_hash_agent`, so every database matches the long-lived one
+  (see "Known schema drift" above). The `(content_hash, agent_id)` dedup is
+  the application's advisory lock from the same PR. A no-op on the long-lived
+  database; cannot fail on data. Slot from the drain register (147 released);
+  checked before claiming: no open PR branch carries a `150`. Sets
+  `lock_timeout = '3s'`. Pinned by `epigraph-db/tests/claim_repo_helpers.rs`
+  (`the_dedup_race_is_serialized_*`) and
+  `epigraph-api/tests/post_claims_dedup_409.rs`. **Deploy order:** none
+  against other migrations. On a database that still HAS the constraint,
+  apply it with (or after) the binaries that take the lock: before them the
+  constraint is that database's only race guard. Undo is in the file's header. **Applied to throwaway databases only,
   NOT to any deployed database.**
 - **153**: public `armed_lineage_stays_in_group` — once the operator binding
   is armed, a non-privileged session leaves no CURRENT claim naming

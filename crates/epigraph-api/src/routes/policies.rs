@@ -183,10 +183,11 @@ pub async fn create_challenge(
     //
     // The existing row is FOUND, not inferred from a unique violation.
     // `uq_claims_content_hash_agent` (migration 013) is absent on the
-    // long-lived production database (migrations/README.md, "Known schema
-    // drift"), so a handler that relied on the constraint firing would 500 on
-    // a fresh database and silently mint a duplicate pending challenge on
-    // production. The lookup works with or without the constraint.
+    // long-lived production database and, since migration 150, on every
+    // database (migrations/README.md, "Known schema drift"), so a handler that
+    // relied on the constraint firing would silently mint a duplicate pending
+    // challenge (and 500 where a database still has it). The lookup works with
+    // or without the constraint.
     //
     // The transaction-scoped advisory lock serializes concurrent creates of
     // the same challenge, so two first requests racing each other cannot both
@@ -619,11 +620,20 @@ mod tests {
         .unwrap()
     }
 
-    /// The fresh-database shape: `uq_claims_content_hash_agent` is present, so
-    /// a second identical insert is a unique violation. Before the lookup the
-    /// repeat answered 500 `Failed to create challenge: ... duplicate key`.
+    /// The constraint-present shape: with `uq_claims_content_hash_agent` in
+    /// force a second identical insert is a unique violation, and before the
+    /// lookup the repeat answered 500 `Failed to create challenge: ... duplicate
+    /// key`. Migration 150 drops the constraint from every database, so this
+    /// arm re-adds it: a database migrated only to 013-149 still has it.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_challenge_repeat_returns_the_existing_challenge(pool: PgPool) {
+        sqlx::query(
+            "ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent \
+             UNIQUE (content_hash, agent_id)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let body = serde_json::json!({ "host": "idem.example", "port": 8443, "protocol": "https" });
 
         let first = create_ok(test_state(pool.clone()), &body, "first").await;
@@ -650,12 +660,13 @@ mod tests {
     }
 
     /// The PRODUCTION shape: `migrations/README.md` records that the
-    /// long-lived database has no `uq_claims_content_hash_agent`. There the
-    /// repeat never errored — it silently inserted a second pending challenge.
-    /// A fix that only caught the unique violation would still do that.
+    /// long-lived database has no `uq_claims_content_hash_agent` (and from
+    /// migration 150 no database does). There the repeat never errored — it
+    /// silently inserted a second pending challenge. A fix that only caught the
+    /// unique violation would still do that.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_challenge_repeat_is_idempotent_without_the_unique_constraint(pool: PgPool) {
-        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
             .execute(&pool)
             .await
             .unwrap();
@@ -688,7 +699,7 @@ mod tests {
     async fn concurrent_first_creates_yield_one_challenge_without_the_unique_constraint(
         pool: PgPool,
     ) {
-        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
             .execute(&pool)
             .await
             .unwrap();
