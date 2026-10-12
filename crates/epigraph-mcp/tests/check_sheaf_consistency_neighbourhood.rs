@@ -88,7 +88,7 @@ async fn sections(
     body["sections"].as_array().expect("sections array").clone()
 }
 
-fn section_of<'a>(sections: &'a [Value], id: Uuid) -> Option<&'a Value> {
+fn section_of(sections: &[Value], id: Uuid) -> Option<&Value> {
     sections.iter().find(|s| s["node_id"] == id.to_string())
 }
 
@@ -248,5 +248,24 @@ async fn the_regulatory_profile_tightens_the_floor(pool: PgPool) {
     assert!(
         (reg - 0.755).abs() < 1e-9,
         "regulatory: 0.95*0.9 - 0.1 = 0.755, got {reg}"
+    );
+}
+
+/// The neighbour's Bel (not its BetP) sets a Positive floor, as in U029's
+/// edge arm: a supporter at [0.7, 1.0] (BetP 0.85) floors its target at
+/// 0.8*0.7 = 0.56, not 0.8*0.85 = 0.68. The old query returned no neighbour
+/// Bel/Pl, so the consumer used the point interval at BetP.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_floor_uses_the_neighbours_belief_not_its_betp(pool: PgPool) {
+    let weak = claim(&pool, None, 0.1, 0.2).await;
+    let wide = claim(&pool, None, 0.7, 1.0).await;
+    edge(&pool, wide, weak, "supports").await;
+
+    let server = build_test_server(pool.clone());
+    let all = sections(&server, &pool, 200, None).await;
+    let r = radius(section_of(&all, weak).expect("the weak target is flagged"));
+    assert!(
+        (r - 0.46).abs() < 1e-9,
+        "floor 0.8*Bel 0.7 = 0.56, minus Bel 0.1 = 0.46; 0.58 means BetP was used. Got {r}"
     );
 }
