@@ -577,14 +577,16 @@ async fn trigger_function(pool: &PgPool) -> (String, String, Option<String>) {
 }
 
 /// `docs/runbooks/153-undo.sql`, applied twice to a database that went
-/// pre-153 -> 153, restores the pre-153 definition of the claims binding
+/// pre-153 -> 153 (not to head), restores the pre-153 definition of the claims binding
 /// trigger function byte for byte, with its owner and ACL; at 153 the function
 /// is owned by the maintenance role.
 #[sqlx::test(migrations = false)]
 async fn the_153_rollback_restores_the_pre_153_trigger_body(pool: PgPool) {
     migrate(&pool, &up_to_below(153)).await;
     let before = trigger_function(&pool).await;
-    migrate(&pool, &MIGRATOR).await;
+    // Up to 153 INCLUSIVE, not head: the undo reverses 153 alone, so a later
+    // migration's change must not be charged to it.
+    migrate(&pool, &up_to_below(154)).await;
     let at_153 = trigger_function(&pool).await;
     assert_ne!(at_153.0, before.0, "CALIBRATION: 153 re-bodied the function");
     assert_eq!(
