@@ -214,7 +214,9 @@ async fn successors_of(pool: &PgPool, id: Uuid) -> i64 {
 /// corpus shape), written before arming as the corpus was.
 async fn corpus_claim(pool: &PgPool) -> Uuid {
     let (legacy, _) = fixture::seed_agent_with_group(pool, "legacy-author").await;
-    insert_claim(pool, legacy, WORLD).await.expect("corpus claim")
+    insert_claim(pool, legacy, WORLD)
+        .await
+        .expect("corpus claim")
 }
 
 /// The three statements that attach a current successor in the writer's own
@@ -270,8 +272,14 @@ async fn three_doors(
     .await;
 
     [
-        (insert, "an INSERT of a current successor in the writer's group"),
-        (first_set, "a first SET supersedes on a claim that stays current"),
+        (
+            insert,
+            "an INSERT of a current successor in the writer's group",
+        ),
+        (
+            first_set,
+            "a first SET supersedes on a claim that stays current",
+        ),
         (reopen, "a re-open of a retired row naming the predecessor"),
     ]
 }
@@ -365,7 +373,9 @@ async fn a_lineage_does_not_move_between_groups_the_writer_writes(pool: PgPool) 
     .execute(&pool)
     .await
     .expect("A writes G2 too");
-    let own = insert_claim(&pool, a, g1).await.expect("A's own claim in G1");
+    let own = insert_claim(&pool, a, g1)
+        .await
+        .expect("A's own claim in G1");
     let bs = insert_claim(&pool, b, bg).await.expect("B's claim");
     arm(&pool).await;
     let sets = [g1, g2];
@@ -429,7 +439,10 @@ async fn the_sanctioned_lineage_writes_are_unchanged(pool: PgPool) {
     })
     .await
     .expect("A supersedes its legacy author's claim");
-    assert_eq!(row_of(&pool, s_legacy).await, (ag, Some(legacy_claim), true));
+    assert_eq!(
+        row_of(&pool, s_legacy).await,
+        (ag, Some(legacy_claim), true)
+    );
 
     // The custodial supersede (maintenance DSN), and a raw cross-group write
     // on a privileged session: only a privileged session crosses groups.
@@ -588,7 +601,10 @@ async fn the_153_rollback_restores_the_pre_153_trigger_body(pool: PgPool) {
     // migration's change must not be charged to it.
     migrate(&pool, &up_to_below(154)).await;
     let at_153 = trigger_function(&pool).await;
-    assert_ne!(at_153.0, before.0, "CALIBRATION: 153 re-bodied the function");
+    assert_ne!(
+        at_153.0, before.0,
+        "CALIBRATION: 153 re-bodied the function"
+    );
     assert_eq!(
         at_153.1, "epigraph_maintenance",
         "153 keeps the function maintenance-owned"
