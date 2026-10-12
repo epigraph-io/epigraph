@@ -88,6 +88,12 @@
 //! `retargeted_to` is fully wired (`retarget_unwired == []`). Meanwhile,
 //! exclude parent edges carrying `retargeted_to` from row-count conflict
 //! metrics.
+//!
+//! The same reason fixes the ATOM's evidence policy (U041): atoms carry
+//! derivation provenance, not derived belief, until `decomposes_to`
+//! propagation exists. `decompose_claims` records one `document` evidence row
+//! per atom naming its parent and writes no BBA, so an atom's belief comes only
+//! from independent evidence or from edges such as the retargets above.
 
 use crate::decompose::strip_code_fence;
 use serde::{Deserialize, Serialize};
