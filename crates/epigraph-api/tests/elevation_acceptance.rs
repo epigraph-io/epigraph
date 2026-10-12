@@ -1056,7 +1056,8 @@ async fn one_act_runs_only_after_its_confirmation(pool: PgPool) {
     let (holder, by) = (x.person, p.person);
     let assignment: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let a = sqlx::query_scalar(
-            "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'test')",
+            "SELECT public.epigraph_grant_role('role:auditor', $1, \
+                    now() - interval '30 seconds', NULL, $2, 'test')",
         )
         .bind(holder)
         .bind(by)

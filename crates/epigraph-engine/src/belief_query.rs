@@ -144,9 +144,10 @@ pub async fn get_belief(
         // × locality, via `effective_source_strength`) before combining, so the
         // framed read agrees with the cached `claims.pignistic_prob` that the
         // recompute path writes. `perspective = None` → global calibration.
-        let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, None)
-            .await?
-            .expect("all_bbas is non-empty so combination yields Some");
+        let (combined, fold_conflict) =
+            recompute_framed_belief(pool, frame_id, &frame, &all_bbas, None)
+                .await?
+                .expect("all_bbas is non-empty so combination yields Some");
 
         let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
         let bel = epigraph_ds::measures::belief(&combined, &target);
@@ -157,7 +158,7 @@ pub async fn get_belief(
             belief: bel,
             plausibility: pl,
             pignistic_prob: betp,
-            mass_on_conflict: combined.mass_of_conflict(),
+            mass_on_conflict: fold_conflict,
             mass_on_missing: combined.mass_of_missing(),
             framed: true,
             source: "recomputed".to_string(),
@@ -278,16 +279,17 @@ pub async fn get_perspective_belief(
         })
         .unwrap_or_default();
 
-    let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, Some(&perspective))
-        .await?
-        .expect("all_bbas is non-empty so combination yields Some");
+    let (combined, fold_conflict) =
+        recompute_framed_belief(pool, frame_id, &frame, &all_bbas, Some(&perspective))
+            .await?
+            .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     Ok(BeliefInterval {
         belief: epigraph_ds::measures::belief(&combined, &target),
         plausibility: epigraph_ds::measures::plausibility(&combined, &target),
         pignistic_prob: epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index),
-        mass_on_conflict: combined.mass_of_conflict(),
+        mass_on_conflict: fold_conflict,
         mass_on_missing: combined.mass_of_missing(),
         framed: true,
         source: "recomputed_perspective".to_string(),
@@ -374,7 +376,7 @@ fn combine_framed_bbas(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
     ctx: &FramedBeliefContext,
-) -> Result<Option<MassFunction>, BeliefQueryError> {
+) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -401,14 +403,20 @@ fn combine_framed_bbas(
         mass_fns.push(combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?);
     }
 
-    // Combine via the SAME adaptive rule the recompute/write path uses
-    // (`combine_multiple`: canonical sort + per-step Dempster/Conjunctive/
-    // Yager/Inagaki selection by conflict). Matching it — not a plain Dempster
-    // fold — is what makes this compute-on-read result reproduce the recompute
-    // path's combination for the same discounted BBAs.
-    let (combined, _reports) =
+    // Combine via the SAME rule the recompute/write path uses
+    // (`combine_multiple`: canonical sort + a Dempster step per BBA since U025).
+    // Matching it is what makes this compute-on-read result reproduce the
+    // recompute path's combination for the same discounted BBAs.
+    //
+    // The conflict is reported the same way the recompute caches it
+    // (`edge_factor::compute_combined_belief` -> `claims.mass_on_empty`): the
+    // fold's `aggregate_conflict`, because Dempster normalises it out of the
+    // combined mass. A single BBA is not folded; its own empty-set mass is
+    // the conflict.
+    let (combined, reports) =
         combination::combine_multiple(&mass_fns, 0.9).map_err(BeliefQueryError::Ds)?;
-    Ok(Some(combined))
+    let conflict = combination::fold_conflict(&combined, &reports);
+    Ok(Some((combined, conflict)))
 }
 
 /// Recompute the combined mass function for a framed claim, discounting each
@@ -429,7 +437,7 @@ async fn recompute_framed_belief(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
     perspective: Option<&PerspectiveReliability>,
-) -> Result<Option<MassFunction>, BeliefQueryError> {
+) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -531,7 +539,7 @@ async fn perspective_belief_for_claim(
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
-    let combined = combine_framed_bbas(frame, &all_bbas, ctx)?
+    let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
@@ -539,7 +547,7 @@ async fn perspective_belief_for_claim(
         belief: epigraph_ds::measures::belief(&combined, &target),
         plausibility: epigraph_ds::measures::plausibility(&combined, &target),
         pignistic_prob: epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index),
-        mass_on_conflict: combined.mass_of_conflict(),
+        mass_on_conflict: fold_conflict,
         mass_on_missing: combined.mass_of_missing(),
         framed: true,
         source: "recomputed_perspective".to_string(),
