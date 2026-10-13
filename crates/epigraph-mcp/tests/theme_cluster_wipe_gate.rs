@@ -25,6 +25,14 @@
 //! `admin_wipe_with_the_canonical_prefix_replaces_the_set` is the calibration:
 //! it proves this fixture DOES observe a wipe, so the "untouched" assertions
 //! elsewhere are not vacuous.
+//!
+//! # Out of scope
+//!
+//! These tests pin the WIPE only. An admitted additive run (the default, open
+//! to a `claims:write` caller under any prefix) that does create themes still
+//! re-points its clustered claims' `theme_id` at the new themes
+//! (`ClaimThemeRepository::bulk_assign`); this fixture deliberately cannot
+//! observe that, and nothing here claims it is prevented.
 
 mod common;
 
@@ -110,7 +118,7 @@ fn params(wipe_first: Option<bool>, label_prefix: Option<&str>) -> ThemeClusterP
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn non_admin_call_with_defaults_leaves_the_theme_set_untouched(pool: PgPool) {
+async fn non_admin_call_with_defaults_does_not_wipe_the_theme_set(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let (theme, member) = seed_live_theme_set(&pool).await;
     let (_, writer, _) = seed_caller(&pool, &["claims:write"]).await;
@@ -127,8 +135,9 @@ async fn non_admin_call_with_defaults_leaves_the_theme_set_untouched(pool: PgPoo
     assert_eq!(
         live_set_state(&pool, theme, member).await,
         (true, Some(theme)),
-        "a theme_cluster call that did not ask for a wipe must leave the existing theme rows \
-         and claims.theme_id untouched (backlog 5abe23de: the default used to be wipe_first=true)"
+        "a theme_cluster call that did not ask for a wipe must not wipe: the sentinel theme \
+         survives and its embedding-less member keeps its theme_id (backlog 5abe23de: the \
+         default used to be wipe_first=true)"
     );
 }
 
