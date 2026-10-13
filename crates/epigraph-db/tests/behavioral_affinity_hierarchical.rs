@@ -172,3 +172,53 @@ async fn hierarchical_affinity_respects_the_similarity_floor(pool: PgPool) {
         "an unrelated goal must not match: {hits:?}"
     );
 }
+
+/// Regression guard for the claim arm the UNION sits beside: a FLAT
+/// execution (its `workflow_id` is a workflow claim) is still keyed on that
+/// claim, still counted once per row, and a hierarchical row in the same
+/// query does not displace it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn flat_claim_executions_still_reach_affinity_beside_hierarchical(pool: PgPool) {
+    let agent_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(blake3::hash(b"u033-flat-agent").as_bytes().as_slice())
+    .bind("u033-flat-agent")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let flat: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind("u033 flat workflow")
+    .bind(blake3::hash(b"u033 flat workflow").as_bytes().as_slice())
+    .bind(agent_id)
+    .bind(0.8_f64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let hier = insert_workflow(&pool, "u033-affinity-beside-flat", 1.0).await;
+    let q = axis_vec(4);
+    let t0 = Utc::now();
+    // Two flat reports (one row each) and one 2-step hierarchical report.
+    insert_report(&pool, flat, true, 1, t0, &q).await;
+    insert_report(&pool, flat, true, 1, t0 + Duration::seconds(1), &q).await;
+    insert_report(&pool, hier, true, 2, t0, &q).await;
+
+    let viewer = public_viewer(&pool).await;
+    let hits =
+        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 1, 10)
+            .await
+            .expect("affinity query");
+    let flat_hit = hits
+        .iter()
+        .find(|(id, _, _)| *id == flat)
+        .unwrap_or_else(|| panic!("flat workflow claim {flat} missing: {hits:?}"));
+    assert_eq!(flat_hit.2, 2, "flat rows count once each: {flat_hit:?}");
+    let hier_hit = hits
+        .iter()
+        .find(|(id, _, _)| *id == hier)
+        .unwrap_or_else(|| panic!("hierarchical workflow {hier} missing: {hits:?}"));
+    assert_eq!(hier_hit.2, 1, "one hierarchical report: {hier_hit:?}");
+}
