@@ -183,6 +183,9 @@ class ReconcilerMainTests(unittest.TestCase):
             patched_urls,
             sorted(f"http://api.test/api/v1/claims/{b}/labels" for b in (B1, B2)),
         )
+        # Each PATCH adds exactly the `resolved` label and removes nothing.
+        for c in patch.call_args_list:
+            self.assertEqual(c.kwargs["json"], {"add": ["resolved"], "remove": []})
         self.assertEqual(err, "")
         self.assertEqual(
             self._summary(out), "Reconciler: patched=2 needs_review=0 apply=True"
