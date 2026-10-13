@@ -3053,6 +3053,140 @@ mod tests {
         assert_eq!(metadata["success_count"], 1);
     }
 
+    /// A bare hierarchical root plus the outcome route alone (U033 fixtures).
+    async fn outcome_fixture(pool: &PgPool, canonical_name: &str) -> (axum::Router, uuid::Uuid) {
+        use crate::state::{ApiConfig, AppState};
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome atomicity.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn post_outcome(
+        app: axum::Router,
+        workflow_id: uuid::Uuid,
+        body: serde_json::Value,
+    ) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                ))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    fn two_step_body(quality: Option<f64>) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "outcome_details": "ok",
+            "quality": quality,
+            "step_executions": [
+                {"step_index": 0, "planned": "Step A", "actual": "done", "deviated": false},
+                {"step_index": 1, "planned": "Step B", "actual": "done", "deviated": false}
+            ]
+        })
+    }
+
+    async fn outcome_counters_and_rows(
+        pool: &PgPool,
+        workflow_id: uuid::Uuid,
+    ) -> (serde_json::Value, i64) {
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (metadata, rows)
+    }
+
+    /// U033 / I229, HTTP twin: a step row the database refuses fails the
+    /// whole report (5xx) and moves nothing. Real DB failure injection: a
+    /// BEFORE INSERT trigger refusing only the second step. Before U033 the
+    /// counters autocommitted first, step A landed, step B was logged and
+    /// skipped, and the handler answered 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_is_all_or_nothing_when_a_step_row_fails(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-atomic-http").await;
+        sqlx::query(
+            "CREATE FUNCTION u033_http_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER u033_http_fail BEFORE INSERT ON behavioral_executions \
+             FOR EACH ROW EXECUTE FUNCTION u033_http_fail()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let status = post_outcome(app, workflow_id, two_step_body(None)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "counters must not move when a step row fails: {metadata}"
+        );
+        assert_eq!(rows, 0, "step A must roll back with step B");
+    }
+
+    /// U033 / I229, HTTP twin: an out-of-range `quality` is a 400 with no side
+    /// effects, not a 200 whose step rows the CHECK silently refused.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_rejects_out_of_range_quality(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-quality-http").await;
+        for bad in [1.5_f64, -0.1] {
+            let status = post_outcome(app.clone(), workflow_id, two_step_body(Some(bad))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "quality {bad}");
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        // Positive control: the boundary value lands, both rows included.
+        let status = post_outcome(app, workflow_id, two_step_body(Some(1.0))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 1);
+        assert_eq!(rows, 2);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
         use crate::state::{ApiConfig, AppState};
