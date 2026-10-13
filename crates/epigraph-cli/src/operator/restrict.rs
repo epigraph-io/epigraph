@@ -2052,14 +2052,7 @@ async fn reverse_batch(
 
     let s2 = states_of(conn, specs, &claim_ids, &keys).await?;
     let after = fetch_claims(conn, &claim_ids, false).await?;
-    let ends_after = edge_ends(
-        conn,
-        &deferred
-            .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
-            .collect::<Vec<_>>(),
-    )
-    .await?;
+    let ends_after = edge_ends(conn, &edge_ids(&keys)).await?;
     let counters_after = xact_counters(conn).await?;
     let readable_after = app_readable(conn, specs, &claim_ids, &keys).await?;
 
@@ -2109,6 +2102,34 @@ async fn reverse_batch(
                 "{} {} ended as {got}, the manifest records {want}",
                 k.0, k.1
             ));
+        }
+        // An edge put back on its record must have every endpoint this
+        // manifest moved back on ITS record, read from the database now: a
+        // restored edge never outruns an endpoint that is still restricted.
+        if k.0 == "edges" {
+            if let Some(e) = ends_after.get(&k.1) {
+                for (node, state) in [(&e.source, &e.source_state), (&e.target, &e.target_state)] {
+                    let recorded = match node.1.as_str() {
+                        "claim" if res.claim_posts.contains_key(&node.0) => prior_claims
+                            .get(&node.0)
+                            .map(|r| (r.owner_group_id, r.visibility.clone())),
+                        "evidence" => res
+                            .rows
+                            .get(&("evidence".to_string(), node.0.to_string()))
+                            .map(|r| (r.owner_group_id, r.visibility.clone())),
+                        _ => None,
+                    };
+                    if let Some(r) = recorded {
+                        if *state != r {
+                            v.push(format!(
+                                "edge {} was restored while its endpoint {} {} is ({}, {}), not \
+                                 its recorded ({}, {})",
+                                k.1, node.1, node.0, state.0, state.1, r.0, r.1
+                            ));
+                        }
+                    }
+                }
+            }
         }
         if a.tenancy.visibility != "public" && want.tenancy.visibility == "public" {
             expect_gained.insert(k.clone());
