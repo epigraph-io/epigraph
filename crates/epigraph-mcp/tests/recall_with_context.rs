@@ -1822,6 +1822,58 @@ async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
     );
 }
 
+/// A claim's scope caveats travel with it (backlog 99582af7, design note 3): a
+/// `qualifies` edge ("A bounds the conditions under which B applies") is
+/// returned among the hit's epistemic neighbours, with direction, so a caller
+/// reading the hit also reads where it does NOT hold. Both directions are
+/// seeded: incoming = "is qualified by", outgoing = "qualifies".
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_hit_carries_its_qualifies_caveats(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-qualifies", "Scope caveats").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "anchor hub para", &pgvec, None).await;
+
+    let caveat = seed_neighbour_claim(&pool, agent, "holds only in 1 M monovalent NaCl", 0.9).await;
+    let bounded = seed_neighbour_claim(&pool, agent, "a claim the hub para bounds", 0.7).await;
+    seed_claim_edge(&pool, caveat, para, "qualifies").await; // incoming
+    seed_claim_edge(&pool, para, bounded, "qualifies").await; // outgoing
+
+    let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    assert!(
+        has_edge(&edges, caveat, "qualifies", "incoming"),
+        "the caveat is the edge SOURCE, so the hit must carry it as an incoming \
+         `qualifies` (\"is qualified by\"); got {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, bounded, "qualifies", "outgoing"),
+        "the hit is the SOURCE of the second `qualifies`, so it must be reported \
+         outgoing; got {edges:?}"
+    );
+    assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
+
+    // The contract a caller reads names the relation too.
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let limit_doc = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "recall_with_context")
+        .expect("recall_with_context is registered")["inputSchema"]["properties"]
+        ["epistemic_limit"]["description"]
+        .as_str()
+        .expect("epistemic_limit has a description")
+        .to_string();
+    assert!(
+        limit_doc.contains("elaborates / cites / qualifies"),
+        "recall_with_context's epistemic_limit must list qualifies among the carried \
+         relationships; got: {limit_doc}"
+    );
+}
+
 /// `epistemic_limit` caps PER RELATIONSHIP, keeps the strongest neighbour of
 /// each, and `epistemic_edges_total` / `_truncated` report what the cap hid.
 #[sqlx::test(migrations = "../../migrations")]
