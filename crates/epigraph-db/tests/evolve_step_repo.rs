@@ -305,6 +305,10 @@ async fn evolve_step_supersedes_cascade_carries_structural_edges_but_not_execute
     let executes = seed_typed_edge(&pool, workflow, "workflow", step, "claim", "executes").await;
     let asserted = seed_typed_edge(&pool, other_agent, "agent", step, "claim", "asserts").await;
     let authored = seed_typed_edge(&pool, other_agent, "agent", step, "claim", "AUTHORED").await;
+    // A NON-agent `asserts` (a claim or paper asserting the step, the shape
+    // migration 041 reads) is not authorship by an agent: it follows the head.
+    let asserter = seed_claim(&pool, agent, "a claim that asserts the step", 0.7).await;
+    let claim_asserted = seed_typed_edge(&pool, asserter, "claim", step, "claim", "asserts").await;
 
     let evolved = ClaimRepository::evolve_step(
         &pool,
@@ -369,6 +373,11 @@ async fn evolve_step_supersedes_cascade_carries_structural_edges_but_not_execute
         ends(&pool, authored).await,
         (other_agent, step),
         "agent AUTHORED stays"
+    );
+    assert_eq!(
+        ends(&pool, claim_asserted).await,
+        (asserter, head),
+        "a non-agent asserts follows the head (the carve-out is agents' only)"
     );
 }
 
