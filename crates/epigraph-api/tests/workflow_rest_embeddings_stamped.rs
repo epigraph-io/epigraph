@@ -110,14 +110,35 @@ async fn goal_embedding_present(pool: &PgPool, workflow_id: Uuid) -> bool {
         .expect("read back the workflow row")
 }
 
+/// `(claims authored by `system`, of those how many have embedding IS NULL)`.
+/// Each `sqlx::test` runs in a fresh database and the system agent is created
+/// at the start of the arm, so the system agent's claims are exactly the set
+/// this request wrote, whatever kinds the executor plans.
+async fn system_claim_counts(pool: &PgPool, system: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE embedding IS NULL) FROM claims \
+          WHERE agent_id = $1",
+    )
+    .bind(system)
+    .fetch_one(pool)
+    .await
+    .expect("count the system agent's claims")
+}
+
 /// Asserts that every claim the request wrote is the system agent's and carries
 /// a vector, and that the workflow row carries a goal embedding. The claim and
 /// goal checks have separate messages, so a red run shows which write was lost.
+///
+/// Two claim checks: the hand-listed `contents` (named, so a red run says which
+/// claim lost its vector), and the WHOLE write set (every claim the system agent
+/// authored, which must number `claims_ingested`). The whole-set check covers
+/// claim kinds the list does not name, such as `store_workflow`'s phase summary.
 async fn assert_all_embedded(
     pool: &PgPool,
     system: Uuid,
     workflow_id: Uuid,
     contents: &[String],
+    claims_ingested: u64,
     route: &str,
 ) {
     let rows = claims_by_content(pool, contents).await;
@@ -141,6 +162,18 @@ async fn assert_all_embedded(
         missing.is_empty(),
         "{route}: every claim the request wrote must carry an embedding after a 200; \
          these have embedding IS NULL: {missing:?}"
+    );
+    let (written, unembedded) = system_claim_counts(pool, system).await;
+    assert_eq!(
+        u64::try_from(written).expect("non-negative count"),
+        claims_ingested,
+        "{route}: the system agent's claims are exactly the {claims_ingested} the request wrote"
+    );
+    assert_eq!(
+        unembedded, 0,
+        "{route}: {unembedded} of the {written} claims the request wrote have embedding IS NULL \
+         (the named contents above all carry one, so the missing vector is on a claim kind \
+         the list does not name)"
     );
     assert!(
         goal_embedding_present(pool, workflow_id).await,
@@ -175,9 +208,10 @@ async fn rest_store_workflow_embeds_every_claim_it_writes(pool: PgPool) {
     .expect("store_workflow answers 200");
 
     assert_eq!(body["already_ingested"].as_bool(), Some(false), "{body}");
+    let claims_ingested = body["claims_ingested"].as_u64().unwrap_or(0);
     assert!(
-        body["claims_ingested"].as_u64().unwrap_or(0) >= 3,
-        "the goal and both steps are written: {body}"
+        claims_ingested > 3,
+        "the goal, both steps and the phase summary are written: {body}"
     );
     let workflow_id: Uuid = body["workflow_id"]
         .as_str()
@@ -186,7 +220,15 @@ async fn rest_store_workflow_embeds_every_claim_it_writes(pool: PgPool) {
 
     let mut contents = steps.clone();
     contents.push(goal);
-    assert_all_embedded(&pool, system, workflow_id, &contents, "store_workflow").await;
+    assert_all_embedded(
+        &pool,
+        system,
+        workflow_id,
+        &contents,
+        claims_ingested,
+        "store_workflow",
+    )
+    .await;
 }
 
 /// `POST /api/v1/workflows/ingest`: the thesis, the phase and both step claims
@@ -240,8 +282,9 @@ async fn rest_ingest_workflow_embeds_every_claim_it_writes(pool: PgPool) {
     .expect("ingest_workflow answers 200");
 
     assert_eq!(body["already_ingested"].as_bool(), Some(false), "{body}");
+    let claims_ingested = body["claims_ingested"].as_u64().unwrap_or(0);
     assert!(
-        body["claims_ingested"].as_u64().unwrap_or(0) >= 4,
+        claims_ingested >= 4,
         "the thesis, the phase and both steps are written: {body}"
     );
     let workflow_id: Uuid = body["workflow_id"]
@@ -252,5 +295,13 @@ async fn rest_ingest_workflow_embeds_every_claim_it_writes(pool: PgPool) {
     let mut contents = steps.clone();
     contents.push(thesis);
     contents.push(phase);
-    assert_all_embedded(&pool, system, workflow_id, &contents, "ingest_workflow").await;
+    assert_all_embedded(
+        &pool,
+        system,
+        workflow_id,
+        &contents,
+        claims_ingested,
+        "ingest_workflow",
+    )
+    .await;
 }
