@@ -240,7 +240,7 @@ empty; you enrich it in place. Verbatim ground-truth example
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `source` | object | Source metadata: `title`, `doi`/`uri`, `source_type` (PascalCase: `Paper`, `Textbook`, `InternalDocument`, `Report`, `Transcript`, `Legal`, `Tabular`), `authors[{name, affiliations[]}]`, `journal`, `year`, `metadata` |
+| `source` | object | Source metadata: `title`, `doi`/`uri`, `source_type` (PascalCase: `Paper`, `Textbook`, `InternalDocument`, `Report`, `Transcript`, `Legal`, `Tabular`), `authors[{name, affiliations[]}]`, `journal`, `year`, `metadata`. `authors` must be real names as printed in the byline. If no author is identifiable, emit `[]`. Never emit placeholders such as "Authors Not Specified" or "Unknown": they mint a shared fake agent that asserts every claim of the paper (ingest now drops them). Ingest tries body-byline recovery when the list is empty and `source_text` is present. |
 | `thesis` | string \| null | The paper's main claim — verbatim abstract span when present, else a bottom-up synthesis |
 | `thesis_derivation` | enum | `"TopDown"` (default — explicit/quoted) or `"BottomUp"` (synthesized) |
 | `sections[]` | array | Document structure, in order. Each: `title`, optional `heading_span {start,end}`, `paragraphs[]` |
