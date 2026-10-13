@@ -942,14 +942,14 @@ pub async fn report_workflow_outcome(
                 deviation_reason: s.deviation_reason.clone(),
             })
             .collect();
-        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
+        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_with_embedder(
             &server.pool,
+            server.embedder.as_ref(),
             workflow_id,
             params.success,
             &step_executions,
             params.quality,
             params.goal_text.as_deref(),
-            None,
             None,
         )
         .await;

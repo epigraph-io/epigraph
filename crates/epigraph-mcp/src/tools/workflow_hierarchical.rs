@@ -164,31 +164,42 @@ pub async fn report_hierarchical_outcome(
     let workflow_id =
         Uuid::parse_str(&params.workflow_id).map_err(|_| invalid_uuid("workflow_id"))?;
 
-    do_report_hierarchical_outcome_via_pool(
+    do_report_hierarchical_outcome_with_embedder(
         &server.pool,
+        server.embedder.as_ref(),
         workflow_id,
         params.success,
         &params.step_executions,
         params.quality,
         params.goal_text.as_deref(),
         params.run_label.as_deref(),
-        None,
     )
     .await
 }
 
-/// The goal text a hierarchical outcome report should embed, if any.
-/// STUB (U033 red step): embeds nothing yet.
-fn report_goal_to_embed(_goal_text: Option<&str>) -> Option<&str> {
-    None
+/// The `goal_text` the step rows fall back to when a report names no goal.
+const GOAL_PLACEHOLDER: &str = "hierarchical";
+
+/// The goal text a hierarchical outcome report should embed, if any: the
+/// trimmed `goal_text`, unless it is blank or the `"hierarchical"`
+/// placeholder. Embedding a placeholder would make every goal-less report
+/// "similar" to every other one in `behavioral_affinity_lineage`.
+fn report_goal_to_embed(goal_text: Option<&str>) -> Option<&str> {
+    goal_text
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != GOAL_PLACEHOLDER)
 }
 
-/// Embed the report's goal (best-effort, BEFORE the transaction), then report.
-/// STUB (U033 red step): does not embed yet.
+/// Embed the report's goal, best-effort, BEFORE the transaction (embedder
+/// latency stays out of the `workflows` row lock), then report. An embedder
+/// failure is a NULL `goal_embedding`, never a failed report: the same
+/// contract as the flat `report_workflow_outcome` path's "Embed the goal text
+/// for affinity matching". Shared by `report_hierarchical_outcome` and the
+/// hierarchical branch of `report_workflow_outcome`.
 #[allow(clippy::too_many_arguments)]
 pub async fn do_report_hierarchical_outcome_with_embedder(
     pool: &sqlx::PgPool,
-    _embedder: &dyn epigraph_embeddings::EmbeddingService,
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
     workflow_id: Uuid,
     success: bool,
     step_executions: &[HierarchicalStepExecution],
@@ -196,6 +207,18 @@ pub async fn do_report_hierarchical_outcome_with_embedder(
     goal_text: Option<&str>,
     run_label: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
+    // Refuse a bad report before paying for an embedding.
+    validate_quality(quality)?;
+    let goal_embedding = match report_goal_to_embed(goal_text) {
+        Some(goal) => match embedder.generate(goal).await {
+            Ok(vec) => Some(vec),
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     do_report_hierarchical_outcome_via_pool(
         pool,
         workflow_id,
@@ -204,7 +227,7 @@ pub async fn do_report_hierarchical_outcome_with_embedder(
         quality,
         goal_text,
         run_label,
-        None,
+        goal_embedding.as_deref(),
     )
     .await
 }
@@ -354,7 +377,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     //    A refused row fails the report: `?` drops `unstamped_tx`, which rolls
     //    back the counter UPDATE and every earlier step row.
     let report_ts = chrono::Utc::now();
-    let goal_text_owned = goal_text.unwrap_or("hierarchical").to_string();
+    let goal_text_owned = goal_text.unwrap_or(GOAL_PLACEHOLDER).to_string();
     let goal_embedding_pgvec = goal_embedding.map(crate::embed::format_pgvector);
     for step_exec in step_executions {
         let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
