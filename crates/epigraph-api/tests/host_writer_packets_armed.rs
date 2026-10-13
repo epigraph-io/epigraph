@@ -61,6 +61,23 @@
 //! M3 the labels UPDATE dropped from `persist_packet`;
 //! M4 S's writer membership in HG not granted;
 //! M5 the properties UPDATE dropped from `persist_packet`.
+//!
+//! TWO DEPLOYMENT SHAPES. The test above is the shape once the legacy
+//! `*_privacy` policies are dropped: S holds a writer membership in HG, and
+//! `claims_tenancy`'s WITH CHECK alone admits the HG claim. The second test,
+//! `..._through_the_legacy_privacy_policies_without_a_membership`, is the shape
+//! of pre-MT-4z deployments where the legacy policies remain: S has NO
+//! membership in HG, and the three legacy PERMISSIVE `FOR ALL` policies
+//! (`claims_privacy`, `evidence_privacy`, `edges_privacy`, present in no
+//! migration, with no WITH CHECK, so their USING is reused as one) are
+//! installed with their deployed definitions. Permissive policies OR, so the
+//! claim INSERT into HG is admitted by `claims_privacy`, not by membership; the
+//! evidence and trace rows then take migration 114's arm (e) and land
+//! writer-owned in S's OWN personal group, not in HG. A calibration arm posts
+//! the same body before the policies exist and pins the row-security refusal,
+//! so the case cannot pass on a schema where membership alone would admit it.
+//! M6 (`claims_privacy` alone dropped before the first packet) turns the
+//! second test red with the same row-security refusal.
 
 mod viewer_fixture;
 
@@ -720,4 +737,268 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_under_an_armed_
         assert_eq!(audit[0]["owner_group_id"], owner.to_string(), "{case}");
         assert_eq!(audit[0]["admin_agent_id"], admin.to_string(), "{case}");
     }
+}
+
+/// `(owner_group_id, writer_owned)` of `claim`'s evidence and reasoning-trace
+/// rows: `(evidence, traces)`.
+async fn dependents_writer_owned(
+    pool: &PgPool,
+    claim: Uuid,
+) -> (Vec<(Uuid, bool)>, Vec<(Uuid, bool)>) {
+    let ev: Vec<(Uuid, bool)> =
+        sqlx::query_as("SELECT owner_group_id, writer_owned FROM evidence WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_all(pool)
+            .await
+            .expect("evidence");
+    let tr: Vec<(Uuid, bool)> = sqlx::query_as(
+        "SELECT owner_group_id, writer_owned FROM reasoning_traces WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("traces");
+    (ev, tr)
+}
+
+/// The legacy policies' helper functions and the three PERMISSIVE `FOR ALL`
+/// policies, as deployments that predate their removal still carry them: no
+/// WITH CHECK (so USING is reused as one), and a USING that is TRUE for every
+/// row without a `fully_private` encryption row.
+async fn install_legacy_privacy_policies(pool: &PgPool) {
+    let ddl = [
+        "CREATE OR REPLACE FUNCTION public.epigraph_current_group_id() \
+          RETURNS uuid LANGUAGE plpgsql STABLE AS $function$ \
+         DECLARE raw text; \
+         BEGIN \
+             raw := current_setting('app.group_id', true); \
+             IF raw IS NULL OR raw = '' THEN RETURN NULL; END IF; \
+             RETURN raw::uuid; \
+         EXCEPTION WHEN invalid_text_representation THEN RETURN NULL; \
+         END; $function$",
+        "CREATE OR REPLACE FUNCTION public.epigraph_is_visible_to_group(p_entity_id uuid, p_table text) \
+          RETURNS boolean LANGUAGE plpgsql STABLE AS $function$ \
+         DECLARE gid uuid := epigraph_current_group_id(); found boolean; \
+         BEGIN \
+             IF p_table = 'claim' THEN \
+                 SELECT EXISTS(SELECT 1 FROM claim_encryption ce \
+                                WHERE ce.claim_id = p_entity_id \
+                                  AND ce.privacy_tier = 'fully_private' \
+                                  AND (gid IS NULL OR ce.group_id != gid)) INTO found; \
+             ELSIF p_table = 'evidence' THEN \
+                 SELECT EXISTS(SELECT 1 FROM evidence_encryption ee \
+                                WHERE ee.evidence_id = p_entity_id \
+                                  AND ee.privacy_tier = 'fully_private' \
+                                  AND (gid IS NULL OR ee.group_id != gid)) INTO found; \
+             ELSE \
+                 found := false; \
+             END IF; \
+             RETURN NOT found; \
+         END; $function$",
+        "CREATE POLICY evidence_privacy ON evidence AS PERMISSIVE FOR ALL TO PUBLIC \
+           USING (epigraph_is_visible_to_group(id, 'evidence'::text))",
+        "CREATE POLICY edges_privacy ON edges AS PERMISSIVE FOR ALL TO PUBLIC \
+           USING (epigraph_is_visible_to_group(source_id, 'claim'::text) \
+              AND epigraph_is_visible_to_group(source_id, 'evidence'::text) \
+              AND epigraph_is_visible_to_group(target_id, 'claim'::text) \
+              AND epigraph_is_visible_to_group(target_id, 'evidence'::text))",
+        "CREATE POLICY claims_privacy ON claims AS PERMISSIVE FOR ALL TO PUBLIC \
+           USING (epigraph_is_visible_to_group(id, 'claim'::text))",
+    ];
+    for stmt in ddl {
+        sqlx::query(stmt)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("install the legacy policies: {e}\n{stmt}"));
+    }
+}
+
+/// `(table, permissive, roles, cmd, qual, with_check)` of the `*_privacy`
+/// policies, as `pg_policies` deparses them.
+async fn legacy_privacy_policies(
+    pool: &PgPool,
+) -> Vec<(String, String, Vec<String>, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT tablename::text, permissive, roles::text[], cmd, qual, with_check \
+           FROM pg_policies \
+          WHERE schemaname = 'public' \
+            AND policyname IN ('claims_privacy', 'evidence_privacy', 'edges_privacy') \
+          ORDER BY tablename",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read pg_policies")
+}
+
+// The pre-MT-4z shape (module doc, "TWO DEPLOYMENT SHAPES"). Its own database,
+// so the legacy policies it installs reach no other test.
+#[allow(clippy::too_many_lines)]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_through_the_legacy_privacy_policies_without_a_membership(
+    pool: PgPool,
+) {
+    // ── Fixture (unarmed) ──
+    let (h, hg) = seed_human_operator(&pool, "human-h").await;
+    let (l, _) = seed_agent_with_group(&pool, "recorder-l").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, l, h)
+            .await
+            .expect("l -> h");
+    }
+    let (s, s_group) = seed_agent_with_group(&pool, "service-s").await;
+    let s_client = seed_service_client(&pool, s, "host writer s", &["claims:write"]).await;
+    let state = app_role_state(&pool).await;
+
+    // ── Allow S's client for H and arm; NO membership for S in HG ──
+    let s_client_id = s_client.id;
+    as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_allow_author_binding_client($1, $2, 'host')")
+            .bind(s_client_id)
+            .bind(h)
+            .execute(&mut *conn)
+            .await
+            .expect("allow");
+        sqlx::query("SELECT armed_now FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+    let memberships: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT group_id, role::text FROM group_memberships \
+          WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(s)
+    .fetch_all(&pool)
+    .await
+    .expect("S's memberships");
+    assert_eq!(
+        memberships,
+        vec![(s_group, "admin".to_string())],
+        "PREMISE: S is only the admin of its own personal group, with nothing in HG"
+    );
+    let s_token = token(&pool, &s_client).await;
+
+    // ── Calibration: the migrated schema alone refuses the same body ──
+    assert!(
+        legacy_privacy_policies(&pool).await.is_empty(),
+        "PREMISE: no migration installs the legacy *_privacy policies"
+    );
+    let p1 = egress_packet(l, &format!("p1-{}.example.test", Uuid::new_v4().simple()));
+    let (status, body) = post_packet(&state, &s_token, &p1).await;
+    assert!(
+        !status.is_success()
+            && body
+                .to_string()
+                .contains("new row violates row-level security policy for table"),
+        "CALIBRATION: without the legacy policies and without a membership the HG claim is \
+         refused by row security: {status} {body}"
+    );
+    assert!(
+        rows_with_content(&pool, &p1["claim"]["content"])
+            .await
+            .is_empty(),
+        "CALIBRATION: nothing written"
+    );
+
+    // ── The legacy policies, with their deployed shape ──
+    install_legacy_privacy_policies(&pool).await;
+    let installed = legacy_privacy_policies(&pool).await;
+    let shape = |table: &str, qual: &str| {
+        (
+            table.to_string(),
+            "PERMISSIVE".to_string(),
+            vec!["public".to_string()],
+            "ALL".to_string(),
+            qual.to_string(),
+            None,
+        )
+    };
+    assert_eq!(
+        installed,
+        vec![
+            shape("claims", "epigraph_is_visible_to_group(id, 'claim'::text)"),
+            shape(
+                "edges",
+                "(epigraph_is_visible_to_group(source_id, 'claim'::text) AND \
+                 epigraph_is_visible_to_group(source_id, 'evidence'::text) AND \
+                 epigraph_is_visible_to_group(target_id, 'claim'::text) AND \
+                 epigraph_is_visible_to_group(target_id, 'evidence'::text))"
+            ),
+            shape(
+                "evidence",
+                "epigraph_is_visible_to_group(id, 'evidence'::text)"
+            ),
+        ],
+        "PREMISE: the legacy policies as deployed: permissive, public, ALL, no WITH CHECK"
+    );
+
+    // ── Q1: the egress approval packet ──
+    let (status, body) = post_packet(&state, &s_token, &p1).await;
+    assert_eq!(status, StatusCode::CREATED, "Q1: {body}");
+    assert_eq!(body["was_duplicate"], false, "Q1: {body}");
+    assert!(body["trace_id"].is_string(), "Q1 has a trace: {body}");
+    assert_eq!(
+        body["evidence_ids"].as_array().map(Vec::len),
+        Some(1),
+        "Q1: {body}"
+    );
+    let rows = rows_with_content(&pool, &p1["claim"]["content"]).await;
+    assert_eq!(rows.len(), 1, "Q1: one claim");
+    let q1_id = rows[0].id;
+    assert_eq!(body["claim_id"], q1_id.to_string());
+    assert_eq!(
+        (
+            rows[0].agent_id,
+            rows[0].owner_group_id,
+            rows[0].labels.clone(),
+            rows[0].properties.clone(),
+            rows[0].visibility.as_str(),
+            rows[0].trace_id.map(|t| t.to_string()),
+        ),
+        (
+            l,
+            hg,
+            strings(&p1["claim"]["labels"]),
+            Some(p1["claim"]["properties"].clone()),
+            "public",
+            body["trace_id"].as_str().map(str::to_string),
+        ),
+        "Q1: authored by L, owned by HG, labels and properties exactly as sent"
+    );
+    assert_eq!(
+        dependents_writer_owned(&pool, q1_id).await,
+        (vec![(s_group, true)], vec![(s_group, true)]),
+        "Q1: its evidence and trace are writer-owned by S's personal group, NOT HG"
+    );
+
+    // ── Q2: the Foreman mirror packet ──
+    let p2 = mirror_packet(l, &format!("wi-{}", Uuid::new_v4().simple()));
+    let (status, body) = post_packet(&state, &s_token, &p2).await;
+    assert_eq!(status, StatusCode::CREATED, "Q2: {body}");
+    assert_eq!(body["was_duplicate"], false, "Q2: {body}");
+    let rows = rows_with_content(&pool, &p2["claim"]["content"]).await;
+    assert_eq!(rows.len(), 1, "Q2: one claim");
+    assert_eq!(
+        (
+            rows[0].agent_id,
+            rows[0].owner_group_id,
+            rows[0].labels.clone(),
+            rows[0].properties.clone(),
+        ),
+        (
+            l,
+            hg,
+            strings(&p2["claim"]["labels"]),
+            Some(p2["claim"]["properties"].clone())
+        ),
+        "Q2: authored by L, owned by HG, labels and properties exactly as sent"
+    );
+    assert_eq!(
+        dependents_writer_owned(&pool, rows[0].id).await,
+        (vec![(s_group, true)], vec![(s_group, true)]),
+        "Q2: its evidence and trace are writer-owned by S's personal group, NOT HG"
+    );
 }
