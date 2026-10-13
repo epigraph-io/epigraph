@@ -368,38 +368,43 @@ async fn overview_limit_below_one_is_clamped_to_one(pool: PgPool) {
     }
 }
 
-/// Guard, and meant to pass on main as well: with no query string the body is
-/// today's body — every supernode, every edge, and no new top-level key. The
-/// epigraph-gui reads `cluster_edges` unbounded from this exact shape.
+/// Guard, and meant to pass on main as well: with no bound in the query string
+/// the body is today's body — every supernode, every edge, and no new
+/// top-level key. The epigraph-gui reads `cluster_edges` unbounded from this
+/// exact shape. `color_by` is a pre-existing param that never changed the
+/// body, so it must not opt the caller into the bounded shape either.
 #[sqlx::test(migrations = "../../migrations")]
 async fn overview_without_params_is_unchanged(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;
     seed_three_clusters(&pool).await;
 
-    let body = get_overview(&url, "").await;
+    for query in ["", "color_by=type"] {
+        let body = get_overview(&url, query).await;
 
-    let keys: std::collections::BTreeSet<&str> = body
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            "cluster_edges",
-            "degraded",
-            "generated_at",
-            "run_id",
-            "supernodes"
-        ]
-        .into_iter()
-        .collect()
-    );
-    assert_eq!(supernode_labels(&body), ["A", "B", "C"]);
-    let mut weights = edge_weights(&body);
-    weights.sort_unstable();
-    assert_eq!(weights, [1, 2, 4]);
+        let keys: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "cluster_edges",
+                "degraded",
+                "generated_at",
+                "run_id",
+                "supernodes"
+            ]
+            .into_iter()
+            .collect(),
+            "{query:?}"
+        );
+        assert_eq!(supernode_labels(&body), ["A", "B", "C"], "{query:?}");
+        let mut weights = edge_weights(&body);
+        weights.sort_unstable();
+        assert_eq!(weights, [1, 2, 4], "{query:?}");
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
