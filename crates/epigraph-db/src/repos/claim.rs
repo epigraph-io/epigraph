@@ -6739,6 +6739,13 @@ impl ClaimRepository {
     /// `level` defaults to 2 (step). The `properties` JSONB on the new claim
     /// includes `level` and `step_lineage_id` so existing find_workflow_hierarchical
     /// queries (which filter on `properties->>'level' = '2'`) still work.
+    ///
+    /// With `supersedes`, the new claim also records `supersedes = parent`, so
+    /// the Supersede admin cascade (and its deferred replay) migrates the
+    /// parent's edges onto it; see [`Self::migrate_superseded_edges_conn`] and
+    /// the step-lineage paragraph of [`Self::supersede`]'s edge migration
+    /// policy. This function performs only the act: the request paths run the
+    /// cascade after it commits.
     #[instrument(skip(pool))]
     pub async fn evolve_step(
         pool: &PgPool,
@@ -6861,10 +6868,17 @@ impl ClaimRepository {
             "level": level,
             "step_lineage_id": lineage_id.to_string(),
         });
+        // A `supersedes` step also records the supersession in the column, as
+        // the supersede act does: that is what `migrate_superseded_edges_conn`
+        // (the Supersede admin cascade, and its deferred replay) and migration
+        // 120's deferral check verify before carrying the retired step's edges
+        // to this one. A `revises` branch supersedes nothing (both heads stay
+        // current), so it records none.
+        let supersedes: Option<Uuid> = (edge_type == "supersedes").then_some(parent_uuid);
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8)",
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8, $9)",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -6874,6 +6888,7 @@ impl ClaimRepository {
         .bind(lineage_id)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(supersedes)
         .execute(&mut *tx)
         .await?;
 
