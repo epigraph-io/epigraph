@@ -429,3 +429,139 @@ async fn non_ascii_source_url_does_not_panic(pool: PgPool) {
     let resp = assess(&pool, caller, claim, request(true, 0.6, Some(&url))).await;
     assert_eq!(resp.claim_id, claim);
 }
+
+// ── canonical frame by id (U027F) ──
+//
+// The canonical `claim_validity` frame is prod's row `8a594393`: public, owned
+// by the nil (world) group, hypotheses `[supported, refuted, uncertain]`.
+// Migration 154 seeds it on a fresh database. Resolving it BY NAME through the
+// caller's viewer, with a create on a miss, let whoever named a frame
+// `claim_validity` first decide what every later assess wrote into: a frame
+// over other hypotheses refused every later caller (frames.name is UNIQUE, so
+// the right one could never be created), and a frame with the right
+// hypotheses but a non-canonical owner received everybody's evidence.
+
+/// Prod's canonical `claim_validity` frame id. A literal here, not the crate
+/// constant, so this file pins the VALUE.
+const CANONICAL_CLAIM_VALIDITY: Uuid = Uuid::from_u128(0x8a59_4393_c343_4f1a_b942_5c5b_7862_f792);
+
+/// Frames other than `binary_truth`, whose by-name get-or-create the cache
+/// rule still runs (Q40, a separate unit).
+async fn frames_besides_binary_truth(pool: &PgPool) -> Vec<String> {
+    frame_names(pool)
+        .await
+        .into_iter()
+        .filter(|n| n != "binary_truth")
+        .collect()
+}
+
+/// With no `frame_id`, assess writes into the canonical row `8a594393`, and
+/// never creates a frame to do it.
+///
+/// 9f2465e3: no row carries that id; the by-name get-or-create mints a
+/// `claim_validity` frame under a random id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn assess_lands_on_the_canonical_claim_validity_id(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess lands on 8a594393").await;
+    let frames_before = frames_besides_binary_truth(&pool).await;
+
+    let resp = assess(&pool, caller, claim, request(true, 0.8, None)).await;
+
+    assert_eq!(
+        resp.frame_id, CANONICAL_CLAIM_VALIDITY,
+        "assess must write into the canonical claim_validity frame 8a594393"
+    );
+    let rows = rows_on(&pool, claim, CANONICAL_CLAIM_VALIDITY).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the call's BBA must land on 8a594393: {rows:?}"
+    );
+    assert_eq!(
+        frames_besides_binary_truth(&pool).await,
+        frames_before,
+        "assess must not create a frame to resolve claim_validity"
+    );
+}
+
+/// Another caller naming a frame `claim_validity` (POST /frames does exactly
+/// `FrameRepository::create`) over other hypotheses cannot make a later
+/// caller's assess fail.
+///
+/// 9f2465e3: the attacker's create succeeds on a database with no
+/// `claim_validity` yet, and the victim's assess errors with `frame
+/// "claim_validity" exists over ["supported", "unsupported"]` from then on.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_frame_squatting_the_claim_validity_name_cannot_fail_another_callers_assess(
+    pool: PgPool,
+) {
+    let (claim, _viewer, victim) = seed_claim(&pool, "assess after a name squat").await;
+    // The attacker's create may be refused (the canonical row holds the name);
+    // whether it is, is not the point. The victim's call is.
+    let _ = epigraph_db::FrameRepository::create(
+        &pool,
+        "claim_validity",
+        Some("squatter"),
+        &["supported".to_string(), "unsupported".to_string()],
+    )
+    .await;
+
+    let result = try_assess(&pool, victim, claim, request(true, 0.8, None)).await;
+    let resp = result.unwrap_or_else(|e| {
+        panic!("a frame another caller named claim_validity made this caller's assess fail: {e:?}")
+    });
+    assert_eq!(
+        resp.frame_id, CANONICAL_CLAIM_VALIDITY,
+        "the victim's evidence must land on the canonical frame"
+    );
+}
+
+/// A `claim_validity` frame with the right hypotheses but NOT the canonical
+/// row (another id, owned by the attacker's group) never receives assess's
+/// evidence. Modelled with 8a594393 absent (a database the seed has not run
+/// on): the squatter exists only because the canonical row does not. With the
+/// canonical row missing, the intended behaviour is a refusal that writes
+/// nothing; 154's pre-check refuses to seed over such a squatter.
+///
+/// 9f2465e3: the by-name lookup finds the squatter and stores the victim's BBA
+/// on it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_validity_frame_owned_by_another_group_never_receives_assess_evidence(
+    pool: PgPool,
+) {
+    let (claim, _viewer, victim) = seed_claim(&pool, "assess beside an owned squatter").await;
+    let (_attacker, attacker_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "assess-squatter").await;
+    sqlx::query("DELETE FROM frames WHERE id = $1")
+        .bind(CANONICAL_CLAIM_VALIDITY)
+        .execute(&pool)
+        .await
+        .expect("model a database without the canonical row");
+    let squatter: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses, visibility, owner_group_id) \
+         VALUES ('claim_validity', 'squatter', ARRAY['supported','refuted','uncertain'], \
+                 'public', $1) RETURNING id",
+    )
+    .bind(attacker_group)
+    .fetch_one(&pool)
+    .await
+    .expect("CALIBRATION: a group-owned public claim_validity frame can be inserted");
+
+    let result = try_assess(&pool, victim, claim, request(true, 0.8, None)).await;
+
+    assert!(
+        rows_on(&pool, claim, squatter).await.is_empty(),
+        "assess stored the victim's BBA on the attacker-owned claim_validity frame {squatter}"
+    );
+    if let Ok(resp) = result {
+        assert_ne!(
+            resp.frame_id, squatter,
+            "assess reported the squatter as its frame"
+        );
+    }
+    assert_eq!(
+        mass_function_count(&pool, claim).await,
+        0,
+        "with the canonical frame missing, assess must write nothing"
+    );
+}
