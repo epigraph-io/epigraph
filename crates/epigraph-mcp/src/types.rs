@@ -1764,7 +1764,7 @@ pub struct AuthorResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentParams {
     #[schemars(
-        description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms)."
+        description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
 }
@@ -1777,7 +1777,7 @@ pub struct IngestDocumentParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentInlineParams {
     #[schemars(
-        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, an optional top-level source_text, and an optional top-level `labels` array of caller labels (e.g. a stage tag) applied to every claim the ingest writes or resolves to, in addition to the writer's own `doi:<document key>` label (a claim another agent authored that the ingest converges onto gets the doi: label only). When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
@@ -1790,7 +1790,7 @@ pub struct IngestDocumentInlineParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentSpineParams {
     #[schemars(
-        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms."
+        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms. An optional top-level `labels` array of caller labels (e.g. a stage tag) is applied to every node this call writes, in addition to the writer's own `doi:<document key>` label; a node another agent authored gets the doi: label only."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
@@ -1814,9 +1814,14 @@ pub struct IngestDocumentSpineResponse {
     /// `ingest_document_inline` with atoms filled for those paths only.
     pub new_paragraph_paths: Vec<String>,
     /// Spine nodes this ingest resolved to that belong to a group the ingesting
-    /// agent cannot write, so the document's `doi:` label was not added to them.
+    /// agent cannot write, so the document's labels (`doi:` and any caller
+    /// `labels`) were not added to them.
     /// See `IngestDocumentResponse::converged_claims_unlabelled`.
     pub converged_claims_unlabelled: usize,
+    /// Spine nodes this ingest resolved to that ANOTHER agent authored: they got
+    /// the document's `doi:` label but not the caller's `labels`.
+    /// See `IngestDocumentResponse::converged_claims_caller_labels_withheld`.
+    pub converged_claims_caller_labels_withheld: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -2128,9 +2133,10 @@ pub struct IngestDocumentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
     /// Claims this ingest RESOLVED TO (content-addressed convergence onto a row
-    /// that already existed) but could not tag with the document's `doi:` label,
-    /// because they belong to a group the ingesting agent cannot write. The paper
-    /// still `asserts` each of them; only the label is missing. Disclosed rather
+    /// that already existed) but could not tag with the document's labels (its
+    /// `doi:` label and any caller `labels`), because they belong to a group the
+    /// ingesting agent cannot write. The paper still `asserts` each of them; only
+    /// the labels are missing. Disclosed rather
     /// than swallowed, so a caller counting a paper's claim set by label can
     /// see the gap.
     ///
@@ -2146,6 +2152,15 @@ pub struct IngestDocumentResponse {
     /// edges against its `doi:` label set itself. Stated because an earlier
     /// summary described this field as the disclosure for every ingest path.
     pub converged_claims_unlabelled: usize,
+    /// Claims this ingest RESOLVED TO that another agent authored, which got the
+    /// document's `doi:` label but NOT the caller's `labels`: caller vocabulary
+    /// (a `resolved`, a `policy:` tag) is never written onto someone else's
+    /// claim by an ingest, even one the ingesting agent's group membership lets
+    /// it write. Disjoint from `converged_claims_unlabelled` (which counts rows
+    /// that got no label at all) and always 0 when the extraction carries no
+    /// `labels`. Reaches callers exactly as `converged_claims_unlabelled` does;
+    /// the detached tools log one WARN per claim (target `tenancy.scoped_write`).
+    pub converged_claims_caller_labels_withheld: usize,
     pub already_ingested: bool,
 }
 
