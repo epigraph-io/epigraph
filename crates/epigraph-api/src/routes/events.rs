@@ -1141,3 +1141,157 @@ mod payload_uuid_tests {
         );
     }
 }
+
+/// The `(since, after_id)` cursor on the in-process half (drain U045).
+///
+/// Feature-independent, unlike `tests` above: under `not(db)` the in-memory
+/// store is the ONLY cursor implementation, and under `db` it still serves
+/// every event type that is pushed to `global_event_store()` but never
+/// persisted (`edge.added`, belief and community events). The HTTP tests in
+/// `tests/events_unified_test.rs` insert rows through SQL, which filters them
+/// before this code runs, so they cannot see a broken in-process predicate.
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("valid instant")
+    }
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn cursor(since: Option<DateTime<Utc>>, after_id: Option<Uuid>) -> EventFilter {
+        EventFilter {
+            since,
+            after_id,
+            event_type: None,
+            limit: None,
+            offset: None,
+        }
+    }
+
+    /// A store holding `events` exactly as given — fixed timestamps and ids,
+    /// in this insertion order — which `EventStore::push` cannot produce.
+    fn store_with(events: &[(DateTime<Utc>, Uuid)]) -> EventStore {
+        let store = EventStore::new();
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(i, &(created_at, id))| GraphEvent {
+                id,
+                event_type: "test.cursor".to_string(),
+                actor_id: None,
+                payload: serde_json::json!({}),
+                graph_version: i as i64 + 1,
+                created_at,
+            })
+            .collect();
+        *store.events.try_write().expect("fresh store is unlocked") = rows;
+        store
+    }
+
+    #[test]
+    fn without_since_everything_is_admitted() {
+        let f = cursor(None, None);
+        assert!(f.admits(at(-1_000), id(0)));
+        assert!(f.admits(at(1_000), id(u128::MAX)));
+    }
+
+    #[test]
+    fn since_alone_is_inclusive_at_its_own_instant() {
+        let f = cursor(Some(at(10)), None);
+        assert!(f.admits(at(10), id(1)), "an event AT `since` is admitted");
+        assert!(f.admits(at(10), id(0)), "whatever its id");
+        assert!(f.admits(at(11), id(0)));
+        assert!(!f.admits(at(9), id(u128::MAX)), "an earlier event is not");
+    }
+
+    #[test]
+    fn since_with_after_id_is_a_strict_keyset() {
+        let f = cursor(Some(at(10)), Some(id(5)));
+        assert!(
+            !f.admits(at(10), id(5)),
+            "the cursor's own event must not be re-served"
+        );
+        assert!(
+            !f.admits(at(10), id(4)),
+            "a lower id at the cursor's instant was already passed"
+        );
+        assert!(
+            f.admits(at(10), id(6)),
+            "a higher id at the cursor's instant is next"
+        );
+        assert!(
+            f.admits(at(11), id(0)),
+            "any id at a later instant is admitted"
+        );
+        assert!(
+            !f.admits(at(9), id(u128::MAX)),
+            "any id at an earlier instant is not"
+        );
+    }
+
+    /// One transaction stamps all of its events with one `created_at`, so a
+    /// same-instant block can be larger than a page. Paging it with the
+    /// documented cursor `(since = last.created_at, after_id = last.id)` must
+    /// return every event exactly once, in `(created_at, id)` order, although
+    /// the store holds them in descending-id insertion order and with a later
+    /// event inserted first.
+    #[tokio::test]
+    async fn keyset_paging_through_a_same_instant_block_serves_each_event_once() {
+        let mut rows = vec![(at(20), id(1))];
+        rows.extend((1..=7).rev().map(|n| (at(10), id(n * 10))));
+        rows.push((at(5), id(99)));
+        let store = store_with(&rows);
+
+        let mut served = Vec::new();
+        let mut filter = cursor(Some(at(10)), None);
+        filter.limit = Some(3);
+        for _ in 0..5 {
+            let (page, _) = store.list(&filter).await;
+            served.extend(page.iter().map(|e| (e.created_at, e.id)));
+            let Some(last) = page.last() else { break };
+            filter.since = Some(last.created_at);
+            filter.after_id = Some(last.id);
+            if page.len() < 3 {
+                break;
+            }
+        }
+
+        let mut expected: Vec<_> = (1..=7).map(|n| (at(10), id(n * 10))).collect();
+        expected.push((at(20), id(1)));
+        assert_eq!(
+            served, expected,
+            "every event at or after the cursor, once each, in (created_at, id) order"
+        );
+    }
+
+    /// `offset`/`limit` under a cursor must page over the keyset order, so
+    /// consecutive pages neither overlap nor leave a gap.
+    #[tokio::test]
+    async fn offset_paging_under_a_cursor_follows_keyset_order() {
+        let rows: Vec<_> = [(30, 3), (10, 9), (20, 1), (10, 2), (20, 7), (10, 5)]
+            .iter()
+            .map(|&(s, n)| (at(s), id(n)))
+            .collect();
+        let store = store_with(&rows);
+
+        let mut served = Vec::new();
+        for offset in [0, 2, 4] {
+            let mut filter = cursor(Some(at(10)), None);
+            filter.limit = Some(2);
+            filter.offset = Some(offset);
+            let (page, total) = store.list(&filter).await;
+            assert_eq!(total, 6);
+            served.extend(page.iter().map(|e| (e.created_at, e.id)));
+        }
+
+        let expected: Vec<_> = [(10, 2), (10, 5), (10, 9), (20, 1), (20, 7), (30, 3)]
+            .iter()
+            .map(|&(s, n)| (at(s), id(n)))
+            .collect();
+        assert_eq!(served, expected);
+    }
+}
