@@ -22,9 +22,11 @@
 //! into it with no callers to rewrite.
 //!
 //! `epigraph-db/tests` already carries its own `strip_line_comments` copies and
-//! belongs to the same future decision; this batch does not touch them, and
-//! deliberately does not scan `crates/epigraph-db/src/repos/` with this function
-//! — see the note on [`strip_comments`].
+//! belongs to the same future decision; this batch does not touch them.
+//! `epigraph-db/tests/lint_text/mod.rs` is NOT a copy of this module: it holds
+//! `spend_views`, the spend-marker pass, which this crate's
+//! `tool_viewer_is_spent.rs` also carries — see the note on [`strip_comments`]
+//! for why the exemption marker over `crates/epigraph-db/src/repos/` stays raw.
 
 /// Remove `//` line comments and `/* */` block comments, respecting string
 /// literals so a `"//"` inside a SQL fragment does not truncate the line.
@@ -43,11 +45,14 @@
 /// three-way acquisition partition and the tool-module mention set are all
 /// byte-identical over stripped and unstripped source on the tree as it stands.
 ///
-/// The same measurement is why `crates/epigraph-db/src/repos/` is not a scan
-/// root for this function: there, stripping DOES move a register, because the
-/// `VISIBILITY-EXEMPT:` convention is carried in comments by design —
-/// `VISIBILITY-EXEMPT` measures 40 → 32 under the stripper as shipped, 8 of the
-/// markers being Rust line comments rather than in-SQL `/* */` ones.
+/// The same measurement is why the `VISIBILITY-EXEMPT:` scans over
+/// `crates/epigraph-db/src/repos/` do not use this function: there, stripping
+/// DOES move a register, because that convention is carried in comments by
+/// design — `VISIBILITY-EXEMPT` measures 40 → 32 under the stripper as shipped,
+/// 8 of the markers being Rust line comments rather than in-SQL `/* */` ones.
+/// The spend markers in those scans are read through `spend_views` (in
+/// `epigraph-db/tests/lint_text/mod.rs`), with no register moving; this crate's
+/// `tool_viewer_is_spent.rs` makes the same split.
 ///
 /// It is NOT because a lifetime toggles this function's string state. An earlier
 /// revision of this paragraph said so; that was true of the PRE-FIX stripper and

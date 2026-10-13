@@ -2460,10 +2460,10 @@
       "id": "F-LINT-PRED-RESIDUAL-A",
       "where": "crates/epigraph-mcp/tests/tool_viewer_is_spent.rs; crates/epigraph-db/tests/visibility_lint.rs::every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer; crates/epigraph-db/tests/write_gate_lint.rs::measure_ungated_writes",
       "what": "Deferred residual of tenancy/fix-lint-robustness's own scope. Analysis held outside this repository.",
-      "status": "open",
-      "owner": "unassigned; a follow-on lint batch",
-      "disposition": "CONVERSION-TAIL",
-      "disposition_note": "RE-DISPOSED by the parent from FIX-SCHEDULED. The batch named in `fix_batch` has been delivered and did not close this, so the label asserted a scheduled fix that no longer exists — the same stale-owner problem the disposition pass was created to remove. Raised by tenancy/fix-lint-robustness as an explicitly deferred part of its own scope, not as a new discovery about the tree. Deferred for two reasons: no finding names these, and two of the three sit in the same file as that batch's signature-selector change -- moving a predicate and a selector together destroys the tree-changed-versus-vision-changed attribution this series exists to produce. One commit per site, each after that batch lands. Analysis held outside this repository.",
+      "status": "CLOSED 2026-10-13 by fix/drain-x10-lint-predicates-code-tokens for the three named sites.",
+      "owner": "fix/drain-x10-lint-predicates-code-tokens, which closed it. The pre-fix owner clause was 'unassigned; a follow-on lint batch'.",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED 2026-10-13: each of the three sites now matches its spend markers only where they take effect (method-call markers in code, the predicate text in live SQL) and reads the exemption marker raw, pinned by fixture tests in each file; every exact-set register is unchanged. Earlier note follows. RE-DISPOSED by the parent from FIX-SCHEDULED. The batch named in `fix_batch` has been delivered and did not close this, so the label asserted a scheduled fix that no longer exists — the same stale-owner problem the disposition pass was created to remove. Raised by tenancy/fix-lint-robustness as an explicitly deferred part of its own scope, not as a new discovery about the tree. Deferred for two reasons: no finding names these, and two of the three sit in the same file as that batch's signature-selector change -- moving a predicate and a selector together destroys the tree-changed-versus-vision-changed attribution this series exists to produce. One commit per site, each after that batch lands. Analysis held outside this repository.",
       "disposition_date": "2026-09-13"
     },
     {

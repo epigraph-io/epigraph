@@ -35,11 +35,14 @@
 //! decision can absorb it (one file, one public function, no dependencies)
 //! rather than having to unpick it.
 //!
-//! The full inventory that decision inherits is **five** strippers: the two
-//! `strip_comments` module copies (this one and `epigraph-mcp`'s), and three
-//! `strip_line_comments` — `epigraph-api/tests/no_bypass_in_handlers.rs` plus
-//! `epigraph-db/tests/{locked_decisions.rs, no_anonymous_viewer.rs}`. None is
-//! touched here beyond the lift.
+//! The inventory that decision inherits is every comment stripper under
+//! `crates/*/tests`. It is not counted here, because a count written into a doc
+//! goes stale silently and earlier counts in this paragraph did; the authority
+//! is `grep -rnE 'fn strip_comments|fn strip_line_comments' crates/*/tests`.
+//! Beside those, the spend-marker pass `spend_views` exists twice —
+//! `epigraph-db/tests/lint_text/mod.rs` and
+//! `epigraph-mcp/tests/tool_viewer_is_spent.rs` — and belongs to the same
+//! decision. None is touched here beyond the lift.
 
 /// Remove `//` line comments and `/* */` block comments, respecting string
 /// literals so a `"//"` inside a SQL fragment does not truncate the line.
@@ -65,13 +68,15 @@
 /// is byte-identical over stripped and unstripped source on the tree as it
 /// stands, which means this change closes a hazard without moving a number.
 ///
-/// The same measurement is why `crates/epigraph-db/src/repos/` is NOT a scan
-/// root for this function: there, stripping *does* move a register, because the
-/// `VISIBILITY-EXEMPT:` convention is carried in comments BY DESIGN. Measured
-/// over `src/repos/` with the stripper as shipped: `VISIBILITY-EXEMPT` goes
-/// 40 → 32, because 8 of the 40 markers are Rust line comments rather than
-/// in-SQL `/* */` ones. Those scanners read their markers from raw source on
-/// purpose.
+/// The same measurement is why the `VISIBILITY-EXEMPT:` scans over
+/// `crates/epigraph-db/src/repos/` do NOT use this function: there, stripping
+/// *does* move a register, because that convention is carried in comments BY
+/// DESIGN. Measured over `src/repos/` with the stripper as shipped:
+/// `VISIBILITY-EXEMPT` goes 40 → 32, because 8 of the 40 markers are Rust line
+/// comments rather than in-SQL `/* */` ones. Those scanners read the exemption
+/// marker from raw source on purpose. The SPEND markers in the same scanners
+/// (`.splice(`, `.splice_write(`, `visibility = 'public'`) are read through
+/// `epigraph-db/tests/lint_text/mod.rs::spend_views`, with no register moving.
 ///
 /// The DECLARATION registers are not what would move, and an earlier revision of
 /// this paragraph said they were: it claimed a lifetime
