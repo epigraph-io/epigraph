@@ -99,6 +99,9 @@
 //! When a table gains tenancy columns, or gains its first repo-layer write, add
 //! it here in the same PR.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -638,10 +641,15 @@ fn ungated_writes_in(file: &str, src: &str) -> (Vec<String>, Vec<String>) {
     (ordinary, macros)
 }
 
-/// How many `.splice_write(` calls `body` makes. Matched against the body's
-/// text.
+/// How many `.splice_write(` calls `body` makes.
+///
+/// Counted over the body with Rust comments removed, so a commented-out call or
+/// a doc line naming the method is not a gate. Only this count is stripped:
+/// [`scoped_write_offsets`] and [`inside_query_macro`] keep reading the raw body,
+/// because their offsets index into it and a different text would move the
+/// register for reasons unrelated to gating.
 fn splice_write_calls(body: &str) -> usize {
-    body.matches(".splice_write(").count()
+    strip_comments(body).matches(".splice_write(").count()
 }
 
 /// Functions that spliced SOME of their scoped writes but not all of them.
