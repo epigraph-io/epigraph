@@ -30,15 +30,29 @@
 //! the MCP writes (`ds_auto::auto_wire_ds_update`), the recompute
 //! (`edge_factor::compute_combined_belief`) and the compute-on-read readers
 //! (`belief_query::combine_framed_bbas`, behind framed `get_belief`,
-//! `get_perspective_belief` and its batch). So the next recompute cannot
-//! re-inflate what the write left honest, and no reader serves a value the
-//! cache does not hold.
+//! `get_perspective_belief` and its batch). For a viewer who can see the
+//! evidence rows its BBAs reference, the next recompute therefore cannot
+//! re-inflate what the write left honest, and those readers agree with the
+//! cache. The REST combine paths (`routes/belief.rs`, `routes/assess.rs`) are
+//! not routed here yet; they still Dempster-fold every BBA.
+//!
+//! Source keys are read through the caller's viewer
+//! ([`source_keys_for_rows`]). A BBA can be visible while its evidence row is
+//! not: `epigraph-operator hide-evidence` narrows evidence to a private group
+//! and leaves `mass_functions.evidence_id` pointing at it (`epigraph-cli`
+//! `operator/hide.rs`; migration 110 keeps the narrowing in place). For
+//! a viewer who cannot see that evidence row, the BBA has no key and folds as
+//! independent, as it did before this rule; a recompute run under such a
+//! viewer can write that pre-rule value into the cache.
 //!
 //! Known limits of the URL key ([`normalize_source_url`]): query strings,
 //! fragments and the scheme are kept, so one page reached through different
 //! tracking parameters, `#anchors`, or `http` vs `https` counts as distinct
-//! sources and still corroborates. That errs toward the pre-fix behaviour,
-//! never toward hiding a genuinely independent source.
+//! sources and still corroborates; those misses err toward the pre-fix
+//! behaviour. The path is lowercased, which goes the other way: two URLs that
+//! differ only in the case of a case-sensitive path are MERGED into one
+//! source, a deliberate under-count of corroboration in exchange for catching
+//! the common case-variant repeat.
 
 use std::collections::HashMap;
 
@@ -76,7 +90,8 @@ pub fn normalize_source_url(url: &str) -> Option<String> {
 
 /// The [`SourceKey`] of each row, in row order. A row has a key only when it
 /// names both a source agent and an evidence row whose `source_url` is set and
-/// visible to `viewer`.
+/// visible to `viewer`. A row whose evidence `viewer` cannot see (a hidden
+/// evidence row, see the module docs) has no key and folds as independent.
 ///
 /// Read on the caller's executor, through `viewer`, so the write path's
 /// stamped transaction, the recompute's connection and the compute-on-read
