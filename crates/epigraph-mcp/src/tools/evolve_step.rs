@@ -136,8 +136,8 @@ pub async fn evolve_step(
             // argument and support edges belong to other writers, which only
             // the administrative cascade re-points (backlog 8d3b4527). The
             // step-lineage rule in `migrate_superseded_edges` leaves the
-            // workflow's `executes` and agents' authorship edges on the
-            // retired step. The maintenance session is acquired before the act
+            // workflow's `executes`, the lineage's `revises` history and
+            // agents' authorship edges on the retired step. The maintenance session is acquired before the act
             // commits; without one the deferral commits with the act,
             // attributed to the principal this transaction is stamped with.
             let trigger = CascadeTrigger::new(

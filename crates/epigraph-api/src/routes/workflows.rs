@@ -1467,7 +1467,8 @@ pub async fn evolve_step(
     // cascade (backlog 8d3b4527): the act above moved no edge, and the retired
     // step's decomposition, argument and support edges belong to other
     // writers. `migrate_superseded_edges`' step-lineage rule leaves the
-    // workflow's `executes` and agents' authorship edges on the retired step.
+    // workflow's `executes`, the lineage's `revises` history and agents'
+    // authorship edges on the retired step.
     // The maintenance session is acquired BEFORE the act commits; without one
     // the deferral commits with the act, under the caller's stamp.
     let supersession = if result.edge_type == "supersedes" {

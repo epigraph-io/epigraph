@@ -486,7 +486,13 @@ pub struct SupersedeEdgeMigration {
 /// resolved through the lineage (`WorkflowRepository`'s `ResolvedStep`,
 /// `ClaimRepository::latest_in_lineage`), so moving the edge would detach the
 /// frozen step the workflow was defined with.
-pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] = &["executes"];
+///
+/// `revises` is lineage-internal history, like `supersedes` (which no
+/// supersession moves): `R -revises-> S` records that R branched from S.
+/// Carried onto S's successor it would say R branched from a version that did
+/// not exist when R was written; carried onto R's successor it would say the
+/// successor branched from S directly.
+pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] = &["executes", "revises"];
 
 /// Relationships an AGENT holds on a step that a step-lineage supersession
 /// leaves on the retired step (incoming edges with `source_type = 'agent'`).
@@ -5276,10 +5282,12 @@ impl ClaimRepository {
     /// `supersedes = parent`, and the request paths run the same administrative
     /// cascade. When the old and new claims share a non-null `step_lineage_id`,
     /// the migration also leaves `executes` (the workflow's FROZEN step; the
-    /// head is resolved through the lineage) and agents' `asserts` / `AUTHORED`
-    /// (the successor is written by the evolve_step caller, not by the agents
-    /// that asserted the old content) on the retired step. A supersession made
-    /// here writes no `step_lineage_id`, so it moves both as before. The rule
+    /// head is resolved through the lineage), `revises` in either direction
+    /// (the lineage's branch history, like `supersedes`) and agents'
+    /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
+    /// caller, not by the agents that asserted the old content) on the retired
+    /// step. A supersession made here writes no `step_lineage_id`, so it moves
+    /// all of them as before. The rule
     /// is read from the rows, because the deferred replay knows nothing of
     /// the original caller.
     ///
