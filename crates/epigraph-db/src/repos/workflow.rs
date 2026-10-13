@@ -1340,6 +1340,40 @@ impl WorkflowRepository {
         Ok(r.rows_affected())
     }
 
+    /// `(id, goal)` of hierarchical workflows whose `goal_embedding` is NULL,
+    /// oldest first, at most `limit` rows. The recovery half of
+    /// [`Self::set_goal_embedding`].
+    ///
+    /// Every write path embeds the goal best-effort and continues on an
+    /// embedder failure, and the three embedding searches here
+    /// (`find_hierarchical_by_embedding`, `search_by_goal_embedding_since`,
+    /// `search_hierarchical_by_embedding_scored`) filter
+    /// `goal_embedding IS NOT NULL`, so such a row stays invisible to them
+    /// until the `embed_backfill` CLI embeds it from this list.
+    ///
+    /// A blank goal has nothing to embed and is excluded, or it would be
+    /// reported (and fail) on every run.
+    ///
+    /// No viewer: `workflows` has `relrowsecurity = false` and no policy (see
+    /// `set_truth_value`), so the read is the same on any connection.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn find_needing_goal_embedding(
+        pool: &PgPool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, goal FROM workflows \
+             WHERE goal_embedding IS NULL AND btrim(goal) <> '' \
+             ORDER BY created_at ASC, id ASC \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Set `workflows.truth_value` for the given workflow id. Used by
     /// `deprecate_workflow` to cascade truth=0.05 from the flat-claim row
     /// onto the hierarchical-table row so `find_workflow_hierarchical`
