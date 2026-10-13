@@ -17,6 +17,8 @@
 //! * the replay, on the maintenance connection, carries `decomposes_to` (both
 //!   directions) and `continues_argument` onto the live head, and leaves the
 //!   workflow's `executes` and another agent's `asserts` on the frozen step;
+//! * with a maintenance connection configured, the tool APPLIES the cascade in
+//!   the request instead (`cascade.status` = `applied`, no deferral);
 //! * the workflow's `step_follows` chain stays on the frozen steps its
 //!   `executes` edges name, so `ordered_steps` keeps the step order;
 //! * `revises` records no supersession and no cascade.
@@ -274,6 +276,9 @@ async fn evolve_step_supersedes_cascade_carries_structure_to_the_live_head_over_
     );
 
     // ── Hop 2: head1 -> head2 (head1's own `supersedes` is already set) ──
+    // An agent asserts head1's content between the hops: the carve-out must
+    // also hold on a row that is itself a successor.
+    let asserted_head1 = seed_edge(&pool, other_agent, "agent", head1, "asserts").await;
     let body = evolve(&server, params(head1, "supersedes", "D3 v3")).await;
     let head2 = parse_uuid_field(&body, "claim_id");
     let (_, cause, old, new) = deferral_of(&pool, &body).await;
@@ -290,7 +295,63 @@ async fn evolve_step_supersedes_cascade_carries_structure_to_the_live_head_over_
     );
     assert_eq!(ends(&pool, to_child).await, (head2, child));
     assert_eq!(ends(&pool, continued).await, (prior, head2));
-    assert_eq!(ends(&pool, executes).await, (workflow, step));
+    assert_eq!(
+        ends(&pool, asserted_head1).await,
+        (other_agent, head1),
+        "an agent's asserts of head1 stays on head1 when head1 is superseded"
+    );
+}
+
+/// With a maintenance connection configured (prod's normal shape), the tool
+/// runs the cascade IN THE REQUEST: `cascade.status` is `applied`, the edges
+/// have moved before any replay, and nothing was deferred.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_applies_the_cascade_in_request_with_a_maintenance_session(
+    pool: PgPool,
+) {
+    let (server, caller) = app_role_server_with_maintenance(&pool, 0xC6).await;
+    let group = bind_and_arm(&pool, caller).await;
+    let (other_agent, _) = fixture::seed_agent_with_group(&pool, "evolve-applied-other").await;
+
+    let step = fixture::seed_group_claim(&pool, caller, group, "E2: weigh the sample").await;
+    let parent = fixture::seed_group_claim(&pool, caller, group, "the E-arm").await;
+    let child = fixture::seed_group_claim(&pool, caller, group, "E2.1 tare").await;
+    let workflow = seed_workflow(&pool).await;
+
+    let decomposed_from = seed_edge(&pool, parent, "claim", step, "decomposes_to").await;
+    let to_child = seed_edge(&pool, step, "claim", child, "decomposes_to").await;
+    let executes = seed_edge(&pool, workflow, "workflow", step, "executes").await;
+    let asserted = seed_edge(&pool, other_agent, "agent", step, "asserts").await;
+
+    let body = evolve(&server, params(step, "supersedes", "E2 v2")).await;
+    let head = parse_uuid_field(&body, "claim_id");
+    assert_eq!(
+        body["cascade"]["status"], "applied",
+        "a configured maintenance session applies the cascade in the request: {body}"
+    );
+    assert_eq!(
+        ends(&pool, decomposed_from).await,
+        (parent, head),
+        "parent -decomposes_to-> head, with no replay"
+    );
+    assert_eq!(ends(&pool, to_child).await, (head, child));
+    assert_eq!(
+        ends(&pool, executes).await,
+        (workflow, step),
+        "executes stays on the frozen step"
+    );
+    assert_eq!(
+        ends(&pool, asserted).await,
+        (other_agent, step),
+        "another agent's asserts stays on the content it asserted"
+    );
+    let deferrals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'cascade.deferred'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(deferrals, 0, "an applied cascade records no deferral");
 }
 
 /// A workflow's `step_follows` chain links the FROZEN steps its `executes`
