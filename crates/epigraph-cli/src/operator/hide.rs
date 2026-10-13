@@ -844,6 +844,7 @@ async fn apply_in(
             hidden: true,
             after: false,
             neighbour: false,
+            writer_owned: None,
         })
         .collect();
     w.append(&prior)?;
@@ -984,6 +985,7 @@ async fn apply_in(
             hidden: false,
             after: true,
             neighbour: true,
+            writer_owned: None,
         })
         .collect();
     post.extend(p_now.rows.iter().map(|r| Record {
@@ -996,6 +998,7 @@ async fn apply_in(
         hidden: true,
         after: true,
         neighbour: false,
+        writer_owned: None,
     }));
     w.append_post(&post)?;
     writeln!(
@@ -1268,6 +1271,7 @@ mod tests {
             endpoints_public: None,
             shared_outside: false,
             neighbours: BTreeSet::new(),
+            writer_owned: None,
             evidence_type: Some(t.into()),
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
             preview: Some("line one\nline two".into()),
