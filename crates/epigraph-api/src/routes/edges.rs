@@ -156,6 +156,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
     "refines",               // claim → claim (refinement)
     "cites",                 // claim → claim (citation link)
+    "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
     "CONTRADICTS",           // claim → claim (contradiction)
     "supersedes",            // claim → claim (version chain)

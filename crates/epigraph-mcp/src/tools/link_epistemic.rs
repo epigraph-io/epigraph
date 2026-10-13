@@ -18,11 +18,11 @@
 //! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
 //!   [`STRUCTURAL_RELATIONSHIPS`] (lowercase canonical strings; `supersedes`
 //!   is intentionally excluded — it has dedicated semantics in
-//!   `supersede_claim`). The structural set (currently just `cites`) is kept
+//!   `supersede_claim`). The structural set (`cites`, `qualifies`) is kept
 //!   separate because its members map to `RestrictionKind::Neutral` by
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
-//!   here just lets citation/provenance edges be created MCP-natively
-//!   without a doomed detour through the raw HTTP edges route.
+//!   here just lets citation/provenance links and scope caveats be created
+//!   MCP-natively without a doomed detour through the raw HTTP edges route.
 //! - idempotent on `(source, target, relationship)` — and for the SYMMETRIC
 //!   relationships (`contradicts`, `corroborates`, see
 //!   [`SYMMETRIC_RELATIONSHIPS`]) on the UNORDERED pair, so filing one in both
@@ -97,7 +97,17 @@ fn is_epistemic_relationship(s: &str) -> bool {
 /// allow-list instead. `auto_wire_edge_if_epistemic` already no-ops safely on
 /// `Neutral` relationships (see `epigraph_engine::edge_factor`'s
 /// short-circuit), so no changes are needed to the belief-wiring path itself.
-pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
+///
+/// `qualifies` (backlog 99582af7) is a SCOPE CAVEAT: `A qualifies B` says A
+/// bounds the conditions under which B applies (a salt regime, a geometry, a
+/// population), not whether B is true. Before it existed the only way to wire
+/// such a caveat was `contradicts`/`refutes`, which depresses B's belief for a
+/// reason that is not about B's truth. It is directional (deliberately absent
+/// from [`SYMMETRIC_RELATIONSHIPS`]), lower-case only (the U014 casing
+/// ruling), and an optional condition can ride in the edge's `properties`.
+/// `get_neighborhood` returns every relationship unfiltered, so a claim's
+/// qualifiers already travel with it there.
+pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites", "qualifies"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
@@ -171,7 +181,7 @@ pub async fn do_link_epistemic(
     let target_id = parse_uuid(&params.target_claim_id)?;
 
     // Tight allow-list — lowercase canonical epistemic relations, plus the
-    // separate structural set (currently just `cites`; see
+    // separate structural set (`cites`, `qualifies`; see
     // STRUCTURAL_RELATIONSHIPS doc comment for why it isn't folded into
     // EPISTEMIC_RELATIONSHIPS).
     if !is_epistemic_relationship(&params.relationship)
