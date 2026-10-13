@@ -645,3 +645,100 @@ fn perspective_locality_applies_to_untagged_evidence() {
         "untyped, no matching override → global 0.6",
     );
 }
+
+// ── Backlog bc06ec6f: writers store the canonical key ─────────────────────
+
+/// `Empirical`, `Observation`: the title-case spelling some callers send.
+fn title_case(key: &str) -> String {
+    let mut chars = key.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + chars.as_str()
+    })
+}
+
+/// BBA writers now store `canonical_evidence_type(raw)` instead of the
+/// caller's string. At the global tier that must move no weight. For every
+/// canonical key and every alias in `calibration.toml`, in the spellings
+/// callers send (lower, upper and title case), with and without a stored
+/// `source_strength`, under an intra and an unknown locality, the row with
+/// the canonical key weighs exactly what the row with the raw key weighed.
+/// The keys come from the loaded file, so an alias added later is covered.
+#[test]
+fn storing_the_canonical_key_leaves_the_global_weight_unchanged() {
+    let cal = load_calibration();
+    let mut keys: Vec<&String> = cal
+        .evidence_type_weights
+        .keys()
+        .chain(cal.evidence_type_aliases.keys())
+        .collect();
+    keys.sort();
+    assert!(
+        keys.len() >= 20,
+        "non-vacuity: calibration.toml should carry the canonical keys and their aliases, got {keys:?}"
+    );
+
+    let mut checked = 0;
+    for key in keys {
+        for spelling in [key.clone(), key.to_uppercase(), title_case(key)] {
+            let canonical = cal
+                .canonical_evidence_type(&spelling)
+                .expect("a calibrated key is never blank");
+            assert!(
+                cal.evidence_type_weights.contains_key(&canonical),
+                "{spelling:?} must resolve to a canonical weights key, got {canonical:?}"
+            );
+            for source_strength in [None, Some(0.42)] {
+                for locality in ["unknown", "intra_self_cite"] {
+                    let raw = effective_source_strength(
+                        &row(Some(&spelling), locality, source_strength),
+                        None,
+                        None,
+                        &cal,
+                    );
+                    let stored = effective_source_strength(
+                        &row(Some(&canonical), locality, source_strength),
+                        None,
+                        None,
+                        &cal,
+                    );
+                    approx(
+                        stored,
+                        raw,
+                        &format!(
+                            "{spelling:?} -> {canonical:?}, ss {source_strength:?}, {locality}"
+                        ),
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked >= 240, "non-vacuity: {checked} cases");
+}
+
+/// Trimming is the one global-tier change, and it is disclosed here. The
+/// readers lowercase but do not trim, so a padded key used to miss
+/// calibration and fall back to the stored `source_strength`, or to 0.5. Its
+/// canonical form now carries the calibrated weight, which the unpadded key
+/// always had, so no caller can reach a weight it could not reach before.
+#[test]
+fn a_padded_key_now_weighs_what_its_unpadded_key_always_weighed() {
+    let cal = load_calibration();
+    let weigh =
+        |key: &str| effective_source_strength(&row(Some(key), "unknown", None), None, None, &cal);
+    let padded = " Computation ";
+    let canonical = cal
+        .canonical_evidence_type(padded)
+        .expect("a padded calibrated key is not blank");
+    assert_eq!(canonical, "statistical");
+    approx(weigh(padded), 0.5, "a raw padded key misses calibration");
+    approx(
+        weigh(&canonical),
+        weigh("computation"),
+        "the stored padded key weighs what the unpadded key weighs",
+    );
+    assert!(
+        (weigh(&canonical) - 0.5).abs() > 1e-6,
+        "non-vacuity: statistical is calibrated away from the 0.5 fallback"
+    );
+}

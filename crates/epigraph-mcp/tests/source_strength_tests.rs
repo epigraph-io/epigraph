@@ -106,7 +106,8 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         (stored_strength - confidence).abs() > 0.01,
         "source_strength must NOT equal confidence ({confidence}); confidence is encoded in BBA shape"
     );
-    assert_eq!(stored.1.as_deref(), Some("testimony"));
+    // The DB-vocab tag `testimony` is stored as its canonical key (bc06ec6f).
+    assert_eq!(stored.1.as_deref(), Some("testimonial"));
     // Phase 3 (issue #197): auto_wire_ds_update must pipe its evidence_id
     // parameter through to mass_functions.evidence_id as the FK to the
     // evidence row that produced this BBA. Without this, the linking

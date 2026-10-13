@@ -235,6 +235,11 @@ pub async fn assess_claim(
         None,
         Some("discount"),
         None,
+        // Untyped on purpose (bc06ec6f). `build_bba_directed` already sized
+        // these masses with the request's type weight, so a typed row would be
+        // discounted by it a second time on any later fold. The row is also
+        // transient: the combined row stored below shares its
+        // (claim, frame, NULL, NULL) key and replaces it in this request.
         None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
@@ -376,6 +381,7 @@ pub async fn assess_claim(
         &combined_json,
         final_k,
         final_method,
+        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
         None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
     )

@@ -1222,7 +1222,9 @@ pub async fn submit_evidence(
         None,
         Some("discount"),
         Some(request.reliability),
-        request.evidence_type.as_deref(),
+        // Canonical key, or the caller's own key lowercased (bc06ec6f).
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref())
+            .as_deref(),
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
@@ -1468,6 +1470,7 @@ pub async fn submit_evidence(
         &combined_json,
         final_k,
         final_method,
+        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
         "unknown", // combined result; locality is per-input, not aggregate (issue #197)
         None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
     )

@@ -268,6 +268,7 @@ async fn create(
         &vacuous_masses,
         None,
         Some("prior"),
+        None,      // vacuous prior: not evidence, so no evidence type (bc06ec6f)
         "unknown", // vacuous prior; no evidence yet (issue #197)
         None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
@@ -469,18 +470,10 @@ async fn promote(
     let mut tx = pool.begin().await?;
 
     // Copy mass function
+    // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
+    // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
     if let Some(latest) = mass_rows.last() {
-        sqlx::query(
-            r#"
-            INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k, combination_method)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id) DO UPDATE
-            SET masses = EXCLUDED.masses, conflict_k = EXCLUDED.conflict_k, created_at = NOW()
-            "#,
-        )
-        .bind(id).bind(rv_frame.0).bind(latest.source_agent_id)
-        .bind(&latest.masses).bind(latest.conflict_k).bind(latest.combination_method.as_deref())
-        .execute(&mut *tx).await?;
+        epigraph_db::MassFunctionRepository::copy_to_frame(&mut *tx, latest, rv_frame.0).await?;
     }
 
     // Add to research_validity frame

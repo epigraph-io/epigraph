@@ -413,6 +413,10 @@ pub async fn analyze_result(
         &masses_json,
         None,
         Some("error_derived"),
+        // Untyped on purpose (bc06ec6f): the only type source in scope is the
+        // submitter-declared `data_source`, and typing from it would raise the
+        // row above the 0.5 unknown-type weight.
+        None,
         "unknown", // experiment-derived; no evidence-DOI vs paper comparison (issue #197)
         None,      // error-derived BBA has no evidence row (issue #197 Phase 3)
     )

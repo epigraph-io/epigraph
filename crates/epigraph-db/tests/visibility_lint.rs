@@ -2401,6 +2401,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "mass_function.rs",
+        "copy_to_frame",
+        "Runs no SQL of its own: it re-stores an already-read `MassFunctionRow` onto another \
+         frame through `store_with_perspective` (the entry above), an INSERT INTO \
+         `mass_functions` whose write-side control is that table's `WITH CHECK` against the \
+         connection's GUCs. There is nothing to filter: the caller (hypothesis promotion) read \
+         the source row through `get_for_claim_frame` with its own viewer. Generic executor so \
+         the promotion's transaction can hold the copy and its `claim_frames` insert together.",
+    ),
+    (
         "claim.rs",
         "deprecate_claim",
         "UPDATE `claims` SET `is_current = false`, `truth_value = 0.05`, `embedding = NULL`. A \

@@ -147,6 +147,15 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT to update existing entries.
     ///
+    /// `evidence_type` is the canonical evidence-type key the caller KNOWS for
+    /// this BBA, or `None` when it does not (backlog bc06ec6f). It is a
+    /// required parameter so every caller has to decide: this wrapper used to
+    /// hard-code `None`, which is how every `store()` writer (praxis
+    /// `interview_extraction`, the `error_derived` experiment loop) wrote
+    /// untyped BBAs. A combined system row (`source_agent_id = None`, the
+    /// result of folding several inputs) has no single type and must pass
+    /// `None`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
@@ -159,7 +168,8 @@ impl MassFunctionRepository {
         masses_json: &serde_json::Value,
         conflict_k: Option<f64>,
         combination_method: Option<&str>,
-        locality_tag: &str,        // 'intra' | 'cross' | 'unknown' (issue #197)
+        evidence_type: Option<&str>, // canonical evidence-type key, None when unknown (bc06ec6f)
+        locality_tag: &str,          // 'intra' | 'cross' | 'unknown' (issue #197)
         evidence_id: Option<Uuid>, // FK to evidence(id), NULL for non-evidence BBAs (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
         Self::store_with_perspective(
@@ -172,9 +182,47 @@ impl MassFunctionRepository {
             conflict_k,
             combination_method,
             None,
-            None,
+            evidence_type,
             locality_tag,
             evidence_id,
+        )
+        .await
+    }
+
+    /// Copy a stored BBA onto another frame for the same claim, keeping every
+    /// provenance column: `source_agent_id`, `masses`, `conflict_k`,
+    /// `combination_method`, `source_strength`, `evidence_type`,
+    /// `locality_tag` and `evidence_id` (backlog bc06ec6f).
+    ///
+    /// Hypothesis promotion (`hypothesis_assessment` → `research_validity`)
+    /// used a raw INSERT of `claim_id, frame_id, source_agent_id, masses,
+    /// conflict_k, combination_method` only, so the promoted BBA lost its type,
+    /// its reliability, its locality and its evidence link, and was then
+    /// combined at the 0.5 unknown-type weight. `perspective_id` is not copied, exactly as before:
+    /// the copy lands under the (claim, frame, agent, NULL) key, so re-promoting
+    /// re-states one row instead of adding another.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, row), fields(claim_id = %row.claim_id, from = %row.frame_id))]
+    pub async fn copy_to_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        row: &MassFunctionRow,
+        target_frame_id: Uuid,
+    ) -> Result<Uuid, DbError> {
+        Self::store_with_perspective(
+            executor,
+            row.claim_id,
+            target_frame_id,
+            row.source_agent_id,
+            None,
+            &row.masses,
+            row.conflict_k,
+            row.combination_method.as_deref(),
+            row.source_strength,
+            row.evidence_type.as_deref(),
+            &row.locality_tag,
+            row.evidence_id,
         )
         .await
     }
@@ -1029,6 +1077,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1042,6 +1091,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1123,6 +1173,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1137,6 +1188,7 @@ mod tests {
             &masses,
             None,
             Some("test"),
+            None, // evidence_type
             "unknown",
             None,
         )
@@ -1178,6 +1230,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1193,6 +1246,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
@@ -1270,6 +1324,7 @@ mod tests {
                 &masses,
                 None,
                 Some("test"),
+                None, // evidence_type
                 "unknown",
                 None,
             )
