@@ -187,3 +187,31 @@ async fn blank_content_is_still_reported_before_an_empty_generation(pool: PgPool
         other => panic!("expected InvalidContent at thesis, got: {other:?}"),
     }
 }
+
+/// The guard runs BEFORE the step-1 idempotency gate: re-ingesting a
+/// generation that is already processed (it has its `executes` edges) with an
+/// empty plan is refused as `EmptyGeneration`, not reported
+/// `already_ingested` — the caller's payload is malformed either way, and a
+/// silent "already done" would hide that its steps were dropped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_reingest_of_a_processed_generation_is_refused_not_already_ingested(pool: PgPool) {
+    let canonical = "u032-empty-reingest";
+    run(&pool, &extraction(canonical, 0))
+        .await
+        .expect("generation 0 with one step ingests");
+    let g1 = run(&pool, &extraction(canonical, 1))
+        .await
+        .expect("generation 1 with one step ingests");
+    assert!(
+        g1.executes_edges_created > 0,
+        "precondition: gen 1 is processed"
+    );
+
+    let mut stub = extraction(canonical, 1);
+    stub.phases = vec![];
+    let err = run(&pool, &stub)
+        .await
+        .expect_err("an empty re-ingest must be refused before the idempotency gate");
+    assert_empty_generation(err, canonical, 1);
+    assert_eq!(rows(&pool, canonical).await, 2, "nothing new written");
+}
