@@ -2107,6 +2107,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
     ),
     (
+        "trace.rs",
+        "create_with_reasoning_type",
+        "INSERT INTO `reasoning_traces` -- the SAME statement as `trace.rs::create` above, which \
+         is now a one-line delegate to it; the SQL text moved byte-identically. Same argument: a \
+         WRITE governed by migration 077's WITH CHECK against the connection's stamped GUCs, not \
+         an in-query viewer predicate. It differs only in letting the caller choose the \
+         CHECK-validated `reasoning_type` and record `properties.submitted_methodology` \
+         (backlog e207bb6d).",
+    ),
+    (
         "evidence.rs",
         "create",
         "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
