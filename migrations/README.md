@@ -1286,6 +1286,27 @@ restart.
   current successors and confirm the world group has no live writer
   (`docs/deploy.md`, migration 153, steps 3 and 4).
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **154**: public `seed_claim_validity_frame` — seeds the canonical
+  `claim_validity` frame at prod's fixed id
+  `8a594393-c343-4f1a-b942-5c5b7862f792` (public, nil world group,
+  `{supported, refuted, uncertain}`) with `ON CONFLICT (id) DO NOTHING`, after
+  refusing (RAISE, naming it) any OTHER frame already holding the name, and
+  then VERIFIES the row with that id is exactly the canonical one, RAISING
+  otherwise. It never UPDATEs a row, so on prod (where the row exists since
+  2026-06-15) it is a no-op. Why: `POST /claims/:id/assess` now resolves its
+  default frame by this id and never creates it
+  (`edge_factor::resolve_claim_validity_frame`); the by-name get-or-create let
+  the first caller to name a frame `claim_validity` (`frames.name` is UNIQUE)
+  refuse every later assess or receive its evidence. Adds no object, so no
+  register edit. Sets `lock_timeout = '3s'`. Apply as a role that bypasses
+  row security (the verify fails closed otherwise). Behaviour in
+  `epigraph-db/tests/claim_validity_frame_seed.rs` and
+  `epigraph-api/tests/assess_canonical_frame.rs`. Undo: delete the row only on
+  a database where this file inserted it and nothing references it; never on
+  prod. Checked before claiming: no open PR branch and no remote branch
+  carries a `154`. **Deploy order:** apply before (or with) the binary that
+  resolves by id; that binary refuses assess with no `frame_id` until the row
+  exists. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

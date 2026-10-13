@@ -372,11 +372,10 @@ async fn explicit_frame_id_is_used_as_given(pool: PgPool) {
         rows[0]
     );
     assert!(
-        !frame_names(&pool)
+        rows_on(&pool, claim, CANONICAL_CLAIM_VALIDITY)
             .await
-            .iter()
-            .any(|n| n == "claim_validity"),
-        "an explicit frame_id must not create claim_validity"
+            .is_empty(),
+        "an explicit frame_id must not write into claim_validity"
     );
 
     let before = mass_function_count(&pool, claim).await;
@@ -395,15 +394,24 @@ async fn explicit_frame_id_is_used_as_given(pool: PgPool) {
     );
 }
 
-/// A pre-existing `claim_validity` frame over the wrong hypotheses is refused,
-/// not written into with 3-way-remapped masses.
+/// The canonical `claim_validity` row over the wrong hypotheses (154 refuses
+/// to seed or apply over one; modelled here by corrupting it in place) is
+/// refused, not written into with 3-way-remapped masses.
 ///
 /// Main: assess never looks at `claim_validity` and writes a BBA on a
 /// per-source frame.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_claim_validity_frame_over_other_hypotheses_is_refused(pool: PgPool) {
     let (claim, _viewer, caller) = seed_claim(&pool, "assess on a wrong claim_validity").await;
-    create_frame(&pool, "claim_validity", &["supported", "unsupported"]).await;
+    sqlx::query("UPDATE frames SET hypotheses = ARRAY['supported','unsupported'] WHERE id = $1")
+        .bind(CANONICAL_CLAIM_VALIDITY)
+        .execute(&pool)
+        .await
+        .expect("corrupt the canonical row's axis");
+    let perspectives_before: i64 = sqlx::query_scalar("SELECT count(*) FROM perspectives")
+        .fetch_one(&pool)
+        .await
+        .expect("count perspectives");
 
     let result = try_assess(&pool, caller, claim, request(true, 0.8, None)).await;
     assert!(
@@ -414,6 +422,14 @@ async fn a_claim_validity_frame_over_other_hypotheses_is_refused(pool: PgPool) {
         mass_function_count(&pool, claim).await,
         0,
         "a refused call writes no BBA"
+    );
+    let perspectives_after: i64 = sqlx::query_scalar("SELECT count(*) FROM perspectives")
+        .fetch_one(&pool)
+        .await
+        .expect("count perspectives");
+    assert_eq!(
+        perspectives_after, perspectives_before,
+        "a refused call writes no evidence perspective"
     );
 }
 
