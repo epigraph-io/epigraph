@@ -323,8 +323,15 @@ impl WorkflowRepository {
     ///    the new row and must never become its parent (U032).
     /// 3. `None` when there is no predecessor (a lineage may legitimately
     ///    start above generation 0), or when a DIFFERENT lineage named in `p`
-    ///    has no row at `generation - 1`: that ingest starts the caller's own
-    ///    lineage, exactly as before.
+    ///    has no row at `generation - 1`: the named parent links nothing,
+    ///    exactly as before, and there is no fallback to `canonical_name`'s own
+    ///    predecessor. If `canonical_name` has no rows that ingest starts a new
+    ///    lineage; if it already has lower generations, the row is stored
+    ///    parentless even though [`Self::ingest_anchors`] treats it as a
+    ///    generation of that lineage (authority over `lineage_head`, submitter
+    ///    inherited). That residual is the current default pending operator
+    ///    question Q2 (U032 scope §6), pinned by
+    ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
     ///
     /// `workflows` has no row security, as [`Self::find_root_by_canonical`]
     /// records, so this read needs no viewer.

@@ -1743,6 +1743,7 @@ pub async fn record_behavioral_execution(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),

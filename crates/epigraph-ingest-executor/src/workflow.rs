@@ -137,8 +137,9 @@ pub struct WorkflowIngestExecutionResult {
     /// `true` when this ingest inserted (or upserted) a `workflow → variant_of
     /// → workflow` edge, i.e. when a parent was resolved (the named
     /// `parent_canonical_name` at `generation - 1`, or this lineage's
-    /// predecessor; see `WorkflowRepository::resolve_ingest_parent`). Idempotent re-ingests that hit the gate at step 1 return `false`
-    /// (no insertion attempted) even when the edge already exists in the DB.
+    /// predecessor; see `WorkflowRepository::resolve_ingest_parent`).
+    /// Idempotent re-ingests that hit the gate at step 1 return `false` (no
+    /// insertion attempted) even when the edge already exists in the DB.
     pub variant_of_edge_created: bool,
     pub relationship_edges_created: usize,
     /// `true` when the idempotency gate short-circuited (workflow already
