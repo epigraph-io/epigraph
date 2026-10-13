@@ -755,14 +755,14 @@ pub(crate) async fn create_claim_core(
     let (created_claim, was_created) = if request.if_not_exists {
         ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl).await?
     } else {
-        // The (content_hash, agent_id) UNIQUE constraint that create_strict's
-        // 409-on-duplicate contract relied on was dropped (migration 107), so
-        // create_strict now silently INSERTs duplicates — 20+ identical claims
-        // accumulated this way (bug c11c1295). Re-assert the contract at the app
-        // layer: refuse a duplicate up front with the same 409 the constraint
-        // would have produced. (Restoring the DB constraint requires de-duping
-        // existing rows first and is a separate migration; adding it here would
-        // brick API boot on the existing duplicates.)
+        // create_strict's 409-on-duplicate contract relied on the
+        // (content_hash, agent_id) UNIQUE constraint migration 013 added. It is
+        // absent on the long-lived database (dropped out-of-band; 20+ identical
+        // claims accumulated, bug c11c1295) and migration 150 drops it
+        // everywhere (backlog 00f1a517), so create_strict silently INSERTs
+        // duplicates. The contract is re-asserted here at the app layer:
+        // lock_content_hash_agent, then a find, refusing a duplicate up front
+        // with the same 409 the constraint would have produced.
         let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
         let dup_conflict = || {
