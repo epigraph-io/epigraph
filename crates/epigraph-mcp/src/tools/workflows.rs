@@ -1103,6 +1103,7 @@ pub async fn report_workflow_outcome(
         params.success,
         Some("observation"),
         Some(evidence.id.as_uuid()), // unique perspective per evidence submission
+        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
     )
     .await
     .map_err(internal_error)?;

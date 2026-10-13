@@ -36,8 +36,10 @@ const ADMIN_ONLY: &[&str] = &[
 ];
 
 /// The measured count at the commit that introduced this ratchet (EL-10).
-/// Lower it when a literal goes away; never raise it.
-const HIGH_WATER: usize = 73;
+/// Lower it when a literal goes away; never raise it. 73 -> 69: the five
+/// `claims:admin` rows of `epigraph-mcp`'s `SCOPE_MAP` name
+/// `scope_map::CLAIMS_ADMIN` (one literal) instead of spelling it (X04).
+const HIGH_WATER: usize = 69;
 
 /// The gate module: the chokepoint itself spells the scopes.
 const GATE: &str = "epigraph-auth/src/lib.rs";

@@ -13,8 +13,10 @@
 //!
 //! The in-memory `EventStore` uses a module-level `OnceLock` so that all
 //! handlers share the same store without modifying `AppState`. Each event
-//! receives a monotonically increasing `graph_version`, making it trivial
-//! to request "all events since version N" for incremental synchronisation.
+//! receives a monotonically increasing `graph_version`, which orders
+//! [`graph_snapshot`]. Incremental synchronisation through
+//! `GET /api/v1/events` is by the `(since, after_id)` cursor instead, and that
+//! cursor is NOT commit-ordered: see [`list_events`] for the contract.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -113,14 +115,15 @@ impl EventStore {
                         return false;
                     }
                 }
-                if let Some(since) = filter.since {
-                    if e.created_at < since {
-                        return false;
-                    }
-                }
-                true
+                filter.admits(e.created_at, e.id)
             })
             .collect();
+        // Under a cursor, keyset order so `offset`/`limit` page exactly like
+        // the table. Without one, insertion (= graph_version) order as before.
+        let mut filtered = filtered;
+        if filter.since.is_some() {
+            filtered.sort_by_key(|e| (e.created_at, e.id));
+        }
 
         let total = filtered.len();
         let offset = filter.offset.unwrap_or(0);
@@ -163,8 +166,15 @@ impl Default for EventStore {
 /// Query parameters for `GET /api/v1/events`.
 #[derive(Debug, Deserialize)]
 pub struct EventFilter {
-    /// Only return events created at or after this timestamp
+    /// Only return events created at or after this timestamp (INCLUSIVE, and
+    /// NOT commit-ordered — see [`list_events`]).
     pub since: Option<DateTime<Utc>>,
+    /// Keyset tiebreaker for `since`: with both set, only events whose
+    /// `(created_at, id)` is strictly greater than `(since, after_id)` are
+    /// returned. The correct polling cursor is the pair
+    /// `(since = last.created_at, after_id = last.id)`. Rejected (400) without
+    /// `since`.
+    pub after_id: Option<Uuid>,
     /// Only return events of this type
     pub event_type: Option<String>,
     /// Maximum number of events to return (default 100, max 1000)
@@ -173,10 +183,30 @@ pub struct EventFilter {
     pub offset: Option<usize>,
 }
 
+impl EventFilter {
+    /// Whether an event at `(created_at, id)` lies at or after this filter's
+    /// cursor. The in-process mirror of the predicate
+    /// `epigraph_db::EventRepository::list` applies in SQL — inclusive
+    /// `created_at >= since` without `after_id`, the strict keyset
+    /// `(created_at, id) > (since, after_id)` with it — so both halves of the
+    /// `list_events` merge page identically. No `since`: everything is
+    /// admitted (`after_id` alone is rejected by the handler).
+    pub fn admits(&self, created_at: DateTime<Utc>, id: Uuid) -> bool {
+        match (self.since, self.after_id) {
+            (None, _) => true,
+            (Some(since), None) => created_at >= since,
+            (Some(since), Some(after)) => (created_at, id) > (since, after),
+        }
+    }
+}
+
 /// Response body for `GET /api/v1/events`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventListResponse {
     pub events: Vec<GraphEvent>,
+    /// Size of the merged result before `offset`/`limit`. Under the `db`
+    /// feature its persisted half is capped by an overfetch, so it is NOT a
+    /// count of every matching event (see [`list_events`], "Cursor contract").
     pub total: usize,
 }
 
@@ -212,13 +242,61 @@ const MAX_EVENT_TYPE_LENGTH: usize = 200;
 /// Maximum payload size in bytes (64 KB, matching claim content limits).
 const MAX_PAYLOAD_SIZE: usize = 65_536;
 
+/// How far, in seconds, a `since` poller must re-read BEHIND its cursor (and
+/// dedupe by event id) to catch events that became visible after it polled
+/// but carry an earlier `created_at` — see [`list_events`], "Cursor contract".
+///
+/// Meant to be the longest expected write transaction. 300 s is PROVISIONAL
+/// (drain U045, operator question Q3): it covers normal MCP/REST write
+/// transactions but NOT a large whole-document ingest, whose transaction can
+/// run longer than any fixed window. That is why this is a stopgap and not a
+/// commit-ordered cursor; the trigger for replacing it is in [`list_events`].
+pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/v1/events` - Paginated, filterable event log.
 ///
-/// Returns events ordered by `graph_version` (ascending). Supports
-/// filtering by `event_type` and `since` timestamp, with `limit`/`offset`
-/// pagination.
+/// Returns events ordered by `(created_at, id)` ascending — NOT by
+/// `graph_version`. Supports filtering by `event_type` and the
+/// `(since, after_id)` cursor, with `limit`/`offset` pagination.
+///
+/// # Cursor contract
+///
+/// * `since` alone is INCLUSIVE (`created_at >= since`): re-polling with the
+///   last event's `created_at` re-serves it, and every event sharing that
+///   timestamp. Kept for compatibility.
+/// * The correct polling cursor is the pair
+///   `(since = last.created_at, after_id = last.id)`, which returns events
+///   whose `(created_at, id)` is strictly greater. It pages through a block of
+///   events that share one `created_at` (one transaction stamps all of its
+///   events with the same `NOW()`), which `since` alone cannot. `after_id`
+///   without `since` is a 400.
+/// * With a cursor the page is the OLDEST matching events after it (the
+///   cursor is applied in SQL, not to an already-truncated newest-N window).
+/// * `total` is NOT the number of events after the cursor: it counts the
+///   merged set before paging, whose persisted half is capped by the route's
+///   overfetch. To drain a cursor, page until a page comes back shorter than
+///   `limit`; do not compare against `total`.
+///
+/// **The cursor is NOT commit-ordered.** An event's `created_at` is its
+/// transaction's START time and it becomes visible only at COMMIT, so an event
+/// can appear after a poll carrying a timestamp behind a cursor that already
+/// moved past it (`epigraph_db::EventRepository::publish_or_log_conn`, "An
+/// event's `created_at` is NOT its visibility order"). A consumer that must
+/// not miss events re-reads an overlap window of
+/// [`EVENTS_SINCE_OVERLAP_SECS`] behind its cursor (`since = cursor - W`,
+/// paging with `after_id` until a page comes back short) and dedupes by `id`.
+/// That window is a stopgap: a transaction longer than it can still be missed.
+///
+/// **Trigger for a commit-ordered cursor** (drain U045 option (a): an `xid8`
+/// column set from `pg_current_xact_id()` and a `pg_snapshot_xmin` watermark
+/// behind an opaque `after` cursor): the first consumer of
+/// transactionally-published event types — a `claim.created` follower, a sync
+/// client, or a webhook relay reading `events`. Today's only `since` poller
+/// (epiclaw-host's synthesis watcher) reads `synthesis.*` events, which are
+/// written by autocommit `POST /api/v1/events`, so its race window is one
+/// statement.
 ///
 /// # Tenancy (PR-09)
 ///
@@ -265,6 +343,12 @@ pub async fn list_events(
     // 401 branches — runs identically in both. Under `not(db)` the value is a
     // `NoDbViewer` unit and nothing reads it.
     let _ = &viewer;
+    if filter.after_id.is_some() && filter.since.is_none() {
+        return Err(ApiError::ValidationError {
+            field: "after_id".to_string(),
+            reason: "after_id is a tiebreaker for since and requires it".to_string(),
+        });
+    }
     #[cfg(feature = "db")]
     {
         let limit = filter.limit.unwrap_or(100).min(1000);
@@ -273,12 +357,21 @@ pub async fn list_events(
         // 1. Pull from the persisted events table. Overfetch (limit + offset)
         //    plus headroom so dedup against the in-memory store doesn't
         //    starve the page. We still apply the final limit/offset post-merge.
+        //    With `since` the cursor goes INTO the SQL, so the rows returned
+        //    are the OLDEST after it; filtering the newest `overfetch` rows
+        //    afterwards (the pre-U045 shape) lost the oldest whenever more
+        //    than `overfetch` events sat after the cursor.
         let overfetch = (limit.saturating_add(offset)).saturating_mul(2).max(limit);
+        let cursor = filter.since.map(|since| epigraph_db::EventCursor {
+            since,
+            after_id: filter.after_id,
+        });
         let rows = epigraph_db::EventRepository::list(
             &_state.db_pool,
             &viewer,
             filter.event_type.as_deref(),
             None, // actor_id — not part of the public filter
+            cursor,
             overfetch as i64,
         )
         .await
@@ -303,6 +396,7 @@ pub async fn list_events(
         //    pass a large limit here and re-page after merging.
         let in_mem_filter = EventFilter {
             since: filter.since,
+            after_id: filter.after_id,
             event_type: filter.event_type.clone(),
             limit: Some(usize::MAX),
             offset: None,
@@ -315,12 +409,9 @@ pub async fn list_events(
         retain_visible_events(&_state.db_pool, &viewer, &mut in_mem).await?;
         events.extend(in_mem);
 
-        // 3. Defensive since-filter on the merged set. The DB query above
-        //    didn't narrow by `since`, so persisted events older than the
-        //    cutoff need to be dropped here.
-        if let Some(since) = filter.since {
-            events.retain(|e| e.created_at >= since);
-        }
+        // 3. Defensive cursor filter on the merged set. Both halves already
+        //    applied it; kept so the page cannot depend on either one alone.
+        events.retain(|e| filter.admits(e.created_at, e.id));
 
         // 4. Dedup by event id. Persisted rows are first in the vec, so
         //    `retain` keeps the persisted copy when the same id appears in
@@ -328,10 +419,10 @@ pub async fn list_events(
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         events.retain(|e| seen.insert(e.id));
 
-        // 5. Sort by `created_at` ascending. ASC matches the natural
-        //    polling semantics of `since`-based subscribers (oldest-first
-        //    so the next `since` cursor is just the last event's `created_at`).
-        events.sort_by_key(|e| e.created_at);
+        // 5. Sort by the keyset `(created_at, id)` ascending: oldest first,
+        //    and the same total order the SQL cursor uses, so the next cursor
+        //    is the last event's `(created_at, id)`.
+        events.sort_by_key(|e| (e.created_at, e.id));
 
         // 6. Apply offset + limit to the merged, sorted, deduped set.
         let total = events.len();
@@ -616,12 +707,18 @@ pub async fn graph_snapshot(
 
         // Fetch all events up to version via the event list (filter by version not yet in repo,
         // so we fetch all and filter client-side for now)
-        let rows =
-            epigraph_db::EventRepository::list(&_state.db_pool, &viewer, None, None, version + 1)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to fetch events for snapshot: {e}"),
-                })?;
+        let rows = epigraph_db::EventRepository::list(
+            &_state.db_pool,
+            &viewer,
+            None,
+            None,
+            None,
+            version + 1,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch events for snapshot: {e}"),
+        })?;
         let events: Vec<GraphEvent> = rows
             .into_iter()
             .filter(|r| r.graph_version <= version)
@@ -1049,5 +1146,159 @@ mod payload_uuid_tests {
             v.to_string().contains(&found[0].to_string()),
             "never fabricate an id that is not a substring of the payload"
         );
+    }
+}
+
+/// The `(since, after_id)` cursor on the in-process half (drain U045).
+///
+/// Feature-independent, unlike `tests` above: under `not(db)` the in-memory
+/// store is the ONLY cursor implementation, and under `db` it still serves
+/// every event type that is pushed to `global_event_store()` but never
+/// persisted (`edge.added`, belief and community events). The HTTP tests in
+/// `tests/events_unified_test.rs` insert rows through SQL, which filters them
+/// before this code runs, so they cannot see a broken in-process predicate.
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("valid instant")
+    }
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn cursor(since: Option<DateTime<Utc>>, after_id: Option<Uuid>) -> EventFilter {
+        EventFilter {
+            since,
+            after_id,
+            event_type: None,
+            limit: None,
+            offset: None,
+        }
+    }
+
+    /// A store holding `events` exactly as given — fixed timestamps and ids,
+    /// in this insertion order — which `EventStore::push` cannot produce.
+    fn store_with(events: &[(DateTime<Utc>, Uuid)]) -> EventStore {
+        let store = EventStore::new();
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(i, &(created_at, id))| GraphEvent {
+                id,
+                event_type: "test.cursor".to_string(),
+                actor_id: None,
+                payload: serde_json::json!({}),
+                graph_version: i as i64 + 1,
+                created_at,
+            })
+            .collect();
+        *store.events.try_write().expect("fresh store is unlocked") = rows;
+        store
+    }
+
+    #[test]
+    fn without_since_everything_is_admitted() {
+        let f = cursor(None, None);
+        assert!(f.admits(at(-1_000), id(0)));
+        assert!(f.admits(at(1_000), id(u128::MAX)));
+    }
+
+    #[test]
+    fn since_alone_is_inclusive_at_its_own_instant() {
+        let f = cursor(Some(at(10)), None);
+        assert!(f.admits(at(10), id(1)), "an event AT `since` is admitted");
+        assert!(f.admits(at(10), id(0)), "whatever its id");
+        assert!(f.admits(at(11), id(0)));
+        assert!(!f.admits(at(9), id(u128::MAX)), "an earlier event is not");
+    }
+
+    #[test]
+    fn since_with_after_id_is_a_strict_keyset() {
+        let f = cursor(Some(at(10)), Some(id(5)));
+        assert!(
+            !f.admits(at(10), id(5)),
+            "the cursor's own event must not be re-served"
+        );
+        assert!(
+            !f.admits(at(10), id(4)),
+            "a lower id at the cursor's instant was already passed"
+        );
+        assert!(
+            f.admits(at(10), id(6)),
+            "a higher id at the cursor's instant is next"
+        );
+        assert!(
+            f.admits(at(11), id(0)),
+            "any id at a later instant is admitted"
+        );
+        assert!(
+            !f.admits(at(9), id(u128::MAX)),
+            "any id at an earlier instant is not"
+        );
+    }
+
+    /// One transaction stamps all of its events with one `created_at`, so a
+    /// same-instant block can be larger than a page. Paging it with the
+    /// documented cursor `(since = last.created_at, after_id = last.id)` must
+    /// return every event exactly once, in `(created_at, id)` order, although
+    /// the store holds them in descending-id insertion order and with a later
+    /// event inserted first.
+    #[tokio::test]
+    async fn keyset_paging_through_a_same_instant_block_serves_each_event_once() {
+        let mut rows = vec![(at(20), id(1))];
+        rows.extend((1..=7).rev().map(|n| (at(10), id(n * 10))));
+        rows.push((at(5), id(99)));
+        let store = store_with(&rows);
+
+        let mut served = Vec::new();
+        let mut filter = cursor(Some(at(10)), None);
+        filter.limit = Some(3);
+        for _ in 0..5 {
+            let (page, _) = store.list(&filter).await;
+            served.extend(page.iter().map(|e| (e.created_at, e.id)));
+            let Some(last) = page.last() else { break };
+            filter.since = Some(last.created_at);
+            filter.after_id = Some(last.id);
+            if page.len() < 3 {
+                break;
+            }
+        }
+
+        let mut expected: Vec<_> = (1..=7).map(|n| (at(10), id(n * 10))).collect();
+        expected.push((at(20), id(1)));
+        assert_eq!(
+            served, expected,
+            "every event at or after the cursor, once each, in (created_at, id) order"
+        );
+    }
+
+    /// `offset`/`limit` under a cursor must page over the keyset order, so
+    /// consecutive pages neither overlap nor leave a gap.
+    #[tokio::test]
+    async fn offset_paging_under_a_cursor_follows_keyset_order() {
+        let rows: Vec<_> = [(30, 3), (10, 9), (20, 1), (10, 2), (20, 7), (10, 5)]
+            .iter()
+            .map(|&(s, n)| (at(s), id(n)))
+            .collect();
+        let store = store_with(&rows);
+
+        let mut served = Vec::new();
+        for offset in [0, 2, 4] {
+            let mut filter = cursor(Some(at(10)), None);
+            filter.limit = Some(2);
+            filter.offset = Some(offset);
+            let (page, total) = store.list(&filter).await;
+            assert_eq!(total, 6);
+            served.extend(page.iter().map(|e| (e.created_at, e.id)));
+        }
+
+        let expected: Vec<_> = [(10, 2), (10, 5), (10, 9), (20, 1), (20, 7), (30, 3)]
+            .iter()
+            .map(|&(s, n)| (at(s), id(n)))
+            .collect();
+        assert_eq!(served, expected);
     }
 }

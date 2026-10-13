@@ -126,7 +126,7 @@ pub use elevation_ceremony::{
 };
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
-pub use event::{EventRepository, EventRow};
+pub use event::{EventCursor, EventRepository, EventRow};
 pub use evidence::{
     DerivationEvidence, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter,
     EvidenceListRow, EvidenceRepository, EvidenceSearchResult,

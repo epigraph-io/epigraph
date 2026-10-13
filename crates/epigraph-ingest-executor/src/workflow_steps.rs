@@ -366,8 +366,10 @@ pub async fn add_step(
     .bind(step_text)
     // Scoped to the workflow like the builder's step nodes: the row is
     // authored by the shared system agent, so a plain `blake3(step_text)`
-    // collides on `uq_claims_content_hash_agent` with any other workflow's
-    // step of the same text (backlog 6178a205).
+    // collides on the (content_hash, agent_id) dedup key with any other
+    // workflow's step of the same text (backlog 6178a205; 013's
+    // `uq_claims_content_hash_agent` through migration 149, the app-layer
+    // lock from 150).
     .bind(compound_content_hash(&step_hash, canonical_name).as_slice())
     .bind(agent_id)
     .bind(serde_json::json!({

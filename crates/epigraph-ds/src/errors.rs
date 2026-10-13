@@ -37,6 +37,14 @@ pub enum DsError {
     #[error("Need at least one mass function (got 0)")]
     InsufficientSources,
 
+    /// A probability argument is NaN or outside [0, 1]
+    #[error("Invalid probability: {value} (must be in [0, 1])")]
+    InvalidProbability { value: f64 },
+
+    /// The operation is defined only on a two-hypothesis frame
+    #[error("Expected a two-hypothesis frame (got n={n})")]
+    NotBinaryFrame { n: usize },
+
     /// Frame has too many hypotheses for full power-set enumeration
     #[error("Frame too large for power-set enumeration (n={n}, max=20)")]
     FrameTooLarge { n: usize },

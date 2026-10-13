@@ -36,6 +36,7 @@ pub async fn list_events(
         viewer,
         params.event_type.as_deref(),
         actor_id,
+        None, // no cursor: MCP `list_events` is a "recent events" view
         limit,
     )
     .await

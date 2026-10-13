@@ -398,6 +398,9 @@ pub async fn assess_claim(
     // No "combined result" mass_functions row is stored any more: it sat on the
     // input BBA's key and overwrote it, and a recompute must never re-combine a
     // combined row. The per-frame result is cached by the upsert below.
+    // So no cached row can ever sit over an agent-less input (backlog
+    // b5cb3efb): the input is keyed by its own perspective, and nothing is
+    // stored on the (claim, frame, NULL, NULL) slot.
 
     // Store global scoped belief cache
     let _ = epigraph_db::ScopedBeliefRepository::upsert(

@@ -12,9 +12,11 @@
 //! ("Duplicate entity already exists") and wrote nothing.
 //!
 //! These drive the real writers (`store_workflow`, `do_ingest_workflow_via_pool`,
-//! `add_step`) against a freshly migrated database with the constraint IN FORCE
-//! — asserted up front, because `tests/common::drop_unique_constraint` exists
-//! and a dropped constraint would make every assertion here vacuous.
+//! `add_step`) against a freshly migrated database with the constraint IN FORCE.
+//! Migration 150 drops it from every database (backlog 00f1a517), so the arms
+//! that need it re-add it up front with `tests/common::add_unique_constraint`,
+//! which asserts it is present: without it a collision would insert a second
+//! row instead of failing, and the "succeeds" assertions would be vacuous.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -36,18 +38,10 @@ use uuid::Uuid;
 
 const SHARED_STEP: &str = "Run tests";
 
-async fn assert_constraint_in_force(pool: &PgPool) {
-    let present: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
-                        WHERE conname = 'uq_claims_content_hash_agent')",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read pg_constraint");
-    assert!(
-        present,
-        "uq_claims_content_hash_agent must be in force, or no collision can happen"
-    );
+/// Put `uq_claims_content_hash_agent` in force on the private database (see
+/// the module doc); `add_unique_constraint` asserts the post-condition.
+async fn put_constraint_in_force(pool: &PgPool) {
+    add_unique_constraint(pool).await;
 }
 
 async fn server(pool: &PgPool) -> EpiGraphMcpFull {
@@ -113,7 +107,7 @@ async fn executed_claim(
 /// also the same step text) must succeed and write its own rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn second_store_workflow_sharing_phase_and_step_text_succeeds(pool: PgPool) {
-    assert_constraint_in_force(&pool).await;
+    put_constraint_in_force(&pool).await;
     let server = server(&pool).await;
 
     let (wf_a, _name_a) = store(
@@ -206,7 +200,7 @@ fn extraction_with_step(canonical: &str, step: &str) -> WorkflowExtraction {
 /// before the fix — what fails is exactly `add_step`'s INSERT.
 #[sqlx::test(migrations = "../../migrations")]
 async fn add_step_text_already_used_by_another_workflow_succeeds(pool: PgPool) {
-    assert_constraint_in_force(&pool).await;
+    put_constraint_in_force(&pool).await;
     let server = server(&pool).await;
     let viewer = fixture::public_viewer(&pool).await;
 
@@ -666,7 +660,7 @@ async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: 
 /// written by the same system agent hit `uq_claims_content_hash_agent`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPool) {
-    assert_constraint_in_force(&pool).await;
+    put_constraint_in_force(&pool).await;
     let server = server(&pool).await;
     let viewer = fixture::public_viewer(&pool).await;
     let shared = format!("cargo test {}", Uuid::new_v4());

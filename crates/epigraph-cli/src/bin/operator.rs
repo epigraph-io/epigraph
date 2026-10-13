@@ -32,6 +32,11 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator restrict-claims --claims-file claims.txt --target-group <uuid> \
+//!         --operator <uuid> --manifest-out restrict-1.jsonl [--allow-non-world-owner] \
+//!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
+//!         [--accept-unenforced]]
+//!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
@@ -68,7 +73,8 @@
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    elevation, hide, human, legacy, link, passkey, reown, reown_linked, reverse, system_agent,
+    elevation, hide, human, legacy, link, passkey, reown, reown_linked, restrict, reverse,
+    system_agent,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -543,6 +549,63 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Move listed PUBLIC claims, and every row that follows them, into a
+    /// target group with visibility `group` (the audited admin privatization
+    /// act). Reversed exactly by `reown-reverse --manifest`.
+    RestrictClaims {
+        /// One claim UUID per line; only these claims are ever touched.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The group the claims move into: an existing, active group (not
+        /// world or seed) of which `--operator` is a live admin.
+        #[arg(long)]
+        target_group: Uuid,
+        /// The operator (a person's agent id) the act is attributed to in the
+        /// audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before any write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back, and no manifest or audit row is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's eligible claim count, repeated back.
+        #[arg(long)]
+        confirm_count: Option<usize>,
+        /// Proceed although legacy permissive policies mean the restriction is
+        /// not enforced; the run and its audit row then say UNENFORCED.
+        #[arg(long)]
+        accept_unenforced: bool,
+        /// Also move public claims owned by a group other than the world
+        /// group. Off by default: only the world-owned corpus moves.
+        #[arg(long)]
+        allow_non_world_owner: bool,
+        /// The decision this act carries out, recorded in the manifest and the
+        /// audit row. Required under `--apply`.
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why, recorded in the manifest and the audit row. Required under
+        /// `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Claims per transaction.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// Stop after this many batches (a re-run with a new manifest picks up
+        /// the rest).
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// How many claims the dry run lists row by row.
+        #[arg(long, default_value_t = 3)]
+        sample: usize,
+    },
     /// Arm migration 128's admin-scope switch: from then on every mint strips
     /// the admin-only scopes and every path that hands scopes out refuses
     /// them. Audited. Without `--apply`, the change is rolled back.
@@ -656,6 +719,46 @@ async fn main_inner() -> anyhow::Result<i32> {
             anyhow::bail!("--batch-size must be at least 1");
         }
     }
+    // restrict-claims' options, refused before any connection when they cannot
+    // describe a valid run (no ruling, reason or confirmed count under --apply).
+    let restrict_opts = if let Command::RestrictClaims {
+        claims_file,
+        target_group,
+        operator: op,
+        manifest_out,
+        apply,
+        confirm_count,
+        accept_unenforced,
+        allow_non_world_owner,
+        ruling,
+        reason,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        sample,
+    } = &cli.command
+    {
+        let o = restrict::Options {
+            claims_file: claims_file.clone(),
+            target: *target_group,
+            operator: *op,
+            manifest_out: manifest_out.clone(),
+            apply: *apply,
+            confirm_count: *confirm_count,
+            accept_unenforced: *accept_unenforced,
+            allow_non_world_owner: *allow_non_world_owner,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            sample: *sample,
+        };
+        restrict::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
     // The role vocabulary, before any connection: a typo is refused by this
     // tool with the valid values, not by the table's CHECK.
     let system_role = if let Command::RegisterSystemAgent { role, .. } = &cli.command {
@@ -1263,6 +1366,19 @@ async fn main_inner() -> anyhow::Result<i32> {
             };
             reown::validate(&opts)?;
             let report = reown::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
+        Command::RestrictClaims { claims_file, .. } => {
+            let opts = restrict_opts.expect("built above");
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let report = restrict::run(&mut conn, &opts, &ids, &mut stdout).await?;
             Ok(if report.batch_failures.is_empty() {
                 0
             } else {

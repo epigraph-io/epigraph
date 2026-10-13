@@ -31,6 +31,7 @@ async fn events_of_type(event_type: &str) -> Vec<epigraph_api::routes::events::G
     let filter = EventFilter {
         event_type: Some(event_type.to_string()),
         since: None,
+        after_id: None,
         limit: Some(1000),
         offset: None,
     };

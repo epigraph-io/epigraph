@@ -6,7 +6,8 @@
 //!
 //! Until U027 the handler also stored a "combined result" row on the input's
 //! `(claim, frame, NULL agent, NULL perspective)` key, which replaced the input
-//! in the same request. Each call now stores its input under its own evidence
+//! in the same request (main later skipped that store while an input held the
+//! slot, backlog b5cb3efb). Each call now stores its input under its own evidence
 //! perspective and no combined row at all, so the row that survives IS the
 //! `discount` input row.
 //!

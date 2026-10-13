@@ -86,6 +86,116 @@ pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
+/// The `combination_method` a belief writer stamps on its cached result when
+/// it folded nothing: a lone input BBA leaves the fold's `reports` empty, so
+/// there is no Dempster label to record. Without a label that row was
+/// indistinguishable from an agent-less input BBA (backlog b5cb3efb).
+pub const CACHED_COMBINATION_UNFOLDED: &str = "cached_unfolded";
+
+/// The `combination_method` prefix of a cached result that went through the
+/// cautious (dependent-source) arm: `format!("cautious+{adaptive}")`.
+const CACHED_COMBINATION_CAUTIOUS_PREFIX: &str = "cautious+";
+
+/// The label a belief writer records for a fold that ended on `method`:
+/// `format!("{method:?}")`, spelled out so the list below cannot drift. A new
+/// `CombinationMethod` variant fails to compile here until it is added, and
+/// the unit test pins every arm to the `Debug` spelling the writers use.
+const fn combination_method_label(method: epigraph_ds::CombinationMethod) -> &'static str {
+    use epigraph_ds::CombinationMethod as M;
+    match method {
+        M::Conjunctive => "Conjunctive",
+        M::Dempster => "Dempster",
+        M::YagerOpen => "YagerOpen",
+        M::YagerClosed => "YagerClosed",
+        M::DuboisPrade => "DuboisPrade",
+        M::Inagaki => "Inagaki",
+        M::TbmConjunctive => "TbmConjunctive",
+    }
+}
+
+/// Every `combination_method` label a cached combination row can carry, other
+/// than the `cautious+…` family.
+const CACHED_COMBINATION_LABELS: [&str; 8] = {
+    use epigraph_ds::CombinationMethod as M;
+    [
+        combination_method_label(M::Conjunctive),
+        combination_method_label(M::Dempster),
+        combination_method_label(M::YagerOpen),
+        combination_method_label(M::YagerClosed),
+        combination_method_label(M::DuboisPrade),
+        combination_method_label(M::Inagaki),
+        combination_method_label(M::TbmConjunctive),
+        CACHED_COMBINATION_UNFOLDED,
+    ]
+};
+
+/// The placeholder a combine-input query carries where
+/// [`with_cached_combination_excluded`] installs its predicate.
+const NOT_CACHED_COMBINATION_MARKER: &str = "/* {NOT_CACHED_COMBINATION} */";
+
+/// Replace [`NOT_CACHED_COMBINATION_MARKER`] in `sql` with `AND <predicate>`,
+/// the predicate excluding cached combination rows, with every column
+/// qualified by `qualifier` (`""` or `"mf."`).
+///
+/// A cached combination row is what `routes::belief::submit_evidence` and
+/// `routes::assess` store after folding a claim's inputs: no source agent, no
+/// perspective, and a combination label (see [`CACHED_COMBINATION_LABELS`] or
+/// the `cautious+` prefix). It is a DERIVED artifact of the very rows it sits
+/// beside, so a reader that folds it again counts that evidence twice
+/// (backlog b5cb3efb).
+///
+/// The agent test is what keeps real inputs: `submit_ds_evidence` stores an
+/// input labelled `"Dempster"` too, but always with its agent. `COALESCE`
+/// keeps a row whose label is NULL (`NOT NULL` would drop it).
+fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
+    assert!(
+        sql.contains(NOT_CACHED_COMBINATION_MARKER),
+        "combine-input query has no {NOT_CACHED_COMBINATION_MARKER} marker:\n{sql}"
+    );
+    let labels = CACHED_COMBINATION_LABELS
+        .iter()
+        .map(|l| format!("'{l}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let q = qualifier;
+    let predicate = format!(
+        "AND NOT COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
+         AND ({q}combination_method IN ({labels}) \
+              OR {q}combination_method LIKE '{CACHED_COMBINATION_CAUTIOUS_PREFIX}%'), false)"
+    );
+    sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
+}
+
+/// Whether a writer must NOT store its cached combination row for this pair,
+/// because the row would overwrite an input.
+///
+/// `inputs` must come from a combine-input reader such as
+/// [`MassFunctionRepository::get_for_claim_frame`], which has already
+/// excluded the cached rows.
+///
+/// The cached row's key is (claim, frame, NULL agent, NULL perspective). The
+/// unique key is `NULLS NOT DISTINCT` (migration 034), so this is ONE slot per
+/// pair, and an agent-less, perspective-less INPUT lives in that slot too:
+/// `/assess` always stores its input there, and `/frames/:id/evidence` does
+/// when the body names neither an agent nor a perspective. Writing the cache
+/// would overwrite that input, and the readers would then drop it as a cached
+/// row, losing the evidence (backlog b5cb3efb). When this returns `true` the
+/// writer skips the cache. The input stays in the slot and is folded once.
+///
+/// A row in the slot counts as an input only if it carries a label: any label
+/// that survived the reader's predicate is not a cached-combination label. An
+/// UNLABELLED row is ambiguous. It is usually the copy that writers before
+/// b5cb3efb cached for a lone BBA, so the writer keeps overwriting it and that
+/// stale copy corrects itself, exactly as the writer always did.
+#[must_use]
+pub fn cached_combination_slot_holds_input(inputs: &[MassFunctionRow]) -> bool {
+    inputs.iter().any(|row| {
+        row.source_agent_id.is_none()
+            && row.perspective_id.is_none()
+            && row.combination_method.is_some()
+    })
+}
+
 /// A row from the mass_functions table
 #[derive(Debug, Clone, FromRow)]
 pub struct MassFunctionRow {
@@ -305,6 +415,18 @@ impl MassFunctionRepository {
     ///
     /// Returns all source BBAs that can be combined.
     ///
+    /// Cached combination rows are excluded (see
+    /// [`with_cached_combination_excluded`]), because a cached result folded
+    /// again counts its inputs twice (backlog b5cb3efb). Most callers fold the
+    /// rows. A few take only the LATEST row instead: `conflict_batch`, the
+    /// hypothesis status reads and the promotion copy in the api and the cli.
+    /// Those get the latest INPUT BBA, not the writers' cached combination.
+    /// That is deliberate. The writers no longer cache a combination on a pair
+    /// whose shared slot holds an input, so "latest including the cache" would
+    /// mean the aggregate on some pairs and a single input on others. And a
+    /// cached row copied to another frame would be dropped there by this
+    /// predicate.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -315,13 +437,17 @@ impl MassFunctionRepository {
         frame_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_cached_combination_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2
+              /* {NOT_CACHED_COMBINATION} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
+                "",
+            ),
             3,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id).bind(frame_id);
@@ -400,6 +526,11 @@ impl MassFunctionRepository {
     /// interpretation when parsed with the binary frame (index 0 and 1 are
     /// shared across frames, but `{0,1}` in a ternary frame ≠ Theta on binary).
     ///
+    /// Cached combination rows are excluded (see
+    /// [`with_cached_combination_excluded`]): every caller of this reader folds
+    /// or reads its rows as INPUT evidence, and a cached result re-folded is
+    /// that evidence counted twice (backlog b5cb3efb).
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -409,16 +540,20 @@ impl MassFunctionRepository {
         claim_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_cached_combination_excluded(
+                r#"
             SELECT mf.id, mf.claim_id, mf.frame_id, mf.source_agent_id, mf.perspective_id,
                    mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
                    mf.evidence_type, mf.locality_tag, mf.evidence_id, mf.created_at
             FROM mass_functions mf
             JOIN frames f ON mf.frame_id = f.id
             WHERE mf.claim_id = $1 AND array_length(f.hypotheses, 1) = 2
+              /* {NOT_CACHED_COMBINATION} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY mf.frame_id, mf.created_at ASC
             "#,
+                "mf.",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id);
@@ -928,6 +1063,11 @@ impl MassFunctionRepository {
     ///
     /// Returns all mass function rows for the given claim IDs,
     /// ordered by claim_id then created_at. The caller groups by claim_id.
+    ///
+    /// Cached combination rows are excluded (see
+    /// [`with_cached_combination_excluded`]): every caller of this reader folds
+    /// or reads its rows as INPUT evidence, and a cached result re-folded is
+    /// that evidence counted twice (backlog b5cb3efb).
     #[instrument(skip(executor, claim_ids, viewer))]
     pub async fn get_for_claims<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -935,15 +1075,19 @@ impl MassFunctionRepository {
         claim_ids: &[Uuid],
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_cached_combination_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id,
                    masses, conflict_k, combination_method,
                    source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = ANY($1)
+              /* {NOT_CACHED_COMBINATION} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY claim_id, created_at ASC
             "#,
+                "",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_ids);
@@ -1582,5 +1726,213 @@ mod tests {
             evidence_id: Some(Uuid::new_v4()),
             created_at: Utc::now(),
         };
+    }
+
+    /// Only a LABELLED agent-less, perspective-less row blocks the cache.
+    /// An agent's row and a perspective's row live on other keys, and an
+    /// unlabelled row in the slot is the pre-b5cb3efb single-BBA copy, which
+    /// the writer overwrites.
+    #[test]
+    fn only_a_labelled_row_in_the_shared_slot_blocks_the_cached_combination() {
+        let row =
+            |agent: Option<Uuid>, perspective: Option<Uuid>, label: Option<&str>| MassFunctionRow {
+                id: Uuid::new_v4(),
+                claim_id: Uuid::nil(),
+                frame_id: Uuid::nil(),
+                source_agent_id: agent,
+                perspective_id: perspective,
+                masses: serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                conflict_k: None,
+                combination_method: label.map(str::to_string),
+                source_strength: None,
+                evidence_type: None,
+                locality_tag: "unknown".to_string(),
+                evidence_id: None,
+                created_at: Utc::now(),
+            };
+        let some = Some(Uuid::new_v4());
+        let agent_input = row(some, None, Some("discount"));
+        let perspective_input = row(None, some, Some("discount"));
+
+        assert!(!cached_combination_slot_holds_input(&[]));
+        assert!(!cached_combination_slot_holds_input(&[
+            agent_input.clone(),
+            perspective_input.clone()
+        ]));
+        assert!(!cached_combination_slot_holds_input(&[
+            agent_input.clone(),
+            row(None, None, None)
+        ]));
+        for label in ["discount", "auto_wire", "prior"] {
+            assert!(
+                cached_combination_slot_holds_input(&[
+                    agent_input.clone(),
+                    row(None, None, Some(label))
+                ]),
+                "an agent-less, perspective-less {label:?} input holds the slot"
+            );
+        }
+    }
+
+    /// The cached-row labels are exactly the `Debug` spelling the writers
+    /// record (`format!("{:?}", report.method_used)`), for every variant.
+    #[test]
+    fn cached_combination_labels_match_the_writers_debug_spelling() {
+        use epigraph_ds::CombinationMethod as M;
+        for m in [
+            M::Conjunctive,
+            M::Dempster,
+            M::YagerOpen,
+            M::YagerClosed,
+            M::DuboisPrade,
+            M::Inagaki,
+            M::TbmConjunctive,
+        ] {
+            let debug = format!("{m:?}");
+            assert_eq!(combination_method_label(m), debug);
+            assert!(
+                CACHED_COMBINATION_LABELS.contains(&debug.as_str()),
+                "{debug} missing from CACHED_COMBINATION_LABELS"
+            );
+        }
+        assert!(CACHED_COMBINATION_LABELS.contains(&CACHED_COMBINATION_UNFOLDED));
+    }
+
+    /// Every combine-input reader drops the writers' cached combination row
+    /// in each of its shapes, and keeps the rows that only look like one
+    /// (backlog b5cb3efb):
+    /// * an input labelled `"Dempster"` WITH its agent — `submit_ds_evidence`
+    ///   stores exactly that (`format!("{method:?}")`, `Some(agent_id)`);
+    /// * an agent-less row with no label — a legacy input shape the
+    ///   predicate cannot classify, so it must not be silently dropped
+    ///   (`NOT (NULL)` would drop it; the `COALESCE` is what keeps it);
+    /// * agent-less, perspective-less INPUTS with a non-combination label —
+    ///   `"discount"` is what `/assess` and an anonymous `/evidence` store, and
+    ///   `"auto_wire"` / `"prior"` are other writers' labels. These pin the
+    ///   label list: dropping every labelled agent-less row would pass the
+    ///   cached cases;
+    /// * an agent-less row WITH a perspective labelled `"Dempster"` — pins the
+    ///   perspective conjunct.
+    ///
+    /// Each look-alike sits on its OWN claim: two agent-less, perspective-less
+    /// rows on one pair would upsert into one another (NULLS NOT DISTINCT).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn combine_input_readers_exclude_only_cached_combination_rows(pool: sqlx::PgPool) {
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let agent_a = insert_agent(&pool, "b5cb-input-a").await;
+        let agent_b = insert_agent(&pool, "b5cb-input-b").await;
+        let suffix = Uuid::new_v4();
+        let frame = insert_frame(&pool, &format!("b5cb-binary-{suffix}")).await;
+        let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+
+        // (cached label, is it a cached combination row?)
+        let perspective: Uuid = sqlx::query_scalar(
+            "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(format!("b5cb-perspective-{suffix}"))
+        .bind(agent_a)
+        .fetch_one(&pool)
+        .await
+        .expect("seed perspective");
+
+        // (label of the agent-less row, its perspective, is it a cached
+        // combination row?)
+        let cases: Vec<(Option<String>, Option<Uuid>, bool)> = CACHED_COMBINATION_LABELS
+            .iter()
+            .map(|l| (Some((*l).to_string()), None, true))
+            .chain([
+                (Some("cautious+Dempster".to_string()), None, true),
+                (Some("cautious+none".to_string()), None, true),
+                (None, None, false),
+                (Some("discount".to_string()), None, false),
+                (Some("auto_wire".to_string()), None, false),
+                (Some("prior".to_string()), None, false),
+                (Some("Dempster".to_string()), Some(perspective), false),
+            ])
+            .collect();
+
+        for (label, perspective_id, is_cached) in cases {
+            let claim = insert_claim(
+                &pool,
+                agent_a,
+                &format!("b5cb-{label:?}-{perspective_id:?}-{suffix}"),
+            )
+            .await;
+            let input_a = MassFunctionRepository::store(
+                &pool,
+                claim,
+                frame,
+                Some(agent_a),
+                &masses,
+                None,
+                Some("discount"),
+                None, // evidence_type
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+            let input_dempster_with_agent = MassFunctionRepository::store(
+                &pool,
+                claim,
+                frame,
+                Some(agent_b),
+                &masses,
+                None,
+                Some("Dempster"),
+                None, // evidence_type
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+            let agentless = MassFunctionRepository::store_with_perspective(
+                &pool,
+                claim,
+                frame,
+                None,
+                perspective_id,
+                &masses,
+                Some(0.1),
+                label.as_deref(),
+                None, // source_strength
+                None, // evidence_type
+                "unknown",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let mut want = vec![input_a, input_dempster_with_agent];
+            if !is_cached {
+                want.push(agentless);
+            }
+            want.sort();
+
+            let by_frame =
+                MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim, frame)
+                    .await
+                    .unwrap();
+            let by_binary =
+                MassFunctionRepository::get_for_claim_binary_frames(&pool, &viewer, claim)
+                    .await
+                    .unwrap();
+            let by_claims = MassFunctionRepository::get_for_claims(&pool, &viewer, &[claim])
+                .await
+                .unwrap();
+            for (reader, rows) in [
+                ("get_for_claim_frame", by_frame),
+                ("get_for_claim_binary_frames", by_binary),
+                ("get_for_claims", by_claims),
+            ] {
+                let mut got: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+                got.sort();
+                assert_eq!(
+                    got, want,
+                    "{reader}, agent-less row labelled {label:?}, perspective \
+                     {perspective_id:?} (cached: {is_cached})"
+                );
+            }
+        }
     }
 }

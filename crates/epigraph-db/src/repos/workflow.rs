@@ -280,9 +280,9 @@ impl WorkflowRepository {
     ///   record itself as submitter and then pass every head-keyed authority
     ///   check (the takeover the review measured).
     /// * `linked_parent` — exactly the row the executor links as `parent_id`
-    ///   (`find_root_by_canonical(parent, generation - 1)`, the same saturating
-    ///   arithmetic), so authority is checked against the row actually linked,
-    ///   not a different generation of the parent's name.
+    ///   ([`Self::resolve_ingest_parent`], the SAME function the executor
+    ///   calls), so authority is checked against the row actually linked, not a
+    ///   different generation of the parent's name.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if a query fails.
@@ -294,17 +294,72 @@ impl WorkflowRepository {
     ) -> Result<IngestAnchors, sqlx::Error> {
         let existing = Self::find_root_by_canonical(&mut *conn, canonical_name, generation).await?;
         let lineage_head = Self::head_by_canonical(&mut *conn, canonical_name).await?;
-        let linked_parent = match parent_canonical_name {
-            Some(pcn) => {
-                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?
-            }
-            None => None,
-        };
+        let linked_parent = Self::resolve_ingest_parent(
+            &mut *conn,
+            canonical_name,
+            generation,
+            parent_canonical_name,
+        )
+        .await?;
         Ok(IngestAnchors {
             existing,
             lineage_head,
             linked_parent,
         })
+    }
+
+    /// The row an ingest of `(canonical_name, generation)` links as its
+    /// `parent_id` (and `variant_of` target). The executor and
+    /// [`Self::ingest_anchors`] both call this, so the row whose authority is
+    /// checked is exactly the row that gets linked.
+    ///
+    /// 1. `parent_canonical_name = Some(p)`: `(p, generation - 1)` with the
+    ///    same saturating arithmetic as before (issue #51 semantics, forks
+    ///    included).
+    /// 2. Otherwise — or when (1) finds nothing and `p` names this same
+    ///    lineage — the PREDECESSOR: the highest generation of
+    ///    `canonical_name` strictly BELOW `generation`. Not the lineage head:
+    ///    for a gap-filling ingest (gen 2 while gen 5 exists) the head is above
+    ///    the new row and must never become its parent (U032).
+    /// 3. `None` when there is no predecessor (a lineage may legitimately
+    ///    start above generation 0), or when a DIFFERENT lineage named in `p`
+    ///    has no row at `generation - 1`: the named parent links nothing,
+    ///    exactly as before, and there is no fallback to `canonical_name`'s own
+    ///    predecessor. If `canonical_name` has no rows that ingest starts a new
+    ///    lineage; if it already has lower generations, the row is stored
+    ///    parentless even though [`Self::ingest_anchors`] treats it as a
+    ///    generation of that lineage (authority over `lineage_head`, submitter
+    ///    inherited). That residual is the current default pending operator
+    ///    question Q2 (U032 scope §6), pinned by
+    ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
+    ///
+    /// `workflows` has no row security, as [`Self::find_root_by_canonical`]
+    /// records, so this read needs no viewer.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn resolve_ingest_parent(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+        generation: i32,
+        parent_canonical_name: Option<&str>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        if let Some(pcn) = parent_canonical_name {
+            let named =
+                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?;
+            if named.is_some() || pcn != canonical_name {
+                return Ok(named);
+            }
+        }
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM workflows WHERE canonical_name = $1 AND generation < $2 \
+             ORDER BY generation DESC LIMIT 1",
+        )
+        .bind(canonical_name)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(|(id,)| id))
     }
 
     /// The distinct `canonical_name`s of the workflows that EXECUTE `claim_id`
@@ -1338,6 +1393,40 @@ impl WorkflowRepository {
             .execute(pool)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    /// `(id, goal)` of hierarchical workflows whose `goal_embedding` is NULL,
+    /// oldest first, at most `limit` rows. The recovery half of
+    /// [`Self::set_goal_embedding`].
+    ///
+    /// Every write path embeds the goal best-effort and continues on an
+    /// embedder failure, and the three embedding searches here
+    /// (`find_hierarchical_by_embedding`, `search_by_goal_embedding_since`,
+    /// `search_hierarchical_by_embedding_scored`) filter
+    /// `goal_embedding IS NOT NULL`, so such a row stays invisible to them
+    /// until the `embed_backfill` CLI embeds it from this list.
+    ///
+    /// A blank goal has nothing to embed and is excluded, or it would be
+    /// reported (and fail) on every run.
+    ///
+    /// No viewer: `workflows` has `relrowsecurity = false` and no policy (see
+    /// `set_truth_value`), so the read is the same on any connection.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn find_needing_goal_embedding(
+        pool: &PgPool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, goal FROM workflows \
+             WHERE goal_embedding IS NULL AND btrim(goal) <> '' \
+             ORDER BY created_at ASC, id ASC \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
     }
 
     /// Set `workflows.truth_value` for the given workflow id. Used by
