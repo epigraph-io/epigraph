@@ -160,23 +160,59 @@ pub struct SubmitEvidenceRequest {
     pub evidence_type: Option<String>,
     /// Conflict K at or above which a `conflict.detected` event is emitted.
     /// Since U025 it no longer selects a combination rule: `combine_multiple`
-    /// folds with Dempster at every step.
+    /// folds with Dempster at every step. It does not affect the claim's
+    /// belief, which is the shared recompute's
+    /// (`edge_factor::recompute_claim_belief_on_frame`).
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Mass assignments: keys are comma-separated hypothesis indices, values are mass.
     /// Prefix key with `~` for CDST complement (negative) elements.
     pub masses: std::collections::BTreeMap<String, f64>,
-    /// Override combination method: "conjunctive", "dempster", "yager_open",
-    /// "yager_closed", "dubois_prade", "inagaki". If omitted, uses adaptive.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). The
+    /// claim's belief is computed by the shared recompute, the one
+    /// `recompute_beliefs` and MCP `submit_ds_evidence` use. Sending it earns a
+    /// `warnings` entry.
     #[serde(default)]
     pub combination_method: Option<String>,
-    /// Inagaki gamma parameter [0, 1]. Only used when combination_method = "inagaki".
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It was
+    /// the Inagaki gamma for `combination_method = "inagaki"`. Sending it earns
+    /// a `warnings` entry.
     #[serde(default)]
     pub gamma: Option<f64>,
-    /// If true, skip independence checking. Caller asserts provenance independence.
-    /// Logged for audit purposes.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It
+    /// skipped an independence analysis the shared recompute does not run.
+    /// Sending `true` earns a `warnings` entry.
     #[serde(default)]
     pub assume_independent: Option<bool>,
+}
+
+/// One warning per deprecated `SubmitEvidenceRequest` field the caller sent
+/// (backlog 82dcff9d, the REST twin of MCP `submit_ds_evidence`'s
+/// `deprecated_parameter_warnings`). They are accepted, not refused, for
+/// parity with MCP.
+#[cfg(feature = "db")]
+fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String> {
+    const WHY: &str = "The claim's belief is always recomputed by the shared Dempster fold \
+                       (the one recompute_beliefs uses).";
+    let mut out = Vec::new();
+    if let Some(method) = &request.combination_method {
+        out.push(format!(
+            "combination_method={method} is deprecated: it did not change the returned belief. \
+             {WHY}"
+        ));
+    }
+    if let Some(gamma) = request.gamma {
+        out.push(format!(
+            "gamma={gamma} is deprecated: it did not change the returned belief. {WHY}"
+        ));
+    }
+    if request.assume_independent == Some(true) {
+        out.push(format!(
+            "assume_independent=true is deprecated: it did not change the returned belief, \
+             since no independence analysis runs. {WHY}"
+        ));
+    }
+    out
 }
 
 fn default_reliability() -> f64 {
@@ -201,9 +237,10 @@ pub struct EvidenceSubmissionResponse {
     pub pignistic_prob: Option<f64>,
     pub bayesian_posterior: f64,
     pub total_sources: i64,
-    /// What the caller should know about this submission's effect: the
-    /// claim's cache was not updated (it carries another frame). Omitted when
-    /// empty.
+    /// What the caller should know about this submission's effect: a
+    /// deprecated request field it sent (`combination_method`, `gamma`,
+    /// `assume_independent`), or that the claim's cache was not updated (it
+    /// carries another frame). Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -1390,7 +1427,7 @@ pub async fn submit_evidence(
                 message: e.to_string(),
             })?
             .flatten();
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = deprecated_parameter_warnings(&request);
     if cache_frame != Some(frame_id) {
         warnings.push(format!(
             "claim {}'s cached belief was NOT updated by this call: it carries another frame \
