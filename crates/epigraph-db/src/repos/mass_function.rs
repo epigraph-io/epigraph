@@ -416,9 +416,16 @@ impl MassFunctionRepository {
     /// Returns all source BBAs that can be combined.
     ///
     /// Cached combination rows are excluded (see
-    /// [`with_cached_combination_excluded`]): every caller of this reader folds
-    /// or reads its rows as INPUT evidence, and a cached result re-folded is
-    /// that evidence counted twice (backlog b5cb3efb).
+    /// [`with_cached_combination_excluded`]), because a cached result folded
+    /// again counts its inputs twice (backlog b5cb3efb). Most callers fold the
+    /// rows. A few take only the LATEST row instead: `conflict_batch`, the
+    /// hypothesis status reads and the promotion copy in the api and the cli.
+    /// Those get the latest INPUT BBA, not the writers' cached combination.
+    /// That is deliberate. The writers no longer cache a combination on a pair
+    /// whose shared slot holds an input, so "latest including the cache" would
+    /// mean the aggregate on some pairs and a single input on others. And a
+    /// cached row copied to another frame would be dropped there by this
+    /// predicate.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
