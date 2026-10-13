@@ -308,8 +308,8 @@ locked are stepped over. Run one.
 2. **Phase 0** — mints a personal group, plus a live membership in it, for every
    claim author that lacks one (migration 057 documents ~1,198 orphan agents
    that have never authenticated).
-3. The entity arms: `claims`, `communities`, `recall_events`,
-   `harvester_fragments`. (`--entity perspectives` is accepted and does
+3. The entity arms: `claims`, `recall_events`, `harvester_fragments`.
+   (`--entity perspectives` and `--entity communities` are accepted and do
    nothing; see below.)
 4. `settle_remaining`, then `verify`.
 
@@ -325,6 +325,18 @@ platform` fail after every perspective an operator-linked agent wrote, until a
 re-run moved the row into the operator's group, against the writer's
 declaration. A moved perspective stays `public`, so nobody lost read access. Its
 owner group can UPDATE it (117) where nobody could before. Rows an earlier run
+moved are left as they are.
+
+**`communities` is not re-owned either, for the same reason.** Its one writer,
+`CommunityRepository::create`, declares `TenancyDecl::instance_wide()` and
+projects the community's own group (068's id-preserving shape) without making
+that group the row's owner: a community's directory entry is how others decide
+whether to join it. The backfill used to re-stamp every world-owned community
+to `('public', communities.id)`, and `verify` counted every world-owned
+community as residue in every mode, so each community created after a run
+failed the pre-flight until a re-run moved it, against the writer's
+declaration. A moved community stays `public`; its own group can UPDATE or
+DELETE it (115, 117) where nobody could before. Communities an earlier run
 moved are left as they are.
 
 A fifth arm, **legacy `ownership` transcription**, ran between (3) and (4) until
