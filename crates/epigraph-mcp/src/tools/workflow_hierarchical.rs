@@ -183,7 +183,7 @@ const GOAL_PLACEHOLDER: &str = "hierarchical";
 /// The goal text a hierarchical outcome report should embed, if any: the
 /// trimmed `goal_text`, unless it is blank or the `"hierarchical"`
 /// placeholder. Embedding a placeholder would make every goal-less report
-/// "similar" to every other one in `behavioral_affinity_lineage`.
+/// "similar" to every other one in `behavioral_affinity_hierarchical`.
 fn report_goal_to_embed(goal_text: Option<&str>) -> Option<&str> {
     goal_text
         .map(str::trim)
@@ -268,7 +268,7 @@ fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
 ///
 /// `goal_embedding` is computed by the caller BEFORE this runs (embedder
 /// latency stays out of the row lock) and is written on every step row, so
-/// the report feeds `behavioral_affinity_lineage`.
+/// the report feeds `behavioral_affinity_hierarchical`.
 #[allow(clippy::too_many_arguments)]
 pub async fn do_report_hierarchical_outcome_via_pool(
     pool: &sqlx::PgPool,
@@ -751,7 +751,7 @@ mod tests {
     }
 
     /// U033 / I229 part (4): the report's goal is embedded once and written on
-    /// every step row, and those rows then reach `behavioral_affinity_lineage`
+    /// every step row, and those rows then reach `behavioral_affinity_hierarchical`
     /// under the workflow's own id, which is what `find_workflow`'s
     /// hierarchical leg looks up. Before U033 every row had a NULL
     /// `goal_embedding`. The embedder is the deterministic `MockProvider` (the
@@ -789,12 +789,8 @@ mod tests {
         let qvec = epigraph_embeddings::EmbeddingService::generate(&embedder, goal)
             .await
             .unwrap();
-        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, Uuid::nil())
-            .await
-            .expect("resolve viewer");
-        let hits = epigraph_db::BehavioralExecutionRepository::behavioral_affinity_lineage(
+        let hits = epigraph_db::BehavioralExecutionRepository::behavioral_affinity_hierarchical(
             &pool,
-            &viewer,
             &crate::embed::format_pgvector(&qvec),
             0.5,
             1,

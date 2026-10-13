@@ -2557,6 +2557,19 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "behavioral_execution.rs",
+        "behavioral_affinity_hierarchical",
+        "U033: scores hierarchical outcome reports. FROM `behavioral_executions` JOIN `workflows` \
+         and nothing else -- no `claims`, no `edges`. Neither relation carries a `visibility` or \
+         `owner_group_id` column, and row security is off on both (`residual_unstamped_writes.rs` \
+         records `workflows` as MEASURED `relrowsecurity = false`; `behavioral_executions` as \
+         not claim-derived with no `owner_group_id`). It projects only `(workflows.id, float8, \
+         bigint)` -- no content column. The `workflows` ids it can return are the same ones the \
+         viewer-less `search_hierarchical_by_embedding_scored` already returns to every caller of \
+         `find_workflow`. The flat (claim-rooted) twin, `behavioral_affinity_lineage`, keeps its \
+         Viewer and its markers; this is a separate fn precisely so the claim arm is unchanged.",
+    ),
+    (
+        "behavioral_execution.rs",
         "rolling_success_rate",
         "Aggregates `AVG(success::int)` over the newest `window` rows of `behavioral_executions` \
          for one workflow. The statement's FROM is `behavioral_executions` alone, and what it \

@@ -505,6 +505,29 @@ async fn find_workflow_post_embed(
         } else {
             std::collections::HashMap::new()
         };
+    // Hierarchical outcome reports (U033) are keyed on their `workflows.id`,
+    // which `find_lineage_root` returns unchanged for a hierarchical row. A
+    // SEPARATE query with its own budget: sharing the lineage query's limit
+    // would let hierarchical roots push flat roots out of it. The key spaces
+    // are disjoint (a `workflows.id` is never a claim id), so extending the
+    // map cannot overwrite a flat entry.
+    let mut affinity_map = affinity_map;
+    if let Some(pgvec) = pgvec_opt.as_deref() {
+        match BehavioralExecutionRepository::behavioral_affinity_hierarchical(
+            &server.pool,
+            pgvec,
+            0.5, // min_similarity
+            1,   // min_executions
+            20,  // limit
+        )
+        .await
+        {
+            Ok(rows) => {
+                affinity_map.extend(rows.into_iter().map(|(id, sim, count)| (id, (sim, count))))
+            }
+            Err(e) => tracing::warn!("hierarchical behavioral affinity lookup failed: {e}"),
+        }
+    }
 
     // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
     // `workflows` table and labels its claims `workflow_thesis` / `workflow_step`

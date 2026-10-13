@@ -1,16 +1,32 @@
-//! U033 / I229: hierarchical outcome reports must reach
-//! `BehavioralExecutionRepository::behavioral_affinity_lineage`.
+//! U033 / I229: hierarchical outcome reports must reach behavioral affinity.
 //!
 //! A hierarchical report writes one `behavioral_executions` row per step with
 //! `workflow_id` = a `workflows.id`, never a `claims.id`. The lineage CTE's
-//! `live_roots` joined `claims` only, so every hierarchical row dropped out
+//! `live_roots` joins `claims` only, so every hierarchical row drops out
 //! there, embedded or not, and `find_workflow`'s hierarchical leg (keyed on
 //! `find_lineage_root(row.id)` = `row.id`, since a `workflows` row has no
 //! claim→claim lineage edges) never found an affinity entry.
+//! `BehavioralExecutionRepository::behavioral_affinity_hierarchical` is the
+//! separate query that scores them, so they never compete with flat roots for
+//! `behavioral_affinity_lineage`'s `limit`.
 
 use chrono::{Duration, Utc};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow, WorkflowRepository};
+
+/// The hierarchical affinity query under test, with the callers' floor and
+/// limit defaults spelled out once.
+async fn hier_affinity(pool: &PgPool, q: &str, min_executions: i64) -> Vec<(Uuid, f64, i64)> {
+    BehavioralExecutionRepository::behavioral_affinity_hierarchical(
+        pool,
+        q,
+        0.5,
+        min_executions,
+        10,
+    )
+    .await
+    .expect("hierarchical affinity query")
+}
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -84,7 +100,7 @@ async fn public_viewer(pool: &PgPool) -> Viewer {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn hierarchical_executions_reach_lineage_affinity(pool: PgPool) {
+async fn hierarchical_executions_reach_affinity(pool: PgPool) {
     let wf = insert_workflow(&pool, "u033-affinity-live", 1.0).await;
     let q = axis_vec(0);
     let t0 = Utc::now();
@@ -93,11 +109,7 @@ async fn hierarchical_executions_reach_lineage_affinity(pool: PgPool) {
     insert_report(&pool, wf, true, 2, t0 + Duration::seconds(1), &q).await;
     insert_report(&pool, wf, false, 2, t0 + Duration::seconds(2), &q).await;
 
-    let viewer = public_viewer(&pool).await;
-    let hits =
-        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 1, 10)
-            .await
-            .expect("affinity query");
+    let hits = hier_affinity(&pool, &q, 1).await;
 
     let hit = hits
         .iter()
@@ -114,10 +126,7 @@ async fn hierarchical_executions_reach_lineage_affinity(pool: PgPool) {
     );
 
     // The gate is applied to that per-report count.
-    let gated =
-        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 3, 10)
-            .await
-            .expect("affinity query");
+    let gated = hier_affinity(&pool, &q, 3).await;
     assert!(
         gated.iter().all(|(id, _, _)| *id != wf),
         "2 reports must not clear min_executions = 3: {gated:?}"
@@ -135,11 +144,7 @@ async fn deprecated_hierarchical_workflows_stay_out_of_affinity(pool: PgPool) {
     insert_report(&pool, live, true, 2, t0, &q).await;
     insert_report(&pool, dead, true, 2, t0, &q).await;
 
-    let viewer = public_viewer(&pool).await;
-    let hits =
-        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 1, 10)
-            .await
-            .expect("affinity query");
+    let hits = hier_affinity(&pool, &q, 1).await;
     assert!(
         hits.iter().any(|(id, _, _)| *id == live),
         "control: the live workflow must appear: {hits:?}"
@@ -155,30 +160,29 @@ async fn hierarchical_affinity_respects_the_similarity_floor(pool: PgPool) {
     let wf = insert_workflow(&pool, "u033-affinity-orthogonal", 1.0).await;
     insert_report(&pool, wf, true, 2, Utc::now(), &axis_vec(2)).await;
 
-    let viewer = public_viewer(&pool).await;
+    // Positive control: the aligned query finds it, so a missing row below is
+    // the similarity floor and nothing else.
+    let aligned = hier_affinity(&pool, &axis_vec(2), 1).await;
+    assert!(
+        aligned.iter().any(|(id, sim, _)| *id == wf && *sim > 0.99),
+        "control: the same-goal query must find the workflow: {aligned:?}"
+    );
+
     // Orthogonal query: cosine similarity 0, below the 0.5 floor.
-    let hits = BehavioralExecutionRepository::behavioral_affinity_lineage(
-        &pool,
-        &viewer,
-        &axis_vec(3),
-        0.5,
-        1,
-        10,
-    )
-    .await
-    .expect("affinity query");
+    let hits = hier_affinity(&pool, &axis_vec(3), 1).await;
     assert!(
         hits.iter().all(|(id, _, _)| *id != wf),
         "an unrelated goal must not match: {hits:?}"
     );
 }
 
-/// Regression guard for the claim arm the UNION sits beside: a FLAT
-/// execution (its `workflow_id` is a workflow claim) is still keyed on that
-/// claim, still counted once per row, and a hierarchical row in the same
-/// query does not displace it.
+/// The two stores stay in their own queries: a FLAT execution (its
+/// `workflow_id` is a workflow claim) is keyed on that claim and counted once
+/// per row by `behavioral_affinity_lineage`, which returns no hierarchical
+/// root; `behavioral_affinity_hierarchical` returns the hierarchical root and
+/// no flat one.
 #[sqlx::test(migrations = "../../migrations")]
-async fn flat_claim_executions_still_reach_affinity_beside_hierarchical(pool: PgPool) {
+async fn flat_and_hierarchical_executions_are_scored_by_separate_queries(pool: PgPool) {
     let agent_id: Uuid = sqlx::query_scalar(
         "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
     )
@@ -216,11 +220,21 @@ async fn flat_claim_executions_still_reach_affinity_beside_hierarchical(pool: Pg
         .find(|(id, _, _)| *id == flat)
         .unwrap_or_else(|| panic!("flat workflow claim {flat} missing: {hits:?}"));
     assert_eq!(flat_hit.2, 2, "flat rows count once each: {flat_hit:?}");
-    let hier_hit = hits
+    assert!(
+        hits.iter().all(|(id, _, _)| *id != hier),
+        "the lineage query scores claim roots only: {hits:?}"
+    );
+
+    let hier_hits = hier_affinity(&pool, &q, 1).await;
+    let hier_hit = hier_hits
         .iter()
         .find(|(id, _, _)| *id == hier)
-        .unwrap_or_else(|| panic!("hierarchical workflow {hier} missing: {hits:?}"));
+        .unwrap_or_else(|| panic!("hierarchical workflow {hier} missing: {hier_hits:?}"));
     assert_eq!(hier_hit.2, 1, "one hierarchical report: {hier_hit:?}");
+    assert!(
+        hier_hits.iter().all(|(id, _, _)| *id != flat),
+        "the hierarchical query scores `workflows` rows only: {hier_hits:?}"
+    );
 }
 
 /// A pgvector literal with cosine similarity `cos` to `axis_vec(axis)`: the

@@ -1370,7 +1370,7 @@ pub async fn report_hierarchical_outcome(
     // 5. Write per-step behavioral_executions rows on the same transaction; a
     //    refused row returns 500 and rolls back everything above. Capture the
     //    timestamp once so rows from a single outcome report group cleanly
-    //    downstream (and count as ONE report in `behavioral_affinity_lineage`).
+    //    downstream (and count as ONE report in `behavioral_affinity_hierarchical`).
     let report_ts = chrono::Utc::now();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {

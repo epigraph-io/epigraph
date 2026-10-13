@@ -301,3 +301,84 @@ async fn closer_hierarchical_workflow_outranks_a_distant_flat_claim(pool: PgPool
          does not replace one"
     );
 }
+
+/// U033 / I229: a hierarchical workflow's outcome reports must surface as
+/// `behavioral_affinity` on its `find_workflow` result.
+///
+/// `report_hierarchical_outcome` writes one `behavioral_executions` row per
+/// step, keyed on the `workflows.id` and carrying the goal embedding. The
+/// flat lineage query can never score those rows (its roots must be claims),
+/// so `find_workflow` merges `behavioral_affinity_hierarchical` into its
+/// affinity map; the hierarchical leg looks the row up under its own id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_outcome_reports_surface_as_behavioral_affinity(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = fixture::public_viewer(&pool).await;
+    let query_pgvec = axis_pgvec_1536(3);
+
+    let goal = format!("hierarchical affinity probe {}", Uuid::new_v4());
+    let hier_id = store(&server, &viewer, &goal, &["step one", "step two"]).await;
+    let unit: Vec<f32> = (0..1536).map(|i| if i == 3 { 1.0 } else { 0.0 }).collect();
+    epigraph_db::WorkflowRepository::set_goal_embedding(&pool, hier_id, &unit)
+        .await
+        .expect("set goal embedding");
+
+    // One two-step report, shaped exactly as `report_hierarchical_outcome`
+    // writes it: shared `created_at`, the goal embedding on every row.
+    let at = chrono::Utc::now();
+    for step in ["step one", "step two"] {
+        let row = epigraph_db::BehavioralExecutionRow {
+            id: Uuid::new_v4(),
+            workflow_id: hier_id,
+            goal_text: goal.clone(),
+            success: true,
+            step_beliefs: serde_json::json!({"deviated": false}),
+            tool_pattern: vec![step.to_string()],
+            quality: Some(1.0),
+            deviation_count: 0,
+            total_steps: 1,
+            created_at: at,
+            step_claim_id: None,
+            run_label: None,
+        };
+        epigraph_db::BehavioralExecutionRepository::create(&pool, row, Some(&query_pgvec))
+            .await
+            .expect("insert behavioral_executions row");
+    }
+
+    let result = find_workflow_with_pgvec(
+        &server,
+        &viewer,
+        FindWorkflowParams {
+            goal: "qqzzx_hier_affinity_probe".to_string(),
+            limit: Some(5),
+            min_truth: Some(0.0),
+        },
+        Some(query_pgvec),
+    )
+    .await
+    .expect("find_workflow_with_pgvec");
+
+    let body = first_text(&result);
+    let arr = body.as_array().expect("result is an array");
+    let hit = arr
+        .iter()
+        .find(|r| r["workflow_id"].as_str() == Some(&hier_id.to_string()))
+        .unwrap_or_else(|| {
+            panic!(
+                "the hierarchical workflow must be returned: {}",
+                serde_json::to_string(arr).unwrap()
+            )
+        });
+    assert!(
+        hit["behavioral_affinity"]
+            .as_f64()
+            .is_some_and(|a| a > 0.99),
+        "the reported goal is the query vector, so affinity must be ~1: {hit}"
+    );
+    assert_eq!(
+        hit["behavioral_execution_count"].as_i64(),
+        Some(1),
+        "one report, counted once however many steps it wrote: {hit}"
+    );
+}
