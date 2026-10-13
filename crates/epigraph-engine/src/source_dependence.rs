@@ -33,6 +33,12 @@
 //! `get_perspective_belief` and its batch). So the next recompute cannot
 //! re-inflate what the write left honest, and no reader serves a value the
 //! cache does not hold.
+//!
+//! Known limits of the URL key ([`normalize_source_url`]): query strings,
+//! fragments and the scheme are kept, so one page reached through different
+//! tracking parameters, `#anchors`, or `http` vs `https` counts as distinct
+//! sources and still corroborates. That errs toward the pre-fix behaviour,
+//! never toward hiding a genuinely independent source.
 
 use std::collections::HashMap;
 
