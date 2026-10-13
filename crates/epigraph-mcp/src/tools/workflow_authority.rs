@@ -41,12 +41,46 @@
 //!   (`WorkflowRepository::ingest_anchors`, via
 //!   `WorkflowRepository::resolve_ingest_parent`), not the latest generation of
 //!   the parent's name, and inherits that row's submitter when the name is new.
-//! * `add_step`, `delete_step` and every new generation require, over the
-//!   AUTHENTICATED transport and when a submitter is recorded, in this order:
-//!   the submitter; its operator (#503, the operator itself as on every HTTP
-//!   gate); or the AUDITED admin arm. stdio is unchanged (the batch H-b bar:
-//!   stdio changes only for #374), as `patch_claim`'s whole-patch check is
+//! * `add_step`, `delete_step`, `deprecate_workflow` and every new generation
+//!   require, over the AUTHENTICATED transport and when a submitter is
+//!   recorded, in this order: the submitter; its operator (#503, the operator
+//!   itself as on every HTTP gate); an agent LIVE-bound to the submitter's
+//!   human (below); or the AUDITED admin arm. stdio is unchanged (the batch H-b
+//!   bar: stdio changes only for #374), as `patch_claim`'s whole-patch check is
 //!   HTTP-only.
+//! * THE LINKED-AGENT ARM (operator ruling, 2026-10-13: "widen the rule to
+//!   admit linked agents and make sure their provenance is recorded"). The
+//!   operator arm alone could not admit them: it compares the caller with the
+//!   operator OF THE SUBMITTER, and once a human is itself the recorded
+//!   submitter there is no such operator. So the arm compares HUMANS: the
+//!   caller's LIVE delegation (`AgentRepository::live_delegation`, composed of
+//!   the kernel's own reads: migration 122's binding, so a revoked human binds
+//!   no one (`OPL01`), plus 107's acting read for a link (not retired, live
+//!   membership), or 149's allowlist) must name the human the submitter
+//!   belongs to (`AgentRepository::human_of(submitter, false)`: the submitter
+//!   itself when it is that human, else its link's operator in any state, or
+//!   its allowlisted client's). So it admits the submitting human's agents and
+//!   the agents of the submitting agent's human; retired or membership-revoked
+//!   links, revoked humans, unbound agents and other humans' agents stay
+//!   refused, and a workflow with no recorded submitter stays admin-only. It
+//!   runs before the admin arm, so a bound agent with a stale `claims:admin`
+//!   scope is not refused `ADM02`. Over HTTP an agent with ANY operator-link
+//!   record is refused its viewer before any tool runs
+//!   (`tools::viewer::request_viewer`), so the population this arm admits there
+//!   is the ALLOWLISTED one (149); the link half is the same rule, kept
+//!   consistent for a caller that can reach it.
+//! * PROVENANCE. Every write admitted over the authenticated transport is
+//!   recorded on its own transaction ([`record_workflow_write`]): the admin
+//!   arm's `workflows.admin_write` row, and for the submitter, operator and
+//!   linked-agent arms one `workflows.caller_write` `security_events` row
+//!   ([`record_caller_workflow_write`]) naming the `arm`, the `acting_agent`,
+//!   the human it acted for (`operator`), the `binding`, the `submitter`, the
+//!   tool (`action`), the `workflow_id`, the token (`client_id`,
+//!   `token_jti`) and the tool's own facts (`write`). The row is attributed to
+//!   the session principal, the system agent, because 077's
+//!   `security_events_append` admits no other attribution on that stamp; the
+//!   actor is `acting_agent`. A new generation records one row per anchor it
+//!   was checked against, naming the anchor and the row it created.
 //! * THE ADMIN ARM IS NOT THE TOKEN'S SCOPE. It was: the first revision reused
 //!   [`crate::tools::claims::require_owner_or_admin`], which admits on
 //!   `claims:admin` in the token alone, and the write then ran on the system
@@ -74,7 +108,9 @@
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
 //!   the wrong object and the wrong verb.
 //!
-//! The system-agent stamp is unchanged for the rows these writes make.
+//! The system-agent stamp is unchanged for the rows these writes make: the
+//! caller is recorded in the provenance row, not by re-authoring the rows,
+//! which would move them out of the system agent's group.
 
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;

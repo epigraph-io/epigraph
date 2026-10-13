@@ -3,8 +3,9 @@
 //!
 //! These arms pin both halves of the rule: a workflow CREATED through an
 //! ingest records its submitter and is then mutable, over the authenticated
-//! transport, only by that submitter, its operator, or the audited
-//! `claims:admin` path; a workflow with NO record (every workflow written
+//! transport, only by that submitter, its operator, an agent live-bound to the
+//! submitter's human (pinned in `workflow_linked_agent_authority.rs`), or the
+//! audited `claims:admin` path; a workflow with NO record (every workflow written
 //! before batch H-b — nothing recorded who created them) is platform corpus
 //! (U005, default decision A) and is mutable over that transport ONLY through
 //! the audited `claims:admin` path. stdio is unchanged for both. See
