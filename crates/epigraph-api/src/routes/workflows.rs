@@ -3893,8 +3893,13 @@ mod tests {
         };
         let (h, h_client) = seed_human_operator(&pool, "h3-la-human").await;
         let (agent, client) = seed_allowlisted_agent(&pool, h, "h3-la-agent").await;
+        let authored_sql = "SELECT source_id FROM edges \
+                            WHERE relationship = 'AUTHORED' AND source_type = 'agent' \
+                              AND target_type = 'claim' AND target_id = $1";
+        let authored_total = "SELECT count(*) FROM edges WHERE relationship = 'AUTHORED'";
 
-        let resp = router_as(test_auth())
+        let ingester = test_auth();
+        let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
                 ingest_payload("h3-http-linked"),
@@ -3911,6 +3916,28 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Authorship of what the ingest created: one AUTHORED edge from the
+        // ingesting principal per executed claim (all new in this database).
+        let executed: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'executes'",
+        )
+        .bind(wf)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!executed.is_empty());
+        for c in &executed {
+            let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+                .bind(c)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(sources, vec![ingester.agent_id.unwrap()], "claim {c}");
+        }
+        let authored_before: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
                             WHERE w.canonical_name = 'h3-http-linked' AND e.relationship = 'executes'";
         let provenance_sql = "SELECT agent_id, details FROM security_events \
@@ -3944,6 +3971,14 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty(), "no provenance for a refusal: {rows:?}");
+        let authored_mid: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            authored_mid, authored_before,
+            "no AUTHORED edge for a refusal"
+        );
 
         let auth = as_agent(h, h_client);
         let resp = router_as(auth.clone())
@@ -3969,6 +4004,16 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(stamp, h, "the system agent still authors the step");
+        let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+            .bind(Uuid::parse_str(&step).unwrap())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sources,
+            vec![h],
+            "one AUTHORED edge from the acting principal"
+        );
         let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
             .bind(wf)
             .fetch_all(&pool)
