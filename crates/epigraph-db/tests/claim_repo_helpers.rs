@@ -943,3 +943,110 @@ async fn the_dedup_race_is_serialized_on_a_bare_connection_without_the_constrain
     let (rows, outcomes) = race_two_first_creates(&pool, Racer::OnBareConnection).await;
     assert_one_row_one_creator(rows, outcomes);
 }
+
+/// The dedup lock must be held until the CALLER's transaction commits, not
+/// just until `create_or_get` returns.
+///
+/// # The window this pins, which the barrier arms do not
+///
+/// The barrier arms park caller 1 INSIDE its INSERT, so they prove only that
+/// the lock is held DURING the insert. Production callers in a transaction do
+/// more work after `create_or_get` returns and before they commit (the MCP
+/// submission path writes its trace and verb edges; POST /claims
+/// `if_not_exists=true` and /submit commit later). That post-return window is
+/// the widest real race window: caller 1's row exists but is uncommitted, so a
+/// caller 2 that is not made to wait misses it and inserts a second row.
+///
+/// A regression that releases the lock early — a session lock unlocked at the
+/// end of `create_or_get_signed`, or the lock taken on another connection —
+/// still holds it while caller 1 is parked in its INSERT, so the barrier arms
+/// stay green. This arm, which has no barrier, goes red.
+///
+/// # The interleaving
+///
+/// Caller 1 runs `create_or_get` in its own transaction, which RETURNS, and the
+/// transaction is kept open. Caller 2 then starts on the same pair. The arm
+/// waits until caller 2 has either FINISHED (nothing made it wait: it inserted
+/// past caller 1's uncommitted row) or is BLOCKED on a two-key advisory lock in
+/// this database. Only then does caller 1 commit; the assertions decide which
+/// observation was correct.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dedup_lock_is_held_until_the_callers_transaction_commits(pool: PgPool) {
+    // The production shape. Explicit, so the arm cannot pass on the constraint
+    // (where it is present, caller 2 would wait on the unique index instead).
+    drop_unique_constraint(&pool).await;
+
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+    let content = format!("cog held until commit {}", Uuid::new_v4());
+    let first = make_claim(&content, agent_id);
+    let second = make_claim(&content, agent_id);
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let mut tx_1 = pool.begin().await.expect("begin caller 1's transaction");
+    let (created_1, was_created_1) = ClaimRepository::create_or_get(
+        &mut tx_1,
+        &viewer,
+        &first,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("caller 1's create_or_get");
+    assert!(was_created_1, "caller 1 is the first create of the pair");
+    let id_1: Uuid = created_1.id.into();
+
+    // tx_1 stays OPEN: create_or_get has returned, the row is uncommitted.
+    let caller_2 = tokio::spawn(run_racer(pool.clone(), second, Racer::InCallerTransaction));
+
+    let mut blocked = false;
+    for _ in 0..600 {
+        if caller_2.is_finished() {
+            break;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        blocked || caller_2.is_finished(),
+        "caller 2 neither finished nor blocked on a dedup lock while caller 1's transaction was \
+         open; the arm cannot tell held from released"
+    );
+
+    tx_1.commit().await.expect("commit caller 1's transaction");
+    let (id_2, was_created_2) = caller_2.await.expect("caller 2 must not panic");
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows for the pair");
+    assert_eq!(
+        rows, 1,
+        "caller 2 inserted a second row for one (content_hash, agent_id) while caller 1's \
+         transaction was still open: the dedup lock was released before caller 1 committed \
+         (caller 2 blocked first: {blocked})"
+    );
+    assert!(
+        blocked,
+        "caller 2 finished while caller 1's transaction was open, so nothing made it wait for \
+         caller 1's row"
+    );
+    assert!(
+        !was_created_2,
+        "caller 2 ran after caller 1 committed, so it must report the existing row"
+    );
+    assert_eq!(id_2, id_1, "caller 2 must answer with caller 1's row");
+}
