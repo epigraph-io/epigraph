@@ -950,6 +950,7 @@ pub async fn report_workflow_outcome(
             params.quality,
             params.goal_text.as_deref(),
             None,
+            None,
         )
         .await;
     }

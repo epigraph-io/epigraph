@@ -172,14 +172,49 @@ pub async fn report_hierarchical_outcome(
         params.quality,
         params.goal_text.as_deref(),
         params.run_label.as_deref(),
+        None,
     )
     .await
+}
+
+/// Refuse a `quality` the `behavioral_executions` CHECK (migration 002:
+/// `quality IS NULL OR quality BETWEEN 0 AND 1`) would refuse anyway, before
+/// anything is written. NaN is refused too: it fails every comparison, so
+/// the CHECK would refuse it as well.
+fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
+    match quality {
+        Some(q) if !(q.is_finite() && (0.0..=1.0).contains(&q)) => Err(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Owned(format!(
+                "`quality` must be a finite number in [0, 1]; got {q}"
+            )),
+            data: None,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Pool-only outcome reporting for hierarchical workflows. Updates
 /// `workflows.metadata` rolling counters and writes per-step
 /// `behavioral_executions` rows with `step_claim_id` resolved from the
 /// workflow's `executes` edges (level=2 claims, in plan order).
+///
+/// ALL OR NOTHING (U033 / I229). The counter read, the counter write, the
+/// step lookup and every step row run on ONE transaction, and the counter
+/// read takes `FOR UPDATE` on the `workflows` row, so two concurrent reports
+/// serialize instead of both writing `use_count = n + 1`. A step row the
+/// database refuses fails the whole report and rolls the counters back; it
+/// used to be logged and skipped while the tool answered success.
+///
+/// The transaction is a plain `pool.begin()`, not an author-stamped one:
+/// neither `workflows` nor `behavioral_executions` has row security, so there
+/// is no `WITH CHECK` for a stamp to satisfy. It is named `unstamped_tx` so
+/// `tests/residual_unstamped_writes.rs` does not count it as stamped.
+///
+/// `goal_embedding` is computed by the caller BEFORE this runs (embedder
+/// latency stays out of the row lock) and is written on every step row, so
+/// the report feeds `behavioral_affinity_lineage`.
+#[allow(clippy::too_many_arguments)]
 pub async fn do_report_hierarchical_outcome_via_pool(
     pool: &sqlx::PgPool,
     workflow_id: Uuid,
@@ -188,12 +223,19 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     quality: Option<f64>,
     goal_text: Option<&str>,
     run_label: Option<&str>,
+    goal_embedding: Option<&[f32]>,
 ) -> Result<CallToolResult, McpError> {
-    // 1. Confirm hierarchical workflow exists.
+    // 0. Validate before touching the database.
+    validate_quality(quality)?;
+
+    let mut unstamped_tx = pool.begin().await.map_err(internal_error)?;
+
+    // 1. Confirm hierarchical workflow exists, and lock its row for the
+    //    read-modify-write of the counters below.
     let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *unstamped_tx)
             .await
             .map_err(internal_error)?;
     let mut metadata = match row {
@@ -243,7 +285,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(pool)
+        .execute(&mut *unstamped_tx)
         .await
         .map_err(internal_error)?;
 
@@ -271,15 +313,17 @@ pub async fn do_report_hierarchical_outcome_via_pool(
                   e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *unstamped_tx)
     .await
     .map_err(internal_error)?;
     let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
 
     // 5. Per-step behavioral_executions rows. Single timestamp groups them.
+    //    A refused row fails the report: `?` drops `unstamped_tx`, which rolls
+    //    back the counter UPDATE and every earlier step row.
     let report_ts = chrono::Utc::now();
     let goal_text_owned = goal_text.unwrap_or("hierarchical").to_string();
-    let mut written = 0_usize;
+    let goal_embedding_pgvec = goal_embedding.map(crate::embed::format_pgvector);
     for step_exec in step_executions {
         let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
         if step_claim_id.is_none() && !step_claim_ids.is_empty() {
@@ -308,12 +352,16 @@ pub async fn do_report_hierarchical_outcome_via_pool(
             step_claim_id,
             run_label: run_label.map(str::to_string),
         };
-        if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(pool, row, None).await {
-            tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
-            continue;
-        }
-        written += 1;
+        epigraph_db::BehavioralExecutionRepository::create(
+            &mut *unstamped_tx,
+            row,
+            goal_embedding_pgvec.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
     }
+
+    unstamped_tx.commit().await.map_err(internal_error)?;
 
     success_json(&serde_json::json!({
         "workflow_id": workflow_id,
@@ -322,7 +370,9 @@ pub async fn do_report_hierarchical_outcome_via_pool(
         "failure_count": failure_count,
         "avg_variance": avg_variance,
         "variance": variance,
-        "step_executions_written": written,
+        // All or nothing: every requested step row was written, or the call
+        // returned an error and none was.
+        "step_executions_written": step_executions.len(),
     }))
 }
 
@@ -411,6 +461,7 @@ mod tests {
             &steps,
             None,
             Some("smoke run"),
+            None,
             None,
         )
         .await
@@ -525,6 +576,7 @@ mod tests {
             None,
             Some("atomicity run"),
             None,
+            None,
         )
         .await;
         assert!(res.is_err(), "a refused step row must fail the report");
@@ -554,6 +606,7 @@ mod tests {
                 Some(bad),
                 Some("quality run"),
                 None,
+                None,
             )
             .await
             .expect_err("out-of-range quality must be refused");
@@ -579,6 +632,7 @@ mod tests {
             Some(1.0),
             Some("quality run"),
             None,
+            None,
         )
         .await
         .expect("quality 1.0 is in range");
@@ -587,13 +641,56 @@ mod tests {
         assert_eq!(rows, 2);
     }
 
+    /// U033 / I229 regression guard (not a red test: an unlocked
+    /// read-modify-write can pass by luck). Concurrent reports must not lose
+    /// increments; `FOR UPDATE` on the `workflows` row serializes them.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_reports_do_not_lose_increments(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-concurrent").await;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                do_report_hierarchical_outcome_via_pool(
+                    &pool,
+                    workflow_id,
+                    i % 2 == 0,
+                    &two_steps(),
+                    None,
+                    Some("concurrency run"),
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message.to_string())
+            }));
+        }
+        for h in handles {
+            h.await.expect("join").expect("report must succeed");
+        }
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(8), "{metadata}");
+        assert_eq!(metadata["success_count"].as_i64(), Some(4), "{metadata}");
+        assert_eq!(metadata["failure_count"].as_i64(), Some(4), "{metadata}");
+        assert_eq!(rows, 16, "two step rows per report");
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();
-        let err =
-            do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None, None)
-                .await
-                .expect_err("unknown workflow id must error");
+        let err = do_report_hierarchical_outcome_via_pool(
+            &pool,
+            bogus,
+            true,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown workflow id must error");
         assert!(err.message.contains("no hierarchical workflow"));
     }
 }
