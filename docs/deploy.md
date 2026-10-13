@@ -2579,3 +2579,55 @@ reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
 **Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
 transaction: it restores 123's body of the function and re-asserts its owner.
 Run it before `123-undo.sql`.
+
+## `epigraph-operator restrict-claims` — the audited admin privatization act (no migration)
+
+Moves listed PUBLIC claims, and every row that follows them (evidence,
+reasoning traces, BBAs, versions, challenges, frame assignments, fragments,
+and every edge with the claim as an endpoint, other writers' rows included),
+into a target group with `visibility = 'group'`. Reversed exactly by
+`reown-reverse`. Runs on the maintenance DSN like the other operator verbs, and
+like `reown-claims` it needs a SUPERUSER DSN (its readability probe switches
+the session to the application role). Module doc:
+`crates/epigraph-cli/src/operator/restrict.rs`.
+
+```bash
+# dry run: plan, held claims with reasons, per-table counts, a sample, ENFORCED/UNENFORCED
+epigraph-operator restrict-claims --claims-file ids.txt --target-group <group> \
+    --operator <person> --manifest-out restrict-1.jsonl
+# apply: repeat the dry run's eligible count back
+epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>" [--accept-unenforced]
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+```
+
+- **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
+  public owners). The target must be an existing `active` group, not world or
+  seed, administered by `--operator`. A claim whose move would make another
+  group's row readable to the target's members (e.g. an edge declared
+  `('group', H)`) is HELD, not widened. Pinned evidence is left as it is.
+- **Enforcement**: the run detects legacy permissive read policies (and row
+  security disabled) on every table it touches. `--apply` refuses while any
+  exist unless `--accept-unenforced`; the report and the audit row then say
+  UNENFORCED, because an application session can still read the moved rows.
+- **Manifest**: the header before the first batch, each batch's prior tuples
+  (owner, visibility, co-owner, `writer_owned`) fsynced before its write. Never
+  overwritten: a resumed run takes a new path; moved claims count as done.
+  `--max-batches` bounds one run.
+- **Audit**: one `security_events` row per applied run
+  (`privatization.cli_restrict`) and per reversed manifest
+  (`privatization.cli_restrict_reverse`), attributed to `--operator`, written
+  in the first batch transaction that changes anything; it carries the ruling,
+  reason, target, planned counts, the operator login and process, the SHA-256
+  of the id file and of the manifest header (the whole manifest on reverse),
+  and ENFORCED/UNENFORCED.
+- **Reverse** restores every recorded row and edge to its own recorded tuple,
+  never to a meet recomputed from its endpoints (an edge declared group between
+  public claims stays group). An edge whose other moved endpoint is held keeps
+  its narrow meet until that endpoint is reversed. The declassification
+  interlock is armed transaction-locally around the one claims UPDATE, for
+  claims recorded as originally public only.
+- **Not covered**: edges whose endpoint is the claim's EVIDENCE are not
+  re-met by the tenancy trigger and keep their tenancy (the plan counts
+  them). `claims.updated_at` is stamped by its trigger on apply and reverse.
