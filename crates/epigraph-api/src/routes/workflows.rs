@@ -336,6 +336,8 @@ pub async fn store_workflow(
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         None,
@@ -1752,6 +1754,8 @@ pub async fn ingest_workflow(
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         auth,
@@ -2508,6 +2512,29 @@ async fn require_api_workflow_authority(
     Ok(Some((head, grant)))
 }
 
+/// AUTHORSHIP (operator rulings, 2026-10-13; the MCP twin's
+/// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
+/// edge from the acting principal to each claim this request CREATED, on its
+/// own (system-stamped) transaction. The claims stay the system agent's. A
+/// request with no principal records nothing (it names no agent).
+#[cfg(feature = "db")]
+async fn record_api_authorship(
+    conn: &mut sqlx::PgConnection,
+    acting: Option<Uuid>,
+    created: &[Uuid],
+    route: &str,
+) -> Result<(), ApiError> {
+    let Some(acting) = acting else {
+        return Ok(());
+    };
+    epigraph_ingest_executor::record_caller_authorship(conn, acting, created, route)
+        .await
+        .map(|_| ())
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{route}: could not record authorship: {e}. Nothing was written."),
+        })
+}
+
 /// What an ingest records, decided BEFORE the plan walk on the same
 /// transaction (see [`workflow_ingest_submitter`]).
 #[cfg(feature = "db")]
@@ -2670,6 +2697,9 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+    if r.claim_created {
+        record_api_authorship(&mut tx, auth.agent_id, &[r.step_claim_id], "add_step").await?;
+    }
     if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
         let details = serde_json::json!({
             "canonical_name": req.canonical_name,
@@ -2945,6 +2975,23 @@ mod tests {
         }
     }
 
+    /// [`test_auth`] whose principal is a registered `agents` row, for a caller
+    /// whose write succeeds: the `AUTHORED` edge it gets from every claim it
+    /// creates is refused by `edges_validate_refs` for an agent that does not
+    /// exist (in production a token's agent always does).
+    async fn registered_auth(pool: &PgPool) -> crate::middleware::bearer::AuthContext {
+        let auth = test_auth();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'test caller')",
+        )
+        .bind(auth.agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        auth
+    }
+
     /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
     /// `state.db_pool`: the rows the executor writes are owned by the
     /// `workflow-ingest-system` agent's personal group, and a connection that
@@ -2961,9 +3008,10 @@ mod tests {
     async fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
+        let auth = registered_auth(&pool).await;
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
-            .layer(axum::Extension(test_auth()))
+            .layer(axum::Extension(auth))
             .with_state(state)
     }
 
@@ -3360,7 +3408,7 @@ mod tests {
     async fn workflow_steps_refuse_a_caller_who_did_not_submit_the_workflow(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3439,7 +3487,7 @@ mod tests {
     async fn workflow_lineage_and_admin_arm_are_checked_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3568,7 +3616,7 @@ mod tests {
     async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let ingester = test_auth();
+        let ingester = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3898,7 +3946,7 @@ mod tests {
                               AND target_type = 'claim' AND target_id = $1";
         let authored_total = "SELECT count(*) FROM edges WHERE relationship = 'AUTHORED'";
 
-        let ingester = test_auth();
+        let ingester = registered_auth(&pool).await;
         let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",

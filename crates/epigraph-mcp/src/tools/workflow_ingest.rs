@@ -142,6 +142,19 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
         .await
         .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
+    // over HTTP, this server's pinned agent on stdio) AUTHORED every claim this
+    // ingest CREATED (`result.inserted`: thesis, phase, step and operation
+    // claims new to the graph); a reused claim keeps its creator's edge.
+    let created: Vec<uuid::Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    epigraph_ingest_executor::record_caller_authorship(
+        &mut tx,
+        caller.agent_id(),
+        &created,
+        "workflow_ingest",
+    )
+    .await
+    .map_err(|e| internal_error(format!("workflow ingest: could not record authorship: {e}")))?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));

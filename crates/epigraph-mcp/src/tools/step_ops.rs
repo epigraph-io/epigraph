@@ -147,6 +147,19 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+    // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
+    // over HTTP, this server's pinned agent on stdio) AUTHORED the step claim
+    // this call created; the claim itself stays the system agent's.
+    if r.claim_created {
+        epigraph_ingest_executor::record_caller_authorship(
+            &mut tx,
+            caller.agent_id(),
+            &[r.step_claim_id],
+            "add_step",
+        )
+        .await
+        .map_err(|e| internal_error(format!("add_step: could not record authorship: {e}")))?;
+    }
     // The arm that admitted the caller is recorded with the write: the admin
     // arm's audit row, or the provenance row of any other authenticated arm.
     if let Some((head, grant)) = authority {
