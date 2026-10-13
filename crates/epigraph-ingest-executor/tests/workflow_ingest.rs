@@ -452,3 +452,106 @@ async fn a_lineage_may_start_above_generation_zero(pool: PgPool) {
         "a cross-lineage parent at a missing generation must not fall back to anything"
     );
 }
+
+/// The predecessor is the NEAREST generation below the new one: neither the
+/// lineage root nor the head. Gens 0, 1 and 4 exist, so a gap-filling gen 3
+/// has three distinct candidates (root gen 0, predecessor gen 1, head gen 4)
+/// and only the predecessor is right. This is the shape the defect was filed
+/// on (a lineage running gen 0 through gen 8, where root and predecessor
+/// differ), and it also pins that `ingest_anchors` — whose `linked_parent` the
+/// MCP and HTTP authority checks and the admin audit use — resolves the SAME
+/// row the executor then links: on the gap path the old named-parent-only
+/// lookup returns nothing, so a regression there would leave the linked row
+/// unchecked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_predecessor_is_the_nearest_generation_below_not_the_root_or_head(pool: PgPool) {
+    let name = "u032-nearest";
+    let r0 = exec(&pool, &generation_of(name, 0)).await;
+    let r1 = exec(&pool, &generation_of(name, 1)).await;
+    let r4 = exec(&pool, &generation_of(name, 4)).await;
+    assert_eq!(
+        parent_of(&pool, r4.workflow_id).await,
+        Some(r1.workflow_id),
+        "a parentless gen 4 links to gen 1, the nearest generation below it, not the root gen 0"
+    );
+
+    // Gen 3 names its own lineage; gen 2 is missing, so this takes the fallback.
+    let mut g3 = generation_of(name, 3);
+    g3.source.parent_canonical_name = Some(name.to_string());
+
+    let anchors = epigraph_db::WorkflowRepository::ingest_anchors(
+        &mut pool.acquire().await.expect("acquire"),
+        name,
+        3,
+        Some(name),
+    )
+    .await
+    .expect("ingest_anchors");
+    assert_eq!(
+        anchors.linked_parent,
+        Some(r1.workflow_id),
+        "the authority layer must check the predecessor gen 1, the row the executor links"
+    );
+    assert_eq!(anchors.lineage_head, Some(r4.workflow_id));
+
+    let r3 = exec(&pool, &g3).await;
+    assert_eq!(
+        parent_of(&pool, r3.workflow_id).await,
+        Some(r1.workflow_id),
+        "gen 3 must link to gen 1: not the root gen 0, not the head gen 4"
+    );
+    assert_eq!(
+        parent_of(&pool, r3.workflow_id).await,
+        anchors.linked_parent,
+        "the linked row is exactly the row ingest_anchors reported"
+    );
+    assert_eq!(
+        variant_of_edges(&pool, r3.workflow_id, r1.workflow_id).await,
+        1
+    );
+    assert_eq!(
+        variant_of_edges(&pool, r3.workflow_id, r0.workflow_id).await,
+        0
+    );
+
+    // A parentless gen 5 links to the head gen 4, not the root.
+    let r5 = exec(&pool, &generation_of(name, 5)).await;
+    assert_eq!(
+        parent_of(&pool, r5.workflow_id).await,
+        Some(r4.workflow_id),
+        "gen 5 must link to gen 4, the nearest generation below it"
+    );
+}
+
+/// CURRENT DEFAULT, PENDING operator question Q2 (U032 scope §6): a parent
+/// named in a DIFFERENT lineage that has no row at `generation - 1` links
+/// nothing — even when the caller's own lineage already has lower generations
+/// the predecessor fallback could have used. The fallback is for an unnamed
+/// parent or this same lineage only. If Q2 is ruled (refuse, or fall back to
+/// the own-lineage predecessor), this test is meant to flip with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2(pool: PgPool) {
+    let mut own0 = generation_of("u032-xfork", 0);
+    own0.phases[0].steps[0].compound = "Invoke executor for the fork lineage root".to_string();
+    let own_root = exec(&pool, &own0).await;
+
+    let mut other0 = generation_of("u032-xother", 0);
+    other0.phases[0].steps[0].compound = "Invoke executor for the other lineage root".to_string();
+    exec(&pool, &other0).await;
+
+    // Gen 5 of the fork names the other lineage, which has no gen 4.
+    let mut fork = generation_of("u032-xfork", 5);
+    fork.source.parent_canonical_name = Some("u032-xother".to_string());
+    let rf = exec(&pool, &fork).await;
+    assert_eq!(
+        parent_of(&pool, rf.workflow_id).await,
+        None,
+        "a cross-lineage parent at a missing generation must not fall back to the caller's \
+         own predecessor (gen 0 exists and must not be picked)"
+    );
+    assert!(!rf.variant_of_edge_created);
+    assert_eq!(
+        variant_of_edges(&pool, rf.workflow_id, own_root.workflow_id).await,
+        0
+    );
+}
