@@ -1798,7 +1798,17 @@ mod tests {
     ///   stores exactly that (`format!("{method:?}")`, `Some(agent_id)`);
     /// * an agent-less row with no label — a legacy input shape the
     ///   predicate cannot classify, so it must not be silently dropped
-    ///   (`NOT (NULL)` would drop it; the `COALESCE` is what keeps it).
+    ///   (`NOT (NULL)` would drop it; the `COALESCE` is what keeps it);
+    /// * agent-less, perspective-less INPUTS with a non-combination label —
+    ///   `"discount"` is what `/assess` and an anonymous `/evidence` store, and
+    ///   `"auto_wire"` / `"prior"` are other writers' labels. These pin the
+    ///   label list: dropping every labelled agent-less row would pass the
+    ///   cached cases;
+    /// * an agent-less row WITH a perspective labelled `"Dempster"` — pins the
+    ///   perspective conjunct.
+    ///
+    /// Each look-alike sits on its OWN claim: two agent-less, perspective-less
+    /// rows on one pair would upsert into one another (NULLS NOT DISTINCT).
     #[sqlx::test(migrations = "../../migrations")]
     async fn combine_input_readers_exclude_only_cached_combination_rows(pool: sqlx::PgPool) {
         let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
@@ -1809,18 +1819,38 @@ mod tests {
         let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
 
         // (cached label, is it a cached combination row?)
-        let cases: Vec<(Option<String>, bool)> = CACHED_COMBINATION_LABELS
+        let perspective: Uuid = sqlx::query_scalar(
+            "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(format!("b5cb-perspective-{suffix}"))
+        .bind(agent_a)
+        .fetch_one(&pool)
+        .await
+        .expect("seed perspective");
+
+        // (label of the agent-less row, its perspective, is it a cached
+        // combination row?)
+        let cases: Vec<(Option<String>, Option<Uuid>, bool)> = CACHED_COMBINATION_LABELS
             .iter()
-            .map(|l| (Some((*l).to_string()), true))
+            .map(|l| (Some((*l).to_string()), None, true))
             .chain([
-                (Some("cautious+Dempster".to_string()), true),
-                (Some("cautious+none".to_string()), true),
-                (None, false),
+                (Some("cautious+Dempster".to_string()), None, true),
+                (Some("cautious+none".to_string()), None, true),
+                (None, None, false),
+                (Some("discount".to_string()), None, false),
+                (Some("auto_wire".to_string()), None, false),
+                (Some("prior".to_string()), None, false),
+                (Some("Dempster".to_string()), Some(perspective), false),
             ])
             .collect();
 
-        for (label, is_cached) in cases {
-            let claim = insert_claim(&pool, agent_a, &format!("b5cb-{label:?}-{suffix}")).await;
+        for (label, perspective_id, is_cached) in cases {
+            let claim = insert_claim(
+                &pool,
+                agent_a,
+                &format!("b5cb-{label:?}-{perspective_id:?}-{suffix}"),
+            )
+            .await;
             let input_a = MassFunctionRepository::store(
                 &pool,
                 claim,
@@ -1849,14 +1879,16 @@ mod tests {
             )
             .await
             .unwrap();
-            let agentless = MassFunctionRepository::store(
+            let agentless = MassFunctionRepository::store_with_perspective(
                 &pool,
                 claim,
                 frame,
                 None,
+                perspective_id,
                 &masses,
                 Some(0.1),
                 label.as_deref(),
+                None, // source_strength
                 None, // evidence_type
                 "unknown",
                 None,
@@ -1890,7 +1922,8 @@ mod tests {
                 got.sort();
                 assert_eq!(
                     got, want,
-                    "{reader}, agent-less row labelled {label:?} (cached: {is_cached})"
+                    "{reader}, agent-less row labelled {label:?}, perspective \
+                     {perspective_id:?} (cached: {is_cached})"
                 );
             }
         }
