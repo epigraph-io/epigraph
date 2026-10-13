@@ -2628,6 +2628,11 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   its narrow meet until that endpoint is reversed. The declassification
   interlock is armed transaction-locally around the one claims UPDATE, for
   claims recorded as originally public only.
-- **Not covered**: edges whose endpoint is the claim's EVIDENCE are not
-  re-met by the tenancy trigger and keep their tenancy (the plan counts
-  them). `claims.updated_at` is stamped by its trigger on apply and reverse.
+- **Edges with an evidence endpoint** (claim->evidence, evidence->evidence)
+  are not re-met by the tenancy trigger, so the tool narrows them itself: an
+  edge is no more visible than its least visible endpoint. Each takes the meet
+  of its endpoints (the same tuple a claim-endpoint edge gets) unless it is
+  already at least as narrow; each is recorded and restored like every other
+  edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
+- **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
+  reverse.

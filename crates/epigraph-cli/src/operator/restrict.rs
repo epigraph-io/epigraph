@@ -31,9 +31,21 @@
 //! other writers' rows included: a narrowing takes a writer-owned row into the
 //! claim's group and clears its `writer_owned` flag, migration 114), onto the
 //! harvester fragments it is the provenance of, and re-meets every edge with
-//! the claim as an endpoint (migration 122's edges arm). Nothing else is
-//! written. Edges whose endpoint is the claim's EVIDENCE are not re-met by the
-//! trigger and are left as they are; the plan reports how many there are.
+//! the claim as an endpoint (migration 122's edges arm).
+//!
+//! # Edges with an evidence endpoint
+//!
+//! The trigger does not re-meet an edge whose endpoint is the claim's
+//! EVIDENCE (claim->evidence, evidence->evidence). The rule is that an edge is
+//! no more visible than its least visible endpoint, so this tool narrows each
+//! such edge itself, in the same transaction, to the meet of its endpoints
+//! (the trigger's own convention, so it ends exactly as a claim-endpoint edge
+//! would), unless the edge is already at least as narrow, when it keeps its
+//! tuple. Such an edge is recorded and reversed like every other row (and
+//! deferred like one while another moved endpoint is not back). An edge of
+//! ANOTHER group on that evidence holds the claim, as any widening row does.
+//! Pinned evidence does not narrow, so its edges are not touched. Nothing else
+//! is written; the plan reports how many evidence-endpoint edges there are.
 //!
 //! # The manifest records every row's full prior tenancy
 //!
@@ -533,6 +545,150 @@ pub fn narrows(before: &Tenancy, after: &Tenancy) -> bool {
     reader_groups(after).is_superset(&reader_groups(before))
 }
 
+/// The tuple an edge takes when its endpoints are now `ends`, under the rule
+/// "an edge is no more visible than its least visible endpoint": the meet of
+/// its endpoints (migration 122's convention, so an evidence-endpoint edge
+/// ends exactly as a claim-endpoint edge would), unless the edge is ALREADY at
+/// least as narrow as that meet, in which case it keeps its tuple. The result
+/// is never wider than `prior` unless `prior` and the meet are incomparable
+/// (another group's edge), which the caller holds before writing.
+#[must_use]
+pub fn narrowed(prior: &Tenancy, ends_meet: Option<Tenancy>) -> Tenancy {
+    match ends_meet {
+        None => prior.clone(),
+        Some(m) if narrows(&m, prior) => prior.clone(),
+        Some(m) => m,
+    }
+}
+
+/// Edges with an EVIDENCE endpoint among `ev_claim`'s keys (evidence id ->
+/// its claim), as attached rows of that claim. Edges whose key is in `skip`
+/// are left out (the claim-endpoint edges `fetch_attached` already returned).
+/// `claims` is every claim of `ev_claim` the edge touches through an evidence
+/// endpoint, plus any claim endpoint in `in_set`; `neighbours` is any claim
+/// endpoint outside `in_set`.
+async fn fetch_evidence_edges(
+    conn: &mut PgConnection,
+    ev_claim: &BTreeMap<Uuid, Uuid>,
+    in_set: &BTreeSet<Uuid>,
+    skip: &BTreeSet<RowKey>,
+) -> anyhow::Result<Snapshot> {
+    let mut out = Snapshot::new();
+    if ev_claim.is_empty() {
+        return Ok(out);
+    }
+    let ev: Vec<Uuid> = ev_claim.keys().copied().collect();
+    let rows = sqlx::query(
+        "SELECT e.id, e.source_id, e.source_type::text, e.target_id, e.target_type::text, \
+                e.owner_group_id, e.visibility::text, e.co_owner_group_id, e.signer_id \
+           FROM edges e \
+          WHERE (e.source_type = 'evidence' AND e.source_id = ANY($1)) \
+             OR (e.target_type = 'evidence' AND e.target_id = ANY($1))",
+    )
+    .bind(&ev)
+    .fetch_all(&mut *conn)
+    .await
+    .context("reading edges with an evidence endpoint")?;
+    for r in &rows {
+        let id: Uuid = r.get(0);
+        let key = ("edges".to_string(), id.to_string());
+        if skip.contains(&key) {
+            continue;
+        }
+        let mut claims = BTreeSet::new();
+        let mut neighbours = BTreeSet::new();
+        for (nid, ty) in [
+            (r.get::<Uuid, _>(1), r.get::<String, _>(2)),
+            (r.get::<Uuid, _>(3), r.get::<String, _>(4)),
+        ] {
+            match ty.as_str() {
+                "evidence" => {
+                    if let Some(c) = ev_claim.get(&nid) {
+                        claims.insert(*c);
+                    }
+                }
+                "claim" if in_set.contains(&nid) => {
+                    claims.insert(nid);
+                }
+                "claim" => {
+                    neighbours.insert(nid);
+                }
+                _ => {}
+            }
+        }
+        let Some(claim) = claims.iter().next().copied() else {
+            continue;
+        };
+        out.insert(
+            key,
+            Attached {
+                table: "edges".into(),
+                pk: id.to_string(),
+                claim,
+                claims,
+                tenancy: Tenancy {
+                    owner: r.get(5),
+                    visibility: r.get(6),
+                    co_owner: r.get(7),
+                },
+                writer: r.get(8),
+                endpoints_public: None,
+                shared_outside: false,
+                neighbours,
+                writer_owned: None,
+                evidence_type: None,
+                labels: Vec::new(),
+                preview: None,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The current state of exactly `keys`: what `fetch_attached` returns for
+/// `claims`, plus any edge key it does not return (an evidence-endpoint edge),
+/// read by id. A key that no longer resolves is absent.
+async fn states_of(
+    conn: &mut PgConnection,
+    specs: &[TableSpec],
+    claims: &[Uuid],
+    keys: &BTreeSet<RowKey>,
+) -> anyhow::Result<BTreeMap<RowKey, RowState>> {
+    let fresh = fetch_attached(conn, specs, claims).await?;
+    let mut out: BTreeMap<RowKey, RowState> = keys
+        .iter()
+        .filter_map(|k| fresh.get(k).map(|a| (k.clone(), RowState::of(a))))
+        .collect();
+    let missing: Vec<Uuid> = keys
+        .iter()
+        .filter(|k| k.0 == "edges" && !out.contains_key(*k))
+        .filter_map(|k| Uuid::parse_str(&k.1).ok())
+        .collect();
+    if !missing.is_empty() {
+        let rows: Vec<(Uuid, Uuid, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, owner_group_id, visibility::text, co_owner_group_id FROM edges \
+              WHERE id = ANY($1)",
+        )
+        .bind(&missing)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (id, o, v, co) in rows {
+            out.insert(
+                ("edges".to_string(), id.to_string()),
+                RowState {
+                    tenancy: Tenancy {
+                        owner: o,
+                        visibility: v,
+                        co_owner: co,
+                    },
+                    writer_owned: None,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 fn edge_ids(keys: &BTreeSet<RowKey>) -> Vec<Uuid> {
     keys.iter()
         .filter(|(t, _)| t == "edges")
@@ -829,8 +985,21 @@ async fn run_batch(
     }
     let cand_ids: Vec<Uuid> = cands.iter().map(|c| c.id).collect();
     let cand_set: BTreeSet<Uuid> = cand_ids.iter().copied().collect();
-    let attached = fetch_attached(conn, ctx.specs, &cand_ids).await?;
+    let mut attached = fetch_attached(conn, ctx.specs, &cand_ids).await?;
     let pinned = pinned_of(conn, &evidence_ids(&attached)).await?;
+    // Edges with an EVIDENCE endpoint that narrows (the candidates' unpinned
+    // evidence): the tenancy trigger does not re-meet them, so this tool
+    // narrows them itself (an edge is no more visible than its least visible
+    // endpoint) and records them like every other row.
+    let ev_claim: BTreeMap<Uuid, Uuid> = attached
+        .iter()
+        .filter(|(k, _)| k.0 == "evidence" && !pinned.contains(&k.1))
+        .filter_map(|(k, a)| Uuid::parse_str(&k.1).ok().map(|id| (id, a.claim)))
+        .collect();
+    let claim_edge_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    let ev_edges = fetch_evidence_edges(conn, &ev_claim, &cand_set, &claim_edge_keys).await?;
+    let ev_edge_keys: BTreeSet<RowKey> = ev_edges.keys().cloned().collect();
+    attached.extend(ev_edges);
 
     // ---- rows the cascade would WIDEN, or that went stale ----
     // Each row's state after the move is predicted as the trigger computes it:
@@ -867,7 +1036,11 @@ async fn run_batch(
                 } else {
                     e.target_state.clone()
                 };
-                meet(&s, &t).unwrap_or_else(|| a.tenancy.clone())
+                if ev_edge_keys.contains(k) {
+                    narrowed(&a.tenancy, meet(&s, &t))
+                } else {
+                    meet(&s, &t).unwrap_or_else(|| a.tenancy.clone())
+                }
             }),
             _ if k.0 == "evidence" && pinned.contains(&k.1) => Some(a.tenancy.clone()),
             _ => Some(Tenancy {
@@ -953,11 +1126,28 @@ async fn run_batch(
     .context("UPDATE claims")?
     .rows_affected();
 
-    let fresh = fetch_attached(conn, ctx.specs, &claim_ids).await?;
-    let s2: BTreeMap<RowKey, RowState> = keys
-        .iter()
-        .filter_map(|k| fresh.get(k).map(|a| (k.clone(), RowState::of(a))))
-        .collect();
+    // The evidence-endpoint edges: the narrowest of their endpoints NOW.
+    let ev_keys_moving: BTreeSet<RowKey> = keys.intersection(&ev_edge_keys).cloned().collect();
+    let ends_ev = edge_ends(conn, &edge_ids(&ev_keys_moving)).await?;
+    let mut ev_writes: Vec<(String, RowState)> = Vec::new();
+    for k in &ev_keys_moving {
+        let (Some(a), Some(e)) = (s0.get(k), ends_ev.get(&k.1)) else {
+            continue;
+        };
+        let want = narrowed(&a.tenancy, meet(&e.source_state, &e.target_state));
+        if want != a.tenancy {
+            ev_writes.push((
+                k.1.clone(),
+                RowState {
+                    tenancy: want,
+                    writer_owned: None,
+                },
+            ));
+        }
+    }
+    write_rows(conn, spec_of(ctx.specs, "edges"), &claim_ids, &ev_writes).await?;
+
+    let s2 = states_of(conn, ctx.specs, &claim_ids, &keys).await?;
     let after_claims = fetch_claims(conn, &claim_ids, false).await?;
     let ends = edge_ends(conn, &edge_ids(&keys)).await?;
     let counters_after = xact_counters(conn).await?;
@@ -992,6 +1182,16 @@ async fn run_batch(
         let spec = spec_of(ctx.specs, &k.0);
         let before = RowState::of(a);
         let want = match spec.kind {
+            Kind::Edges if ev_edge_keys.contains(k) => match ends.get(&k.1) {
+                None => {
+                    v.push(format!("edge {} has no endpoints row after the batch", k.1));
+                    continue;
+                }
+                Some(e) => RowState {
+                    tenancy: narrowed(&before.tenancy, meet(&e.source_state, &e.target_state)),
+                    writer_owned: None,
+                },
+            },
             Kind::Edges => match ends.get(&k.1) {
                 None => {
                     v.push(format!("edge {} has no endpoints row after the batch", k.1));
@@ -1043,6 +1243,19 @@ async fn run_batch(
                 "{} {} WIDENED from {before} to {got}: readable by someone who could not read it",
                 k.0, k.1
             ));
+        }
+        // (3b) no edge is more visible than its least visible endpoint.
+        if let Some(m) = ends
+            .get(&k.1)
+            .filter(|_| k.0 == "edges")
+            .and_then(|e| meet(&e.source_state, &e.target_state))
+        {
+            if !narrows(&m, &got.tenancy) {
+                v.push(format!(
+                    "edge {} is {got}, more visible than its least visible endpoint ({}, {})",
+                    k.1, m.owner, m.visibility
+                ));
+            }
         }
     }
     if planned != actual {
@@ -1259,8 +1472,9 @@ pub async fn run(
     let ev_edges = evidence_endpoint_edges(conn, &pre.eligible).await?;
     writeln!(
         out,
-        "EVIDENCE-ENDPOINT-EDGES\t{ev_edges}\t(edges whose endpoint is evidence of an eligible \
-         claim: the tenancy trigger does not re-meet them, so they keep their tenancy)"
+        "EVIDENCE-ENDPOINT-EDGES\t{ev_edges}\t(edges with an evidence endpoint of an eligible \
+         claim: narrowed with it to the narrowest of their endpoints unless already narrower; \
+         recorded and restored like every edge)"
     )?;
     writeln!(
         out,
@@ -1599,7 +1813,22 @@ async fn reverse_batch(
     }
     let cand_ids: BTreeSet<Uuid> = cands.iter().map(|(id, _)| *id).collect();
     let cand_vec: Vec<Uuid> = cand_ids.iter().copied().collect();
-    let attached = fetch_attached(conn, specs, &cand_vec).await?;
+    let mut attached = fetch_attached(conn, specs, &cand_vec).await?;
+    // The RECORDED edges with an evidence endpoint (this run narrowed them);
+    // unrecorded ones are not touched by a claim's restoration, so they are
+    // not part of this reversal.
+    let ev_claim: BTreeMap<Uuid, Uuid> = attached
+        .iter()
+        .filter(|(k, _)| k.0 == "evidence")
+        .filter_map(|(k, a)| Uuid::parse_str(&k.1).ok().map(|id| (id, a.claim)))
+        .collect();
+    let claim_edge_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    let ev_edges = fetch_evidence_edges(conn, &ev_claim, &cand_ids, &claim_edge_keys).await?;
+    attached.extend(
+        ev_edges
+            .into_iter()
+            .filter(|(k, _)| res.rows.contains_key(k)),
+    );
 
     // ---- rows: the CAS; an unrecorded non-public row would be widened ----
     let mut drift: BTreeMap<Uuid, String> = BTreeMap::new();
@@ -1723,10 +1952,10 @@ async fn reverse_batch(
         .execute(&mut *conn)
         .await?;
 
-    let s1 = fetch_attached(conn, specs, &claim_ids).await?;
+    let s1 = states_of(conn, specs, &claim_ids, &keys).await?;
     let mut trigger_changed: BTreeMap<String, i64> = BTreeMap::new();
     for (k, a) in &s0 {
-        if s1.get(k).map(RowState::of) != Some(RowState::of(a)) {
+        if s1.get(k) != Some(&RowState::of(a)) {
             *trigger_changed.entry(k.0.clone()).or_default() += 1;
         }
     }
@@ -1739,7 +1968,7 @@ async fn reverse_batch(
         }
         if let (Some(rec), Some(cur)) = (res.rows.get(k), s1.get(k)) {
             let want = RowState::of_record(rec);
-            if RowState::of(cur) != want {
+            if *cur != want {
                 to_write
                     .entry(k.0.clone())
                     .or_default()
@@ -1812,7 +2041,7 @@ async fn reverse_batch(
             continue;
         }
         let want = RowState::of_record(rec);
-        if RowState::of(cur) != want {
+        if *cur != want {
             edge_rows.push((k.1.clone(), want));
         }
     }
@@ -1821,11 +2050,7 @@ async fn reverse_batch(
         *restored.entry("edges".into()).or_default() += i64::try_from(n).unwrap_or(i64::MAX);
     }
 
-    let fresh = fetch_attached(conn, specs, &claim_ids).await?;
-    let s2: BTreeMap<RowKey, RowState> = keys
-        .iter()
-        .filter_map(|k| fresh.get(k).map(|a| (k.clone(), RowState::of(a))))
-        .collect();
+    let s2 = states_of(conn, specs, &claim_ids, &keys).await?;
     let after = fetch_claims(conn, &claim_ids, false).await?;
     let ends_after = edge_ends(
         conn,
@@ -1867,9 +2092,12 @@ async fn reverse_batch(
                 .get(&k.1)
                 .and_then(|e| meet(&e.source_state, &e.target_state))
             {
-                Some(m) if got.tenancy == m => {}
+                // Still at least as narrow as its least visible endpoint (the
+                // trigger's meet, or this run's narrower recorded state).
+                Some(m) if narrows(&m, &got.tenancy) => {}
                 other => v.push(format!(
-                    "deferred edge {} is {got}, not the narrow meet of its endpoints {other:?}",
+                    "deferred edge {} is {got}, more visible than the meet of its endpoints \
+                     {other:?}",
                     k.1
                 )),
             }
@@ -2074,6 +2302,36 @@ mod tests {
             (Uuid::from_u128(1), Some(Uuid::from_u128(2)))
         );
         assert_eq!(m.visibility, "group");
+    }
+
+    #[test]
+    fn narrowed_takes_the_meet_unless_already_narrower() {
+        let t = |o: u128, v: &str, co: Option<u128>| Tenancy {
+            owner: Uuid::from_u128(o),
+            visibility: v.into(),
+            co_owner: co.map(Uuid::from_u128),
+        };
+        // public edge, an endpoint now in group 1: the meet.
+        assert_eq!(
+            narrowed(&t(0, "public", None), Some(t(1, "group", None))),
+            t(1, "group", None)
+        );
+        // already narrower (1 AND 2) than the meet (1): kept.
+        assert_eq!(
+            narrowed(&t(1, "group", Some(2)), Some(t(1, "group", None))),
+            t(1, "group", Some(2))
+        );
+        // equal reader set: kept, not rewritten.
+        assert_eq!(
+            narrowed(&t(1, "group", None), Some(t(1, "group", None))),
+            t(1, "group", None)
+        );
+        // incomparable (another group's edge): the meet, which the caller
+        // detects as a widening and holds.
+        let n = narrowed(&t(3, "group", None), Some(t(1, "group", None)));
+        assert!(!narrows(&t(3, "group", None), &n));
+        // both endpoints public: unchanged.
+        assert_eq!(narrowed(&t(5, "public", None), None), t(5, "public", None));
     }
 
     #[test]
