@@ -1798,3 +1798,102 @@ async fn retire_repairs_a_hidden_endpoint_without_naming_it_to_the_caller(pool: 
         );
     }
 }
+
+/// The re-derivation reads the `mass_functions` that SURVIVE the retirement. A
+/// BBA keyed on the matcher edge (`perspective_id` = the edge, the shape
+/// `auto_wire_ds_for_edge` writes) is deleted by the retirement
+/// (`delete_edge_bbas`), and the re-derived value must exclude it: the latent
+/// deleted-BBA / no-recompute gap the scope's option B closes. Prod held no
+/// such BBA on 2026-08-19, and today's promote path writes none, so the
+/// fixture plants one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_rederives_without_the_edge_keyed_bba_it_deletes(pool: PgPool) {
+    let (w, a, b, candidate, admin) = promoted_pair(&pool, "u043-edge-bba").await;
+    let edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges \
+          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+            AND properties->>'source' = 'cross_source_matcher' AND valid_to IS NULL \
+          ORDER BY created_at LIMIT 1",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("CALIBRATION: the promotion wrote a live matcher edge");
+    let d = seed_surviving_bba_and_derive(&pool, b, w).await;
+
+    // A strongly FALSE-leaning BBA keyed on the matcher edge, from a different
+    // source agent, folded into b's cache.
+    let edge_signer = insert_agent(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect(
+        &database_url_of(&pool),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool over the test database")
+    .with_maintenance_pool(pool.clone());
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, viewer) = session.split();
+    let frame = epigraph_engine::edge_factor::ensure_binary_frame(&mut *conn, viewer)
+        .await
+        .expect("the engine's binary frame");
+    epigraph_db::PerspectiveRepository::ensure_edge_perspective(
+        &mut *conn,
+        edge,
+        Some(edge_signer),
+    )
+    .await
+    .expect("the edge's perspective row (mass_functions.perspective_id FK)");
+    sqlx::query(
+        "INSERT INTO mass_functions \
+           (claim_id, frame_id, source_agent_id, perspective_id, masses, source_strength, \
+            evidence_type) \
+         VALUES ($1, $2, $3, $4, $5, 1.0, 'empirical')",
+    )
+    .bind(b)
+    .bind(frame)
+    .bind(edge_signer)
+    .bind(edge)
+    .bind(serde_json::json!({"1": 0.8, "0,1": 0.2}))
+    .execute(&mut *conn)
+    .await
+    .expect("seed the edge-keyed BBA");
+    epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut *conn, viewer, b)
+        .await
+        .expect("fold the edge-keyed BBA into b's cache");
+    drop(session);
+    let combined = betp_of(&pool, b)
+        .await
+        .expect("CALIBRATION: b has a cache from both BBAs");
+    assert!(
+        (combined - d).abs() > 0.1,
+        "CALIBRATION: the edge-keyed BBA must move b's value measurably \
+         (surviving-only {d}, combined {combined})"
+    );
+
+    let json = retire_on(app_role_state(&pool, true).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "applied", "{json}");
+    assert!(
+        json["bbas_invalidated"].as_u64().unwrap_or(0) >= 1,
+        "the retirement deletes the edge-keyed BBA: {json}"
+    );
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("count the edge-keyed BBAs");
+    assert_eq!(left, 0, "no BBA keyed on the retired edge survives: {json}");
+
+    let after = betp_of(&pool, b)
+        .await
+        .expect("b keeps a cache: a BBA still backs it");
+    assert!(
+        (after - d).abs() < 1e-9,
+        "the re-derivation must run AFTER the edge-keyed BBA is deleted and fold only the \
+         surviving one: expected {d}, found {after} (combined value was {combined}): {json}"
+    );
+}
