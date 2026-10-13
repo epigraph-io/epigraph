@@ -252,9 +252,8 @@ pub async fn begin_author_stamped_tx<'p>(
 /// (`improve_workflow_hierarchy`, or any extraction naming a parent). The rule,
 /// forward-only because `workflows` recorded no owner before, is
 /// `tools::workflow_authority`'s: a workflow created since H-b records its
-/// submitter, and only the submitter, its operator, an agent live-bound to the
-/// submitter's human, or `claims:admin` may change it; a workflow with no record
-/// is platform corpus, mutable only through the audited `claims:admin` path
+/// submitter, and only the submitter, its operator, or `claims:admin` may change
+/// it; a workflow with no record is platform corpus, mutable only through the audited `claims:admin` path
 /// (U005). The system-agent stamp is unchanged for the rows these writes make;
 /// the caller is recorded in a `security_events` provenance row on the same
 /// transaction (`tools::workflow_authority::record_workflow_write`).

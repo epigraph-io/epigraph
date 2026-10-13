@@ -208,9 +208,9 @@ impl SecurityEventRepository {
     pub const WORKFLOW_CALLER_WRITE: &'static str = "workflows.caller_write";
 
     /// Record the PROVENANCE of a hierarchical-workflow write admitted over the
-    /// authenticated transport through a non-admin arm (the submitter, the
-    /// submitter's operator, or an agent live-bound to the submitter's human),
-    /// on the CALLER's transaction, so it commits or rolls back with the write.
+    /// authenticated transport through a non-admin arm (the submitter or the
+    /// submitter's operator), on the CALLER's transaction, so it commits or
+    /// rolls back with the write.
     ///
     /// Those writes are authored by, and stamped from, the workflow-ingest
     /// system agent, so the rows they make name no caller; `details` carries

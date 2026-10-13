@@ -44,40 +44,22 @@
 //! * `add_step`, `delete_step`, `deprecate_workflow` and every new generation
 //!   require, over the AUTHENTICATED transport and when a submitter is
 //!   recorded, in this order: the submitter; its operator (#503, the operator
-//!   itself as on every HTTP gate); an agent LIVE-bound to the submitter's
-//!   human (below); or the AUDITED admin arm. stdio is unchanged (the batch H-b
-//!   bar: stdio changes only for #374), as `patch_claim`'s whole-patch check is
-//!   HTTP-only.
-//! * THE LINKED-AGENT ARM (operator ruling, 2026-10-13: "widen the rule to
-//!   admit linked agents and make sure their provenance is recorded"). The
-//!   operator arm alone could not admit them: it compares the caller with the
-//!   operator OF THE SUBMITTER, and once a human is itself the recorded
-//!   submitter there is no such operator. So the arm compares HUMANS: the
-//!   caller's LIVE delegation (`AgentRepository::live_delegation`, composed of
-//!   the kernel's own reads: migration 122's binding, so a revoked human binds
-//!   no one (`OPL01`), plus 107's acting read for a link (not retired, live
-//!   membership), or 149's allowlist) must name the human the submitter
-//!   belongs to (`AgentRepository::human_of(submitter, false)`: the submitter
-//!   itself when it is that human, else its link's operator in any state, or
-//!   its allowlisted client's). So it admits the submitting human's agents and
-//!   the agents of the submitting agent's human; retired or membership-revoked
-//!   links, revoked humans, unbound agents and other humans' agents stay
-//!   refused, and a workflow with no recorded submitter stays admin-only. It
-//!   runs before the admin arm, so a bound agent with a stale `claims:admin`
-//!   scope is not refused `ADM02`. Over HTTP an agent with ANY operator-link
-//!   record is refused its viewer before any tool runs
-//!   (`tools::viewer::request_viewer`), so the population this arm admits there
-//!   is the ALLOWLISTED one (149); the link half is the same rule, kept
-//!   consistent for a caller that can reach it.
+//!   itself as on every HTTP gate); or the AUDITED admin arm. stdio is
+//!   unchanged (the batch H-b bar: stdio changes only for #374), as
+//!   `patch_claim`'s whole-patch check is HTTP-only. Agents bound to the
+//!   submitter's human are NOT admitted over HTTP (operator ruling,
+//!   2026-10-13: the shared host credential must not gain edit rights over a
+//!   human's workflows); their authority traces to the human through
+//!   `OPERATED_BY` / the author binding.
 //! * PROVENANCE. Every write admitted over the authenticated transport is
 //!   recorded on its own transaction ([`record_workflow_write`]): the admin
-//!   arm's `workflows.admin_write` row, and for the submitter, operator and
-//!   linked-agent arms one `workflows.caller_write` `security_events` row
+//!   arm's `workflows.admin_write` row, and for the submitter and operator arms
+//!   one `workflows.caller_write` `security_events` row
 //!   ([`record_caller_workflow_write`]) naming the `arm`, the `acting_agent`,
-//!   the human it acted for (`operator`), the `binding`, the `submitter`, the
-//!   tool (`action`), the `workflow_id`, the token (`client_id`,
-//!   `token_jti`) and the tool's own facts (`write`). The row is attributed to
-//!   the session principal, the system agent, because 077's
+//!   the human it acted for (`operator`, on the operator arm), the
+//!   `submitter`, the tool (`action`), the `workflow_id`, the token
+//!   (`client_id`, `token_jti`) and the tool's own facts (`write`). The row is
+//!   attributed to the session principal, the system agent, because 077's
 //!   `security_events_append` admits no other attribution on that stamp; the
 //!   actor is `acting_agent`. A new generation records one row per anchor it
 //!   was checked against, naming the anchor and the row it created.
@@ -126,14 +108,6 @@ pub(crate) enum WorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
-    /// The caller is an agent LIVE-bound to the human the submitter belongs to
-    /// (the operator ruling of 2026-10-13): `operator` is that human,
-    /// `binding` how the caller is bound to it (`live_link` /
-    /// `client_allowlist`).
-    LinkedAgent {
-        operator: uuid::Uuid,
-        binding: &'static str,
-    },
     /// The AUDITED admin arm.
     Admin,
 }
@@ -218,16 +192,9 @@ pub(crate) async fn require_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
-    // 3. An agent LIVE-bound to the human the submitter belongs to (operator
-    //    ruling, 2026-10-13). Before the admin arm, so a bound agent that also
-    //    carries a stale claims:admin scope is admitted here, not refused ADM02.
-    if let Some(arm) = linked_agent_arm(conn, caller_agent, owner, tool_name).await? {
-        return Ok(grant(arm));
-    }
-    // 4. The AUDITED admin arm.
+    // 3. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    let needs = "the workflow's submitter, the submitter's operator, an agent live-bound to the \
-                 submitter's human, or a live claims:admin grant";
+    let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
     if admin_arm(conn, auth, caller_agent, &subject, needs, tool_name)
         .await?
         .is_some()
@@ -236,62 +203,10 @@ pub(crate) async fn require_workflow_authority(
     }
     Err(crate::errors::invalid_params(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
-         neither that submitter, nor its operator, nor an agent live-bound to the submitter's \
-         human, and holds no claims:admin. {tool_name} requires the workflow's submitter, the \
-         submitter's operator, an agent live-bound to the submitter's human, or the audited \
-         claims:admin path. Nothing was written."
+         neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
+         the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
+         Nothing was written."
     )))
-}
-
-/// The LINKED-AGENT arm (operator ruling, 2026-10-13): the caller's LIVE
-/// delegation (`AgentRepository::live_delegation`: a not-retired link with a
-/// live writer membership, or an allowlisted client, to a human that is still a
-/// registered human operator) names the human the submitter belongs to
-/// (`AgentRepository::human_of(submitter, false)`: the submitter itself when it
-/// is that human, else the operator of its link of ANY state, or of its
-/// allowlisted client). So it admits an agent of the submitting human and an
-/// agent of the same human as the submitting agent; a retired or
-/// membership-revoked link, a revoked human, an unbound agent and another
-/// human's agent are not admitted. Both reads run on the request's own
-/// transaction (definer reads, independent of the stamp).
-async fn linked_agent_arm(
-    conn: &mut sqlx::PgConnection,
-    caller: uuid::Uuid,
-    owner: uuid::Uuid,
-    tool_name: &'static str,
-) -> Result<Option<WorkflowArm>, McpError> {
-    let Some(delegation) = epigraph_db::AgentRepository::live_delegation(&mut *conn, caller)
-        .await
-        .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: could not read the caller's operator binding: {e}"
-            ))
-        })?
-    else {
-        return Ok(None);
-    };
-    let owner_human = epigraph_db::AgentRepository::human_of(&mut *conn, owner, false)
-        .await
-        .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: could not read the submitter's human: {e}"
-            ))
-        })?;
-    if owner_human != Some(delegation.operator_id) {
-        return Ok(None);
-    }
-    tracing::info!(
-        caller = %caller,
-        submitter = %owner,
-        operator = %delegation.operator_id,
-        binding = delegation.binding,
-        tool = tool_name,
-        "workflow authority granted to an agent live-bound to the submitter's human"
-    );
-    Ok(Some(WorkflowArm::LinkedAgent {
-        operator: delegation.operator_id,
-        binding: delegation.binding,
-    }))
 }
 
 /// The AUDITED admin arm, shared by a submitted workflow (after its submitter
@@ -388,8 +303,8 @@ pub(crate) async fn audit_admin_workflow_write(
 
 /// Record the write a [`WorkflowGrant`] admitted, on the SAME transaction as
 /// the write: the admin arm's `workflows.admin_write` row
-/// ([`audit_admin_workflow_write`]); for the submitter, operator and
-/// linked-agent arms, [`record_caller_workflow_write`]; nothing for an
+/// ([`audit_admin_workflow_write`]); for the submitter and operator arms,
+/// [`record_caller_workflow_write`]; nothing for an
 /// unchecked (stdio) grant. `details` carries the tool's own facts.
 ///
 /// # Errors
@@ -420,14 +335,14 @@ pub(crate) async fn record_workflow_write(
 }
 
 /// The PROVENANCE of a write admitted over the authenticated transport through
-/// the submitter, operator or linked-agent arm: one `workflows.caller_write`
+/// the submitter or operator arm: one `workflows.caller_write`
 /// `security_events` row on the write's own transaction
 /// (`SecurityEventRepository::workflow_caller_write`), recording the arm, the
-/// acting agent, the human it acted for (`operator`: the caller's live human on
-/// the linked-agent arm, the caller itself on the operator arm, null on the
-/// submitter arm), the binding, the submitter, the tool, the workflow and the
-/// token. The rows the write makes stay authored and stamped by the system
-/// agent; this row is where the caller is recorded. A no-op for an unchecked
+/// acting agent, the human it acted for (`operator`: the caller itself on the
+/// operator arm, null on the submitter arm), the submitter, the tool, the
+/// workflow and the token. The rows the write makes stay authored and stamped
+/// by the system agent; this row records who acted, and the `AUTHORED` edges
+/// who wrote the claims it created. A no-op for an unchecked
 /// (stdio) or admin grant (the admin arm has its own row).
 ///
 /// # Errors
@@ -443,13 +358,10 @@ pub(crate) async fn record_caller_workflow_write(
     details: serde_json::Value,
 ) -> Result<(), McpError> {
     let acting = caller.agent_id();
-    let (arm, operator, binding) = match grant.arm {
+    let (arm, operator) = match grant.arm {
         WorkflowArm::Unchecked | WorkflowArm::Admin => return Ok(()),
-        WorkflowArm::Submitter => ("submitter", None, None),
-        WorkflowArm::Operator => ("operator", Some(acting), None),
-        WorkflowArm::LinkedAgent { operator, binding } => {
-            ("linked_agent", Some(operator), Some(binding))
-        }
+        WorkflowArm::Submitter => ("submitter", None),
+        WorkflowArm::Operator => ("operator", Some(acting)),
     };
     let Some(token) = auth else {
         return Err(internal_error(format!(
@@ -463,7 +375,6 @@ pub(crate) async fn record_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
-        "binding": binding,
         "client_id": token.client_id,
         "token_jti": token.jti,
         "write": details,

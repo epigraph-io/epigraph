@@ -2268,12 +2268,6 @@ enum ApiWorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
-    /// The caller is an agent LIVE-bound to the human the submitter belongs to
-    /// (operator ruling, 2026-10-13).
-    LinkedAgent {
-        operator: Uuid,
-        binding: &'static str,
-    },
     /// The AUDITED admin arm.
     Admin,
 }
@@ -2300,11 +2294,9 @@ impl ApiWorkflowGrant {
 /// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
 /// whose module doc records the measurements and the rule). Refuse unless the
 /// caller has authority over workflow `workflow_id`: when a submitter is
-/// recorded, in this order, the submitter, its operator, an agent LIVE-bound to
-/// the submitter's human (operator ruling, 2026-10-13; the MCP twin's
-/// `linked_agent_arm`), or the AUDITED admin arm — `claims:admin` in the token
-/// AND a live grant on the token's client record (migration 111's predicate),
-/// never the scope alone. A workflow with
+/// recorded, in this order, the submitter, its operator, or the AUDITED admin
+/// arm — `claims:admin` in the token AND a live grant on the token's client
+/// record (migration 111's predicate), never the scope alone. A workflow with
 /// no record (written before batch H-b) is platform corpus (U005, default
 /// decision A): only the audited admin arm admits it, and a caller with no
 /// token is refused.
@@ -2360,27 +2352,6 @@ async fn workflow_authority(
         if op.is_some_and(|l| l.operator_id == caller) {
             return Ok(allowed(ApiWorkflowArm::Operator));
         }
-        // An agent LIVE-bound to the submitter's human, before the admin arm
-        // (the MCP twin's `linked_agent_arm`: the same two reads, the same
-        // comparison).
-        let delegation = epigraph_db::AgentRepository::live_delegation(&mut *conn, caller)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not read the caller's operator binding: {e}"),
-            })?;
-        if let Some(d) = delegation {
-            let owner_human = epigraph_db::AgentRepository::human_of(&mut *conn, owner, false)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("could not read the submitter's human: {e}"),
-                })?;
-            if owner_human == Some(d.operator_id) {
-                return Ok(allowed(ApiWorkflowArm::LinkedAgent {
-                    operator: d.operator_id,
-                    binding: d.binding,
-                }));
-            }
-        }
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     if api_admin_arm(conn, auth, caller, &subject).await? {
@@ -2389,14 +2360,14 @@ async fn workflow_authority(
     Err(ApiError::Forbidden {
         reason: format!(
             "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-             submitter, its submitter's operator, an agent live-bound to the submitter's human, \
-             nor a live claims:admin holder. Nothing was written."
+             submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
+             written."
         ),
     })
 }
 
-/// The PROVENANCE of a write admitted through the submitter, operator or
-/// linked-agent arm (the MCP twin's `record_caller_workflow_write`, the same
+/// The PROVENANCE of a write admitted through the submitter or operator arm
+/// (the MCP twin's `record_caller_workflow_write`, the same
 /// `workflows.caller_write` row and fields), on the write's own transaction.
 /// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
 /// The token fields are null on a route that carries no token
@@ -2412,13 +2383,10 @@ async fn record_api_caller_workflow_write(
     grant: ApiWorkflowGrant,
     details: serde_json::Value,
 ) -> Result<(), ApiError> {
-    let (arm, operator, binding) = match grant.arm {
+    let (arm, operator) = match grant.arm {
         ApiWorkflowArm::Admin => return Ok(()),
-        ApiWorkflowArm::Submitter => ("submitter", None, None),
-        ApiWorkflowArm::Operator => ("operator", Some(acting), None),
-        ApiWorkflowArm::LinkedAgent { operator, binding } => {
-            ("linked_agent", Some(operator), Some(binding))
-        }
+        ApiWorkflowArm::Submitter => ("submitter", None),
+        ApiWorkflowArm::Operator => ("operator", Some(acting)),
     };
     let record = serde_json::json!({
         "action": action,
@@ -2427,7 +2395,6 @@ async fn record_api_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
-        "binding": binding,
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
         "write": details,
@@ -3852,7 +3819,7 @@ mod tests {
     }
 
     /// A registered human operator (migration 122 section 1c).
-    async fn seed_human_operator(pool: &PgPool, label: &str) -> Uuid {
+    async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
         let (agent, client) = seed_bound_agent(pool, label, "human").await;
         sqlx::query(
             "INSERT INTO human_operators (agent_id, client_id, reason) VALUES ($1, $2, 'test')",
@@ -3862,7 +3829,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        agent
+        (agent, client)
     }
 
     /// The agent of a service client ALLOWLISTED for `operator` (migration
@@ -3892,15 +3859,14 @@ mod tests {
         (agent, client)
     }
 
-    /// The operator ruling over HTTP (the MCP twin is
-    /// `epigraph-mcp/tests/workflow_linked_agent_authority.rs`): on a workflow
-    /// whose recorded submitter is the human H, an agent bound to H (an
-    /// allowlisted client of H) adds a step: 200, with one
-    /// `workflows.caller_write` provenance row naming the acting agent, H, the
-    /// arm and the token. An agent bound to ANOTHER human is refused 403 with
-    /// nothing written and no provenance row.
+    /// The operator ruling over HTTP (2026-10-13; the MCP twin is
+    /// `epigraph-mcp/tests/workflow_write_provenance.rs`): on a workflow whose
+    /// recorded submitter is the human H, an agent bound to H (an allowlisted
+    /// client of H, the shape a host's shared credential takes) is REFUSED 403
+    /// with nothing written and no provenance row; H itself is admitted (the
+    /// submitter arm) with one `workflows.caller_write` row naming it.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn an_agent_bound_to_the_submitting_human_adds_a_step_over_http(pool: PgPool) {
+    async fn a_bound_agent_is_refused_and_the_submitting_human_admitted_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
@@ -3925,10 +3891,8 @@ mod tests {
             a.agent_id = Some(agent);
             a
         };
-        let h = seed_human_operator(&pool, "h3-la-human").await;
-        let other = seed_human_operator(&pool, "h3-la-other").await;
+        let (h, h_client) = seed_human_operator(&pool, "h3-la-human").await;
         let (agent, client) = seed_allowlisted_agent(&pool, h, "h3-la-agent").await;
-        let (foreign, foreign_client) = seed_allowlisted_agent(&pool, other, "h3-la-foreign").await;
 
         let resp = router_as(test_auth())
             .oneshot(post_json(
@@ -3957,17 +3921,17 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = router_as(as_agent(foreign, foreign_client))
+        let resp = router_as(as_agent(agent, client))
             .oneshot(post_json(
                 "/api/v1/workflows/steps",
-                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "another human's agent"}),
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's agent's step"}),
             ))
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::FORBIDDEN,
-            "another human's agent"
+            "an agent bound to the submitting human is not admitted over HTTP"
         );
         let mid: i64 = sqlx::query_scalar(executes_sql)
             .fetch_one(&pool)
@@ -3981,19 +3945,15 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty(), "no provenance for a refusal: {rows:?}");
 
-        let auth = as_agent(agent, client);
+        let auth = as_agent(h, h_client);
         let resp = router_as(auth.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/steps",
-                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's agent's step"}),
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's own step"}),
             ))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "an agent bound to the submitting human"
-        );
+        assert_eq!(resp.status(), StatusCode::OK, "the submitting human");
         let step = parse_body(resp).await["step_claim_id"]
             .as_str()
             .unwrap()
@@ -4008,7 +3968,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_ne!(stamp, agent, "the system agent still authors the step");
+        assert_ne!(stamp, h, "the system agent still authors the step");
         let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
             .bind(wf)
             .fetch_all(&pool)
@@ -4023,11 +3983,10 @@ mod tests {
         );
         assert_eq!(d["action"], "add_step");
         assert_eq!(d["submitter"], h.to_string());
-        assert_eq!(d["arm"], "linked_agent");
-        assert_eq!(d["acting_agent"], agent.to_string());
-        assert_eq!(d["operator"], h.to_string());
-        assert_eq!(d["binding"], epigraph_db::CLIENT_ALLOWLIST_BINDING);
-        assert_eq!(d["client_id"], client.to_string());
+        assert_eq!(d["arm"], "submitter");
+        assert_eq!(d["acting_agent"], h.to_string());
+        assert_eq!(d["operator"], serde_json::Value::Null);
+        assert_eq!(d["client_id"], h_client.to_string());
         assert_eq!(d["token_jti"], auth.jti.to_string());
         assert_eq!(d["write"]["step_claim_id"], step.as_str());
     }
