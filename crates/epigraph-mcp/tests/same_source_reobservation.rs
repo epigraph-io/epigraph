@@ -201,3 +201,84 @@ async fn recompute_does_not_reinflate_same_source_repeats(pool: PgPool) {
          {first}, recomputed {recomputed}"
     );
 }
+
+/// The cache's binary frame, as the DS wiring recorded it.
+async fn belief_frame(pool: &PgPool, claim_id: Uuid) -> Uuid {
+    sqlx::query_scalar::<_, Option<Uuid>>("SELECT belief_frame_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read belief_frame_id")
+        .expect("belief_frame_id written by the DS wiring")
+}
+
+/// The compute-on-read readers must agree with the cache. Framed `get_belief`
+/// (MCP `get_belief` with a frame), `get_perspective_belief` (`scoped_belief`,
+/// `get_claim`, the REST perspective routes) and `get_perspective_belief_batch`
+/// (lensed `recall` / `memory`) recombine the stored BBAs on every read. If
+/// they still folded same-source repeats as independent, the defect would stay
+/// visible through every one of them while `claims.pignistic_prob` looked
+/// honest.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compute_on_read_readers_agree_with_the_cache_after_same_source_repeats(pool: PgPool) {
+    let (server, claim) = setup(&pool, "readers").await;
+
+    let first = observe(&server, &pool, claim, "Listed, no due date.", Some(PAGE)).await;
+    observe(
+        &server,
+        &pool,
+        claim,
+        "Still listed, unchanged.",
+        Some(PAGE),
+    )
+    .await;
+    let cached = observe(&server, &pool, claim, "Unchanged again.", Some(PAGE)).await;
+    assert!(
+        (cached - first).abs() < 1e-9,
+        "precondition: the write path keeps the cache at the single-observation value \
+         ({first} vs {cached})"
+    );
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let frame = belief_frame(&pool, claim).await;
+
+    let framed = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim, Some(frame))
+        .await
+        .expect("framed get_belief");
+    assert!(
+        (framed.pignistic_prob - cached).abs() < 1e-9,
+        "framed get_belief folded same-source repeats as independent: cache {cached}, \
+         framed read {}",
+        framed.pignistic_prob
+    );
+
+    // A perspective with no reliability overrides expresses no opinion, so the
+    // lensed read must reduce to the same value.
+    let lens = Uuid::new_v4();
+    let lensed =
+        epigraph_engine::belief_query::get_perspective_belief(&pool, &viewer, claim, frame, lens)
+            .await
+            .expect("get_perspective_belief");
+    assert!(
+        (lensed.pignistic_prob - cached).abs() < 1e-9,
+        "get_perspective_belief folded same-source repeats as independent: cache {cached}, \
+         lensed read {}",
+        lensed.pignistic_prob
+    );
+
+    let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
+        &pool,
+        &viewer,
+        &[claim],
+        frame,
+        lens,
+    )
+    .await
+    .expect("get_perspective_belief_batch");
+    let batched = batch[0].1.as_ref().expect("batch item").pignistic_prob;
+    assert!(
+        (batched - cached).abs() < 1e-9,
+        "get_perspective_belief_batch folded same-source repeats as independent: cache \
+         {cached}, batch read {batched}"
+    );
+}
