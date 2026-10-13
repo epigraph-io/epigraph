@@ -204,6 +204,9 @@ impl EventFilter {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventListResponse {
     pub events: Vec<GraphEvent>,
+    /// Size of the merged result before `offset`/`limit`. Under the `db`
+    /// feature its persisted half is capped by an overfetch, so it is NOT a
+    /// count of every matching event (see [`list_events`], "Cursor contract").
     pub total: usize,
 }
 
@@ -271,6 +274,10 @@ pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
 ///   without `since` is a 400.
 /// * With a cursor the page is the OLDEST matching events after it (the
 ///   cursor is applied in SQL, not to an already-truncated newest-N window).
+/// * `total` is NOT the number of events after the cursor: it counts the
+///   merged set before paging, whose persisted half is capped by the route's
+///   overfetch. To drain a cursor, page until a page comes back shorter than
+///   `limit`; do not compare against `total`.
 ///
 /// **The cursor is NOT commit-ordered.** An event's `created_at` is its
 /// transaction's START time and it becomes visible only at COMMIT, so an event
