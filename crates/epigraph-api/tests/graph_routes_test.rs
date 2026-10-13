@@ -368,6 +368,29 @@ async fn overview_limit_below_one_is_clamped_to_one(pool: PgPool) {
     }
 }
 
+/// `edge_limit` shares `limit`'s `1..=10_000` clamp. No `limit` is sent, so
+/// every supernode comes back and only the edge cap is under test: `0` and
+/// `-5` must both mean "the single heaviest edge", never a 500 from a
+/// negative `LIMIT` and never an empty edge list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_edge_limit_below_one_is_clamped_to_one(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    for query in ["edge_limit=0", "edge_limit=-5"] {
+        let body = get_overview(&url, query).await;
+        assert_eq!(supernode_labels(&body), ["A", "B", "C"], "{query}");
+        assert_eq!(edge_weights(&body), [4], "{query}");
+        assert_eq!(
+            edge_endpoints(&body["cluster_edges"][0]),
+            ids(&[s.a, s.b]),
+            "{query}"
+        );
+        assert_eq!(body["total_supernodes"], 3, "{query}");
+        assert_eq!(body["truncated"], true, "{query}");
+    }
+}
+
 /// Guard, and meant to pass on main as well: with no bound in the query string
 /// the body is today's body — every supernode, every edge, and no new
 /// top-level key. The epigraph-gui reads `cluster_edges` unbounded from this
