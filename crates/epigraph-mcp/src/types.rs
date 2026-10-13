@@ -1460,9 +1460,10 @@ pub struct UpdateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
     /// Populated when supporting evidence *lowered* the pignistic probability
-    /// (weak/high-ignorance-mass BBA on a claim with no prior DS state; this is
-    /// mathematically correct Dempster-Shafer combination, and the warning
-    /// exists so callers don't mistake it for a bug), and when
+    /// (the claim's prior sits above the plausibility its stored BBAs allow, so
+    /// the monotonicity clamp yields to that bound; this is mathematically
+    /// correct Dempster-Shafer combination, and the warning exists so callers
+    /// don't mistake it for a bug), and when
     /// [`Self::cache_written`] is `false`. Several notes are joined by a space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
