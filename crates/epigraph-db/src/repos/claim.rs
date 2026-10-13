@@ -488,6 +488,17 @@ pub struct SupersedeEdgeMigration {
 /// frozen step the workflow was defined with.
 pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] = &["executes"];
 
+/// Relationships an AGENT holds on a step that a step-lineage supersession
+/// leaves on the retired step (incoming edges with `source_type = 'agent'`).
+///
+/// `evolve_step` writes its successor under the CALLER's `agent_id`, not the
+/// retired step's (unlike the supersede act, which keeps the old author). An
+/// agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
+/// content; carried onto the successor it would record the agent asserting
+/// content it never saw. (Scope U047 sub-decision A, default "exclude"; the
+/// opposite ruling is removing this constant's use.)
+pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -530,7 +541,8 @@ async fn require_privileged_session(
 ///
 /// A STEP-LINEAGE supersession (old and new share a non-null
 /// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
-/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step. The rule is
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step, and its agents'
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
 /// derived from the rows, not from a caller flag, because the deferred replay
 /// runs this same function knowing nothing of the original caller.
 async fn migrate_superseded_edges(
@@ -559,14 +571,15 @@ async fn migrate_superseded_edges(
     .bind(old_uuid)
     .fetch_one(&mut *conn)
     .await?;
-    let frozen: Vec<String> = if step_lineage {
-        STEP_LINEAGE_FROZEN_RELATIONSHIPS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    } else {
-        Vec::new()
+    let step_lineage_set = |set: &[&str]| -> Vec<String> {
+        if step_lineage {
+            set.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            Vec::new()
+        }
     };
+    let frozen = step_lineage_set(STEP_LINEAGE_FROZEN_RELATIONSHIPS);
+    let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -579,6 +592,7 @@ async fn migrate_superseded_edges(
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
+           AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
          RETURNING id",
     )
@@ -586,6 +600,7 @@ async fn migrate_superseded_edges(
     .bind(old_uuid)
     .bind(&weakening)
     .bind(&frozen)
+    .bind(&agent_authorship)
     .fetch_all(&mut *conn)
     .await?;
 
