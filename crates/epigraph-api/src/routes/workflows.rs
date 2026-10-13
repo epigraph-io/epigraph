@@ -3273,6 +3273,66 @@ mod tests {
         assert_eq!(rows, 2);
     }
 
+    /// U033 / I229, HTTP twin of the MCP row-lock test: the route's counter
+    /// read takes `FOR UPDATE`, so a report arriving while another
+    /// transaction holds the `workflows` row waits and then increments the
+    /// committed value. The holder writes `use_count = 5` and keeps its lock
+    /// until the report is observed blocked in `pg_stat_activity`. Without
+    /// the lock the route reads the stale row, blocks only at its UPDATE, and
+    /// then overwrites the 5 with 1.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_waits_for_a_held_counter_row(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-row-lock-http").await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{use_count}', '5') \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let report = tokio::spawn(post_outcome(app, workflow_id, two_step_body(None)));
+
+        // Sync point: the report is blocked on the held row. Bounded by
+        // iterations, not wall time.
+        let mut blocked = false;
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "the report never blocked on the held workflows row"
+        );
+
+        holder.commit().await.unwrap();
+        assert_eq!(report.await.expect("join"), StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(
+            metadata["use_count"], 6,
+            "the report must increment the committed 5, not overwrite it: {metadata}"
+        );
+        assert_eq!(rows, 2);
+    }
+
     /// `outcome_fixture` with a deterministic `MockProvider` as the embedding
     /// service: the OpenAI boundary is the only thing stood in for.
     async fn embedding_outcome_fixture(

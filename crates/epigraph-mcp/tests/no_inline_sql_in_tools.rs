@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
-///   `workflow_hierarchical.rs` 9).** Fixture assertions inside
+///   `workflow_hierarchical.rs` 12).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds.rs", 1, 0),
@@ -104,7 +104,10 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // counters-and-rows read-back (2), and the two goal-embedding row counts.
     // All fixture SQL inside `mod tests`; the 3 production statements are
     // unchanged in number and now run on one transaction.
-    ("workflow_hierarchical.rs", 3, 9),
+    // 9 -> 12 (U033 finalize): the row-lock test's holder transaction (the
+    // `FOR UPDATE` read and the `use_count = 5` write) and its
+    // `pg_stat_activity` lock-wait poll. Fixture SQL again.
+    ("workflow_hierarchical.rs", 3, 12),
     ("workflow_ingest.rs", 0, 10),
     ("workflows.rs", 2, 0),
 ];

@@ -738,6 +738,85 @@ mod tests {
         assert_eq!(rows, 16, "two step rows per report");
     }
 
+    /// U033 / I229: the counter read takes `FOR UPDATE`, so a report that
+    /// arrives while another transaction holds the `workflows` row WAITS and
+    /// then increments the committed value. Deterministic, unlike
+    /// `concurrent_reports_do_not_lose_increments`: the holder writes
+    /// `use_count = 5` and keeps its lock until the report is observed blocked
+    /// in `pg_stat_activity`. Without the lock the report reads the stale row
+    /// (no `use_count`), blocks only at its UPDATE, and then overwrites the
+    /// holder's 5 with 1.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_report_waits_for_a_held_counter_row_and_increments_the_committed_value(
+        pool: sqlx::PgPool,
+    ) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-row-lock").await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{use_count}', '5') \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let report_pool = pool.clone();
+        let report = tokio::spawn(async move {
+            do_report_hierarchical_outcome_via_pool(
+                &report_pool,
+                workflow_id,
+                true,
+                &two_steps(),
+                None,
+                Some("row lock run"),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message.to_string())
+        });
+
+        // Sync point: the report is blocked on the held row. Bounded by
+        // iterations, not wall time.
+        let mut blocked = false;
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "the report never blocked on the held workflows row"
+        );
+
+        holder.commit().await.unwrap();
+        report.await.expect("join").expect("report must succeed");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(
+            metadata["use_count"].as_i64(),
+            Some(6),
+            "the report must increment the committed 5, not overwrite it: {metadata}"
+        );
+        assert_eq!(rows, 2);
+    }
+
     fn mock_embedder() -> epigraph_embeddings::MockProvider {
         epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536))
     }
