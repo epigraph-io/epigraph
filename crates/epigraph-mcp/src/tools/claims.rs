@@ -254,9 +254,10 @@ pub(crate) async fn submit_claim_response(
 ///   trace becomes the claim's canonical trace only if it had none. The DS
 ///   auto-wire is skipped (`was_created` is false), so none of it moves the
 ///   existing belief. `novelty_threshold` is never consulted: the exact-content
-///   pre-check skips the gate. `source_url` is written nowhere for `empirical`
-///   evidence, whose evidence type has no URL slot (`parse_evidence_type`) —
-///   true of a fresh insert as well.
+///   pre-check skips the gate. `source_url` is recorded on the new evidence
+///   row's `source_url` column whatever the evidence type (backlog 4c42c0bf),
+///   so it is applied even for `empirical`, whose evidence type has no URL slot
+///   of its own (`parse_evidence_type`).
 ///
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
@@ -264,7 +265,6 @@ pub(crate) async fn submit_claim_response(
 fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut discarded: Vec<&'static str> = Vec::new();
-    let url_has_a_slot = !params.evidence_type.eq_ignore_ascii_case("empirical");
     match by {
         DedupBy::NoveltyGate => {
             discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
@@ -287,11 +287,7 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
                 "confidence",
             ]);
             if params.source_url.is_some() {
-                if url_has_a_slot {
-                    applied.push("source_url");
-                } else {
-                    discarded.push("source_url");
-                }
+                applied.push("source_url");
             }
             if params.reasoning.is_some() {
                 applied.push("reasoning");
@@ -661,9 +657,17 @@ async fn write_submission(
     )
     .await
     .map_err(internal_error)?;
-    EvidenceRepository::create(&mut *conn, &evidence_with_sig)
-        .await
-        .map_err(internal_error)?;
+    // The caller's `source_url` lands on the evidence row whatever the type, as
+    // in `update_with_evidence`: with the creation BBA's `evidence_id` (below)
+    // it is the source identity that lets a later re-sighting of the same page
+    // fold as a repeat, not as corroboration (backlog 4c42c0bf).
+    EvidenceRepository::create_with_source_url(
+        &mut *conn,
+        &evidence_with_sig,
+        params.source_url.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
 
     // Verb-edges: every submission references its own Evidence + Trace.
     // Emitted on both branches per the architecture doc's "re-occurrence
@@ -745,6 +749,8 @@ async fn write_submission(
                     weight,
                     supports: true,
                     evidence_type: Some(&params.evidence_type),
+                    // Written above in this transaction, so the FK holds.
+                    evidence_id: Some(evidence_with_sig.id.as_uuid()),
                 },
                 /* persist_truth_from_pignistic */ true,
                 tool_name,

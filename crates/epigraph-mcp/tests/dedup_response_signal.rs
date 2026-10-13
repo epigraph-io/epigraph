@@ -124,13 +124,16 @@ async fn submit_claim_reports_a_content_hash_hit_and_what_it_kept(pool: PgPool) 
     assert!(second.get("belief").is_none(), "{second}");
 }
 
-/// `source_url` on `empirical` evidence has no slot in the stored evidence type,
-/// so the hit must list it as discarded rather than applied.
+/// `source_url` on `empirical` evidence has no slot in the stored evidence
+/// TYPE, but it is recorded on the evidence row's `source_url` column whatever
+/// the type (backlog 4c42c0bf: it is the source identity the combine step uses
+/// to tell a re-sighting of one page from independent corroboration). So the
+/// hit must list it as applied, and the resubmit's row must carry it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
+async fn an_empirical_source_url_is_recorded_and_reported_applied(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let content = "g11: empirical evidence keeps no url";
+    let content = "g11: empirical evidence keeps its url on the row";
     let mut p = submit(content, "ev", &[]);
     p.evidence_type = "empirical".into();
     epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p, None)
@@ -147,18 +150,18 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     );
     let d = &second["deduplicated"];
     assert!(
-        strs(&d["inputs_discarded"]).contains(&"source_url".to_string()),
+        strs(&d["inputs_applied"]).contains(&"source_url".to_string()),
         "{second}"
     );
     assert!(
-        !strs(&d["inputs_applied"]).contains(&"source_url".to_string()),
+        !strs(&d["inputs_discarded"]).contains(&"source_url".to_string()),
         "{second}"
     );
-    // MEASURED: no evidence row for this claim carries the url anywhere.
+    // MEASURED: the resubmit's evidence row (evidence_data "ev two") carries
+    // the url in its source_url column.
     let (hits,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM evidence e JOIN claims c ON c.id = e.claim_id \
-         WHERE c.content = $1 AND (e.properties::text LIKE '%' || $2 || '%' \
-                                   OR e.source_url = $2)",
+         WHERE c.content = $1 AND e.raw_content = 'ev two' AND e.source_url = $2",
     )
     .bind(content)
     .bind(&url)
@@ -166,8 +169,8 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(
-        hits, 0,
-        "the url was stored after all; the list would be wrong"
+        hits, 1,
+        "the resubmit's url was not stored on its evidence row; the list would be wrong"
     );
 }
 
