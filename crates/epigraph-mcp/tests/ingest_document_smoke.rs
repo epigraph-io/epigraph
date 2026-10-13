@@ -979,6 +979,19 @@ async fn mixed_real_and_placeholder_authors_keep_index_alignment(pool: PgPool) {
         5,
         "the real author asserts every one of the 5 claims"
     );
+    // `authored.position` is the ORIGINAL extraction index, so a dropped
+    // placeholder leaves a gap rather than renumbering the real authors.
+    let position: (serde_json::Value,) = sqlx::query_as(
+        r#"
+        SELECT e.properties->'position' FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored' AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(position.0, serde_json::json!(1));
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {

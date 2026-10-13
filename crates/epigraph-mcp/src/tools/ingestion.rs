@@ -891,9 +891,10 @@ pub async fn do_ingest_document(
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
     // Defensive backstop (backlog a55aac45): hierarchical extraction sometimes
     // drops `source.authors` (empty array), so a paper would be recorded with no
-    // real authors. When the structured list is empty, fall back to parsing the
-    // author byline out of the raw `source_text` body (Tier 1 only; Tier 2 has
-    // no `source_text` and silently no-ops). The parser is conservative and
+    // real authors. When the structured list has no real author (empty or
+    // placeholder-only), fall back to parsing the author byline out of the raw
+    // `source_text` body (Tier 1 only; Tier 2 has no `source_text` and silently
+    // no-ops). The parser is conservative and
     // returns empty when unsure — it never fabricates a placeholder author, so
     // the empty-fallback case preserves the pre-existing behavior exactly.
     //
@@ -1017,6 +1018,9 @@ pub async fn do_ingest_document(
             "paper",
             "authored",
             Some(serde_json::json!({
+                // The ORIGINAL extraction index: it can have gaps where a
+                // placeholder author was dropped ([Unknown, Alice] gives Alice
+                // position 1 and no edge position 0).
                 "position": idx,
                 "role": author.roles.first().map_or("author", String::as_str),
                 "affiliations": author.affiliations,
@@ -1833,7 +1837,7 @@ pub async fn do_ingest_document_spine(
     // Same defensive backstop as `do_ingest_document` (backlog a55aac45): the
     // spine path is the recommended two-phase entry and shares the empty-authors
     // failure mode, so recover the byline from `source_text` when the structured
-    // author list is absent. Gated on Paper/Textbook source_type (see the
+    // author list has no real author (empty or placeholder-only). Gated on Paper/Textbook source_type (see the
     // `do_ingest_document` rationale). Conservative parser; empty ⇒ pre-existing
     // behavior.
     let byline_eligible = matches!(
@@ -1953,6 +1957,9 @@ pub async fn do_ingest_document_spine(
             "paper",
             "authored",
             Some(serde_json::json!({
+                // The ORIGINAL extraction index: it can have gaps where a
+                // placeholder author was dropped ([Unknown, Alice] gives Alice
+                // position 1 and no edge position 0).
                 "position": idx,
                 "role": author.roles.first().map_or("author", String::as_str),
                 "affiliations": author.affiliations,
