@@ -407,6 +407,22 @@ async fn overview_min_size_keeps_a_cluster_of_exactly_that_size(pool: PgPool) {
     assert_eq!(body["truncated"], true);
 }
 
+/// `include_edges=false` on its own is an opt-out the handler must honour:
+/// no other param makes the request bounded, so this arm alone pins that
+/// `include_edges` selects the bounded body.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_include_edges_false_alone_skips_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "include_edges=false").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B", "C"]);
+    assert_eq!(edge_weights(&body), Vec::<i64>::new());
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], false);
+}
+
 /// Guard, and meant to pass on main as well: with no bound in the query string
 /// the body is today's body — every supernode, every edge, and no new
 /// top-level key. The epigraph-gui reads `cluster_edges` unbounded from this
