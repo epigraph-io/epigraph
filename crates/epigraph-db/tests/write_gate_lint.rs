@@ -605,23 +605,43 @@ fn measure_ungated_writes() -> (BTreeMap<String, String>, BTreeMap<String, Strin
     let mut ordinary = BTreeMap::new();
     let mut macros = BTreeMap::new();
     for (file, src) in repo_files() {
-        for f in fns_in(&src) {
-            if f.body.contains(".splice_write(") {
-                continue;
-            }
-            let offsets = scoped_write_offsets(&f.body);
-            if offsets.is_empty() {
-                continue;
-            }
-            let key = format!("{file}::{}", f.name);
-            if offsets.iter().all(|&at| inside_query_macro(&f.body, at)) {
-                macros.insert(key, String::new());
-            } else {
-                ordinary.insert(key, String::new());
-            }
+        let (o, m) = ungated_writes_in(&file, &src);
+        ordinary.extend(o.into_iter().map(|k| (k, String::new())));
+        macros.extend(m.into_iter().map(|k| (k, String::new())));
+    }
+    (ordinary, macros)
+}
+
+/// [`measure_ungated_writes`] over ONE source string: the `file::fn` keys of
+/// its ordinary and macro-only ungated writers, in that order.
+///
+/// Split out so the clearing rule can be exercised on synthetic sources that do
+/// not exist in `src/repos/`.
+fn ungated_writes_in(file: &str, src: &str) -> (Vec<String>, Vec<String>) {
+    let mut ordinary = Vec::new();
+    let mut macros = Vec::new();
+    for f in fns_in(src) {
+        if splice_write_calls(&f.body) > 0 {
+            continue;
+        }
+        let offsets = scoped_write_offsets(&f.body);
+        if offsets.is_empty() {
+            continue;
+        }
+        let key = format!("{file}::{}", f.name);
+        if offsets.iter().all(|&at| inside_query_macro(&f.body, at)) {
+            macros.push(key);
+        } else {
+            ordinary.push(key);
         }
     }
     (ordinary, macros)
+}
+
+/// How many `.splice_write(` calls `body` makes. Matched against the body's
+/// text.
+fn splice_write_calls(body: &str) -> usize {
+    body.matches(".splice_write(").count()
 }
 
 /// Functions that spliced SOME of their scoped writes but not all of them.
@@ -655,7 +675,7 @@ fn partial_conversion_report() -> Vec<String> {
 fn partial_conversions_in(file: &str, src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for f in fns_in(src) {
-        let spliced = f.body.matches(".splice_write(").count();
+        let spliced = splice_write_calls(&f.body);
         if spliced == 0 {
             continue;
         }
@@ -761,6 +781,75 @@ fn the_partial_conversion_guard_is_not_vacuous() {
     );
 }
 
+/// A `.splice_write(` counts only where it is CODE, never where it is prose.
+///
+/// Both clearing rules read the same count — [`measure_ungated_writes`]
+/// clears a function with at least one, and
+/// [`partial_conversions_in`] compares it to the scoped-write count — so both
+/// are exercised. The comments in these fixtures deliberately name no scoped
+/// table, so the scoped-write count is the same with or without them and the
+/// only thing under test is the marker count.
+#[test]
+fn splice_write_counts_only_in_code_not_in_comments() {
+    // 1. UNGATED, with the call only in comments: still an ungated writer.
+    let commented = r#"
+        pub async fn touch(pool: &PgPool, v: &Viewer, id: Uuid) -> Result<(), DbError> {
+            // let sql = v.splice_write(sql, 3);
+            /* v.splice_write( once the marker lands */
+            sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
+                .bind(id).execute(pool).await?;
+            Ok(())
+        }
+    "#;
+    let (ordinary, macros) = ungated_writes_in("synthetic.rs", commented);
+    assert_eq!(
+        ordinary,
+        vec!["synthetic.rs::touch".to_string()],
+        "a scoped write whose only `.splice_write(` is inside comments is \
+         ungated and must stay in the register (macros: {macros:?})"
+    );
+
+    // 2. HALF-CONVERTED, plus a comment naming the call: one real splice,
+    //    two scoped writes — must still be reported as partial.
+    let half = r#"
+        pub async fn seal(pool: &PgPool, v: &Viewer, id: Uuid) -> Result<(), DbError> {
+            let sql = v.splice_write("UPDATE claims AS c SET sealed = true WHERE c.id = $1 /* {WRITABLE:c} */", 2);
+            sqlx::query(&sql).bind(id).bind(v.writable_bind().unwrap()).execute(pool).await?;
+            // TODO: route the next one through v.splice_write(sql, 2) as well
+            sqlx::query("UPDATE public.claim_versions SET sealed = true WHERE claim_id = $1")
+                .bind(id).execute(pool).await?;
+            Ok(())
+        }
+    "#;
+    let hits = partial_conversions_in("synthetic.rs", half);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a function splicing 1 of its 2 scoped writes must be reported even when \
+         a comment also names `.splice_write(`: {hits:?}"
+    );
+    assert!(
+        hits[0].contains("splices 1") && hits[0].contains("issues 2"),
+        "the comment must not be counted as a splice: {}",
+        hits[0]
+    );
+
+    // 3. The real call, in code, still clears — the strip must not eat it.
+    let gated = r#"
+        pub async fn touch(pool: &PgPool, v: &Viewer, id: Uuid) -> Result<(), DbError> {
+            // gated below
+            let sql = v.splice_write("UPDATE evidence AS e SET raw_content = $2 WHERE e.id = $1 /* {WRITABLE:e} */", 3);
+            sqlx::query(&sql).bind(id).execute(pool).await?;
+            Ok(())
+        }
+    "#;
+    let (ordinary, macros) = ungated_writes_in("synthetic.rs", gated);
+    assert!(
+        ordinary.is_empty() && macros.is_empty(),
+        "a spliced write must be cleared: {ordinary:?} {macros:?}"
+    );
+}
+
 fn expected(list: &[(&str, &str)]) -> BTreeMap<String, String> {
     list.iter()
         .map(|(k, _)| ((*k).to_string(), String::new()))
@@ -818,7 +907,7 @@ fn the_write_scanner_is_not_vacuous() {
         1,
         "an unguarded UPDATE on a scoped table must be seen"
     );
-    assert!(!f.body.contains(".splice_write("));
+    assert_eq!(splice_write_calls(&f.body), 0);
 
     // 2. The SAME statement, marked and spliced, is NOT counted.
     let gated = r#"
@@ -830,7 +919,7 @@ fn the_write_scanner_is_not_vacuous() {
         }
     "#;
     assert!(
-        fns_in(gated)[0].body.contains(".splice_write("),
+        splice_write_calls(&fns_in(gated)[0].body) > 0,
         "the converted form must be recognised as gated — if this fails the \
          lint charges every converted site forever and the ratchet can never \
          go down"
