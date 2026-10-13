@@ -34,10 +34,13 @@
 //!   recorded as its submitter, and then pass every head-keyed check
 //!   (`add_step`, `delete_step`, `improve_workflow_hierarchy`) while the real
 //!   submitter was refused on its own lineage.
-//! * A variant ingest (`parent_canonical_name` set) also requires authority over
-//!   EXACTLY the row the executor links as `parent_id`
-//!   (`WorkflowRepository::ingest_anchors`), not the latest generation of the
-//!   parent's name, and inherits that row's submitter when the name is new.
+//! * Every new generation that links a parent — a variant ingest
+//!   (`parent_canonical_name` set), or since U032 an unnamed generation > 0
+//!   linked to its lineage predecessor — also requires authority over EXACTLY
+//!   the row the executor links as `parent_id`
+//!   (`WorkflowRepository::ingest_anchors`, via
+//!   `WorkflowRepository::resolve_ingest_parent`), not the latest generation of
+//!   the parent's name, and inherits that row's submitter when the name is new.
 //! * `add_step`, `delete_step` and every new generation require, over the
 //!   AUTHENTICATED transport and when a submitter is recorded, in this order:
 //!   the submitter; its operator (#503, the operator itself as on every HTTP

@@ -1,0 +1,34 @@
+{
+  "claim": {
+    "content": "Foreman lifecycle: {{KIND}} on work item {{WORK_ITEM}}",
+    "initial_truth": 0.99,
+    "agent_id": "{{AUTHOR}}",
+    "properties": {
+      "feature_id": "{{FEATURE}}",
+      "kind": "{{KIND}}",
+      "payload": {{PAYLOAD}},
+      "work_item_id": "{{WORK_ITEM}}"
+    },
+    "labels": ["foreman", "lifecycle", "{{FEATURE}}"]
+  },
+  "evidence": [
+    {
+      "content_hash": "{{EVIDENCE_HASH}}",
+      "evidence_type": {
+        "type": "observation",
+        "observed_at": "{{OBSERVED_AT}}",
+        "method": "foreman_lifecycle",
+        "location": null
+      },
+      "raw_content": null,
+      "signature": null
+    }
+  ],
+  "reasoning_trace": {
+    "methodology": "deductive",
+    "explanation": "Host process directly observed this event: foreman_lifecycle",
+    "confidence": 0.99,
+    "inputs": [{ "type": "evidence", "index": 0 }]
+  },
+  "signature": ""
+}

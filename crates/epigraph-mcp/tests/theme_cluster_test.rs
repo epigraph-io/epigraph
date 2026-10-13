@@ -6,6 +6,12 @@
 //! pgvector embeddings via the `Vector` type, which is more setup than this
 //! smoke needs — the bin's HTTP route already has integration coverage in
 //! `crates/epigraph-api/tests/admin_scope_promotions_test.rs`.
+//!
+//! Side effect: these run on the SHARED test DB and call with defaults, which
+//! since backlog 5abe23de is an additive run (`wipe_first=false`). If that DB
+//! holds leftover embeddings, each run ADDS `auto-NN` themes rather than
+//! wiping and rebuilding the set (the theme-set wipe itself is pinned on
+//! isolated databases in `theme_cluster_wipe_gate.rs`).
 
 #[macro_use]
 mod common;
@@ -28,11 +34,11 @@ async fn theme_cluster_skip_path_returns_summary() {
         limit: None,
         label_prefix: None,
         centroid_dim: None,
-        // None => engine receives the safe-by-default `wipe_first=true`.
+        // None => additive run (`wipe_first=false`, backlog 5abe23de).
         wipe_first: None,
     };
 
-    let result = theme_cluster(&server, params).await.expect("tool ok");
+    let result = theme_cluster(&server, params, None).await.expect("tool ok");
     let body = common::first_text(&result);
 
     assert!(
@@ -56,13 +62,23 @@ async fn theme_cluster_skip_path_returns_summary() {
         "summary must include centroid_dim: {body}"
     );
 
-    // The warning is only emitted when `wipe_first=false` AND
-    // `themes_created > 0`. On the default path (`wipe_first=true`) the field
-    // must never be present — additive-duplicate proliferation cannot happen.
-    assert!(
-        body.get("warning").is_none(),
-        "default wipe_first=true path must not emit the additive-mode warning: {body}"
-    );
+    // The additive-mode warning is emitted exactly when the (default,
+    // additive) run created themes; a run that created nothing has no
+    // duplicates to warn about.
+    if body["themes_created"] == 0 {
+        assert!(
+            body.get("warning").is_none(),
+            "a run that created no theme must not emit the additive-mode warning: {body}"
+        );
+    } else {
+        let warning = body["warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an additive run that created themes must warn: {body}"));
+        assert!(
+            warning.contains("wipe_first=false (the default)"),
+            "the warning must say the run was additive by default: {warning}"
+        );
+    }
 
     // On the skip path the engine returns themes_created=0 and a non-empty
     // skipped_reason. We allow either branch (a CI DB containing leftover
@@ -99,7 +115,7 @@ async fn theme_cluster_caps_oversized_limit() {
         wipe_first: None,
     };
 
-    let result = theme_cluster(&server, params).await.expect("tool ok");
+    let result = theme_cluster(&server, params, None).await.expect("tool ok");
     let body = common::first_text(&result);
     assert!(body.get("themes_created").is_some());
 }

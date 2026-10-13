@@ -212,9 +212,11 @@ graph claims'), follow the best-matching workflow steps."
 That resolution is the bug. `find_workflow` returns `305050d2` — a *pointer* claim whose
 goal is a prose description and whose `steps` array is **empty** — and the runner-up
 `d32ee4e8` has literal steps `["step-a","step-b","step-c"]`. With no real steps to
-follow, the agent falls back to calling the bare `theme_cluster` MCP tool, which
-defaults to `wipe_first=true` on a 500-claim sample with `label_prefix="auto"`. That is
-the nightly wipe, and it is what happened on 2026-08-18.
+follow, the agent falls back to calling the bare `theme_cluster` MCP tool, which then
+defaulted to `wipe_first=true` on a 500-claim sample with `label_prefix="auto"`. That is
+the nightly wipe, and it is what happened on 2026-08-18. (Since backlog 5abe23de the
+tool defaults to `wipe_first=false`, and a wipe needs `claims:admin` and the `"auto"`
+prefix; a bare call is now additive, and still not what the nightly should run.)
 
 **The nightly must NOT run `theme_pipeline.py grow`.** It executes in an epiclaw
 container capped at 1 GB with `EPICLAW_MAX_CONTAINERS=2`; UMAP over 330k embeddings

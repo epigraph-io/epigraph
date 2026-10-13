@@ -72,6 +72,9 @@ pub struct SheafConsistencyQuery {
     pub min_radius: Option<f64>,
     pub limit: Option<i64>,
     pub frame_id: Option<Uuid>,
+    /// Restriction profile: `regulatory`, or `scientific` (the default), as
+    /// for the MCP `check_sheaf_consistency` and `POST /api/v1/sheaf/reconcile`.
+    pub profile: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -117,7 +120,36 @@ pub struct BeliefAtQuery {
 
 // ── Handlers ──
 
+/// A claim's belief interval from its cached scalars: `[bel, pl]` around
+/// BetP, falling back to the point interval at BetP when Bel / Pl are NULL,
+/// with the measured open-world mass when there is one.
+#[cfg(feature = "db")]
+fn sheaf_interval(
+    betp: f64,
+    belief: Option<f64>,
+    plausibility: Option<f64>,
+    open_world: Option<f64>,
+) -> epigraph_engine::EpistemicInterval {
+    let base = epigraph_engine::EpistemicInterval::from_scalar(
+        betp,
+        belief.unwrap_or(betp),
+        plausibility.unwrap_or(betp),
+    );
+    epigraph_engine::EpistemicInterval::new(
+        base.bel,
+        base.pl,
+        open_world.unwrap_or(base.open_world),
+    )
+}
+
 /// GET /api/v1/sheaf/consistency - Check sheaf consistency across claims.
+///
+/// Reads every visible claim's whole in-force neighbourhood (relationships
+/// matched case-insensitively) and scores it with
+/// `epigraph_engine::build_cdst_sections`, as the MCP `check_sheaf_consistency`
+/// does: a directional positive edge constrains only its target, and
+/// `profile` picks the restriction factors. `limit` truncates the OUTPUT
+/// (worst first), never the scan.
 #[cfg(feature = "db")]
 pub async fn sheaf_consistency(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -126,6 +158,10 @@ pub async fn sheaf_consistency(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let min_radius = params.min_radius.unwrap_or(0.1);
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let profile = match params.profile.as_deref() {
+        Some("regulatory") => epigraph_engine::sheaf::RestrictionProfile::regulatory(),
+        _ => epigraph_engine::sheaf::RestrictionProfile::scientific(),
+    };
 
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -143,7 +179,6 @@ pub async fn sheaf_consistency(
         &mut *read,
         &viewer,
         params.frame_id,
-        limit * 10, // fetch more rows since multiple neighbors per claim
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -152,93 +187,53 @@ pub async fn sheaf_consistency(
 
     crate::routes::finish_scoped_read(read, "sheaf_consistency").await?;
 
-    // Group rows by claim_id → (local_interval, neighbors)
-    // neighbor entry: (EpistemicInterval, RestrictionKind)
-    let mut neighbor_map: HashMap<
-        Uuid,
-        (
-            epigraph_engine::EpistemicInterval,
-            Vec<(
-                epigraph_engine::EpistemicInterval,
-                epigraph_engine::RestrictionKind,
-            )>,
-        ),
-    > = HashMap::new();
-
-    for row in &rows {
-        let claim_betp = match row.claim_betp {
-            Some(v) => v,
-            None => continue,
-        };
-        let neighbor_betp = match row.neighbor_betp {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Build the local interval for this claim.
-        let local_iv = epigraph_engine::EpistemicInterval::from_scalar(
-            claim_betp,
-            row.claim_belief.unwrap_or(claim_betp),
-            row.claim_plausibility.unwrap_or(claim_betp),
-        );
-        // Override open_world if the DB has a measured value.
-        let local_iv = epigraph_engine::EpistemicInterval::new(
-            local_iv.bel,
-            local_iv.pl,
-            row.claim_open_world.unwrap_or(local_iv.open_world),
-        );
-
-        // Build the neighbor interval. The consistency query only returns a
-        // scalar neighbor_betp + optional open_world_mass. Use the scalar as
-        // both bel and pl (width=0, i.e. no closed-world ignorance data), then
-        // override open_world from the DB column if present.
-        let neighbor_iv = {
-            let base = epigraph_engine::EpistemicInterval::from_scalar(
-                neighbor_betp,
-                neighbor_betp,
-                neighbor_betp,
-            );
-            epigraph_engine::EpistemicInterval::new(
-                base.bel,
-                base.pl,
-                row.neighbor_open_world.unwrap_or(base.open_world),
-            )
-        };
-
-        let rk = epigraph_engine::restriction_kind(&row.relationship);
-        let entry = neighbor_map
-            .entry(row.claim_id)
-            .or_insert_with(|| (local_iv, Vec::new()));
-        // Always use the first-seen local_iv (consistent per claim_id).
-        entry.1.push((neighbor_iv, rk));
-    }
-
-    // Compute CDST sections.
-    let mut sections: Vec<serde_json::Value> = neighbor_map
-        .into_iter()
-        .map(|(claim_id, (local_interval, neighbors))| {
-            let section =
-                epigraph_engine::compute_cdst_section(claim_id, local_interval, &neighbors);
-            serde_json::json!({
-                "node_id": section.node_id,
-                "local_betp": section.local_betp,
-                "expected_betp": section.expected_betp,
-                "consistency_radius": section.consistency_radius,
-                "neighbor_count": section.neighbor_count,
-                "local_belief": section.local_interval.bel,
-                "local_plausibility": section.local_interval.pl,
-                "open_world_local": section.open_world_local,
-                "open_world_expected": section.open_world_expected,
-                "interval_inconsistency": section.interval_inconsistency,
-                "ignorance_inconsistency": section.ignorance_inconsistency,
+    let neighbor_rows: Vec<epigraph_engine::NeighborRow> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(epigraph_engine::NeighborRow {
+                claim_id: row.claim_id,
+                local: sheaf_interval(
+                    row.claim_betp?,
+                    row.claim_belief,
+                    row.claim_plausibility,
+                    row.claim_open_world,
+                ),
+                neighbor: sheaf_interval(
+                    row.neighbor_betp?,
+                    row.neighbor_belief,
+                    row.neighbor_plausibility,
+                    row.neighbor_open_world,
+                ),
+                relationship: row.relationship.clone(),
+                outgoing: row.direction == "outgoing",
             })
         })
-        .filter(|s| {
-            s["consistency_radius"]
-                .as_f64()
-                .is_some_and(|r| r >= min_radius)
-        })
         .collect();
+
+    let mut sections: Vec<serde_json::Value> =
+        epigraph_engine::build_cdst_sections(&neighbor_rows, &profile)
+            .into_iter()
+            .map(|section| {
+                serde_json::json!({
+                    "node_id": section.node_id,
+                    "local_betp": section.local_betp,
+                    "expected_betp": section.expected_betp,
+                    "consistency_radius": section.consistency_radius,
+                    "neighbor_count": section.neighbor_count,
+                    "local_belief": section.local_interval.bel,
+                    "local_plausibility": section.local_interval.pl,
+                    "open_world_local": section.open_world_local,
+                    "open_world_expected": section.open_world_expected,
+                    "interval_inconsistency": section.interval_inconsistency,
+                    "ignorance_inconsistency": section.ignorance_inconsistency,
+                })
+            })
+            .filter(|s| {
+                s["consistency_radius"]
+                    .as_f64()
+                    .is_some_and(|r| r >= min_radius)
+            })
+            .collect();
 
     // Sort by consistency_radius descending (worst first).
     sections.sort_by(|a, b| {

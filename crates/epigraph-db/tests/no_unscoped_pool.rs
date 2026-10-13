@@ -632,7 +632,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// inside `MatchCandidateRepo::promote_if_pending` instead of on `state.db_pool`
 /// (the file 7 -> 6, keeping sites), read off `the_scanner_is_not_vacuous`'s own
 /// failure on the merged tree (`left: 258, right: 259`).
-const HIGH_WATER: usize = 258;
+/// 258 -> 256 (backlog 5ce88457): `store_workflow` and `ingest_workflow` store
+/// their post-commit claim embeddings on a transaction stamped from the
+/// workflow-ingest system agent's viewer (`embed_inserted_workflow_claims`)
+/// instead of an unstamped `UPDATE` on `state.db_pool` that row security
+/// refused. `routes/workflows.rs` 14 -> 12, keeping sites, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// (`recorded 14, measured 12`).
+const HIGH_WATER: usize = 256;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -995,7 +1002,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // caller's `ViewerExtractor` and authors as its principal, so its
     // `Viewer::resolve(&state.db_pool, ..)` of an OAuth client row id is gone.
     // Read off this test's failure output.
-    ("routes/workflows.rs", 14),
+    //
+    // 14 -> 12 (backlog 5ce88457): the post-commit claim-embedding `UPDATE` in
+    // `store_workflow` and `ingest_workflow` ran on `state.db_pool`, which row
+    // security refused for every system-owned claim while the route still
+    // answered 200. Both now go through `embed_inserted_workflow_claims`, which
+    // stores on a system-agent-stamped transaction. This ratchet had kept the
+    // two sites as allowed count, which is how the refusal stayed hidden. Read
+    // off this test's failure output (`recorded 14, measured 12`).
+    ("routes/workflows.rs", 12),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

@@ -1,30 +1,41 @@
-//! Backfill missing primary claim embeddings (`claims.embedding`, 1536d).
+//! Backfill missing primary claim embeddings (`claims.embedding`, 1536d) and
+//! hierarchical workflow goal embeddings (`workflows.goal_embedding`, 1536d).
 //!
-//! This targets the active recall column. It is distinct from `reembed`, which
-//! fills `embedding_3072` for side-by-side large-model experiments.
+//! The claims leg targets the active recall column. It is distinct from
+//! `reembed`, which fills `embedding_3072` for side-by-side large-model
+//! experiments.
+//!
+//! The workflows leg is the recovery path for the workflow write paths, which
+//! embed the goal best-effort and leave `goal_embedding` NULL on an embedder
+//! failure; see `epigraph_cli::embed_backfill`. Both legs run on every
+//! invocation, each limited to `--limit` rows, and the run exits 2 if either
+//! leg had a failure.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
-use epigraph_db::ClaimRepository;
+use epigraph_cli::embed_backfill::{backfill_workflow_goal_embeddings, WorkflowBackfillSummary};
+use epigraph_db::{ClaimRepository, WorkflowRepository};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider, OpenAiProvider};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "embed_backfill",
-    about = "Backfill missing primary claim embeddings for semantic recall"
+    about = "Backfill missing primary claim embeddings and hierarchical workflow goal embeddings"
 )]
 struct Cli {
     /// PostgreSQL connection URL.
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
-    /// Maximum rows to process this run. Keep this modest on small VMs.
+    /// Maximum rows to process this run, applied to each leg (claims,
+    /// workflows) independently. Keep this modest on small VMs.
     #[arg(long, default_value_t = 500)]
     limit: i64,
 
-    /// Do not write embeddings; only report how many rows would be processed.
+    /// Do not write embeddings; only report how many rows each leg would
+    /// process. Needs no OpenAI key.
     #[arg(long)]
     dry_run: bool,
 
@@ -77,21 +88,68 @@ async fn run(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> anyhow::Result<()> {
-    let rows = ClaimRepository::find_claims_needing_embeddings(pool, viewer, cli.limit)
+    // Select both legs before deciding anything: a dry run, or a run with
+    // nothing to do, must report both legs and must not need a provider.
+    let claims = ClaimRepository::find_claims_needing_embeddings(pool, viewer, cli.limit)
         .await
         .context("find claims needing embeddings")?;
+    // `workflows` has no row security, so this leg needs no viewer.
+    let workflows = WorkflowRepository::find_needing_goal_embedding(pool, cli.limit)
+        .await
+        .context("find workflows needing goal embeddings")?;
 
     if cli.dry_run {
-        println!("embed_backfill: {} claims need embeddings", rows.len());
+        println!("embed_backfill: {} claims need embeddings", claims.len());
+        println!(
+            "embed_backfill: {} workflows need goal embeddings",
+            workflows.len()
+        );
         return Ok(());
     }
 
-    if rows.is_empty() {
-        println!("embed_backfill: 0 claims embedded");
-        return Ok(());
-    }
+    let provider = if claims.is_empty() && workflows.is_empty() {
+        None
+    } else {
+        Some(build_1536d_provider(cli.openai_api_key, cli.allow_mock)?)
+    };
 
-    let provider = build_1536d_provider(cli.openai_api_key, cli.allow_mock)?;
+    let claims_failed = match (&provider, claims.is_empty()) {
+        // An empty claims leg prints exactly the claims-only bin's line, so a
+        // log scraper keyed on it is unaffected by the workflows leg.
+        (_, true) | (None, _) => {
+            println!("embed_backfill: 0 claims embedded");
+            0
+        }
+        (Some(provider), false) => {
+            let (written, failed) = backfill_claims(pool, provider.as_ref(), claims).await;
+            println!("embed_backfill: {written} claims embedded, {failed} failed");
+            failed
+        }
+    };
+
+    let wf = match &provider {
+        Some(provider) if !workflows.is_empty() => {
+            backfill_workflow_goal_embeddings(pool, provider.as_ref(), workflows).await
+        }
+        _ => WorkflowBackfillSummary::default(),
+    };
+    println!(
+        "embed_backfill: {} workflows embedded, {} failed",
+        wf.written, wf.failed
+    );
+
+    if claims_failed > 0 || wf.failed > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// The claims leg: embed and store each row. Returns `(written, failed)`.
+async fn backfill_claims(
+    pool: &sqlx::PgPool,
+    provider: &dyn EmbeddingService,
+    rows: Vec<(uuid::Uuid, String)>,
+) -> (usize, usize) {
     let mut written = 0usize;
     let mut failed = 0usize;
 
@@ -117,12 +175,7 @@ async fn run(
             }
         }
     }
-
-    println!("embed_backfill: {written} claims embedded, {failed} failed");
-    if failed > 0 {
-        std::process::exit(2);
-    }
-    Ok(())
+    (written, failed)
 }
 
 fn build_1536d_provider(

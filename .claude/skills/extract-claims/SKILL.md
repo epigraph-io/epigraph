@@ -253,6 +253,7 @@ empty; you enrich it in place. Verbatim ground-truth example
 | `sections[].paragraphs[].evidence_type` | string \| null | One value from the closed set below; atoms inherit it |
 | `relationships[]` | array | Top-level inter-atom edges, **path-based** (see below) |
 | `source_text` | string \| null | The original source bytes the spans index into. Present ⇒ the writer re-runs the verbatim guard |
+| `labels` | string[] (optional) | Caller labels for this ingest run (e.g. a stage tag). Applied to every claim the ingest writes, next to the writer's own `doi:<key>` label; a claim another agent authored that the ingest converges onto gets the `doi:` label only. An unexpanded shell variable (`$X`) is refused before anything is written |
 
 **Atoms are plain strings, `generality` is a parallel array.** This is the most
 common shape mistake: `atoms` is `["claim one", "claim two"]` (NOT objects), and

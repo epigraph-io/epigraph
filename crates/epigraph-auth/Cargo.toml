@@ -7,6 +7,6 @@ repository.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
-jsonwebtoken = "9"
+jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }

@@ -355,25 +355,8 @@ pub async fn store_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
         let wf_id = result.workflow_id;
-        for (claim_id, content) in &result.inserted {
-            match embedder.generate(content).await {
-                Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
-                }
-            }
-        }
+        embed_inserted_workflow_claims(&state, embedder.as_ref(), "workflows", &result.inserted)
+            .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&request.goal).await {
             Ok(qvec) => {
@@ -1743,6 +1726,7 @@ pub async fn record_behavioral_execution(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1787,25 +1771,13 @@ pub async fn ingest_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
         let wf_id = result.workflow_id;
-        for (claim_id, content) in &result.inserted {
-            match embedder.generate(content).await {
-                Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
-                }
-            }
-        }
+        embed_inserted_workflow_claims(
+            &state,
+            embedder.as_ref(),
+            "workflows/ingest",
+            &result.inserted,
+        )
+        .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
@@ -1976,6 +1948,121 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
         })
 }
 
+/// Embed the claims a workflow ingest just committed. This runs post-commit and
+/// best-effort, on a transaction stamped from the **workflow-ingest system
+/// agent's** viewer: the same authority [`begin_system_ingest_stamped_tx`] wrote
+/// the claims with.
+///
+/// # Why not `state.db_pool`
+///
+/// The claims are authored by the system agent and owned by its personal
+/// group. An `UPDATE claims SET embedding` on the unstamped pool carries no
+/// viewer, so row security on `claims` refuses it. Before this helper existed,
+/// both `store_workflow` and `ingest_workflow` did exactly that and only
+/// WARN-logged the refusal. The route answered 200 and every claim it had
+/// written was left without a vector (backlog 5ce88457), invisible to dense
+/// recall against CLAUDE.md's "Embedding policy". The CALLER's viewer is wrong
+/// too: the `{WRITABLE:c}` splice in `store_embedding_if_unsealed` would render
+/// the caller's groups, and no system-owned row satisfies them.
+///
+/// No caller re-binding is needed. Migration 122's claims trigger fires on
+/// `UPDATE OF agent_id, supersedes, is_current`, not on `embedding`.
+///
+/// # Shape
+///
+/// * Every vector is generated FIRST, with no connection held, so a provider
+///   round trip never holds a transaction open. This is the rule
+///   `epigraph-mcp`'s `claim_helper::embed_claim_author_stamped` states.
+/// * Then ONE stamped transaction stores them all through
+///   [`epigraph_db::ClaimRepository::store_embedding_if_unsealed`]. That call
+///   takes the row lock, re-checks seal and `is_current`, and runs in its own
+///   savepoint, so one refused row does not abort the rest.
+/// * Every failure is logged and swallowed. The claims are already committed,
+///   and the embedding policy forbids a failed embed from unwinding them. A
+///   missing `ScopedPool` or system authority is logged at ERROR on
+///   `tenancy.scoped_write`. There is never a fallback to `state.db_pool`.
+#[cfg(feature = "db")]
+async fn embed_inserted_workflow_claims(
+    state: &AppState,
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
+    route: &'static str,
+    inserted: &[(Uuid, String)],
+) {
+    if inserted.is_empty() {
+        return;
+    }
+
+    let mut vectors: Vec<(Uuid, String)> = Vec::with_capacity(inserted.len());
+    for (claim_id, content) in inserted {
+        match embedder.generate(content).await {
+            Ok(embedding) => vectors.push((*claim_id, format_embedding(&embedding))),
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to generate embedding for ingested workflow claim");
+            }
+        }
+    }
+    if vectors.is_empty() {
+        return;
+    }
+
+    let Some(scoped) = state.scoped.as_ref() else {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            claims = vectors.len(),
+            "workflow claim embeddings not stored: this process was not built from a \
+             ScopedPool, so no connection can be stamped with the ingest system agent's \
+             authority. The claims are stored but carry no vector."
+        );
+        return;
+    };
+    let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                route = route,
+                claims = vectors.len(),
+                error = %e,
+                "workflow claim embeddings not stored: could not establish the \
+                 workflow-ingest-system agent's write authority. The claims are stored but \
+                 carry no vector."
+            );
+            return;
+        }
+    };
+    let mut tx = match scoped.begin_as(&authority.viewer).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(route = route, claims = vectors.len(), error = %e, "workflow claim embeddings not stored: could not begin a system-agent-stamped transaction");
+            return;
+        }
+    };
+
+    let mut stored = 0usize;
+    for (claim_id, pgvec) in &vectors {
+        match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+            &mut tx,
+            &authority.viewer,
+            *claim_id,
+            pgvec,
+        )
+        .await
+        {
+            Ok(true) => stored += 1,
+            Ok(false) => {
+                tracing::warn!(claim_id = %claim_id, route = route, "workflow claim embedding matched no row (claim missing, sealed, superseded, or not writable by the system agent)");
+            }
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to store embedding for ingested workflow claim");
+            }
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(route = route, claims = stored, error = %e, "workflow claim embeddings could not commit; the claims are stored but carry no vector");
+    }
+}
+
 #[cfg(feature = "db")]
 fn format_embedding(embedding: &[f32]) -> String {
     format!(
@@ -2103,7 +2190,9 @@ pub struct DeleteStepRequest {
 /// Map a workflow-ingest executor error. Migration 105's personal-group
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
-/// detail logged and kept out of the body. Everything else stays a 500.
+/// detail logged and kept out of the body. A content-less generation
+/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
+/// else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2115,6 +2204,13 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
             if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
+        }
+        // U032: a content-less generation is the caller's payload error: 400,
+        // not a 500 that invites the retry loop that minted the stubs.
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
         }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
@@ -2575,6 +2671,29 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// U032: a step-less new generation (or an empty plan) is the caller's
+    /// payload error — 400 with the executor's reason, not a 500 that invites
+    /// a retry (the retry loop is what minted the empty generations).
+    #[test]
+    fn an_empty_generation_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("empty workflow generation")
+                    && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
 
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 

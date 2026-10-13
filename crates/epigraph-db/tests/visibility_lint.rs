@@ -817,6 +817,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "lock_content_hash_agent",
+        "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
+         (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
+         no row for a viewer to filter. Both callers (create_or_get_signed and POST /claims' \
+         if_not_exists=false branch) follow it with find_by_content_hash_and_agent, which takes \
+         the caller's viewer.",
+    ),
+    (
+        "claim.rs",
         "update_trace_id_conn",
         "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
          authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
@@ -1453,11 +1462,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "ingest_anchors",
-        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
-         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
-         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
-         for a viewer to filter; the ingest entry points call it on the plan walk's own \
-         transaction to decide which existing rows need the caller's authority.",
+        "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
+         `resolve_ingest_parent` lookups by `canonical_name` (batch H-b review, H3's \
+         lineage-takeover fix). `workflows` has no row security and no policy, as \
+         `find_root_by_canonical` records, so there is nothing for a viewer to filter; the \
+         ingest entry points call it on the plan walk's own transaction to decide which \
+         existing rows need the caller's authority.",
+    ),
+    (
+        "workflow.rs",
+        "resolve_ingest_parent",
+        "READ of `workflows` only (U032): the row an ingest links as `parent_id`, the named \
+         parent at `generation - 1` or the lineage's predecessor. `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
+         own transaction so the row authority-checked is the row linked.",
     ),
     (
         "system_agent.rs",
@@ -2105,6 +2124,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "trace.rs",
         "create",
         "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "trace.rs",
+        "create_with_reasoning_type",
+        "INSERT INTO `reasoning_traces` -- the SAME statement as `trace.rs::create` above, which \
+         is now a one-line delegate to it; the SQL text moved byte-identically. Same argument: a \
+         WRITE governed by migration 077's WITH CHECK against the connection's stamped GUCs, not \
+         an in-query viewer predicate. It differs only in letting the caller choose the \
+         CHECK-validated `reasoning_type` and record `properties.submitted_methodology` \
+         (backlog e207bb6d).",
     ),
     (
         "evidence.rs",

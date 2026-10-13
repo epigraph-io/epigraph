@@ -18,6 +18,25 @@ pub struct EventRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// A position in the event log for `since`-style polling: the keyset
+/// `(created_at, id)` of the last event a consumer has processed.
+///
+/// `since` alone is the legacy, INCLUSIVE cursor (`created_at >= since`).
+/// With `after_id` set the cursor becomes the strict keyset
+/// `(created_at, id) > (since, after_id)`, which is what lets a poller page
+/// through a block of events that share one `created_at` — one transaction
+/// stamps every event it publishes with the same `NOW()`, so such blocks can
+/// be larger than a page. `after_id` without `since` is meaningless, which is
+/// why it lives inside this struct rather than beside it.
+///
+/// Neither form is commit-ordered: see [`EventRepository::publish_or_log_conn`]
+/// ("An event's `created_at` is NOT its visibility order").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventCursor {
+    pub since: DateTime<Utc>,
+    pub after_id: Option<Uuid>,
+}
+
 pub struct EventRepository;
 
 impl EventRepository {
@@ -202,6 +221,19 @@ impl EventRepository {
     /// client-side. The overwhelming majority of rows still pass, so `LIMIT n`
     /// stops after roughly `n` rows.
     ///
+    /// # Cursor: which `limit` rows come back
+    ///
+    /// * `cursor = None` — the NEWEST `limit` rows (`created_at DESC`): a
+    ///   "recent events" view.
+    /// * `cursor = Some(c)` — the OLDEST `limit` rows at or after `c`
+    ///   (`created_at ASC, id ASC`; inclusive `created_at >= since` without
+    ///   `after_id`, the strict keyset `(created_at, id) > (since, after_id)`
+    ///   with it). `epigraph-api`'s `EventFilter::admits` is the in-process
+    ///   mirror of this predicate. A `since` poller needs exactly this page: fetching
+    ///   the newest rows and dropping those before the cursor afterwards (the
+    ///   route's behaviour before drain U045) silently loses the oldest events
+    ///   whenever more than `limit` of them sit after the cursor.
+    ///
     /// # Errors
     ///
     /// Returns the underlying [`sqlx::Error`] if the query fails.
@@ -210,13 +242,23 @@ impl EventRepository {
         viewer: &crate::visibility::Viewer,
         event_type: Option<&str>,
         actor_id: Option<Uuid>,
+        cursor: Option<EventCursor>,
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
+        let order = if cursor.is_some() {
+            "e.created_at ASC, e.id ASC"
+        } else {
+            "e.created_at DESC"
+        };
+        // Token replace, not `format!`: the literal holds regex quantifiers
+        // and the `{VISIBILITY:c}` marker, both of which are brace syntax.
         let sql = viewer.splice(
-            "SELECT e.id, e.event_type, e.actor_id, e.payload, e.graph_version, e.created_at \
+            &"SELECT e.id, e.event_type, e.actor_id, e.payload, e.graph_version, e.created_at \
              FROM events e \
              WHERE ($1::text IS NULL OR e.event_type = $1) \
                AND ($2::uuid IS NULL OR e.actor_id = $2) \
+               AND ($4::timestamptz IS NULL OR e.created_at > $4 \
+                    OR (e.created_at = $4 AND ($5::uuid IS NULL OR e.id > $5))) \
                AND NOT EXISTS ( \
                      SELECT 1 \
                      FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
@@ -231,13 +273,16 @@ impl EventRepository {
                              WHERE true /* {VISIBILITY:c} */ \
                            ) \
                    ) \
-             ORDER BY e.created_at DESC LIMIT $3",
-            4,
+             ORDER BY __EVENT_ORDER__ LIMIT $3"
+                .replace("__EVENT_ORDER__", order),
+            6,
         );
         let mut q = sqlx::query_as::<_, EventRow>(&sql)
             .bind(event_type)
             .bind(actor_id)
-            .bind(limit);
+            .bind(limit)
+            .bind(cursor.map(|c| c.since))
+            .bind(cursor.and_then(|c| c.after_id));
         // Guarded, not `unwrap_or(&[])`: `render_predicate` emits nothing for a
         // `Bypass` viewer, so an unconditional bind would send one more
         // parameter than the rendered statement references.
@@ -366,7 +411,10 @@ impl EventRepository {
     /// commit-ordered cursor is a change to the events API's contract, not to
     /// this helper. A consumer that must not miss events should re-read an
     /// overlap window behind its cursor (the endpoint's `since` is inclusive)
-    /// and dedupe by event id.
+    /// and dedupe by event id. The window is named by `epigraph-api`'s
+    /// `routes::events::EVENTS_SINCE_OVERLAP_SECS`, and that route's
+    /// `list_events` doc states the cursor contract and the trigger for a
+    /// commit-ordered cursor.
     ///
     /// Uses runtime `sqlx::query` (not the compile-time macro) to avoid
     /// adding offline-data churn for callers in transactional contexts.

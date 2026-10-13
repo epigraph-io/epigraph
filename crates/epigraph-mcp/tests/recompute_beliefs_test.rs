@@ -80,7 +80,8 @@ async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
         1.0,  // weight
         true, // supports
         Some("empirical"),
-        None, // evidence_id
+        None,  // evidence_id
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");

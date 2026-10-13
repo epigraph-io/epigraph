@@ -6,6 +6,8 @@
 //! - **ignorance_h1**: closed-world ignorance width mismatch
 //! - **open_world_h1**: open-world mass spread (frame incompleteness)
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,7 +15,10 @@ use crate::epistemic_interval::{
     restrict_epistemic_frame_evidence, restrict_epistemic_negative, restrict_epistemic_positive,
     EpistemicInterval,
 };
-use crate::sheaf::{restriction_kind_from_properties, RestrictionKind, RestrictionProfile};
+use crate::sheaf::{
+    restriction_kind_from_properties, restriction_kind_with_profile, RestrictionKind,
+    RestrictionProfile,
+};
 
 // ── Obstruction taxonomy ──────────────────────────────────────────────────
 
@@ -41,14 +46,21 @@ pub struct CdstSheafSection {
 
     // Scalar backward-compat fields
     pub local_betp: f64,
+    /// BetP of `expected_interval` (all-neighbour average; display only).
     pub expected_betp: f64,
+    /// Node inconsistency: the max of the Positive-group Bel-floor shortfall
+    /// and the Negative/FrameEvidence-group `|local_betp − expected_betp|`.
+    /// Equals `|local_betp − expected_betp|` only for a node with no Positive
+    /// neighbour. See [`compute_cdst_section`].
     pub consistency_radius: f64,
 
     // Interval fields
     pub local_interval: EpistemicInterval,
+    /// All-neighbour average of the restricted neighbour intervals.
     pub expected_interval: EpistemicInterval,
 
-    /// Hausdorff distance between local and expected intervals.
+    /// The max of the Positive-group Bel-floor shortfall and the Hausdorff
+    /// distance to the Negative/FrameEvidence group's expected interval.
     pub interval_inconsistency: f64,
 
     // Open-world decomposition
@@ -228,6 +240,28 @@ pub fn compute_cdst_expected(
 }
 
 /// Build a CDST sheaf section for a single node.
+///
+/// The neighbours are scored in two groups:
+/// - **Positive** (`supports`-like) neighbours are a one-sided Bel FLOOR, the
+///   node twin of the Positive arm of
+///   [`compute_cdst_edge_inconsistency_with_properties`]: each supporter
+///   commits the node to at least `restrict_epistemic_positive(n, f).bel`, so
+///   the binding floor is the MAX over supporters and only the node's bel
+///   sitting below it counts. Over-support (a hub corroborated above a weak
+///   supporter's discounted floor) is benign and scores 0. With this, a
+///   Positive-only node's radius equals its worst incoming supports-edge
+///   shortfall.
+/// - **Other** (Negative / FrameEvidence) neighbours keep the symmetric
+///   metric over their own average: Hausdorff distance for
+///   `interval_inconsistency` and `|local_betp − expected_betp|` for
+///   `consistency_radius`. A node with only such neighbours is scored exactly
+///   as before.
+///
+/// `consistency_radius` and `interval_inconsistency` are each the max of the
+/// two groups' terms (0 for an empty group). `expected_interval` /
+/// `expected_betp` stay the all-neighbour average for display, so the radius
+/// is no longer `|local_betp − expected_betp|` when Positive neighbours are
+/// present.
 pub fn compute_cdst_section(
     node_id: Uuid,
     local_interval: EpistemicInterval,
@@ -236,9 +270,38 @@ pub fn compute_cdst_section(
     let expected = compute_cdst_expected(neighbors);
     let expected_interval = expected.unwrap_or(local_interval);
 
-    let interval_inconsistency = local_interval.hausdorff_distance(&expected_interval);
     let local_betp = local_interval.betp();
     let expected_betp = expected_interval.betp();
+
+    // Positive group: max Bel floor over supporters, one-sided shortfall.
+    let positive_shortfall = neighbors
+        .iter()
+        .filter_map(|(interval, kind)| match kind {
+            RestrictionKind::Positive(factor) => {
+                Some(restrict_epistemic_positive(interval, *factor).bel)
+            }
+            _ => None,
+        })
+        .reduce(f64::max)
+        .map_or(0.0, |floor| (floor - local_interval.bel).max(0.0));
+
+    // Other group (Negative / FrameEvidence): the symmetric metric over the
+    // group's own average. Order-preserving filter, so a node with no
+    // Positive neighbour gets bit-for-bit the pre-split values.
+    let others: Vec<(EpistemicInterval, RestrictionKind)> = neighbors
+        .iter()
+        .filter(|(_, k)| !matches!(k, RestrictionKind::Positive(_)))
+        .copied()
+        .collect();
+    let (other_hausdorff, other_radius) = compute_cdst_expected(&others).map_or((0.0, 0.0), |e| {
+        (
+            local_interval.hausdorff_distance(&e),
+            (local_betp - e.betp()).abs(),
+        )
+    });
+
+    let interval_inconsistency = positive_shortfall.max(other_hausdorff);
+    let consistency_radius = positive_shortfall.max(other_radius);
 
     let neighbor_count = neighbors
         .iter()
@@ -249,7 +312,7 @@ pub fn compute_cdst_section(
         node_id,
         local_betp,
         expected_betp,
-        consistency_radius: (local_betp - expected_betp).abs(),
+        consistency_radius,
         local_interval,
         expected_interval,
         interval_inconsistency,
@@ -258,6 +321,80 @@ pub fn compute_cdst_section(
         ignorance_inconsistency: (local_interval.width() - expected_interval.width()).abs(),
         neighbor_count,
     }
+}
+
+/// One `(claim, neighbour)` row of a node's epistemic neighbourhood, as a
+/// DB consumer reads it (one row per incident edge, from each endpoint's
+/// side).
+#[derive(Debug, Clone)]
+pub struct NeighborRow {
+    /// The claim whose section this row contributes to.
+    pub claim_id: Uuid,
+    /// The claim's own interval (first-seen row per claim wins).
+    pub local: EpistemicInterval,
+    /// The interval at the other end of the edge.
+    pub neighbor: EpistemicInterval,
+    /// The edge relationship (case-insensitive).
+    pub relationship: String,
+    /// `true` when `claim_id` is the edge's SOURCE (the edge points away from
+    /// it), `false` when it is the target.
+    pub outgoing: bool,
+}
+
+/// Directional positive relationships: `src -[rel]-> dst` constrains `dst`
+/// (a floor from its supporter) but says nothing about `src`, so the row read
+/// from the source's side (`outgoing`) is skipped by [`build_cdst_sections`].
+///
+/// `corroborates` is NOT here: it is symmetric (idempotent on the unordered
+/// pair), so both sides keep it. Negative kinds and `frame_validates` keep
+/// both sides too (the Negative metric is unchanged; U080). `informs` and
+/// `supersedes` are left out because the neighbourhood query
+/// (`SheafRepository::get_claim_neighbor_betp_pairs`) never returns them;
+/// adding them is a separate change.
+pub const DIRECTIONAL_POSITIVE_RELATIONSHIPS: &[&str] =
+    &["supports", "elaborates", "specializes", "generalizes"];
+
+fn is_directional_positive(relationship: &str) -> bool {
+    DIRECTIONAL_POSITIVE_RELATIONSHIPS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(relationship))
+}
+
+/// Group neighbourhood rows by claim and build one CDST section per claim, in
+/// first-seen claim order. Restriction kinds come from `profile`.
+///
+/// Direction rule: an `outgoing` row of a [`DIRECTIONAL_POSITIVE_RELATIONSHIPS`]
+/// edge is skipped (a supporter is not constrained by its target), but the
+/// claim still gets a section, with `neighbor_count` 0 if nothing else
+/// reaches it.
+pub fn build_cdst_sections(
+    rows: &[NeighborRow],
+    profile: &RestrictionProfile,
+) -> Vec<CdstSheafSection> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut groups: HashMap<Uuid, (EpistemicInterval, Vec<(EpistemicInterval, RestrictionKind)>)> =
+        HashMap::new();
+    for row in rows {
+        let entry = groups.entry(row.claim_id).or_insert_with(|| {
+            order.push(row.claim_id);
+            (row.local, Vec::new())
+        });
+        if row.outgoing && is_directional_positive(&row.relationship) {
+            continue;
+        }
+        entry.1.push((
+            row.neighbor,
+            restriction_kind_with_profile(&row.relationship, profile),
+        ));
+    }
+    order
+        .into_iter()
+        .filter_map(|id| {
+            groups
+                .remove(&id)
+                .map(|(local, neighbors)| compute_cdst_section(id, local, &neighbors))
+        })
+        .collect()
 }
 
 /// Compute the interval inconsistency for a single directed edge and classify it.
@@ -533,6 +670,486 @@ mod tests {
             section.expected_interval.open_world
         );
         assert!(section.open_world_expected > 0.0);
+    }
+
+    #[test]
+    fn test_cdst_section_over_supported_hub_has_zero_radius() {
+        // I043: a hub at [0.98, 1.0] with one supporter at BetP 0.5 is
+        // corroborated ABOVE its supporter's discounted floor. A supports edge
+        // is a one-sided Bel floor (bel_n * f = 0.40), so over-support is
+        // benign, exactly as the edge path's Positive arm scores it.
+        // The old symmetric metric gave radius |0.99 - 0.50| = 0.49 and
+        // Hausdorff max(|0.98 - 0.40|, |1.0 - 0.60|) = 0.58.
+        let hub = EpistemicInterval::new(0.98, 1.0, 0.0);
+        let supporter = EpistemicInterval::new(0.5, 0.5, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            hub,
+            &[(supporter, RestrictionKind::Positive(0.8))],
+        );
+        assert!(
+            s.consistency_radius < 1e-9,
+            "over-supported hub must have radius 0, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "over-supported hub must have interval_inconsistency 0, got {}",
+            s.interval_inconsistency
+        );
+        assert_eq!(s.neighbor_count, 1);
+    }
+
+    #[test]
+    fn test_cdst_section_under_supported_node_still_flags() {
+        // Local [0.10, 0.90] under a supporter at [0.90, 0.90], f = 0.8:
+        // Bel floor = 0.72, local bel 0.10 -> shortfall 0.62.
+        // (A BetP floor would give 0.72 - 0.50 = 0.22; the old symmetric
+        // metric gave |0.50 - 0.82| = 0.32. 0.62 pins the Bel floor that
+        // U029 settled on for the edge.)
+        let local = EpistemicInterval::new(0.10, 0.90, 0.0);
+        let supporter = EpistemicInterval::new(0.90, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[(supporter, RestrictionKind::Positive(0.8))],
+        );
+        assert!(
+            (s.consistency_radius - 0.62).abs() < 1e-9,
+            "under-support shortfall should be 0.62, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.62).abs() < 1e-9,
+            "interval_inconsistency should equal the Bel shortfall 0.62, got {}",
+            s.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_floor_is_max_over_supporters() {
+        // Local [0.50, 0.60]; supporters [0.9, 0.9] (floor 0.72) and
+        // [0.1, 0.1] (floor 0.08), both f = 0.8. Each supporter independently
+        // commits the node to at least its floor, so the binding floor is the
+        // MAX (0.72): radius 0.22. A mean floor (0.40) would hide it (0), and
+        // the old symmetric metric gave |0.55 - 0.50| = 0.05.
+        let local = EpistemicInterval::new(0.50, 0.60, 0.0);
+        let strong = EpistemicInterval::new(0.9, 0.9, 0.0);
+        let weak = EpistemicInterval::new(0.1, 0.1, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (strong, RestrictionKind::Positive(0.8)),
+                (weak, RestrictionKind::Positive(0.8)),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.22).abs() < 1e-9,
+            "binding floor is the max over supporters: expected 0.22, got {}",
+            s.consistency_radius
+        );
+        assert_eq!(s.neighbor_count, 2);
+    }
+
+    #[test]
+    fn test_cdst_section_positive_radius_equals_worst_supports_edge() {
+        // Node and edge must agree: for a Positive-only node the node radius is
+        // its worst incoming supports-edge shortfall, as scored by the
+        // independent edge path (compute_cdst_edge_inconsistency).
+        let node = EpistemicInterval::new(0.30, 0.70, 0.0);
+        let supporters = [
+            EpistemicInterval::new(0.60, 0.80, 0.0),
+            EpistemicInterval::new(0.85, 0.95, 0.0),
+            EpistemicInterval::new(0.20, 0.40, 0.0),
+        ];
+        let node_id = Uuid::new_v4();
+        let neighbors: Vec<_> = supporters
+            .iter()
+            .map(|s| (*s, RestrictionKind::Positive(sci().supports)))
+            .collect();
+        let section = compute_cdst_section(node_id, node, &neighbors);
+        let worst_edge = supporters
+            .iter()
+            .map(|s| {
+                compute_cdst_edge_inconsistency(
+                    Uuid::new_v4(),
+                    node_id,
+                    *s,
+                    node,
+                    "supports",
+                    &sci(),
+                )
+                .interval_inconsistency
+            })
+            .fold(0.0f64, f64::max);
+        // 0.85 * 0.8 - 0.30 = 0.38
+        assert!(
+            (worst_edge - 0.38).abs() < 1e-9,
+            "edge path gave {worst_edge}"
+        );
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst supports-edge shortfall {}",
+            section.consistency_radius,
+            worst_edge
+        );
+        assert!((section.interval_inconsistency - worst_edge).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cdst_section_negative_only_unchanged() {
+        // U080 / I143 guard: Negative-only nodes keep the symmetric metric
+        // bit-for-bit. Local [0.80, 0.95], contradicter [0.80, 0.95], f = 0.9:
+        // restricted = [(1-0.95)*0.9, 1-0.8*0.9] = [0.045, 0.28], BetP 0.1625;
+        // local BetP 0.875 -> radius 0.7125;
+        // Hausdorff = max(|0.80-0.045|, |0.95-0.28|) = 0.755.
+        let local = EpistemicInterval::new(0.80, 0.95, 0.0);
+        let neighbors = vec![(
+            EpistemicInterval::new(0.80, 0.95, 0.0),
+            RestrictionKind::Negative(0.9),
+        )];
+        let s = compute_cdst_section(Uuid::new_v4(), local, &neighbors);
+        let expected = compute_cdst_expected(&neighbors).unwrap();
+        assert_eq!(
+            s.consistency_radius.to_bits(),
+            (local.betp() - expected.betp()).abs().to_bits(),
+            "Negative-only radius must stay |local_betp - expected_betp|"
+        );
+        assert_eq!(
+            s.interval_inconsistency.to_bits(),
+            local.hausdorff_distance(&expected).to_bits(),
+            "Negative-only interval_inconsistency must stay the Hausdorff distance"
+        );
+        assert!((s.consistency_radius - 0.7125).abs() < 1e-9);
+        assert!((s.interval_inconsistency - 0.755).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cdst_section_mixed_takes_max_of_floor_and_negative_distance() {
+        // Local [0.50, 0.60]; supporter [0.9, 0.9] Positive(0.8) -> shortfall
+        // 0.22; contradicter [0.1, 0.1] Negative(0.9) -> restricted
+        // [0.81, 0.91], BetP 0.86, symmetric distance |0.55 - 0.86| = 0.31,
+        // Hausdorff max(0.31, 0.31) = 0.31. The supporter does NOT enter the
+        // Negative group's average, so radius = max(0.22, 0.31) = 0.31.
+        // (The old all-neighbour average gave |0.55 - 0.84| = 0.29.)
+        let local = EpistemicInterval::new(0.50, 0.60, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.9, 0.9, 0.0),
+                    RestrictionKind::Positive(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.1, 0.1, 0.0),
+                    RestrictionKind::Negative(0.9),
+                ),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.31).abs() < 1e-9,
+            "mixed node radius should be max(0.22, 0.31) = 0.31, got {}",
+            s.consistency_radius
+        );
+        assert!((s.interval_inconsistency - 0.31).abs() < 1e-9);
+        // expected_betp stays the all-neighbour average for display.
+        assert!((s.expected_betp - 0.84).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cdst_section_mixed_floor_shortfall_dominates_negative_distance() {
+        // The other direction of the mixed-node max: an under-supported node
+        // must not hide its floor shortfall behind a small Negative distance.
+        // Local [0.10, 0.20], BetP 0.15.
+        // Supporter [0.9, 0.9] Positive(0.8): floor 0.72 -> shortfall 0.62.
+        // Contradicter [0.9, 0.9] Negative(0.9): restricted
+        // [(1-0.9)*0.9, 1-0.9*0.9] = [0.09, 0.19], BetP 0.14 -> distance
+        // 0.01, Hausdorff max(0.01, 0.01) = 0.01.
+        // max(0.62, 0.01) = 0.62. (The old all-neighbour average
+        // [0.405, 0.555], BetP 0.48, gave |0.15 - 0.48| = 0.33.)
+        let local = EpistemicInterval::new(0.10, 0.20, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.9, 0.9, 0.0),
+                    RestrictionKind::Positive(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.9, 0.9, 0.0),
+                    RestrictionKind::Negative(0.9),
+                ),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.62).abs() < 1e-9,
+            "mixed node radius should be max(0.62, 0.01) = 0.62, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.62).abs() < 1e-9,
+            "mixed node interval_inconsistency should be max(0.62, 0.01) = 0.62, got {}",
+            s.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_frame_evidence_only_unchanged() {
+        // FrameEvidence neighbours (frame_validates) keep the symmetric metric
+        // bit-for-bit, like Negative ones. FE passes bel/pl through:
+        // neighbour [0.20, 0.40] -> restricted [0.20, 0.40], BetP 0.30;
+        // local [0.80, 0.90], BetP 0.85 -> radius 0.55;
+        // Hausdorff max(|0.80-0.20|, |0.90-0.40|) = 0.60.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let neighbors = vec![(
+            EpistemicInterval::new(0.20, 0.40, 0.0),
+            RestrictionKind::FrameEvidence(0.8),
+        )];
+        let s = compute_cdst_section(Uuid::new_v4(), local, &neighbors);
+        let expected = compute_cdst_expected(&neighbors).unwrap();
+        assert_eq!(
+            s.consistency_radius.to_bits(),
+            (local.betp() - expected.betp()).abs().to_bits(),
+            "FrameEvidence-only radius must stay |local_betp - expected_betp|"
+        );
+        assert_eq!(
+            s.interval_inconsistency.to_bits(),
+            local.hausdorff_distance(&expected).to_bits(),
+            "FrameEvidence-only interval_inconsistency must stay the Hausdorff distance"
+        );
+        assert!(
+            (s.consistency_radius - 0.55).abs() < 1e-9,
+            "got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.60).abs() < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_mixed_positive_and_frame_evidence() {
+        // FrameEvidence neighbours belong to the symmetric group, not the
+        // floor group, and are NOT dropped from it.
+        // Local [0.80, 0.90]; supporter [0.5, 0.5] Positive(0.8): floor 0.40,
+        // shortfall 0. FE neighbour [0.20, 0.40]: symmetric distance
+        // |0.85 - 0.30| = 0.55, Hausdorff 0.60. max(0, 0.55) = 0.55.
+        // (The old all-neighbour average [0.30, 0.50], BetP 0.40, gave
+        // |0.85 - 0.40| = 0.45; dropping FE from the group would give 0.)
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.5, 0.5, 0.0),
+                    RestrictionKind::Positive(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.20, 0.40, 0.0),
+                    RestrictionKind::FrameEvidence(0.8),
+                ),
+            ],
+        );
+        assert!(
+            (s.consistency_radius - 0.55).abs() < 1e-9,
+            "FE neighbour must set the symmetric term 0.55, got {}",
+            s.consistency_radius
+        );
+        assert!(
+            (s.interval_inconsistency - 0.60).abs() < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+        assert_eq!(s.neighbor_count, 2);
+    }
+
+    // ── build_cdst_sections tests ────────────────────────────────────────
+
+    fn weak() -> EpistemicInterval {
+        EpistemicInterval::new(0.1, 0.2, 0.0)
+    }
+    fn strong() -> EpistemicInterval {
+        EpistemicInterval::new(0.95, 1.0, 0.0)
+    }
+
+    /// Both endpoint rows of one edge `src -[rel]-> dst`, as the
+    /// neighbourhood query returns them.
+    fn edge_rows(
+        src: (Uuid, EpistemicInterval),
+        dst: (Uuid, EpistemicInterval),
+        rel: &str,
+    ) -> [NeighborRow; 2] {
+        [
+            NeighborRow {
+                claim_id: src.0,
+                local: src.1,
+                neighbor: dst.1,
+                relationship: rel.to_string(),
+                outgoing: true,
+            },
+            NeighborRow {
+                claim_id: dst.0,
+                local: dst.1,
+                neighbor: src.1,
+                relationship: rel.to_string(),
+                outgoing: false,
+            },
+        ]
+    }
+
+    fn section_of(sections: &[CdstSheafSection], id: Uuid) -> &CdstSheafSection {
+        sections
+            .iter()
+            .find(|s| s.node_id == id)
+            .unwrap_or_else(|| panic!("no section for {id}"))
+    }
+
+    #[test]
+    fn test_build_sections_skips_outgoing_supports() {
+        // A supporter is not constrained by its target: the SOURCE side of a
+        // directional positive edge contributes no neighbour.
+        // a (weak) supports b (strong): read from a's side, b would impose a
+        // floor 0.95 * 0.8 = 0.76 on a -> a spurious 0.66 (04b7055e's case).
+        // c (strong) supports d (weak): d is genuinely under-supported, 0.66.
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut rows = Vec::new();
+        rows.extend(edge_rows((a, weak()), (b, strong()), "supports"));
+        rows.extend(edge_rows((c, strong()), (d, weak()), "supports"));
+        let sections = build_cdst_sections(&rows, &sci());
+        assert_eq!(sections.len(), 4, "every claim with a row gets a section");
+
+        let sa = section_of(&sections, a);
+        assert_eq!(sa.neighbor_count, 0, "a supports-edge source has no floor");
+        assert!(
+            sa.consistency_radius < 1e-9,
+            "weak supporter must not be penalised by its strong target, got {}",
+            sa.consistency_radius
+        );
+        let sc = section_of(&sections, c);
+        assert_eq!(sc.neighbor_count, 0);
+        assert!(sc.consistency_radius < 1e-9);
+
+        let sb = section_of(&sections, b);
+        assert_eq!(sb.neighbor_count, 1);
+        assert!(
+            sb.consistency_radius < 1e-9,
+            "over-supported target is benign"
+        );
+        let sd = section_of(&sections, d);
+        assert_eq!(sd.neighbor_count, 1);
+        assert!(
+            (sd.consistency_radius - 0.66).abs() < 1e-9,
+            "under-supported target must still flag 0.66, got {}",
+            sd.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_build_sections_skips_every_directional_positive_kind_case_insensitively() {
+        for rel in ["elaborates", "specializes", "generalizes", "Supports"] {
+            let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+            let rows = edge_rows((a, weak()), (b, strong()), rel);
+            let sections = build_cdst_sections(&rows, &sci());
+            let sa = section_of(&sections, a);
+            assert_eq!(sa.neighbor_count, 0, "{rel}: source must be skipped");
+            assert!(
+                sa.consistency_radius < 1e-9,
+                "{rel}: got {}",
+                sa.consistency_radius
+            );
+            assert_eq!(section_of(&sections, b).neighbor_count, 1, "{rel}");
+        }
+    }
+
+    #[test]
+    fn test_build_sections_keeps_both_sides_of_symmetric_kinds() {
+        // corroborates is symmetric (unordered pair): the weak side IS
+        // constrained by the strong side, 0.95 * 0.8 - 0.1 = 0.66.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows((a, weak()), (b, strong()), "corroborates"),
+            &sci(),
+        );
+        let sa = section_of(&sections, a);
+        assert_eq!(sa.neighbor_count, 1);
+        assert!(
+            (sa.consistency_radius - 0.66).abs() < 1e-9,
+            "got {}",
+            sa.consistency_radius
+        );
+        assert_eq!(section_of(&sections, b).neighbor_count, 1);
+
+        // Negative kinds are kept on the source side too (unchanged, U080).
+        // [0.80, 0.95] vs [0.80, 0.95], local BetP 0.875:
+        // - contradicts f = 0.9: restricted [0.045, 0.28], BetP 0.1625 -> 0.7125.
+        // - refutes f = 0.8 (Q2: treated symmetric): restricted
+        //   [(1-0.95)*0.8, 1-0.80*0.8] = [0.04, 0.36], BetP 0.20 -> 0.675.
+        let iv = EpistemicInterval::new(0.80, 0.95, 0.0);
+        for (rel, want) in [("contradicts", 0.7125), ("refutes", 0.675)] {
+            let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+            let sections = build_cdst_sections(&edge_rows((e, iv), (f, iv), rel), &sci());
+            for id in [e, f] {
+                let s = section_of(&sections, id);
+                assert_eq!(s.neighbor_count, 1, "{rel}: both sides must be kept");
+                assert!(
+                    (s.consistency_radius - want).abs() < 1e-9,
+                    "{rel}: expected {want}, got {}",
+                    s.consistency_radius
+                );
+            }
+        }
+
+        // frame_validates keeps both sides: FE passes bel/pl through, so
+        // [0.80, 0.90] (BetP 0.85) and [0.20, 0.40] (BetP 0.30) each score
+        // |0.85 - 0.30| = 0.55 against the other.
+        let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows(
+                (e, EpistemicInterval::new(0.80, 0.90, 0.0)),
+                (f, EpistemicInterval::new(0.20, 0.40, 0.0)),
+                "frame_validates",
+            ),
+            &sci(),
+        );
+        for id in [e, f] {
+            let s = section_of(&sections, id);
+            assert_eq!(
+                s.neighbor_count, 1,
+                "frame_validates: both sides must be kept"
+            );
+            assert!(
+                (s.consistency_radius - 0.55).abs() < 1e-9,
+                "frame_validates: expected 0.55, got {}",
+                s.consistency_radius
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_sections_uses_the_given_profile() {
+        // Regulatory supports factor 0.95: floor 0.95 * 0.95 = 0.9025 on d.
+        let (c, d) = (Uuid::new_v4(), Uuid::new_v4());
+        let sections = build_cdst_sections(
+            &edge_rows((c, strong()), (d, weak()), "supports"),
+            &RestrictionProfile::regulatory(),
+        );
+        let sd = section_of(&sections, d);
+        assert!(
+            (sd.consistency_radius - 0.8025).abs() < 1e-9,
+            "regulatory floor shortfall should be 0.8025, got {}",
+            sd.consistency_radius
+        );
     }
 
     // ── compute_cdst_cohomology tests ────────────────────────────────────

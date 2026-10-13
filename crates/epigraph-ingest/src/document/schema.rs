@@ -29,6 +29,15 @@ pub struct DocumentExtraction {
     /// re-runs the verbatim guard. Tier 2 (HTML/CNXML) omits it.
     #[serde(default)]
     pub source_text: Option<String>,
+    /// Caller labels for this ingest run (a stage tag, a batch date, ...). The
+    /// hierarchical writer applies them to EVERY claim the ingest call creates
+    /// or resolves to — thesis, section, paragraph and atom — in addition to
+    /// its own mandatory `doi:<doi>` label. They describe the extraction run,
+    /// not the document, which is why they live here and not on
+    /// [`DocumentSource`]. Omitted from serialized output when empty, so
+    /// `structure_source` output is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 /// Metadata about the source document.

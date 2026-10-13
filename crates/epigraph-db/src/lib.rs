@@ -96,8 +96,8 @@ pub use repos::{
     ContextRepository, CorpusCounts, CorpusStatsRepository, CounterfactualRepository,
     CounterfactualRow, DecideOutcome, DedupRepair, DerivationEvidence, DivergenceRepository,
     EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
-    EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
+    EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventCursor, EventRepository,
+    EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
     EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow, EvidenceRepository,
     EvidenceSearchResult, EvolveStepResult, ExperimentRepository, ExperimentResultRepository,
     ExperimentResultRow, ExperimentRow, FactorRepository, FrameClaimBeliefHit, FrameRepository,
@@ -158,7 +158,10 @@ pub use repos::graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
-pub use repos::mass_function::{delete_edge_bbas, CachedBelief, EdgeBbaCascade, MassFunctionRow};
+pub use repos::mass_function::{
+    cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,
+    MassFunctionRow, CACHED_COMBINATION_UNFOLDED,
+};
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
 // `ownership` table on this line. The export came in from main, which still
 // carries the module, and is dropped rather than resurrected.
