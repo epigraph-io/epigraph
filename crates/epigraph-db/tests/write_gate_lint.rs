@@ -858,6 +858,49 @@ fn splice_write_counts_only_in_code_not_in_comments() {
     );
 }
 
+/// `.splice_write(` is a METHOD CALL: named inside a string literal (a log
+/// line, an error message) it gates nothing, so it must not count toward either
+/// clearing rule.
+#[test]
+fn splice_write_named_only_inside_a_string_is_not_a_gate() {
+    // 1. UNGATED, with the method named only in a log string.
+    let logged = r#"
+        pub async fn touch(pool: &PgPool, v: &Viewer, id: Uuid) -> Result<(), DbError> {
+            tracing::debug!("not yet routed through v.splice_write( here");
+            sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
+                .bind(id).execute(pool).await?;
+            Ok(())
+        }
+    "#;
+    let (ordinary, macros) = ungated_writes_in("synthetic.rs", logged);
+    assert_eq!(
+        ordinary,
+        vec!["synthetic.rs::touch".to_string()],
+        "a scoped write whose only `.splice_write(` is inside a string literal \
+         is ungated and must stay in the register (macros: {macros:?})"
+    );
+
+    // 2. HALF-CONVERTED, plus an error string naming the call: one real
+    //    splice, two scoped writes — must still be reported as partial.
+    let half = r#"
+        pub async fn seal(pool: &PgPool, v: &Viewer, id: Uuid) -> Result<(), DbError> {
+            let sql = v.splice_write("UPDATE claims AS c SET sealed = true WHERE c.id = $1 /* {WRITABLE:c} */", 2);
+            sqlx::query(&sql).bind(id).bind(v.writable_bind().unwrap()).execute(pool).await?;
+            tracing::warn!("versions row still bypasses v.splice_write(");
+            sqlx::query("UPDATE public.claim_versions SET sealed = true WHERE claim_id = $1")
+                .bind(id).execute(pool).await?;
+            Ok(())
+        }
+    "#;
+    let hits = partial_conversions_in("synthetic.rs", half);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a function splicing 1 of its 2 scoped writes must be reported even when \
+         a string also names `.splice_write(`: {hits:?}"
+    );
+}
+
 fn expected(list: &[(&str, &str)]) -> BTreeMap<String, String> {
     list.iter()
         .map(|(k, _)| ((*k).to_string(), String::new()))
