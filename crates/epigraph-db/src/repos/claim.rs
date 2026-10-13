@@ -5270,6 +5270,19 @@ impl ClaimRepository {
     /// positive signal rather than the manufacture of a negative one, and
     /// changing them is not this function's decision to make.
     ///
+    /// ## Step lineages (backlog 8d3b4527)
+    ///
+    /// `evolve_step(supersedes)` is a supersession too: it records
+    /// `supersedes = parent`, and the request paths run the same administrative
+    /// cascade. When the old and new claims share a non-null `step_lineage_id`,
+    /// the migration also leaves `executes` (the workflow's FROZEN step; the
+    /// head is resolved through the lineage) and agents' `asserts` / `AUTHORED`
+    /// (the successor is written by the evolve_step caller, not by the agents
+    /// that asserted the old content) on the retired step. A supersession made
+    /// here writes no `step_lineage_id`, so it moves both as before. The rule
+    /// is read from the rows, because the deferred replay knows nothing of
+    /// the original caller.
+    ///
     /// ## Self-loop guards — deliberately unreachable
     ///
     /// Both statements also carry [`ClaimRepository::mark_duplicate`]'s
