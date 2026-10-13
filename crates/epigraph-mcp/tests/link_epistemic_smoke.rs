@@ -701,11 +701,6 @@ async fn qualifies_edge_is_created_but_does_not_move_belief(pool: PgPool) {
         "qualifies is directional: the caveat points at the claim it bounds"
     );
     assert_eq!(edge_count(&pool, caveat, hub, "qualifies").await, 1);
-    assert_eq!(
-        edge_count(&pool, hub, caveat, "qualifies").await,
-        0,
-        "no reverse row: qualifies is not symmetric"
-    );
 
     let after = read_betp(&pool, hub).await.expect("hub keeps its belief");
     assert!(
@@ -726,6 +721,36 @@ async fn qualifies_edge_is_created_but_does_not_move_belief(pool: PgPool) {
         bbas, 0,
         "no mass function may be materialized for a qualifies edge"
     );
+
+    // Directionality, by behaviour: `hub qualifies caveat` is a DIFFERENT fact
+    // from `caveat qualifies hub`, so it must be a new row. A symmetric
+    // relation (`contradicts`, `corroborates`) dedups the unordered pair and
+    // would return the forward edge with was_created=false here.
+    let reverse = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: hub.to_string(),
+            target_claim_id: caveat.to_string(),
+            relationship: "qualifies".to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("the reverse qualifies call succeeds");
+    let reverse = parse_response(&reverse);
+    assert!(
+        reverse.was_created,
+        "'hub qualifies caveat' is not 'caveat qualifies hub': it must create its own edge, \
+         not dedup onto the forward one"
+    );
+    assert_ne!(
+        reverse.edge_id, resp.edge_id,
+        "the reverse qualifies must be a distinct edge"
+    );
+    assert_eq!(edge_count(&pool, caveat, hub, "qualifies").await, 1);
+    assert_eq!(edge_count(&pool, hub, caveat, "qualifies").await, 1);
 }
 
 // ── validation: supersedes is excluded (belongs to supersede_claim) ─────────

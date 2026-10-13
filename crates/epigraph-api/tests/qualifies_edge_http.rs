@@ -221,4 +221,30 @@ async fn qualifies_edge_is_accepted_and_moves_no_belief(pool: PgPool) {
         0,
         "no legacy BP factor may be created for a qualifies edge"
     );
+
+    // Directionality, by behaviour: `hub qualifies caveat` is a different fact
+    // from `caveat qualifies hub`. A symmetric claim relation dedups the
+    // unordered pair whatever `if_not_exists` says and answers 200 with the
+    // forward row; `qualifies` must create its own edge.
+    let (reverse_status, reverse) =
+        post(&pool, &state, agent, claim_edge(hub, caveat, "qualifies")).await;
+    assert_eq!(
+        reverse_status,
+        StatusCode::CREATED,
+        "'hub qualifies caveat' must create its own edge, not dedup onto the forward one"
+    );
+    assert_ne!(
+        reverse.edge.id, created.edge.id,
+        "the reverse qualifies must be a distinct edge"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE relationship = 'qualifies' \
+         AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
+    )
+    .bind(caveat)
+    .bind(hub)
+    .fetch_one(&pool)
+    .await
+    .expect("count qualifies rows over the pair");
+    assert_eq!(rows, 2, "one qualifies row in each direction");
 }
