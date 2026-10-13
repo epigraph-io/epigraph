@@ -15,6 +15,69 @@ pub struct AuthorEntry {
     pub roles: Vec<String>,
 }
 
+/// Normalised author names that an extractor emits when it could NOT identify
+/// an author ("Authors Not Specified", "Unknown", ...). Each one, taken as a
+/// name, derives the same deterministic author agent on every paper, so that
+/// one fake agent `authored` and `asserts` everything it touches (backlog
+/// a55aac45: arXiv:2606.16707 gained an "Authors Not Specified" agent asserting
+/// all 269 of its claims). Matched EXACTLY after [`normalize_author_name`],
+/// never as a substring, so real names such as "Noneman" survive.
+const PLACEHOLDER_AUTHOR_NAMES: &[&str] = &[
+    "authors not specified",
+    "author not specified",
+    "not specified",
+    "unspecified",
+    "unknown",
+    "unknown author",
+    "unknown authors",
+    "anonymous",
+    "anon",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "nil",
+    "-",
+    "tbd",
+    "various",
+    "various authors",
+    "author",
+    "authors",
+    "et al",
+];
+
+/// Trim, strip surrounding brackets/quotes and a trailing `.`, collapse
+/// internal whitespace, and ASCII-lowercase.
+fn normalize_author_name(name: &str) -> String {
+    let stripped = name
+        .trim()
+        .trim_matches(|c: char| "[]()<>\"'".contains(c) || c.is_whitespace())
+        .trim_end_matches('.')
+        .trim();
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// True when `name` is empty or a known placeholder for "no author identified".
+#[must_use]
+pub fn is_placeholder_author_name(name: &str) -> bool {
+    let normalized = normalize_author_name(name);
+    normalized.is_empty() || PLACEHOLDER_AUTHOR_NAMES.contains(&normalized.as_str())
+}
+
+impl AuthorEntry {
+    /// True when this entry names no real author (empty or a placeholder such
+    /// as "Authors Not Specified"). Ingest skips such entries instead of
+    /// minting a shared fake author agent.
+    #[must_use]
+    pub fn is_placeholder(&self) -> bool {
+        is_placeholder_author_name(&self.name)
+    }
+}
+
 /// A relationship between two claims identified by path. Workflow steps can
 /// support / contradict / refute each other across phases just like document
 /// atoms can across paragraphs.
@@ -37,4 +100,69 @@ pub enum ThesisDerivation {
     #[default]
     TopDown,
     BottomUp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_author_names_are_rejected_in_any_case_or_padding() {
+        for name in [
+            "Authors Not Specified",
+            "AUTHORS NOT SPECIFIED",
+            "  authors   not\tspecified  ",
+            "[Authors Not Specified]",
+            "\"Unknown\"",
+            "(unknown)",
+            "<Unknown Author>",
+            "Anonymous.",
+            "N/A",
+            "n/a",
+            "None",
+            "null",
+            "-",
+            "TBD",
+            "Various Authors",
+            "et al.",
+            "Authors",
+            "",
+            "   ",
+        ] {
+            assert!(
+                is_placeholder_author_name(name),
+                "{name:?} must be treated as a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn real_author_names_survive_exact_match_only() {
+        for name in [
+            "Alice Smith",
+            "Smith, J.",
+            "test",
+            "Noneman",
+            "Unknownson",
+            "Anon Kumar",
+            "Nadia Al-Na",
+            "Ann Author",
+        ] {
+            assert!(
+                !is_placeholder_author_name(name),
+                "{name:?} is a real name and must not be dropped"
+            );
+        }
+        let entry = AuthorEntry {
+            name: "Unknown".to_string(),
+            affiliations: vec![],
+            roles: vec![],
+        };
+        assert!(entry.is_placeholder());
+        let real = AuthorEntry {
+            name: "Alice Smith".to_string(),
+            ..entry
+        };
+        assert!(!real.is_placeholder());
+    }
 }

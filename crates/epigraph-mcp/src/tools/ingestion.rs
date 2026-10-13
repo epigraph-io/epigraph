@@ -906,11 +906,26 @@ pub async fn do_ingest_document(
         epigraph_ingest::document::schema::SourceType::Paper
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
-    let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+    // "No real author" covers an empty list AND a list of only placeholder
+    // names ("Authors Not Specified", "Unknown", ...): either way the byline
+    // backstop gets its chance (backlog a55aac45, arXiv:2606.16707).
+    //
+    // Index alignment with the planner's `author_placeholder` edges (keyed by
+    // `author_index` into `author_agent_map`):
+    // - structured list in use: the planner and the loop below skip the SAME
+    //   original indices (`AuthorEntry::is_placeholder`), so every planned
+    //   `asserts` edge maps to a real author's agent;
+    // - byline fallback in use: every structured entry was a placeholder, so the
+    //   planner emitted NO `author_placeholder` edges; the fallback's indices are
+    //   never looked up for `asserts`, and byline authors get `authored → paper`
+    //   only — the same as the empty-list fallback.
+    let has_real_author = extraction
         .source
         .authors
-        .is_empty()
+        .iter()
+        .any(|a| !a.is_placeholder());
+    let parsed_fallback;
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if !has_real_author
         && byline_eligible
     {
         parsed_fallback = extraction
@@ -921,13 +936,13 @@ pub async fn do_ingest_document(
         if parsed_fallback.is_empty() {
             tracing::warn!(
                 paper = %paper_title,
-                "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
+                "ingest_document: source.authors empty or placeholder-only and no byline recovered from body; paper will have no author agents"
             );
         } else {
             tracing::info!(
                 paper = %paper_title,
                 count = parsed_fallback.len(),
-                "ingest_document: source.authors empty; recovered authors from body byline fallback"
+                "ingest_document: source.authors empty or placeholder-only; recovered authors from body byline fallback"
             );
         }
         &parsed_fallback
@@ -947,7 +962,17 @@ pub async fn do_ingest_document(
             .map_err(internal_error)?
     };
     for (idx, author) in authors.iter().enumerate() {
-        if author.name.is_empty() {
+        // Empty or placeholder name: no agent, no `authored` edge. Same original
+        // `idx` the planner skipped, so `author_agent_map` stays aligned.
+        if author.is_placeholder() {
+            if !author.name.trim().is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    name = %author.name,
+                    author_index = idx,
+                    "ingest_document: dropping placeholder author name"
+                );
+            }
             continue;
         }
         let (_did, pub_key_bytes) =
@@ -1816,11 +1841,26 @@ pub async fn do_ingest_document_spine(
         epigraph_ingest::document::schema::SourceType::Paper
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
-    let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+    // "No real author" covers an empty list AND a list of only placeholder
+    // names ("Authors Not Specified", "Unknown", ...): either way the byline
+    // backstop gets its chance (backlog a55aac45, arXiv:2606.16707).
+    //
+    // Index alignment with the planner's `author_placeholder` edges (keyed by
+    // `author_index` into `author_agent_map`):
+    // - structured list in use: the planner and the loop below skip the SAME
+    //   original indices (`AuthorEntry::is_placeholder`), so every planned
+    //   `asserts` edge maps to a real author's agent;
+    // - byline fallback in use: every structured entry was a placeholder, so the
+    //   planner emitted NO `author_placeholder` edges; the fallback's indices are
+    //   never looked up for `asserts`, and byline authors get `authored → paper`
+    //   only — the same as the empty-list fallback.
+    let has_real_author = extraction
         .source
         .authors
-        .is_empty()
+        .iter()
+        .any(|a| !a.is_placeholder());
+    let parsed_fallback;
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if !has_real_author
         && byline_eligible
     {
         parsed_fallback = extraction
@@ -1831,13 +1871,13 @@ pub async fn do_ingest_document_spine(
         if parsed_fallback.is_empty() {
             tracing::warn!(
                 paper = %paper_title,
-                "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
+                "ingest_document_spine: source.authors empty or placeholder-only and no byline recovered from body; paper will have no author agents"
             );
         } else {
             tracing::info!(
                 paper = %paper_title,
                 count = parsed_fallback.len(),
-                "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
+                "ingest_document_spine: source.authors empty or placeholder-only; recovered authors from body byline fallback"
             );
         }
         &parsed_fallback
@@ -1857,7 +1897,17 @@ pub async fn do_ingest_document_spine(
             .map_err(internal_error)?
     };
     for (idx, author) in authors.iter().enumerate() {
-        if author.name.is_empty() {
+        // Empty or placeholder name: no agent, no `authored` edge. Same original
+        // `idx` the planner skipped, so `author_agent_map` stays aligned.
+        if author.is_placeholder() {
+            if !author.name.trim().is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    name = %author.name,
+                    author_index = idx,
+                    "ingest_document_spine: dropping placeholder author name"
+                );
+            }
             continue;
         }
         let (_did, pub_key_bytes) =
