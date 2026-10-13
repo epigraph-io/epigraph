@@ -17,6 +17,8 @@
 //! * the replay, on the maintenance connection, carries `decomposes_to` (both
 //!   directions) and `continues_argument` onto the live head, and leaves the
 //!   workflow's `executes` and another agent's `asserts` on the frozen step;
+//! * the workflow's `step_follows` chain stays on the frozen steps its
+//!   `executes` edges name, so `ordered_steps` keeps the step order;
 //! * `revises` records no supersession and no cascade.
 //!
 //! Seeding, links and arming run on the harness pool (the maintenance role's
@@ -36,7 +38,20 @@ use uuid::Uuid;
 
 /// An app-role stdio server whose own agent (the CALLER of every tool) is
 /// pre-created and keyed by `seed`, so the test can bind it before arming.
+/// It has no maintenance connection, so the cascade is DEFERRED.
 async fn app_role_server(pool: &PgPool, seed: u8) -> (EpiGraphMcpFull, Uuid) {
+    server_with(pool, seed, false).await
+}
+
+/// [`app_role_server`] whose ScopedPool also holds a maintenance pool (the
+/// `epigraph_maintenance` role, as `replay_now` builds it), so the tool runs
+/// the cascade IN THE REQUEST: the `applied` branch prod takes whenever the
+/// maintenance DSN is configured.
+async fn app_role_server_with_maintenance(pool: &PgPool, seed: u8) -> (EpiGraphMcpFull, Uuid) {
+    server_with(pool, seed, true).await
+}
+
+async fn server_with(pool: &PgPool, seed: u8, maintenance: bool) -> (EpiGraphMcpFull, Uuid) {
     let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
     let caller: Uuid = sqlx::query_scalar(
         "INSERT INTO agents (public_key, display_name) VALUES ($1, 'mcp-agent') RETURNING id",
@@ -46,10 +61,14 @@ async fn app_role_server(pool: &PgPool, seed: u8) -> (EpiGraphMcpFull, Uuid) {
     .await
     .expect("the caller's agent row");
     let url = fixture::database_url_for(pool).await;
-    let scoped =
+    let mut scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
+    if maintenance {
+        scoped = scoped
+            .with_maintenance_pool(fixture::downgraded_pool(pool, "epigraph_maintenance").await);
+    }
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
     let embedder =
         epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
@@ -272,6 +291,94 @@ async fn evolve_step_supersedes_cascade_carries_structure_to_the_live_head_over_
     assert_eq!(ends(&pool, to_child).await, (head2, child));
     assert_eq!(ends(&pool, continued).await, (prior, head2));
     assert_eq!(ends(&pool, executes).await, (workflow, step));
+}
+
+/// A workflow's `step_follows` chain links the FROZEN steps its `executes`
+/// edges name (`workflow_steps::ordered_steps` walks the chain inside that id
+/// set), so a step-lineage supersession must leave the chain where it is.
+///
+/// The chain order differs from plan order on purpose: X was added
+/// (`add_step`: no `plan_index`, so plan order puts it last) between the
+/// planned S1 and S2. If the cascade re-pointed `S1 -> X` and `X -> S2` onto
+/// X's successor, the walk would stop at S1 and fall back to plan order,
+/// reporting [S1, S2, X]; and a later `add_step` at that slot would find no
+/// `prev -> next` row to remove and fork the chain.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_keeps_the_workflow_step_chain_on_the_frozen_steps(pool: PgPool) {
+    let (server, caller) = app_role_server_with_maintenance(&pool, 0xC7).await;
+    let group = bind_and_arm(&pool, caller).await;
+    let workflow = seed_workflow(&pool).await;
+
+    let s1 = fixture::seed_group_claim(&pool, caller, group, "S1: planned first").await;
+    let s2 = fixture::seed_group_claim(&pool, caller, group, "S2: planned second").await;
+    let x = fixture::seed_group_claim(&pool, caller, group, "X: added between").await;
+    sqlx::query(
+        "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"level\": 2}' \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![s1, s2, x])
+    .execute(&pool)
+    .await
+    .expect("mark the three claims level-2 steps");
+    for (step, plan) in [(s1, Some(1)), (s2, Some(2)), (x, None)] {
+        let props = match plan {
+            Some(i) => serde_json::json!({ "plan_index": i }),
+            None => serde_json::json!({}),
+        };
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
+                                relationship, properties) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', $3)",
+        )
+        .bind(workflow)
+        .bind(step)
+        .bind(props)
+        .execute(&pool)
+        .await
+        .expect("seed executes");
+    }
+    let s1_to_x = seed_edge(&pool, s1, "claim", x, "step_follows").await;
+    let x_to_s2 = seed_edge(&pool, x, "claim", s2, "step_follows").await;
+    let ordered = |pool: PgPool| async move {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_ingest_executor::workflow_steps::ordered_steps(&mut conn, workflow)
+            .await
+            .expect("ordered_steps")
+    };
+    assert_eq!(
+        ordered(pool.clone()).await,
+        vec![s1, x, s2],
+        "fixture: the chain, not plan order, places X second"
+    );
+
+    let body = evolve(&server, params(x, "supersedes", "X v2: added, refined")).await;
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let head = parse_uuid_field(&body, "claim_id");
+
+    assert_eq!(
+        ends(&pool, s1_to_x).await,
+        (s1, x),
+        "S1 -step_follows-> X stays on the frozen step"
+    );
+    assert_eq!(
+        ends(&pool, x_to_s2).await,
+        (x, s2),
+        "X -step_follows-> S2 stays on the frozen step"
+    );
+    let on_head: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'step_follows' \
+           AND (source_id = $1 OR target_id = $1)",
+    )
+    .bind(head)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(on_head, 0, "no step_follows edge reaches the successor");
+    assert_eq!(
+        ordered(pool.clone()).await,
+        vec![s1, x, s2],
+        "the workflow's step order survives the evolution"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

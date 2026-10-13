@@ -530,3 +530,71 @@ async fn evolve_step_supersedes_cascade_leaves_revises_history_in_place(pool: Pg
         "R -revises-> S stays on R when R is superseded (outgoing)"
     );
 }
+
+/// A workflow's chain edges (`step_follows` between steps, `phase_follows`
+/// between phases) link the FROZEN claims its `executes` edges name, and
+/// `workflow_steps::ordered_steps` walks them inside that id set. A
+/// step-lineage supersession leaves them, in both directions, on the retired
+/// claim; the decomposition edge beside them still follows the head, so this
+/// arm is not satisfied by a cascade that moved nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_cascade_leaves_the_step_and_phase_chains_in_place(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let step = seed_claim(&pool, agent, "S: the middle step", 0.7).await;
+    let prev = seed_claim(&pool, agent, "the step before", 0.7).await;
+    let next = seed_claim(&pool, agent, "the step after", 0.7).await;
+    let prev_phase = seed_claim(&pool, agent, "a phase before", 0.7).await;
+    let next_phase = seed_claim(&pool, agent, "a phase after", 0.7).await;
+    let parent = seed_claim(&pool, agent, "the phase S decomposes", 0.7).await;
+
+    let step_in = seed_typed_edge(&pool, prev, "claim", step, "claim", "step_follows").await;
+    let step_out = seed_typed_edge(&pool, step, "claim", next, "claim", "step_follows").await;
+    let phase_in =
+        seed_typed_edge(&pool, prev_phase, "claim", step, "claim", "phase_follows").await;
+    let phase_out =
+        seed_typed_edge(&pool, step, "claim", next_phase, "claim", "phase_follows").await;
+    let decomposed_from =
+        seed_typed_edge(&pool, parent, "claim", step, "claim", "decomposes_to").await;
+
+    let head = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(step),
+        "S: the middle step, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, step, head)
+        .await
+        .expect("the Supersede cascade");
+
+    assert_eq!(
+        ends(&pool, decomposed_from).await,
+        (parent, head),
+        "control: decomposes_to follows the head"
+    );
+    assert_eq!(
+        ends(&pool, step_in).await,
+        (prev, step),
+        "prev -step_follows-> S stays on S"
+    );
+    assert_eq!(
+        ends(&pool, step_out).await,
+        (step, next),
+        "S -step_follows-> next stays on S"
+    );
+    assert_eq!(
+        ends(&pool, phase_in).await,
+        (prev_phase, step),
+        "phase_follows (incoming) stays"
+    );
+    assert_eq!(
+        ends(&pool, phase_out).await,
+        (step, next_phase),
+        "phase_follows (outgoing) stays"
+    );
+}
