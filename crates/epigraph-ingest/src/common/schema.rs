@@ -31,7 +31,12 @@ const PLACEHOLDER_AUTHOR_NAMES: &[&str] = &[
     "unknown author",
     "unknown authors",
     "anonymous",
+    "anonymous author",
+    "anonymous authors",
     "anon",
+    "no author",
+    "no authors",
+    "not available",
     // "na" is deliberately absent: it is a real surname (e.g. Korean "Na"), and
     // the placeholder spelling "N/A" is listed.
     "n/a",
@@ -47,19 +52,17 @@ const PLACEHOLDER_AUTHOR_NAMES: &[&str] = &[
     "et al",
 ];
 
-/// Trim, strip surrounding brackets/quotes and a trailing `.`, collapse
-/// internal whitespace, and ASCII-lowercase.
+/// ASCII-lowercase, spell a plural marker `(s)` as `s` ("Author(s) Not
+/// Specified" -> "authors not specified"), strip surrounding brackets, quotes
+/// and dots in any order ("[Authors Not Specified]." included), and collapse
+/// internal whitespace.
 fn normalize_author_name(name: &str) -> String {
-    let stripped = name
-        .trim()
-        .trim_matches(|c: char| "[]()<>\"'".contains(c) || c.is_whitespace())
-        .trim_end_matches('.')
-        .trim();
-    stripped
+    let lowered = name.to_ascii_lowercase().replace("(s)", "s");
+    lowered
+        .trim_matches(|c: char| "[]()<>\"'.".contains(c) || c.is_whitespace())
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
 }
 
 /// True when `name` is empty or a known placeholder for "no author identified".
@@ -109,24 +112,65 @@ mod tests {
 
     #[test]
     fn placeholder_author_names_are_rejected_in_any_case_or_padding() {
+        // Every PLACEHOLDER_AUTHOR_NAMES entry as a LITERAL (not by iterating the
+        // list, which would not notice a deleted entry), each followed by a
+        // cased / padded / bracketed variant that must normalise onto it.
         for name in [
-            "Authors Not Specified",
+            "authors not specified",
             "AUTHORS NOT SPECIFIED",
             "  authors   not\tspecified  ",
             "[Authors Not Specified]",
+            "[Authors Not Specified].",
+            "Author(s) Not Specified",
+            "author not specified",
+            "Author Not Specified.",
+            "not specified",
+            "(Not Specified)",
+            "unspecified",
+            "UNSPECIFIED",
+            "unknown",
             "\"Unknown\"",
             "(unknown)",
+            "unknown author",
             "<Unknown Author>",
+            "unknown authors",
+            "Unknown Author(s)",
+            "anonymous",
             "Anonymous.",
-            "N/A",
+            "anonymous author",
+            "'Anonymous Author'",
+            "anonymous authors",
+            "Anonymous Author(s)",
+            "anon",
+            " Anon. ",
+            "no author",
+            "No Author",
+            "no authors",
+            "No author(s)",
+            "not available",
+            "Not Available",
             "n/a",
+            "N/A",
+            "none",
             "None",
             "null",
+            "NULL",
+            "nil",
+            "Nil",
             "-",
+            " - ",
+            "tbd",
             "TBD",
+            "various",
+            "Various",
+            "various authors",
             "Various Authors",
-            "et al.",
+            "author",
+            "Author",
+            "authors",
             "Authors",
+            "et al",
+            "et al.",
             "",
             "   ",
         ] {
