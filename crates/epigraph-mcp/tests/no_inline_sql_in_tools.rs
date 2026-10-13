@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
-///   `workflow_hierarchical.rs` 3).** Fixture assertions inside
+///   `workflow_hierarchical.rs` 9).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds.rs", 1, 0),
@@ -99,7 +99,12 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // same commit. Moving it to the repo layer is filed as follow-up work; doing it
     // inside a merge resolution would bury a refactor in a conflict fix.
     ("recall.rs", 13, 0),
-    ("workflow_hierarchical.rs", 3, 3),
+    // Test sites 3 -> 9 (U033, 2026-10-13): the all-or-nothing test's
+    // failure-injection trigger (CREATE FUNCTION + CREATE TRIGGER), the shared
+    // counters-and-rows read-back (2), and the two goal-embedding row counts.
+    // All fixture SQL inside `mod tests`; the 3 production statements are
+    // unchanged in number and now run on one transaction.
+    ("workflow_hierarchical.rs", 3, 9),
     ("workflow_ingest.rs", 0, 10),
     ("workflows.rs", 2, 0),
 ];
