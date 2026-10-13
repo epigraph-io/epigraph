@@ -581,10 +581,14 @@ async fn apply_moves_the_claim_and_everything_that_follows(pool: PgPool) {
         ("mass_functions", fx.mf_w),
         ("claim_versions", fx.cv),
         ("challenges", fx.challenge),
-        ("harvester_fragments", fx.frag),
     ] {
         assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
     }
+    assert_eq!(
+        row(&pool, "harvester_fragments", fx.frag).await,
+        publ(WORLD),
+        "a fragment that is also B's provenance is a shared NODE: it does not narrow"
+    );
     assert!(!writer_owned(&pool, "evidence", fx.ev_w).await);
     assert!(!writer_owned(&pool, "mass_functions", fx.mf_w).await);
     let cf: (Uuid, String) = sqlx::query_as(
@@ -1471,4 +1475,236 @@ async fn a_claim_whose_evidence_edge_would_widen_is_held(pool: PgPool) {
         "held evidence-edge claim",
     );
     assert!(audit_rows(&pool).await.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nodes stay; only this claim's dependent and link rows narrow
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The classification of every table a restriction touches: DEPENDENT rows
+/// (the claim's own) and LINK rows (an association of the claim with another
+/// node) narrow; harvester fragments are NODES and narrow only when every
+/// claim they are the provenance of is restricted with them. A table the
+/// cascade gains without a decision here fails this test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_touched_table_is_classified_node_link_or_dependent(pool: PgPool) {
+    use epigraph_cli::operator::restrict::{role_of, Role};
+    let mut conn = pool.acquire().await.unwrap();
+    let specs = epigraph_cli::operator::tables::propagated_tables(&mut conn)
+        .await
+        .expect("propagated tables");
+    let mut got: Vec<(String, Role)> = specs
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                role_of(&s.name).expect("unclassified table"),
+            )
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let want: Vec<(String, Role)> = [
+        ("challenges", Role::Dependent),
+        ("claim_cluster_membership", Role::Link),
+        ("claim_clusters", Role::Link),
+        ("claim_frames", Role::Link),
+        ("claim_neighborhood_membership", Role::Link),
+        ("claim_signature_revocations", Role::Dependent),
+        ("claim_versions", Role::Dependent),
+        ("claims", Role::Dependent),
+        ("ds_bayesian_divergence", Role::Dependent),
+        ("ds_combined_beliefs", Role::Dependent),
+        ("edges", Role::Link),
+        ("entity_mentions", Role::Link),
+        ("evidence", Role::Dependent),
+        ("experiment_entity_mentions", Role::Link),
+        ("experiment_triples", Role::Dependent),
+        ("harvester_claim_provenance", Role::Link),
+        ("harvester_fragments", Role::SharedNode),
+        ("mass_functions", Role::Dependent),
+        ("reasoning_traces", Role::Dependent),
+        ("triples", Role::Dependent),
+    ]
+    .into_iter()
+    .map(|(t, r)| (t.to_string(), r))
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// A cluster, a frame, a shared fragment and the far-end claim and evidence
+/// of A's edges are NODES: after restricting A they are byte-identical, the
+/// other member's link rows are unchanged, and only A's own link rows (graph
+/// cluster membership, k-means assignment, frame assignment, provenance) and
+/// A's edges narrow. A fragment that is A's alone narrows with A. The reversal
+/// restores every row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.target;
+    let run = Uuid::new_v4();
+    let gc = Uuid::new_v4();
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO graph_clusters (id, run_id, label, size) VALUES ('{gc}', '{run}', 'c', 2)"
+        ),
+    )
+    .await;
+    for c in [fx.a, fx.b] {
+        exec(
+            &pool,
+            &format!(
+                "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) \
+                 VALUES ('{c}', '{gc}', '{run}')"
+            ),
+        )
+        .await;
+        exec(
+            &pool,
+            &format!(
+                "INSERT INTO claim_clusters (claim_id, cluster_id, centroid_distance, \
+                   second_centroid_dist, boundary_ratio, silhouette_score, cluster_run_id) \
+                 VALUES ('{c}', 7, 0.1, 0.2, 0.5, 0.3, '{run}')"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ('{}', '{}')",
+            fx.b, fx.frame
+        ),
+    )
+    .await;
+    let ev_b = evidence(&pool, fx.b, "B's evidence").await;
+    let x_ee = node_edge(&pool, (fx.ev_a, "evidence"), (ev_b, "evidence"), None).await;
+    let src: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
+    )
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let frag_a: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
+                                          visibility) \
+         VALUES ($1, $2, 'A only', $3, 'public') RETURNING id",
+    )
+    .bind(src)
+    .bind(h32(Uuid::new_v4()))
+    .bind(WORLD)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) \
+             VALUES ('{}', '{frag_a}')",
+            fx.a
+        ),
+    )
+    .await;
+
+    let node_rows = |t: &'static str, cond: String| {
+        let pool = pool.clone();
+        async move {
+            let rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(t)::text FROM {t} t WHERE {cond} ORDER BY 1"
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            rows
+        }
+    };
+    let b_links = |pool: PgPool, b: Uuid| async move {
+        let mut out = Vec::new();
+        for t in [
+            "claim_cluster_membership",
+            "claim_clusters",
+            "claim_frames",
+            "harvester_claim_provenance",
+            "evidence",
+        ] {
+            let rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(t)::text FROM {t} t WHERE claim_id = $1 ORDER BY 1"
+            ))
+            .bind(b)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            out.push((t, rows));
+        }
+        out
+    };
+    let nodes_before = (
+        node_rows("graph_clusters", format!("id = '{gc}'")).await,
+        node_rows("frames", format!("id = '{}'", fx.frame)).await,
+        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
+        node_rows("claims", format!("id = '{}'", fx.b)).await,
+    );
+    let b_before = b_links(pool.clone(), fx.b).await;
+    let before = snapshot(&pool, true).await;
+
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    let nodes_after = (
+        node_rows("graph_clusters", format!("id = '{gc}'")).await,
+        node_rows("frames", format!("id = '{}'", fx.frame)).await,
+        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
+        node_rows("claims", format!("id = '{}'", fx.b)).await,
+    );
+    assert_eq!(nodes_before, nodes_after, "a connected NODE changed");
+    assert_eq!(
+        b_before,
+        b_links(pool.clone(), fx.b).await,
+        "B's own rows changed"
+    );
+    for t in [
+        "claim_cluster_membership",
+        "claim_clusters",
+        "claim_frames",
+        "harvester_claim_provenance",
+    ] {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT owner_group_id, visibility::text FROM {t} WHERE claim_id = $1"
+        ))
+        .bind(fx.a)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty(), "{t}: A has no row");
+        assert!(
+            rows.iter().all(|r| *r == grp(g)),
+            "{t}: A's link rows {rows:?}"
+        );
+    }
+    assert_eq!(row(&pool, "harvester_fragments", frag_a).await, grp(g));
+    assert_eq!(edge(&pool, x_ee).await, (g, "group".into(), None));
+    assert_eq!(row(&pool, "evidence", ev_b).await, publ(WORLD));
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "nodes and links reversed",
+    );
 }
