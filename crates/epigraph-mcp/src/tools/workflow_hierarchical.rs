@@ -177,6 +177,38 @@ pub async fn report_hierarchical_outcome(
     .await
 }
 
+/// The goal text a hierarchical outcome report should embed, if any.
+/// STUB (U033 red step): embeds nothing yet.
+fn report_goal_to_embed(_goal_text: Option<&str>) -> Option<&str> {
+    None
+}
+
+/// Embed the report's goal (best-effort, BEFORE the transaction), then report.
+/// STUB (U033 red step): does not embed yet.
+#[allow(clippy::too_many_arguments)]
+pub async fn do_report_hierarchical_outcome_with_embedder(
+    pool: &sqlx::PgPool,
+    _embedder: &dyn epigraph_embeddings::EmbeddingService,
+    workflow_id: Uuid,
+    success: bool,
+    step_executions: &[HierarchicalStepExecution],
+    quality: Option<f64>,
+    goal_text: Option<&str>,
+    run_label: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    do_report_hierarchical_outcome_via_pool(
+        pool,
+        workflow_id,
+        success,
+        step_executions,
+        quality,
+        goal_text,
+        run_label,
+        None,
+    )
+    .await
+}
+
 /// Refuse a `quality` the `behavioral_executions` CHECK (migration 002:
 /// `quality IS NULL OR quality BETWEEN 0 AND 1`) would refuse anyway, before
 /// anything is written. NaN is refused too: it fails every comparison, so
@@ -674,6 +706,116 @@ mod tests {
         assert_eq!(metadata["success_count"].as_i64(), Some(4), "{metadata}");
         assert_eq!(metadata["failure_count"].as_i64(), Some(4), "{metadata}");
         assert_eq!(rows, 16, "two step rows per report");
+    }
+
+    fn mock_embedder() -> epigraph_embeddings::MockProvider {
+        epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536))
+    }
+
+    /// U033 / I229: only a real goal is embedded. The `"hierarchical"`
+    /// placeholder the step rows fall back to, and blank text, are not goals:
+    /// embedding them would make every such report "similar" to every other.
+    #[test]
+    fn report_goal_to_embed_skips_blank_and_placeholder() {
+        assert_eq!(report_goal_to_embed(None), None);
+        assert_eq!(report_goal_to_embed(Some("")), None);
+        assert_eq!(report_goal_to_embed(Some("   ")), None);
+        assert_eq!(report_goal_to_embed(Some("hierarchical")), None);
+        assert_eq!(
+            report_goal_to_embed(Some("  Deploy with zero downtime ")),
+            Some("Deploy with zero downtime")
+        );
+    }
+
+    /// U033 / I229 part (4): the report's goal is embedded once and written on
+    /// every step row, and those rows then reach `behavioral_affinity_lineage`
+    /// under the workflow's own id, which is what `find_workflow`'s
+    /// hierarchical leg looks up. Before U033 every row had a NULL
+    /// `goal_embedding`. The embedder is the deterministic `MockProvider` (the
+    /// OpenAI boundary); the database is real.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_reported_goal_is_embedded_on_every_step_row_and_reaches_affinity(
+        pool: sqlx::PgPool,
+    ) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-embedding").await;
+        let goal = "Validate hierarchical outcome reporting";
+        let embedder = mock_embedder();
+        do_report_hierarchical_outcome_with_embedder(
+            &pool,
+            &embedder,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some(goal),
+            None,
+        )
+        .await
+        .expect("report must succeed");
+
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(embedded, 2, "every step row carries the goal embedding");
+
+        let qvec = epigraph_embeddings::EmbeddingService::generate(&embedder, goal)
+            .await
+            .unwrap();
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, Uuid::nil())
+            .await
+            .expect("resolve viewer");
+        let hits = epigraph_db::BehavioralExecutionRepository::behavioral_affinity_lineage(
+            &pool,
+            &viewer,
+            &crate::embed::format_pgvector(&qvec),
+            0.5,
+            1,
+            20,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter()
+                .any(|(id, sim, n)| *id == workflow_id && *sim > 0.99 && *n == 1),
+            "the report must feed affinity under the workflow's id: {hits:?}"
+        );
+    }
+
+    /// Best-effort: an embedder failure leaves the rows un-embedded but never
+    /// fails the report (the flat `report_workflow_outcome` path's contract).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_embedder_failure_does_not_fail_the_report(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-embed-fail").await;
+        let failing = mock_embedder().with_failures(1.0);
+        do_report_hierarchical_outcome_with_embedder(
+            &pool,
+            &failing,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some("Validate hierarchical outcome reporting"),
+            None,
+        )
+        .await
+        .expect("an embedder failure must not fail the report");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(embedded, 0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
