@@ -186,6 +186,30 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// TEXT is what makes this check about the query rather than about the call.
 const SPENT_MARKERS: &[&str] = &[".splice(", ".splice_write(", "visibility = 'public'"];
 
+/// Does `body` spend its viewer? Matched against the body's text.
+fn spends_viewer(body: &str) -> bool {
+    SPENT_MARKERS.iter().any(|m| body.contains(m))
+}
+
+/// One line per viewer-taking fn that runs SQL, does not spend its viewer and
+/// carries no [`EXEMPT_MARKER`] — the verdict
+/// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] asserts empty.
+fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for f in fns {
+        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
+            // Delegating wrapper: the callee is subject to this same lint.
+            continue;
+        }
+        let spends = spends_viewer(&f.body);
+        let exempt = f.body.contains(EXEMPT_MARKER);
+        if !spends && !exempt {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+    offenders
+}
+
 fn repos_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")
 }
@@ -316,65 +340,72 @@ fn viewer_taking_fns() -> Vec<ViewerFn> {
 
 /// Every `fn` under `src/repos/`, with its parameter list and body.
 fn repo_fns() -> Vec<ViewerFn> {
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| repo_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`repo_fns`] over ONE source string, so the verdicts can be exercised on
+/// synthetic sources that do not exist under `src/repos/`.
+fn repo_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
     let mut out = Vec::new();
-    for (file, src) in repo_files() {
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find("fn ") {
-            let at = from + rel;
-            from = at + 3;
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
 
-            // `fn` must be a whole token.
-            if at > 0 {
-                let prev = src.as_bytes()[at - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue;
-                }
-            }
-
-            let after = &src[at + 3..];
-            let name_end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            if name_end == 0 {
+        // `fn` must be a whole token.
+        if at > 0 {
+            let prev = src.as_bytes()[at - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
                 continue;
             }
-            let name = after[..name_end].to_string();
-
-            // Skip an optional generic list, then require the parameter list.
-            let mut cursor = at + 3 + name_end;
-            let rest = src[cursor..].trim_start();
-            let mut generics = String::new();
-            if rest.starts_with('<') {
-                let lt = src[cursor..].find('<').expect("just matched") + cursor;
-                let g = balanced(&src, lt, b'<', b'>');
-                cursor = lt + g.len();
-                generics = g.to_string();
-            }
-            let Some(paren_rel) = src[cursor..].find('(') else {
-                continue;
-            };
-            let paren = cursor + paren_rel;
-            // Anything other than whitespace between the name and `(` means
-            // this is not a declaration we can read.
-            if !src[cursor..paren].trim().is_empty() {
-                continue;
-            }
-            let params = balanced(&src, paren, b'(', b')');
-            let Some(brace_rel) = src[paren + params.len()..].find('{') else {
-                continue;
-            };
-            let brace = paren + params.len() + brace_rel;
-            let body = balanced(&src, brace, b'{', b'}').to_string();
-
-            out.push(ViewerFn {
-                file: file.clone(),
-                line: src[..at].matches('\n').count() + 1,
-                name,
-                generics,
-                params: params.to_string(),
-                body,
-            });
         }
+
+        let after = &src[at + 3..];
+        let name_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = after[..name_end].to_string();
+
+        // Skip an optional generic list, then require the parameter list.
+        let mut cursor = at + 3 + name_end;
+        let rest = src[cursor..].trim_start();
+        let mut generics = String::new();
+        if rest.starts_with('<') {
+            let lt = src[cursor..].find('<').expect("just matched") + cursor;
+            let g = balanced(src, lt, b'<', b'>');
+            cursor = lt + g.len();
+            generics = g.to_string();
+        }
+        let Some(paren_rel) = src[cursor..].find('(') else {
+            continue;
+        };
+        let paren = cursor + paren_rel;
+        // Anything other than whitespace between the name and `(` means
+        // this is not a declaration we can read.
+        if !src[cursor..paren].trim().is_empty() {
+            continue;
+        }
+        let params = balanced(src, paren, b'(', b')');
+        let Some(brace_rel) = src[paren + params.len()..].find('{') else {
+            continue;
+        };
+        let brace = paren + params.len() + brace_rel;
+        let body = balanced(src, brace, b'{', b'}').to_string();
+
+        out.push(ViewerFn {
+            file: file.to_string(),
+            line: src[..at].matches('\n').count() + 1,
+            name,
+            generics,
+            params: params.to_string(),
+            body,
+        });
     }
     out
 }
@@ -392,18 +423,7 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
         fns.len()
     );
 
-    let mut offenders = Vec::new();
-    for f in &fns {
-        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
-            // Delegating wrapper: the callee is subject to this same lint.
-            continue;
-        }
-        let spends = SPENT_MARKERS.iter().any(|m| f.body.contains(m));
-        let exempt = f.body.contains(EXEMPT_MARKER);
-        if !spends && !exempt {
-            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
-        }
-    }
+    let offenders = unspent_offenders(&fns);
 
     assert!(
         offenders.is_empty(),
@@ -424,6 +444,102 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
          EXPECTED_EXEMPTIONS.\n",
         offenders.join("\n")
     );
+}
+
+/// A spend marker counts only where it is CODE, never where it is prose.
+///
+/// The fixtures are synthetic source strings run through the same selector and
+/// the same verdict as the real scan, so this test cannot be satisfied by
+/// editing `src/repos/`.
+#[test]
+fn spend_markers_count_only_in_code_not_in_comments() {
+    let viewer_fns = |src: &str| -> Vec<ViewerFn> {
+        repo_fns_in("synthetic.rs", src)
+            .into_iter()
+            .filter(|f| f.params.contains("Viewer"))
+            .collect()
+    };
+
+    // 1. All three markers present only in comments (line, block, doc): the
+    //    SQL runs with no predicate, so the function must be reported.
+    let commented = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            // let sql = viewer.splice("SELECT c.content FROM claims c WHERE /* {VISIBILITY:c} */", 1);
+            // or viewer.splice_write(..) once this becomes a write
+            /* previously: AND (c.visibility = 'public' OR ...) */
+            /// TODO restore viewer.splice( here
+            let rows = sqlx::query_scalar("SELECT content FROM claims")
+                .fetch_all(pool)
+                .await?;
+            Ok(rows)
+        }
+    "#;
+    let fns = viewer_fns(commented);
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    let offenders = unspent_offenders(&fns);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "a viewer-taking fn whose only spend-marker text is inside comments \
+         runs its SQL unfiltered and must be reported, got {offenders:?}"
+    );
+    assert!(offenders[0].contains("titles"), "{}", offenders[0]);
+
+    // 2. Real `.splice(` and `.splice_write(` calls spend the viewer.
+    for call in ["splice", "splice_write"] {
+        let src = format!(
+            r#"
+            pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<u64, DbError> {{
+                let sql = viewer.{call}("UPDATE claims AS c SET x = 1 WHERE c.id = $1", 2);
+                Ok(sqlx::query(&sql).execute(pool).await?.rows_affected())
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "a real `.{call}(` call must count as spending the viewer"
+        );
+    }
+
+    // 3. The static three-bind predicate lives INSIDE the SQL string literal,
+    //    so string contents must stay visible to the spend check.
+    let three_bind = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            let rows = sqlx::query_scalar!(
+                "SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+                viewer.bypass_bind(),
+                &viewer.group_bind()
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_fns(three_bind)).is_empty(),
+        "the static three-bind predicate inside a SQL literal must count as \
+         spending the viewer"
+    );
+
+    // 4. `VISIBILITY-EXEMPT:` is a comment convention by design — in-SQL
+    //    `--` and Rust `//` alike. Both must still exempt.
+    for marker in [
+        "// VISIBILITY-EXEMPT: corpus-cardinality scalar.\n",
+        "let _ = \"-- VISIBILITY-EXEMPT: corpus-cardinality scalar.\";\n",
+    ] {
+        let src = format!(
+            r#"
+            pub async fn corpus_size(pool: &PgPool, viewer: &Viewer) -> Result<i64, DbError> {{
+                {marker}
+                Ok(sqlx::query_scalar("SELECT COUNT(*) FROM claims").fetch_one(pool).await?)
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "an exemption written as {marker:?} must still exempt the function"
+        );
+    }
 }
 
 /// The exemption list is a ratchet, not a category.
