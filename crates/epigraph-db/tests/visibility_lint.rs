@@ -2380,6 +2380,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "evidence.rs",
+        "create_with_source_url",
+        "INSERT INTO `evidence`: the body `create` always ran, now also binding the caller's \
+         `source_url` instead of NULL (`create` delegates here with None). The same write \
+         argument as `evidence.rs::create` applies verbatim -- authorization is the stamped \
+         GUCs evaluated by the table's WITH CHECK, not an in-query predicate -- and the SQL \
+         text is byte-identical to `create`'s. Backlog 4c42c0bf.",
+    ),
+    (
         "edge.rs",
         "create",
         "INSERT INTO `edges`. Same write-side argument as the two above. It moved because a          verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted ABOUT a row the same          submission just wrote: once that row's INSERT lives in a transaction, an edge emitted          on a different connection points at a row no other session can see yet. NOTE FOR A          CALLER PASSING A TRANSACTION, which the function's own doc also carries: a failed          statement aborts the whole PostgreSQL transaction, so `let _ = create(...)` does NOT          preserve best-effort semantics there -- it defers the failure to COMMIT as          `current transaction is aborted` with the cause gone.          `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort` wraps it in a SAVEPOINT          for exactly that reason. SCOPE: executor only; the SQL is unchanged.",

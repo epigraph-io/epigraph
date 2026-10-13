@@ -181,6 +181,25 @@ impl EvidenceRepository {
         executor: E,
         evidence: &Evidence,
     ) -> Result<Evidence, DbError> {
+        Self::create_with_source_url(executor, evidence, None).await
+    }
+
+    /// [`Self::create`], also recording the `source_url` column.
+    ///
+    /// `Evidence` has no URL field, so `create` has always written NULL there.
+    /// MCP `update_with_evidence` takes a caller `source_url` and passes it
+    /// here, whatever the evidence type: the URL is the source identity the
+    /// combine step uses to recognise a re-observation of the SAME source
+    /// (`epigraph_engine::source_dependence`, backlog 4c42c0bf).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, evidence))]
+    pub async fn create_with_source_url<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        evidence: &Evidence,
+        source_url: Option<&str>,
+    ) -> Result<Evidence, DbError> {
         let id: Uuid = evidence.id.into();
         let agent_id: Uuid = evidence.agent_id.into();
         let claim_id: Uuid = evidence.claim_id.into();
@@ -209,7 +228,7 @@ impl EvidenceRepository {
             id,
             content_hash.as_slice(),
             evidence_type_str,
-            None::<String>, // source_url extracted from evidence_type if needed
+            source_url,
             raw_content,
             claim_id,
             signature,
@@ -620,6 +639,36 @@ impl EvidenceRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// `source_url` of each of `ids` that has one and that `viewer` can see,
+    /// keyed by evidence id. Rows with a NULL or invisible `source_url` are
+    /// simply absent.
+    ///
+    /// Backs `epigraph_engine::source_dependence::source_keys_for_rows`: the
+    /// combine step's same-source test (backlog 4c42c0bf).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn source_urls_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_url \
+             FROM evidence e \
+             WHERE e.id = ANY($1) \
+               AND e.source_url IS NOT NULL \
+               /* {VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.
