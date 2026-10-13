@@ -203,8 +203,10 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
         let hash = content_hash(thesis_text);
         let seed = format!("{doc_title}\u{1f}thesis");
         let id = compound_claim_id(&hash, &seed);
-        // Stored hash is scoped too, so `uq_claims_content_hash_agent` cannot
-        // collapse two documents' structural rows. See `ids::compound_content_hash`.
+        // Stored hash is scoped too, so the (content_hash, agent_id) dedup
+        // (`uq_claims_content_hash_agent` through migration 149, the app-layer
+        // lock from 150) cannot collapse two documents' structural rows. See
+        // `ids::compound_content_hash`.
         let stored_hash = compound_content_hash(&hash, &seed);
         path_index.insert("thesis".to_string(), id);
 

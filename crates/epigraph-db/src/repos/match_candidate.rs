@@ -75,7 +75,9 @@ pub enum DecideOutcome {
 pub struct RetirementOutcome {
     /// The candidate's status before the retirement flipped it to `stale`.
     pub previous_status: String,
-    /// Both endpoints of the retired pair, for the caller's follow-up.
+    /// Both endpoints of the retired pair: the claims whose belief the
+    /// retirement cascade (`admin_cascade::apply_match_retire`) re-derives
+    /// when the retirement withdrew anything.
     pub affected_claims: Vec<Uuid>,
     pub edges_retracted: u64,
     pub factors_deleted: u64,

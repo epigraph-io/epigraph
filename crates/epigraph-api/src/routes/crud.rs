@@ -1447,7 +1447,9 @@ pub struct BuildThemesFromCorpusRequest {
     /// Theme labels are auto-named `"{prefix}-{idx}"`. Default `"auto"`.
     pub label_prefix: Option<String>,
     /// If true, `DELETE FROM claim_themes` before building. Default false —
-    /// callers that want a clean slate must opt in explicitly.
+    /// callers that want a clean slate must opt in explicitly. A wipe replaces
+    /// the whole live set, so it is refused (400) unless `label_prefix` is the
+    /// canonical `"auto"` (`epigraph_engine::theme_kmeans::validate_config`).
     pub wipe_first: Option<bool>,
     /// Embedding dimension to source. `None` or `Some(1536)` uses the legacy
     /// `claims.embedding` column and writes to `claim_themes.centroid`.
@@ -1479,7 +1481,9 @@ pub async fn build_themes_from_corpus(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<BuildThemesFromCorpusRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use epigraph_engine::theme_kmeans::{run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError};
+    use epigraph_engine::theme_kmeans::{
+        run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError, CANONICAL_LABEL_PREFIX,
+    };
 
     let auth = auth_ctx
         .ok_or(ApiError::Unauthorized {
@@ -1503,7 +1507,9 @@ pub async fn build_themes_from_corpus(
             .limit
             .map_or(500, |v| u32::try_from(v.max(1)).unwrap_or(u32::MAX))
             .max(1),
-        label_prefix: request.label_prefix.unwrap_or_else(|| "auto".to_string()),
+        label_prefix: request
+            .label_prefix
+            .unwrap_or_else(|| CANONICAL_LABEL_PREFIX.to_string()),
         wipe_first: request.wipe_first.unwrap_or(false),
         centroid_dim: request.centroid_dim.unwrap_or(1536),
     };

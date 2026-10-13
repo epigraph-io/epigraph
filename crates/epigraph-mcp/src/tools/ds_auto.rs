@@ -77,6 +77,17 @@ const BINARY_FRAME_NAME: &str = "binary_truth";
 /// Hypotheses for the canonical binary frame.
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
+/// `mass_functions.combination_method` of the BBA [`auto_wire_ds_update`] seeds
+/// from a claim's `truth_value` (backlog fc55465b).
+pub const TRUTH_VALUE_SEED_METHOD: &str = "truth_value_seed";
+
+/// The range a `truth_value` is capped to before it is seeded, so the seed's
+/// committed mass is at most 0.99, the cap `build_bba_on_index` puts on
+/// evidence. An uncapped t = 1.0 (or 0.0) would seed a categorical BBA, and
+/// under Dempster's rule a categorical BBA absorbs every later one: the claim
+/// could never be moved by evidence again.
+pub const SEED_TRUTH_BOUNDS: (f64, f64) = (0.005, 0.995);
+
 /// Get-or-create the canonical `binary_truth` frame.
 ///
 /// Handles race conditions: get → create → fallback get.
@@ -513,6 +524,29 @@ pub async fn auto_wire_ds_for_claim(
 /// `evidence_id` is passed as `perspective_id` so that each evidence submission
 /// gets its own BBA row rather than upsert-overwriting the previous one on the
 /// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
+///
+/// # The claim's scalar prior (backlog fc55465b)
+///
+/// A claim whose `truth_value` came from a path that wrote no BBA (ingest-time
+/// `calculate_initial_truth`, REST create) has nothing for the new evidence to
+/// combine with, and its `pignistic_prob` cache is NULL. Two guards keep the
+/// first update from discarding that prior:
+///
+/// - **Seed** (`seed_truth_prior = true`, and the claim has NO BBA on any
+///   two-hypothesis frame): before the evidence BBA is stored, the claim gets a
+///   [`TRUTH_VALUE_SEED_METHOD`] row built by
+///   [`MassFunction::from_pignistic_prior`], whose BetP is exactly the
+///   `truth_value` (capped to [`SEED_TRUTH_BOUNDS`]), so the seed alone moves
+///   nothing. It is attributed to the claim's author (the authored scalar is
+///   the author's opinion), stored undiscounted (`source_strength = 1.0`,
+///   `evidence_type = NULL`: `effective_source_strength`'s exempt arm), with no
+///   perspective and no evidence row. It is written at most once: afterwards
+///   the claim has BBAs. A caller that seeds must pass an `evidence_id`, or its
+///   own evidence BBA would upsert over a seed it authored.
+/// - **Clamp prior**: the supports=true monotonicity clamp reads
+///   `COALESCE(pignistic_prob, truth_value)`, so a caller that does not seed
+///   (a non-owner attaching to a public claim, `backfill_factors`) still has a
+///   prior to clamp to.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
     conn: &mut sqlx::PgConnection,
@@ -524,6 +558,7 @@ pub async fn auto_wire_ds_update(
     supports: bool,
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
+    seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
@@ -552,6 +587,71 @@ pub async fn auto_wire_ds_update(
     // canonical key; both resolve through the calibration alias map (bc06ec6f).
     let evidence_type_str =
         epigraph_engine::calibration::canonical_evidence_type(evidence_type_str);
+
+    // The claim's scalar prior, read ONCE, before anything below writes: the
+    // cached `pignistic_prob` (the clamp's prior), the authored `truth_value`
+    // (the seed, and the clamp's prior when the cache is NULL), and the author
+    // (the seed's source). PR-09: a per-id read over a caller-supplied uuid, so
+    // it is filtered rather than exempted; an invisible claim reads as "no
+    // prior", the same answer a nonexistent one gives.
+    let claim_prior: Option<(Option<f64>, f64, Uuid)> = {
+        let sql = viewer.splice(
+            "SELECT c.pignistic_prob, c.truth_value, c.agent_id FROM claims c \
+                 WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        // Owned, so the boxed read borrows only the savepoint's connection.
+        let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
+        optional_read_under_savepoint(&mut *conn, "claim prior", move |c| {
+            Box::pin(async move {
+                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid)>(&sql).bind(claim_id);
+                if let Some(g) = group {
+                    q = q.bind(g);
+                }
+                q.fetch_optional(c).await
+            })
+        })
+        .await?
+    };
+
+    // The truth_value seed (see the doc comment). Decided on BBA PRESENCE over
+    // every two-hypothesis frame, not on `pignistic_prob IS NULL`: a claim can
+    // carry a cache from another frame (`assess_claim`, an other-frame
+    // recompute) and no binary BBA, and a claim whose BBAs sit on a legacy
+    // binary frame already has its prior in the combine below.
+    if seed_truth_prior {
+        if let Some((_, truth, author)) = claim_prior {
+            let existing =
+                MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
+                    .await
+                    .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
+            let t = truth.clamp(SEED_TRUTH_BOUNDS.0, SEED_TRUTH_BOUNDS.1);
+            let seed = if existing.is_empty() {
+                MassFunction::from_pignistic_prior(frame.clone(), 0, t)
+                    .map_err(|e| format!("truth_value seed: {e}"))?
+            } else {
+                None
+            };
+            if let Some(seed) = seed {
+                MassFunctionRepository::store_with_perspective(
+                    &mut *conn,
+                    claim_id,
+                    frame_id,
+                    Some(author), // the authored scalar is the author's opinion
+                    None,         // no perspective
+                    &mass_to_json(&seed)?,
+                    None,
+                    Some(TRUTH_VALUE_SEED_METHOD),
+                    Some(1.0), // exempt reliability: read undiscounted, so BetP stays t
+                    None,      // no evidence_type (the exempt arm keys on its absence)
+                    "unknown",
+                    None, // no evidence row produced it
+                )
+                .await
+                .map_err(|e| format!("store truth_value seed: {e}"))?;
+            }
+        }
+    }
 
     // Store BBA — use evidence_id as perspective_id so each evidence submission
     // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
@@ -623,35 +723,14 @@ pub async fn auto_wire_ds_update(
         })
         .await?;
 
-    // Read current pignistic_prob for monotonicity clamp.  Supporting evidence
-    // must never lower BetP: high-conflict K between legacy mixed-format BBAs
-    // (m({0})>0 AND m({1})>0) and a new pure-support BBA can push mass to
-    // missing via Inagaki redistribution and reduce pignistic_prob even when
-    // supports=true.  We bound the result from below by the pre-addition value.
-    let prior_betp: Option<f64> = {
-        // PR-09: a per-id belief oracle over a caller-supplied uuid, so it
-        // is filtered rather than exempted. `unwrap_or(None)` already
-        // treats "no row" as "no prior", so an invisible claim degrades to
-        // the same answer a nonexistent one gives — no new failure mode.
-        let sql = viewer.splice(
-            "SELECT c.pignistic_prob FROM claims c \
-                 WHERE c.id = $1 /* {VISIBILITY:c} */",
-            2,
-        );
-        // Owned, so the boxed read borrows only the savepoint's connection.
-        let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
-        optional_read_under_savepoint(&mut *conn, "prior pignistic_prob", move |c| {
-            Box::pin(async move {
-                let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
-                if let Some(g) = group {
-                    q = q.bind(g);
-                }
-                q.fetch_optional(c).await
-            })
-        })
-        .await?
-        .flatten()
-    };
+    // The monotonicity clamp's prior. Supporting evidence must never lower
+    // BetP: high-conflict K between legacy mixed-format BBAs (m({0})>0 AND
+    // m({1})>0) and a new pure-support BBA can reduce pignistic_prob even when
+    // supports=true, so the result is bounded from below by the pre-addition
+    // value: the cached `pignistic_prob`, or the authored `truth_value` when the
+    // claim has no cache (backlog fc55465b: with no fallback the clamp never
+    // fired on exactly the claims whose prior was otherwise discarded).
+    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _)| cached.unwrap_or(truth));
 
     // The second value is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of

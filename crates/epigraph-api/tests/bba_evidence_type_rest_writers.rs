@@ -180,11 +180,13 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
     );
 }
 
-/// A single input folds into a combined row whose `combination_method` is
-/// NULL (`reports.last()` is `None`): no agent, no perspective, no method. It
-/// must stay untyped like every other combined row.
+/// A single input is not folded (`reports.last()` is `None`), yet the handler
+/// still caches a copy as a combined row: no agent, no perspective, and the
+/// `cached_unfolded` label (backlog b5cb3efb; it was NULL, which no
+/// combine-input reader could tell from an agent-less input). It must stay
+/// untyped like every other combined row.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_single_input_fold_leaves_an_untyped_null_method_combined_row(
+async fn a_single_input_fold_leaves_an_untyped_cached_unfolded_combined_row(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -223,7 +225,7 @@ async fn a_single_input_fold_leaves_an_untyped_null_method_combined_row(
     assert_eq!(combined.len(), 1, "one combined system row: {rows:?}");
     assert_eq!(
         (combined[0].1.as_deref(), combined[0].2.as_deref()),
-        (None, None),
-        "a single-input combined row has no method and no type: {rows:?}"
+        (Some(epigraph_db::CACHED_COMBINATION_UNFOLDED), None),
+        "a single-input combined row is labelled cached_unfolded and has no type: {rows:?}"
     );
 }

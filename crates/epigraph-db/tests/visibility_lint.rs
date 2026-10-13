@@ -76,6 +76,9 @@
 //! those have no `sqlx::query` in their own body and are correctly skipped,
 //! because the callee is itself subject to this lint.
 
+mod lint_text;
+
+use lint_text::spend_views;
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking repo function carrying a `VISIBILITY-EXEMPT:` marker,
@@ -185,6 +188,49 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// pass a lint keyed on the accessor and fail this one. Requiring the predicate
 /// TEXT is what makes this check about the query rather than about the call.
 const SPENT_MARKERS: &[&str] = &[".splice(", ".splice_write(", "visibility = 'public'"];
+
+/// Does `body` spend its viewer?
+///
+/// Each marker is matched only where it can take effect, through
+/// [`spend_views`]: a method-call marker (`.splice(`, `.splice_write(`) against
+/// the body's CODE — Rust comments removed and string contents blanked — and
+/// the SQL-text marker (`visibility = 'public'`) against its LIVE SQL — Rust
+/// comments removed, string contents kept minus their own `--` / `/* */`
+/// comments. So a commented-out call, a log line naming the method, and a
+/// predicate commented out of the statement all fail to count.
+///
+/// Only the spend side is stripped. [`EXEMPT_MARKER`] is read from the raw body
+/// here and in [`the_exemption_set_is_exactly_what_was_reviewed`]: the
+/// convention is carried in comments by design, some of them Rust line comments
+/// rather than in-SQL `--` ones, and stripping it would turn reviewed exemptions
+/// into offenders. See `lint_text/mod.rs` for the full account.
+fn spends_viewer(body: &str) -> bool {
+    let (code, live_sql) = spend_views(body);
+    SPENT_MARKERS.iter().any(|m| {
+        let is_call = m.starts_with('.') && m.ends_with('(');
+        let view = if is_call { &code } else { &live_sql };
+        view.contains(m)
+    })
+}
+
+/// One line per viewer-taking fn that runs SQL, does not spend its viewer and
+/// carries no [`EXEMPT_MARKER`] — the verdict
+/// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] asserts empty.
+fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for f in fns {
+        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
+            // Delegating wrapper: the callee is subject to this same lint.
+            continue;
+        }
+        let spends = spends_viewer(&f.body);
+        let exempt = f.body.contains(EXEMPT_MARKER);
+        if !spends && !exempt {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+    offenders
+}
 
 fn repos_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")
@@ -308,7 +354,17 @@ struct ViewerFn {
 
 /// Every `fn` under `src/repos/` whose parameter list mentions `Viewer`.
 fn viewer_taking_fns() -> Vec<ViewerFn> {
-    repo_fns()
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| viewer_taking_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`viewer_taking_fns`] over ONE source string. The selector lives here and
+/// only here, so a synthetic fixture is selected by exactly the rule the real
+/// scan uses.
+fn viewer_taking_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
+    repo_fns_in(file, src)
         .into_iter()
         .filter(|f| f.params.contains("Viewer"))
         .collect()
@@ -316,65 +372,72 @@ fn viewer_taking_fns() -> Vec<ViewerFn> {
 
 /// Every `fn` under `src/repos/`, with its parameter list and body.
 fn repo_fns() -> Vec<ViewerFn> {
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| repo_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`repo_fns`] over ONE source string, so the verdicts can be exercised on
+/// synthetic sources that do not exist under `src/repos/`.
+fn repo_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
     let mut out = Vec::new();
-    for (file, src) in repo_files() {
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find("fn ") {
-            let at = from + rel;
-            from = at + 3;
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
 
-            // `fn` must be a whole token.
-            if at > 0 {
-                let prev = src.as_bytes()[at - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue;
-                }
-            }
-
-            let after = &src[at + 3..];
-            let name_end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            if name_end == 0 {
+        // `fn` must be a whole token.
+        if at > 0 {
+            let prev = src.as_bytes()[at - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
                 continue;
             }
-            let name = after[..name_end].to_string();
-
-            // Skip an optional generic list, then require the parameter list.
-            let mut cursor = at + 3 + name_end;
-            let rest = src[cursor..].trim_start();
-            let mut generics = String::new();
-            if rest.starts_with('<') {
-                let lt = src[cursor..].find('<').expect("just matched") + cursor;
-                let g = balanced(&src, lt, b'<', b'>');
-                cursor = lt + g.len();
-                generics = g.to_string();
-            }
-            let Some(paren_rel) = src[cursor..].find('(') else {
-                continue;
-            };
-            let paren = cursor + paren_rel;
-            // Anything other than whitespace between the name and `(` means
-            // this is not a declaration we can read.
-            if !src[cursor..paren].trim().is_empty() {
-                continue;
-            }
-            let params = balanced(&src, paren, b'(', b')');
-            let Some(brace_rel) = src[paren + params.len()..].find('{') else {
-                continue;
-            };
-            let brace = paren + params.len() + brace_rel;
-            let body = balanced(&src, brace, b'{', b'}').to_string();
-
-            out.push(ViewerFn {
-                file: file.clone(),
-                line: src[..at].matches('\n').count() + 1,
-                name,
-                generics,
-                params: params.to_string(),
-                body,
-            });
         }
+
+        let after = &src[at + 3..];
+        let name_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = after[..name_end].to_string();
+
+        // Skip an optional generic list, then require the parameter list.
+        let mut cursor = at + 3 + name_end;
+        let rest = src[cursor..].trim_start();
+        let mut generics = String::new();
+        if rest.starts_with('<') {
+            let lt = src[cursor..].find('<').expect("just matched") + cursor;
+            let g = balanced(src, lt, b'<', b'>');
+            cursor = lt + g.len();
+            generics = g.to_string();
+        }
+        let Some(paren_rel) = src[cursor..].find('(') else {
+            continue;
+        };
+        let paren = cursor + paren_rel;
+        // Anything other than whitespace between the name and `(` means
+        // this is not a declaration we can read.
+        if !src[cursor..paren].trim().is_empty() {
+            continue;
+        }
+        let params = balanced(src, paren, b'(', b')');
+        let Some(brace_rel) = src[paren + params.len()..].find('{') else {
+            continue;
+        };
+        let brace = paren + params.len() + brace_rel;
+        let body = balanced(src, brace, b'{', b'}').to_string();
+
+        out.push(ViewerFn {
+            file: file.to_string(),
+            line: src[..at].matches('\n').count() + 1,
+            name,
+            generics,
+            params: params.to_string(),
+            body,
+        });
     }
     out
 }
@@ -392,18 +455,7 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
         fns.len()
     );
 
-    let mut offenders = Vec::new();
-    for f in &fns {
-        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
-            // Delegating wrapper: the callee is subject to this same lint.
-            continue;
-        }
-        let spends = SPENT_MARKERS.iter().any(|m| f.body.contains(m));
-        let exempt = f.body.contains(EXEMPT_MARKER);
-        if !spends && !exempt {
-            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
-        }
-    }
+    let offenders = unspent_offenders(&fns);
 
     assert!(
         offenders.is_empty(),
@@ -423,6 +475,193 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
          a `{EXEMPT_MARKER}` comment WITH A REASON and raise the count in \
          EXPECTED_EXEMPTIONS.\n",
         offenders.join("\n")
+    );
+}
+
+/// A spend marker counts only where it is CODE, never where it is prose.
+///
+/// The fixtures are synthetic source strings run through the same selector and
+/// the same verdict as the real scan, so this test cannot be satisfied by
+/// editing `src/repos/`.
+#[test]
+fn spend_markers_count_only_in_code_not_in_comments() {
+    let viewer_fns = |src: &str| viewer_taking_fns_in("synthetic.rs", src);
+
+    // 1. All three markers present only in comments (line, block, doc): the
+    //    SQL runs with no predicate, so the function must be reported.
+    let commented = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            // let sql = viewer.splice("SELECT c.content FROM claims c WHERE /* {VISIBILITY:c} */", 1);
+            // or viewer.splice_write(..) once this becomes a write
+            /* previously: AND (c.visibility = 'public' OR ...) */
+            /// TODO restore viewer.splice( here
+            let rows = sqlx::query_scalar("SELECT content FROM claims")
+                .fetch_all(pool)
+                .await?;
+            Ok(rows)
+        }
+    "#;
+    let fns = viewer_fns(commented);
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    let offenders = unspent_offenders(&fns);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "a viewer-taking fn whose only spend-marker text is inside comments \
+         runs its SQL unfiltered and must be reported, got {offenders:?}"
+    );
+    assert!(offenders[0].contains("titles"), "{}", offenders[0]);
+
+    // 2. Real `.splice(` and `.splice_write(` calls spend the viewer.
+    for call in ["splice", "splice_write"] {
+        let src = format!(
+            r#"
+            pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<u64, DbError> {{
+                let sql = viewer.{call}("UPDATE claims AS c SET x = 1 WHERE c.id = $1", 2);
+                Ok(sqlx::query(&sql).execute(pool).await?.rows_affected())
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "a real `.{call}(` call must count as spending the viewer"
+        );
+    }
+
+    // 3. The static three-bind predicate lives INSIDE the SQL string literal,
+    //    so string contents must stay visible to the spend check.
+    let three_bind = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            let rows = sqlx::query_scalar!(
+                "SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+                viewer.bypass_bind(),
+                &viewer.group_bind()
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_fns(three_bind)).is_empty(),
+        "the static three-bind predicate inside a SQL literal must count as \
+         spending the viewer"
+    );
+
+    // 4. `VISIBILITY-EXEMPT:` is a comment convention by design — in-SQL
+    //    `--` and Rust `//` alike. Both must still exempt.
+    for marker in [
+        "// VISIBILITY-EXEMPT: corpus-cardinality scalar.\n",
+        "let _ = \"-- VISIBILITY-EXEMPT: corpus-cardinality scalar.\";\n",
+    ] {
+        let src = format!(
+            r#"
+            pub async fn corpus_size(pool: &PgPool, viewer: &Viewer) -> Result<i64, DbError> {{
+                {marker}
+                Ok(sqlx::query_scalar("SELECT COUNT(*) FROM claims").fetch_one(pool).await?)
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "an exemption written as {marker:?} must still exempt the function"
+        );
+    }
+}
+
+/// A synthetic viewer-taking repo function whose body is `body`, for the
+/// SQL-text spend fixtures below.
+fn viewer_fn_fixture(body: &str) -> String {
+    format!(
+        "
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {{
+            {body}
+        }}
+    "
+    )
+}
+
+/// The verdict for one synthetic function: is it reported as unspent?
+fn fixture_is_unspent(body: &str) -> bool {
+    let fns = viewer_taking_fns_in("synthetic.rs", &viewer_fn_fixture(body));
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    unspent_offenders(&fns).len() == 1
+}
+
+/// `visibility = 'public'` commented out INSIDE the SQL text with `--` is not a
+/// predicate the database evaluates, so it must not spend the viewer.
+#[test]
+fn a_predicate_inside_an_sql_line_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE c.id = $1 -- AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3::uuid[]))").fetch_all(pool).await?)"#
+        ),
+        "a three-bind predicate after an in-SQL `--` is commented out of the \
+         statement and must not count as spending the viewer"
+    );
+}
+
+/// The same for an in-SQL `/* */` comment.
+#[test]
+fn a_predicate_inside_an_sql_block_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* WHERE c.visibility = 'public' */").fetch_all(pool).await?)"#
+        ),
+        "a predicate inside an in-SQL `/* */` comment must not count as \
+         spending the viewer"
+    );
+}
+
+/// `.splice(` / `.splice_write(` are METHOD CALLS: written inside a string
+/// literal (a log line, an error message) they call nothing.
+#[test]
+fn a_splice_call_named_only_inside_a_string_does_not_spend() {
+    for call in ["splice", "splice_write"] {
+        let body = format!(
+            r#"tracing::debug!("not yet routed through viewer.{call}( here");
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c").fetch_all(pool).await?)"#
+        );
+        assert!(
+            fixture_is_unspent(&body),
+            "`.{call}(` inside a string literal is not a call and must not \
+             count as spending the viewer"
+        );
+    }
+}
+
+/// The over-strip guard for the two tests above: an in-SQL `--` comment ends at
+/// the end of ITS line, so a live predicate on the next line of the same
+/// literal — a real newline or a `\n` escape — still spends the viewer.
+#[test]
+fn an_sql_comment_does_not_hide_a_live_predicate_on_a_later_line() {
+    let multi_line = r#"Ok(sqlx::query_scalar(
+                "SELECT c.content FROM claims c
+                 -- visibility: the static three-bind form
+                 WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+            ).fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(multi_line),
+        "a `--` line must not hide the live predicate on the next line"
+    );
+
+    let escaped = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c -- read path\n WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(escaped),
+        "a `\\n` escape ends an in-SQL `--` comment like a real newline does"
+    );
+
+    let after_block = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* read path */ WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(after_block),
+        "an in-SQL `/* */` comment must not hide the predicate after it"
+    );
+
+    let char_quote = r#"let _q = '"';
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(char_quote),
+        "a `'\"'` char literal must not desynchronise the string state"
     );
 }
 
@@ -814,6 +1053,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          FOR UPDATE read is part of the mutation it guards, and claims_tenancy's WITH CHECK \
          (keyed on epigraph_writable_groups()) authorises the row. Both callers check the \
          caller's read authority with a viewer-filtered get before they reach it.",
+    ),
+    (
+        "claim.rs",
+        "lock_content_hash_agent",
+        "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
+         (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
+         no row for a viewer to filter. Both callers (create_or_get_signed and POST /claims' \
+         if_not_exists=false branch) follow it with find_by_content_hash_and_agent, which takes \
+         the caller's viewer.",
     ),
     (
         "claim.rs",
@@ -1453,11 +1701,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "ingest_anchors",
-        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
-         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
-         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
-         for a viewer to filter; the ingest entry points call it on the plan walk's own \
-         transaction to decide which existing rows need the caller's authority.",
+        "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
+         `resolve_ingest_parent` lookups by `canonical_name` (batch H-b review, H3's \
+         lineage-takeover fix). `workflows` has no row security and no policy, as \
+         `find_root_by_canonical` records, so there is nothing for a viewer to filter; the \
+         ingest entry points call it on the plan walk's own transaction to decide which \
+         existing rows need the caller's authority.",
+    ),
+    (
+        "workflow.rs",
+        "resolve_ingest_parent",
+        "READ of `workflows` only (U032): the row an ingest links as `parent_id`, the named \
+         parent at `generation - 1` or the lineage's predecessor. `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
+         own transaction so the row authority-checked is the row linked.",
     ),
     (
         "system_agent.rs",
@@ -2105,6 +2363,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "trace.rs",
         "create",
         "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "trace.rs",
+        "create_with_reasoning_type",
+        "INSERT INTO `reasoning_traces` -- the SAME statement as `trace.rs::create` above, which \
+         is now a one-line delegate to it; the SQL text moved byte-identically. Same argument: a \
+         WRITE governed by migration 077's WITH CHECK against the connection's stamped GUCs, not \
+         an in-query viewer predicate. It differs only in letting the caller choose the \
+         CHECK-validated `reasoning_type` and record `properties.submitted_methodology` \
+         (backlog e207bb6d).",
     ),
     (
         "evidence.rs",

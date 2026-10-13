@@ -8,8 +8,11 @@
 //! implementation and identical observable behaviour.
 //!
 //! ## What it does
-//! 1. Validate `centroid_dim ∈ {1536, 3072}`, `k_min`, `k_max`.
-//! 2. Optionally wipe `claim_themes` (`wipe_first`).
+//! 1. Validate `centroid_dim ∈ {1536, 3072}`, `k_min`, `k_max`, and that a
+//!    `wipe_first` run rebuilds the canonical family
+//!    ([`CANONICAL_LABEL_PREFIX`]) — see [`validate_config`].
+//! 2. Optionally wipe `claim_themes` (`wipe_first`; done in step 6's
+//!    transaction, after the read and the fit).
 //! 3. Pull `(claim_id, embedding)` rows from `claims.embedding` (1536d) or
 //!    `claims.embedding_3072` (3072d).
 //! 4. Reject if 3072d was requested but no rows are populated (operator
@@ -37,6 +40,17 @@ use uuid::Uuid;
 
 use epigraph_db::{ClaimThemeRepository, DbError};
 
+/// The label prefix of the LIVE theme set: the scheduled rebuild writes
+/// `auto-00`, `auto-01`, …, and every caller's default is this prefix.
+///
+/// A `wipe_first` run deletes EVERY theme (`ClaimThemeRepository::delete_all`,
+/// not only those under its own prefix) and clears every `claims.theme_id`, so
+/// whatever it then creates becomes the whole theme set that diverse recall and
+/// the Explorer read. [`validate_config`] therefore admits a wipe only when it
+/// rebuilds this family. Backlog 5abe23de: a sweep probe's wipe under
+/// `"sweep-probe"` replaced the production set with four probe themes.
+pub const CANONICAL_LABEL_PREFIX: &str = "auto";
+
 /// Configuration for [`run_theme_kmeans`].
 ///
 /// Mirrors `BuildThemesFromCorpusRequest` from the HTTP handler with
@@ -58,6 +72,7 @@ pub struct RunThemeKmeansConfig {
     /// Theme label prefix; e.g. `"auto"` produces `auto-00`, `auto-01`, …
     pub label_prefix: String,
     /// When `true`, drops all existing themes first (`ClaimThemeRepository::delete_all`).
+    /// Only admitted with `label_prefix == CANONICAL_LABEL_PREFIX`.
     pub wipe_first: bool,
     /// Embedding dimensionality.  Must be `1536` or `3072`.
     /// 1536 reads `claims.embedding`; 3072 reads `claims.embedding_3072`.
@@ -121,6 +136,43 @@ pub enum ThemeKmeansError {
     /// `epigraph-cli reembed --target claims` first.
     #[error("centroid_dim=3072 requires populated claims.embedding_3072; run `epigraph-cli reembed --target claims` first")]
     Centroid3072Empty,
+}
+
+/// Reject a configuration before anything is read or written.
+///
+/// Runs first in [`run_theme_kmeans`], so it binds every caller together: the
+/// MCP `theme_cluster` tool, `POST /api/v1/themes/build-from-corpus` and the
+/// scheduled `theme_cluster_rebuild` job.
+///
+/// # Errors
+///
+/// [`ThemeKmeansError::BadRequest`] for a `centroid_dim` other than 1536 or
+/// 3072, for `k_min == 0` or `k_max < k_min`, and for a `wipe_first` run whose
+/// `label_prefix` is not [`CANONICAL_LABEL_PREFIX`].
+pub fn validate_config(config: &RunThemeKmeansConfig) -> Result<(), ThemeKmeansError> {
+    if !matches!(config.centroid_dim, 1536 | 3072) {
+        return Err(ThemeKmeansError::BadRequest(format!(
+            "centroid_dim must be 1536 or 3072 (got {})",
+            config.centroid_dim
+        )));
+    }
+
+    if config.k_min == 0 || config.k_max < config.k_min {
+        return Err(ThemeKmeansError::BadRequest(
+            "k_min must be ≥1 and k_max ≥ k_min".to_string(),
+        ));
+    }
+
+    if config.wipe_first && config.label_prefix != CANONICAL_LABEL_PREFIX {
+        return Err(ThemeKmeansError::BadRequest(format!(
+            "wipe_first=true deletes EVERY theme and replaces the live set, so it is only \
+             allowed with the canonical label_prefix \"{CANONICAL_LABEL_PREFIX}\" (got {:?}); \
+             nothing was written. Use wipe_first=false for an additive run under another prefix",
+            config.label_prefix
+        )));
+    }
+
+    Ok(())
 }
 
 /// Run a full theme rebuild via k-means.
@@ -198,18 +250,7 @@ pub async fn run_theme_kmeans(
     pool: &PgPool,
     config: &RunThemeKmeansConfig,
 ) -> Result<RunThemeKmeansSummary, ThemeKmeansError> {
-    if !matches!(config.centroid_dim, 1536 | 3072) {
-        return Err(ThemeKmeansError::BadRequest(format!(
-            "centroid_dim must be 1536 or 3072 (got {})",
-            config.centroid_dim
-        )));
-    }
-
-    if config.k_min == 0 || config.k_max < config.k_min {
-        return Err(ThemeKmeansError::BadRequest(
-            "k_min must be ≥1 and k_max ≥ k_min".to_string(),
-        ));
-    }
+    validate_config(config)?;
 
     let limit = config.limit.max(1);
 
@@ -418,4 +459,49 @@ pub async fn run_theme_kmeans(
         centroid_dim: dim as u32,
         skipped_reason: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(label_prefix: &str, wipe_first: bool) -> RunThemeKmeansConfig {
+        RunThemeKmeansConfig {
+            k: None,
+            k_min: 4,
+            k_max: 16,
+            min_claims_per_theme: 5,
+            limit: 500,
+            label_prefix: label_prefix.to_string(),
+            wipe_first,
+            centroid_dim: 1536,
+        }
+    }
+
+    /// Backlog 5abe23de: a wipe replaces the whole live set, so only the
+    /// canonical family may be rebuilt that way. Pinned here, at the layer the
+    /// MCP tool, the REST route and the scheduled job all share, so no single
+    /// caller can drop it.
+    #[test]
+    fn a_wipe_is_admitted_only_for_the_canonical_prefix() {
+        assert!(validate_config(&config(CANONICAL_LABEL_PREFIX, true)).is_ok());
+
+        let err = validate_config(&config("sweep-probe", true))
+            .expect_err("a wipe under a probe prefix must be refused");
+        let ThemeKmeansError::BadRequest(msg) = err else {
+            panic!("expected BadRequest, got {err:?}");
+        };
+        assert!(
+            msg.contains("\"auto\"") && msg.contains("\"sweep-probe\""),
+            "the refusal must name the canonical and the offered prefix: {msg}"
+        );
+    }
+
+    /// The rule is about wiping, not about prefixes: an additive run under any
+    /// prefix is still admitted.
+    #[test]
+    fn an_additive_run_is_admitted_under_any_prefix() {
+        assert!(validate_config(&config("sweep-probe", false)).is_ok());
+        assert!(validate_config(&config(CANONICAL_LABEL_PREFIX, false)).is_ok());
+    }
 }

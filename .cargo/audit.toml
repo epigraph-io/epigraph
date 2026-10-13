@@ -19,7 +19,20 @@
 ignore = [
     # ── No fix available — accepted risk ────────────────────────────────────
     "RUSTSEC-2023-0071", # rsa: Marvin timing side-channel. No fixed upstream
-                         #   release exists (pulled by epigraph-api).
+                         #   release exists. Pulled by jsonwebtoken's
+                         #   `rust_crypto` backend into epigraph-auth,
+                         #   epigraph-api and epigraph-mcp
+                         #   (`cargo tree -i rsa -e normal --workspace`), and
+                         #   by epigraph-api's dev-only RSA test fixture.
+                         #   Accepted because Marvin attacks RSA PRIVATE-key
+                         #   operations, and production holds no RSA private
+                         #   key: RS256 is verify-only, against Google /
+                         #   Cloudflare Access public keys
+                         #   (DecodingKey::from_rsa_components in
+                         #   epigraph-api oauth/providers/google.rs and
+                         #   cloudflare_access.rs), and epigraph's own tokens
+                         #   are signed HS256 (epigraph-auth JwtConfig). An RSA
+                         #   private key outside tests re-opens this entry.
     "RUSTSEC-2026-0097", # rand: unsound with a custom logger. Cargo.lock
                          #   resolves both 0.8.5 and 0.9.2, and both are flagged.
                          #   NOTE: the "no patched release yet" justification

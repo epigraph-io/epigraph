@@ -129,6 +129,13 @@ pub async fn execute_graph_query(
         }
     }
 
+    // Both id SELECTs below (the recursive CTE's anchor and the plain
+    // node SELECT) take their LIMIT window `ORDER BY created_at DESC, id`:
+    // newest matches first, `id` as the tie-breaker so the order is total.
+    // Without it the window was heap order — roughly oldest-first, and it moved
+    // after VACUUM or an UPDATE (backlog 2aacb390). Every allowlisted
+    // `node_table` has `created_at timestamptz NOT NULL` and a
+    // `created_at DESC` btree index (001_initial_schema.sql).
     let where_sql = if where_fragments.is_empty() {
         String::new()
     } else {
@@ -182,6 +189,7 @@ pub async fn execute_graph_query(
                 (SELECT id, 0
                 FROM {node_table}
                 {where_sql}
+                ORDER BY created_at DESC, id
                 LIMIT {limit})
                 UNION
                 SELECT
@@ -238,7 +246,7 @@ pub async fn execute_graph_query(
         Ok(resp)
     } else {
         let sql = format!(
-            "SELECT id FROM {} {} LIMIT {}",
+            "SELECT id FROM {} {} ORDER BY created_at DESC, id LIMIT {}",
             node_table, where_sql, limit
         );
 

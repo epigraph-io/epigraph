@@ -1296,12 +1296,11 @@ async fn persist_packet(
         // 4. Insert reasoning trace (with claim_id)
         let trace_uuid: Uuid = trace_id.into();
         let methodology = convert_methodology(packet.reasoning_trace.methodology);
-        let methodology_str = match methodology {
-            Methodology::Deductive | Methodology::FormalProof => "deductive",
-            Methodology::Inductive => "inductive",
-            Methodology::Abductive | Methodology::Heuristic => "abductive",
-            _ => "statistical",
-        };
+        // The one enum -> reasoning_type mapping, shared with the repo layer
+        // rather than copied here. The packet's `MethodologySubmission` has no
+        // observation variant, so this transport cannot say "observational".
+        let methodology_str =
+            epigraph_db::ReasoningTraceRepository::reasoning_type_for(methodology);
 
         // Convert evidence IDs for trace inputs
         let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();

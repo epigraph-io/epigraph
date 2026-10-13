@@ -4,7 +4,9 @@
 //!
 //! Backlog `c40689c9-a6c0-4c90-adfb-cf52e8a6b917`: the theme layer had no
 //! reader, so "what topics does this graph cover" could only be answered by
-//! running `theme_cluster`, which wipes and rebuilds.
+//! running `theme_cluster`, which then wiped and rebuilt the set by default
+//! (since backlog 5abe23de its default is an additive run, and a wipe needs
+//! `claims:admin` and the canonical `"auto"` prefix).
 //!
 //! ## Why these are not tautologies
 //!

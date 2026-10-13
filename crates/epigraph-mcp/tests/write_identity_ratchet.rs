@@ -352,10 +352,6 @@ const WRITE_BODIES_WITHOUT_AUTH: &[(&str, &str)] = &[
         "sweep_semantic_duplicates",
         "maintenance session over the maintenance connection, gated by claims:admin",
     ),
-    (
-        "theme_cluster",
-        "corpus-wide job with no author stamp that covers it; R3 checklist item 4",
-    ),
 ];
 
 /// Scan 2b (batch H-b review): every write body forwards `auth`, or is listed

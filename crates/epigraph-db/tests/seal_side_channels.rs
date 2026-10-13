@@ -160,10 +160,11 @@ async fn seed_sealable_claim(pool: &PgPool, world: &World, content: &str) -> Uui
 
 /// [`seed_sealable_claim`] with an explicit author.
 ///
-/// Needed because `uq_claims_content_hash_agent` is unique on
-/// `(content_hash, agent_id)`: two claims with IDENTICAL plaintext — the
-/// fixture the `[private]` collision regression requires — cannot share an
-/// author before they are sealed.
+/// Needed because `(content_hash, agent_id)` is a dedup key: two claims with
+/// IDENTICAL plaintext — the fixture the `[private]` collision regression
+/// requires — must not share an author before they are sealed. Through
+/// migration 149 `uq_claims_content_hash_agent` enforced that in the
+/// database; from 150 the app-layer dedup lock does.
 async fn seed_sealable_claim_as(pool: &PgPool, world: &World, author: Uuid, content: &str) -> Uuid {
     let claim = viewer_fixture::seed_group_claim(pool, author, world.group, content).await;
 
@@ -689,8 +690,9 @@ async fn ciphertext_length_and_content_hash_leak_nothing_about_the_plaintext(poo
 
     // Two claims of wildly different length, and two whose plaintext is
     // IDENTICAL. The identical pair is the `[private]` collision regression:
-    // a hash taken over a fixed sentinel would make them collide on
-    // `uq_claims_content_hash_agent`.
+    // a hash taken over a fixed sentinel would make them collide on the
+    // `(content_hash, agent_id)` dedup key (`uq_claims_content_hash_agent`
+    // through migration 149, the app-layer dedup lock from 150).
     let short = seed_sealable_claim(&pool, &world, "x").await;
     let long = seed_sealable_claim(&pool, &world, &"y".repeat(200)).await;
     let (twin_author, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-twin").await;

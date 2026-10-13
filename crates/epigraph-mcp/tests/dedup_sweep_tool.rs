@@ -105,9 +105,11 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// claims on a default-arg call would be the worst possible failure here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_reports_without_mutating(pool: PgPool) {
-    // Identical content REQUIRES distinct agents: uq_claims_content_hash_agent
-    // makes an exact within-agent duplicate impossible, which is precisely why
-    // the real duplicate corpus is cross-agent.
+    // Identical content from DISTINCT agents: that is the shape of the real
+    // duplicate corpus this sweep targets (cross-agent restatements). The
+    // database no longer enforces (content_hash, agent_id) uniqueness (013's
+    // uq_claims_content_hash_agent is dropped from migration 150); the
+    // app-layer dedup lock does, so within-agent twins are not the sweep's job.
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     let a = seed(&pool, a1, "identical text", 0.9, &pgvec(0, 0.0), &[]).await;

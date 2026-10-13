@@ -6,6 +6,13 @@
 //! which `call_tool` translates into 403 Forbidden) AND fails the test
 //! suite.
 
+/// The admin tier of this map, named once. It gates the `claims:admin` rows of
+/// [`SCOPE_MAP`] at dispatch, and inside a tool the admin-only half of a tool
+/// whose ordinary use is `claims:write` (`theme_cluster`'s `wipe_first`, backlog
+/// 5abe23de). Checked only through `AuthContext::has_scope`, the admin-scope
+/// chokepoint (`epigraph-api/tests/admin_scope_literals.rs`).
+pub const CLAIMS_ADMIN: &str = "claims:admin";
+
 /// Look up the OAuth scope required to dispatch `tool_name`.
 ///
 /// Returns `None` for unknown tools. The call site MUST treat `None` as a
@@ -140,7 +147,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // covers promote/reject on `decide_match_candidate`. Supersession and
     // dedup were in this bucket until batch OA1; they are the caller's own act
     // on its own claim and moved to claims:write above.
-    ("retire_match_candidate", "claims:admin"),
+    ("retire_match_candidate", CLAIMS_ADMIN),
     // Hard-deletes the edge row: irreversible and audit-destroying, so it
     // sits with the other irreversible graph mutations rather than with
     // `patch_edge`. Note this is STRICTER than the HTTP route it wraps
@@ -158,7 +165,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // (test fixtures, mis-typed edges with no audit value), not the ordinary
     // way to remove an edge. If retraction proves sufficient in practice,
     // `delete_edge` should be withdrawn rather than left as the easier path.
-    ("delete_edge", "claims:admin"),
+    ("delete_edge", CLAIMS_ADMIN),
     // The three corpus-wide maintenance jobs. They run on a bypass viewer over
     // the maintenance connection, so they read and write EVERY tenant's rows
     // regardless of the caller: `sweep_semantic_duplicates` returns other
@@ -167,9 +174,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // H-a review on config A: a claims:write-only principal with no membership
     // listed two foreign group-private ids and retired one). Cross-tenant power
     // is admin power, the same tier as `mark_duplicate`, which the sweep calls.
-    ("backfill_embeddings", "claims:admin"),
-    ("recompute_beliefs", "claims:admin"),
-    ("sweep_semantic_duplicates", "claims:admin"),
+    ("backfill_embeddings", CLAIMS_ADMIN),
+    ("recompute_beliefs", CLAIMS_ADMIN),
+    ("sweep_semantic_duplicates", CLAIMS_ADMIN),
 ];
 
 #[cfg(test)]

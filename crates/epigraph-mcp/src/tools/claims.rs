@@ -40,59 +40,129 @@ use uuid::Uuid;
 /// The enum is the trust-modifier bucket; the calibration key is the tuned
 /// mass profile.
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
-    match s.to_lowercase().replace('-', "_").as_str() {
-        "bayesian_inference" | "bayesian" => Ok(Methodology::BayesianInference),
-
-        "deductive_logic" | "deductive" | "deductive_reasoning" | "theoretical_derivation" => {
-            Ok(Methodology::Deductive)
-        }
-
-        // meta-analysis is a statistical synthesis over a population of prior
-        // studies — an inductive generalization, not a formal proof. It used to
-        // map to FormalProof, handing the single highest trust modifier in the
-        // system (1.2, above Deductive's 1.1) to an empirical synthesis that
-        // calibration.toml itself ranks BELOW deductive_logic (0.80 vs 0.85).
-        "inductive_generalization" | "inductive" | "meta_analysis" | "meta" => {
-            Ok(Methodology::Inductive)
-        }
-
-        "abductive" => Ok(Methodology::Abductive),
-
-        // Direct observation lands on Instrumental by the repo's own authority:
-        // calibration.toml [methodology_aliases] maps
-        // `experimental_observation = "instrumental"`. `statistical_analysis`
-        // stays here to agree with the sibling mapping
-        // `ingestion::methodology_from_planned`.
-        "statistical_analysis"
-        | "statistical"
-        | "statistical_inference"
-        | "instrumental"
-        | "instrumental_measurement"
-        | "computational"
-        | "computational_simulation"
-        | "observational"
-        | "observation"
-        | "direct_observation"
-        | "experimental_observation"
-        | "negative_result" => Ok(Methodology::Instrumental),
-
-        "visual_inspection" => Ok(Methodology::VisualInspection),
-
-        // Reading an assertion out of a document, rather than deriving or
-        // measuring it.
-        "extraction"
-        | "llm_extraction"
-        | "literature_synthesis"
-        | "legal_document_review"
-        | "textbook_assertion" => Ok(Methodology::Extraction),
-
-        "formal_proof" | "proof" | "mathematical_proof" => Ok(Methodology::FormalProof),
-
-        "expert_elicitation" | "expert" | "testimonial" | "heuristic" => Ok(Methodology::Heuristic),
-
-        other => Err(format!("unknown methodology: {other}")),
-    }
+    let token = normalize_methodology(s);
+    lookup_methodology(&token)
+        .map(|&(_, bucket, _)| bucket)
+        .ok_or_else(|| format!("unknown methodology: {token}"))
 }
+
+/// The `reasoning_traces.reasoning_type` a submitted methodology string is
+/// stored as, or `None` if [`parse_methodology`] would reject the string.
+///
+/// Read from the same [`METHODOLOGY_VOCABULARY`] row as the trust bucket, so
+/// every accepted string has an explicit value by construction. This is
+/// finer than `ReasoningTraceRepository::reasoning_type_for(bucket)`: the
+/// observation family shares the `Instrumental` bucket with the statistical
+/// family but is stored as `observational` (backlog e207bb6d).
+fn reasoning_type_for_submitted(s: &str) -> Option<&'static str> {
+    lookup_methodology(&normalize_methodology(s)).map(|&(_, _, reasoning_type)| reasoning_type)
+}
+
+/// The `reasoning_type` a submission's trace is stored as:
+/// [`reasoning_type_for_submitted`] of the caller's string.
+///
+/// `parse_methodology` has already rejected any string outside
+/// [`METHODOLOGY_VOCABULARY`] before a write starts, so the `None` arm is
+/// unreachable by construction. It falls back to the enum-level mapping
+/// rather than failing the write, and warns; the submitted string is still
+/// recorded verbatim on the trace, so nothing is lost.
+fn trace_reasoning_type(submitted: &str, bucket: Methodology) -> &'static str {
+    reasoning_type_for_submitted(submitted).unwrap_or_else(|| {
+        tracing::warn!(
+            submitted,
+            ?bucket,
+            "methodology accepted by parse_methodology has no vocabulary row; \
+             storing the enum-level reasoning_type"
+        );
+        ReasoningTraceRepository::reasoning_type_for(bucket)
+    })
+}
+
+/// Hyphens normalize to underscores and case folds, so calibration's
+/// `"meta-analysis"` alias and `"Direct-Observation"` resolve. The one
+/// normalizer both lookups share.
+fn normalize_methodology(s: &str) -> String {
+    s.to_lowercase().replace('-', "_")
+}
+
+fn lookup_methodology(token: &str) -> Option<&'static (&'static str, Methodology, &'static str)> {
+    METHODOLOGY_VOCABULARY.iter().find(|(t, _, _)| *t == token)
+}
+
+/// The accepted methodology vocabulary: `(normalized token, trust bucket,
+/// reasoning_type)`. One row per token, so every string the MCP surface
+/// accepts has both a [`Methodology`] and an explicit stored
+/// `reasoning_type`. The third column must be in
+/// `ReasoningTraceRepository::REASONING_TYPES` (the `reasoning_type_valid`
+/// CHECK); `tests::every_accepted_methodology_has_an_explicit_reasoning_type_in_the_check_set`
+/// enforces that.
+///
+/// The `reasoning_type` column equals `ReasoningTraceRepository::reasoning_type_for(bucket)`
+/// on every row except the observation family, which is stored as
+/// `observational` instead of `statistical`. Instrumental, negative_result,
+/// visual_inspection and the extraction family stay `statistical` (the CHECK
+/// has no closer value); the trace keeps the submitted string verbatim at
+/// `properties.submitted_methodology` either way.
+#[rustfmt::skip]
+const METHODOLOGY_VOCABULARY: &[(&str, Methodology, &str)] = &[
+    ("bayesian_inference", Methodology::BayesianInference, "statistical"),
+    ("bayesian", Methodology::BayesianInference, "statistical"),
+
+    ("deductive_logic", Methodology::Deductive, "deductive"),
+    ("deductive", Methodology::Deductive, "deductive"),
+    ("deductive_reasoning", Methodology::Deductive, "deductive"),
+    ("theoretical_derivation", Methodology::Deductive, "deductive"),
+
+    // meta-analysis is a statistical synthesis over a population of prior
+    // studies — an inductive generalization, not a formal proof. It used to
+    // map to FormalProof, handing the single highest trust modifier in the
+    // system (1.2, above Deductive's 1.1) to an empirical synthesis that
+    // calibration.toml itself ranks BELOW deductive_logic (0.80 vs 0.85).
+    ("inductive_generalization", Methodology::Inductive, "inductive"),
+    ("inductive", Methodology::Inductive, "inductive"),
+    ("meta_analysis", Methodology::Inductive, "inductive"),
+    ("meta", Methodology::Inductive, "inductive"),
+
+    ("abductive", Methodology::Abductive, "abductive"),
+
+    // Direct observation lands on Instrumental by the repo's own authority:
+    // calibration.toml [methodology_aliases] maps
+    // `experimental_observation = "instrumental"`. `statistical_analysis`
+    // stays here to agree with the sibling mapping
+    // `ingestion::methodology_from_planned`. The bucket is shared; the stored
+    // reasoning_type is not — an observation is not a statistical inference.
+    ("statistical_analysis", Methodology::Instrumental, "statistical"),
+    ("statistical", Methodology::Instrumental, "statistical"),
+    ("statistical_inference", Methodology::Instrumental, "statistical"),
+    ("instrumental", Methodology::Instrumental, "statistical"),
+    ("instrumental_measurement", Methodology::Instrumental, "statistical"),
+    ("computational", Methodology::Instrumental, "statistical"),
+    ("computational_simulation", Methodology::Instrumental, "statistical"),
+    ("observational", Methodology::Instrumental, "observational"),
+    ("observation", Methodology::Instrumental, "observational"),
+    ("direct_observation", Methodology::Instrumental, "observational"),
+    ("experimental_observation", Methodology::Instrumental, "observational"),
+    ("negative_result", Methodology::Instrumental, "statistical"),
+
+    ("visual_inspection", Methodology::VisualInspection, "statistical"),
+
+    // Reading an assertion out of a document, rather than deriving or
+    // measuring it.
+    ("extraction", Methodology::Extraction, "statistical"),
+    ("llm_extraction", Methodology::Extraction, "statistical"),
+    ("literature_synthesis", Methodology::Extraction, "statistical"),
+    ("legal_document_review", Methodology::Extraction, "statistical"),
+    ("textbook_assertion", Methodology::Extraction, "statistical"),
+
+    ("formal_proof", Methodology::FormalProof, "deductive"),
+    ("proof", Methodology::FormalProof, "deductive"),
+    ("mathematical_proof", Methodology::FormalProof, "deductive"),
+
+    ("expert_elicitation", Methodology::Heuristic, "abductive"),
+    ("expert", Methodology::Heuristic, "abductive"),
+    ("testimonial", Methodology::Heuristic, "abductive"),
+    ("heuristic", Methodology::Heuristic, "abductive"),
+];
 
 /// Load the evidence-type weight from CalibrationConfig.
 ///
@@ -569,9 +639,24 @@ async fn write_submission(
     // Persist Trace + Evidence on every submission. In the transaction: a
     // refusal here now rolls the claim back instead of committing it as an
     // orphan.
-    ReasoningTraceRepository::create(&mut *conn, &trace, claim.id)
-        .await
-        .map_err(internal_error)?;
+    //
+    // The trace's reasoning_type comes from the SUBMITTED string, not the
+    // coarser `methodology` bucket, so a direct observation is stored as
+    // `observational` rather than `statistical` (backlog e207bb6d). The string
+    // itself is kept verbatim at `properties.submitted_methodology`. It is the
+    // EFFECTIVE string, defaults included: a `batch_submit_claims` entry that
+    // omitted `methodology` records `BATCH_DEFAULT_METHODOLOGY`, and a
+    // `resolve_backlog_item` call without one records `expert_elicitation`.
+    let reasoning_type = trace_reasoning_type(&params.methodology, *methodology);
+    ReasoningTraceRepository::create_with_reasoning_type(
+        &mut *conn,
+        &trace,
+        claim.id,
+        reasoning_type,
+        Some(&params.methodology),
+    )
+    .await
+    .map_err(internal_error)?;
     // The caller's URL goes in `evidence.source_url` whatever the evidence
     // type: `empirical` evidence (an `Observation`) has no URL slot of its own,
     // so the column is the only place it can live (backlog 43ab8c73).
@@ -1305,10 +1390,11 @@ pub async fn update_with_evidence(
     // Compare pignistic-vs-pignistic. `get_belief_columns` reads the persisted
     // `pignistic_prob` column (distinct from `truth_value`; see claim.rs docs).
     // It is NULL for a claim with no prior DS state — in that case fall back to
-    // `truth_value` (`before`), which is the belief the fresh BBA is combined
-    // against. The monotonicity clamp in `auto_wire_ds_update` bounds BetP below
-    // by the prior column value for supports=true, so the warning is only ever
-    // reachable on the NULL-column (no-prior-DS-state) path.
+    // `truth_value` (`before`), which `auto_wire_ds_update` seeds as a BBA and
+    // the fresh evidence is combined against (backlog fc55465b). Its
+    // monotonicity clamp bounds a supports=true BetP below by that same prior,
+    // up to the combined plausibility, so the warning is reachable only when
+    // the prior sits above what the stored BBAs make plausible.
     let pre_pignistic =
         ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
@@ -1358,6 +1444,7 @@ pub async fn update_with_evidence(
         params.supports,
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
+        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
     )
     .await
     .map_err(|e| {
@@ -2746,5 +2833,225 @@ mod tests {
     fn an_unknown_methodology_is_still_rejected() {
         assert!(parse_methodology("vibes").is_err());
         assert!(parse_methodology("").is_err());
+    }
+
+    use super::{
+        normalize_methodology, reasoning_type_for_submitted, trace_reasoning_type,
+        METHODOLOGY_VOCABULARY,
+    };
+    use epigraph_db::ReasoningTraceRepository;
+
+    /// Every accepted string has an explicit stored reasoning_type, and it is
+    /// one `reasoning_type_valid` admits — so no accepted submission can fail
+    /// at the CHECK, and none silently falls back.
+    #[test]
+    fn every_accepted_methodology_has_an_explicit_reasoning_type_in_the_check_set() {
+        assert!(METHODOLOGY_VOCABULARY.len() >= 36, "vocabulary shrank");
+        for &(token, _, reasoning_type) in METHODOLOGY_VOCABULARY {
+            assert!(
+                ReasoningTraceRepository::REASONING_TYPES.contains(&reasoning_type),
+                "{token:?} maps to {reasoning_type:?}, which reasoning_type_valid refuses"
+            );
+            assert_eq!(
+                reasoning_type_for_submitted(token),
+                Some(reasoning_type),
+                "{token:?}"
+            );
+        }
+    }
+
+    /// A row whose token is not already normalized, or that repeats an
+    /// earlier token, can never be reached by a lookup.
+    #[test]
+    fn every_vocabulary_row_is_reachable() {
+        let mut seen = std::collections::HashSet::new();
+        for &(token, _, _) in METHODOLOGY_VOCABULARY {
+            assert_eq!(
+                normalize_methodology(token),
+                token,
+                "{token:?} is not in normalized form, so no input can match it"
+            );
+            assert!(seen.insert(token), "{token:?} appears twice");
+        }
+    }
+
+    /// The trust bucket and stored reasoning_type for every accepted token,
+    /// written out independently of the table (the buckets are the arms of
+    /// the pre-table `parse_methodology` match), so a moved or mis-edited row
+    /// fails here. Exactly one family (the observation family) differs from
+    /// the enum-level `ReasoningTraceRepository::reasoning_type_for(bucket)`.
+    #[test]
+    fn reasoning_type_table_rows() {
+        let expected: &[(&[&str], Methodology, &str)] = &[
+            (
+                &["bayesian_inference", "bayesian"],
+                Methodology::BayesianInference,
+                "statistical",
+            ),
+            (
+                &[
+                    "deductive_logic",
+                    "deductive",
+                    "deductive_reasoning",
+                    "theoretical_derivation",
+                ],
+                Methodology::Deductive,
+                "deductive",
+            ),
+            (
+                &[
+                    "inductive_generalization",
+                    "inductive",
+                    "meta_analysis",
+                    "meta",
+                ],
+                Methodology::Inductive,
+                "inductive",
+            ),
+            (&["abductive"], Methodology::Abductive, "abductive"),
+            (
+                &[
+                    "statistical_analysis",
+                    "statistical",
+                    "statistical_inference",
+                ],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["computational", "computational_simulation"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &[
+                    "direct_observation",
+                    "observation",
+                    "observational",
+                    "experimental_observation",
+                ],
+                Methodology::Instrumental,
+                "observational",
+            ),
+            (
+                &["instrumental", "instrumental_measurement"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["negative_result"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["visual_inspection"],
+                Methodology::VisualInspection,
+                "statistical",
+            ),
+            (
+                &[
+                    "extraction",
+                    "llm_extraction",
+                    "literature_synthesis",
+                    "legal_document_review",
+                    "textbook_assertion",
+                ],
+                Methodology::Extraction,
+                "statistical",
+            ),
+            (
+                &["formal_proof", "proof", "mathematical_proof"],
+                Methodology::FormalProof,
+                "deductive",
+            ),
+            (
+                &["expert_elicitation", "expert", "testimonial", "heuristic"],
+                Methodology::Heuristic,
+                "abductive",
+            ),
+        ];
+        let mut covered = 0;
+        for (tokens, bucket, want) in expected {
+            for token in *tokens {
+                assert_eq!(
+                    parse_methodology(token),
+                    Ok(*bucket),
+                    "{token:?} must stay in the {bucket:?} trust bucket"
+                );
+                assert_eq!(
+                    reasoning_type_for_submitted(token),
+                    Some(*want),
+                    "{token:?} must be stored as {want:?}"
+                );
+                covered += 1;
+            }
+        }
+        assert_eq!(
+            covered,
+            METHODOLOGY_VOCABULARY.len(),
+            "a vocabulary row has no expected reasoning_type here"
+        );
+
+        let differs: Vec<&str> = METHODOLOGY_VOCABULARY
+            .iter()
+            .filter(|(_, bucket, rt)| ReasoningTraceRepository::reasoning_type_for(*bucket) != *rt)
+            .map(|(t, _, _)| *t)
+            .collect();
+        assert_eq!(
+            differs,
+            [
+                "observational",
+                "observation",
+                "direct_observation",
+                "experimental_observation"
+            ],
+            "only the observation family may differ from the enum-level mapping"
+        );
+    }
+
+    #[test]
+    fn the_calibrated_methodology_vocabulary_has_a_reasoning_type() {
+        let cal =
+            CalibrationConfig::from_workspace_root().expect("load workspace calibration.toml");
+        assert!(
+            cal.methodology_aliases
+                .contains_key("experimental_observation"),
+            "calibration.toml did not load (empty fallback) — vacuous otherwise"
+        );
+        for key in cal
+            .methodology_profiles
+            .keys()
+            .filter(|k| k.as_str() != "default")
+            .chain(cal.methodology_aliases.keys())
+        {
+            assert!(
+                reasoning_type_for_submitted(key).is_some(),
+                "calibration.toml knows {key:?} but it has no stored reasoning_type"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trace_reasoning_type_reads_the_submitted_string_and_falls_back_to_the_bucket() {
+        // The submitted string decides, normalized like parse_methodology.
+        assert_eq!(
+            trace_reasoning_type("Direct-Observation", Methodology::Instrumental),
+            "observational"
+        );
+        assert_eq!(
+            trace_reasoning_type("statistical_analysis", Methodology::Instrumental),
+            "statistical"
+        );
+        // Unreachable through submit_claim (parse_methodology rejects first),
+        // but if it ever happens the write still stores a CHECK-valid value:
+        // the enum-level mapping of the bucket, not a hardcoded default.
+        assert_eq!(
+            trace_reasoning_type("vibes", Methodology::FormalProof),
+            "deductive"
+        );
+        assert_eq!(
+            trace_reasoning_type("vibes", Methodology::Instrumental),
+            "statistical"
+        );
     }
 }

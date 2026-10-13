@@ -101,7 +101,7 @@ impl ThemeClusterRebuildHandler {
             // enough to cover the wrhq-scale corpus, small enough that
             // linfa k-means stays well under the 2 GB VM RAM ceiling.
             limit: 5000,
-            label_prefix: "auto".to_string(),
+            label_prefix: epigraph_engine::theme_kmeans::CANONICAL_LABEL_PREFIX.to_string(),
             // Scheduled rebuild replaces existing themes wholesale; the
             // skip-check above ensures we only do this when the corpus
             // has actually changed.

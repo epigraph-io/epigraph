@@ -369,6 +369,57 @@ impl MassFunction {
         Ok(Self { frame, masses })
     }
 
+    /// The least-committed BBA on a two-hypothesis frame whose pignistic
+    /// probability for `hypothesis_idx` is exactly `t`.
+    ///
+    /// Used to turn a scalar belief (a claim's `truth_value`) into a BBA that
+    /// can take part in evidence combination without moving belief by itself
+    /// (backlog fc55465b). With `o` the other hypothesis:
+    ///
+    /// - `t > 1/2`: `m({idx}) = 2t-1`, `m(Θ) = 2-2t`
+    /// - `t < 1/2`: `m({o}) = 1-2t`, `m(Θ) = 2t`
+    /// - `t = 1/2`: `None` (the vacuous BBA: there is nothing to store)
+    ///
+    /// Any binary BBA with `BetP(idx) = t` has `m(idx) + m(Θ)/2 = t` and
+    /// `m(o) + m(Θ)/2 = 1-t`, so `m(Θ) <= 2·min(t, 1-t)`; this one attains that
+    /// bound, which makes it the least committed (Smets). The simple-support
+    /// shape `m({idx}) = t` is NOT pignistic-preserving: its BetP is `(1+t)/2`.
+    ///
+    /// Exact for every `t` in `[0, 1]`, so `t = 0` and `t = 1` give categorical
+    /// (dogmatic) BBAs; a caller that must stay revisable caps `t` first.
+    ///
+    /// # Errors
+    /// - `DsError::InvalidProbability` if `t` is NaN or outside `[0, 1]`
+    /// - `DsError::NotBinaryFrame` if the frame does not have two hypotheses
+    /// - `DsError::ElementOutsideFrame` if `hypothesis_idx` is not 0 or 1
+    pub fn from_pignistic_prior(
+        frame: FrameOfDiscernment,
+        hypothesis_idx: usize,
+        t: f64,
+    ) -> Result<Option<Self>, DsError> {
+        if !(0.0..=1.0).contains(&t) {
+            return Err(DsError::InvalidProbability { value: t });
+        }
+        let n = frame.hypothesis_count();
+        if n != 2 {
+            return Err(DsError::NotBinaryFrame { n });
+        }
+        if !frame.is_valid_index(hypothesis_idx) {
+            return Err(DsError::ElementOutsideFrame {
+                element: format!("index {hypothesis_idx}"),
+            });
+        }
+        if (t - 0.5).abs() < SUM_TOLERANCE {
+            return Ok(None);
+        }
+        let (lean, mass) = if t > 0.5 {
+            (hypothesis_idx, 2.0 * t - 1.0)
+        } else {
+            (1 - hypothesis_idx, 1.0 - 2.0 * t)
+        };
+        Self::simple(frame, BTreeSet::from([lean]), mass).map(Some)
+    }
+
     /// Get the mass of a specific focal element (0.0 if not present)
     #[must_use]
     pub fn mass_of(&self, fe: &FocalElement) -> f64 {

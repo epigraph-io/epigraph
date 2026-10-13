@@ -153,6 +153,11 @@ pub fn executor_caller_error(
         {
             db_caller_error(db)
         }
+        // U032: the caller's payload plans a content-less generation. A caller
+        // error, so an agent stops retrying (the retry loop minted the stubs).
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            invalid_params(format!("{context}: {e}"))
+        }
         other => internal_error(format!("{context}: {other}")),
     }
 }
@@ -231,6 +236,31 @@ mod tests {
             elevated.message.contains("ELEVATED READ-ONLY"),
             "{}",
             elevated.message
+        );
+    }
+
+    /// U032: a step-less new generation (or an empty plan) is the CALLER's
+    /// payload error. As INTERNAL_ERROR it invited the very retry loop that
+    /// minted 7 empty generations in ~90 s; it must be INVALID_PARAMS and keep
+    /// the executor's reason text.
+    #[test]
+    fn an_empty_generation_is_invalid_params() {
+        let e = executor_caller_error(
+            "workflow ingest",
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("empty workflow generation")
+                && e.message.contains("weekly-capability-audit")
+                && e.message.contains("Nothing was written"),
+            "{}",
+            e.message
         );
     }
 

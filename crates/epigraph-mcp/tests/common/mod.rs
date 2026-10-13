@@ -92,7 +92,8 @@ macro_rules! test_pool_or_skip {
 }
 
 /// Drop the (content_hash, agent_id) UNIQUE constraint to exercise the
-/// pre-107 fixture path.
+/// pre-107 fixture path. From migration 150 a freshly-migrated database is
+/// already in that shape; the drop states the precondition explicitly.
 pub async fn drop_unique_constraint(pool: &PgPool) {
     sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
         .execute(pool)
@@ -113,20 +114,22 @@ pub async fn drop_unique_constraint(pool: &PgPool) {
 /// — Postgres reports the collision against the constraint's backing INDEX, not
 /// against the constraint — while the handler named only `duplicate_object`
 /// (`42710`). On the old shared database this never fired, because an earlier
-/// arm had always just DROPPED the constraint. On a freshly-migrated database
-/// migration 013 has already created it, so the ADD raises 42P07 EVERY time and
-/// the swallow is the normal path rather than the fallback.
+/// arm had always just DROPPED the constraint. On a database migrated only to
+/// 013-149 the constraint is already there, so the ADD raises 42P07 and the
+/// swallow is what keeps it idempotent; from migration 150 (backlog 00f1a517)
+/// a freshly-migrated database has no constraint and the ADD is the normal path.
 /// `epigraph-db/tests/claim_repo_helpers.rs` hit and fixed this first; this is
 /// the same fix, and the divergence between the two copies is exactly the class
 /// that made it survive.
 ///
 /// # Why the post-condition is asserted rather than trusted
 ///
-/// Because the ADD now always raises and is always caught, a future edit that
-/// renamed the constraint, named the wrong columns or targeted the wrong table
-/// would be swallowed identically, and every post-107 arm would go on asserting
-/// `DuplicateKey` against whatever migration 013 happens to provide. Reading
-/// `pg_constraint` makes the fixture prove the precondition it claims.
+/// Where the constraint is already present the ADD raises and is caught, so a
+/// future edit that renamed the constraint, named the wrong columns or targeted
+/// the wrong table would be swallowed identically, and every post-107 arm would
+/// go on asserting `DuplicateKey` against whatever the database happens to
+/// provide. Reading `pg_constraint` makes the fixture prove the precondition it
+/// claims.
 pub async fn add_unique_constraint(pool: &PgPool) {
     sqlx::query(
         "DELETE FROM claims a USING claims b

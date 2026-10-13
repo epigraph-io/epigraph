@@ -46,4 +46,24 @@ pub enum IngestExecutorError {
     /// extraction field responsible (e.g. `"phases[2].summary"`).
     #[error("blank claim content at {path}: claim content must not be empty or whitespace-only")]
     InvalidContent { path: String },
+
+    /// The plan would write a content-less workflow generation: it plans no
+    /// claims at all (any generation), or it is a NEW generation (> 0) that
+    /// plans no level-2 step claims. Raised before anything is written.
+    ///
+    /// Generation 0 with a thesis and no steps stays legal: that is the
+    /// `store_workflow` / `POST /workflows` `steps: []` scaffold that
+    /// `add_step` fills in place.
+    #[error(
+        "empty workflow generation: {canonical_name} generation {generation} plans {level2} \
+         step claims and {claims} claims in total; a workflow generation above 0 needs at least \
+         one step, and every ingest needs at least one claim (steps under an unrecognised key \
+         are ignored). Nothing was written; retrying the same payload will be refused again"
+    )]
+    EmptyGeneration {
+        canonical_name: String,
+        generation: i32,
+        level2: usize,
+        claims: usize,
+    },
 }

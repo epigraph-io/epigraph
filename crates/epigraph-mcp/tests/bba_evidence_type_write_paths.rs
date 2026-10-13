@@ -308,6 +308,7 @@ async fn auto_wire_ds_update_resolves_a_linked_evidence_tag(pool: PgPool) {
         true,
         Some("reference"),
         None,
+        false, // seed_truth_prior: backfill_factors does not seed (ds_auto doc)
     )
     .await
     .expect("auto_wire_ds_update");
