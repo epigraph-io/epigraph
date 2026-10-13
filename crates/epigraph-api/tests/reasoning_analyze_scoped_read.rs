@@ -351,7 +351,10 @@ async fn analyze_drops_a_stored_claim_the_caller_cannot_read(pool: PgPool) {
     }]);
     let shapes: [(&str, Value); 3] = [
         ("unscoped", json!({ "claim_ids": null })),
-        ("claim_ids", json!({ "claim_ids": [private, public] })),
+        (
+            "claim_ids",
+            json!({ "claim_ids": [private, public, orphan] }),
+        ),
         ("caller_edges", json!({ "edges": own_edge })),
     ];
 
