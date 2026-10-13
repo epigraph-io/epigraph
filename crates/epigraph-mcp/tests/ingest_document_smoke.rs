@@ -853,6 +853,22 @@ async fn claim_asserts_by(pool: &PgPool, name: &str) -> i64 {
     row.0
 }
 
+/// ALL agent→claim `asserts` edges, whoever the agent is. The document walk
+/// writes these only for planned `author_placeholder` edges (its own claim
+/// assertions are paper→claim), so this count is name-independent.
+async fn agent_claim_asserts_total(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges
+        WHERE source_type = 'agent' AND target_type = 'claim' AND relationship = 'asserts'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
 fn paper_id_of(result: &rmcp::model::CallToolResult) -> uuid::Uuid {
     let json: serde_json::Value =
         serde_json::from_str(&result_text(result)).expect("response JSON");
@@ -891,9 +907,9 @@ async fn placeholder_author_name_mints_no_author_agent(pool: PgPool) {
         "with only a placeholder author the paper has no authored edge"
     );
     assert_eq!(
-        claim_asserts_by(&pool, "Authors Not Specified").await,
+        agent_claim_asserts_total(&pool).await,
         0,
-        "no placeholder agent asserts the paper's claims"
+        "no agent at all asserts the paper's claims: its only author was a placeholder"
     );
     // The ingest itself still lands: dropping a bad name must not cost the claims.
     let json: serde_json::Value =
