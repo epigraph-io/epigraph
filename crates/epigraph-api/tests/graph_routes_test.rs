@@ -391,6 +391,22 @@ async fn overview_edge_limit_below_one_is_clamped_to_one(pool: PgPool) {
     }
 }
 
+/// `min_size` drops clusters BELOW the size, so a cluster of exactly
+/// `min_size` is kept: B (size 3) survives `min_size=3`, C (size 1) does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_min_size_keeps_a_cluster_of_exactly_that_size(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "min_size=3").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B"]);
+    assert_eq!(edge_weights(&body), [4]);
+    assert_eq!(edge_endpoints(&body["cluster_edges"][0]), ids(&[s.a, s.b]));
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], true);
+}
+
 /// Guard, and meant to pass on main as well: with no bound in the query string
 /// the body is today's body — every supernode, every edge, and no new
 /// top-level key. The epigraph-gui reads `cluster_edges` unbounded from this
