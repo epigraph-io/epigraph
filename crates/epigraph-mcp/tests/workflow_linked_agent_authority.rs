@@ -581,6 +581,59 @@ async fn an_agent_of_a_revoked_human_operator_is_refused(pool: PgPool) {
     .await;
 }
 
+/// The same revoke for a LINKED caller on a workflow submitted by a sibling
+/// linked agent S. Here the target side still names H (S's link record
+/// outlives H's registration), and migration 107's acting read still names H
+/// (the revoke touches no membership), so only migration 122's binding — H is
+/// no longer a registered human, so its links bind no one — refuses the call.
+/// CALIBRATION: the same caller is admitted before the revoke.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_linked_agent_of_a_revoked_human_operator_is_refused(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let h = human(&pool, "h").await;
+    let s = linked_agent(&pool, h, "submitter").await;
+    let agent = linked_agent(&pool, h, "caller").await;
+    workflow_submitted_by(&pool, &server, "la-revoked-link", s).await;
+    let auth = token(agent, Uuid::new_v4());
+    let viewer = direct_viewer(&pool, agent).await;
+    tools::step_ops::add_step(
+        &server,
+        &viewer,
+        add("la-revoked-link", "before the revoke"),
+        Some(&auth),
+    )
+    .await
+    .expect("calibration: admitted while H is a registered human");
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, $2)")
+            .bind(h)
+            .bind("test: revoke the human")
+            .fetch_one(&pool)
+            .await
+            .expect("revoke the human operator");
+    assert!(revoked, "calibration: the registration is revoked now");
+    let still_acting = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::operator_actor(&mut conn, agent)
+            .await
+            .expect("actor read")
+    };
+    assert_eq!(
+        still_acting.map(|l| l.operator_id),
+        Some(h),
+        "calibration: 107's acting read alone would still admit"
+    );
+    assert_refused(
+        &pool,
+        &server,
+        &viewer,
+        &auth,
+        "la-revoked-link",
+        "was submitted by agent",
+    )
+    .await;
+}
+
 /// An agent bound to a DIFFERENT human is refused on H's workflow, whether H
 /// submitted it or one of H's agents did.
 #[sqlx::test(migrations = "../../migrations")]
