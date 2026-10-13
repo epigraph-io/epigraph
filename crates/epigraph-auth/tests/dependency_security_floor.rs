@@ -1,0 +1,100 @@
+//! Security floor for dependencies whose resolved version carries a published
+//! advisory: the workspace `Cargo.lock` must resolve each of them at or above
+//! the first release that fixes it.
+//!
+//! `cargo audit` runs in CI only as an ADVISORY job (`continue-on-error`), so a
+//! lockfile regression onto a vulnerable release would not stop a merge. This
+//! test does: a `cargo update` that lands on an older patch, or a manifest
+//! change that pulls a second copy below the floor, fails here.
+//!
+//! - `jsonwebtoken` < 10.3.0: type confusion in claim validation lets a
+//!   mistyped `exp`/`nbf` skip its check (CVE-2026-25537, fixed in 10.3.0).
+//!   This crate is the one that signs and validates every epigraph token.
+//! - `openssl` < 0.10.80: the rust-openssl memory-safety advisories of 2026
+//!   (CVE-2026-41676 `Deriver::derive`, CVE-2026-41678 AES key wrap,
+//!   CVE-2026-41681 `MdCtxRef::digest_final`, CVE-2026-41898 PSK/cookie
+//!   callback length, CVE-2026-42327 `X509Ref::ocsp_responders`).
+//!
+//! Every resolved copy of a package is checked, not just the first, and the
+//! comparison is numeric (a string compare orders 0.10.9 above 0.10.80).
+
+use std::path::PathBuf;
+
+/// (package, first fixed version). A package listed here MUST be in the lockfile:
+/// a floor that silently passes because the package vanished pins nothing.
+const FLOORS: &[(&str, [u64; 3])] = &[("jsonwebtoken", [10, 3, 0]), ("openssl", [0, 10, 80])];
+
+fn workspace_lockfile() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read workspace lockfile {}: {e}", path.display()))
+}
+
+/// Every `version` the lockfile resolves for `name`, one per `[[package]]` entry.
+fn resolved_versions(lock: &str, name: &str) -> Vec<String> {
+    let name_line = format!("name = \"{name}\"");
+    lock.split("[[package]]")
+        .filter(|entry| entry.lines().any(|l| l.trim() == name_line))
+        .map(|entry| {
+            entry
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("version = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("lockfile entry for {name} has no version line"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// `major.minor.patch` as numbers; a pre-release/build suffix on the patch is
+/// dropped (a pre-release of the fixed version is treated as the fixed version,
+/// which only matters if one were ever resolved, and none is today).
+fn parse_semver(v: &str) -> [u64; 3] {
+    let mut parts = v.split('.').map(|p| {
+        let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("unparseable version component in {v:?}"))
+    });
+    let mut out = [0u64; 3];
+    for slot in &mut out {
+        *slot = parts
+            .next()
+            .unwrap_or_else(|| panic!("version {v:?} has fewer than three components"));
+    }
+    out
+}
+
+#[test]
+fn parse_semver_orders_numerically_not_lexically() {
+    // The floor is only as good as the comparison: "0.10.9" > "0.10.80" as strings.
+    assert!(parse_semver("0.10.9") < parse_semver("0.10.80"));
+    assert!(parse_semver("9.3.1") < parse_semver("10.3.0"));
+    assert_eq!(parse_semver("10.4.0"), [10, 4, 0]);
+}
+
+#[test]
+fn lockfile_resolves_no_dependency_below_its_security_floor() {
+    let lock = workspace_lockfile();
+    let mut violations = Vec::new();
+    for (name, floor) in FLOORS {
+        let versions = resolved_versions(&lock, name);
+        assert!(
+            !versions.is_empty(),
+            "{name} is not in Cargo.lock: drop its floor deliberately rather than let it pass vacuously"
+        );
+        for v in versions {
+            if parse_semver(&v) < *floor {
+                violations.push(format!(
+                    "{name} {v} < {}.{}.{}",
+                    floor[0], floor[1], floor[2]
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Cargo.lock resolves a dependency below its security floor: {}",
+        violations.join("; ")
+    );
+}
