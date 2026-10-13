@@ -5513,24 +5513,76 @@ impl ClaimRepository {
         }
     }
 
+    /// Serialize every find-then-insert of one `(content_hash, agent_id)` for
+    /// the rest of the caller's CURRENT TRANSACTION.
+    ///
+    /// # Why the database does not do this
+    ///
+    /// Migration 013's `uq_claims_content_hash_agent` is absent on the
+    /// long-lived database (migrations/README.md, "Known schema drift"), and
+    /// migration 150 drops it everywhere else so CI matches it. Without it,
+    /// "find, and insert on a miss" is a check-then-act race: the find runs on
+    /// a snapshot that cannot see a concurrent caller's uncommitted insert, so
+    /// two first creates of one pair both miss and both insert. This lock is
+    /// the contract now; the `DuplicateKey` catch arms stay for a future
+    /// partial unique index (`WHERE is_current`).
+    ///
+    /// # How a caller must use it
+    ///
+    /// Take it as its OWN statement, inside a transaction, BEFORE the find, and
+    /// keep that transaction open until the insert commits. A
+    /// `pg_advisory_xact_lock` is released at the end of the transaction that
+    /// took it — on an autocommit connection that is the end of this very
+    /// statement, which serializes nothing. Under READ COMMITTED the find,
+    /// issued after the lock is granted, reads a snapshot that includes the
+    /// previous holder's committed row.
+    ///
+    /// The two-key form keeps this lock space disjoint from the single-key
+    /// locks elsewhere; `'epigraph.claim_dedup'` keeps it disjoint from
+    /// `policies.rs::create_challenge`'s `'epigraph.policy_challenge'`.
+    ///
+    /// A caller that creates many claims in one transaction holds one lock per
+    /// distinct pair until it commits, in input order.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the lock statement fails.
+    pub async fn lock_content_hash_agent(
+        conn: &mut sqlx::PgConnection,
+        content_hash: &[u8],
+        agent_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('epigraph.claim_dedup'), \
+                    hashtext(encode($1, 'hex') || $2::text))",
+        )
+        .bind(content_hash)
+        .bind(agent_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Insert a claim row unconditionally (no implicit dedup).
     ///
     /// Use this when the caller has already determined that an insert is
-    /// the correct action (or wants the post-107 UNIQUE constraint to be
-    /// the authoritative dedup gate).
+    /// the correct action. A caller that must not mint a second row for one
+    /// `(content_hash, agent_id)` takes [`Self::lock_content_hash_agent`] and
+    /// runs [`Self::find_by_content_hash_and_agent`] first, in the same
+    /// transaction (or uses [`Self::create_or_get`], which does both).
     ///
-    /// **Pre-107:** inserts a duplicate row when `(content_hash, agent_id)`
-    /// already exists.
+    /// **Without `uq_claims_content_hash_agent`** (the long-lived database,
+    /// and every database from migration 150): inserts a duplicate row when
+    /// `(content_hash, agent_id)` already exists.
     ///
-    /// **Post-107:** the `uq_claims_content_hash_agent` constraint surfaces
-    /// duplicate insertions as `DbError::DuplicateKey`.
+    /// **With it** (a database that re-adds it, or a future partial unique
+    /// index): duplicate insertions surface as `DbError::DuplicateKey`.
     ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` on a `(content_hash, agent_id)`
-    /// collision (post-107 only). Returns `DbError::QueryFailed` for other
-    /// database errors.
+    /// collision (only where a unique constraint on the pair exists). Returns
+    /// `DbError::QueryFailed` for other database errors.
     pub async fn create_strict(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
@@ -5664,17 +5716,25 @@ impl ClaimRepository {
     /// `was_created=false`. Otherwise inserts and returns the new row with
     /// `was_created=true`.
     ///
-    /// **Post-107 race handling:** if a concurrent writer inserts the same
-    /// `(content_hash, agent_id)` between the find and the insert, the INSERT
-    /// fails with the unique constraint. This helper catches that error,
-    /// re-runs the find, and returns the resulting row with
-    /// `was_created=false`.
+    /// **Race handling:** the find and the insert run inside one transaction
+    /// (a real `BEGIN` on a bare connection, a SAVEPOINT inside the caller's)
+    /// that first takes [`Self::lock_content_hash_agent`]. Two concurrent first
+    /// creates of one pair therefore serialize: the second waits for the
+    /// first's transaction to end, then its find sees the committed row and it
+    /// returns `was_created=false`. This holds without any unique constraint,
+    /// which is the shape of the long-lived database and, from migration 150,
+    /// of every database (backlog 00f1a517). Inside a caller's transaction the
+    /// lock is held until THAT transaction ends, which is what keeps the
+    /// caller's still-uncommitted row from being missed.
     ///
-    /// **Pre-107 (constraint not yet applied):** the catch path is
-    /// unreachable, and a concurrent race may produce two rows. S2 backfill
-    /// (future) cleans up any rows produced during the S1→S4 transition.
+    /// **Belt-and-braces catch:** a writer that inserts the pair WITHOUT the
+    /// lock can still win between the find and the insert. Where a unique
+    /// constraint on the pair exists, the INSERT then fails; this helper
+    /// catches that error, re-runs the find, and returns the resulting row with
+    /// `was_created=false`. Without such a constraint that writer's row is a
+    /// duplicate this helper cannot see.
     ///
-    /// **Constraint match assumption:** the post-107 catch path matches
+    /// **Constraint match assumption:** the catch path matches
     /// `DbError::DuplicateKey { .. }` only because
     /// `uq_claims_content_hash_agent` is the only unique constraint that can
     /// fire on a fresh-UUID `INSERT INTO claims`. If a future migration adds
@@ -5705,10 +5765,11 @@ impl ClaimRepository {
     /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`, for the
     /// same reason.
     ///
-    /// On a connection that is NOT already in a transaction, `conn.begin()` is a
-    /// real `BEGIN`/`COMMIT` pair around the one INSERT — same durability, one
-    /// extra round trip, and the same visible behaviour the pre-savepoint code
-    /// had.
+    /// On a connection that is NOT already in a transaction, the outer scope is
+    /// a real `BEGIN`/`COMMIT` pair around the lock, the find and the insert,
+    /// and the insert's own scope is a SAVEPOINT inside it — same durability,
+    /// and the row is visible to the next lock holder the moment the lock is
+    /// released.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-unique-violation database errors,
@@ -5740,8 +5801,48 @@ impl ClaimRepository {
     ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
+        // The serialization scope: a real BEGIN on a bare connection (an
+        // advisory xact lock taken in autocommit is released at the end of its
+        // own statement), a SAVEPOINT inside the caller's transaction (the lock
+        // then lives until the caller's transaction ends). Closed explicitly on
+        // every path below.
+        let mut scope = conn
+            .begin()
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        match Self::create_or_get_serialized(&mut scope, viewer, claim, decl, signer_id).await {
+            Ok(out) => {
+                scope
+                    .commit()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Ok(out)
+            }
+            Err(e) => {
+                scope
+                    .rollback()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::create_or_get_signed`], run inside its
+    /// serialization scope: lock, find, then the savepointed insert.
+    async fn create_or_get_serialized(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Acquire;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
+
+        Self::lock_content_hash_agent(&mut *conn, content_hash.as_slice(), agent_id).await?;
 
         if let Some(existing) = Self::find_by_content_hash_and_agent(
             &mut *conn,
@@ -5778,7 +5879,8 @@ impl ClaimRepository {
         match attempt {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
-                // Post-107 race: another writer won. Re-find and return.
+                // A writer that bypassed the lock won, and a unique constraint
+                // on the pair caught it. Re-find and return.
                 let existing = Self::find_by_content_hash_and_agent(
                     &mut *conn,
                     viewer,

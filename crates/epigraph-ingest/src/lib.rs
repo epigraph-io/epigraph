@@ -419,8 +419,10 @@ mod tests {
         }
 
         // Document builder only: compound rows carry a SEED-SCOPED storage hash
-        // so `uq_claims_content_hash_agent` cannot collapse two documents'
-        // structural rows; atoms keep the plain content hash.
+        // so the (content_hash, agent_id) dedup key (013's
+        // `uq_claims_content_hash_agent`, dropped from 150; the identity tests
+        // re-add it) cannot collapse two documents' structural rows; atoms keep
+        // the plain content hash.
         for c in &doc_plan.claims {
             let plain = content_hash(&c.content);
             if c.id_is_document_scoped() {
