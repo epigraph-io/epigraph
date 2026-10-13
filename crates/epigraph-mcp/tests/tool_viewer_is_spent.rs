@@ -90,6 +90,31 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// order, same reasoning as `visibility_lint.rs::SPENT_MARKERS`.
 const SPENT_MARKERS: &[&str] = &[".splice(", "visibility = 'public'"];
 
+/// Does `body` spend its viewer? Matched against the body's text.
+fn spends_viewer(body: &str) -> bool {
+    SPENT_MARKERS.iter().any(|m| body.contains(m))
+}
+
+/// One line per viewer-taking fn that runs SQL, does not spend its viewer and
+/// carries no `VISIBILITY-EXEMPT:` reason — the verdict
+/// [`every_viewer_taking_tool_fn_that_runs_sql_spends_the_viewer`] asserts empty.
+fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for f in fns {
+        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
+            // Delegating wrapper: its callee is subject to this lint or to
+            // `visibility_lint.rs`.
+            continue;
+        }
+        let spends = spends_viewer(&f.body);
+        let exempt = f.body.contains(EXEMPT_MARKER);
+        if !spends && !exempt {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+    offenders
+}
+
 fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")
 }
@@ -205,61 +230,68 @@ struct ViewerFn {
 
 /// Every `fn` under `src/tools/` whose parameter list mentions `Viewer`.
 fn viewer_taking_fns() -> Vec<ViewerFn> {
+    tool_files()
+        .into_iter()
+        .flat_map(|(file, src)| viewer_taking_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`viewer_taking_fns`] over ONE source string, so the verdict can be
+/// exercised on synthetic sources that do not exist under `src/tools/`.
+fn viewer_taking_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
     let mut out = Vec::new();
-    for (file, src) in tool_files() {
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find("fn ") {
-            let at = from + rel;
-            from = at + 3;
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
 
-            if at > 0 {
-                let prev = src.as_bytes()[at - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue;
-                }
-            }
-
-            let after = &src[at + 3..];
-            let name_end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            if name_end == 0 {
+        if at > 0 {
+            let prev = src.as_bytes()[at - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
                 continue;
             }
-            let name = after[..name_end].to_string();
-
-            let mut cursor = at + 3 + name_end;
-            let rest = src[cursor..].trim_start();
-            if rest.starts_with('<') {
-                let lt = src[cursor..].find('<').expect("just matched") + cursor;
-                let generics = balanced(&src, lt, b'<', b'>');
-                cursor = lt + generics.len();
-            }
-            let Some(paren_rel) = src[cursor..].find('(') else {
-                continue;
-            };
-            let paren = cursor + paren_rel;
-            if !src[cursor..paren].trim().is_empty() {
-                continue;
-            }
-            let params = balanced(&src, paren, b'(', b')');
-            if !params.contains("Viewer") {
-                continue;
-            }
-
-            let Some(brace_rel) = src[paren + params.len()..].find('{') else {
-                continue;
-            };
-            let brace = paren + params.len() + brace_rel;
-            let body = balanced(&src, brace, b'{', b'}').to_string();
-
-            out.push(ViewerFn {
-                file: file.clone(),
-                line: src[..at].matches('\n').count() + 1,
-                name,
-                body,
-            });
         }
+
+        let after = &src[at + 3..];
+        let name_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = after[..name_end].to_string();
+
+        let mut cursor = at + 3 + name_end;
+        let rest = src[cursor..].trim_start();
+        if rest.starts_with('<') {
+            let lt = src[cursor..].find('<').expect("just matched") + cursor;
+            let generics = balanced(src, lt, b'<', b'>');
+            cursor = lt + generics.len();
+        }
+        let Some(paren_rel) = src[cursor..].find('(') else {
+            continue;
+        };
+        let paren = cursor + paren_rel;
+        if !src[cursor..paren].trim().is_empty() {
+            continue;
+        }
+        let params = balanced(src, paren, b'(', b')');
+        if !params.contains("Viewer") {
+            continue;
+        }
+
+        let Some(brace_rel) = src[paren + params.len()..].find('{') else {
+            continue;
+        };
+        let brace = paren + params.len() + brace_rel;
+        let body = balanced(src, brace, b'{', b'}').to_string();
+
+        out.push(ViewerFn {
+            file: file.to_string(),
+            line: src[..at].matches('\n').count() + 1,
+            name,
+            body,
+        });
     }
     out
 }
@@ -287,20 +319,7 @@ fn the_scanner_finds_the_tool_surface_rather_than_passing_vacuously() {
 
 #[test]
 fn every_viewer_taking_tool_fn_that_runs_sql_spends_the_viewer() {
-    let fns = viewer_taking_fns();
-    let mut offenders = Vec::new();
-    for f in &fns {
-        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
-            // Delegating wrapper: its callee is subject to this lint or to
-            // `visibility_lint.rs`.
-            continue;
-        }
-        let spends = SPENT_MARKERS.iter().any(|m| f.body.contains(m));
-        let exempt = f.body.contains(EXEMPT_MARKER);
-        if !spends && !exempt {
-            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
-        }
-    }
+    let offenders = unspent_offenders(&viewer_taking_fns());
 
     assert!(
         offenders.is_empty(),
@@ -344,5 +363,86 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
          EXPECTED_EXEMPTIONS in the same commit and say at the site why no \
          predicate can be written — and if the reason cites a compensating \
          control, make sure that control exists in this tree.\n"
+    );
+}
+
+/// A spend marker counts only where it is CODE, never where it is prose.
+///
+/// The fixtures are synthetic source strings run through the same selector and
+/// the same verdict as the real scan, so this test cannot be satisfied by
+/// editing `src/tools/`.
+#[test]
+fn spend_markers_count_only_in_code_not_in_comments() {
+    // 1. Markers present only in comments (line, block, doc): the SQL runs
+    //    with no predicate, so the function must be reported.
+    let commented = r#"
+        pub async fn list_titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, McpError> {
+            // let sql = viewer.splice("SELECT c.content FROM claims c WHERE /* {VISIBILITY:c} */");
+            /* previously: AND (c.visibility = 'public' OR ...) */
+            /// TODO restore viewer.splice( here
+            let rows = sqlx::query_scalar("SELECT content FROM claims")
+                .fetch_all(pool)
+                .await?;
+            Ok(rows)
+        }
+    "#;
+    let fns = viewer_taking_fns_in("synthetic.rs", commented);
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    let offenders = unspent_offenders(&fns);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "a viewer-taking fn whose only `.splice(` / `visibility = 'public'` \
+         text is inside comments runs its SQL unfiltered and must be reported, \
+         got {offenders:?}"
+    );
+    assert!(offenders[0].contains("list_titles"), "{}", offenders[0]);
+
+    // 2. A real `.splice(` call spends the viewer.
+    let spliced = r#"
+        pub async fn list_titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, McpError> {
+            let sql = viewer.splice("SELECT c.content FROM claims c WHERE /* {VISIBILITY:c} */", 1);
+            let rows = sqlx::query_scalar(&sql).fetch_all(pool).await?;
+            Ok(rows)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_taking_fns_in("synthetic.rs", spliced)).is_empty(),
+        "a spliced statement must count as spending the viewer"
+    );
+
+    // 3. The static three-bind predicate lives INSIDE the SQL string literal,
+    //    so string contents must stay visible to the spend check.
+    let three_bind = r#"
+        pub async fn list_titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, McpError> {
+            let rows = sqlx::query_scalar!(
+                "SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+                viewer.bypass_bind(),
+                &viewer.group_bind()
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_taking_fns_in("synthetic.rs", three_bind)).is_empty(),
+        "the static three-bind predicate inside a SQL literal must count as \
+         spending the viewer"
+    );
+
+    // 4. `VISIBILITY-EXEMPT:` is a comment convention by design, including a
+    //    Rust line comment: it must still exempt (and stay in the reviewed
+    //    exemption set, which reads the same raw body).
+    let exempt = r#"
+        pub async fn corpus_size(pool: &PgPool, viewer: &Viewer) -> Result<i64, McpError> {
+            // VISIBILITY-EXEMPT: corpus-cardinality scalar, no row content leaves.
+            let n = sqlx::query_scalar("SELECT COUNT(*) FROM claims").fetch_one(pool).await?;
+            Ok(n)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_taking_fns_in("synthetic.rs", exempt)).is_empty(),
+        "a `// VISIBILITY-EXEMPT:` line comment must still exempt the function"
     );
 }
