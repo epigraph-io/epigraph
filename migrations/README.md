@@ -1285,8 +1285,11 @@ restart.
   the application's advisory lock from the same PR. A no-op on the long-lived
   database; cannot fail on data. Slot from the drain register (147 released);
   checked before claiming: no open PR branch carries a `150`. Sets
-  `lock_timeout = '3s'`. Pinned by `epigraph-db/tests/claim_repo_helpers.rs`
-  (`the_dedup_race_is_serialized_*`) and
+  `lock_timeout = '3s'`. Its effect is pinned by
+  `claim_repo_helpers.rs::migrated_claims_carry_no_full_content_hash_agent_unique`;
+  the lock that replaces it by `epigraph-db/tests/claim_repo_helpers.rs`
+  (`the_dedup_race_is_serialized_*`,
+  `the_dedup_lock_is_held_until_the_callers_transaction_commits`) and
   `epigraph-api/tests/post_claims_dedup_409.rs`. **Deploy order:** none
   against other migrations. On a database that still HAS the constraint,
   apply it with (or after) the binaries that take the lock: before them the

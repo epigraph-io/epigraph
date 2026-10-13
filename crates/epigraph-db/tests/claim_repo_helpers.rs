@@ -1050,3 +1050,49 @@ async fn the_dedup_lock_is_held_until_the_callers_transaction_commits(pool: PgPo
     );
     assert_eq!(id_2, id_1, "caller 2 must answer with caller 1's row");
 }
+
+/// Migration 150 leaves no `uq_claims_content_hash_agent` on a database
+/// migrated to head — CI's shape equals the long-lived database's.
+///
+/// Every race arm above drops the constraint itself, so without this pin
+/// deleting 150, no-op'ing it, or a later migration that re-adds the full
+/// UNIQUE (migrations/README.md forbids it) would leave the suite green while
+/// CI again proved a dedup guarantee production lacks. Checks the named
+/// constraint AND any unique index over exactly `(content_hash, agent_id)`;
+/// a future PARTIAL index (`WHERE is_current`) is the sanctioned target and is
+/// not counted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migrated_claims_carry_no_full_content_hash_agent_unique(pool: PgPool) {
+    let named: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conrelid = 'claims'::regclass AND conname = 'uq_claims_content_hash_agent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect pg_constraint");
+    assert_eq!(
+        named, 0,
+        "uq_claims_content_hash_agent is present after a full migrate: migration 150 must drop it \
+         so CI has the long-lived database's claims shape (backlog 00f1a517)"
+    );
+
+    let full_unique: Vec<String> = sqlx::query_scalar(
+        "SELECT i.indexrelid::regclass::text FROM pg_index i
+         WHERE i.indrelid = 'claims'::regclass
+           AND i.indisunique
+           AND i.indpred IS NULL
+           AND i.indnkeyatts = 2
+           AND (SELECT array_agg(a.attname::text ORDER BY a.attname)
+                  FROM pg_attribute a
+                 WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey))
+               = ARRAY['agent_id', 'content_hash']",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("inspect pg_index");
+    assert!(
+        full_unique.is_empty(),
+        "a non-partial unique index over (content_hash, agent_id) exists after a full migrate: \
+         {full_unique:?}"
+    );
+}
