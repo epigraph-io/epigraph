@@ -50,7 +50,8 @@
 //!   submitter's human are NOT admitted over HTTP (operator ruling,
 //!   2026-10-13: the shared host credential must not gain edit rights over a
 //!   human's workflows); their authority traces to the human through
-//!   `OPERATED_BY` / the author binding.
+//!   `OPERATED_BY` / the author binding, and their authorship through the
+//!   `AUTHORED` edges below.
 //! * PROVENANCE. Every write admitted over the authenticated transport is
 //!   recorded on its own transaction ([`record_workflow_write`]): the admin
 //!   arm's `workflows.admin_write` row, and for the submitter and operator arms
@@ -63,6 +64,18 @@
 //!   `security_events_append` admits no other attribution on that stamp; the
 //!   actor is `acting_agent`. A new generation records one row per anchor it
 //!   was checked against, naming the anchor and the row it created.
+//! * AUTHORSHIP, on EVERY transport (stdio included). Every claim a workflow
+//!   mutation CREATES gets an `AUTHORED` edge (agent -> claim) from the ACTING
+//!   agent (the caller over HTTP, this server's pinned agent on stdio), on the
+//!   write's own transaction
+//!   (`epigraph_ingest_executor::record_caller_authorship`). The claims stay
+//!   authored and stamped by the system ingest agent (`claims.agent_id`); the
+//!   edge is what connects the agent that wrote them to them. Only claims the
+//!   call CREATED get one: a reused claim (a step already present, an
+//!   operation atom shared with another workflow or a document, a re-ingest)
+//!   keeps the edge of the agent that created it. The edge is idempotent, its
+//!   tenancy is the edges trigger's, and `delete_step` / `deprecate_workflow`
+//!   create no claims and write none (the provenance row records who acted).
 //! * THE ADMIN ARM IS NOT THE TOKEN'S SCOPE. It was: the first revision reused
 //!   [`crate::tools::claims::require_owner_or_admin`], which admits on
 //!   `claims:admin` in the token alone, and the write then ran on the system
