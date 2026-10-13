@@ -295,3 +295,126 @@ async fn update_with_evidence_stores_an_empirical_source_url(pool: PgPool) {
         "evidence.source_url for claim {claim_id}; the empirical arm must not drop the URL"
     );
 }
+
+/// A testimonial's `source_url` parameter is the only way to set
+/// `Testimony.source`, so callers pass free text (a person's name) there, and
+/// the writer stores it in the column verbatim. `get_claim` promises "the URLs
+/// of the evidence", so a column value that is not an `http(s)` URL must not be
+/// surfaced — the same rule the `properties` fallback applies to testimony.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_testimonial_whose_source_is_a_name_surfaces_no_url(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = submit(
+        &server,
+        &viewer,
+        rfp_submission(
+            "u036: a testimony from a named witness",
+            "testimonial",
+            Some("Dr. Jane Witness"),
+        ),
+    )
+    .await;
+
+    // CALIBRATION: the free text really is in the column, so the empty list
+    // below is the read's filter and not an empty column.
+    assert_eq!(
+        stored_source_urls(&pool, claim_id).await,
+        vec![Some("Dr. Jane Witness".to_string())]
+    );
+    let body = get_claim_json(&server, &viewer, claim_id).await;
+    assert_eq!(body["source_urls"], serde_json::json!([]), "{body}");
+}
+
+/// The rest of the legacy `properties` fallback, one row per arm, in evidence
+/// order:
+///
+/// * a testimony whose `source` IS an `http(s)` URL — surfaced;
+/// * a figure's DOI — surfaced as `https://doi.org/<doi>`;
+/// * a literature row whose `doi` is not a DOI (ingestion spells such an
+///   identifier `doi:<id>`, `ingestion.rs`) — NOT surfaced as a bogus doi.org
+///   link;
+/// * a row whose column and `properties.source_url` disagree — the column
+///   wins, and the properties URL is not listed at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_legacy_fallback_covers_testimony_and_figure_and_the_column_wins(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = seed_claim(&pool, "u036: a claim with every legacy shape", 0.6).await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+    let minute = |n: i64| t0 + chrono::Duration::minutes(n);
+
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "testimony",
+        serde_json::json!({
+            "type": "testimony",
+            "source": "https://example.org/u036/witness",
+            "testified_at": "2026-01-01T00:00:00Z",
+            "verification": null
+        }),
+        minute(0),
+    )
+    .await;
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "figure",
+        serde_json::json!({
+            "type": "figure",
+            "doi": "10.5555/u036.fig",
+            "figure_id": "Fig. 2a",
+            "caption": null,
+            "mime_type": "image/png",
+            "page": null
+        }),
+        minute(1),
+    )
+    .await;
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "reference",
+        serde_json::json!({
+            "type": "literature",
+            "doi": "arXiv:2401.00001",
+            "extraction_target": "abstract",
+            "page_range": null
+        }),
+        minute(2),
+    )
+    .await;
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "document",
+        serde_json::json!({
+            "type": "document",
+            "source_url": "https://example.org/u036/stale-properties-url",
+            "mime_type": "text/plain",
+            "checksum": null
+        }),
+        minute(3),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE evidence SET source_url = 'https://example.org/u036/column-url' \
+          WHERE claim_id = $1 AND properties->>'source_url' LIKE '%stale-properties-url'",
+    )
+    .bind(claim_id)
+    .execute(&pool)
+    .await
+    .expect("give the document row a column URL that disagrees with its properties");
+
+    let body = get_claim_json(&server, &viewer, claim_id).await;
+    assert_eq!(
+        body["source_urls"],
+        serde_json::json!([
+            "https://example.org/u036/witness",
+            "https://doi.org/10.5555/u036.fig",
+            "https://example.org/u036/column-url"
+        ]),
+        "{body}"
+    );
+}

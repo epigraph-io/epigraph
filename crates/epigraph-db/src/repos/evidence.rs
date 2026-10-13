@@ -666,12 +666,16 @@ impl EvidenceRepository {
     /// `include_source_urls` (backlog 43ab8c73): one batched query rather than
     /// a `get_provenance` per claim.
     ///
-    /// The `evidence.source_url` column wins. Rows written before that column
+    /// The `evidence.source_url` column wins when it holds an `http(s)` URL.
+    /// It may hold free text instead: MCP `testimonial` evidence stores the
+    /// caller's `source_url` parameter there, and that parameter is the
+    /// witness's name as often as a link. Rows written before that column
     /// was populated (it was always NULL) fall back to `properties`: a
     /// Document's `source_url`, a Testimony's `source` only when it is an
     /// `http(s)` URL (otherwise it is free text such as `"unknown"`), and a
-    /// Literature/Figure DOI as `https://doi.org/<doi>`, mirroring REST
-    /// `claim_provenance`.
+    /// Literature/Figure DOI as `https://doi.org/<doi>` only when it is a DOI
+    /// (`10.` prefix; ingestion spells any other identifier `doi:<id>`, which
+    /// has no doi.org link).
     ///
     /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), not per claim: a hidden
     /// evidence row may hang off a public claim (operator hide, foreign
@@ -692,14 +696,19 @@ impl EvidenceRepository {
         }
         let sql = viewer.splice(
             "SELECT e.claim_id, \
-                    COALESCE(e.source_url, \
+                    COALESCE( \
+                      CASE WHEN e.source_url ~* '^https?://' THEN e.source_url END, \
                       CASE e.properties->>'type' \
                         WHEN 'document' THEN e.properties->>'source_url' \
                         WHEN 'testimony' THEN \
                           CASE WHEN e.properties->>'source' ~* '^https?://' \
                                THEN e.properties->>'source' END \
-                        WHEN 'literature' THEN 'https://doi.org/' || (e.properties->>'doi') \
-                        WHEN 'figure' THEN 'https://doi.org/' || (e.properties->>'doi') \
+                        WHEN 'literature' THEN \
+                          CASE WHEN e.properties->>'doi' ~ '^10\\.' \
+                               THEN 'https://doi.org/' || (e.properties->>'doi') END \
+                        WHEN 'figure' THEN \
+                          CASE WHEN e.properties->>'doi' ~ '^10\\.' \
+                               THEN 'https://doi.org/' || (e.properties->>'doi') END \
                       END) AS url \
              FROM evidence e \
              WHERE e.claim_id = ANY($1) \
