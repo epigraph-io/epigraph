@@ -20,20 +20,33 @@ scalar: it has no representation in the DS layer at all. Sampled claims return
 `source: "no_bbas"` in the canonical frame.
 
 A bare scalar conflates two different statements — "85% likely true" and "credible
-source, incomplete evidence". Dempster-Shafer separates them:
+source, incomplete evidence". Dempster-Shafer separates them. The BBA is the
+**pignistic-preserving** seed the runtime already writes on a claim's first
+evidence update (`MassFunction::from_pignistic_prior`, backlog fc55465b / drain
+U026): the least-committed binary BBA whose BetP equals the scalar.
 
 ```
-m({supported}) = 0.85      <- what the source asserts
-m(Θ)           = 0.15      <- "high but not 1.0" IS the ignorance mass
+m({supported}) = 2t - 1 = 0.70   <- what the source commits to
+m(Θ)           = 2 - 2t = 0.30   <- the ignorance mass; BetP(supported) = 0.85 = t
 ```
+
+(For t < 0.5 the committed mass `1 - 2t` goes on the other hypothesis; t = 0.5 is
+the vacuous BBA and nothing is written; t is capped to [0.005, 0.995].)
+
+> **Amended 2026-10-12 (drain U026).** This plan first specified the simple-support
+> shape `m({supported}) = t, m(Θ) = 1 - t`. Its BetP is `(1+t)/2`, so the migration
+> alone would have moved a 0.85 claim to 0.925. Because this migration and the
+> runtime seed both skip a (claim, frame) that already has a BBA, the two shapes
+> would never have reconciled; the script now writes the runtime's shape and tag
+> (`combination_method = 'truth_value_seed'`).
 
 Migrating provenance into a BBA buys four things:
 
 1. **The default epistemic lens becomes meaningful.** Today it would be a no-op
    for most of the corpus, because most claims have no BBA to read.
 2. **The 0.85 cap becomes principled.** It stops being a magic ceiling and becomes
-   an ignorance floor: `m(Θ) >= 0.15` for any provenance-only claim. Nothing is
-   ever certain from provenance alone.
+   an ignorance floor: `m(Θ) = 2 - 2t >= 0.30` for any provenance-only claim.
+   Nothing is ever certain from provenance alone.
 3. **Edges combine instead of compete.** Today a `refutes` edge writes DS columns
    while provenance owns `truth_value` in a different column — backlog 14b98adc.
    As BBAs they combine under Dempster in one frame.
@@ -52,6 +65,7 @@ Migrating provenance into a BBA buys four things:
 | G4 | Perspective library exists with non-null `source_reliability` | 100+ perspectives currently exist, every one with `source_reliability: null`, auto-minted per call. A null reliability makes the lens re-weighting a no-op, so migrating into it produces BBAs that no lens can discriminate. | **OPEN** |
 | G5 | Dry-run reviewed on prod-sized counts | Population sizing must be read before writing, not after. | pending |
 | G6 | Rehearsed on a restored snapshot | 476k rows; the rollback path must be exercised, not assumed. | pending |
+| G7 | Reliability discount decided (added 2026-10-12, drain U026) | The runtime seed is stored undiscounted (`source_strength` 1.0, `evidence_type` NULL), so its BetP is t. This script writes `--evidence-type` (default `textbook_assertion`), so `effective_source_strength` weights each seed by that type's calibrated weight w: effective BetP = 1/2 + w(t - 1/2). Same shape and tag, different reading. Decide whether provenance priors are discounted (keep the flag) or written as the runtime writes them. | **OPEN** |
 
 **G2 is the one most likely to be skipped and most damaging if it is.** This
 migration gives previously single-frame claims a second frame. Before `51780ce4`,
@@ -72,7 +86,14 @@ claim, and the operator names the contexts via `--frame-ids`.
 
 Three consequences, all now implemented:
 
-1. **The binary-only guard was wrong and is gone.** It refused any frame with
+1. **SUPERSEDED 2026-10-12 (drain U026): binary-only is back, for a different
+   reason.** The seed is now `from_pignistic_prior`'s shape, which is defined (and
+   refused otherwise) for two-hypothesis frames, so the script refuses a non-binary
+   frame. An n-ary pignistic-preserving prior (`m({a}) = (nt-1)/(n-1)` for
+   t >= 1/n) is an open design question, not a script default. The original text
+   follows for the record.
+
+   ~~The binary-only guard was wrong and is gone.~~ It refused any frame with
    `len(hypotheses) != 2`, justified as "mapping onto three hypotheses requires
    inventing a position on the third." That reasoning was incorrect — Θ *is* that
    position. `m({asserted}) = tv, m(Θ) = 1 - tv` generalizes to any arity, with Θ
@@ -146,8 +167,11 @@ that Phase 3 makes rollback lossy and why that is acceptable.
 
 ## Rollback
 
-Every written row is tagged `combination_method = 'provenance_migration_v1'`, which
-no other writer uses. Rollback is therefore a scoped delete, and the manifest
+Every written row is tagged `combination_method = 'truth_value_seed'` (the runtime
+seed's tag, amended 2026-10-12) and `locality_tag = 'provenance'` (runtime seeds carry
+`'unknown'`). Rollback deletes only manifest ids that still carry both, so it is
+still a scoped delete; the manifest names the migration (`provenance_migration_v1`)
+on every line. The manifest
 records the exact `mass_functions.id` of each insert plus the claim's prior
 `truth_value` / DS columns.
 
