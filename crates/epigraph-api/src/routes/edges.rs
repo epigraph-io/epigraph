@@ -3001,6 +3001,19 @@ mod tests {
         assert!(!is_valid_relationship(""));
     }
 
+    /// `qualifies` (backlog 99582af7, a belief-neutral scope caveat) is
+    /// accepted in its lower-case canonical spelling ONLY, per the U014 casing
+    /// ruling. The whitelist already mixes cases for older relations
+    /// (`CONTRADICTS`, `EQUIVALENT_TO`, `derived_from`/`DERIVED_FROM`); an
+    /// upper-case `QUALIFIES` alias would split one relation into two
+    /// spellings that readers and the MCP twin treat differently.
+    #[test]
+    fn qualifies_is_valid_in_lower_case_only() {
+        assert!(is_valid_relationship("qualifies"));
+        assert!(!is_valid_relationship("QUALIFIES"));
+        assert!(!is_valid_relationship("Qualifies"));
+    }
+
     #[test]
     fn test_create_edge_request_deserializes() {
         let json = serde_json::json!({
