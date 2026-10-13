@@ -32,8 +32,9 @@ const PLACEHOLDER_AUTHOR_NAMES: &[&str] = &[
     "unknown authors",
     "anonymous",
     "anon",
+    // "na" is deliberately absent: it is a real surname (e.g. Korean "Na"), and
+    // the placeholder spelling "N/A" is listed.
     "n/a",
-    "na",
     "none",
     "null",
     "nil",
@@ -146,6 +147,9 @@ mod tests {
             "Unknownson",
             "Anon Kumar",
             "Nadia Al-Na",
+            "Na",
+            "NA",
+            "Ji-hoon Na",
             "Ann Author",
         ] {
             assert!(
