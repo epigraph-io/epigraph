@@ -540,7 +540,10 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // `UPDATE claims` (truth value, counters) became
     // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
     // viewer-stamped transaction.
-    ("workflows.rs", 2),
+    // 2 -> 0, key removed (backlog 5ce88457): the post-commit
+    // `UPDATE claims SET embedding` in `store_workflow` and `ingest_workflow`
+    // became `ClaimRepository::store_embedding_if_unsealed` on a
+    // system-agent-stamped transaction (`embed_inserted_workflow_claims`).
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.

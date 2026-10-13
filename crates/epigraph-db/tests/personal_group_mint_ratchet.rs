@@ -295,9 +295,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
         "system_agent_write_authority",
-        1,
-        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step). Same \
-         preflight, same refusals (InternalError).",
+        2,
+        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step), and \
+         `embed_inserted_workflow_claims` (the same two handlers' post-commit embed, backlog \
+         5ce88457), which runs only after that transaction committed, so the agent already \
+         resolved once in the request. Same preflight; a refusal there logs and stores no \
+         vector.",
     ),
     (
         "epigraph-cli/src/bin/hypothesis.rs",
