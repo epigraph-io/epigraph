@@ -171,6 +171,12 @@ pub struct ClusterEdgeOut {
 /// Every bound is opt-in: with none of `limit`, `min_size`, `include_edges`
 /// or `edge_limit` present the handler returns today's unbounded body,
 /// unchanged. `color_by` is not a bound.
+///
+/// The presence of ANY of those four keys selects the bounded response shape,
+/// even when its value bounds nothing: `?include_edges=true` alone still adds
+/// `total_supernodes` / `truncated` and orders edges by `weight DESC`. The
+/// keys are typed, so a malformed value (`?limit=abc`, `?include_edges=1`)
+/// is a 400 from the query extractor rather than being ignored.
 #[derive(Debug, Deserialize)]
 pub struct OverviewParams {
     #[serde(default)]
@@ -179,7 +185,10 @@ pub struct OverviewParams {
     /// `1..=OVERVIEW_BOUND_MAX`.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Drop supernodes whose `size` is below this.
+    /// Drop supernodes whose `size` is below this. A FILTER, not a cap: with
+    /// no `limit` every qualifying supernode and (without `edge_limit`) every
+    /// edge among them still comes back, so a caller with a body budget must
+    /// also pass `limit` and `edge_limit`.
     #[serde(default)]
     pub min_size: Option<i32>,
     /// `false` returns `cluster_edges: []` without reading them. Default `true`.
