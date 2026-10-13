@@ -2345,14 +2345,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536. Default `wipe_first=true` ensures clean rebuilds on each call. Pass `false` only for additive runs with a unique `label_prefix` (otherwise duplicate themes accumulate — see backlog: missing UNIQUE constraint on claim_themes.label)."
+        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536, wipe_first=false (additive: new themes are added alongside the existing set, and repeated runs under one label_prefix accumulate duplicate labels). `wipe_first=true` deletes EVERY existing theme, whatever its prefix, and clears every claim's theme assignment before rebuilding: it requires claims:admin and the canonical label_prefix \"auto\", and is refused otherwise with nothing written. To read the current themes use list_themes / get_theme, never this tool."
     )]
     async fn theme_cluster(
         &self,
         Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::themes::theme_cluster(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::themes::theme_cluster(self, params, auth).await
     }
 
     // ── RDF Triple Layer (3 tools) ──
