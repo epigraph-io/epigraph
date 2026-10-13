@@ -1392,6 +1392,19 @@ pub struct EvolveStepResponse {
     pub belief_cascade: Option<epigraph_engine::retraction_cascade::CascadeReport>,
 }
 
+/// POST /api/v1/workflows/steps/{id}/evolve - Evolve a versioned step.
+///
+/// Creates a new claim in the step's lineage that `supersedes` (linear
+/// refinement; the parent is retired) or `revises` (a concurrent branch; both
+/// stay current) the parent. With `supersedes` the new claim records
+/// `supersedes = parent` and the administrative Supersede cascade (as
+/// `POST /api/v1/claims/{id}/supersede` runs it) carries the retired step's
+/// edges onto it, reported in `cascade` (`applied`; `deferred` to the replay
+/// timer when no maintenance connection is configured; or `failed`, and
+/// replayable) and `belief_cascade`. The workflow's `executes` edge, its step
+/// chain (`step_follows` / `phase_follows`), the lineage's `revises` history
+/// and other agents' `asserts` / `AUTHORED` stay on the retired step.
+/// `revises` retires nothing and runs no cascade.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,

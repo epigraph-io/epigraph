@@ -1556,7 +1556,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent."
+        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent. With 'supersedes' the new claim records supersedes = parent and the administrative Supersede cascade (as supersede_claim runs it) carries the retired step's edges onto it; the response's `cascade` reports it (status applied; deferred, for the replay timer to apply, when this server has no maintenance connection; or failed, and replayable), with `belief_cascade`. The workflow's `executes` edge, its step chain (`step_follows` / `phase_follows`), the lineage's `revises` history and other agents' `asserts` / `AUTHORED` stay on the retired step. 'revises' retires nothing and runs no cascade."
     )]
     async fn evolve_step(
         &self,
