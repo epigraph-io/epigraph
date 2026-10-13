@@ -1,9 +1,8 @@
-//! `POST /api/v1/claims/:id/assess` must never leave a typed combined cache
-//! (backlog bc06ec6f). Its input BBA and its combined cache share one
-//! `mass_functions` key, so the cache replaces the input in the same request;
-//! the row that survives is the combined cache and must stay untyped. The
-//! input is untyped too: its masses were already sized with the request's
-//! type weight.
+//! `POST /api/v1/claims/:id/assess` must never leave a typed row (backlog
+//! bc06ec6f). Its input BBA and its combined cache share one `mass_functions`
+//! key, so the handler does not store the cache over the input (backlog
+//! b5cb3efb). The row that survives is the input. It must stay untyped,
+//! because its masses were already sized with the request's type weight.
 //!
 //! Its own binary because the handler reads `calibration.toml` relative to the
 //! working directory, so this test moves the process to the workspace root.
@@ -51,7 +50,7 @@ async fn spawn_app(conn_opts: &PgConnectOptions) -> (SocketAddr, oneshot::Sender
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn assess_leaves_only_an_untyped_combined_cache(
+async fn assess_leaves_only_its_untyped_input(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -103,11 +102,12 @@ async fn assess_leaves_only_an_untyped_combined_cache(
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("mass_function_id in {body}"));
 
-    // The handler stores its input BBA with no agent and no perspective, then
-    // stores the combined result under the SAME key (claim, frame, NULL, NULL;
-    // unique NULLS NOT DISTINCT, migration 034), so the upsert replaces the
-    // input with the combined cache. What survives is a combined row, and a
-    // combined row has no single type.
+    // The handler stores its input BBA with no agent and no perspective. The
+    // combined result's key is the SAME (claim, frame, NULL, NULL; unique NULLS
+    // NOT DISTINCT, migration 034), so storing it would overwrite the input, and
+    // the combine-input readers would then drop that input as a cached row.
+    // The handler therefore skips the cache while an input holds the slot
+    // (backlog b5cb3efb). What survives is the untyped input.
     let rows: Vec<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT id, combination_method, evidence_type FROM mass_functions WHERE claim_id = $1",
     )
@@ -118,19 +118,16 @@ async fn assess_leaves_only_an_untyped_combined_cache(
     assert_eq!(
         rows.len(),
         1,
-        "input and combined rows share one key: {rows:?}"
+        "one row on the shared key: the input, with no cache beside it: {rows:?}"
     );
     assert_eq!(
         rows[0].0, mf_id,
-        "the surviving row is the upserted input row: {rows:?}"
-    );
-    assert_ne!(
-        rows[0].1.as_deref(),
-        Some("discount"),
-        "the input row was replaced by the combined cache: {rows:?}"
+        "the surviving row is the input the handler stored: {rows:?}"
     );
     assert_eq!(
-        rows[0].2, None,
-        "the combined cache must stay untyped: {rows:?}"
+        rows[0].1.as_deref(),
+        Some("discount"),
+        "the input row survives; no combined cache was stored over it: {rows:?}"
     );
+    assert_eq!(rows[0].2, None, "the input must stay untyped: {rows:?}");
 }

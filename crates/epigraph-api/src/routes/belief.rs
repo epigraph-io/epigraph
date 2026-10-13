@@ -1462,22 +1462,28 @@ pub async fn submit_evidence(
 
     // Store the combined result as a system mass function (agent_id = None)
     let combined_json = combined.masses_to_json();
-    let _ = epigraph_db::MassFunctionRepository::store(
-        pool,
-        request.claim_id,
-        frame_id,
-        None, // system-generated combined result
-        &combined_json,
-        final_k,
-        // A lone BBA is not folded, so `final_method` is None; label the row
-        // anyway, or the combine-input readers cannot tell this cached copy
-        // from an agent-less input and fold it twice (backlog b5cb3efb).
-        final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
-        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
-        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-    )
-    .await;
+    // Not over an input: the cached row's (claim, frame, NULL, NULL) key is
+    // also where an agent-less, perspective-less input lives, and the
+    // combine-input readers would drop that input once a cached label
+    // replaced it (backlog b5cb3efb).
+    if !epigraph_db::cached_combination_slot_holds_input(&all_rows) {
+        let _ = epigraph_db::MassFunctionRepository::store(
+            pool,
+            request.claim_id,
+            frame_id,
+            None, // system-generated combined result
+            &combined_json,
+            final_k,
+            // A lone BBA is not folded, so `final_method` is None; label the row
+            // anyway, or the combine-input readers cannot tell this cached copy
+            // from an agent-less input and fold it twice (backlog b5cb3efb).
+            final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
+            None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
+            "unknown", // combined result; locality is per-input, not aggregate (issue #197)
+            None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
+        )
+        .await;
+    }
 
     let report_responses: Vec<CombinationReportResponse> = reports
         .iter()

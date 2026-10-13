@@ -166,6 +166,36 @@ fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
     sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
 }
 
+/// Whether a writer must NOT store its cached combination row for this pair,
+/// because the row would overwrite an input.
+///
+/// `inputs` must come from a combine-input reader such as
+/// [`MassFunctionRepository::get_for_claim_frame`], which has already
+/// excluded the cached rows.
+///
+/// The cached row's key is (claim, frame, NULL agent, NULL perspective). The
+/// unique key is `NULLS NOT DISTINCT` (migration 034), so this is ONE slot per
+/// pair, and an agent-less, perspective-less INPUT lives in that slot too:
+/// `/assess` always stores its input there, and `/frames/:id/evidence` does
+/// when the body names neither an agent nor a perspective. Writing the cache
+/// would overwrite that input, and the readers would then drop it as a cached
+/// row, losing the evidence (backlog b5cb3efb). When this returns `true` the
+/// writer skips the cache. The input stays in the slot and is folded once.
+///
+/// A row in the slot counts as an input only if it carries a label: any label
+/// that survived the reader's predicate is not a cached-combination label. An
+/// UNLABELLED row is ambiguous. It is usually the copy that writers before
+/// b5cb3efb cached for a lone BBA, so the writer keeps overwriting it and that
+/// stale copy corrects itself, exactly as the writer always did.
+#[must_use]
+pub fn cached_combination_slot_holds_input(inputs: &[MassFunctionRow]) -> bool {
+    inputs.iter().any(|row| {
+        row.source_agent_id.is_none()
+            && row.perspective_id.is_none()
+            && row.combination_method.is_some()
+    })
+}
+
 /// A row from the mass_functions table
 #[derive(Debug, Clone, FromRow)]
 pub struct MassFunctionRow {
@@ -1689,6 +1719,52 @@ mod tests {
             evidence_id: Some(Uuid::new_v4()),
             created_at: Utc::now(),
         };
+    }
+
+    /// Only a LABELLED agent-less, perspective-less row blocks the cache.
+    /// An agent's row and a perspective's row live on other keys, and an
+    /// unlabelled row in the slot is the pre-b5cb3efb single-BBA copy, which
+    /// the writer overwrites.
+    #[test]
+    fn only_a_labelled_row_in_the_shared_slot_blocks_the_cached_combination() {
+        let row =
+            |agent: Option<Uuid>, perspective: Option<Uuid>, label: Option<&str>| MassFunctionRow {
+                id: Uuid::new_v4(),
+                claim_id: Uuid::nil(),
+                frame_id: Uuid::nil(),
+                source_agent_id: agent,
+                perspective_id: perspective,
+                masses: serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                conflict_k: None,
+                combination_method: label.map(str::to_string),
+                source_strength: None,
+                evidence_type: None,
+                locality_tag: "unknown".to_string(),
+                evidence_id: None,
+                created_at: Utc::now(),
+            };
+        let some = Some(Uuid::new_v4());
+        let agent_input = row(some, None, Some("discount"));
+        let perspective_input = row(None, some, Some("discount"));
+
+        assert!(!cached_combination_slot_holds_input(&[]));
+        assert!(!cached_combination_slot_holds_input(&[
+            agent_input.clone(),
+            perspective_input.clone()
+        ]));
+        assert!(!cached_combination_slot_holds_input(&[
+            agent_input.clone(),
+            row(None, None, None)
+        ]));
+        for label in ["discount", "auto_wire", "prior"] {
+            assert!(
+                cached_combination_slot_holds_input(&[
+                    agent_input.clone(),
+                    row(None, None, Some(label))
+                ]),
+                "an agent-less, perspective-less {label:?} input holds the slot"
+            );
+        }
     }
 
     /// The cached-row labels are exactly the `Debug` spelling the writers

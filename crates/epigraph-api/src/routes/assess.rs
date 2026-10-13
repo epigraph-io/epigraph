@@ -237,9 +237,10 @@ pub async fn assess_claim(
         None,
         // Untyped on purpose (bc06ec6f). `build_bba_directed` already sized
         // these masses with the request's type weight, so a typed row would be
-        // discounted by it a second time on any later fold. The row is also
-        // transient: the combined row stored below shares its
-        // (claim, frame, NULL, NULL) key and replaces it in this request.
+        // discounted by it a second time on any later fold. The row sits in
+        // the pair's (claim, frame, NULL, NULL) slot, which is also the
+        // combined row's key, so the combined row is not stored below while
+        // this input holds the slot (backlog b5cb3efb).
         None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
@@ -373,22 +374,28 @@ pub async fn assess_claim(
     let final_method = final_method_str.as_deref();
 
     let combined_json = combined.masses_to_json();
-    let _ = epigraph_db::MassFunctionRepository::store(
-        pool,
-        claim_id,
-        frame_id,
-        None, // system-generated combined result
-        &combined_json,
-        final_k,
-        // A lone BBA is not folded, so `final_method` is None; label the row
-        // anyway, or the combine-input readers cannot tell this cached copy
-        // from an agent-less input and fold it twice (backlog b5cb3efb).
-        final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
-        None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
-        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-    )
-    .await;
+    // Not over an input: the cached row's (claim, frame, NULL, NULL) key is
+    // also where an agent-less, perspective-less input lives, and the
+    // combine-input readers would drop that input once a cached label
+    // replaced it (backlog b5cb3efb).
+    if !epigraph_db::cached_combination_slot_holds_input(&all_rows) {
+        let _ = epigraph_db::MassFunctionRepository::store(
+            pool,
+            claim_id,
+            frame_id,
+            None, // system-generated combined result
+            &combined_json,
+            final_k,
+            // A lone BBA is not folded, so `final_method` is None; label the row
+            // anyway, or the combine-input readers cannot tell this cached copy
+            // from an agent-less input and fold it twice (backlog b5cb3efb).
+            final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
+            None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
+            "unknown", // combined result; locality is per-input, not aggregate (issue #197)
+            None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
+        )
+        .await;
+    }
 
     // Store global scoped belief cache
     let _ = epigraph_db::ScopedBeliefRepository::upsert(

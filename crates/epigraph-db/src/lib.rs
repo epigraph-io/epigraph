@@ -159,7 +159,8 @@ pub use repos::graph_view::{
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use repos::mass_function::{
-    delete_edge_bbas, CachedBelief, EdgeBbaCascade, MassFunctionRow, CACHED_COMBINATION_UNFOLDED,
+    cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,
+    MassFunctionRow, CACHED_COMBINATION_UNFOLDED,
 };
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
 // `ownership` table on this line. The export came in from main, which still
