@@ -396,6 +396,74 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_mixed_bba_is_not_grouped_with_a_simple_support() {
+        // A legacy mixed BBA (mass on {TRUE} AND {FALSE}) is not a simple
+        // support function: the cautious rule's "strongest repeat" reading does
+        // not apply to it, so it must fold as an independent input even when it
+        // shares a source key with a simple support on either of its focal
+        // elements. Both verdicts are present, so whichever focal element a
+        // mis-grouping picked, it would land in a group.
+        let f = frame();
+        let sup = support(0, 0.8, 0.9);
+        let refute = support(1, 0.5, 0.9);
+        let mixed = MassFunction::new(
+            f.clone(),
+            std::collections::BTreeMap::from([
+                (FocalElement::positive(BTreeSet::from([0])), 0.4),
+                (FocalElement::positive(BTreeSet::from([1])), 0.2),
+                (FocalElement::theta(&f), 0.4),
+            ]),
+        )
+        .unwrap();
+        let independent =
+            combination::combine_multiple(&[sup.clone(), refute.clone(), mixed.clone()], 0.9)
+                .unwrap()
+                .0;
+        let (c, _) = combine_with_source_dependence(
+            vec![
+                (key(1, "https://a/x"), sup),
+                (key(1, "https://a/x"), refute),
+                (key(1, "https://a/x"), mixed),
+            ],
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(c.masses(), independent.masses());
+    }
+
+    #[test]
+    fn repeats_on_a_frame_too_large_for_the_cautious_pass_fold_as_before() {
+        // Above MAX_CAUTIOUS_HYPOTHESES the cautious pass is skipped (it walks
+        // the power set): keyed repeats on such a frame are Dempster-folded
+        // exactly as they were before the rule.
+        let big = FrameOfDiscernment::new(
+            "nine",
+            (0..=MAX_CAUTIOUS_HYPOTHESES)
+                .map(|i| format!("H{i}"))
+                .collect(),
+        )
+        .unwrap();
+        assert!(big.hypothesis_count() > MAX_CAUTIOUS_HYPOTHESES);
+        let m = combination::discount(
+            &MassFunction::simple(big, BTreeSet::from([0]), 0.8).unwrap(),
+            0.9,
+        )
+        .unwrap();
+        let independent = combination::combine_multiple(&[m.clone(), m.clone()], 0.9)
+            .unwrap()
+            .0;
+        let (c, _) = combine_with_source_dependence(
+            vec![
+                (key(1, "https://a/x"), m.clone()),
+                (key(1, "https://a/x"), m),
+            ],
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(c.masses(), independent.masses());
+    }
+
+    #[test]
     fn normalize_rejects_blank_and_folds_trivial_variants() {
         assert_eq!(normalize_source_url("   "), None);
         assert_eq!(normalize_source_url("/"), None);
