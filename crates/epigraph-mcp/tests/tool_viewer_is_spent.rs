@@ -46,6 +46,9 @@
 //! `visibility_lint.rs` gives: binding an array proves a parameter was
 //! supplied, not that the SQL reads it.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking fn under `src/tools/` that runs SQL and carries a
@@ -90,9 +93,19 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// order, same reasoning as `visibility_lint.rs::SPENT_MARKERS`.
 const SPENT_MARKERS: &[&str] = &[".splice(", "visibility = 'public'"];
 
-/// Does `body` spend its viewer? Matched against the body's text.
+/// Does `body` spend its viewer?
+///
+/// Matched against the body with Rust comments removed, so a marker that is
+/// only prose — a commented-out `.splice(` call, a doc line quoting the
+/// predicate — does not count. String literals are KEPT: `visibility =
+/// 'public'` only ever appears inside SQL text.
+///
+/// Only the spend side is stripped. [`EXEMPT_MARKER`] is read from the raw body
+/// on purpose: `VISIBILITY-EXEMPT:` is a comment convention, and stripping it
+/// would turn a reviewed exemption into an offender.
 fn spends_viewer(body: &str) -> bool {
-    SPENT_MARKERS.iter().any(|m| body.contains(m))
+    let code = strip_comments(body);
+    SPENT_MARKERS.iter().any(|m| code.contains(m))
 }
 
 /// One line per viewer-taking fn that runs SQL, does not spend its viewer and
