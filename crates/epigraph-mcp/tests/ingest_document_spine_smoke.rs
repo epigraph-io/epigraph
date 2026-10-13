@@ -301,3 +301,73 @@ async fn spine_rejects_placeholder_author(pool: PgPool) {
         "the real author asserts every spine claim despite the placeholder ahead of her"
     );
 }
+
+/// The spine walk's byline gate is its own copy too: an all-placeholder
+/// structured list counts as "no real author", so the body byline is recovered
+/// (it was gated on an EMPTY list only). Byline authors get `authored → paper`
+/// and no per-claim `asserts` (the planner emitted none for the placeholder).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let byline_text =
+        "Spine Smoke Test Paper\n\nGrace Byline, Ada Byline\n\nAbstract\nSpine body text.\n";
+    assert_eq!(
+        epigraph_ingest::document::byline::parse_byline_authors(byline_text).len(),
+        2,
+        "CALIBRATION: the body byline parses to two authors"
+    );
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-byline");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Unknown", "affiliations": [], "roles": ["author"]}
+    ]);
+    v["source_text"] = serde_json::json!(byline_text);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let authored_names: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT a.display_name FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+        ORDER BY a.display_name
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let authored_names: Vec<&str> = authored_names.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        authored_names,
+        vec!["Ada Byline", "Grace Byline"],
+        "exactly the two byline authors author the paper; no 'Unknown'"
+    );
+
+    let byline_asserts: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts'
+          AND a.display_name IN ('Ada Byline', 'Grace Byline', 'Unknown')
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        byline_asserts.0, 0,
+        "byline-recovered authors get authored→paper only, never per-claim asserts"
+    );
+}
