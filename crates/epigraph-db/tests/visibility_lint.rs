@@ -1557,6 +1557,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "human_of",
+        "READ through migration 122's `epigraph_human_of` SECURITY DEFINER function (widened by \
+         149); same reason as `operator_actor`. It returns one agent id (the human the NAMED \
+         agent belongs to) or NULL, the same relationship `operator_of_author` and \
+         `author_binding` already expose.",
+    ),
+    (
+        "agent.rs",
+        "live_delegation",
+        "READ composed of `author_binding`, `operator_actor` and `human_of`, three SECURITY \
+         DEFINER reads registered here; it reads no table itself. It returns the human the NAMED \
+         agent may act for now, and the binding label, for a caller-authority gate that must \
+         answer on the shared system agent's stamped transaction.",
+    ),
+    (
+        "agent.rs",
         "operates_agents",
         "READ through migration 107's `epigraph_operates_agents` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns one boolean for the NAMED agent (does any \

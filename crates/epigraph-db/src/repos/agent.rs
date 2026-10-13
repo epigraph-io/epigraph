@@ -34,6 +34,15 @@ pub struct OperatorLink {
     pub operator_group_id: Uuid,
 }
 
+/// A caller's LIVE delegation from a human operator, from
+/// [`AgentRepository::live_delegation`]: the human it may act for now, and the
+/// binding that says so ([`LIVE_LINK_BINDING`] or [`CLIENT_ALLOWLIST_BINDING`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveDelegation {
+    pub operator_id: Uuid,
+    pub binding: &'static str,
+}
+
 /// The operator an AUTHOR's claims belong to, from the link record alone.
 ///
 /// Produced only by [`AgentRepository::operator_of_author`] (migration 107's
@@ -1696,6 +1705,80 @@ impl AgentRepository {
     ) -> Result<Option<AuthorOperator>, DbError> {
         let mut conn = pool.acquire().await?;
         Self::operator_of_author(&mut conn, agent_id).await
+    }
+
+    /// "Which human does `agent_id` belong to?", through migration 122's
+    /// `epigraph_human_of` (widened by 149): the agent itself when it is a
+    /// registered human operator; else the operator its `operator_links` row
+    /// names (`live_only`: a NOT-retired row only; otherwise a row of any
+    /// state, which is how a retired agent still belongs to its human); else
+    /// the human its allowlisted OAuth client is bound to (149, arm (c), which
+    /// has no retired state); else `None`.
+    ///
+    /// It answers "whose is this?", never "may this agent act?". A live link
+    /// to a human whose registration was since revoked still names that human
+    /// here; [`Self::live_delegation`] is the caller-side question.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database without
+    /// migration 122) or the read fails.
+    pub async fn human_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        live_only: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_human_of($1, $2)")
+                .bind(agent_id)
+                .bind(live_only)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// "May `agent_id` act for a human right now, and for which one?" — the
+    /// CALLER side of a delegated authority, composed only of the kernel's
+    /// existing reads, never a new notion of "live":
+    ///
+    /// * `epigraph_author_binding` says [`LIVE_LINK_BINDING`] (migration 122:
+    ///   a NOT-retired link to an agent that is still a registered human
+    ///   operator with an active human client, so a revoked human binds no
+    ///   one: the `OPL01` semantics) AND migration 107's acting read
+    ///   ([`Self::operator_actor`]: a live writer membership in that human's
+    ///   group, and the human's own row there live) names the human; or
+    /// * it says [`CLIENT_ALLOWLIST_BINDING`] (migration 149: the agent of an
+    ///   allowlisted, active service/agent OAuth client, bound to a live human
+    ///   operator), and the human is [`Self::human_of`] with `live_only`.
+    ///
+    /// `None` for a human operator itself (it acts as itself, not for anyone),
+    /// a retired or membership-revoked link, a revoked human, a revoked
+    /// allowance, and an unbound agent. Both reads are SECURITY DEFINER
+    /// functions, so the answer does not depend on the connection's stamp.
+    ///
+    /// # Errors
+    /// As [`Self::author_binding`] and [`Self::operator_actor`]. Never mapped
+    /// to `None`: a gate must not decide on an answer it did not get.
+    pub async fn live_delegation(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<LiveDelegation>, DbError> {
+        match Self::author_binding(&mut *conn, agent_id).await?.as_deref() {
+            Some(LIVE_LINK_BINDING) => {
+                Ok(Self::operator_actor(&mut *conn, agent_id)
+                    .await?
+                    .map(|l| LiveDelegation {
+                        operator_id: l.operator_id,
+                        binding: LIVE_LINK_BINDING,
+                    }))
+            }
+            Some(CLIENT_ALLOWLIST_BINDING) => Ok(Self::human_of(&mut *conn, agent_id, true)
+                .await?
+                .map(|operator_id| LiveDelegation {
+                    operator_id,
+                    binding: CLIENT_ALLOWLIST_BINDING,
+                })),
+            _ => Ok(None),
+        }
     }
 
     /// "Does any agent name `agent_id` as its operator?", through migration
