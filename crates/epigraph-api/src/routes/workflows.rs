@@ -3253,6 +3253,98 @@ mod tests {
         assert_eq!(rows, 2);
     }
 
+    /// `outcome_fixture` with a deterministic `MockProvider` as the embedding
+    /// service: the OpenAI boundary is the only thing stood in for.
+    async fn embedding_outcome_fixture(
+        pool: &PgPool,
+        canonical_name: &str,
+    ) -> (axum::Router, uuid::Uuid) {
+        use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome goal embedding.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let state = AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(
+            std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536))),
+        );
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn embedded_rows(pool: &PgPool, workflow_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// U033 / I229 part (4), HTTP twin: a real `goal_text` is embedded once
+    /// and written on every step row, so the report feeds
+    /// `behavioral_affinity_hierarchical`. Before U033 the route passed `None`
+    /// and every row's `goal_embedding` was NULL.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_embeds_a_real_goal_on_every_step_row(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-embed-http").await;
+        let mut body = two_step_body(None);
+        body["goal_text"] = serde_json::json!("Deploy with zero downtime");
+        let status = post_outcome(app, workflow_id, body).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(rows, 2, "both step rows land");
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            2,
+            "every step row carries the goal embedding"
+        );
+    }
+
+    /// The other half of the route's goal filter: the `"hierarchical"`
+    /// placeholder, blank text and an absent goal are not goals, and embedding
+    /// them would make every such report "similar" to every other. The
+    /// embedding service is configured, so a 0 here is the filter and nothing
+    /// else (the positive twin above shows the same fixture does embed).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_does_not_embed_a_placeholder_or_blank_goal(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-no-embed-http").await;
+        for goal in [
+            Some(serde_json::json!("hierarchical")),
+            Some(serde_json::json!("   ")),
+            None,
+        ] {
+            let mut body = two_step_body(None);
+            if let Some(g) = goal {
+                body["goal_text"] = g;
+            }
+            let status = post_outcome(app.clone(), workflow_id, body).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 3, "all three reports landed");
+        assert_eq!(rows, 6);
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            0,
+            "no placeholder, blank or absent goal is embedded"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
         use crate::state::{ApiConfig, AppState};
