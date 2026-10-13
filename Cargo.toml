@@ -76,6 +76,14 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 curve25519-dalek = "4"
+# JWT signing/validation (epigraph-auth, epigraph-api, epigraph-mcp share one copy:
+# epigraph-mcp matches on the `jsonwebtoken::errors::ErrorKind` epigraph-auth returns).
+# 10.x makes the crypto backend a feature: EXACTLY ONE of `aws_lc_rs` / `rust_crypto`
+# must be on, or the first sign/verify panics at runtime. `rust_crypto` is pure Rust:
+# `aws_lc_rs` would add a C build (aws-lc-sys) to epigraph-mcp's release graph, where
+# nothing else uses it. Floor 10.3: CVE-2026-25537 (pinned by
+# crates/epigraph-auth/tests/dependency_security_floor.rs).
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 
 # Internal crates (kernel only)
 epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (PolicyGate, LlmProvider)
