@@ -79,3 +79,181 @@ async fn an_empirical_submission_stores_its_source_url(pool: PgPool) {
         "evidence.source_url for claim {claim_id} = {stored:?}; expected it to hold {RFP_URL}"
     );
 }
+
+async fn get_claim_json(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::Viewer,
+    claim_id: Uuid,
+) -> serde_json::Value {
+    first_text(
+        &epigraph_mcp::tools::claims::get_claim(
+            server,
+            viewer,
+            epigraph_mcp::types::GetClaimParams {
+                claim_id: claim_id.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+        .await
+        .expect("get_claim"),
+    )
+}
+
+/// Insert an evidence row the way a writer from BEFORE the write-path fix left
+/// it: `source_url` column NULL, the link only inside `properties`.
+async fn seed_legacy_evidence(
+    pool: &PgPool,
+    claim_id: Uuid,
+    db_type: &str,
+    properties: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+) {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, content_hash, evidence_type, source_url, claim_id, \
+                               properties, created_at) \
+         VALUES ($1, $2, $3, NULL, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(id.as_bytes().repeat(2))
+    .bind(db_type)
+    .bind(claim_id)
+    .bind(properties)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("seed legacy evidence");
+}
+
+/// Rows written before the write-path fix keep their link only in
+/// `properties`: a Document's `source_url`, a Literature row's `doi`. `get_claim`
+/// must surface both, in evidence order, from those rows — the column is NULL.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_claim_surfaces_the_evidence_url_of_a_pre_existing_document_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = seed_claim(&pool, "u036: a claim with legacy evidence", 0.6).await;
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "document",
+        serde_json::json!({
+            "type": "document",
+            "source_url": "https://example.org/u036/doc",
+            "mime_type": "text/plain",
+            "checksum": null
+        }),
+        t0,
+    )
+    .await;
+    seed_legacy_evidence(
+        &pool,
+        claim_id,
+        "reference",
+        serde_json::json!({
+            "type": "literature",
+            "doi": "10.1234/u036",
+            "extraction_target": "abstract",
+            "page_range": null
+        }),
+        t0 + chrono::Duration::minutes(1),
+    )
+    .await;
+
+    let body = get_claim_json(&server, &viewer, claim_id).await;
+    assert_eq!(
+        body["source_urls"],
+        serde_json::json!([
+            "https://example.org/u036/doc",
+            "https://doi.org/10.1234/u036"
+        ]),
+        "{body}"
+    );
+}
+
+/// The digest consumer's bulk read: one opt-in flag, and without it the
+/// response is unchanged (no `source_urls` key at all). A URL submitted twice to
+/// the same claim (the second call a content-hash dedup hit) is listed once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_claims_by_label_returns_urls_only_when_asked(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = submit(
+        &server,
+        &viewer,
+        rfp_submission("u036: rfp listed", "empirical", Some(RFP_URL)),
+    )
+    .await;
+    // Different evidence text: the same text on the same claim is the same
+    // evidence row (unique on content_hash, claim_id).
+    let mut resubmit = rfp_submission("u036: rfp listed", "empirical", Some(RFP_URL));
+    resubmit.evidence_data = "listing seen again".into();
+    let again = submit(&server, &viewer, resubmit).await;
+    assert_eq!(again, claim_id, "the resubmit must be a content-hash hit");
+
+    // Built from JSON so the flag is an input the tool's schema accepts.
+    let query = |include: bool| {
+        let params: epigraph_mcp::types::QueryClaimsByLabelParams =
+            serde_json::from_value(serde_json::json!({
+                "labels": ["u036-rfp"],
+                "include_source_urls": include,
+            }))
+            .expect("params");
+        params
+    };
+    let find = |body: &serde_json::Value| -> serde_json::Value {
+        body.as_array()
+            .unwrap_or_else(|| panic!("expected an array, got {body}"))
+            .iter()
+            .find(|c| c["id"] == claim_id.to_string())
+            .unwrap_or_else(|| panic!("claim {claim_id} not listed: {body}"))
+            .clone()
+    };
+
+    let with = first_text(
+        &epigraph_mcp::tools::paper_queries::query_claims_by_label(&server, &viewer, query(true))
+            .await
+            .expect("query with urls"),
+    );
+    let claim = find(&with);
+    assert_eq!(
+        claim["source_urls"],
+        serde_json::json!([RFP_URL]),
+        "{claim}"
+    );
+
+    let without = first_text(
+        &epigraph_mcp::tools::paper_queries::query_claims_by_label(&server, &viewer, query(false))
+            .await
+            .expect("query without urls"),
+    );
+    let claim = find(&without);
+    assert!(
+        claim.get("source_urls").is_none(),
+        "the default response must not carry source_urls: {claim}"
+    );
+}
+
+/// A testimony with no URL is stored with `source = "unknown"`. That is free
+/// text, not a link, so `get_claim` reports an EMPTY list — present, not absent,
+/// so a consumer can tell "no URL on file" from "this server does not say".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_testimony_with_no_url_surfaces_none(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = submit(
+        &server,
+        &viewer,
+        rfp_submission("u036: an unsourced testimony", "testimonial", None),
+    )
+    .await;
+
+    let body = get_claim_json(&server, &viewer, claim_id).await;
+    assert!(
+        body.get("source_urls").is_some(),
+        "get_claim must always carry source_urls: {body}"
+    );
+    assert_eq!(body["source_urls"], serde_json::json!([]), "{body}");
+}
