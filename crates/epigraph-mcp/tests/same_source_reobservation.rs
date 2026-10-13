@@ -35,6 +35,17 @@ async fn observe(
     data: &str,
     source_url: Option<&str>,
 ) -> f64 {
+    observe_verdict(server, pool, claim_id, data, source_url, true).await
+}
+
+async fn observe_verdict(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+    claim_id: Uuid,
+    data: &str,
+    source_url: Option<&str>,
+    supports: bool,
+) -> f64 {
     let viewer = fixture::public_viewer(pool).await;
     epigraph_mcp::tools::claims::update_with_evidence(
         server,
@@ -46,7 +57,7 @@ async fn observe(
             evidence_type: "empirical".into(),
             evidence_data: data.into(),
             source_url: source_url.map(String::from),
-            supports: true,
+            supports,
             strength: 0.8,
             labels: vec![],
         },
@@ -372,4 +383,44 @@ async fn submit_then_same_source_updates_do_not_raise_betp(pool: PgPool) {
         "framed get_belief disagrees with the post-submit value: {after_submit} vs {}",
         framed.pignistic_prob
     );
+}
+
+/// Same-source REFUTING repeats. The write path's monotonicity clamp applies
+/// only to supporting evidence (`betp = prior.min(pl)` when `supports`), so in
+/// the supporting tests a fold that wrongly LOWERED BetP could be lifted back to
+/// the first value by the clamp. No clamp applies here: this measures the
+/// write-path combine itself. Re-worded refutations of one page by one agent
+/// must leave BetP where the first refutation put it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn same_source_refutations_do_not_compound(pool: PgPool) {
+    let (server, claim) = setup(&pool, "refute").await;
+
+    let first = observe_verdict(
+        &server,
+        &pool,
+        claim,
+        "Listing withdrawn from the page.",
+        Some(PAGE),
+        false,
+    )
+    .await;
+    assert!(
+        first < 0.5,
+        "precondition: one refuting observation must move BetP below 0.5, got {first}"
+    );
+    for (i, data) in [
+        "Still withdrawn, nothing posted.",
+        "Re-checked: listing remains withdrawn.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let now = observe_verdict(&server, &pool, claim, data, Some(PAGE), false).await;
+        assert!(
+            (now - first).abs() < 1e-9,
+            "refutation #{} of the SAME source moved BetP {first} -> {now}: a repeat \
+             of one source was combined as independent evidence",
+            i + 2
+        );
+    }
 }
