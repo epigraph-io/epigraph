@@ -1341,6 +1341,56 @@ impl EdgeRepository {
         Ok(q.fetch_one(executor).await?)
     }
 
+    /// The claim-to-claim edges `viewer` can read, as
+    /// `(source_id, target_id, relationship, properties)`: the edge set
+    /// `POST /api/v1/reasoning/analyze` reasons over when its caller supplies
+    /// none.
+    ///
+    /// With `among = Some(ids)` only edges whose source AND target are both in
+    /// `ids` are returned. With `None`, every readable claim-to-claim edge.
+    /// `limit = None` is `LIMIT NULL`, i.e. no cap.
+    ///
+    /// Filtered by the co-owner-aware edge predicate
+    /// (`Viewer::edge_predicate_fragment`), so a derived result can name only
+    /// endpoints of edges the viewer could already list through
+    /// `GET /api/v1/edges`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, among))]
+    pub async fn claim_edges_for_reasoning<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        among: Option<&[Uuid]>,
+        limit: Option<i64>,
+    ) -> Result<Vec<(Uuid, Uuid, String, serde_json::Value)>, DbError> {
+        // `$1::uuid[] IS NULL` keeps one statement for both arms, so the
+        // predicate is spliced at one bind index and cannot be missed on
+        // either of them.
+        let sql = viewer.splice(
+            "SELECT e.source_id, e.target_id, e.relationship, e.properties \
+               FROM edges e \
+              WHERE e.source_type = 'claim' \
+                AND e.target_type = 'claim' \
+                AND ($1::uuid[] IS NULL \
+                     OR (e.source_id = ANY($1) AND e.target_id = ANY($1))) \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, Json<serde_json::Value>)>(&sql)
+            .bind(among)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(s, t, r, Json(p))| (s, t, r, p))
+            .collect())
+    }
+
     /// The edge-keyed BBA cleanup every application act that withdraws an edge
     /// runs, in the act's own transaction (migration 120; D1 names edge-keyed
     /// BBA deletes an administrative cascade).

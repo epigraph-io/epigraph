@@ -639,7 +639,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// refused. `routes/workflows.rs` 14 -> 12, keeping sites, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// (`recorded 14, measured 12`).
-const HIGH_WATER: usize = 256;
+/// 256 -> 255 when `routes/reasoning.rs::analyze`'s edge loader moved onto
+/// `AppState::read_as`; the file reached zero and its key was deleted.
+const HIGH_WATER: usize = 255;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -700,7 +702,8 @@ const HIGH_WATER: usize = 256;
 /// 267, the file keeping 5 post-commit side-effect sites, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// (`recorded 10, measured 5`).
-const HIGH_WATER_FILES: usize = 44;
+/// 44 -> 43 when `routes/reasoning.rs` reached zero (see [`HIGH_WATER`]).
+const HIGH_WATER_FILES: usize = 43;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -917,7 +920,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/political.rs", 5),
     ("routes/provenance.rs", 1),
     ("routes/rag.rs", 2),
-    ("routes/reasoning.rs", 1),
+    // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
+    // loader moved onto `AppState::read_as` and
+    // `EdgeRepository::claim_edges_for_reasoning` ({EDGE_VISIBILITY:e}), and the
+    // handler took a `ViewerExtractor`. Pinned by
+    // `epigraph-api/tests/reasoning_analyze_scoped_read.rs`.
     ("routes/revoke_signature.rs", 1),
     // `routes/search.rs` was 6 and is GONE, not zeroed: PR-29, conversion shard
     // 3. Two of the six were inline `sqlx::query*` statements in the handler
