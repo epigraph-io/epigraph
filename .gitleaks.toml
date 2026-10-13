@@ -1,0 +1,3 @@
+# STUB: default rules only, no allowlist yet.
+[extend]
+useDefault = true
