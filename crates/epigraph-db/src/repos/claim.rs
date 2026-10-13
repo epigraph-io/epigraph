@@ -479,6 +479,15 @@ pub struct SupersedeEdgeMigration {
     pub resourced: Vec<Uuid>,
 }
 
+/// Relationships a STEP-LINEAGE supersession (`evolve_step(supersedes)`) leaves
+/// on the retired step, in either direction.
+///
+/// `executes` attaches a workflow to its FROZEN original step: the live head is
+/// resolved through the lineage (`WorkflowRepository`'s `ResolvedStep`,
+/// `ClaimRepository::latest_in_lineage`), so moving the edge would detach the
+/// frozen step the workflow was defined with.
+pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] = &["executes"];
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -518,6 +527,12 @@ async fn require_privileged_session(
 /// `contradicts`) attached to the claim they were filed against or by; see the
 /// "Edge migration policy" section of [`ClaimRepository::supersede`]'s doc
 /// comment for why (issue #398).
+///
+/// A STEP-LINEAGE supersession (old and new share a non-null
+/// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step. The rule is
+/// derived from the rows, not from a caller flag, because the deferred replay
+/// runs this same function knowing nothing of the original caller.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -527,6 +542,31 @@ async fn migrate_superseded_edges(
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+
+    // Is this a step-lineage supersession? Both rows must carry the SAME
+    // lineage: a plain supersede of a step writes a successor with no
+    // `step_lineage_id` (supersede_act_conn's INSERT omits it), so it keeps
+    // moving `executes` like every other supersession.
+    let step_lineage: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the supersession the mutation below carries out.
+        SELECT EXISTS (
+            SELECT 1 FROM claims o JOIN claims n ON n.id = $1
+             WHERE o.id = $2
+               AND o.step_lineage_id IS NOT NULL
+               AND n.step_lineage_id = o.step_lineage_id)"#,
+    )
+    .bind(new_uuid)
+    .bind(old_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let frozen: Vec<String> = if step_lineage {
+        STEP_LINEAGE_FROZEN_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -538,12 +578,14 @@ async fn migrate_superseded_edges(
          WHERE target_id = $2 AND target_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -553,12 +595,14 @@ async fn migrate_superseded_edges(
          WHERE source_id = $2 AND source_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
