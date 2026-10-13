@@ -27,7 +27,10 @@
 //! also a pin on that.
 //!
 //! The handler is invoked directly as an `async fn`, on the `#[sqlx::test]`
-//! superuser pool with a public-only viewer. That is deliberate: this file pins
+//! superuser pool, with the viewer of a seeded agent (the call's evidence
+//! perspective records that principal, and `perspectives.owner_agent_id` is a
+//! foreign key, so the nil-principal public viewer cannot call it). That is
+//! deliberate: this file pins
 //! the handler's FRAME and CACHE semantics, not its tenancy (the stamping of
 //! `assess.rs`'s one raw-pool site is a separate change), so an RLS refusal
 //! must not be able to make an arm pass or fail.
@@ -59,9 +62,14 @@ fn request(supports: bool, confidence: f64, source_url: Option<&str>) -> AssessC
     .expect("AssessClaimRequest deserializes")
 }
 
-/// `Viewer` is not `Clone`, so each call resolves its own public viewer.
-async fn assess(pool: &PgPool, claim: Uuid, req: AssessClaimRequest) -> AssessClaimResponse {
-    let viewer = public_viewer(pool).await;
+/// `Viewer` is not `Clone`, so each call resolves its own viewer for `caller`.
+async fn assess(
+    pool: &PgPool,
+    caller: Uuid,
+    claim: Uuid,
+    req: AssessClaimRequest,
+) -> AssessClaimResponse {
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
     let state = AppState::with_db(pool.clone(), ApiConfig::default());
     let Json(resp) = assess_claim(
         ViewerExtractor(viewer),
@@ -74,10 +82,11 @@ async fn assess(pool: &PgPool, claim: Uuid, req: AssessClaimRequest) -> AssessCl
     resp
 }
 
-async fn seed_claim(pool: &PgPool, content: &str) -> (Uuid, Viewer) {
+/// A public claim plus its author, who is also the assess caller.
+async fn seed_claim(pool: &PgPool, content: &str) -> (Uuid, Viewer, Uuid) {
     let (agent, _group) = seed_agent_with_group(pool, "assess-canonical").await;
     let claim = seed_public_claim(pool, agent, content).await;
-    (claim, public_viewer(pool).await)
+    (claim, public_viewer(pool).await, agent)
 }
 
 /// Give `claim` a `binary_truth` BBA (BetP(TRUE) = 0.85) and let the cache
@@ -164,7 +173,7 @@ async fn rows_on(pool: &PgPool, claim: Uuid, frame: Uuid) -> Vec<serde_json::Val
 /// Main: two new `paper_validity_https___example_org_a/_b` frames appear.
 #[sqlx::test(migrations = "../../migrations")]
 async fn assess_without_frame_id_does_not_mint_a_frame_per_source(pool: PgPool) {
-    let (claim, viewer) = seed_claim(&pool, "assess mints no per-source frame").await;
+    let (claim, viewer, caller) = seed_claim(&pool, "assess mints no per-source frame").await;
     // binary_truth exists before the baseline, so the cache rule's own
     // get-or-create of it is not counted as a mint.
     seed_binary_truth_cache(&pool, &viewer, claim).await;
@@ -172,12 +181,14 @@ async fn assess_without_frame_id_does_not_mint_a_frame_per_source(pool: PgPool) 
 
     let a = assess(
         &pool,
+        caller,
         claim,
         request(true, 0.8, Some("https://example.org/a")),
     )
     .await;
     let b = assess(
         &pool,
+        caller,
         claim,
         request(true, 0.8, Some("https://example.org/b")),
     )
@@ -209,11 +220,12 @@ async fn assess_without_frame_id_does_not_mint_a_frame_per_source(pool: PgPool) 
 /// paper-frame BBA's value.
 #[sqlx::test(migrations = "../../migrations")]
 async fn assess_does_not_repoint_or_lower_a_binary_truth_cache(pool: PgPool) {
-    let (claim, viewer) = seed_claim(&pool, "assess respects the binary_truth cache").await;
+    let (claim, viewer, caller) = seed_claim(&pool, "assess respects the binary_truth cache").await;
     let (binary, p0) = seed_binary_truth_cache(&pool, &viewer, claim).await;
 
     assess(
         &pool,
+        caller,
         claim,
         request(true, 0.3, Some("https://example.org/weak")),
     )
@@ -242,10 +254,10 @@ async fn assess_does_not_repoint_or_lower_a_binary_truth_cache(pool: PgPool) {
 /// `(claim, frame, NULL agent, NULL perspective)` key.
 #[sqlx::test(migrations = "../../migrations")]
 async fn repeated_assess_calls_accumulate(pool: PgPool) {
-    let (claim, _viewer) = seed_claim(&pool, "assess accumulates").await;
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess accumulates").await;
 
-    let first = assess(&pool, claim, request(true, 0.9, None)).await;
-    let second = assess(&pool, claim, request(true, 0.9, None)).await;
+    let first = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    let second = assess(&pool, caller, claim, request(true, 0.9, None)).await;
     assert_eq!(first.frame_id, second.frame_id);
 
     let rows = rows_on(&pool, claim, second.frame_id).await;
@@ -279,10 +291,10 @@ async fn repeated_assess_calls_accumulate(pool: PgPool) {
 /// Main: panics with "byte index 80 is not a char boundary".
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_ascii_source_url_does_not_panic(pool: PgPool) {
-    let (claim, _viewer) = seed_claim(&pool, "assess with a non-ASCII source").await;
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess with a non-ASCII source").await;
     let url = format!("{}é", "a".repeat(79));
     assert_eq!(url.len(), 81, "CALIBRATION: `é` must straddle byte 80");
 
-    let resp = assess(&pool, claim, request(true, 0.6, Some(&url))).await;
+    let resp = assess(&pool, caller, claim, request(true, 0.6, Some(&url))).await;
     assert_eq!(resp.claim_id, claim);
 }

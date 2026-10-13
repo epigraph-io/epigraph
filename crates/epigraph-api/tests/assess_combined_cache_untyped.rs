@@ -9,6 +9,10 @@
 //! in the same request. Each call now stores its input under its own evidence
 //! perspective and no combined row at all, so the row that survives IS the
 //! `discount` input row.
+//!
+//! Driven over HTTP with a real bearer agent, so it also pins that the call's
+//! evidence perspective records that agent as `owner_agent_id` (attribution,
+//! as for the DS auto-wire's evidence perspectives; `TenancyDecl::instance_wide`).
 #![cfg(feature = "db")]
 
 mod common;
@@ -121,4 +125,19 @@ async fn assess_leaves_only_its_untyped_input_row(
         "the surviving row is the discount input, not a combined cache: {rows:?}"
     );
     assert_eq!(rows[0].2, None, "the input BBA must stay untyped: {rows:?}");
+
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT p.owner_agent_id FROM mass_functions m \
+         JOIN perspectives p ON p.id = m.perspective_id WHERE m.id = $1",
+    )
+    .bind(mf_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("the input row's perspective");
+    assert_eq!(
+        owner,
+        Some(Some(agent)),
+        "the call's evidence perspective must record the calling agent \
+         (None: no perspective row; Some(None): unattributed)"
+    );
 }

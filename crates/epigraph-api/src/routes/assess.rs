@@ -228,10 +228,16 @@ pub async fn assess_claim(
     // Each call gets its OWN row, keyed by a fresh synthetic perspective (the
     // ds_auto C-1 pattern). With agent and perspective both NULL every call
     // shared one `UNIQUE NULLS NOT DISTINCT` key, so a call overwrote the
-    // previous one and repeated assessments never accumulated.
+    // previous one and repeated assessments never accumulated. The perspective
+    // records the calling agent as `owner_agent_id` (attribution, like the DS
+    // auto-wire's evidence perspectives); a principal-less viewer leaves it NULL.
     let call_perspective = Uuid::new_v4();
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, call_perspective, None)
-        .await?;
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(
+        pool,
+        call_perspective,
+        viewer.principal(),
+    )
+    .await?;
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         pool,
         claim_id,
