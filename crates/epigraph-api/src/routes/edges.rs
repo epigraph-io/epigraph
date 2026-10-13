@@ -4419,6 +4419,7 @@ mod db_tests {
         let (events, _) = store
             .list(&EventFilter {
                 since: None,
+                after_id: None,
                 event_type: Some("edge.updated".to_string()),
                 limit: Some(1000),
                 offset: None,
@@ -4437,6 +4438,7 @@ mod db_tests {
         let (retired_events, _) = store
             .list(&EventFilter {
                 since: None,
+                after_id: None,
                 event_type: Some("edge.retired".to_string()),
                 limit: Some(1000),
                 offset: None,
@@ -4495,6 +4497,7 @@ mod db_tests {
             let (events, _) = store
                 .list(&EventFilter {
                     since: None,
+                    after_id: None,
                     event_type: Some(event_type.to_string()),
                     limit: Some(1000),
                     offset: None,
