@@ -2799,14 +2799,27 @@ pub struct ReconcileSheafParams {
 pub struct SheafSectionEntry {
     pub node_id: String,
     pub local_betp: f64,
+    /// BetP of the all-neighbour average restricted interval. Display only:
+    /// `consistency_radius` is not `|local_betp - expected_betp|` once a
+    /// Positive neighbour is present.
     pub expected_betp: f64,
+    /// Max of the Positive-group Bel-floor shortfall (the node's Bel below
+    /// the strongest supporter's restricted Bel; over-support scores 0) and
+    /// `|local_betp - expected|` over the Negative/FrameEvidence group.
     pub consistency_radius: f64,
+    /// Neighbour rows that constrain this node. The source side of a
+    /// directional positive edge (supports, elaborates, specializes,
+    /// generalizes) is not counted, so a pure supporter reports 0.
     pub neighbor_count: usize,
     pub local_belief: f64,
     pub local_plausibility: f64,
     pub open_world_local: f64,
     pub open_world_expected: f64,
+    /// Interval twin of `consistency_radius`: the max of the Bel-floor
+    /// shortfall and the Hausdorff distance to the Negative/FrameEvidence
+    /// group's expected interval.
     pub interval_inconsistency: f64,
+    /// `|width_local - width_expected|` against the all-neighbour average.
     pub ignorance_inconsistency: f64,
 }
 
