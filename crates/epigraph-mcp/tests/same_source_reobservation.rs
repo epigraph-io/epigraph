@@ -282,3 +282,94 @@ async fn compute_on_read_readers_agree_with_the_cache_after_same_source_repeats(
          {cached}, batch read {batched}"
     );
 }
+
+/// The production shape of the filed case (claim fc5e6a60): `submit_claim`
+/// records the listing on first sighting, then weekly `update_with_evidence`
+/// re-sightings of the SAME page follow. The creation BBA must carry the same
+/// source identity as the re-sightings; otherwise the FIRST re-sighting is
+/// still folded as independent corroboration (the filed 0.672 -> 0.768 step)
+/// and only later repeats are idempotent.
+///
+/// The re-sightings use the creation's strength and evidence type, so each is
+/// the same reading of the same page. (A STRONGER reading of one source may
+/// legitimately raise BetP to that reading: the cautious fold keeps the
+/// strongest, it does not freeze the first.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_then_same_source_updates_do_not_raise_betp(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let body = first_text(
+        &epigraph_mcp::tools::claims::submit_claim(
+            &server,
+            &viewer,
+            epigraph_mcp::types::SubmitClaimParams {
+                content: format!("X09 submit-then-update {}", Uuid::new_v4()),
+                methodology: "direct_observation".into(),
+                evidence_data: "Listed; 3 addenda; no due date.".into(),
+                evidence_type: "empirical".into(),
+                confidence: 0.8,
+                source_url: Some(PAGE.into()),
+                reasoning: None,
+                labels: vec![],
+                novelty_threshold: None,
+            },
+            None,
+        )
+        .await
+        .expect("submit_claim"),
+    );
+    let claim = parse_uuid_field(&body, "claim_id");
+    let after_submit = pignistic(&pool, claim).await;
+    assert!(
+        after_submit > 0.5,
+        "precondition: the creation BBA supports the claim, got {after_submit}"
+    );
+
+    for (i, data) in [
+        "Still listed, due date still not shown.",
+        "Re-checked: listing unchanged, three addenda.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let now = observe(&server, &pool, claim, data, Some(PAGE)).await;
+        assert!(
+            (now - after_submit).abs() < 1e-9,
+            "re-sighting #{} of the page submit_claim recorded moved BetP {after_submit} -> \
+             {now}: the creation BBA and the re-sighting were combined as independent sources",
+            i + 1
+        );
+    }
+
+    // The recompute and the framed reader must agree, without the write
+    // path's monotonicity clamp in play.
+    sqlx::query("UPDATE claims SET pignistic_prob = NULL WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("clear cache");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let wrote =
+        epigraph_engine::edge_factor::recompute_claim_belief_binary(&mut conn, &viewer, claim)
+            .await
+            .expect("recompute");
+    assert!(wrote, "the claim has BBAs on the binary frame");
+    drop(conn);
+    let recomputed = pignistic(&pool, claim).await;
+    assert!(
+        (recomputed - after_submit).abs() < 1e-9,
+        "recompute folded the creation BBA and same-source re-sightings as independent: \
+         post-submit BetP {after_submit}, recomputed {recomputed}"
+    );
+
+    let frame = belief_frame(&pool, claim).await;
+    let framed = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim, Some(frame))
+        .await
+        .expect("framed get_belief");
+    assert!(
+        (framed.pignistic_prob - after_submit).abs() < 1e-9,
+        "framed get_belief disagrees with the post-submit value: {after_submit} vs {}",
+        framed.pignistic_prob
+    );
+}
