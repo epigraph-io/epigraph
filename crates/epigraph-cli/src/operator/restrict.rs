@@ -33,6 +33,19 @@
 //! harvester fragments it is the provenance of, and re-meets every edge with
 //! the claim as an endpoint (migration 122's edges arm).
 //!
+//! # Nodes stay; dependent and link rows narrow
+//!
+//! The rule is that edges (links) disappear, not the nodes they connect. Every
+//! table this touches is classified in [`TABLE_ROLES`]: the claim's own
+//! DEPENDENT rows and every LINK row (an edge, a cluster, frame or
+//! neighbourhood assignment, an entity mention, a provenance link) narrow; the
+//! node at the other end (another claim, its evidence, a frame, a cluster, an
+//! entity) is never written. The one NODE the cascade itself reaches is a
+//! harvester fragment (through its provenance link): the trigger narrows it,
+//! and this tool puts it back in the same transaction unless every claim it is
+//! the provenance of ends in the target. The census then proves no other row
+//! of any table changed.
+//!
 //! # Edges with an evidence endpoint
 //!
 //! The trigger does not re-meet an edge whose endpoint is the claim's
@@ -123,6 +136,59 @@ pub const OPERATION: &str = "restrict-claims";
 pub const EVENT_APPLY: &str = "privatization.cli_restrict";
 /// `security_events.event_type` of an applied reversal of one manifest.
 pub const EVENT_REVERSE: &str = "privatization.cli_restrict_reverse";
+
+/// What a table touched by a restriction IS, which decides whether its rows
+/// narrow with the claim. The rule: the claim's own DEPENDENT rows and every
+/// LINK row (an association of the claim with another node) narrow; a NODE
+/// never narrows merely because it is connected to a narrowed claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A row that belongs to the claim alone (keyed by its `claim_id`).
+    Dependent,
+    /// A row associating the claim with another node (an edge, a cluster or
+    /// frame or neighbourhood assignment, an entity mention, a provenance
+    /// link). The other node is not touched.
+    Link,
+    /// A node the cascade reaches through a link (a harvester fragment through
+    /// its provenance): it narrows only when EVERY claim it is the provenance
+    /// of is restricted into the target; otherwise it keeps its tuple.
+    SharedNode,
+}
+
+/// The [`Role`] of every table `epigraph_propagate_tenancy` (plus `claims`,
+/// fragments and edges) touches. A closed list: a table the cascade gains is
+/// refused until it is classified here.
+pub const TABLE_ROLES: &[(&str, Role)] = &[
+    ("claims", Role::Dependent),
+    ("evidence", Role::Dependent),
+    ("reasoning_traces", Role::Dependent),
+    ("mass_functions", Role::Dependent),
+    ("ds_combined_beliefs", Role::Dependent),
+    ("ds_bayesian_divergence", Role::Dependent),
+    ("claim_versions", Role::Dependent),
+    ("challenges", Role::Dependent),
+    ("triples", Role::Dependent),
+    ("experiment_triples", Role::Dependent),
+    ("claim_signature_revocations", Role::Dependent),
+    ("entity_mentions", Role::Link),
+    ("experiment_entity_mentions", Role::Link),
+    ("claim_frames", Role::Link),
+    ("claim_clusters", Role::Link),
+    ("claim_cluster_membership", Role::Link),
+    ("claim_neighborhood_membership", Role::Link),
+    ("harvester_claim_provenance", Role::Link),
+    ("edges", Role::Link),
+    ("harvester_fragments", Role::SharedNode),
+];
+
+/// The classification of `table`, if it has one.
+#[must_use]
+pub fn role_of(table: &str) -> Option<Role> {
+    TABLE_ROLES
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, r)| *r)
+}
 
 /// Everything `restrict-claims` was told.
 #[derive(Clone, Debug)]
@@ -1022,6 +1088,26 @@ async fn run_batch(
         }
     };
     let in_target = (ctx.target, "group".to_string());
+    // A fragment is a NODE (Role::SharedNode): it narrows only if every claim
+    // it is the provenance of ends in the target (a candidate, or a claim
+    // already there). Otherwise it keeps its tuple.
+    let frag_neighbours: Vec<Uuid> = attached
+        .values()
+        .filter(|a| a.table == "harvester_fragments")
+        .flat_map(|a| a.neighbours.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let already_in_target: BTreeSet<Uuid> = fetch_claims(conn, &frag_neighbours, false)
+        .await?
+        .into_iter()
+        .filter(|c| c.owner == ctx.target && c.visibility == "group")
+        .map(|c| c.id)
+        .collect();
+    let fragment_narrows = |a: &Attached, moving: &BTreeSet<Uuid>| -> bool {
+        a.claims.iter().all(|c| moving.contains(c))
+            && a.neighbours.iter().all(|c| already_in_target.contains(c))
+    };
     let mut hold: BTreeMap<Uuid, Hold> = BTreeMap::new();
     for (k, a) in &attached {
         let predicted = match spec_of(ctx.specs, &k.0).kind {
@@ -1043,6 +1129,7 @@ async fn run_batch(
                 }
             }),
             _ if k.0 == "evidence" && pinned.contains(&k.1) => Some(a.tenancy.clone()),
+            Kind::Fragments if !fragment_narrows(a, &cand_set) => Some(a.tenancy.clone()),
             _ => Some(Tenancy {
                 owner: ctx.target,
                 visibility: "group".into(),
@@ -1095,6 +1182,11 @@ async fn run_batch(
         .filter(|(_, a)| a.claims.iter().any(|c| moving.contains(c)))
         .collect();
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
+    let kept_nodes: BTreeSet<RowKey> = s0
+        .iter()
+        .filter(|(_, a)| a.table == "harvester_fragments" && !fragment_narrows(a, &moving))
+        .map(|(k, _)| k.clone())
+        .collect();
 
     // ---- manifest first: every prior, fsynced before the write ----
     let mut prior: Vec<Record> = eligible
@@ -1125,6 +1217,23 @@ async fn run_batch(
     .await
     .context("UPDATE claims")?
     .rows_affected();
+
+    // NODES the cascade reached and must not narrow: back on their tuple.
+    let mid = states_of(conn, ctx.specs, &claim_ids, &kept_nodes).await?;
+    let node_writes: Vec<(String, RowState)> = kept_nodes
+        .iter()
+        .filter_map(|k| {
+            let a = s0.get(k)?;
+            (mid.get(k) != Some(&RowState::of(a))).then(|| (k.1.clone(), RowState::of(a)))
+        })
+        .collect();
+    let nodes_restored = write_rows(
+        conn,
+        spec_of(ctx.specs, "harvester_fragments"),
+        &claim_ids,
+        &node_writes,
+    )
+    .await?;
 
     // The evidence-endpoint edges: the narrowest of their endpoints NOW.
     let ev_keys_moving: BTreeSet<RowKey> = keys.intersection(&ev_edge_keys).cloned().collect();
@@ -1213,6 +1322,7 @@ async fn run_batch(
                 },
             },
             _ if k.0 == "evidence" && pinned.contains(&k.1) => before.clone(),
+            _ if kept_nodes.contains(k) => before.clone(),
             _ => RowState {
                 tenancy: Tenancy {
                     owner: ctx.target,
@@ -1269,6 +1379,13 @@ async fn run_batch(
         "claims".into(),
         (0, i64::try_from(claim_ids.len()).unwrap_or(i64::MAX), 0),
     );
+    if nodes_restored > 0 {
+        // The cascade narrowed them and this batch put them back: two updates.
+        expect_counts
+            .entry("harvester_fragments".into())
+            .or_default()
+            .1 += 2 * i64::try_from(nodes_restored).unwrap_or(i64::MAX);
+    }
     for (t, n) in &planned {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
     }
@@ -1407,6 +1524,13 @@ pub async fn run(
     let ids_sha256 = sha256_file(&opts.claims_file)?;
     let target_kind = check_target(conn, opts.target, opts.operator).await?;
     let specs = tables::propagated_tables(conn).await?;
+    if let Some(t) = specs.iter().find(|t| role_of(&t.name).is_none()) {
+        bail!(
+            "the tenancy cascade reaches table {}, which restrict-claims has not classified as \
+             node, link or dependent (restrict::TABLE_ROLES); refusing",
+            t.name
+        );
+    }
     let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;

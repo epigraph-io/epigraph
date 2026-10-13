@@ -2628,6 +2628,14 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   its narrow meet until that endpoint is reversed. The declassification
   interlock is armed transaction-locally around the one claims UPDATE, for
   claims recorded as originally public only.
+- **Nodes stay; links narrow.** The claim's own dependent rows (evidence,
+  traces, BBAs, beliefs, versions, challenges, triples, revocations) and its
+  LINK rows (edges, cluster / frame / neighbourhood assignments, entity
+  mentions, provenance links) narrow. A node at the other end (another claim
+  or its evidence, a frame, a cluster, an entity) is never written. A harvester
+  fragment narrows only if every claim it is the provenance of is restricted
+  into the target; otherwise it keeps its tuple. The classification is
+  `restrict::TABLE_ROLES`; an unclassified table is refused.
 - **Edges with an evidence endpoint** (claim->evidence, evidence->evidence)
   are not re-met by the tenancy trigger, so the tool narrows them itself: an
   edge is no more visible than its least visible endpoint. Each takes the meet
