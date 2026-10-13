@@ -101,7 +101,7 @@
 
 mod lint_text;
 
-use lint_text::strip_comments;
+use lint_text::spend_views;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -643,13 +643,14 @@ fn ungated_writes_in(file: &str, src: &str) -> (Vec<String>, Vec<String>) {
 
 /// How many `.splice_write(` calls `body` makes.
 ///
-/// Counted over the body with Rust comments removed, so a commented-out call or
-/// a doc line naming the method is not a gate. Only this count is stripped:
+/// Counted over the body's CODE view ([`spend_views`]: Rust comments removed,
+/// string contents blanked), so a commented-out call, a doc line naming the
+/// method, or a log string naming it is not a gate. Only this count is stripped:
 /// [`scoped_write_offsets`] and [`inside_query_macro`] keep reading the raw body,
 /// because their offsets index into it and a different text would move the
 /// register for reasons unrelated to gating.
 fn splice_write_calls(body: &str) -> usize {
-    strip_comments(body).matches(".splice_write(").count()
+    spend_views(body).0.matches(".splice_write(").count()
 }
 
 /// Functions that spliced SOME of their scoped writes but not all of them.

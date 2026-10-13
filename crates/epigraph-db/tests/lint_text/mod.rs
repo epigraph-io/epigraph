@@ -1,33 +1,22 @@
 //! Shared source-text preparation for this crate's **source-scanning lints**.
 //!
-//! A third copy of `crates/epigraph-api/tests/lint_text/mod.rs` (the second is
-//! `crates/epigraph-mcp/tests/lint_text/mod.rs`). The body of
-//! [`strip_comments`] is byte-identical to both; only this header and the doc
-//! comment differ. The reason it is a copy and not a shared crate is the one the
-//! `epigraph-mcp` twin gives: integration tests cannot share modules across
-//! crates, and how cross-crate test reuse should work is a separate decision.
-//! When that decision lands, all three collapse into it.
+//! One function, [`spend_views`], used by `visibility_lint.rs` and
+//! `write_gate_lint.rs` for ONE thing: deciding whether a function body
+//! *spends* its viewer (or, for writes, gates them). Each spend marker is
+//! matched only where it can take effect:
 //!
-//! The older `strip_line_comments` copies in this directory are left alone;
-//! they handle line comments only and serve sentinel scans whose argument does
-//! not depend on block comments.
+//! * the method-call markers (`.splice(`, `.splice_write(`) in CODE — not in a
+//!   comment, not inside a string literal;
+//! * the SQL-text marker (`visibility = 'public'`) in LIVE SQL — inside a
+//!   string literal, but not inside that SQL's own `--` / `/* */` comments, and
+//!   not in a Rust comment.
 //!
-//! # What the callers here read stripped, and what they deliberately do not
-//!
-//! `visibility_lint.rs` and `write_gate_lint.rs` use this for ONE thing: the
-//! *spend* markers (`.splice(`, `.splice_write(`, `visibility = 'public'`) are
-//! matched against comment-stripped function bodies, so a marker written in a
-//! comment does not count as the function using its viewer. Everything else
-//! stays on the raw body, for measured reasons:
+//! Everything else in those files stays on the raw body, for measured reasons:
 //!
 //! * **`VISIBILITY-EXEMPT:` is read RAW.** The exemption convention is carried
-//!   in comments by design. Most markers sit inside SQL string literals as
-//!   `-- VISIBILITY-EXEMPT:` (which survive this function, since it keeps
-//!   strings), but some are Rust line comments, and stripping them would turn
-//!   reviewed exemptions into offenders and shrink the exemption register.
-//! * **String literals are kept.** `visibility = 'public'` only ever appears
-//!   inside SQL text, so a stripper that also blanked strings would report
-//!   every `sqlx::query!` macro site as unspent.
+//!   in comments by design — mostly in-SQL `-- VISIBILITY-EXEMPT:`, some as
+//!   Rust line comments — so stripping it would turn reviewed exemptions into
+//!   offenders and shrink the exemption register.
 //! * **Scoped-write offsets, the "runs SQL" gate and the function selectors
 //!   are unchanged.** They are a different measurement; moving them in the same
 //!   change as the spend predicate would make a moved register ambiguous
@@ -35,29 +24,59 @@
 //!
 //! Every exact-set register in both files is unchanged by adopting this — the
 //! files' own register tests are the measurement.
+//!
+//! `epigraph-mcp/tests/tool_viewer_is_spent.rs` carries a copy with a
+//! byte-identical body, for the same reason `epigraph-mcp` carries its own
+//! `lint_text`: integration tests cannot share modules across crates, and how
+//! cross-crate test reuse should work is a separate, pending decision.
 
-/// Remove `//` line comments and `/* */` block comments, respecting string
-/// literals so a `"//"` inside a SQL fragment does not truncate the line, and
-/// recognising char literals so a lifetime tick does not open a string.
+/// The two texts a SPEND check reads, returned as `(code, live_sql)`:
 ///
-/// Deliberately simple and deliberately over-eager on one case: a `//` inside a
-/// raw string would be treated as a comment. For a caller that reads stripped
-/// text only to decide whether a SPEND marker is present, that over-eagerness
-/// can only hide a marker and report a function as unspent — a loud failure,
-/// never a silent clearance.
-pub fn strip_comments(src: &str) -> String {
+/// * **`code`** — Rust comments removed and string-literal CONTENTS blanked,
+///   the quotes kept. A method-call marker (`.splice(`, `.splice_write(`)
+///   counts only here: written inside a string — a log line, an error
+///   message — it calls nothing.
+/// * **`live_sql`** — Rust comments removed, string-literal contents kept minus
+///   the comments of the SQL they carry: `--` up to the end of its line (a real
+///   newline or a `\n` escape) and `/* */` spans. A SQL-text marker
+///   (`visibility = 'public'`) counts only here: a predicate commented out of
+///   the statement is not one the database evaluates.
+///
+/// One pass over the RAW source, with the comment and char-literal rules of
+/// `epigraph-api/tests/lint_text/mod.rs::strip_comments`. It does not run on
+/// that function's output, because that output drops the byte after each `\`
+/// escape — the byte that tells `\n` (an SQL newline) from any other escape.
+///
+/// Limits, stated so a green run is not read as more than it is:
+///
+/// * A `--` inside a SQL quoted literal (`'--'`) is read as a comment. That
+///   over-strips: it can only hide a marker and report a function as unspent,
+///   a loud failure.
+/// * An SQL comment is ended at the close of its Rust string. Where one
+///   statement is assembled from several literals with no newline between
+///   them, a comment that runs on into the next literal is not followed.
+/// * Raw strings are read with ordinary-string rules, as `strip_comments`
+///   reads them. The `"` pairs of sqlx `AS "col!"` overrides inside an
+///   `r#"…"#` statement keep the state in sync at the literal's end; the
+///   override name between them is read as code, in both views alike.
+///
+/// The `VISIBILITY-EXEMPT:` marker reads neither view: it is a comment
+/// convention by design and is read from the raw body.
+pub fn spend_views(src: &str) -> (String, String) {
     let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
+    let mut code = String::with_capacity(b.len());
+    let mut sql = String::with_capacity(b.len());
     let mut i = 0;
-    let (mut in_str, mut in_line, mut in_block) = (false, false, false);
-    let mut quote = b'"';
+    let (mut in_line, mut in_block, mut in_str) = (false, false, false);
+    let (mut sql_line, mut sql_block) = (false, false);
     while i < b.len() {
         let c = b[i];
         let next = b.get(i + 1).copied();
         if in_line {
             if c == b'\n' {
                 in_line = false;
-                out.push('\n');
+                code.push('\n');
+                sql.push('\n');
             }
         } else if in_block {
             if c == b'*' && next == Some(b'/') {
@@ -66,11 +85,44 @@ pub fn strip_comments(src: &str) -> String {
             }
         } else if in_str {
             if c == b'\\' {
-                i += 1; // skip the escaped byte
-            } else if c == quote {
-                in_str = false;
+                // An escape is never a delimiter. `\n` is an SQL newline, so it
+                // ends an SQL line comment; `\` + a real newline is a Rust line
+                // continuation, which removes the newline, so it does not.
+                if sql_line && next == Some(b'n') {
+                    sql_line = false;
+                }
+                if !sql_line && !sql_block {
+                    sql.push('\\');
+                    if let Some(n) = next {
+                        sql.push(n as char);
+                    }
+                }
+                i += 2;
+                continue;
             }
-            out.push(c as char);
+            if c == b'"' {
+                (in_str, sql_line, sql_block) = (false, false, false);
+                code.push('"');
+                sql.push('"');
+            } else if sql_line {
+                if c == b'\n' {
+                    sql_line = false;
+                    sql.push('\n');
+                }
+            } else if sql_block {
+                if c == b'*' && next == Some(b'/') {
+                    sql_block = false;
+                    i += 1;
+                }
+            } else if c == b'-' && next == Some(b'-') {
+                sql_line = true;
+                i += 1;
+            } else if c == b'/' && next == Some(b'*') {
+                sql_block = true;
+                i += 1;
+            } else {
+                sql.push(c as char);
+            }
         } else if c == b'/' && next == Some(b'/') {
             in_line = true;
             i += 1;
@@ -78,52 +130,30 @@ pub fn strip_comments(src: &str) -> String {
             in_block = true;
             i += 1;
         } else if c == b'\'' {
-            // A `'` is a LIFETIME far more often than a char literal in this
-            // tree, and an earlier revision treated both as string delimiters.
-            // That left the scanner in string state from the tick until the
-            // next one anywhere in the file, and the string arm copies bytes
-            // verbatim — so every comment in between survived unstripped. It
-            // was measured, not theorised. Counting rule, stated because an
-            // earlier revision gave three magnitudes that no single rule
-            // produces: a line whose FIRST non-whitespace is `//` and which the
-            // shipped stripper blanks while the pre-fix one left intact. On that
-            // rule, 122 such lines under `crates/epigraph-api/src/routes/`, 52
-            // under `crates/epigraph-mcp/src/tools/`, and 29 in `webhooks.rs` —
-            // the file whose doc comment produced the original report — came
-            // through the pre-fix stripper unstripped.
-            //
-            // The in-tree precedent for the correct rule is `balanced` /
-            // `balanced_block` in the two lint files that call this: recognise
-            // the char-literal SHAPE and treat nothing else as a string. So
-            // copy a char literal whole (its contents cannot open a comment)
-            // and otherwise emit the tick and stay in code.
-            let close = if b.get(i + 1) == Some(&b'\\') {
-                // Escaped: '\n', '\'', '\u{1F600}'. Bounded, because a Rust
-                // char escape is at most twelve bytes and an unbounded search
-                // would resurrect the defect above.
+            // The char-literal SHAPE rule of `strip_comments`, for the same
+            // reason: a lifetime tick must not open a string, and the contents
+            // of `'"'` must not either.
+            let close = if next == Some(b'\\') {
                 (i + 2..(i + 14).min(b.len())).find(|&k| b[k] == b'\'')
             } else if b.get(i + 2) == Some(&b'\'') {
                 Some(i + 2)
             } else {
                 None
             };
-            match close {
-                Some(end) => {
-                    for &x in &b[i..=end] {
-                        out.push(x as char);
-                    }
-                    i = end;
-                }
-                None => out.push('\''),
+            let end = close.unwrap_or(i);
+            for &x in &b[i..=end] {
+                code.push(x as char);
+                sql.push(x as char);
             }
+            i = end;
         } else {
             if c == b'"' {
                 in_str = true;
-                quote = c;
             }
-            out.push(c as char);
+            code.push(c as char);
+            sql.push(c as char);
         }
         i += 1;
     }
-    out
+    (code, sql)
 }
