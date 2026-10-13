@@ -1624,25 +1624,25 @@ async fn deprecate_hierarchical_workflow(
                 row_retired.push(c.id.to_string());
             }
         }
-        if grant.is_admin() {
-            crate::tools::workflow_authority::audit_admin_workflow_write(
-                &mut tx,
-                auth,
-                caller,
-                TOOL,
-                row,
-                grant.owner,
-                serde_json::json!({
-                    "truth_value_after": 0.05,
-                    "workflow_row_changed": row_changed > 0,
-                    "retired_claim_ids": row_retired,
-                    "kept_shared_claim_ids": row_kept,
-                    "cascade": cascade,
-                    "reason": params.reason,
-                }),
-            )
-            .await?;
-        }
+        // From the post-lock grant only (step 3): the admin arm's audit row,
+        // or the provenance row of any other authenticated arm.
+        crate::tools::workflow_authority::record_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            TOOL,
+            row,
+            *grant,
+            serde_json::json!({
+                "truth_value_after": 0.05,
+                "workflow_row_changed": row_changed > 0,
+                "retired_claim_ids": row_retired,
+                "kept_shared_claim_ids": row_kept,
+                "cascade": cascade,
+                "reason": params.reason,
+            }),
+        )
+        .await?;
         if row_changed > 0 {
             deprecated_ids.push(row.to_string());
         }

@@ -1699,6 +1699,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "security_event.rs",
+        "workflow_caller_write",
+        "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
+         write (who acted, for which human, under which arm), on the write's own system-stamped \
+         transaction, attributed to the session principal as 077's `security_events_append` \
+         requires. There is no read to filter; the row records a write the caller just made.",
+    ),
+    (
+        "security_event.rs",
         "admin_audit_write",
         "WRITE through migration 112's SECURITY DEFINER `epigraph_admin_audit_write` (batch \
          H-b review): one `security_events` row for an admin workflow write, after re-checking \

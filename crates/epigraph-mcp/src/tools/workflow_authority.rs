@@ -107,8 +107,8 @@ pub(crate) enum WorkflowArm {
 pub(crate) struct WorkflowGrant {
     /// The workflow's recorded submitter, if any.
     pub owner: Option<uuid::Uuid>,
-    /// The arm that admitted the caller. The admin arm's write must then record
-    /// [`audit_admin_workflow_write`] on the same transaction as its write.
+    /// The arm that admitted the caller. Every write it admits records it on
+    /// the same transaction through [`record_workflow_write`].
     pub arm: WorkflowArm,
 }
 
@@ -348,6 +348,97 @@ pub(crate) async fn audit_admin_workflow_write(
             "{tool_name}: could not write the admin audit row: {e}. Nothing was written."
         ))
     })
+}
+
+/// Record the write a [`WorkflowGrant`] admitted, on the SAME transaction as
+/// the write: the admin arm's `workflows.admin_write` row
+/// ([`audit_admin_workflow_write`]); for the submitter, operator and
+/// linked-agent arms, [`record_caller_workflow_write`]; nothing for an
+/// unchecked (stdio) grant. `details` carries the tool's own facts.
+///
+/// # Errors
+/// An internal error if the row cannot be written; the caller's write then
+/// rolls back with it.
+pub(crate) async fn record_workflow_write(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: WriteIdentity,
+    tool_name: &'static str,
+    workflow_id: uuid::Uuid,
+    grant: WorkflowGrant,
+    details: serde_json::Value,
+) -> Result<(), McpError> {
+    if grant.is_admin() {
+        return audit_admin_workflow_write(
+            conn,
+            auth,
+            caller,
+            tool_name,
+            workflow_id,
+            grant.owner,
+            details,
+        )
+        .await;
+    }
+    record_caller_workflow_write(conn, auth, caller, tool_name, workflow_id, grant, details).await
+}
+
+/// The PROVENANCE of a write admitted over the authenticated transport through
+/// the submitter, operator or linked-agent arm: one `workflows.caller_write`
+/// `security_events` row on the write's own transaction
+/// (`SecurityEventRepository::workflow_caller_write`), recording the arm, the
+/// acting agent, the human it acted for (`operator`: the caller's live human on
+/// the linked-agent arm, the caller itself on the operator arm, null on the
+/// submitter arm), the binding, the submitter, the tool, the workflow and the
+/// token. The rows the write makes stay authored and stamped by the system
+/// agent; this row is where the caller is recorded. A no-op for an unchecked
+/// (stdio) or admin grant (the admin arm has its own row).
+///
+/// # Errors
+/// An internal error if the row cannot be written; the caller's write then
+/// rolls back with it.
+pub(crate) async fn record_caller_workflow_write(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: WriteIdentity,
+    tool_name: &'static str,
+    workflow_id: uuid::Uuid,
+    grant: WorkflowGrant,
+    details: serde_json::Value,
+) -> Result<(), McpError> {
+    let acting = caller.agent_id();
+    let (arm, operator, binding) = match grant.arm {
+        WorkflowArm::Unchecked | WorkflowArm::Admin => return Ok(()),
+        WorkflowArm::Submitter => ("submitter", None, None),
+        WorkflowArm::Operator => ("operator", Some(acting), None),
+        WorkflowArm::LinkedAgent { operator, binding } => {
+            ("linked_agent", Some(operator), Some(binding))
+        }
+    };
+    let Some(token) = auth else {
+        return Err(internal_error(format!(
+            "{tool_name}: a {arm} workflow write with no token to record. Nothing was written."
+        )));
+    };
+    let record = serde_json::json!({
+        "action": tool_name,
+        "workflow_id": workflow_id,
+        "submitter": grant.owner,
+        "arm": arm,
+        "acting_agent": acting,
+        "operator": operator,
+        "binding": binding,
+        "client_id": token.client_id,
+        "token_jti": token.jti,
+        "write": details,
+    });
+    epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
+        .await
+        .map_err(|e| {
+            internal_error(format!(
+                "{tool_name}: could not record the write's provenance: {e}. Nothing was written."
+            ))
+        })
 }
 
 /// Remove the submitter key from caller-supplied workflow metadata, so only the

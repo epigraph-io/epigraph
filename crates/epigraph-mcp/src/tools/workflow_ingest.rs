@@ -107,6 +107,10 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // record); `None` = a brand-new lineage, whose submitter is the caller.
     let mut inherited: Option<Option<uuid::Uuid>> = None;
     let mut admin_write = false;
+    // Every anchor's grant, so the arm that admitted the caller over it is
+    // recorded with the write (`record_caller_workflow_write`).
+    let mut grants: Vec<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)> =
+        Vec::with_capacity(2);
     if creating {
         let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -127,6 +131,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             )
             .await?;
             admin_write |= grant.is_admin();
+            grants.push((anchor, grant));
             // The lineage head is checked first, so a new generation of an
             // existing name inherits ITS submitter; a new name forked from a
             // parent inherits the parent's.
@@ -150,6 +155,29 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             .await
             .map_err(internal_error)?;
         }
+    }
+    // The provenance of the authority exercised over each existing anchor
+    // through a non-admin authenticated arm: one row per anchor, naming the
+    // anchor (the workflow the caller had authority over) and the row created.
+    for (anchor, grant) in &grants {
+        crate::tools::workflow_authority::record_caller_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "workflow_ingest",
+            *anchor,
+            *grant,
+            serde_json::json!({
+                "created_workflow_id": result.workflow_id,
+                "canonical_name": extraction.source.canonical_name,
+                "generation": extraction.source.generation,
+                "parent_canonical_name": extraction.source.parent_canonical_name,
+                "lineage_head_before": anchors.lineage_head,
+                "linked_parent": anchors.linked_parent,
+                "recorded_submitter": submitter,
+            }),
+        )
+        .await?;
     }
     if admin_write {
         crate::tools::workflow_authority::audit_admin_workflow_write(
