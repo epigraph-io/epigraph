@@ -17,6 +17,10 @@
 //! * `hide-evidence` — hide and PIN selected evidence rows on the operator's
 //!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
 //!   them hidden), under the guards and manifest `hide`'s module doc lists.
+//! * `restrict-claims` — move listed PUBLIC claims, and every row that follows
+//!   them, into a target group with `visibility = 'group'` (the audited admin
+//!   privatization act; see [`restrict`]). `reown-reverse` reverses its
+//!   manifest exactly.
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!
@@ -125,6 +129,7 @@ pub mod manifest;
 pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
+pub mod restrict;
 pub mod reverse;
 pub mod system_agent;
 pub mod tables;
