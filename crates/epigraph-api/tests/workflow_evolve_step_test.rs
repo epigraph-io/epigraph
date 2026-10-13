@@ -220,3 +220,93 @@ async fn evolve_step_supersedes_creates_new_claim_and_edge() {
     ).bind(new_id).bind(parent).fetch_one(&pool).await.unwrap();
     assert_eq!(edge_count, 1);
 }
+
+/// Backlog 8d3b4527: `supersedes` runs the Supersede admin cascade, as
+/// `POST /api/v1/claims/:id/supersede` does. With the cascade configured it is
+/// APPLIED in the request: the decomposition parent's edge reaches the new
+/// head, and the workflow's `executes` stays on the frozen step (heads are
+/// resolved through the lineage).
+#[tokio::test(flavor = "multi_thread")]
+async fn evolve_step_supersedes_runs_the_supersede_cascade() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent_id = common::seed_system_agent(&pool).await;
+    let step = common::seed_claim(&pool, "a step with structure").await;
+    let decomposer = common::seed_claim(&pool, "the step's decomposition parent").await;
+    let workflow = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal) VALUES ($1, $2, 'evolve cascade http')",
+    )
+    .bind(workflow)
+    .bind(format!("evolve-cascade-http-{workflow}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let decomposes =
+        common::insert_edge(&pool, decomposer, step, "claim", "claim", "decomposes_to").await;
+    let executes =
+        common::insert_edge(&pool, workflow, step, "workflow", "claim", "executes").await;
+
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:write".into()],
+            "service",
+            None,
+            Some(agent_id),
+            chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("test JWT");
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/workflows/steps/{step}/evolve"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "parent_id": step,
+            "content": "the step, restated",
+            "edge_type": "supersedes",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "body={text}");
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["cascade"]["status"], "applied", "body={text}");
+    let head: Uuid = json["claim_id"].as_str().unwrap().parse().unwrap();
+
+    let ends = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "SELECT source_id, target_id FROM edges WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        ends(decomposes).await,
+        (decomposer, head),
+        "the decomposition parent reaches the new head"
+    );
+    assert_eq!(
+        ends(executes).await,
+        (workflow, step),
+        "executes stays on the frozen step"
+    );
+}
