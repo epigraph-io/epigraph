@@ -945,6 +945,15 @@ pub async fn get_claim(
         None => None,
     };
 
+    // The URLs of the claim's evidence, always (possibly empty): one
+    // single-id call to the batched, per-evidence-row-filtered read, so a
+    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
+    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &[id])
+        .await
+        .map_err(internal_error)?
+        .remove(&id)
+        .unwrap_or_default();
+
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
         #[serde(flatten)]
@@ -952,6 +961,7 @@ pub async fn get_claim(
         classification: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
+        source_urls: Vec<String>,
     }
 
     success_json(&GetClaimResponse {
@@ -969,6 +979,7 @@ pub async fn get_claim(
         },
         classification,
         lensed_belief,
+        source_urls,
     })
 }
 

@@ -719,6 +719,12 @@ pub struct QueryClaimsByLabelParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
+    )]
+    #[serde(default)]
+    pub include_source_urls: bool,
 }
 
 // ── Workflows ──
@@ -1221,6 +1227,22 @@ pub struct ClaimResponse {
     /// authored value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief_score: Option<f64>,
+}
+
+/// A [`ClaimResponse`] with the claim's evidence URLs, for tools that surface
+/// them (`query_claims_by_label`'s `include_source_urls`).
+///
+/// A flattened wrapper rather than a `ClaimResponse` field so the other tools'
+/// claim literals are untouched, and so the serialized claim is byte-identical
+/// to a bare `ClaimResponse` when `source_urls` is `None`.
+#[derive(Debug, Serialize)]
+pub struct ClaimWithSources {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// URLs of the evidence attached to the claim, oldest first, deduplicated
+    /// (`EvidenceRepository::source_urls_by_claim_ids`). `None` = not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

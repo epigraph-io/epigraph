@@ -658,6 +658,71 @@ impl EvidenceRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
+    /// The link of each evidence row attached to each of `claim_ids`, keyed by
+    /// claim, in evidence `created_at` order, deduplicated per claim. A claim
+    /// with no linked evidence has no entry.
+    ///
+    /// Backs `get_claim`'s `source_urls` and `query_claims_by_label`'s opt-in
+    /// `include_source_urls` (backlog 43ab8c73): one batched query rather than
+    /// a `get_provenance` per claim.
+    ///
+    /// The `evidence.source_url` column wins. Rows written before that column
+    /// was populated (it was always NULL) fall back to `properties`: a
+    /// Document's `source_url`, a Testimony's `source` only when it is an
+    /// `http(s)` URL (otherwise it is free text such as `"unknown"`), and a
+    /// Literature/Figure DOI as `https://doi.org/<doi>`, mirroring REST
+    /// `claim_provenance`.
+    ///
+    /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), not per claim: a hidden
+    /// evidence row may hang off a public claim (operator hide, foreign
+    /// attach), and its URL must not reach a viewer outside its group.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn source_urls_by_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<String>>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, Vec<String>> =
+            std::collections::HashMap::new();
+        if claim_ids.is_empty() {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            "SELECT e.claim_id, \
+                    COALESCE(e.source_url, \
+                      CASE e.properties->>'type' \
+                        WHEN 'document' THEN e.properties->>'source_url' \
+                        WHEN 'testimony' THEN \
+                          CASE WHEN e.properties->>'source' ~* '^https?://' \
+                               THEN e.properties->>'source' END \
+                        WHEN 'literature' THEN 'https://doi.org/' || (e.properties->>'doi') \
+                        WHEN 'figure' THEN 'https://doi.org/' || (e.properties->>'doi') \
+                      END) AS url \
+             FROM evidence e \
+             WHERE e.claim_id = ANY($1) \
+               /* {VISIBILITY:e} */ \
+             ORDER BY e.claim_id, e.created_at, e.id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<String>)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (claim_id, url) in q.fetch_all(executor).await? {
+            let Some(url) = url.filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            let urls = out.entry(claim_id).or_default();
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        Ok(out)
+    }
+
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.
     ///
     /// A case-folded relationship (`epigraph_core::edge::relationships::

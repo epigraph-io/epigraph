@@ -1269,7 +1269,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state."
+        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
     )]
     async fn get_claim(
         &self,
