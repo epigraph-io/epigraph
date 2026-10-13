@@ -313,13 +313,17 @@ fn store_claim(id: Uuid, truth: f64) -> epigraph_core::Claim {
 
 /// The in-memory claim set is filtered by the caller's viewer too: an entry
 /// naming another group's private claim contributes neither its id nor its
-/// truth value to a stranger's analysis.
+/// truth value to a stranger's analysis, whichever request shape asks — with
+/// or without `claim_ids`, and with the caller's own `edges`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn analyze_drops_a_stored_claim_the_caller_cannot_read(pool: PgPool) {
     let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "store-owner").await;
     let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "store-stranger").await;
     let private = viewer_fixture::seed_group_claim(&pool, owner, group, "store private").await;
     let public = viewer_fixture::seed_public_claim(&pool, owner, "store public").await;
+    // A stored entry naming no `claims` row: nobody can be shown to read it, so
+    // it is dropped for every caller (the fail-closed reading), the owner too.
+    let orphan = Uuid::new_v4();
 
     let state_with_store = || async {
         let mut state = AppState::with_scoped_pool(
@@ -329,37 +333,45 @@ async fn analyze_drops_a_stored_claim_the_caller_cannot_read(pool: PgPool) {
         let mut store = std::collections::HashMap::new();
         store.insert(private, store_claim(private, 0.9));
         store.insert(public, store_claim(public, 0.4));
+        store.insert(orphan, store_claim(orphan, 0.7));
         state.claim_store = std::sync::Arc::new(tokio::sync::RwLock::new(store));
         state
     };
 
-    for claim_ids in [None, Some(vec![private, public])] {
-        let arm = if claim_ids.is_some() {
-            "claim_ids"
-        } else {
-            "unscoped"
-        };
+    // The third shape supplies its own edges, so the handler skips the edge
+    // auto-load. The stored-claim filter must hold on that path too: a caller
+    // who sends one edge of its own is still reading the stored claim set. Both
+    // endpoints are fresh ids, neither stored claim, so the caller's own input
+    // cannot put `private` in the body and `public` stays unsupported.
+    let own_edge = json!([{
+        "source_id": Uuid::new_v4(),
+        "target_id": Uuid::new_v4(),
+        "relationship": "supports",
+        "strength": 0.5,
+    }]);
+    let shapes: [(&str, Value); 3] = [
+        ("unscoped", json!({ "claim_ids": null })),
+        ("claim_ids", json!({ "claim_ids": [private, public] })),
+        ("caller_edges", json!({ "edges": own_edge })),
+    ];
+
+    for (arm, shape) in shapes {
+        let req =
+            || -> AnalyzeRequest { serde_json::from_value(shape.clone()).expect("AnalyzeRequest") };
 
         // Non-vacuity: the owner's analysis carries both stored claims.
-        let mine = analyze_as(
-            state_with_store().await,
-            &pool,
-            owner,
-            request(claim_ids.clone()),
-        )
-        .await;
+        let mine = analyze_as(state_with_store().await, &pool, owner, req()).await;
         assert_eq!(
             mine["stats"]["claims_loaded"], 2,
-            "[{arm}] the owner must load both stored claims: {mine}"
+            "[{arm}] the owner must load both stored claims, and not the \
+             entry that names no claims row: {mine}"
+        );
+        assert!(
+            !mine.to_string().contains(&orphan.to_string()),
+            "[{arm}] a stored entry naming no claims row must be dropped: {mine}"
         );
 
-        let theirs = analyze_as(
-            state_with_store().await,
-            &pool,
-            stranger,
-            request(claim_ids),
-        )
-        .await;
+        let theirs = analyze_as(state_with_store().await, &pool, stranger, req()).await;
         assert_eq!(
             theirs["stats"]["claims_loaded"], 1,
             "[{arm}] a stranger must load only the public stored claim: {theirs}"
