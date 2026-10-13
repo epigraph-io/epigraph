@@ -242,3 +242,185 @@ async fn analyze_requires_the_analysis_reasoning_scope(pool: PgPool) {
     let (status, body) = analyze(addr, &scoped, request).await;
     assert_eq!(status, 200, "the scoped token must be served: {body}");
 }
+
+// ── Direct handler invocation ──
+//
+// The two arms below call the handler as a function, because each needs an
+// `AppState` the router fixture cannot build: one with entries in the
+// in-memory `claim_store`, one whose raw pool is a different session from its
+// scoped pool.
+
+use axum::extract::State;
+use axum::{Extension, Json};
+use epigraph_api::middleware::bearer::{AuthContext, ViewerExtractor};
+use epigraph_api::middleware::ClientType;
+use epigraph_api::routes::reasoning::{analyze as analyze_handler, AnalyzeRequest};
+use epigraph_api::state::{ApiConfig, AppState};
+
+/// An `AuthContext` holding only `analysis:reasoning`, for `agent`.
+fn reasoning_auth(agent: Uuid) -> Extension<AuthContext> {
+    Extension(AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: ClientType::Service,
+        scopes: vec!["analysis:reasoning".to_string()],
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+    })
+}
+
+fn request(claim_ids: Option<Vec<Uuid>>) -> AnalyzeRequest {
+    serde_json::from_value(json!({ "claim_ids": claim_ids })).expect("AnalyzeRequest")
+}
+
+/// Call the handler as `agent` and return the response as JSON, so the
+/// assertions read the same wire shape the HTTP arms do.
+async fn analyze_as(state: AppState, pool: &PgPool, agent: Uuid, req: AnalyzeRequest) -> Value {
+    let viewer = epigraph_db::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve viewer");
+    let Json(resp) = analyze_handler(
+        ViewerExtractor(viewer),
+        State(state),
+        Some(reasoning_auth(agent)),
+        Json(req),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("analyze as {agent} must succeed: {e:?}"));
+    serde_json::to_value(resp).expect("serialize response")
+}
+
+/// An in-memory claim with `id` and `truth`.
+fn store_claim(id: Uuid, truth: f64) -> epigraph_core::Claim {
+    let now = chrono::Utc::now();
+    epigraph_core::Claim::with_id(
+        epigraph_core::ClaimId::from_uuid(id),
+        format!("store claim {id}"),
+        epigraph_core::AgentId::new(),
+        [0u8; 32],
+        [0u8; 32],
+        None,
+        None,
+        epigraph_core::TruthValue::new(truth).expect("truth in range"),
+        now,
+        now,
+    )
+}
+
+/// The in-memory claim set is filtered by the caller's viewer too: an entry
+/// naming another group's private claim contributes neither its id nor its
+/// truth value to a stranger's analysis.
+#[sqlx::test(migrations = "../../migrations")]
+async fn analyze_drops_a_stored_claim_the_caller_cannot_read(pool: PgPool) {
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "store-owner").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "store-stranger").await;
+    let private = viewer_fixture::seed_group_claim(&pool, owner, group, "store private").await;
+    let public = viewer_fixture::seed_public_claim(&pool, owner, "store public").await;
+
+    let state_with_store = || async {
+        let mut state = AppState::with_scoped_pool(
+            viewer_fixture::scoped_pool(&pool).await,
+            ApiConfig::default(),
+        );
+        let mut store = std::collections::HashMap::new();
+        store.insert(private, store_claim(private, 0.9));
+        store.insert(public, store_claim(public, 0.4));
+        state.claim_store = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        state
+    };
+
+    for claim_ids in [None, Some(vec![private, public])] {
+        let arm = if claim_ids.is_some() {
+            "claim_ids"
+        } else {
+            "unscoped"
+        };
+
+        // Non-vacuity: the owner's analysis carries both stored claims.
+        let mine = analyze_as(
+            state_with_store().await,
+            &pool,
+            owner,
+            request(claim_ids.clone()),
+        )
+        .await;
+        assert_eq!(
+            mine["stats"]["claims_loaded"], 2,
+            "[{arm}] the owner must load both stored claims: {mine}"
+        );
+
+        let theirs = analyze_as(
+            state_with_store().await,
+            &pool,
+            stranger,
+            request(claim_ids),
+        )
+        .await;
+        assert_eq!(
+            theirs["stats"]["claims_loaded"], 1,
+            "[{arm}] a stranger must load only the public stored claim: {theirs}"
+        );
+        assert_eq!(
+            theirs["unsupported_claims"],
+            json!([public.to_string()]),
+            "[{arm}] the stranger's unsupported set must be the public claim alone"
+        );
+        assert!(
+            !theirs.to_string().contains(&private.to_string()),
+            "[{arm}] another group's private claim id leaked into a stranger's analysis: {theirs}"
+        );
+    }
+}
+
+/// The edge read runs on the caller's viewer-stamped connection, not the raw
+/// pool.
+///
+/// `#[sqlx::test]` connects as a superuser that bypasses row security, so on
+/// the router fixture a read reverted to `state.db_pool` is indistinguishable
+/// from one on `read_as`. Here the raw pool is a separate session downgraded
+/// to `epigraph_app` and never stamped, the instrument
+/// `shard6_routes_scoped_read.rs::split_state` uses (this is another copy of
+/// it, the duplication that file registers). On that session the row policies
+/// admit only public edges, so a reverted read loses the owner's own
+/// group-private edge while the spliced predicate would still have admitted it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn analyze_serves_the_owners_private_edge_from_the_stamped_connection(pool: PgPool) {
+    let c = corpus(&pool).await;
+
+    let raw = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let raw_is_privileged: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("role privileges on the raw pool");
+    assert!(
+        !raw_is_privileged,
+        "CALIBRATION: the raw pool must be subject to row security, or a read \
+         reverted onto it is invisible and this arm proves nothing"
+    );
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(&pool).await);
+
+    let body = analyze_as(
+        state,
+        &pool,
+        c.owner_agent,
+        request(Some(vec![c.p1, c.p2, c.p3])),
+    )
+    .await;
+    assert_eq!(
+        body["stats"]["edges_loaded"], 2,
+        "the owner must load its own group-private edge through the stamped \
+         connection: {body}"
+    );
+    assert_eq!(
+        support_pairs(&body),
+        sorted(vec![(c.p1, c.p2), (c.p2, c.p3), (c.p1, c.p3)]),
+        "the owner's analysis must derive through its own private edge"
+    );
+}
