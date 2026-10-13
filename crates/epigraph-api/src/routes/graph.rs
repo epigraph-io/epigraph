@@ -138,6 +138,15 @@ pub struct OverviewResponse {
     pub status: Option<&'static str>,
     pub supernodes: Vec<Supernode>,
     pub cluster_edges: Vec<ClusterEdgeOut>,
+    /// Count of every supernode in the run. Emitted only when the request
+    /// carried a bound (see [`OverviewParams::is_bounded`]), so the default
+    /// body keeps its exact shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_supernodes: Option<i64>,
+    /// `true` when the bound actually cut supernodes or edges. Emitted only
+    /// when the request carried a bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -157,10 +166,45 @@ pub struct ClusterEdgeOut {
     pub weight: i32,
 }
 
+/// Query params of `GET /api/v1/graph/communities/overview`.
+///
+/// Every bound is opt-in: with none of `limit`, `min_size`, `include_edges`
+/// or `edge_limit` present the handler returns today's unbounded body,
+/// unchanged. `color_by` is not a bound.
 #[derive(Debug, Deserialize)]
 pub struct OverviewParams {
     #[serde(default)]
     pub color_by: Option<String>,
+    /// Return only the top-N supernodes by `size DESC, id ASC`. Clamped to
+    /// `1..=OVERVIEW_BOUND_MAX`.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Drop supernodes whose `size` is below this.
+    #[serde(default)]
+    pub min_size: Option<i32>,
+    /// `false` returns `cluster_edges: []` without reading them. Default `true`.
+    #[serde(default)]
+    pub include_edges: Option<bool>,
+    /// Keep only the heaviest N edges (`weight DESC`). Clamped to
+    /// `1..=OVERVIEW_BOUND_MAX`.
+    #[serde(default)]
+    pub edge_limit: Option<i64>,
+}
+
+/// Ceiling for `limit` and `edge_limit`, so a client cannot ask for a negative
+/// or absurd `LIMIT`.
+pub const OVERVIEW_BOUND_MAX: i64 = 10_000;
+
+impl OverviewParams {
+    /// Whether the request opted into the bounded response. `color_by` does
+    /// not count: it never changed the body and must not start to.
+    #[must_use]
+    pub const fn is_bounded(&self) -> bool {
+        self.limit.is_some()
+            || self.min_size.is_some()
+            || self.include_edges.is_some()
+            || self.edge_limit.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -226,9 +270,24 @@ const fn default_hops() -> i64 {
     1
 }
 
+/// Cluster-level overview of the latest clustering run: supernodes and the
+/// edges between them.
+///
+/// With no bound in the query string this returns EVERY supernode of the run
+/// (`size DESC`) and EVERY cluster edge, exactly as before the bounds existed;
+/// epigraph-gui reads that shape. A caller with a body budget (the Explorer
+/// BFF) opts in with [`OverviewParams`]:
+///
+/// * `limit` / `min_size` select the top supernodes by `size DESC, id ASC`,
+///   and then only the edges INDUCED among the returned supernodes come back;
+/// * `edge_limit` keeps the heaviest edges (`weight DESC, cluster_a,
+///   cluster_b`);
+/// * `include_edges=false` skips the edge read entirely.
+///
+/// A bounded response also carries `total_supernodes` and `truncated`.
 pub async fn overview(
     State(state): State<AppState>,
-    Query(_params): Query<OverviewParams>,
+    Query(params): Query<OverviewParams>,
 ) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
     let pool: &PgPool = &state.db_pool;
     let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
@@ -248,8 +307,13 @@ pub async fn overview(
             status: Some("no_clusters_computed"),
             supernodes: vec![],
             cluster_edges: vec![],
+            total_supernodes: None,
+            truncated: None,
         }));
     };
+    if params.is_bounded() {
+        return overview_bounded(pool, run_id, generated_at, degraded, &params).await;
+    }
     let supernodes: Vec<Supernode> = sqlx::query_as::<_, Supernode>(
         "SELECT id AS cluster_id, label, size, mean_betp, dominant_type, dominant_frame_id
          FROM graph_clusters
@@ -276,6 +340,85 @@ pub async fn overview(
         status: None,
         supernodes,
         cluster_edges,
+        total_supernodes: None,
+        truncated: None,
+    }))
+}
+
+/// The opt-in bounded body of [`overview`]. Runs on the caller's `pool` so the
+/// handler keeps its single `.db_pool` site.
+async fn overview_bounded(
+    pool: &PgPool,
+    run_id: Uuid,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    degraded: bool,
+    params: &OverviewParams,
+) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
+    let clamp = |n: i64| n.clamp(1, OVERVIEW_BOUND_MAX);
+    let node_limit = params.limit.map(clamp);
+    // `LIMIT NULL` is `LIMIT ALL` in Postgres.
+    let supernodes: Vec<Supernode> = sqlx::query_as::<_, Supernode>(
+        "SELECT id AS cluster_id, label, size, mean_betp, dominant_type, dominant_frame_id
+         FROM graph_clusters
+         WHERE run_id = $1 AND ($2::int IS NULL OR size >= $2)
+         ORDER BY size DESC, id ASC
+         LIMIT $3",
+    )
+    .bind(run_id)
+    .bind(params.min_size)
+    .bind(node_limit)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    let (total,): (i64,) = sqlx::query_as("SELECT count(*) FROM graph_clusters WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .map_err(internal)?;
+    let nodes_cut = i64::try_from(supernodes.len()).unwrap_or(i64::MAX) < total;
+
+    let mut edges_cut = false;
+    let cluster_edges = if params.include_edges.unwrap_or(true) {
+        // Restrict to the induced subgraph only when the supernode set was
+        // actually bounded; with `edge_limit` alone every cluster is returned
+        // and shipping every id as an array would be pure overhead.
+        let induced: Option<Vec<Uuid>> = (params.limit.is_some() || params.min_size.is_some())
+            .then(|| supernodes.iter().map(|s| s.cluster_id).collect());
+        let edge_limit = params.edge_limit.map(clamp);
+        // One row past the cap distinguishes "cut" from "exactly fit".
+        let mut edges: Vec<ClusterEdgeOut> = sqlx::query_as::<_, ClusterEdgeOut>(
+            "SELECT cluster_a AS a, cluster_b AS b, weight
+             FROM cluster_edges
+             WHERE run_id = $1
+               AND ($2::uuid[] IS NULL OR (cluster_a = ANY($2) AND cluster_b = ANY($2)))
+             ORDER BY weight DESC, cluster_a, cluster_b
+             LIMIT $3",
+        )
+        .bind(run_id)
+        .bind(induced)
+        .bind(edge_limit.map(|n| n + 1))
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?;
+        if let Some(cap) = edge_limit.and_then(|n| usize::try_from(n).ok()) {
+            if edges.len() > cap {
+                edges.truncate(cap);
+                edges_cut = true;
+            }
+        }
+        edges
+    } else {
+        vec![]
+    };
+    Ok(Json(OverviewResponse {
+        run_id: Some(run_id),
+        generated_at: Some(generated_at),
+        degraded,
+        status: None,
+        supernodes,
+        cluster_edges,
+        total_supernodes: Some(total),
+        truncated: Some(nodes_cut || edges_cut),
     }))
 }
 
