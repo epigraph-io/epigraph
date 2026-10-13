@@ -46,9 +46,6 @@
 //! `visibility_lint.rs` gives: binding an array proves a parameter was
 //! supplied, not that the SQL reads it.
 
-mod lint_text;
-
-use lint_text::strip_comments;
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking fn under `src/tools/` that runs SQL and carries a
@@ -95,17 +92,158 @@ const SPENT_MARKERS: &[&str] = &[".splice(", "visibility = 'public'"];
 
 /// Does `body` spend its viewer?
 ///
-/// Matched against the body with Rust comments removed, so a marker that is
-/// only prose — a commented-out `.splice(` call, a doc line quoting the
-/// predicate — does not count. String literals are KEPT: `visibility =
-/// 'public'` only ever appears inside SQL text.
+/// Each marker is matched only where it can take effect, through
+/// [`spend_views`]: the method-call marker (`.splice(`) against the body's
+/// CODE — Rust comments removed and string contents blanked — and the SQL-text
+/// marker (`visibility = 'public'`) against its LIVE SQL — Rust comments
+/// removed, string contents kept minus their own `--` / `/* */` comments. So a
+/// commented-out call, a log line naming the method, and a predicate commented
+/// out of the statement all fail to count.
 ///
 /// Only the spend side is stripped. [`EXEMPT_MARKER`] is read from the raw body
 /// on purpose: `VISIBILITY-EXEMPT:` is a comment convention, and stripping it
 /// would turn a reviewed exemption into an offender.
 fn spends_viewer(body: &str) -> bool {
-    let code = strip_comments(body);
-    SPENT_MARKERS.iter().any(|m| code.contains(m))
+    let (code, live_sql) = spend_views(body);
+    SPENT_MARKERS.iter().any(|m| {
+        let is_call = m.starts_with('.') && m.ends_with('(');
+        let view = if is_call { &code } else { &live_sql };
+        view.contains(m)
+    })
+}
+
+/// The two texts a SPEND check reads, returned as `(code, live_sql)`.
+///
+/// A copy of `epigraph-db/tests/lint_text/mod.rs::spend_views`, with a
+/// byte-identical body. It lives in this file rather than in this crate's
+/// `lint_text` module because `tool_viewer_coverage.rs` also compiles that
+/// module and has no spend check, so it would be dead code there.
+///
+///
+/// * **`code`** — Rust comments removed and string-literal CONTENTS blanked,
+///   the quotes kept. A method-call marker (`.splice(`, `.splice_write(`)
+///   counts only here: written inside a string — a log line, an error
+///   message — it calls nothing.
+/// * **`live_sql`** — Rust comments removed, string-literal contents kept minus
+///   the comments of the SQL they carry: `--` up to the end of its line (a real
+///   newline or a `\n` escape) and `/* */` spans. A SQL-text marker
+///   (`visibility = 'public'`) counts only here: a predicate commented out of
+///   the statement is not one the database evaluates.
+///
+/// One pass over the RAW source, with the comment and char-literal rules of
+/// `lint_text::strip_comments`. It does not run on that function's output,
+/// because that output drops the byte after each `\` escape — the byte that
+/// tells `\n` (an SQL newline) from any other escape.
+///
+/// Limits, stated so a green run is not read as more than it is:
+///
+/// * A `--` inside a SQL quoted literal (`'--'`) is read as a comment. That
+///   over-strips: it can only hide a marker and report a function as unspent,
+///   a loud failure.
+/// * An SQL comment is ended at the close of its Rust string. Where one
+///   statement is assembled from several literals with no newline between
+///   them, a comment that runs on into the next literal is not followed.
+/// * Raw strings are read with ordinary-string rules, as `strip_comments`
+///   reads them. The `"` pairs of sqlx `AS "col!"` overrides inside an
+///   `r#"…"#` statement keep the state in sync at the literal's end; the
+///   override name between them is read as code, in both views alike.
+///
+/// The `VISIBILITY-EXEMPT:` marker reads neither view: it is a comment
+/// convention by design and is read from the raw body.
+fn spend_views(src: &str) -> (String, String) {
+    let b = src.as_bytes();
+    let mut code = String::with_capacity(b.len());
+    let mut sql = String::with_capacity(b.len());
+    let mut i = 0;
+    let (mut in_line, mut in_block, mut in_str) = (false, false, false);
+    let (mut sql_line, mut sql_block) = (false, false);
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        if in_line {
+            if c == b'\n' {
+                in_line = false;
+                code.push('\n');
+                sql.push('\n');
+            }
+        } else if in_block {
+            if c == b'*' && next == Some(b'/') {
+                in_block = false;
+                i += 1;
+            }
+        } else if in_str {
+            if c == b'\\' {
+                // An escape is never a delimiter. `\n` is an SQL newline, so it
+                // ends an SQL line comment; `\` + a real newline is a Rust line
+                // continuation, which removes the newline, so it does not.
+                if sql_line && next == Some(b'n') {
+                    sql_line = false;
+                }
+                if !sql_line && !sql_block {
+                    sql.push('\\');
+                    if let Some(n) = next {
+                        sql.push(n as char);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                (in_str, sql_line, sql_block) = (false, false, false);
+                code.push('"');
+                sql.push('"');
+            } else if sql_line {
+                if c == b'\n' {
+                    sql_line = false;
+                    sql.push('\n');
+                }
+            } else if sql_block {
+                if c == b'*' && next == Some(b'/') {
+                    sql_block = false;
+                    i += 1;
+                }
+            } else if c == b'-' && next == Some(b'-') {
+                sql_line = true;
+                i += 1;
+            } else if c == b'/' && next == Some(b'*') {
+                sql_block = true;
+                i += 1;
+            } else {
+                sql.push(c as char);
+            }
+        } else if c == b'/' && next == Some(b'/') {
+            in_line = true;
+            i += 1;
+        } else if c == b'/' && next == Some(b'*') {
+            in_block = true;
+            i += 1;
+        } else if c == b'\'' {
+            // The char-literal SHAPE rule of `strip_comments`, for the same
+            // reason: a lifetime tick must not open a string, and the contents
+            // of `'"'` must not either.
+            let close = if next == Some(b'\\') {
+                (i + 2..(i + 14).min(b.len())).find(|&k| b[k] == b'\'')
+            } else if b.get(i + 2) == Some(&b'\'') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            let end = close.unwrap_or(i);
+            for &x in &b[i..=end] {
+                code.push(x as char);
+                sql.push(x as char);
+            }
+            i = end;
+        } else {
+            if c == b'"' {
+                in_str = true;
+            }
+            code.push(c as char);
+            sql.push(c as char);
+        }
+        i += 1;
+    }
+    (code, sql)
 }
 
 /// One line per viewer-taking fn that runs SQL, does not spend its viewer and
