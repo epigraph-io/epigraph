@@ -347,7 +347,17 @@ struct ViewerFn {
 
 /// Every `fn` under `src/repos/` whose parameter list mentions `Viewer`.
 fn viewer_taking_fns() -> Vec<ViewerFn> {
-    repo_fns()
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| viewer_taking_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`viewer_taking_fns`] over ONE source string. The selector lives here and
+/// only here, so a synthetic fixture is selected by exactly the rule the real
+/// scan uses.
+fn viewer_taking_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
+    repo_fns_in(file, src)
         .into_iter()
         .filter(|f| f.params.contains("Viewer"))
         .collect()
@@ -468,12 +478,7 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
 /// editing `src/repos/`.
 #[test]
 fn spend_markers_count_only_in_code_not_in_comments() {
-    let viewer_fns = |src: &str| -> Vec<ViewerFn> {
-        repo_fns_in("synthetic.rs", src)
-            .into_iter()
-            .filter(|f| f.params.contains("Viewer"))
-            .collect()
-    };
+    let viewer_fns = |src: &str| viewer_taking_fns_in("synthetic.rs", src);
 
     // 1. All three markers present only in comments (line, block, doc): the
     //    SQL runs with no predicate, so the function must be reported.
