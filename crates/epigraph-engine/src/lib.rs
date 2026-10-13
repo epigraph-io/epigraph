@@ -56,6 +56,7 @@ pub mod retraction_cascade;
 pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
+pub mod source_dependence;
 pub mod theme_cluster;
 pub mod theme_kmeans;
 pub mod triple_extractor;

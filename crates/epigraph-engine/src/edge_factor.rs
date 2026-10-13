@@ -897,43 +897,36 @@ async fn compute_combined_belief(
         warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
     }
 
+    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
+    // one `source_url`) are folded cautiously into one before the Dempster
+    // fold (backlog 4c42c0bf, `crate::source_dependence`); the write path
+    // `ds_auto::auto_wire_ds_update` uses the same function, so a recompute
+    // cannot re-inflate what the write left honest.
+    //
     // `fold_conflict` is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of
     // the combined mass (`combined.mass_of_conflict()` is 0), so the
     // multi-BBA arm takes it from the per-step reports via
     // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
-    // A single BBA is not folded: its own empty-set mass is the conflict.
-    let (combined, fold_conflict) = if all_rows.len() == 1 {
-        let r = &all_rows[0];
-        let mf = parse_stored_bba(frame, &r.masses)?;
+    // A single (or single-source) BBA is not folded: its own empty-set mass
+    // is the conflict.
+    let source_keys =
+        crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows).await?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    for (row, key) in all_rows.iter().zip(source_keys) {
+        let mf = parse_stored_bba(frame, &row.masses)?;
         let reliability = effective_source_strength(
-            r,
+            row,
             per_frame_intra,
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
         let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-        let k = d.mass_of_conflict();
-        (d, k)
-    } else {
-        let mut mass_fns = Vec::with_capacity(all_rows.len());
-        for row in &all_rows {
-            let mf = parse_stored_bba(frame, &row.masses)?;
-            let reliability = effective_source_strength(
-                row,
-                per_frame_intra,
-                per_frame_evidence_weights.as_ref(),
-                &calibration,
-            );
-            let d =
-                combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-            mass_fns.push(d);
-        }
-        let (c, reports) = combination::combine_multiple(&mass_fns, 0.9)
+        items.push((key, d));
+    }
+    let (combined, fold_conflict) =
+        crate::source_dependence::combine_with_source_dependence(items, 0.9)
             .map_err(|e| format!("combine_multiple: {e}"))?;
-        let k = combination::fold_conflict(&c, &reports);
-        (c, k)
-    };
 
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
     // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.

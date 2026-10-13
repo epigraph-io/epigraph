@@ -1352,7 +1352,12 @@ pub async fn update_with_evidence(
     )
     .await?;
 
-    EvidenceRepository::create(&mut *tx, &evidence)
+    // The caller's `source_url` lands on the evidence row whatever the type
+    // (`parse_evidence_type` keeps it only inside Document/Testimony
+    // properties): it is the source identity the combine step uses to fold a
+    // re-observation of the SAME source cautiously rather than as independent
+    // corroboration (backlog 4c42c0bf, `epigraph_engine::source_dependence`).
+    EvidenceRepository::create_with_source_url(&mut *tx, &evidence, params.source_url.as_deref())
         .await
         .map_err(internal_error)?;
 
