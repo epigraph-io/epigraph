@@ -39,8 +39,8 @@
 mod viewer_fixture;
 
 use epigraph_db::repos::privatization::{
-    PrivatizationRepository, SealCommitEvidence, SealCommitItem, SealCommitVersion,
-    UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
+    seal_manifest_evidence_properties, PrivatizationRepository, SealCommitEvidence, SealCommitItem,
+    SealCommitVersion, UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
 };
 use epigraph_privacy::{encryptor::FieldTag, pad, unpad};
 use sqlx::PgPool;
@@ -383,13 +383,26 @@ async fn seal_payload(pool: &PgPool, claim: Uuid) -> SealCommitItem {
             .await
             .expect("read versions");
 
-    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, raw_content, properties FROM evidence WHERE claim_id = $1 ORDER BY id",
-    )
-    .bind(claim)
-    .fetch_all(pool)
-    .await
-    .expect("read evidence");
+    // `source_url` is folded into the properties the CLI encrypts, as the seal
+    // manifest serves them.
+    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> =
+        sqlx::query_as::<_, (Uuid, Option<String>, serde_json::Value, Option<String>)>(
+            "SELECT id, raw_content, properties, source_url FROM evidence \
+              WHERE claim_id = $1 ORDER BY id",
+        )
+        .bind(claim)
+        .fetch_all(pool)
+        .await
+        .expect("read evidence")
+        .into_iter()
+        .map(|(id, raw, props, url)| {
+            (
+                id,
+                raw,
+                seal_manifest_evidence_properties(&props, url.as_deref()),
+            )
+        })
+        .collect();
 
     SealCommitItem {
         claim_id: claim,
@@ -474,6 +487,27 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
         assert_eq!(n, 1, "the fixture must seed a {table} row before the seal");
     }
 
+    // `evidence.source_url` is plaintext the seal must take too. The fixture's
+    // evidence has none, so give it one, and CALIBRATE it like the tables above.
+    sqlx::query(
+        "UPDATE evidence SET source_url = 'https://example.org/sealed' WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("give the evidence a URL");
+    let urls_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE claim_id = $1 AND source_url IS NOT NULL",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("calibrate evidence URLs");
+    assert!(
+        urls_before > 0,
+        "the fixture must carry an evidence URL before the seal"
+    );
+
     let payload = seal_payload(&pool, claim).await;
     let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
     assert_eq!(sealed, vec![claim], "the seal reported the claim it sealed");
@@ -540,20 +574,28 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
     }
 
     // Evidence, on both vector columns.
-    let evidence: Vec<(Option<String>, bool, bool, serde_json::Value)> = sqlx::query_as(
-        "SELECT raw_content, embedding IS NOT NULL, embedding_3072 IS NOT NULL, properties \
-           FROM evidence WHERE claim_id = $1",
+    let evidence: Vec<(
+        Option<String>,
+        bool,
+        bool,
+        serde_json::Value,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT raw_content, embedding IS NOT NULL, embedding_3072 IS NOT NULL, properties, \
+                    source_url \
+               FROM evidence WHERE claim_id = $1",
     )
     .bind(claim)
     .fetch_all(&pool)
     .await
     .expect("read evidence");
     assert!(!evidence.is_empty(), "the fixture seeded an evidence row");
-    for (raw, emb, emb3072, props) in &evidence {
+    for (raw, emb, emb3072, props, url) in &evidence {
         assert_eq!(raw.as_deref(), Some("[sealed]"));
         assert!(!emb, "sealed evidence keeps no ANN vector");
         assert!(!emb3072, "sealed evidence keeps no 3072-d ANN vector");
         assert_eq!(props, &serde_json::json!({}));
+        assert_eq!(url, &None, "sealed evidence keeps no plaintext source_url");
     }
 
     // The derived extractions are gone, INCLUDING the table §6.5.4's list omits.
@@ -726,8 +768,25 @@ async fn no_trace_of_a_sealed_claim_survives_a_full_data_dump(pool: PgPool) {
     let control_nonce = format!("nonce{}", Uuid::new_v4().simple());
     let sealed_claim =
         seed_sealable_claim(&pool, &world, &format!("secret text {sealed_nonce} ends")).await;
-    let _control =
+    let control =
         seed_sealable_claim(&pool, &world, &format!("public text {control_nonce} ends")).await;
+
+    // `evidence.source_url` is a separate column with separate nonces, so the
+    // control proves the dump reaches THIS column: the content nonces above are
+    // in every other plaintext column already.
+    let sealed_url_nonce = format!("nonce{}", Uuid::new_v4().simple());
+    let control_url_nonce = format!("nonce{}", Uuid::new_v4().simple());
+    for (claim, nonce) in [
+        (sealed_claim, &sealed_url_nonce),
+        (control, &control_url_nonce),
+    ] {
+        sqlx::query("UPDATE evidence SET source_url = $2 WHERE claim_id = $1")
+            .bind(claim)
+            .bind(format!("https://example.org/{nonce}"))
+            .execute(&pool)
+            .await
+            .expect("give the evidence a URL");
+    }
 
     let payload = seal_payload(&pool, sealed_claim).await;
     commit_seal(&pool, &world, &[payload]).await;
@@ -766,6 +825,15 @@ async fn no_trace_of_a_sealed_claim_survives_a_full_data_dump(pool: PgPool) {
         dump.matches(&sealed_nonce).count(),
         0,
         "the sealed claim's plaintext survives somewhere in the dump"
+    );
+    assert!(
+        dump.matches(&control_url_nonce).count() > 0,
+        "the POSITIVE CONTROL for evidence.source_url is missing from the dump"
+    );
+    assert_eq!(
+        dump.matches(&sealed_url_nonce).count(),
+        0,
+        "the sealed claim's evidence URL survives in plaintext in the dump"
     );
 }
 
