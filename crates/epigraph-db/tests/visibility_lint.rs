@@ -76,6 +76,9 @@
 //! those have no `sqlx::query` in their own body and are correctly skipped,
 //! because the callee is itself subject to this lint.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking repo function carrying a `VISIBILITY-EXEMPT:` marker,
@@ -186,9 +189,21 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// TEXT is what makes this check about the query rather than about the call.
 const SPENT_MARKERS: &[&str] = &[".splice(", ".splice_write(", "visibility = 'public'"];
 
-/// Does `body` spend its viewer? Matched against the body's text.
+/// Does `body` spend its viewer?
+///
+/// Matched against the body with Rust comments removed, so a marker that is
+/// only prose — a commented-out `.splice(` call, a doc line quoting the
+/// predicate — does not count. String literals are KEPT: `visibility =
+/// 'public'` only ever appears inside SQL text.
+///
+/// Only the spend side is stripped. [`EXEMPT_MARKER`] is read from the raw body
+/// here and in [`the_exemption_set_is_exactly_what_was_reviewed`]: the
+/// convention is carried in comments by design, some of them Rust line comments
+/// rather than in-SQL `--` ones, and stripping it would turn reviewed exemptions
+/// into offenders. See `lint_text/mod.rs` for the full account.
 fn spends_viewer(body: &str) -> bool {
-    SPENT_MARKERS.iter().any(|m| body.contains(m))
+    let code = strip_comments(body);
+    SPENT_MARKERS.iter().any(|m| code.contains(m))
 }
 
 /// One line per viewer-taking fn that runs SQL, does not spend its viewer and
