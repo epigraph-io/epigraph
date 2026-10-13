@@ -1624,7 +1624,7 @@ async fn deprecate_hierarchical_workflow(
                 row_retired.push(c.id.to_string());
             }
         }
-        if grant.admin {
+        if grant.is_admin() {
             crate::tools::workflow_authority::audit_admin_workflow_write(
                 &mut tx,
                 auth,

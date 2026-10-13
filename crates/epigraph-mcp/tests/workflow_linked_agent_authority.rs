@@ -146,7 +146,10 @@ async fn retired_agent(pool: &PgPool, operator: Uuid, label: &str) -> Uuid {
     let out = AgentRepository::link_retired_agent(&mut conn, agent, operator)
         .await
         .expect("retired link");
-    assert!(out.link_retired && !out.membership_live, "calibration: {out:?}");
+    assert!(
+        out.link_retired && !out.membership_live,
+        "calibration: {out:?}"
+    );
     agent
 }
 
@@ -488,8 +491,16 @@ async fn assert_refused(
     .await
     .expect_err("refused");
     assert!(err.message.contains(expect_text), "{}", err.message);
-    assert!(err.message.contains("Nothing was written"), "{}", err.message);
-    assert_eq!(steps(pool, canonical).await, before_steps, "no step written");
+    assert!(
+        err.message.contains("Nothing was written"),
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        steps(pool, canonical).await,
+        before_steps,
+        "no step written"
+    );
     assert_eq!(
         provenance_total(pool).await,
         before_rows,
@@ -707,6 +718,7 @@ async fn a_bound_agent_adds_a_generation_with_provenance(pool: PgPool) {
     let h = human(&pool, "h").await;
     let (agent, client) = allowlisted_agent(&pool, h, "a").await;
     let gen0 = workflow_submitted_by(&pool, &server, "la-gen", h).await;
+    assert_eq!(generations(&pool, "la-gen").await, 1, "calibration");
     let auth = token(agent, client);
     let viewer = http_viewer(&server, &auth).await;
 
@@ -733,6 +745,7 @@ async fn a_bound_agent_adds_a_generation_with_provenance(pool: PgPool) {
         Some(h.to_string()),
         "the generation inherits the lineage's submitter, never the caller"
     );
+    assert_eq!(generations(&pool, "la-gen").await, 2);
     let rows = provenance(&pool, gen0).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     let stamp: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = (SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'executes' LIMIT 1)")
@@ -857,7 +870,10 @@ async fn the_provenance_row_is_admitted_on_the_application_role(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("read epigraph_app");
-    assert!(!bypassrls, "epigraph_app holds BYPASSRLS: this arm is vacuous");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: this arm is vacuous"
+    );
     let seed_server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let h = human(&pool, "h").await;
     let (agent, client) = allowlisted_agent(&pool, h, "a").await;

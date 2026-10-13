@@ -147,7 +147,7 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.is_admin()) {
         crate::tools::workflow_authority::audit_admin_workflow_write(
             &mut tx,
             auth,
@@ -224,7 +224,7 @@ pub async fn delete_step(
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.is_admin()) {
         crate::tools::workflow_authority::audit_admin_workflow_write(
             &mut tx,
             auth,

@@ -80,14 +80,43 @@ use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::write_identity::WriteIdentity;
 
+/// Which arm of [`require_workflow_authority`] admitted the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowArm {
+    /// stdio: the gate does not run (the batch H-b bar), and nothing is
+    /// recorded about the caller.
+    Unchecked,
+    /// The caller is the recorded submitter.
+    Submitter,
+    /// The caller is the operator of the submitter (#503).
+    Operator,
+    /// The caller is an agent LIVE-bound to the human the submitter belongs to
+    /// (the operator ruling of 2026-10-13): `operator` is that human,
+    /// `binding` how the caller is bound to it (`live_link` /
+    /// `client_allowlist`).
+    LinkedAgent {
+        operator: uuid::Uuid,
+        binding: &'static str,
+    },
+    /// The AUDITED admin arm.
+    Admin,
+}
+
 /// What [`require_workflow_authority`] admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkflowGrant {
     /// The workflow's recorded submitter, if any.
     pub owner: Option<uuid::Uuid>,
-    /// Admitted ONLY through the audited admin arm: the caller must then write
+    /// The arm that admitted the caller. The admin arm's write must then record
     /// [`audit_admin_workflow_write`] on the same transaction as its write.
-    pub admin: bool,
+    pub arm: WorkflowArm,
+}
+
+impl WorkflowGrant {
+    /// Admitted ONLY through the audited admin arm.
+    pub(crate) fn is_admin(&self) -> bool {
+        matches!(self.arm, WorkflowArm::Admin)
+    }
 }
 
 /// Refuse the caller unless it has authority over workflow `workflow_id`; see
@@ -113,7 +142,7 @@ pub(crate) async fn require_workflow_authority(
                 "{tool_name}: could not read the workflow's submitter: {e}"
             ))
         })?;
-    let grant = |admin| WorkflowGrant { owner, admin };
+    let grant = |arm| WorkflowGrant { owner, arm };
     // AUTHENTICATED TRANSPORT ONLY. The batch H-b bar keeps stdio unchanged
     // except for #374's retirement label, and stdio is not a trust boundary
     // here: the process that spawned the server handed it the DSN, the same
@@ -121,7 +150,7 @@ pub(crate) async fn require_workflow_authority(
     // HTTP-only. The submitter is still RECORDED for a stdio ingest, so an
     // HTTP caller cannot take over a workflow a stdio agent created.
     let Some(auth) = auth else {
-        return Ok(grant(false));
+        return Ok(grant(WorkflowArm::Unchecked));
     };
     let caller_agent = caller.agent_id();
     // A workflow with NO recorded submitter (written before batch H-b) is
@@ -136,7 +165,7 @@ pub(crate) async fn require_workflow_authority(
         );
         let needs = "a live claims:admin grant (the audited claims:admin path)";
         return match admin_arm(conn, auth, caller_agent, &subject, needs, tool_name).await? {
-            Some(()) => Ok(grant(true)),
+            Some(()) => Ok(grant(WorkflowArm::Admin)),
             None => Err(crate::errors::invalid_params(format!(
                 "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on a \
                  legacy platform workflow requires the audited claims:admin path. Nothing was \
@@ -146,28 +175,87 @@ pub(crate) async fn require_workflow_authority(
     };
     // 1. The submitter.
     if caller_agent == owner {
-        return Ok(grant(false));
+        return Ok(grant(WorkflowArm::Submitter));
     }
     // 2. The submitter's operator (#503; HTTP admits the operator itself, never
     //    the actor arm, exactly as `require_owner_or_admin` does).
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
-        return Ok(grant(false));
+        return Ok(grant(WorkflowArm::Operator));
     }
-    // 3. The AUDITED admin arm.
+    // 3. An agent LIVE-bound to the human the submitter belongs to (operator
+    //    ruling, 2026-10-13). Before the admin arm, so a bound agent that also
+    //    carries a stale claims:admin scope is admitted here, not refused ADM02.
+    if let Some(arm) = linked_agent_arm(conn, caller_agent, owner, tool_name).await? {
+        return Ok(grant(arm));
+    }
+    // 4. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
+    let needs = "the workflow's submitter, the submitter's operator, an agent live-bound to the \
+                 submitter's human, or a live claims:admin grant";
     if admin_arm(conn, auth, caller_agent, &subject, needs, tool_name)
         .await?
         .is_some()
     {
-        return Ok(grant(true));
+        return Ok(grant(WorkflowArm::Admin));
     }
     Err(crate::errors::invalid_params(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
-         neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
-         the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
-         Nothing was written."
+         neither that submitter, nor its operator, nor an agent live-bound to the submitter's \
+         human, and holds no claims:admin. {tool_name} requires the workflow's submitter, the \
+         submitter's operator, an agent live-bound to the submitter's human, or the audited \
+         claims:admin path. Nothing was written."
     )))
+}
+
+/// The LINKED-AGENT arm (operator ruling, 2026-10-13): the caller's LIVE
+/// delegation (`AgentRepository::live_delegation`: a not-retired link with a
+/// live writer membership, or an allowlisted client, to a human that is still a
+/// registered human operator) names the human the submitter belongs to
+/// (`AgentRepository::human_of(submitter, false)`: the submitter itself when it
+/// is that human, else the operator of its link of ANY state, or of its
+/// allowlisted client). So it admits an agent of the submitting human and an
+/// agent of the same human as the submitting agent; a retired or
+/// membership-revoked link, a revoked human, an unbound agent and another
+/// human's agent are not admitted. Both reads run on the request's own
+/// transaction (definer reads, independent of the stamp).
+async fn linked_agent_arm(
+    conn: &mut sqlx::PgConnection,
+    caller: uuid::Uuid,
+    owner: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<Option<WorkflowArm>, McpError> {
+    let Some(delegation) = epigraph_db::AgentRepository::live_delegation(&mut *conn, caller)
+        .await
+        .map_err(|e| {
+            internal_error(format!(
+                "{tool_name}: could not read the caller's operator binding: {e}"
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let owner_human = epigraph_db::AgentRepository::human_of(&mut *conn, owner, false)
+        .await
+        .map_err(|e| {
+            internal_error(format!(
+                "{tool_name}: could not read the submitter's human: {e}"
+            ))
+        })?;
+    if owner_human != Some(delegation.operator_id) {
+        return Ok(None);
+    }
+    tracing::info!(
+        caller = %caller,
+        submitter = %owner,
+        operator = %delegation.operator_id,
+        binding = delegation.binding,
+        tool = tool_name,
+        "workflow authority granted to an agent live-bound to the submitter's human"
+    );
+    Ok(Some(WorkflowArm::LinkedAgent {
+        operator: delegation.operator_id,
+        binding: delegation.binding,
+    }))
 }
 
 /// The AUDITED admin arm, shared by a submitted workflow (after its submitter

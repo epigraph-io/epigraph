@@ -126,7 +126,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 "workflow_ingest",
             )
             .await?;
-            admin_write |= grant.admin;
+            admin_write |= grant.is_admin();
             // The lineage head is checked first, so a new generation of an
             // existing name inherits ITS submitter; a new name forked from a
             // parent inherits the parent's.
