@@ -81,7 +81,9 @@ curve25519-dalek = "4"
 # 10.x makes the crypto backend a feature: EXACTLY ONE of `aws_lc_rs` / `rust_crypto`
 # must be on, or the first sign/verify panics at runtime. `rust_crypto` is pure Rust:
 # `aws_lc_rs` would add a C build (aws-lc-sys) to epigraph-mcp's release graph, where
-# nothing else uses it. Floor 10.3: CVE-2026-25537 (pinned by
+# nothing else activates it (`cargo tree -i aws-lc-rs -e normal --workspace` matches no
+# package; the aws-lc-rs entries in Cargo.lock are optional rustls/rustls-webpki
+# features, recorded but not enabled). Floor 10.3: CVE-2026-25537 (pinned by
 # crates/epigraph-auth/tests/dependency_security_floor.rs).
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 
