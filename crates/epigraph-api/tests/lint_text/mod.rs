@@ -35,8 +35,10 @@
 //! decision can absorb it (one file, one public function, no dependencies)
 //! rather than having to unpick it.
 //!
-//! The full inventory that decision inherits is **five** strippers: the two
-//! `strip_comments` module copies (this one and `epigraph-mcp`'s), and three
+//! The full inventory that decision inherits is **six** strippers: the three
+//! `strip_comments` module copies (this one, `epigraph-mcp`'s, and
+//! `epigraph-db/tests/lint_text/mod.rs`, added later for the spend-marker
+//! checks of `visibility_lint.rs` and `write_gate_lint.rs`), and three
 //! `strip_line_comments` — `epigraph-api/tests/no_bypass_in_handlers.rs` plus
 //! `epigraph-db/tests/{locked_decisions.rs, no_anonymous_viewer.rs}`. None is
 //! touched here beyond the lift.
@@ -65,13 +67,15 @@
 /// is byte-identical over stripped and unstripped source on the tree as it
 /// stands, which means this change closes a hazard without moving a number.
 ///
-/// The same measurement is why `crates/epigraph-db/src/repos/` is NOT a scan
-/// root for this function: there, stripping *does* move a register, because the
-/// `VISIBILITY-EXEMPT:` convention is carried in comments BY DESIGN. Measured
-/// over `src/repos/` with the stripper as shipped: `VISIBILITY-EXEMPT` goes
-/// 40 → 32, because 8 of the 40 markers are Rust line comments rather than
-/// in-SQL `/* */` ones. Those scanners read their markers from raw source on
-/// purpose.
+/// The same measurement is why the `VISIBILITY-EXEMPT:` scans over
+/// `crates/epigraph-db/src/repos/` do NOT use this function: there, stripping
+/// *does* move a register, because that convention is carried in comments BY
+/// DESIGN. Measured over `src/repos/` with the stripper as shipped:
+/// `VISIBILITY-EXEMPT` goes 40 → 32, because 8 of the 40 markers are Rust line
+/// comments rather than in-SQL `/* */` ones. Those scanners read the exemption
+/// marker from raw source on purpose. The SPEND markers in the same scanners
+/// (`.splice(`, `.splice_write(`, `visibility = 'public'`) are read stripped,
+/// through `epigraph-db/tests/lint_text/mod.rs`, with no register moving.
 ///
 /// The DECLARATION registers are not what would move, and an earlier revision of
 /// this paragraph said they were: it claimed a lifetime
