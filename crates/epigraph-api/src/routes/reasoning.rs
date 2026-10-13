@@ -209,19 +209,48 @@ pub async fn analyze(
             })
             .collect(),
     };
-    // Release the read lock before doing computation
+    // Release the read lock before doing computation (and before any await
+    // below).
     drop(store);
 
-    // If no edges were supplied, auto-load claim-to-claim edges from the DB.
+    // Both reads below run on ONE viewer-stamped connection.
     //
-    // Rationale: callers should not have to pre-fetch edges to get useful
-    // results from the reasoning engine.  The fallback is behind `#[cfg(feature = "db")]`
-    // so the non-DB build path is unaffected.
+    // 1. The stored claims are kept only where they name a claim the caller can
+    //    read: an entry for another group's private claim contributes neither
+    //    its id nor its truth value. An entry naming no `claims` row is dropped
+    //    too, which is the fail-closed reading of "cannot decide".
+    // 2. If no edges were supplied, claim-to-claim edges are auto-loaded, so
+    //    callers need not pre-fetch them. The fallback is behind
+    //    `#[cfg(feature = "db")]` so the non-DB build path is unaffected.
     #[cfg(feature = "db")]
-    let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
-        load_edges_from_db(&state, &viewer, &request.claim_ids).await?
-    } else {
-        request.edges
+    let (reasoning_claims, request_edges) = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "reasoning_analyze",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+
+        let stored_ids: Vec<Uuid> = reasoning_claims.iter().map(|c| c.id).collect();
+        let readable =
+            epigraph_db::ClaimRepository::visible_claim_ids(&mut *read, &viewer, &stored_ids)
+                .await?;
+        let reasoning_claims: Vec<ReasoningClaim> = reasoning_claims
+            .into_iter()
+            .filter(|c| readable.contains(&c.id))
+            .collect();
+
+        let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
+            load_edges_from_db(&mut read, &viewer, &request.claim_ids).await?
+        } else {
+            request.edges
+        };
+        (reasoning_claims, request_edges)
     };
 
     #[cfg(not(feature = "db"))]
@@ -366,32 +395,21 @@ pub async fn analyze(
 /// target are in that set are returned. Otherwise every readable
 /// claim-to-claim edge, capped at 10 000 rows to prevent OOM on large graphs.
 ///
-/// The read runs on a viewer-stamped connection (`AppState::read_as`) and its
-/// statement carries the edge-visibility predicate, so the row-level policies
-/// and the in-query predicate agree about which edges the caller may see.
+/// `conn` is the caller's viewer-stamped connection (`AppState::read_as`) and
+/// the statement carries the edge-visibility predicate, so the row-level
+/// policies and the in-query predicate agree about which edges the caller may
+/// see.
 ///
 /// The edge `strength` field is stored inside the `properties` JSONB column
 /// (key `"strength"`).  If absent or non-numeric the edge defaults to 0.5.
 #[cfg(feature = "db")]
 async fn load_edges_from_db(
-    state: &AppState,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
     claim_ids: &Option<Vec<Uuid>>,
 ) -> Result<Vec<EdgeInput>, ApiError> {
     /// Row cap on the unscoped arm.
     const UNSCOPED_EDGE_CAP: i64 = 10_000;
-
-    let mut read = state.read_as(viewer).await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_read",
-            error = %e,
-            handler = "reasoning_analyze",
-            "could not acquire a viewer-stamped connection"
-        );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
-        }
-    })?;
 
     // A present-but-empty `claim_ids` takes the unscoped arm, as it always has.
     let among = claim_ids.as_deref().filter(|ids| !ids.is_empty());
@@ -402,7 +420,7 @@ async fn load_edges_from_db(
     };
 
     let rows =
-        epigraph_db::EdgeRepository::claim_edges_for_reasoning(&mut *read, viewer, among, limit)
+        epigraph_db::EdgeRepository::claim_edges_for_reasoning(&mut *conn, viewer, among, limit)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to load edges for reasoning: {e}"),
