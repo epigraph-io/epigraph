@@ -107,10 +107,15 @@ async fn url_for(pool: &sqlx::PgPool) -> String {
 }
 
 /// Backends parked on the barrier (inside an `INSERT INTO claims`).
+///
+/// Both probes count only waiters in THIS test's database: `pg_locks` is
+/// cluster-wide, and other `#[sqlx::test]` databases on the same server hold
+/// advisory locks of their own.
 async fn on_the_barrier(pool: &sqlx::PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_locks \
-          WHERE locktype = 'advisory' AND objid = $1::bigint AND objsubid = 1 AND NOT granted",
+          WHERE locktype = 'advisory' AND objid = $1::bigint AND objsubid = 1 AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
     )
     .bind(BARRIER_KEY)
     .fetch_one(pool)
@@ -123,7 +128,8 @@ async fn on_the_barrier(pool: &sqlx::PgPool) -> i64 {
 async fn on_a_two_key_lock(pool: &sqlx::PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_locks \
-          WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted",
+          WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
     )
     .fetch_one(pool)
     .await

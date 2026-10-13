@@ -594,11 +594,18 @@ async fn install_race_barrier(pool: &PgPool, caller_claim: Uuid) {
 /// Reads `pg_locks` rather than sleeping, so the handshake is observed and not
 /// assumed. The bound exists only so a broken fixture fails instead of hanging
 /// the suite.
+///
+/// `pg_locks` is CLUSTER-wide and every `#[sqlx::test]` gets its own database
+/// on one server, while the arms in this binary run in parallel and share
+/// [`RACE_BARRIER_KEY`]. Unscoped, this probe could see ANOTHER arm's parked
+/// caller and start this arm's caller 2 too early; so it, and the two-key
+/// probe in [`race_two_first_creates`], count only waiters in THIS database.
 async fn wait_until_blocked_on_the_barrier(pool: &PgPool) {
     for _ in 0..600 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_locks \
-              WHERE locktype = 'advisory' AND objid = $1::bigint AND NOT granted",
+              WHERE locktype = 'advisory' AND objid = $1::bigint AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         )
         .bind(RACE_BARRIER_KEY)
         .fetch_one(pool)
@@ -867,7 +874,8 @@ async fn race_two_first_creates(pool: &PgPool, how: Racer) -> (i64, [(Uuid, bool
         }
         let blocked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_locks \
-              WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted",
+              WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         )
         .fetch_one(pool)
         .await
