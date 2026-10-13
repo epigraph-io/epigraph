@@ -413,6 +413,21 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
         2,
         "Claim should have 2 evidence items"
     );
+
+    // The Document's URL lands in `evidence.source_url`, the column REST
+    // `claim_provenance` and `get_evidence` read (backlog 43ab8c73). The packet
+    // path used to bind NULL there, so the URL survived only in `properties`.
+    let stored_urls: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT source_url FROM evidence WHERE claim_id = $1")
+            .bind(response.claim_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read evidence.source_url");
+    assert_eq!(
+        stored_urls,
+        vec![Some("https://example.com/doc.pdf".to_string()); 2],
+        "the packet submit must store each Document evidence URL in the column"
+    );
 }
 
 // =============================================================================

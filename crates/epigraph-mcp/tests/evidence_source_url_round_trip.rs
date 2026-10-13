@@ -257,3 +257,41 @@ async fn a_testimony_with_no_url_surfaces_none(pool: PgPool) {
     );
     assert_eq!(body["source_urls"], serde_json::json!([]), "{body}");
 }
+
+/// `update_with_evidence` is the norcal-rfp reviewer's second write path (it
+/// re-asserts evidence on a claim a prior cycle created), and it wrote its
+/// evidence row through the same NULL-binding `create` `submit_claim` did. An
+/// `empirical` URL passed to it must land in the column too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_stores_an_empirical_source_url(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = seed_claim(&pool, "u036: an rfp re-seen this cycle", 0.6).await;
+    let url = "https://example.org/u036/rfp-update";
+
+    epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        epigraph_mcp::types::UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
+            claim_id: claim_id.to_string(),
+            evidence_type: "empirical".into(),
+            evidence_data: "listing seen again this cycle".into(),
+            source_url: Some(url.into()),
+            supports: true,
+            strength: 0.7,
+            labels: vec![],
+        },
+        None,
+    )
+    .await
+    .expect("update_with_evidence");
+
+    let stored = stored_source_urls(&pool, claim_id).await;
+    assert_eq!(
+        stored,
+        vec![Some(url.to_string())],
+        "evidence.source_url for claim {claim_id}; the empirical arm must not drop the URL"
+    );
+}
