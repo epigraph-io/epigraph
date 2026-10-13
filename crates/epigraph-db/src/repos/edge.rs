@@ -1364,23 +1364,37 @@ impl EdgeRepository {
         among: Option<&[Uuid]>,
         limit: Option<i64>,
     ) -> Result<Vec<(Uuid, Uuid, String, serde_json::Value)>, DbError> {
-        // `$1::uuid[] IS NULL` keeps one statement for both arms, so the
-        // predicate is spliced at one bind index and cannot be missed on
-        // either of them.
-        let sql = viewer.splice(
-            "SELECT e.source_id, e.target_id, e.relationship, e.properties \
-               FROM edges e \
-              WHERE e.source_type = 'claim' \
-                AND e.target_type = 'claim' \
-                AND ($1::uuid[] IS NULL \
-                     OR (e.source_id = ANY($1) AND e.target_id = ANY($1))) \
-                /* {EDGE_VISIBILITY:e} */ \
-              LIMIT $2",
-            3,
-        );
-        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, Json<serde_json::Value>)>(&sql)
-            .bind(among)
-            .bind(limit);
+        // Two statements, not one `$1::uuid[] IS NULL OR ...` disjunction: a
+        // cached prepared statement can settle on a generic plan, which cannot
+        // use an index through that disjunction, and the id-scoped arm would
+        // then scan every edge. Each statement carries its own predicate.
+        let sql = match among {
+            Some(_) => viewer.splice(
+                "SELECT e.source_id, e.target_id, e.relationship, e.properties \
+                   FROM edges e \
+                  WHERE e.source_type = 'claim' \
+                    AND e.target_type = 'claim' \
+                    AND e.source_id = ANY($1) \
+                    AND e.target_id = ANY($1) \
+                    /* {EDGE_VISIBILITY:e} */ \
+                  LIMIT $2",
+                3,
+            ),
+            None => viewer.splice(
+                "SELECT e.source_id, e.target_id, e.relationship, e.properties \
+                   FROM edges e \
+                  WHERE e.source_type = 'claim' \
+                    AND e.target_type = 'claim' \
+                    /* {EDGE_VISIBILITY:e} */ \
+                  LIMIT $1",
+                2,
+            ),
+        };
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, Json<serde_json::Value>)>(&sql);
+        if let Some(ids) = among {
+            q = q.bind(ids);
+        }
+        q = q.bind(limit);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
