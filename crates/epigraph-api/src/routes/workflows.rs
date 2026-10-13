@@ -1743,6 +1743,7 @@ pub async fn record_behavioral_execution(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2103,7 +2104,9 @@ pub struct DeleteStepRequest {
 /// Map a workflow-ingest executor error. Migration 105's personal-group
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
-/// detail logged and kept out of the body. Everything else stays a 500.
+/// detail logged and kept out of the body. A content-less generation
+/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
+/// else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2115,6 +2118,13 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
             if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
+        }
+        // U032: a content-less generation is the caller's payload error: 400,
+        // not a 500 that invites the retry loop that minted the stubs.
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
         }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
@@ -2575,6 +2585,29 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// U032: a step-less new generation (or an empty plan) is the caller's
+    /// payload error — 400 with the executor's reason, not a 500 that invites
+    /// a retry (the retry loop is what minted the empty generations).
+    #[test]
+    fn an_empty_generation_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("empty workflow generation")
+                    && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
 
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
