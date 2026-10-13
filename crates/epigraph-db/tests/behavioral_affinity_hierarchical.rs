@@ -222,3 +222,80 @@ async fn flat_claim_executions_still_reach_affinity_beside_hierarchical(pool: Pg
         .unwrap_or_else(|| panic!("hierarchical workflow {hier} missing: {hits:?}"));
     assert_eq!(hier_hit.2, 1, "one hierarchical report: {hier_hit:?}");
 }
+
+/// A pgvector literal with cosine similarity `cos` to `axis_vec(axis)`: the
+/// remaining weight goes on the next axis, so the vector stays unit length.
+fn tilted_vec(axis: usize, cos: f64) -> String {
+    let mut v = vec!["0".to_string(); DIM];
+    v[axis] = format!("{cos}");
+    v[axis + 1] = format!("{}", (1.0 - cos * cos).sqrt());
+    format!("[{}]", v.join(","))
+}
+
+/// Both callers ask for the top 20 roots and only THEN look up the rows they
+/// hold: HTTP `search_workflows` only ever looks up FLAT lineage roots, and
+/// `find_workflow`'s flat results do the same. Hierarchical roots must not
+/// compete for that budget: more than `limit` hierarchical workflows with a
+/// closer goal must not push a flat root (similarity 0.9, well above the 0.5
+/// floor) out of `behavioral_affinity_lineage`, which would silently strip
+/// `behavioral_affinity` from that flat result.
+#[sqlx::test(migrations = "../../migrations")]
+async fn flat_roots_keep_their_affinity_when_more_than_limit_hierarchical_roots_outrank_them(
+    pool: PgPool,
+) {
+    let agent_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(
+        blake3::hash(b"u033-displacement-agent")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind("u033-displacement-agent")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let flat: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind("u033 displaced flat workflow")
+    .bind(
+        blake3::hash(b"u033 displaced flat workflow")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(agent_id)
+    .bind(0.8_f64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let q = axis_vec(5);
+    let t0 = Utc::now();
+    insert_report(&pool, flat, true, 1, t0, &tilted_vec(5, 0.9)).await;
+    const LIMIT: i64 = 20;
+    for i in 0..=LIMIT {
+        let hier = insert_workflow(&pool, &format!("u033-outranking-{i}"), 1.0).await;
+        insert_report(&pool, hier, true, 1, t0, &q).await;
+    }
+
+    let viewer = public_viewer(&pool).await;
+    let hits = BehavioralExecutionRepository::behavioral_affinity_lineage(
+        &pool, &viewer, &q, 0.5, 1, LIMIT,
+    )
+    .await
+    .expect("affinity query");
+    let flat_hit = hits
+        .iter()
+        .find(|(id, _, _)| *id == flat)
+        .unwrap_or_else(|| {
+            panic!(
+                "flat root {flat} displaced from the top {LIMIT}: {} rows, {hits:?}",
+                hits.len()
+            )
+        });
+    assert!(
+        (flat_hit.1 - 0.9).abs() < 1e-3,
+        "the flat root's similarity is the tilted vector's 0.9: {flat_hit:?}"
+    );
+}
