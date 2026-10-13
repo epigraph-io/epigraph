@@ -869,6 +869,38 @@ async fn agent_claim_asserts_total(pool: &PgPool) -> i64 {
     row.0
 }
 
+/// Edges of ANY relationship whose source is the agent `agent_id`.
+async fn edges_from_agent(pool: &PgPool, agent_id: uuid::Uuid) -> i64 {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND source_type = 'agent'")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    row.0
+}
+
+/// Pre-seed the agent a placeholder NAME derives (`did_key_for_author`), as prod
+/// already holds one (c12bddb2 "Authors Not Specified").
+async fn seed_name_derived_agent(pool: &PgPool, name: &str) -> uuid::Uuid {
+    let key = epigraph_crypto::did_key::did_key_for_author(None, name).1;
+    let agent = epigraph_core::Agent::new(key, Some(name.to_string()));
+    let created = epigraph_db::AgentRepository::create(pool, &agent)
+        .await
+        .expect("seed the name-derived agent");
+    created.id.into()
+}
+
+async fn agents_with_name_key(pool: &PgPool, name: &str) -> i64 {
+    let key = epigraph_crypto::did_key::did_key_for_author(None, name).1;
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
 fn paper_id_of(result: &rmcp::model::CallToolResult) -> uuid::Uuid {
     let json: serde_json::Value =
         serde_json::from_str(&result_text(result)).expect("response JSON");
@@ -1008,6 +1040,48 @@ async fn mixed_real_and_placeholder_authors_keep_index_alignment(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(position.0, serde_json::json!(1));
+}
+
+/// Prod already holds the placeholder-derived agent (c12bddb2 "Authors Not
+/// Specified"). The skip must come BEFORE the lookup by key: a guard on the
+/// create branch alone would still REUSE the existing fake agent and keep
+/// growing its `authored` / `asserts` edges on every new paper. A real author
+/// follows the placeholder so the walk iterates the structured list (a
+/// placeholder-only list would take the byline fallback and never look the
+/// key up).
+#[sqlx::test(migrations = "../../migrations")]
+async fn existing_placeholder_agent_is_not_reused(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let fake = seed_name_derived_agent(&pool, "Authors Not Specified").await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-existing-agent",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+            {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        edges_from_agent(&pool, fake).await,
+        0,
+        "the pre-existing placeholder agent must gain no edge of any kind"
+    );
+    assert_eq!(
+        agents_with_name_key(&pool, "Authors Not Specified").await,
+        1,
+        "only the seeded agent holds the placeholder key; none re-minted"
+    );
+    // The walk did run over the structured list: the real author landed.
+    assert_eq!(authored_total(&pool, paper_id).await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Alice Author").await, 1);
+    assert_eq!(claim_asserts_by(&pool, "Alice Author").await, 5);
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {

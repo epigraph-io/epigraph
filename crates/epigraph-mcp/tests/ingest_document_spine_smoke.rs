@@ -371,3 +371,75 @@ async fn spine_placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
         "byline-recovered authors get authored→paper only, never per-claim asserts"
     );
 }
+
+/// Spine twin of `existing_placeholder_agent_is_not_reused`: prod already holds
+/// the placeholder-derived agent (c12bddb2 "Authors Not Specified"), and the
+/// spine walk's author loop is its own copy. Its skip must come BEFORE the
+/// lookup by key, or the existing fake agent is reused on every new paper.
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_existing_placeholder_agent_is_not_reused(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let key = epigraph_crypto::did_key::did_key_for_author(None, "Authors Not Specified").1;
+    let fake: uuid::Uuid = epigraph_db::AgentRepository::create(
+        &pool,
+        &epigraph_core::Agent::new(key, Some("Authors Not Specified".to_string())),
+    )
+    .await
+    .expect("seed the name-derived agent")
+    .id
+    .into();
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-existing-agent");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+        {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+    ]);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let fake_edges: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND source_type = 'agent'")
+            .bind(fake)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fake_edges.0, 0,
+        "the pre-existing placeholder agent must gain no edge of any kind"
+    );
+    let key_holders: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        key_holders.0, 1,
+        "no second agent minted for the placeholder key"
+    );
+
+    // The walk did run over the structured list: the real author landed.
+    let authored_names: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT a.display_name FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let authored_names: Vec<&str> = authored_names.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(authored_names, vec!["Alice Author"]);
+}
