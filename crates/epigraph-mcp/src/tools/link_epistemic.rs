@@ -507,6 +507,24 @@ mod tests {
         }
     }
 
+    /// The mirror of the guard above, for the whole structural set:
+    /// `link_epistemic` advertises every `STRUCTURAL_RELATIONSHIPS` member as
+    /// moving no belief, and `auto_wire_edge_if_epistemic` only no-ops on
+    /// `Neutral`. A structural entry the engine maps to `Positive` or
+    /// `Negative` would be advertised as inert and still wire belief.
+    #[test]
+    fn every_structural_relationship_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        for rel in STRUCTURAL_RELATIONSHIPS {
+            let kind = restriction_kind_with_profile(rel, &profile);
+            assert!(
+                matches!(kind, RestrictionKind::Neutral),
+                "structural relationship '{rel}' maps to {kind:?}, not Neutral — it would \
+                 move belief while link_epistemic advertises it as belief-neutral"
+            );
+        }
+    }
+
     /// `cites` is a citation/provenance link, not an epistemic claim about the
     /// relationship between two nodes — it is DELIBERATELY `Neutral` (does not
     /// move belief). This is the mirror image of the coverage guard above:
