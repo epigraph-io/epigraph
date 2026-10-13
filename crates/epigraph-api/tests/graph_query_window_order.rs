@@ -281,3 +281,31 @@ async fn graph_query_limit_window_breaks_created_at_ties_by_id(pool: PgPool) {
         "equal created_at must fall back to id ascending (ORDER BY created_at DESC, id)"
     );
 }
+
+/// The ORDER BY is spliced into the SQL for every allowlisted node table, not
+/// only `claims`: `evidence`, `agents` and `reasoning_traces` get the same
+/// `ORDER BY created_at DESC, id`. Postgres resolves the column when it plans
+/// the statement, so an empty table is enough. A later migration that drops
+/// or renames `created_at` on one of them turns that label into a 500 here
+/// instead of in production.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_window_order_plans_for_every_node_table(pool: PgPool) {
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    for label in ["claim", "evidence", "agent", "trace"] {
+        let viewer = public_viewer(&pool).await;
+        let res = execute_graph_query(
+            ViewerExtractor(viewer),
+            State(state.clone()),
+            Json(GraphQueryRequest {
+                query: format!("MATCH (n:{label}) RETURN * LIMIT 1"),
+                agent_id: None,
+            }),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "MATCH (n:{label}) with the ordered LIMIT window must execute; got {:?}",
+            res.err()
+        );
+    }
+}
