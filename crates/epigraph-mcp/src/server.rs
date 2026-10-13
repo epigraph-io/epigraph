@@ -2245,7 +2245,7 @@ impl EpiGraphMcpFull {
     // ── Sheaf (3 tools) ──
 
     #[tool(
-        description = "Check CDST sheaf consistency across all claims. Computes per-node consistency radii using restriction maps — identifies claims whose local belief diverges from what their epistemic neighbors would predict. Returns sections sorted by inconsistency (worst first). Use this to find belief staleness, local contradictions, and open-world spread in the knowledge graph."
+        description = "Check CDST sheaf consistency across all claims. Scans every claim's whole in-force epistemic neighbourhood (relationship names matched case-insensitively) and computes per-node consistency radii using restriction maps — identifies claims whose local belief diverges from what their epistemic neighbors would predict. Supporting neighbours (supports, elaborates, specializes, generalizes, corroborates) act as a one-sided floor: a claim is flagged only when its belief sits BELOW the strongest supporter's discounted belief, never for being over-supported. supports, elaborates, specializes and generalizes constrain only their target, not their source; corroborates constrains both ends. Refuting, contradicting and frame neighbours are scored symmetrically. `profile` selects the restriction factors. Returns sections sorted by inconsistency (worst first); `limit` caps the output, not the scan. Use this to find belief staleness, local contradictions, and open-world spread in the knowledge graph."
     )]
     async fn check_sheaf_consistency(
         &self,
