@@ -3219,8 +3219,28 @@ mod tests {
         .await
         .unwrap();
 
-        let status = post_outcome(app, workflow_id, two_step_body(None)).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(two_step_body(None).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Tie the 500 to the injected refusal of step B, so an unrelated
+        // early error (begin, lookup) cannot satisfy this test.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("behavioral_executions write failed") && body.contains("u033 injected"),
+            "the error must carry the step-row refusal: {body}"
+        );
         let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
         assert!(
             metadata.get("use_count").is_none(),

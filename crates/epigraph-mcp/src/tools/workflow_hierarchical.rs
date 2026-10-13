@@ -634,7 +634,14 @@ mod tests {
             None,
         )
         .await;
-        assert!(res.is_err(), "a refused step row must fail the report");
+        let err = res.expect_err("a refused step row must fail the report");
+        // Tie the failure to the injected refusal of step B, so an unrelated
+        // early error (begin, lookup) cannot satisfy this test.
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR, "{err:?}");
+        assert!(
+            err.message.contains("u033 injected"),
+            "the error must carry the step-row refusal: {err:?}"
+        );
 
         let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
         assert!(
