@@ -71,11 +71,11 @@ pub async fn theme_cluster(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let wipe_first = params.wipe_first.unwrap_or(false);
-    // A wipe replaces the whole live theme set: admin power, as on the HTTP
-    // route (`check_scopes(&auth, &["claims:admin"])`). `has_scope` applies the
+    // A wipe replaces the whole live theme set: admin power, the scope the HTTP
+    // route (`build_themes_from_corpus`) demands for any run. `has_scope` applies the
     // current admin posture, so an armed token's `claims:admin` counts only as
     // the dispatch gate would count it. `None` is stdio: the local operator.
-    if wipe_first && auth.is_some_and(|a| !a.has_scope("claims:admin")) {
+    if wipe_first && auth.is_some_and(|a| !a.has_scope(crate::scope_map::CLAIMS_ADMIN)) {
         return Err(McpError::invalid_request(
             "theme_cluster wipe_first=true deletes every theme and replaces the live set, so it \
              requires claims:admin; nothing was written. Omit wipe_first (default false) for an \
