@@ -54,7 +54,9 @@ pub struct AssessClaimRequest {
     #[serde(default)]
     pub uncertainty_text: Option<String>,
     /// Explicit frame ID. Defaults to the canonical `claim_validity` frame
-    /// (`["supported", "refuted", "uncertain"]`), created on first use.
+    /// (`["supported", "refuted", "uncertain"]`), resolved by its fixed id
+    /// (`edge_factor::CLAIM_VALIDITY_FRAME_ID`, seeded by migration 154) and
+    /// never created at request time.
     #[serde(default)]
     pub frame_id: Option<Uuid>,
     /// Fraction of total mass allocated to open-world ignorance, in [0, 0.5].
@@ -175,6 +177,12 @@ pub async fn assess_claim(
     // `paper_validity_<slug of source_url>` (or `research_validity`), minting a
     // 2-hypothesis frame per source (74 on prod by 2026-10-05) and panicking
     // when a multi-byte char straddled the slug's 80-byte cut.
+    //
+    // U027F: resolved by its fixed id, never by name and never created here.
+    // A by-name get-or-create let whoever first named a frame
+    // `claim_validity` (frames.name is UNIQUE) refuse every later call or
+    // receive its evidence. A missing or non-canonical row refuses the call
+    // before anything is written.
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
         let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
@@ -188,7 +196,7 @@ pub async fn assess_claim(
         let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
             message: format!("acquire connection: {e}"),
         })?;
-        epigraph_engine::edge_factor::ensure_claim_validity_frame(&mut conn, &viewer)
+        epigraph_engine::edge_factor::resolve_claim_validity_frame(&mut conn, &viewer)
             .await
             .map_err(|message| ApiError::InternalError { message })?
     };

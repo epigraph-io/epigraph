@@ -33,10 +33,16 @@ use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionPr
 const BINARY_FRAME_NAME: &str = "binary_truth";
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
-/// The canonical claim-assessment frame (prod id `8a594393`), which replaced
-/// the per-source `paper_validity_<slug>` frames `POST /claims/:id/assess`
-/// used to mint. No migration creates it, so it is resolved by NAME.
+/// The canonical claim-assessment frame's name. It replaced the per-source
+/// `paper_validity_<slug>` frames `POST /claims/:id/assess` used to mint.
 pub const CLAIM_VALIDITY_FRAME_NAME: &str = "claim_validity";
+/// The canonical `claim_validity` frame's fixed id: prod's row (public, nil
+/// world group), seeded on every other database by migration 154. It is
+/// resolved by THIS id, never by name: `frames.name` is UNIQUE and any caller
+/// can create a frame of any name, so a by-name lookup lets the first one to
+/// name a frame `claim_validity` decide what every assess writes into.
+pub const CLAIM_VALIDITY_FRAME_ID: Uuid =
+    Uuid::from_u128(0x8a59_4393_c343_4f1a_b942_5c5b_7862_f792);
 /// `claim_validity`'s ordered axis: 0 = supported, 1 = refuted, 2 = uncertain.
 pub const CLAIM_VALIDITY_HYPOTHESES: [&str; 3] = ["supported", "refuted", "uncertain"];
 
@@ -1188,75 +1194,47 @@ pub async fn ensure_binary_frame(
     }
 }
 
-/// Get-or-create the canonical `claim_validity` frame and return its id.
+/// Resolve the canonical `claim_validity` frame, [`CLAIM_VALIDITY_FRAME_ID`],
+/// and return its id. Never creates a frame.
 ///
-/// Same shape as [`ensure_binary_frame`] (the create runs under its own
-/// SAVEPOINT so a lost `frames_name_key` race cannot abort a caller's
-/// transaction), plus the axis check of
-/// `epigraph_mcp::tools::ds_auto::ensure_axis_frame`: a frame NAME denotes one
-/// ordered axis, so an existing `claim_validity` over different hypotheses is
-/// an error rather than a frame to write 3-way BBAs into.
+/// The row is checked before it is used: its name must be
+/// [`CLAIM_VALIDITY_FRAME_NAME`] and its ordered hypotheses
+/// [`CLAIM_VALIDITY_HYPOTHESES`] (a frame denotes one ordered axis, as in
+/// `epigraph_mcp::tools::ds_auto::ensure_axis_frame`). A missing or different
+/// row is an error, so a caller refuses before it writes anything. A frame
+/// some caller NAMED `claim_validity` under another id is never consulted.
 ///
 /// # Errors
-/// A DB failure, or a `claim_validity` frame whose hypotheses are not
-/// [`CLAIM_VALIDITY_HYPOTHESES`].
-pub async fn ensure_claim_validity_frame(
+/// A DB failure; the row absent or invisible to `viewer` (migration 154 seeds
+/// it); or a row with that id whose name or hypotheses are not the canonical
+/// ones.
+pub async fn resolve_claim_validity_frame(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
-    let hyps: Vec<String> = CLAIM_VALIDITY_HYPOTHESES
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    let check = |row: epigraph_db::FrameRow| -> Result<Uuid, String> {
-        if row.hypotheses == hyps {
-            Ok(row.id)
-        } else {
-            Err(format!(
-                "frame {CLAIM_VALIDITY_FRAME_NAME:?} exists over {:?}, not {hyps:?}",
-                row.hypotheses
-            ))
-        }
-    };
-    if let Some(row) = FrameRepository::get_by_name(&mut *conn, viewer, CLAIM_VALIDITY_FRAME_NAME)
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, CLAIM_VALIDITY_FRAME_ID)
         .await
-        .map_err(|e| format!("get_by_name: {e}"))?
+        .map_err(|e| format!("claim_validity: get_by_id: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "the canonical claim_validity frame {CLAIM_VALIDITY_FRAME_ID} is missing \
+                 (migration 154 seeds it); refusing to create one at request time"
+            )
+        })?;
+    if row.name != CLAIM_VALIDITY_FRAME_NAME
+        || row
+            .hypotheses
+            .iter()
+            .map(String::as_str)
+            .ne(CLAIM_VALIDITY_HYPOTHESES)
     {
-        return check(row);
+        return Err(format!(
+            "frame {CLAIM_VALIDITY_FRAME_ID} is {:?} over {:?}, not the canonical \
+             {CLAIM_VALIDITY_FRAME_NAME:?} over {CLAIM_VALIDITY_HYPOTHESES:?}",
+            row.name, row.hypotheses
+        ));
     }
-    let mut sp = conn
-        .begin()
-        .await
-        .map_err(|e| format!("claim_validity: could not open a savepoint for the create: {e}"))?;
-    let created = FrameRepository::create(
-        &mut *sp,
-        CLAIM_VALIDITY_FRAME_NAME,
-        Some(
-            "Canonical claim-assessment frame. Replaces the per-paper \
-             paper_validity_<slug> throwaway frames; index 0=supported, \
-             1=refuted, 2=uncertain.",
-        ),
-        &hyps,
-    )
-    .await;
-    match created {
-        Ok(row) => {
-            sp.commit().await.map_err(|e| {
-                format!("claim_validity: could not release the create savepoint: {e}")
-            })?;
-            Ok(row.id)
-        }
-        Err(_) => {
-            sp.rollback().await.map_err(|e| {
-                format!("claim_validity: could not roll back the failed create: {e}")
-            })?;
-            let row = FrameRepository::get_by_name(&mut *conn, viewer, CLAIM_VALIDITY_FRAME_NAME)
-                .await
-                .map_err(|e| format!("fallback get_by_name: {e}"))?
-                .ok_or_else(|| "claim_validity frame missing after create attempt".to_string())?;
-            check(row)
-        }
-    }
+    Ok(row.id)
 }
 
 fn binary_frame() -> Result<FrameOfDiscernment, String> {
