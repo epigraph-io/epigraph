@@ -455,3 +455,78 @@ async fn evolve_step_revises_records_no_supersession(pool: PgPool) {
         .expect_err("a revises branch is not a supersession to migrate");
     assert!(e.to_string().contains("does not supersede"), "{e}");
 }
+
+/// `revises` is lineage-internal history, like `supersedes`: `R -revises-> S`
+/// records that R branched from S. A later step-lineage supersession of
+/// EITHER end must leave it where it is. Carried onto S's successor it would
+/// say R branched from a version that did not exist when R was written; carried
+/// onto R's successor it would say that successor branched from S directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_cascade_leaves_revises_history_in_place(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let s = seed_claim(&pool, agent, "S: the original step", 0.7).await;
+
+    // R branches from S; both stay current.
+    let branch = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(s),
+        "R: a concurrent branch of S",
+        "revises",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(revises)");
+    let r = branch.new_claim_id;
+    let revises_edge = branch.edge_id;
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "seeded R -revises-> S"
+    );
+
+    // Incoming side: S is superseded by N within the lineage.
+    let n = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(s),
+        "N: S, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(S, supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, s, n)
+        .await
+        .expect("the Supersede cascade for (S, N)");
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "R -revises-> S stays on S when S is superseded (incoming)"
+    );
+
+    // Outgoing side: R is superseded by R2 within the lineage.
+    let r2 = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(r),
+        "R2: R, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(R, supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, r, r2)
+        .await
+        .expect("the Supersede cascade for (R, R2)");
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "R -revises-> S stays on R when R is superseded (outgoing)"
+    );
+}
