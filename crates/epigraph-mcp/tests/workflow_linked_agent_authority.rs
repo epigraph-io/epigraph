@@ -470,6 +470,83 @@ async fn a_sibling_agent_of_the_submitters_human_adds_a_step_with_provenance(poo
     );
 }
 
+/// The target side reads the submitter's link in ANY state: a workflow whose
+/// submitter is a RETIRED agent of H stays editable by H's live agents (as the
+/// operator keeps what a retired agent wrote, on the claim-ownership arm).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bound_agent_edits_a_workflow_its_humans_retired_agent_submitted(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let h = human(&pool, "h").await;
+    let retired = retired_agent(&pool, h, "retired-submitter").await;
+    let (agent, client) = allowlisted_agent(&pool, h, "a").await;
+    let wf = workflow_submitted_by(&pool, &server, "la-retired-submitter", retired).await;
+    let auth = token(agent, client);
+    let viewer = http_viewer(&server, &auth).await;
+    let before = steps(&pool, "la-retired-submitter").await;
+    tools::step_ops::add_step(
+        &server,
+        &viewer,
+        add(
+            "la-retired-submitter",
+            "a step on a retired agent's workflow",
+        ),
+        Some(&auth),
+    )
+    .await
+    .expect("H's live agent edits what H's retired agent submitted");
+    assert_eq!(steps(&pool, "la-retired-submitter").await, before + 1);
+    let rows = provenance(&pool, wf).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["arm"], "linked_agent");
+    assert_eq!(rows[0].1["submitter"], retired.to_string());
+    assert_eq!(rows[0].1["operator"], h.to_string());
+}
+
+/// The submitter is itself an ALLOWLISTED agent of H (no link record, so
+/// `operator_of_author` cannot see its human): another agent of H is admitted
+/// through `human_of`, and an agent of another human is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sibling_of_an_allowlisted_submitter_is_admitted(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let h = human(&pool, "h").await;
+    let other = human(&pool, "other").await;
+    let (s, _) = allowlisted_agent(&pool, h, "submitter").await;
+    let (agent, client) = allowlisted_agent(&pool, h, "sibling").await;
+    let (foreign, foreign_client) = allowlisted_agent(&pool, other, "foreign").await;
+    let wf = workflow_submitted_by(&pool, &server, "la-allowlisted-submitter", s).await;
+
+    let foreign_auth = token(foreign, foreign_client);
+    let foreign_viewer = http_viewer(&server, &foreign_auth).await;
+    assert_refused(
+        &pool,
+        &server,
+        &foreign_viewer,
+        &foreign_auth,
+        "la-allowlisted-submitter",
+        "was submitted by agent",
+    )
+    .await;
+
+    let auth = token(agent, client);
+    let viewer = http_viewer(&server, &auth).await;
+    let before = steps(&pool, "la-allowlisted-submitter").await;
+    tools::step_ops::add_step(
+        &server,
+        &viewer,
+        add("la-allowlisted-submitter", "a sibling's step"),
+        Some(&auth),
+    )
+    .await
+    .expect("an agent of an allowlisted submitter's human");
+    assert_eq!(steps(&pool, "la-allowlisted-submitter").await, before + 1);
+    let rows = provenance(&pool, wf).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["arm"], "linked_agent");
+    assert_eq!(rows[0].1["submitter"], s.to_string());
+    assert_eq!(rows[0].1["acting_agent"], agent.to_string());
+    assert_eq!(rows[0].1["operator"], h.to_string());
+}
+
 /// Shared shape of every refusal: `add_step` refused with the workflow named,
 /// and NOTHING written — no step, no provenance row.
 async fn assert_refused(
