@@ -1187,7 +1187,11 @@ pub async fn find_workflow_hierarchical(
 ///
 /// Updates `workflows.metadata` counters (use_count, success_count, failure_count,
 /// avg_variance) and writes per-step `behavioral_executions` rows with
-/// `step_claim_id` populated for each step in `step_executions`.
+/// `step_claim_id` populated for each step in `step_executions`, all on one
+/// transaction: a refused step row is a 500 and nothing is written. An
+/// out-of-range `quality` is a 400. A non-blank `goal_text` is embedded
+/// (best-effort) onto every step row so the report feeds behavioral affinity.
+/// NOT idempotent: a retried report counts twice.
 ///
 /// Returns 404 if the id does not correspond to a `workflows` row. Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
@@ -1199,6 +1203,7 @@ pub async fn find_workflow_hierarchical(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "quality outside [0, 1]"),
         (status = 404),
         (status = 500),
     ),
@@ -1210,11 +1215,65 @@ pub async fn report_hierarchical_outcome(
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // 1. Confirm this is a hierarchical workflow root
+    // 0. Validate before touching the database (U033). `behavioral_executions`
+    //    carries CHECK (quality BETWEEN 0 AND 1); an out-of-range value used to
+    //    move the counters and then have every step row silently refused.
+    if let Some(q) = request.quality {
+        if !(q.is_finite() && (0.0..=1.0).contains(&q)) {
+            return Err(ApiError::BadRequest {
+                message: format!("`quality` must be a finite number in [0, 1]; got {q}"),
+            });
+        }
+    }
+
+    // Embed the goal for affinity matching, best-effort and BEFORE the
+    // transaction so embedder latency stays out of the row lock. Blank goals and
+    // the "hierarchical" placeholder are not goals. Mirrors the MCP tool's
+    // `do_report_hierarchical_outcome_with_embedder`.
+    let goal_text = request
+        .goal_text
+        .clone()
+        .unwrap_or_else(|| String::from("hierarchical"));
+    let goal_to_embed = request
+        .goal_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != "hierarchical");
+    let goal_embedding_pgvec = match (goal_to_embed, state.embedding_service()) {
+        (Some(goal), Some(embedder)) => match embedder.generate(goal).await {
+            Ok(vec) => Some(format!(
+                "[{}]",
+                vec.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // ONE transaction for the counters and every step row (U033): a refused row
+    // fails the report and rolls the counters back. A plain transaction, not an
+    // author-stamped one: neither `workflows` nor `behavioral_executions` has
+    // row security, so there is no `WITH CHECK` for a stamp to satisfy.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("transaction begin failed: {e}"),
+        })?;
+
+    // 1. Confirm this is a hierarchical workflow root, and lock its row so two
+    //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
     let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(&state.db_pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflows lookup failed: {e}"),
@@ -1274,7 +1333,7 @@ pub async fn report_hierarchical_outcome(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(&state.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("metadata update failed: {e}"),
@@ -1301,15 +1360,17 @@ pub async fn report_hierarchical_outcome(
                   e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
-    .fetch_all(&state.db_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("step lookup failed: {e}"),
     })?;
     let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
 
-    // 5. Write per-step behavioral_executions rows. Capture timestamp once so
-    //    rows from a single outcome report group cleanly downstream.
+    // 5. Write per-step behavioral_executions rows on the same transaction; a
+    //    refused row returns 500 and rolls back everything above. Capture the
+    //    timestamp once so rows from a single outcome report group cleanly
+    //    downstream (and count as ONE report in `behavioral_affinity_lineage`).
     let report_ts = chrono::Utc::now();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {
@@ -1329,10 +1390,7 @@ pub async fn report_hierarchical_outcome(
             let row = epigraph_db::BehavioralExecutionRow {
                 id: Uuid::new_v4(),
                 workflow_id,
-                goal_text: request
-                    .goal_text
-                    .clone()
-                    .unwrap_or_else(|| String::from("hierarchical")),
+                goal_text: goal_text.clone(),
                 success,
                 step_beliefs,
                 tool_pattern: vec![step_exec.planned.clone()],
@@ -1343,13 +1401,21 @@ pub async fn report_hierarchical_outcome(
                 step_claim_id,
                 run_label: None,
             };
-            if let Err(e) =
-                epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
-            {
-                tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
-            }
+            epigraph_db::BehavioralExecutionRepository::create(
+                &mut *tx,
+                row,
+                goal_embedding_pgvec.as_deref(),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("behavioral_executions write failed: {e}"),
+            })?;
         }
     }
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("outcome commit failed: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": workflow_id,
