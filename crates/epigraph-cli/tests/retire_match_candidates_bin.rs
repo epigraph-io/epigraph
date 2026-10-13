@@ -348,3 +348,121 @@ async fn retire_apply_that_withdrew_nothing_rederives_nothing(pool: PgPool) {
         "{stdout}"
     );
 }
+
+/// A pair retired already, by an earlier run or the online path: its matcher
+/// edge carries `valid_to` and its derived factor and bp_messages are gone.
+/// The edge query still selects it (it has no `valid_to` filter, so the undo
+/// dump records it), but nothing the run does to it changes a row. This makes
+/// it the only input on which the per-edge `withdrew_here > 0` guard decides
+/// anything.
+async fn already_retired_candidate(pool: &PgPool, a: Uuid, b: Uuid) -> Uuid {
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', \
+                 '{\"source\": \"cross_source_matcher\"}'::jsonb) RETURNING id",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("the matcher edge");
+    // The `edges_auto_factor` trigger ignores `valid_to`, so it derived a
+    // factor; the earlier retirement deleted it, bp_messages first.
+    let eid = edge.to_string();
+    sqlx::query(
+        "DELETE FROM bp_messages WHERE factor_id IN \
+         (SELECT id FROM factors WHERE properties->>'source_edge_id' = $1)",
+    )
+    .bind(&eid)
+    .execute(pool)
+    .await
+    .expect("drop the derived bp_messages");
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1")
+        .bind(&eid)
+        .execute(pool)
+        .await
+        .expect("drop the derived factor");
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(edge)
+        .execute(pool)
+        .await
+        .expect("retract the edge");
+    let (factors, retracted): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM factors WHERE properties->>'source_edge_id' = $2), \
+                (SELECT valid_to IS NOT NULL FROM edges WHERE id = $1)",
+    )
+    .bind(edge)
+    .bind(&eid)
+    .fetch_one(pool)
+    .await
+    .expect("read the retired edge back");
+    assert_eq!(
+        (factors, retracted),
+        (0, true),
+        "CALIBRATION: the retired edge is retracted and has no derived factor left"
+    );
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    sqlx::query_scalar(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status) \
+         VALUES ($1, $2, 0.9, '{}'::jsonb, 'stale') RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .fetch_one(pool)
+    .await
+    .expect("the already-retired candidate")
+}
+
+/// The per-edge guard itself: a batch with a live promoted pair and an
+/// already-retired pair (see [`already_retired_candidate`]) finds BOTH matcher
+/// edges, but withdraws only from the live one. The retired pair's endpoints
+/// have no BBA, so re-deriving them would CLEAR caches the run never fed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_apply_leaves_an_already_retired_pair_alone(pool: PgPool) {
+    let operator = seed_agent(&pool).await;
+    let a = viewer_fixture::seed_public_claim(&pool, operator, "u043 rerun a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, operator, "u043 rerun b").await;
+    let c = viewer_fixture::seed_public_claim(&pool, operator, "u043 rerun c").await;
+    let e = viewer_fixture::seed_public_claim(&pool, operator, "u043 rerun e").await;
+    let live = promoted_candidate(&pool, a, b).await;
+    let retired = already_retired_candidate(&pool, c, e).await;
+
+    let d = seed_surviving_bba_and_derive(&pool, b, operator).await;
+    for claim in [a, b, c, e] {
+        poison_betp(&pool, claim).await;
+    }
+
+    let (code, stdout, stderr) = run_retire_apply(&pool, &[live, retired]).await;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    // Both edges reached the withdrawal loop, and only the live one withdrew.
+    for line in [
+        "Found 2 matcher edge(s) to delete.",
+        "factors deleted:     1",
+        "edges deleted:       1",
+    ] {
+        assert!(
+            stdout.contains(line),
+            "CALIBRATION: the retired edge is selected but withdraws nothing ({line:?}):\n{stdout}"
+        );
+    }
+    let after = betp_of(&pool, b)
+        .await
+        .unwrap_or_else(|| panic!("b keeps a cache: a BBA backs it\n{stdout}"));
+    assert!(
+        (after - d).abs() < 1e-9,
+        "CALIBRATION: the live pair is re-derived (expected {d}, found {after})\n{stdout}"
+    );
+    for claim in [c, e] {
+        assert_eq!(
+            betp_of(&pool, claim).await,
+            Some(POISONED_BETP),
+            "the already-retired pair withdrew nothing, so its endpoint {claim} must keep \
+             its cache\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Belief re-derived on the 2 affected endpoint(s)"),
+        "only the live pair's two endpoints are re-derived:\n{stdout}"
+    );
+}
