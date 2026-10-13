@@ -10,11 +10,14 @@
 //!
 //! The HTTP twin of MCP
 //! `link_epistemic_smoke.rs::qualifies_edge_is_created_but_does_not_move_belief`.
-//! The REST path has belief side effects the MCP tool does not (the legacy BP
-//! `factors` row, the 1-hop dependent propagation), so the neutrality is pinned
-//! here on every one of them, against a target that already HAS a belief the
-//! wire could move, with a `refutes` control on a parallel pair proving this
-//! fixture does move belief when the relationship is non-neutral.
+//! The REST path has a belief side effect the MCP tool does not: the legacy BP
+//! `factors` row (the route's own INSERT plus the `edges_auto_factor`
+//! trigger). Neutrality is pinned on it and on the DS wire, against a target
+//! that already HAS a belief the wire could move, each with a positive control
+//! on a parallel pair: a `refutes` edge that does move belief, and a
+//! `supports` edge that does create a factor. The route's 1-hop dependent
+//! propagation runs only when the wire materialized a mass function, so the
+//! zero-BBA assertion covers it.
 
 mod viewer_fixture;
 
@@ -145,7 +148,13 @@ async fn qualifies_edge_is_accepted_and_moves_no_belief(pool: PgPool) {
     let hub = seed_public_claim(&pool, agent, "anchor density threshold").await;
     let refuter = seed_public_claim(&pool, agent, "control: a refuting claim").await;
     let refuted = seed_public_claim(&pool, agent, "control: the refuted claim").await;
-    give_belief(&pool, &[caveat, hub, refuter, refuted]).await;
+    let supporter = seed_public_claim(&pool, agent, "control: a supporting claim").await;
+    let supported = seed_public_claim(&pool, agent, "control: the supported claim").await;
+    give_belief(
+        &pool,
+        &[caveat, hub, refuter, refuted, supporter, supported],
+    )
+    .await;
 
     // Control: on this exact fixture a non-neutral relation from a 0.9 source
     // DOES move its target. Without it, "the hub kept 0.9" could just mean
@@ -167,6 +176,22 @@ async fn qualifies_edge_is_accepted_and_moves_no_belief(pool: PgPool) {
         bbas_on(&pool, control.edge.id).await,
         1,
         "control wired one BBA"
+    );
+
+    // Control: a `supports` edge on this fixture DOES leave a legacy BP factor
+    // over its pair, so the zero asserted for `qualifies` below is a measured
+    // absence, not a query that never counts anything.
+    let (factor_status, _) = post(
+        &pool,
+        &state,
+        agent,
+        claim_edge(supporter, supported, "supports"),
+    )
+    .await;
+    assert_eq!(factor_status, StatusCode::CREATED);
+    assert!(
+        factors_over(&pool, supporter, supported).await >= 1,
+        "control: a supports edge must leave a factor over its pair"
     );
 
     let (status, created) = post(&pool, &state, agent, claim_edge(caveat, hub, "qualifies")).await;
