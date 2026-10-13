@@ -24,10 +24,15 @@
 //! - provenance LCA between agents. The REST `routes/independence.rs` analysis
 //!   does that, but it passes `mass_functions` row ids to `get_lca`, which
 //!   walks claim lineage, so in practice it never finds a shared ancestor. It
-//!   is left where it is; this module is the shared path both the MCP write
-//!   (`ds_auto::auto_wire_ds_update`) and the recompute
-//!   (`edge_factor::compute_combined_belief`) use, so the next recompute cannot
-//!   re-inflate what the write left honest.
+//!   is left where it is.
+//!
+//! Every combine of stored BBAs goes through [`combine_with_source_dependence`]:
+//! the MCP writes (`ds_auto::auto_wire_ds_update`), the recompute
+//! (`edge_factor::compute_combined_belief`) and the compute-on-read readers
+//! (`belief_query::combine_framed_bbas`, behind framed `get_belief`,
+//! `get_perspective_belief` and its batch). So the next recompute cannot
+//! re-inflate what the write left honest, and no reader serves a value the
+//! cache does not hold.
 
 use std::collections::HashMap;
 
@@ -67,17 +72,18 @@ pub fn normalize_source_url(url: &str) -> Option<String> {
 /// names both a source agent and an evidence row whose `source_url` is set and
 /// visible to `viewer`.
 ///
-/// Read on the caller's connection, through `viewer`, so the write path's
-/// stamped transaction and the recompute's connection both see the evidence
-/// rows their own BBAs reference.
+/// Read on the caller's executor, through `viewer`, so the write path's
+/// stamped transaction, the recompute's connection and the compute-on-read
+/// readers' pool (`crate::belief_query`) each see the evidence rows their own
+/// BBAs reference. One query, and none at all when no row can carry a key.
 ///
 /// # Errors
-/// String error if the evidence read fails.
-pub async fn source_keys_for_rows(
-    conn: &mut sqlx::PgConnection,
+/// `DbError` if the evidence read fails.
+pub async fn source_keys_for_rows<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
     rows: &[MassFunctionRow],
-) -> Result<Vec<Option<SourceKey>>, String> {
+) -> Result<Vec<Option<SourceKey>>, epigraph_db::DbError> {
     let evidence_ids: Vec<Uuid> = rows
         .iter()
         .filter(|r| r.source_agent_id.is_some())
@@ -86,9 +92,7 @@ pub async fn source_keys_for_rows(
     let urls: HashMap<Uuid, String> = if evidence_ids.is_empty() {
         HashMap::new()
     } else {
-        EvidenceRepository::source_urls_by_id(&mut *conn, viewer, &evidence_ids)
-            .await
-            .map_err(|e| format!("evidence source_url read: {e}"))?
+        EvidenceRepository::source_urls_by_id(executor, viewer, &evidence_ids).await?
     };
     Ok(rows
         .iter()

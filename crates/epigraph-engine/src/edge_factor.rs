@@ -910,8 +910,9 @@ async fn compute_combined_belief(
     // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
     // A single (or single-source) BBA is not folded: its own empty-set mass
     // is the conflict.
-    let source_keys =
-        crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows).await?;
+    let source_keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+        .await
+        .map_err(|e| format!("evidence source_url read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
     for (row, key) in all_rows.iter().zip(source_keys) {
         let mf = parse_stored_bba(frame, &row.masses)?;

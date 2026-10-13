@@ -747,7 +747,8 @@ pub async fn auto_wire_ds_update(
     // Rows with no source identity fold exactly as before.
     let source_keys =
         epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
-            .await?;
+            .await
+            .map_err(|e| format!("evidence source_url read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
     for (row, key) in all_rows.iter().zip(source_keys) {
         let mf = parse_stored_bba(&frame, &row.masses)?;
