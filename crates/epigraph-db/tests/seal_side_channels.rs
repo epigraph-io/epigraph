@@ -573,14 +573,15 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
         assert_eq!(v, &format!("[sealed:x{}]", claim.simple()));
     }
 
-    // Evidence, on both vector columns.
-    let evidence: Vec<(
+    // Evidence, on both vector columns and the URL column.
+    type SealedEvidenceRow = (
         Option<String>,
         bool,
         bool,
         serde_json::Value,
         Option<String>,
-    )> = sqlx::query_as(
+    );
+    let evidence: Vec<SealedEvidenceRow> = sqlx::query_as(
         "SELECT raw_content, embedding IS NOT NULL, embedding_3072 IS NOT NULL, properties, \
                     source_url \
                FROM evidence WHERE claim_id = $1",
