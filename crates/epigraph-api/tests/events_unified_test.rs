@@ -431,3 +431,70 @@ async fn after_id_without_since_is_rejected() {
         .unwrap();
     assert_eq!(paired.status().as_u16(), 200, "after_id with since");
 }
+
+/// The `(since, after_id)` cursor must also hold for events that live ONLY in
+/// the in-process `EventStore` — `edge.added`, belief and community events are
+/// pushed to `global_event_store()` and never persisted. The SQL tests above
+/// cannot see that half: the database filters their rows before the route's
+/// in-process predicate and merge sort ever run.
+///
+/// The cursor is the first returned event's `created_at` STRING exactly as the
+/// route serialised it, plus its id. In-memory timestamps carry nanoseconds,
+/// so rebuilding the cursor at microsecond precision would let the cursor
+/// event back in even with a correct predicate. Which of the three pushes
+/// sorts first is not assumed (two `Utc::now()` stamps can tie, and then the
+/// random ids decide): the expectation is "everything after page[0]".
+#[tokio::test(flavor = "multi_thread")]
+async fn after_id_cursor_skips_the_cursor_event_in_the_in_memory_store() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let unique_type = format!("test.inmem_cursor_{}", Uuid::new_v4().simple());
+    for i in 0..3 {
+        epigraph_api::routes::events::global_event_store()
+            .push(unique_type.clone(), None, serde_json::json!({"i": i}))
+            .await;
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let client = reqwest::Client::new();
+    let get = |params: Vec<(&'static str, String)>| {
+        let req = client
+            .get(format!("http://{addr}/api/v1/events"))
+            .query(&params)
+            .bearer_auth(&token);
+        async move {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            let body: Value = resp.json().await.unwrap();
+            body["events"].as_array().expect("events array").clone()
+        }
+    };
+
+    let all = get(vec![("event_type", unique_type.clone())]).await;
+    assert_eq!(all.len(), 3, "the three in-memory events, got {all:?}");
+    let first = &all[0];
+    let since = first["created_at"]
+        .as_str()
+        .expect("created_at string")
+        .to_string();
+    let after_id = first["id"].as_str().expect("id string").to_string();
+
+    let page = get(vec![
+        ("event_type", unique_type.clone()),
+        ("since", since.clone()),
+        ("after_id", after_id.clone()),
+    ])
+    .await;
+    let ids = |events: &[Value]| -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e["id"].as_str().expect("id string").to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&page),
+        ids(&all[1..]),
+        "with cursor (since={since}, after_id={after_id}) the page must be \
+         exactly the events after the cursor event, which must not be re-served"
+    );
+}
