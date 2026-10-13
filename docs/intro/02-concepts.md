@@ -253,10 +253,13 @@ atoms; the `theme_cluster` MCP tool in
 (re)builds them from the live corpus by running k-means over
 paragraph embeddings, with elbow-penalised search over
 `k_min..=k_max` when `k` is not pinned. The default `limit` is 500
-(VM OOMs at ~2000 embeddings, per `feedback_memory_limits.md`),
-and `wipe_first=true` is the safe default because `claim_themes`
-has no `UNIQUE(label)` constraint and additive runs silently
-duplicate `auto-00, auto-01, …` rows.
+(VM OOMs at ~2000 embeddings, per `feedback_memory_limits.md`).
+`wipe_first` defaults to `false`: a run is additive, and because
+`claim_themes` has no `UNIQUE(label)` constraint, repeated additive
+runs under one `label_prefix` duplicate `auto-00, auto-01, …` rows.
+`wipe_first=true` is destructive: it deletes EVERY theme (whatever its
+prefix) and clears every `claims.theme_id`, so it needs `claims:admin`
+and is admitted only with the canonical `label_prefix` `"auto"`.
 
 Rule of thumb:
 
