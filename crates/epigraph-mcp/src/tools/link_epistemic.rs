@@ -528,6 +528,39 @@ mod tests {
         );
     }
 
+    /// `qualifies` is a SCOPE CAVEAT ("A bounds the conditions under which B
+    /// applies"), not a verdict on B's truth (backlog 99582af7). It is accepted
+    /// through the structural, belief-neutral set — never the epistemic one, or
+    /// a caveat would be wired like a refutation. It is directional (it is not
+    /// in the symmetric set) and lower-case only, per the U014 casing ruling.
+    #[test]
+    fn qualifies_is_structural_directional_and_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            is_structural_relationship("qualifies"),
+            "'qualifies' must be accepted via STRUCTURAL_RELATIONSHIPS"
+        );
+        assert!(
+            !is_epistemic_relationship("qualifies"),
+            "'qualifies' must NOT be in EPISTEMIC_RELATIONSHIPS (it moves no belief)"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("qualifies", &profile),
+                RestrictionKind::Neutral
+            ),
+            "'qualifies' must map to RestrictionKind::Neutral — a scope caveat must not move belief"
+        );
+        assert!(
+            !is_symmetric_relationship("qualifies"),
+            "'A qualifies B' is not 'B qualifies A'"
+        );
+        assert!(
+            !is_structural_relationship("QUALIFIES"),
+            "lower-case canonical spelling only"
+        );
+    }
+
     /// Pin the polarity split from the spec §4 table: the five positive
     /// relationships strengthen the target (`Positive`), the two negative ones
     /// weaken it (`Negative`). This catches an accidental sign flip in the
