@@ -245,13 +245,15 @@ async fn analyze_requires_the_analysis_reasoning_scope(pool: PgPool) {
 
 // ── Direct handler invocation ──
 //
-// The two arms below call the handler as a function, because each needs an
-// `AppState` the router fixture cannot build: one with entries in the
-// in-memory `claim_store`, one whose raw pool is a different session from its
-// scoped pool.
+// The arms below call the handler as a function. Two need an `AppState` the
+// router fixture cannot build: one with entries in the in-memory
+// `claim_store`, one whose raw pool is a different session from its scoped
+// pool. The third needs a request the router cannot deliver: a resolved
+// viewer with no `AuthContext`.
 
 use axum::extract::State;
 use axum::{Extension, Json};
+use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::{AuthContext, ViewerExtractor};
 use epigraph_api::middleware::ClientType;
 use epigraph_api::routes::reasoning::{analyze as analyze_handler, AnalyzeRequest};
@@ -438,4 +440,54 @@ async fn analyze_serves_the_owners_private_edge_from_the_stamped_connection(pool
         sorted(vec![(c.p1, c.p2), (c.p2, c.p3), (c.p1, c.p3)]),
         "the owner's analysis must derive through its own private edge"
     );
+}
+
+/// The handler refuses a request that carries no `AuthContext`, on its own
+/// terms. Over HTTP `ViewerExtractor` already answers 401 for that request, so
+/// this is the handler's second line, and only a direct call can reach it: the
+/// viewer below is resolved and the state is a working one, so a handler that
+/// checked the scope only when an `AuthContext` happened to be present would
+/// serve this request a full analysis instead of refusing it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn analyze_refuses_a_request_with_no_auth_context(pool: PgPool) {
+    let c = corpus(&pool).await;
+    let state = || async {
+        AppState::with_scoped_pool(
+            viewer_fixture::scoped_pool(&pool).await,
+            ApiConfig::default(),
+        )
+    };
+
+    // Non-vacuity: with the owner's AuthContext the same call is served and
+    // derives through the corpus, so a refusal below is the missing context.
+    let served = analyze_as(
+        state().await,
+        &pool,
+        c.owner_agent,
+        request(Some(vec![c.p1, c.p2, c.p3])),
+    )
+    .await;
+    assert_eq!(
+        served["stats"]["edges_loaded"], 2,
+        "the owner's call must be served: {served}"
+    );
+
+    let viewer = epigraph_db::Viewer::resolve(&pool, c.owner_agent)
+        .await
+        .expect("resolve viewer");
+    let refused = analyze_handler(
+        ViewerExtractor(viewer),
+        State(state().await),
+        None,
+        Json(request(Some(vec![c.p1, c.p2, c.p3]))),
+    )
+    .await;
+    match refused {
+        Err(ApiError::Unauthorized { .. }) => {}
+        Err(other) => panic!("a request with no AuthContext must be Unauthorized, got {other:?}"),
+        Ok(Json(resp)) => panic!(
+            "a request with no AuthContext was served an analysis: {}",
+            serde_json::to_value(resp).expect("serialize response")
+        ),
+    }
 }
