@@ -459,3 +459,95 @@ fn spend_markers_count_only_in_code_not_in_comments() {
         "a `// VISIBILITY-EXEMPT:` line comment must still exempt the function"
     );
 }
+
+/// A synthetic viewer-taking tool function whose body is `body`, for the
+/// SQL-text spend fixtures below.
+fn viewer_fn_fixture(body: &str) -> String {
+    format!(
+        "
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, McpError> {{
+            {body}
+        }}
+    "
+    )
+}
+
+/// The verdict for one synthetic function: is it reported as unspent?
+fn fixture_is_unspent(body: &str) -> bool {
+    let fns = viewer_taking_fns_in("synthetic.rs", &viewer_fn_fixture(body));
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    unspent_offenders(&fns).len() == 1
+}
+
+/// `visibility = 'public'` commented out INSIDE the SQL text with `--` is not a
+/// predicate the database evaluates, so it must not spend the viewer.
+#[test]
+fn a_predicate_inside_an_sql_line_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE c.id = $1 -- AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3::uuid[]))").fetch_all(pool).await?)"#
+        ),
+        "a three-bind predicate after an in-SQL `--` is commented out of the \
+         statement and must not count as spending the viewer"
+    );
+}
+
+/// The same for an in-SQL `/* */` comment.
+#[test]
+fn a_predicate_inside_an_sql_block_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* WHERE c.visibility = 'public' */").fetch_all(pool).await?)"#
+        ),
+        "a predicate inside an in-SQL `/* */` comment must not count as \
+         spending the viewer"
+    );
+}
+
+/// `.splice(` is a METHOD CALL: written inside a string
+/// literal (a log line, an error message) it calls nothing.
+#[test]
+fn a_splice_call_named_only_inside_a_string_does_not_spend() {
+    let body = r#"tracing::debug!("not yet routed through viewer.splice( here");
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c").fetch_all(pool).await?)"#;
+    assert!(
+        fixture_is_unspent(body),
+        "`.splice(` inside a string literal is not a call and must not count \
+         as spending the viewer"
+    );
+}
+
+/// The over-strip guard for the two tests above: an in-SQL `--` comment ends at
+/// the end of ITS line, so a live predicate on the next line of the same
+/// literal — a real newline or a `\n` escape — still spends the viewer.
+#[test]
+fn an_sql_comment_does_not_hide_a_live_predicate_on_a_later_line() {
+    let multi_line = r#"Ok(sqlx::query_scalar(
+                "SELECT c.content FROM claims c
+                 -- visibility: the static three-bind form
+                 WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+            ).fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(multi_line),
+        "a `--` line must not hide the live predicate on the next line"
+    );
+
+    let escaped = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c -- read path\n WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(escaped),
+        "a `\\n` escape ends an in-SQL `--` comment like a real newline does"
+    );
+
+    let after_block = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* read path */ WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(after_block),
+        "an in-SQL `/* */` comment must not hide the predicate after it"
+    );
+
+    let char_quote = r#"let _q = '"';
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(char_quote),
+        "a `'\"'` char literal must not desynchronise the string state"
+    );
+}
