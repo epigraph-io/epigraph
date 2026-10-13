@@ -108,9 +108,10 @@ Schema supports `signature` / `signer_id` on edges (migration 073). S1 does not 
 
 ## Supersession carries verb-edges, except a step's frozen ones
 
-When a claim is replaced (`supersede_claim`, or `evolve_step` with `supersedes`), the new claim records `claims.supersedes = <old>`, and the Supersede admin cascade (`ClaimRepository::migrate_superseded_edges_conn`, run on the maintenance connection after the act commits, or by the deferred replay) re-points the old claim's edges onto the replacement. Weakening edges (`refutes`, `contradicts`) stay on the content they were filed against (issue #398). A STEP-LINEAGE supersession (old and new share a `step_lineage_id`: `evolve_step(supersedes)`) also leaves three kinds of edge on the retired step:
+When a claim is replaced (`supersede_claim`, or `evolve_step` with `supersedes`), the new claim records `claims.supersedes = <old>`, and the Supersede admin cascade (`ClaimRepository::migrate_superseded_edges_conn`, run on the maintenance connection after the act commits, or by the deferred replay) re-points the old claim's edges onto the replacement. Weakening edges (`refutes`, `contradicts`) stay on the content they were filed against (issue #398). A STEP-LINEAGE supersession (old and new share a `step_lineage_id`: `evolve_step(supersedes)`) also leaves four kinds of edge on the retired step:
 
 - `executes` (workflow → step): it names the FROZEN original step; readers reach the live head through the lineage (`ClaimRepository::latest_in_lineage`).
+- the workflow's chain, `step_follows` and `phase_follows`, in either direction: it links the same frozen steps `executes` names, and `workflow_steps::ordered_steps` walks it only inside that set, so a chain edge moved onto the head would break the step order.
 - `revises`, in either direction: like `supersedes`, it is the lineage's own branch history (`R -revises-> S` says R branched from S), so it stays between the versions it was written between.
 - an agent's `asserts` / `AUTHORED`: the evolved step is written by the evolve_step caller, so another agent's assertion of the old content is not an assertion of the new one.
 
