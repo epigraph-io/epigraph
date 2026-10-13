@@ -178,15 +178,16 @@ pub(crate) async fn submit_claim_response(
 ///   its labels, not an evidence row, not a trace.
 /// * [`DedupBy::ContentHash`] — `write_submission` still runs in full on the
 ///   existing claim: `update_labels_conn` UNIONS the labels in; a new Evidence
-///   row (evidence_data, evidence_type, and source_url serialized into the
-///   evidence type) and a new ReasoningTrace (methodology, reasoning,
+///   row (evidence_data, evidence_type, and source_url in `evidence.source_url`)
+///   and a new ReasoningTrace (methodology, reasoning,
 ///   confidence) are written and linked by DERIVED_FROM / HAS_TRACE edges. The
 ///   trace becomes the claim's canonical trace only if it had none. The DS
 ///   auto-wire is skipped (`was_created` is false), so none of it moves the
 ///   existing belief. `novelty_threshold` is never consulted: the exact-content
-///   pre-check skips the gate. `source_url` is written nowhere for `empirical`
-///   evidence, whose evidence type has no URL slot (`parse_evidence_type`) —
-///   true of a fresh insert as well.
+///   pre-check skips the gate. `source_url` is stored in `evidence.source_url`
+///   for every evidence type, `empirical` included (whose evidence type has no
+///   URL slot of its own, `parse_evidence_type`) — true of a fresh insert as
+///   well.
 ///
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
@@ -194,7 +195,6 @@ pub(crate) async fn submit_claim_response(
 fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut discarded: Vec<&'static str> = Vec::new();
-    let url_has_a_slot = !params.evidence_type.eq_ignore_ascii_case("empirical");
     match by {
         DedupBy::NoveltyGate => {
             discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
@@ -217,11 +217,7 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
                 "confidence",
             ]);
             if params.source_url.is_some() {
-                if url_has_a_slot {
-                    applied.push("source_url");
-                } else {
-                    discarded.push("source_url");
-                }
+                applied.push("source_url");
             }
             if params.reasoning.is_some() {
                 applied.push("reasoning");
@@ -576,9 +572,19 @@ async fn write_submission(
     ReasoningTraceRepository::create(&mut *conn, &trace, claim.id)
         .await
         .map_err(internal_error)?;
-    EvidenceRepository::create(&mut *conn, &evidence_with_sig)
-        .await
-        .map_err(internal_error)?;
+    // The caller's URL goes in `evidence.source_url` whatever the evidence
+    // type: `empirical` evidence (an `Observation`) has no URL slot of its own,
+    // so the column is the only place it can live (backlog 43ab8c73).
+    EvidenceRepository::create_with_source_url(
+        &mut *conn,
+        &evidence_with_sig,
+        params
+            .source_url
+            .as_deref()
+            .or_else(|| EvidenceRepository::source_url_of(&evidence_with_sig.evidence_type)),
+    )
+    .await
+    .map_err(internal_error)?;
 
     // Verb-edges: every submission references its own Evidence + Trace.
     // Emitted on both branches per the architecture doc's "re-occurrence
@@ -1267,9 +1273,18 @@ pub async fn update_with_evidence(
     )
     .await?;
 
-    EvidenceRepository::create(&mut *tx, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // As in `write_submission`: the column holds the caller's URL for every
+    // evidence type, including `empirical` (backlog 43ab8c73).
+    EvidenceRepository::create_with_source_url(
+        &mut *tx,
+        &evidence,
+        params
+            .source_url
+            .as_deref()
+            .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+    )
+    .await
+    .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);

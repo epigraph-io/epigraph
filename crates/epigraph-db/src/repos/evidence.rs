@@ -181,6 +181,42 @@ impl EvidenceRepository {
         executor: E,
         evidence: &Evidence,
     ) -> Result<Evidence, DbError> {
+        Self::create_with_source_url(
+            executor,
+            evidence,
+            Self::source_url_of(&evidence.evidence_type),
+        )
+        .await
+    }
+
+    /// The URL an evidence type carries that belongs in `evidence.source_url`:
+    /// a `Document`'s `source_url`, and nothing else.
+    ///
+    /// A `Testimony`'s `source` is free text (a person's name, or the MCP
+    /// default `"unknown"`), and `Literature`/`Figure` carry a DOI rather than
+    /// a URL, so none of those is a column value.
+    #[must_use]
+    pub fn source_url_of(evidence_type: &EvidenceType) -> Option<&str> {
+        match evidence_type {
+            EvidenceType::Document { source_url, .. } => source_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::create`] with an explicit `evidence.source_url`.
+    ///
+    /// For callers that hold a URL the evidence type has no slot for: MCP
+    /// `empirical` evidence is stored as `EvidenceType::Observation`, so its
+    /// caller-supplied URL can only live in the column (backlog 43ab8c73).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, evidence))]
+    pub async fn create_with_source_url<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        evidence: &Evidence,
+        source_url: Option<&str>,
+    ) -> Result<Evidence, DbError> {
         let id: Uuid = evidence.id.into();
         let agent_id: Uuid = evidence.agent_id.into();
         let claim_id: Uuid = evidence.claim_id.into();
@@ -209,7 +245,7 @@ impl EvidenceRepository {
             id,
             content_hash.as_slice(),
             evidence_type_str,
-            None::<String>, // source_url extracted from evidence_type if needed
+            source_url,
             raw_content,
             claim_id,
             signature,
@@ -1083,7 +1119,7 @@ impl EvidenceRepository {
                 .bind(id)
                 .bind(e.content_hash.as_slice())
                 .bind(evidence_type_str)
-                .bind(None::<String>) // source_url extracted from evidence_type if needed
+                .bind(Self::source_url_of(&e.evidence_type))
                 .bind(e.raw_content.as_deref())
                 .bind(claim_id)
                 .bind(signature)
