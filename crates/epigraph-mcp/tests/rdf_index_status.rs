@@ -1,5 +1,6 @@
 //! The three RDF read tools must not let an empty index pass for a negative
-//! answer.
+//! answer, and `query_triples` must not turn a name it could not resolve into
+//! a wildcard.
 //!
 //! No pipeline populates the `entities` / `triples` index today, so every call
 //! to `query_triples`, `search_triples` or `entity_neighborhood` comes back
@@ -250,4 +251,110 @@ async fn entity_neighborhood_reports_the_empty_index(pool: PgPool) {
     );
     assert_eq!(hit["index_populated"], serde_json::json!(true), "got {hit}");
     assert_eq!(hit["triple_count"], serde_json::json!(1), "got {hit}");
+}
+
+// ── unresolved names ──
+
+/// A subject name that resolves to no entity returns NOTHING, flagged
+/// `unresolved`, rather than wildcarding the subject filter and returning the
+/// top-confidence triples of the whole index.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_unresolved_subject_returns_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    seed_public_triple(&pool).await;
+
+    let v = body(
+        query_triples(
+            &server,
+            &viewer,
+            params(Some(("no-such-entity", Some("Material"))), None),
+        )
+        .await
+        .expect("query_triples with an unresolved subject"),
+    );
+    assert_eq!(
+        v["count"],
+        serde_json::json!(0),
+        "the subject names no entity, so no triple can match; returning the seeded \
+         triple means the unresolved name became a wildcard. Got {v}"
+    );
+    assert_eq!(v["unresolved"], serde_json::json!(["subject"]), "got {v}");
+}
+
+/// The same for the object side, with the subject resolved: the object filter
+/// must not silently drop out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_unresolved_object_returns_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    seed_public_triple(&pool).await;
+
+    let v = body(
+        query_triples(
+            &server,
+            &viewer,
+            params(
+                Some(("silicon", Some("Material"))),
+                Some(("no-such-object", Some("Concept"))),
+            ),
+        )
+        .await
+        .expect("query_triples with an unresolved object"),
+    );
+    assert_eq!(v["count"], serde_json::json!(0), "got {v}");
+    assert_eq!(v["unresolved"], serde_json::json!(["object"]), "got {v}");
+}
+
+/// Both names resolve: the seeded triple comes back and nothing is flagged.
+/// Guards against a fix that returns nothing whenever a name is given.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_resolved_names_still_match(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let triple = seed_public_triple(&pool).await;
+
+    let v = body(
+        query_triples(
+            &server,
+            &viewer,
+            params(
+                Some(("silicon", Some("Material"))),
+                Some(("semiconductor", Some("Concept"))),
+            ),
+        )
+        .await
+        .expect("query_triples with resolved names"),
+    );
+    assert_eq!(v["count"], serde_json::json!(1), "got {v}");
+    assert_eq!(
+        v["triples"][0]["id"],
+        serde_json::json!(triple.to_string()),
+        "got {v}"
+    );
+    assert_eq!(v["unresolved"], serde_json::json!([]), "got {v}");
+}
+
+/// A name without a type is refused. Entities are keyed by `(name, type_top)`,
+/// and the old hidden `"Material"` default made a correctly named `Concept`
+/// entity miss, after which the miss wildcarded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_refuses_a_name_without_a_type(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    seed_public_triple(&pool).await;
+
+    let err = query_triples(
+        &server,
+        &viewer,
+        params(None, Some(("semiconductor", None))),
+    )
+    .await
+    .expect_err("an object name with no object_type must be refused");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        err.message.contains("object_type"),
+        "the refusal must name the missing parameter. Got: {}",
+        err.message
+    );
 }

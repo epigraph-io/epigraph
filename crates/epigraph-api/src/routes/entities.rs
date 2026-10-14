@@ -144,11 +144,16 @@ pub struct EntityResponse {
 /// `index_populated` says whether any triple is visible to the caller. No
 /// pipeline populates the triple index today, so `false` means an empty
 /// `triples` list is not evidence that the corpus lacks the fact.
+///
+/// `unresolved` names each of `"subject"` / `"object"` whose name matched no
+/// entity. When it is non-empty, `triples` is empty: a filter on a name that
+/// does not exist matches nothing.
 #[cfg(feature = "db")]
 #[derive(Serialize)]
 pub struct QueryTriplesResponse {
     pub count: usize,
     pub index_populated: bool,
+    pub unresolved: Vec<&'static str>,
     pub triples: Vec<epigraph_db::TripleRow>,
 }
 
@@ -299,15 +304,29 @@ pub async fn batch_create_triples(
 /// POST /api/v1/triples/query — query triples with optional filters
 ///
 /// Entity names are resolved to UUIDs server-side via `EntityRepository::find_by_name_and_type`.
-/// Returns an empty list when a named entity does not exist (rather than an error), so that
-/// callers can distinguish "no entity found" from "entity found but no triples."
+/// A name needs its type (`subject_type` / `object_type`); a name without one is a 400.
+/// When a named entity does not exist the response is empty and names the side in
+/// `unresolved` (rather than an error), so that callers can distinguish "no entity found"
+/// from "entity found but no triples". It never drops the filter and matches everything.
 #[cfg(feature = "db")]
 pub async fn query_triples(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<QueryTriplesRequest>,
 ) -> Result<Json<QueryTriplesResponse>, ApiError> {
-    // Resolve optional subject name → UUID
+    // Entities are keyed by `(canonical_name, type_top)`. A name without a type
+    // was silently dropped from the filter, which matched everything.
+    if req.subject_name.is_some() && req.subject_type.is_none() {
+        return Err(ApiError::BadRequest {
+            message: "subject_type is required when subject_name is given".to_string(),
+        });
+    }
+    if req.object_name.is_some() && req.object_type.is_none() {
+        return Err(ApiError::BadRequest {
+            message: "object_type is required when object_name is given".to_string(),
+        });
+    }
+
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -320,12 +339,23 @@ pub async fn query_triples(
         }
     })?;
 
+    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+
+    // A name that resolves to no entity means no triple can match. It must not
+    // become a `None` filter, which the repo reads as "any subject/object".
+    let mut unresolved: Vec<&'static str> = Vec::new();
+
+    // Resolve optional subject name → UUID
     let subject_id = if let (Some(name), Some(type_top)) =
         (req.subject_name.as_deref(), req.subject_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
+        let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
-            .map(|e| e.id)
+            .map(|e| e.id);
+        if id.is_none() {
+            unresolved.push("subject");
+        }
+        id
     } else {
         None
     };
@@ -334,14 +364,25 @@ pub async fn query_triples(
     let object_id = if let (Some(name), Some(type_top)) =
         (req.object_name.as_deref(), req.object_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
+        let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
-            .map(|e| e.id)
+            .map(|e| e.id);
+        if id.is_none() {
+            unresolved.push("object");
+        }
+        id
     } else {
         None
     };
 
-    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+    if !unresolved.is_empty() {
+        return Ok(Json(QueryTriplesResponse {
+            count: 0,
+            index_populated,
+            unresolved,
+            triples: Vec::new(),
+        }));
+    }
 
     let min_confidence = req.min_confidence.unwrap_or(0.0);
     let limit = req.limit.unwrap_or(50).min(500);
@@ -360,6 +401,7 @@ pub async fn query_triples(
     Ok(Json(QueryTriplesResponse {
         count: rows.len(),
         index_populated,
+        unresolved,
         triples: rows,
     }))
 }

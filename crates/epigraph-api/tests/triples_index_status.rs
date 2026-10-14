@@ -1,5 +1,6 @@
 //! `POST /api/v1/triples/query` and `GET /api/v1/entities/:id/neighborhood`
-//! report whether the triple index is populated.
+//! report whether the triple index is populated, and `query_triples` returns
+//! nothing for a name it cannot resolve.
 //!
 //! The MCP tools over the same index are pinned in
 //! `crates/epigraph-mcp/tests/rdf_index_status.rs`; these arms pin the HTTP
@@ -141,4 +142,63 @@ async fn entity_neighborhood_reports_whether_the_index_is_populated(pool: PgPool
         serde_json::json!(triple.to_string()),
         "got {v}"
     );
+}
+
+/// The handler's own rustdoc promised "an empty list when a named entity does
+/// not exist"; it returned the top-confidence triples of the whole index.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_unresolved_subject_returns_nothing(pool: PgPool) {
+    seed_public_triple(&pool).await;
+
+    let v = query(
+        &pool,
+        request(Some(("no-such-entity", Some("Material"))), None),
+    )
+    .await
+    .expect("query with an unresolved subject");
+    assert_eq!(
+        v["count"],
+        serde_json::json!(0),
+        "the subject names no entity; returning the seeded triple means the name \
+         became a wildcard. Got {v}"
+    );
+    assert_eq!(v["unresolved"], serde_json::json!(["subject"]), "got {v}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_resolved_names_still_match(pool: PgPool) {
+    let (triple, _) = seed_public_triple(&pool).await;
+
+    let v = query(
+        &pool,
+        request(
+            Some(("silicon", Some("Material"))),
+            Some(("semiconductor", Some("Concept"))),
+        ),
+    )
+    .await
+    .expect("query with resolved names");
+    assert_eq!(v["count"], serde_json::json!(1), "got {v}");
+    assert_eq!(
+        v["triples"][0]["id"],
+        serde_json::json!(triple.to_string()),
+        "got {v}"
+    );
+    assert_eq!(v["unresolved"], serde_json::json!([]), "got {v}");
+}
+
+/// A name with no type used to be dropped from the filter without a word, so
+/// the call wildcarded. It is now a 400.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_triples_refuses_a_name_without_a_type(pool: PgPool) {
+    seed_public_triple(&pool).await;
+
+    let res = query(&pool, request(Some(("silicon", None)), None)).await;
+    match res {
+        Err(ApiError::BadRequest { message }) => assert!(
+            message.contains("subject_type"),
+            "the refusal must name the missing field. Got: {message}"
+        ),
+        other => panic!("expected a 400 naming subject_type, got {other:?}"),
+    }
 }

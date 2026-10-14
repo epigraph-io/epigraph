@@ -13,7 +13,7 @@
 use rmcp::model::*;
 use uuid::Uuid;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
@@ -32,29 +32,63 @@ pub async fn query_triples(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let subject_id = if let Some(ref name) = params.subject {
-        let type_top = params.subject_type.as_deref().unwrap_or("Material");
-        EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
-            .await
-            .map_err(internal_error)?
-            .map(|e| e.id)
-    } else {
-        None
-    };
-
-    let object_id = if let Some(ref name) = params.object {
-        let type_top = params.object_type.as_deref().unwrap_or("Material");
-        EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
-            .await
-            .map_err(internal_error)?
-            .map(|e| e.id)
-    } else {
-        None
-    };
+    // Entities are keyed by `(canonical_name, type_top)`. A name without a type
+    // cannot be resolved without guessing one, so it is refused.
+    if params.subject.is_some() && params.subject_type.is_none() {
+        return Err(invalid_params(
+            "subject_type is required when subject is given (entities are keyed by name and type)",
+        ));
+    }
+    if params.object.is_some() && params.object_type.is_none() {
+        return Err(invalid_params(
+            "object_type is required when object is given (entities are keyed by name and type)",
+        ));
+    }
 
     let index_populated = TripleRepository::index_populated(&server.pool, viewer)
         .await
         .map_err(internal_error)?;
+
+    // A name that resolves to no entity means no triple can match. It must not
+    // become a `None` filter, which the repo reads as "any subject/object".
+    let mut unresolved: Vec<&str> = Vec::new();
+
+    let subject_id = match (params.subject.as_deref(), params.subject_type.as_deref()) {
+        (Some(name), Some(type_top)) => {
+            let id = EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
+                .await
+                .map_err(internal_error)?
+                .map(|e| e.id);
+            if id.is_none() {
+                unresolved.push("subject");
+            }
+            id
+        }
+        _ => None,
+    };
+
+    let object_id = match (params.object.as_deref(), params.object_type.as_deref()) {
+        (Some(name), Some(type_top)) => {
+            let id = EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
+                .await
+                .map_err(internal_error)?
+                .map(|e| e.id);
+            if id.is_none() {
+                unresolved.push("object");
+            }
+            id
+        }
+        _ => None,
+    };
+
+    if !unresolved.is_empty() {
+        return success_json(&serde_json::json!({
+            "count": 0,
+            "index_populated": index_populated,
+            "unresolved": unresolved,
+            "triples": [],
+        }));
+    }
 
     let min_confidence = params.min_confidence.unwrap_or(0.0);
     let triples = TripleRepository::query(
@@ -72,6 +106,7 @@ pub async fn query_triples(
     success_json(&serde_json::json!({
         "count": triples.len(),
         "index_populated": index_populated,
+        "unresolved": unresolved,
         "triples": triples,
     }))
 }

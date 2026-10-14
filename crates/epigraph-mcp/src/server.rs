@@ -2360,7 +2360,7 @@ impl EpiGraphMcpFull {
     // ── RDF Triple Layer (3 tools) ──
 
     #[tool(
-        description = "UNPOPULATED INDEX: no pipeline populates the triple/entity index today, so this tool normally returns nothing. Empty results are NOT evidence that the corpus lacks the fact; check the response's index_populated (whether any triple is visible to you) and use recall or query_claims for content questions. Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
+        description = "UNPOPULATED INDEX: no pipeline populates the triple/entity index today, so this tool normally returns nothing. Empty results are NOT evidence that the corpus lacks the fact; check the response's index_populated (whether any triple is visible to you) and use recall or query_claims for content questions. Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional; an omitted filter matches anything. A subject or object name needs its type (subject_type / object_type), and a name that matches no entity returns no triples and is listed in unresolved. Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
     )]
     async fn query_triples(
         &self,
