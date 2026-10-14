@@ -411,3 +411,71 @@ async fn rewire_removes_edge_factors_it_cannot_rederive_and_recomputes_targets(p
     assert_eq!(claim_rows(&pool, only_edge_backed).await, 0);
     assert_eq!(cached_belief(&pool, only_edge_backed).await, None);
 }
+
+/// `(owner_group_id, visibility, writer_owned)` of an edge's BBA rows.
+async fn edge_row_tenancy(pool: &PgPool, edge: Uuid) -> Vec<(Uuid, String, bool)> {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, writer_owned FROM mass_functions \
+          WHERE perspective_id = $1",
+    )
+    .bind(edge)
+    .fetch_all(pool)
+    .await
+    .expect("edge row tenancy")
+}
+
+/// Migration 114: a BBA a non-owner attached to a public claim is the WRITER's
+/// (`writer_owned`, owned by the writer's group). The rewire runs on the
+/// privileged maintenance pool, whose fresh INSERT takes 114's arm (b) and
+/// inherits the CLAIM's tenancy instead. Rewriting the row in place keeps the
+/// writer's ownership; a delete-then-insert would hand the writer's
+/// contribution to the claim's owner, irreversibly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_keeps_a_writer_owned_edge_factor_owned_by_its_writer(pool: PgPool) {
+    let w = seed_world(&pool, "writer").await;
+    let (_writer_agent, writer_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "rewire-writer-group").await;
+    // The privileged test session passes 114's owner guard, so it can declare
+    // what a non-owner's attach would have stamped.
+    sqlx::query(
+        "UPDATE mass_functions SET owner_group_id = $2, visibility = 'public', writer_owned = true \
+          WHERE perspective_id = $1",
+    )
+    .bind(w.edge)
+    .bind(writer_group)
+    .execute(&pool)
+    .await
+    .expect("make the edge factor writer-owned");
+    let claim_owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.target)
+        .fetch_one(&pool)
+        .await
+        .expect("claim owner");
+    let before = edge_row_tenancy(&pool, w.edge).await;
+    assert_eq!(
+        before,
+        vec![(writer_group, "public".to_string(), true)],
+        "precondition: the row is the writer's"
+    );
+    assert_ne!(
+        claim_owner, writer_group,
+        "precondition: the claim is owned by another group"
+    );
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!((summary.rewired, summary.failed), (1, 0), "{summary:?}");
+
+    // The masses were rewritten (so this is not a no-op pass) ...
+    let rows = edge_rows(&pool, w.edge).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_close(mass(&rows[0].1, "~0,1"), 0.48, "rewritten missing mass");
+    // ... and the row is still the writer's.
+    assert_eq!(
+        edge_row_tenancy(&pool, w.edge).await,
+        before,
+        "the rewire must not re-own a writer-owned edge factor"
+    );
+}
