@@ -505,7 +505,7 @@ async fn a_live_member_can_add_another(pool: PgPool) {
 /// It is also why `create_community` passes the authenticated creator: a
 /// community created through the route is never in this state.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_memberless_community_group_is_open_for_bootstrap(pool: PgPool) {
+async fn a_memberless_community_group_is_bootstrappable_by_maintenance(pool: PgPool) {
     let (anyone, _) = fixture::seed_agent_with_group(&pool, "anyone").await;
     let row = CommunityRepository::create(&pool, "orphaned", None, None, None, None)
         .await

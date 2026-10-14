@@ -355,6 +355,14 @@ async fn concurrent_first_joiners_admit_exactly_one(pool: PgPool) {
 
 /// X14: two concurrent first joiners of a never-populated group, both as the
 /// deployed role — neither is admitted, and nothing is written.
+///
+/// This pins that there is no race-window admission for an app session. It is
+/// NOT a lock-order property: under 159 an app session's refusal depends on
+/// neither the other caller nor the `groups` row lock, so each call alone is
+/// the sequential stranger arm of
+/// `a_memberless_legacy_group_does_not_admit_a_first_joiner`. The lock-order
+/// race lives on the maintenance path (`concurrent_first_joiners_admit_exactly_one`).
+/// On 106 one of the two callers here was admitted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_app_first_joiners_admit_none(pool: PgPool) {
     let a = agent(&pool, "x14-race-a").await;
