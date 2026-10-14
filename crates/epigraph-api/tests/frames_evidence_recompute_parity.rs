@@ -5,17 +5,31 @@
 //! The MCP `submit_ds_evidence` delegates its combine and cache write to
 //! `epigraph_engine::edge_factor::recompute_claim_belief_on_frame`, the same
 //! function `recompute_beliefs` and the framed `get_belief` use, so on MCP a
-//! submit and a later recompute agree by construction. The REST handler used to
-//! run its own combine (only `'discount'` rows, independence analysis, the
+//! submit and a later recompute agree by construction. The REST handler ran
+//! its own combine (only `'discount'` rows, independence analysis, the
 //! caller's threshold), wrote the cache unattributed (`belief_frame_id` NULL),
 //! stored its pre-discounted masses with `source_strength = reliability` (which
-//! the shared pipeline discounts AGAIN), and then stored the combined result
-//! back as a NULL-agent "system" BBA, which every later recompute folds in as
-//! one more independent source.
+//! the shared pipeline discounts AGAIN), and stored the combined result back
+//! as an agent-less "cached combination" row beside the inputs.
+//!
+//! Since b5cb3efb (#584) the combine-input readers no longer fold a LABELLED
+//! cached row back in, so on main a recompute of agent-attributed, fully
+//! reliable inputs no longer drifts. What main still gets wrong, and what these
+//! tests pin:
+//! * a derived row is stored beside the inputs, and `total_sources` counts it;
+//! * the cache carries no `belief_frame_id`;
+//! * `reliability` < 1 is applied twice (stored masses AND `source_strength`);
+//! * an input another transport stored (not labelled `'discount'`) is ignored
+//!   by the response;
+//! * an unreadable claim is answered with 201 and a stored BBA;
+//! * the deprecated combination parameters are silently ignored.
 //!
 //! Every test here asserts STORED state (rows, the claims cache after a
 //! no-new-evidence recompute) or a hand-computed Dempster value, never the
 //! response against a function the response was itself computed from.
+//!
+//! These run on the superuser harness, so RLS is bypassed; the application
+//! role's paths are `frames_evidence_app_role.rs`.
 //!
 //! `#[sqlx::test]` gives each test an ephemeral database.
 #![cfg(feature = "db")]
@@ -128,9 +142,8 @@ async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) -> World {
     }
 }
 
-/// POST the evidence and insist on 201, printing the body otherwise so a 401
-/// or 500 can never pose as the behaviour under test.
-async fn post_evidence(w: &World, token: &str, body: Value) -> Value {
+/// POST the evidence and return the status and the body text.
+async fn post_evidence_raw(w: &World, token: &str, body: Value) -> (u16, String) {
     let resp = reqwest::Client::new()
         .post(format!(
             "http://{}/api/v1/frames/{}/evidence",
@@ -141,8 +154,14 @@ async fn post_evidence(w: &World, token: &str, body: Value) -> Value {
         .send()
         .await
         .expect("request");
-    let status = resp.status();
-    let text = resp.text().await.expect("body");
+    let status = resp.status().as_u16();
+    (status, resp.text().await.expect("body"))
+}
+
+/// POST the evidence and insist on 201, printing the body otherwise so a 401
+/// or 500 can never pose as the behaviour under test.
+async fn post_evidence(w: &World, token: &str, body: Value) -> Value {
+    let (status, text) = post_evidence_raw(w, token, body).await;
     assert_eq!(status, 201, "POST evidence must be 201: {text}");
     serde_json::from_str(&text).expect("json body")
 }
@@ -182,10 +201,18 @@ async fn recompute(w: &World) -> f64 {
     cached(w).await.0.expect("belief after recompute")
 }
 
+fn reports(resp: &Value) -> &Vec<Value> {
+    resp["combination_reports"]
+        .as_array()
+        .unwrap_or_else(|| panic!("combination_reports must be an array: {resp}"))
+}
+
 /// I075's literal symptom: a submit's belief must already be the shared
-/// pipeline's fixpoint. Before the fix the handler stored a second, NULL-agent
-/// "combined" row (2 rows), left `belief_frame_id` NULL, and a recompute with
-/// no new evidence moved the belief from 0.60 to 0.72.
+/// pipeline's fixpoint, and nothing derived may be stored to get there. On
+/// main the handler stores a second, agent-less "cached combination" row
+/// beside the input (2 rows) and leaves `belief_frame_id` NULL. (Before
+/// b5cb3efb a recompute with no new evidence also folded that row back in and
+/// moved the belief from 0.60 to 0.72.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn rest_evidence_leaves_the_claim_at_the_shared_pipelines_fixpoint(
     pool_opts: PgPoolOptions,
@@ -231,12 +258,17 @@ async fn rest_evidence_leaves_the_claim_at_the_shared_pipelines_fixpoint(
         (reported - b2).abs() < EPS,
         "the response must report the belief the store holds: {reported} vs {b2}"
     );
+    assert!(
+        reports(&resp).is_empty(),
+        "a single BBA is not folded, so there is no combination step to report: {resp}"
+    );
+    assert_eq!(resp["total_sources"], 1, "one BBA: {resp}");
 }
 
 /// Two independent agents, Dempster with K = 0: Bel = 1 - 0.4 * 0.5 = 0.80,
-/// both in the second response and after a recompute. Before the fix the
-/// response was 0.80 but the recompute moved it to ~0.88 (the stored combined
-/// row folded back in at the 0.5 unknown-source discount).
+/// both in the second response and after a recompute. On main the response
+/// and the recompute agree at 0.80 since b5cb3efb, but the handler stores a
+/// derived row beside the two inputs and `total_sources` counts it (3).
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_agents_combine_to_the_hand_computed_belief(
     pool_opts: PgPoolOptions,
@@ -274,6 +306,15 @@ async fn two_agents_combine_to_the_hand_computed_belief(
         resp["total_sources"], 2,
         "two submissions, two BBAs: {resp}"
     );
+    assert_eq!(bba_rows(&w).await, 2, "two BBAs stored, nothing derived");
+    let reps = reports(&resp);
+    assert_eq!(reps.len(), 1, "one Dempster fold of the two inputs: {resp}");
+    assert_eq!(reps[0]["method_used"], "Dempster", "{resp}");
+    let k = reps[0]["conflict_k"].as_f64().expect("conflict_k");
+    assert!(
+        k.abs() < EPS,
+        "{{0}} and Θ never intersect empty, so K = 0; got {k}"
+    );
     let after = recompute(&w).await;
     assert!(
         (after - 0.8).abs() < EPS,
@@ -282,9 +323,9 @@ async fn two_agents_combine_to_the_hand_computed_belief(
 }
 
 /// `reliability` is applied exactly once. The stored masses are the
-/// discounted ones, and the shared pipeline must not discount them again.
-/// Before the fix the row carried `source_strength = 0.8`, so a recompute
-/// discounted 0.8 a second time (0.64) and folded in the combined row (~0.784).
+/// discounted ones, and the shared pipeline must not discount them again. On
+/// main the row carries `source_strength = 0.8`, which an untyped row's
+/// `effective_source_strength` (tier 1) applies a second time: 0.64.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reliability_is_applied_once(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) {
     let w = world(pool_opts, conn_opts).await;
@@ -311,6 +352,64 @@ async fn reliability_is_applied_once(pool_opts: PgPoolOptions, conn_opts: PgConn
     assert!(
         (stored - 0.8).abs() < EPS,
         "the stored BBA is the reliability-discounted one: m({{0}}) = 0.8, got {stored}"
+    );
+    let reported = resp["updated_belief"].as_f64().expect("updated_belief");
+    assert!(
+        (reported - 0.8).abs() < EPS,
+        "response belief must be 0.80, got {reported}"
+    );
+    let after = recompute(&w).await;
+    assert!(
+        (after - 0.8).abs() < EPS,
+        "a recompute must not apply the reliability a second time: expected 0.80, got {after}"
+    );
+}
+
+/// The same, for a TYPED row whose type is not calibrated, which is what the
+/// in-tree caller `scripts/lib/nli_stance.py` sends
+/// (`evidence_type = "nli_cross_encoder"`, absent from `calibration.toml`).
+/// `effective_source_strength` then falls to tier 4, which also returns the
+/// stored `source_strength`: on main 0.8, so a recompute gives 0.64.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reliability_is_applied_once_on_an_uncalibrated_type(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    let resp = post_evidence(
+        &w,
+        &w.token_a,
+        serde_json::json!({
+            "claim_id": w.claim, "agent_id": w.agent_a, "reliability": 0.8,
+            "evidence_type": "nli_cross_encoder",
+            "masses": {"0": 1.0},
+        }),
+    )
+    .await;
+
+    let (m0, strength, etype): (f64, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT (masses->>'0')::float8, source_strength, evidence_type FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id = $3",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .bind(w.agent_a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("the caller's BBA");
+    assert!(
+        (m0 - 0.8).abs() < EPS,
+        "the stored BBA is the reliability-discounted one: m({{0}}) = 0.8, got {m0}"
+    );
+    assert_eq!(
+        strength,
+        Some(1.0),
+        "the reliability is already in the masses, so the row's own strength is 1.0"
+    );
+    assert_eq!(
+        etype.as_deref(),
+        Some("nli_cross_encoder"),
+        "an uncalibrated type is stored as the caller's key, lowercased"
     );
     let reported = resp["updated_belief"].as_f64().expect("updated_belief");
     assert!(
@@ -384,17 +483,75 @@ async fn deprecated_combination_parameters_are_reported(
     );
 }
 
-/// A submission with no `agent_id` (as `scripts/lib/nli_stance.py` sends)
-/// shares the unique key `(claim, frame, NULL agent, NULL perspective)` with
-/// the old combined row, which then overwrote the caller's BBA with the
-/// combination of every source.
+/// A claim the caller cannot read gets the same 404 a nonexistent one gets,
+/// and nothing is stored: the route is no existence oracle. On main the
+/// handler stores the BBA on the unreadable claim and answers 201.
 #[sqlx::test(migrations = "../../migrations")]
-async fn anonymous_submission_is_not_overwritten_by_a_combined_row(
+async fn an_unreadable_claim_is_not_found_and_nothing_is_stored(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
     let w = world(pool_opts, conn_opts).await;
-    post_evidence(
+    let (agent_b, group_b) = fixture::seed_agent_with_group(&w.pool, "u024-private").await;
+    let private = fixture::seed_group_claim(&w.pool, agent_b, group_b, "u024 private claim").await;
+
+    let (status, text) = post_evidence_raw(
+        &w,
+        &w.token_a,
+        serde_json::json!({
+            "claim_id": private, "agent_id": w.agent_a, "reliability": 1.0,
+            "masses": {"0": 0.6, "0,1": 0.4},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "an unreadable claim must read as absent: {text}"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(private)
+    .bind(w.frame)
+    .fetch_one(&w.pool)
+    .await
+    .expect("count BBAs");
+    assert_eq!(
+        rows, 0,
+        "nothing may be stored on a claim the caller cannot read"
+    );
+}
+
+/// The response folds EVERY input on (claim, frame), not only the
+/// `'discount'` rows REST itself writes: an input another transport stored
+/// (MCP `submit_ds_evidence` labels its rows `"Dempster"`, with its agent)
+/// counts too. On main the response ignores it (0.60, from the REST row
+/// alone), while a recompute folds it: the two disagree.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_input_from_another_transport_counts_toward_the_response(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    let (agent_c, _) = fixture::seed_agent_with_group(&w.pool, "u024-mcp").await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &w.pool,
+        w.claim,
+        w.frame,
+        Some(agent_c),
+        None,
+        &serde_json::json!({"0": 0.5, "0,1": 0.5}),
+        None,
+        Some("Dempster"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed an MCP-shaped input");
+
+    let resp = post_evidence(
         &w,
         &w.token_a,
         serde_json::json!({
@@ -403,33 +560,66 @@ async fn anonymous_submission_is_not_overwritten_by_a_combined_row(
         }),
     )
     .await;
-    post_evidence(
+    let reported = resp["updated_belief"].as_f64().expect("updated_belief");
+    assert!(
+        (reported - 0.8).abs() < EPS,
+        "Dempster of the seeded m({{0}})=0.5 and the posted m({{0}})=0.6 is 0.80; \
+         response said {reported}"
+    );
+    assert_eq!(resp["total_sources"], 2, "both inputs count: {resp}");
+    let after = recompute(&w).await;
+    assert!(
+        (after - reported).abs() < EPS,
+        "the response is the recompute's value: {reported} vs {after}"
+    );
+}
+
+/// A legacy cached combination row (agent-less, perspective-less, labelled
+/// `"Dempster"`: the shape of the ~15.5k rows the writers left on prod) is not
+/// an input. The combine-input readers exclude it (b5cb3efb), so beside one
+/// real input the response must report ONE source and no fold. On main
+/// `total_sources` counts every row on the pair (2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_cached_combination_row_is_not_a_source(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    epigraph_db::MassFunctionRepository::store(
+        &w.pool,
+        w.claim,
+        w.frame,
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        Some(0.0),
+        Some("Dempster"),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed a legacy cached combination row");
+
+    let resp = post_evidence(
         &w,
         &w.token_a,
         serde_json::json!({
-            "claim_id": w.claim, "reliability": 1.0,
-            "masses": {"0": 0.5, "0,1": 0.5},
+            "claim_id": w.claim, "agent_id": w.agent_a, "reliability": 1.0,
+            "masses": {"0": 0.6, "0,1": 0.4},
         }),
     )
     .await;
-
-    let anon: f64 = sqlx::query_scalar(
-        "SELECT (masses->>'0')::float8 FROM mass_functions \
-          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id IS NULL",
-    )
-    .bind(w.claim)
-    .bind(w.frame)
-    .fetch_one(&w.pool)
-    .await
-    .expect("exactly one anonymous BBA");
-    assert!(
-        (anon - 0.5).abs() < EPS,
-        "the anonymous caller's BBA must hold what it submitted (m({{0}}) = 0.5), not a \
-         combination; got {anon}"
-    );
     assert_eq!(
-        bba_rows(&w).await,
-        2,
-        "one BBA per submitter, nothing derived"
+        resp["total_sources"], 1,
+        "the cached row is not a source: {resp}"
+    );
+    assert!(
+        reports(&resp).is_empty(),
+        "one input is not folded, whatever cached row sits beside it: {resp}"
+    );
+    let reported = resp["updated_belief"].as_f64().expect("updated_belief");
+    assert!(
+        (reported - 0.6).abs() < EPS,
+        "the cached row's m({{0}}) = 0.9 must not be folded in: {reported}"
     );
 }
