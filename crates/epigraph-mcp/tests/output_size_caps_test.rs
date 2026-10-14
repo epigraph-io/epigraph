@@ -818,12 +818,15 @@ async fn seed_claim(pool: &PgPool, agent_id: Uuid, content: &str) -> Uuid {
     id
 }
 
-/// `ancestor -> descendant`, the direction `get_lineage`'s recursive CTE walks
-/// (`e.source_id = c.id AND e.target_id = l.id`).
+/// `ancestor --supports--> descendant`: `supports` is a derivation
+/// relationship `get_lineage` walks over the INCOMING edge, so `ancestor` is
+/// reached from `descendant`. (Not a verb edge like `DERIVED_FROM`, whose
+/// place in the lineage walk is an open ruling, not something this fixture
+/// should depend on.)
 async fn seed_claim_edge(pool: &PgPool, ancestor: Uuid, descendant: Uuid) {
     sqlx::query(
         "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'DERIVED_FROM')",
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'supports')",
     )
     .bind(ancestor)
     .bind(descendant)
