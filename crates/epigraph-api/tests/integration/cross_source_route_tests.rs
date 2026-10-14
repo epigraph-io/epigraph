@@ -1897,3 +1897,115 @@ async fn retire_rederives_without_the_edge_keyed_bba_it_deletes(pool: PgPool) {
          surviving one: expected {d}, found {after} (combined value was {combined}): {json}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scope parity: the claim-scoped read and the candidate list
+// ---------------------------------------------------------------------------
+
+async fn get_with_token(
+    router: &Router,
+    path: &str,
+    token: &str,
+) -> axum::http::Response<axum::body::Body> {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// `GET /api/v1/claims/:id/cross_source_matches` checks `claims:read` itself,
+/// as its sibling `list_candidates` does and as its MCP twin
+/// (`find_cross_source_matches` in `epigraph-mcp/src/scope_map.rs`) does.
+///
+/// `claims:write` alone is the wrong scope for a read: `check_scopes` is
+/// strictly conjunctive, with no write-implies-read ladder (see
+/// `policies_auth_test.rs::list_candidates_with_wrong_scope_returns_403`).
+///
+/// The four requests pin, in order:
+/// - the sibling refuses this token (the parity being asserted);
+/// - this route refuses it for a claim that exists and is visible;
+/// - this route refuses it for an id that does not exist — 403, not 404, so
+///   the scope check runs before the existence probe and the two ids cannot be
+///   told apart by a caller without the scope;
+/// - a `claims:read` token is admitted on the same claim (the route is not
+///   simply locked).
+#[sqlx::test(migrations = "../../migrations")]
+async fn cross_source_matches_requires_claims_read_like_list_candidates(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let claim = insert_claim(&pool, agent).await;
+    let absent = Uuid::new_v4();
+    let router = create_test_router(pool);
+
+    let write_only = decide_bearer_token_with_scopes(
+        Uuid::new_v4(),
+        Some(agent),
+        "service",
+        vec!["claims:write".to_string()],
+    );
+
+    let sibling = get_with_token(
+        &router,
+        "/api/v1/match_candidates?status=pending&limit=10",
+        &write_only,
+    )
+    .await;
+    assert_eq!(
+        sibling.status(),
+        StatusCode::FORBIDDEN,
+        "precondition: list_candidates must refuse a token without claims:read"
+    );
+
+    let present = get_with_token(
+        &router,
+        &format!("/api/v1/claims/{claim}/cross_source_matches"),
+        &write_only,
+    )
+    .await;
+    assert_eq!(
+        present.status(),
+        StatusCode::FORBIDDEN,
+        "cross_source_matches must refuse a token without claims:read, as list_candidates does"
+    );
+
+    let missing = get_with_token(
+        &router,
+        &format!("/api/v1/claims/{absent}/cross_source_matches"),
+        &write_only,
+    )
+    .await;
+    assert_eq!(
+        missing.status(),
+        StatusCode::FORBIDDEN,
+        "the scope check must run before the existence probe: an absent id answers \
+         the same as a present one to a caller without claims:read"
+    );
+
+    let reader = decide_bearer_token_with_scopes(
+        Uuid::new_v4(),
+        Some(agent),
+        "service",
+        vec!["claims:read".to_string()],
+    );
+    let admitted = get_with_token(
+        &router,
+        &format!("/api/v1/claims/{claim}/cross_source_matches"),
+        &reader,
+    )
+    .await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::OK,
+        "a claims:read token must still be admitted"
+    );
+    let body = admitted.into_body().collect().await.unwrap().to_bytes();
+    let parsed: Response = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.claim_id, claim.to_string());
+}
