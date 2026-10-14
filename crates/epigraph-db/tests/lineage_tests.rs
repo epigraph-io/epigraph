@@ -856,6 +856,13 @@ async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
     create_claim_edge(&pool, root, predecessor, "supersedes").await;
     // The spelling the matcher writes (`match_candidate.rs`).
     create_claim_edge(&pool, matched, root, "CORROBORATES").await;
+    // OUTGOING non-supersedes edges from R lead to descendants / disputed
+    // claims, never to ancestors: they pin the relationship filter on the
+    // walk's outgoing branch (descendants reported as ancestors otherwise).
+    let descendant = create_test_claim(&pool, "D, supported by R", 0.7).await;
+    let disputed = create_test_claim(&pool, "Y, contradicted by R", 0.6).await;
+    create_claim_edge(&pool, root, descendant, "supports").await;
+    create_claim_edge(&pool, root, disputed, "contradicts").await;
 
     let lineage = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
         .await
@@ -869,6 +876,14 @@ async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
     assert!(
         !lineage.claims.contains_key(&disputer),
         "a contradicting claim is not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&descendant),
+        "a claim R supports is a descendant, not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&disputed),
+        "a claim R contradicts is not an ancestor"
     );
     assert!(
         !lineage.claims.contains_key(&successor),
