@@ -1446,8 +1446,33 @@ pub struct EvolveStepResponse {
     pub step_lineage_id: uuid::Uuid,
     pub edge_type: String,
     pub edge_id: uuid::Uuid,
+    /// `supersedes` only: the Supersede admin cascade (migration 117) that
+    /// carries the retired step's edges onto the new one, as
+    /// `POST /api/v1/claims/:id/supersede` reports it (`applied`, `deferred`
+    /// or `failed`, with its `security_events` row id). Absent for `revises`,
+    /// which supersedes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub cascade: Option<epigraph_engine::admin_cascade::CascadeStatus>,
+    /// `supersedes` only: what the downstream belief cascade repaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub belief_cascade: Option<epigraph_engine::retraction_cascade::CascadeReport>,
 }
 
+/// POST /api/v1/workflows/steps/{id}/evolve - Evolve a versioned step.
+///
+/// Creates a new claim in the step's lineage that `supersedes` (linear
+/// refinement; the parent is retired) or `revises` (a concurrent branch; both
+/// stay current) the parent. With `supersedes` the new claim records
+/// `supersedes = parent` and the administrative Supersede cascade (as
+/// `POST /api/v1/claims/{id}/supersede` runs it) carries the retired step's
+/// edges onto it, reported in `cascade` (`applied`; `deferred` to the replay
+/// timer when no maintenance connection is configured; or `failed`, and
+/// replayable) and `belief_cascade`. The workflow's `executes` edge, its step
+/// chain (`step_follows` / `phase_follows`), the lineage's `revises` history
+/// and other agents' `asserts` / `AUTHORED` stay on the retired step.
+/// `revises` retires nothing and runs no cascade.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1518,15 +1543,61 @@ pub async fn evolve_step(
             message: other.to_string(),
         },
     })?;
+    // A `supersedes` step is a supersession (`claims.supersedes` names the
+    // parent), so it runs `versioning::supersede_claim`'s administrative
+    // cascade (backlog 8d3b4527): the act above moved no edge, and the retired
+    // step's decomposition, argument and support edges belong to other
+    // writers. `migrate_superseded_edges`' step-lineage rule leaves the
+    // workflow's `executes` and its `step_follows` / `phase_follows` chain,
+    // the lineage's `revises` history and agents' authorship edges on the
+    // retired step.
+    // The maintenance session is acquired BEFORE the act commits; without one
+    // the deferral commits with the act, under the caller's stamp.
+    let supersession = if result.edge_type == "supersedes" {
+        let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+            epigraph_engine::admin_cascade::CascadeCause::Supersede,
+            Some(agent),
+            Some(crate::routes::versioning::oauth_principal(&auth)),
+            parent_id,
+            Some(result.new_claim_id),
+        );
+        let (session, deferred) =
+            crate::routes::versioning::admin_session_or_deferral(&state, &mut tx, &trigger).await?;
+        Some((trigger, session, deferred))
+    } else {
+        None
+    };
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("evolve_step: commit failed: {e}"),
     })?;
+
+    // Best-effort, as in `supersede_claim`: the act has committed, so a
+    // cascade failure is reported in `cascade`, never as an error.
+    let (cascade, belief_cascade) = match supersession {
+        Some((trigger, Some(mut session), _)) => {
+            let (conn, admin_viewer) = session.split();
+            let (c, b) = epigraph_engine::admin_cascade::apply_after_supersede(
+                conn,
+                admin_viewer,
+                &viewer,
+                &trigger,
+                parent_id,
+                result.new_claim_id,
+            )
+            .await;
+            (Some(c), Some(b))
+        }
+        Some((_, None, status)) => (Some(status), Some(Default::default())),
+        None => (None, None),
+    };
 
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_type: result.edge_type,
         edge_id: result.edge_id,
+        cascade,
+        belief_cascade,
     }))
 }
 

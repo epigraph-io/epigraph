@@ -1880,7 +1880,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim.rs",
         "migrate_superseded_edges",
         "WRITE. The two edge-migration statements, unchecked; called only after the caller \
-         established the privilege and the supersession.",
+         established the privilege and the supersession. Its one read classifies the pair \
+         (a shared step lineage) for the statements that follow.",
     ),
     (
         "claim.rs",

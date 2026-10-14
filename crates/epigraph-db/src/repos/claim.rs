@@ -479,6 +479,41 @@ pub struct SupersedeEdgeMigration {
     pub resourced: Vec<Uuid>,
 }
 
+/// Relationships a STEP-LINEAGE supersession (`evolve_step(supersedes)`) leaves
+/// on the retired step, in either direction.
+///
+/// `executes` attaches a workflow to its FROZEN original step: the live head is
+/// resolved through the lineage (`WorkflowRepository`'s `ResolvedStep`,
+/// `ClaimRepository::latest_in_lineage`), so moving the edge would detach the
+/// frozen step the workflow was defined with.
+///
+/// `step_follows` (between steps) and `phase_follows` (between phases) are the
+/// workflow's chain, and they link those same FROZEN claims:
+/// `workflow_steps::ordered_steps` takes its id set from the `executes`
+/// targets and follows `step_follows` only inside it. Moved onto the head, the
+/// chain would leave that set, the walk would stop at the evolved slot, and a
+/// later `add_step` there would find no `prev -> next` row to replace and fork
+/// the chain.
+///
+/// `revises` is lineage-internal history, like `supersedes` (which no
+/// supersession moves): `R -revises-> S` records that R branched from S.
+/// Carried onto S's successor it would say R branched from a version that did
+/// not exist when R was written; carried onto R's successor it would say the
+/// successor branched from S directly.
+pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] =
+    &["executes", "step_follows", "phase_follows", "revises"];
+
+/// Relationships an AGENT holds on a step that a step-lineage supersession
+/// leaves on the retired step (incoming edges with `source_type = 'agent'`).
+///
+/// `evolve_step` writes its successor under the CALLER's `agent_id`, not the
+/// retired step's (unlike the supersede act, which keeps the old author). An
+/// agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
+/// content; carried onto the successor it would record the agent asserting
+/// content it never saw. (Scope U047 sub-decision A, default "exclude"; the
+/// opposite ruling is removing this constant's use.)
+pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -518,6 +553,13 @@ async fn require_privileged_session(
 /// `contradicts`) attached to the claim they were filed against or by; see the
 /// "Edge migration policy" section of [`ClaimRepository::supersede`]'s doc
 /// comment for why (issue #398).
+///
+/// A STEP-LINEAGE supersession (old and new share a non-null
+/// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step, and its agents'
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
+/// derived from the rows, not from a caller flag, because the deferred replay
+/// runs this same function knowing nothing of the original caller.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -527,6 +569,32 @@ async fn migrate_superseded_edges(
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+
+    // Is this a step-lineage supersession? Both rows must carry the SAME
+    // lineage: a plain supersede of a step writes a successor with no
+    // `step_lineage_id` (supersede_act_conn's INSERT omits it), so it keeps
+    // moving `executes` like every other supersession.
+    let step_lineage: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the supersession the mutation below carries out.
+        SELECT EXISTS (
+            SELECT 1 FROM claims o JOIN claims n ON n.id = $1
+             WHERE o.id = $2
+               AND o.step_lineage_id IS NOT NULL
+               AND n.step_lineage_id = o.step_lineage_id)"#,
+    )
+    .bind(new_uuid)
+    .bind(old_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let step_lineage_set = |set: &[&str]| -> Vec<String> {
+        if step_lineage {
+            set.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let frozen = step_lineage_set(STEP_LINEAGE_FROZEN_RELATIONSHIPS);
+    let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -538,12 +606,16 @@ async fn migrate_superseded_edges(
          WHERE target_id = $2 AND target_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
+           AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
+    .bind(&agent_authorship)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -553,12 +625,14 @@ async fn migrate_superseded_edges(
          WHERE source_id = $2 AND source_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -5211,6 +5285,23 @@ impl ClaimRepository {
     /// positive signal rather than the manufacture of a negative one, and
     /// changing them is not this function's decision to make.
     ///
+    /// ## Step lineages (backlog 8d3b4527)
+    ///
+    /// `evolve_step(supersedes)` is a supersession too: it records
+    /// `supersedes = parent`, and the request paths run the same administrative
+    /// cascade. When the old and new claims share a non-null `step_lineage_id`,
+    /// the migration also leaves `executes` (the workflow's FROZEN step; the
+    /// head is resolved through the lineage), the workflow's chain edges
+    /// `step_follows` / `phase_follows` in either direction (they link the
+    /// frozen steps `executes` names, which is the id set
+    /// `workflow_steps::ordered_steps` walks), `revises` in either direction
+    /// (the lineage's branch history, like `supersedes`) and agents'
+    /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
+    /// caller, not by the agents that asserted the old content) on the retired
+    /// step. A supersession made here writes no `step_lineage_id`, so it moves
+    /// all of them as before. The rule is read from the rows, because the
+    /// deferred replay knows nothing of the original caller.
+    ///
     /// ## Self-loop guards — deliberately unreachable
     ///
     /// Both statements also carry [`ClaimRepository::mark_duplicate`]'s
@@ -6739,6 +6830,13 @@ impl ClaimRepository {
     /// `level` defaults to 2 (step). The `properties` JSONB on the new claim
     /// includes `level` and `step_lineage_id` so existing find_workflow_hierarchical
     /// queries (which filter on `properties->>'level' = '2'`) still work.
+    ///
+    /// With `supersedes`, the new claim also records `supersedes = parent`, so
+    /// the Supersede admin cascade (and its deferred replay) migrates the
+    /// parent's edges onto it; see [`Self::migrate_superseded_edges_conn`] and
+    /// the step-lineage paragraph of [`Self::supersede`]'s edge migration
+    /// policy. This function performs only the act: the request paths run the
+    /// cascade after it commits.
     #[instrument(skip(pool))]
     pub async fn evolve_step(
         pool: &PgPool,
@@ -6861,10 +6959,17 @@ impl ClaimRepository {
             "level": level,
             "step_lineage_id": lineage_id.to_string(),
         });
+        // A `supersedes` step also records the supersession in the column, as
+        // the supersede act does: that is what `migrate_superseded_edges_conn`
+        // (the Supersede admin cascade, and its deferred replay) and migration
+        // 120's deferral check verify before carrying the retired step's edges
+        // to this one. A `revises` branch supersedes nothing (both heads stay
+        // current), so it records none.
+        let supersedes: Option<Uuid> = (edge_type == "supersedes").then_some(parent_uuid);
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8)",
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8, $9)",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -6874,6 +6979,7 @@ impl ClaimRepository {
         .bind(lineage_id)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(supersedes)
         .execute(&mut *tx)
         .await?;
 
