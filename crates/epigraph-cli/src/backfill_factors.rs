@@ -238,8 +238,20 @@ pub async fn run_rewire_phase(
         }
         return Ok(summary);
     }
+    rewire_edges(pool, viewer, &edges, &mut summary).await;
+    Ok(summary)
+}
 
-    for edge in &edges {
+/// The write half of [`run_rewire_phase`]: rewire each of `edges` (a
+/// selection, possibly minutes or hours old by the time an edge's turn comes)
+/// and add the outcomes to `summary`.
+pub async fn rewire_edges(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    edges: &[RewireEdge],
+    summary: &mut RewireSummary,
+) {
+    for edge in edges {
         match rewire_one(pool, viewer, edge).await {
             Ok(r) => {
                 summary.duplicate_rows_deleted += r.duplicate_rows_deleted;
@@ -259,7 +271,6 @@ pub async fn run_rewire_phase(
             }
         }
     }
-    Ok(summary)
 }
 
 /// Delete `edge`'s `edge_factor` rows on its target, except the one at

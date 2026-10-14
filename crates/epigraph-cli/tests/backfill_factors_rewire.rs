@@ -19,7 +19,8 @@
 mod viewer_fixture;
 
 use epigraph_cli::backfill_factors::{
-    run_rewire_phase, select_rewire_edges, RewireEdge, RewireOptions, EDGE_QUERY,
+    rewire_edges, run_rewire_phase, select_rewire_edges, RewireEdge, RewireOptions, RewireSummary,
+    EDGE_QUERY,
 };
 use epigraph_db::PerspectiveRepository;
 use sqlx::PgPool;
@@ -563,4 +564,61 @@ async fn rewire_merges_a_double_wired_edge_and_counts_it(pool: PgPool) {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, w.stale_agent, "the earliest row's agent wins");
     assert_close(mass(&rows[0].1, "~0,1"), 0.48, "rewritten missing mass");
+}
+
+/// The selection is one snapshot and the run can take hours; an edge
+/// retracted (or an endpoint superseded) after it was selected must not be
+/// re-wired when its turn comes, or the rewire resurrects what the retraction
+/// cascade removed. Re-checked inside the edge's transaction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_rechecks_that_the_edge_is_still_in_force(pool: PgPool) {
+    let retracted = seed_world(&pool, "late-retract").await;
+    let superseded = seed_world(&pool, "late-supersede").await;
+    let live = seed_world(&pool, "late-live").await;
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let snapshot = select_rewire_edges(&pool, &RewireOptions::default())
+        .await
+        .expect("select");
+    assert_eq!(snapshot.len(), 3, "precondition: all three in force");
+
+    // After selection: retract one edge, supersede another's target.
+    sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(retracted.edge)
+    .execute(&pool)
+    .await
+    .expect("retract edge");
+    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL WHERE id = $1")
+        .bind(superseded.target)
+        .execute(&pool)
+        .await
+        .expect("supersede target");
+
+    let mut summary = RewireSummary {
+        eligible: snapshot.len(),
+        ..RewireSummary::default()
+    };
+    rewire_edges(&pool, &viewer, &snapshot, &mut summary).await;
+    assert_eq!(
+        (summary.rewired, summary.skipped_stale, summary.failed),
+        (1, 2, 0),
+        "{summary:?}"
+    );
+    for (w, what) in [
+        (&retracted, "retracted edge"),
+        (&superseded, "superseded target"),
+    ] {
+        let rows = edge_rows(&pool, w.edge).await;
+        assert_eq!(rows.len(), 1, "{what}: {rows:?}");
+        assert_close(
+            mass(&rows[0].1, "~0,1"),
+            0.60,
+            &format!("{what}: not rewired"),
+        );
+    }
+    let rows = edge_rows(&pool, live.edge).await;
+    assert_close(mass(&rows[0].1, "~0,1"), 0.48, "the live edge was rewired");
 }
