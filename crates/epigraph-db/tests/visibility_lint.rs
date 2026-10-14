@@ -2696,6 +2696,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "scoped_belief.rs",
+        "upsert",
+        "INSERT INTO `ds_combined_beliefs` (ON CONFLICT on `(frame_id, claim_id, scope_type, \
+         scope_id)` DO UPDATE); a WRITE with no FROM for a viewer splice. Its control is the \
+         table's FORCE'd RLS (079) against the connection's GUCs, tenancy inherited from the \
+         claim. Generic since U024 so REST `submit_evidence` can write its global scoped belief \
+         on the handler's `write_as` transaction: on the unstamped raw pool FORCE refused it \
+         without an error. Pinned by `epigraph-api/tests/frames_evidence_app_role.rs::\
+         the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role`. The other \
+         callers still pass their pool. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
         "mass_function.rs",
         "copy_to_frame",
         "Runs no SQL of its own: it re-stores an already-read `MassFunctionRow` onto another \

@@ -9,8 +9,11 @@
 //! * `POST /api/v1/frames/:id/evidence` does when the body omits both
 //!   `agent_id` and `perspective_id`.
 //!
-//! Both handlers then cache their fold result in that same slot, which used to
-//! overwrite the input. Once the combine-input readers exclude cached rows,
+//! Both handlers used to cache their fold result in that same slot, which
+//! overwrote the input. Since U024 `/evidence` caches nothing (it delegates to
+//! the shared recompute), so only `/assess` still has a guarded cache store,
+//! and its own input always holds the slot. Once the combine-input readers
+//! exclude cached rows,
 //! the input written to that slot would then disappear from every fold:
 //! `recompute_claim_belief_on_frame` returns `Ok(false)`, and `get_belief`
 //! reads vacuous. When the cache is not written over the input, the input
