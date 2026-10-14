@@ -4,6 +4,11 @@
 //! populated by any current write path. These tools are wired up and correct, but return
 //! empty results against a live graph. Retained for potential future use when an RDF
 //! extraction or materialization pass is introduced.
+//!
+//! Because of that, every response carries `index_populated`
+//! ([`TripleRepository::index_populated`]): whether any triple is visible to the
+//! caller. `false` means an empty answer is not evidence that the corpus lacks
+//! the fact.
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -47,6 +52,10 @@ pub async fn query_triples(
         None
     };
 
+    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+        .await
+        .map_err(internal_error)?;
+
     let min_confidence = params.min_confidence.unwrap_or(0.0);
     let triples = TripleRepository::query(
         &server.pool,
@@ -62,6 +71,7 @@ pub async fn query_triples(
 
     success_json(&serde_json::json!({
         "count": triples.len(),
+        "index_populated": index_populated,
         "triples": triples,
     }))
 }
@@ -71,6 +81,10 @@ pub async fn entity_neighborhood(
     viewer: &epigraph_db::visibility::Viewer,
     params: EntityNeighborhoodParams,
 ) -> Result<CallToolResult, McpError> {
+    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+        .await
+        .map_err(internal_error)?;
+
     // Try UUID first, then name lookup
     let entity = if let Ok(uuid) = params.entity.parse::<Uuid>() {
         EntityRepository::get(&server.pool, uuid)
@@ -83,10 +97,19 @@ pub async fn entity_neighborhood(
             .map_err(internal_error)?
     };
 
-    let entity = entity.ok_or_else(|| McpError {
-        code: rmcp::model::ErrorCode::INVALID_PARAMS,
-        message: std::borrow::Cow::Owned(format!("Entity '{}' not found", params.entity)),
-        data: None,
+    let entity = entity.ok_or_else(|| {
+        let mut message = format!("Entity '{}' not found", params.entity);
+        if !index_populated {
+            message.push_str(
+                " (the triple/entity index is empty: no pipeline populates it, so this \
+                 miss is not evidence that the corpus lacks the entity)",
+            );
+        }
+        McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Owned(message),
+            data: None,
+        }
     })?;
 
     let canonical_id = if entity.is_canonical {
@@ -103,6 +126,7 @@ pub async fn entity_neighborhood(
         "entity_id": canonical_id,
         "canonical_name": entity.canonical_name,
         "type_top": entity.type_top,
+        "index_populated": index_populated,
         "triple_count": triples.len(),
         "triples": triples,
     }))
@@ -114,6 +138,19 @@ pub async fn search_triples(
     params: SearchTriplesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
+
+    // On an empty index the answer is known without embedding the query.
+    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+        .await
+        .map_err(internal_error)?;
+    if !index_populated {
+        return success_json(&serde_json::json!({
+            "count": 0,
+            "index_populated": false,
+            "query": params.query,
+            "triples": [],
+        }));
+    }
 
     // Path B: Embedding fallback — find claims, then look up their triples
     let claim_results = server
@@ -133,6 +170,7 @@ pub async fn search_triples(
 
     success_json(&serde_json::json!({
         "count": triples.len(),
+        "index_populated": true,
         "query": params.query,
         "triples": triples,
     }))

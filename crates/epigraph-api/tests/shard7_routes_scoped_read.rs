@@ -1105,7 +1105,8 @@ async fn entity_neighborhood_serves_the_viewers_own_group_private_triple(pool: P
     let rows = entity_neighborhood(ViewerExtractor(viewer), State(state), Path(subject))
         .await
         .expect("entity_neighborhood")
-        .0;
+        .0
+        .triples;
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     assert_eq!(
@@ -1178,7 +1179,8 @@ async fn query_triples_serves_the_viewers_own_group_private_triple(pool: PgPool)
     )
     .await
     .expect("query_triples")
-    .0;
+    .0
+    .triples;
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     assert_eq!(

@@ -6,6 +6,14 @@
 //! does not yet exist.  The audit below records the gap so that future
 //! implementors have a clear starting point.
 //!
+//! **Status (2026-10): intentionally dormant.** The experiment in PR #275
+//! (`experiments/rdf-triple-matching/CONCLUSION.md`) found the triple layer no
+//! better than lexical search plus embeddings for cross-source matching and
+//! entity retrieval, so no extractor is being built. The read tools stay and
+//! report `index_populated` (`TripleRepository::index_populated`), so callers
+//! can see that the index is empty. Any revival should start with a validation
+//! gate on a fixture corpus, not with a corpus backfill.
+//!
 //! ---
 //!
 //! ## (a) Table Counts

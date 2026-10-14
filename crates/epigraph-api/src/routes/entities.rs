@@ -12,6 +12,10 @@
 //! - `POST /api/v1/triples/query` — Query triples with optional filters
 //! - `GET /api/v1/entities/:id/neighborhood` — Get all triples for an entity
 //!
+//! Both return `{count, index_populated, triples}`. No pipeline populates the
+//! triple index today; `index_populated` (whether any triple is visible to the
+//! caller) is what tells an empty index apart from a query that matched nothing.
+//!
 //! # Tenancy: 5 of this file's 8 raw-pool sites are converted
 //!
 //! Conversion shard 7, and the largest single-file drop in it.
@@ -133,6 +137,29 @@ pub struct EntityResponse {
     pub type_sub: Option<String>,
     pub is_canonical: bool,
     pub created_at: String,
+}
+
+/// Response for `POST /api/v1/triples/query`.
+///
+/// `index_populated` says whether any triple is visible to the caller. No
+/// pipeline populates the triple index today, so `false` means an empty
+/// `triples` list is not evidence that the corpus lacks the fact.
+#[cfg(feature = "db")]
+#[derive(Serialize)]
+pub struct QueryTriplesResponse {
+    pub count: usize,
+    pub index_populated: bool,
+    pub triples: Vec<epigraph_db::TripleRow>,
+}
+
+/// Response for `GET /api/v1/entities/:id/neighborhood`. `index_populated` as
+/// on [`QueryTriplesResponse`].
+#[cfg(feature = "db")]
+#[derive(Serialize)]
+pub struct EntityNeighborhoodResponse {
+    pub count: usize,
+    pub index_populated: bool,
+    pub triples: Vec<epigraph_db::TripleRow>,
 }
 
 /// Response carrying a list of inserted UUIDs
@@ -279,7 +306,7 @@ pub async fn query_triples(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<QueryTriplesRequest>,
-) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
+) -> Result<Json<QueryTriplesResponse>, ApiError> {
     // Resolve optional subject name → UUID
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -314,6 +341,8 @@ pub async fn query_triples(
         None
     };
 
+    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+
     let min_confidence = req.min_confidence.unwrap_or(0.0);
     let limit = req.limit.unwrap_or(50).min(500);
 
@@ -328,7 +357,11 @@ pub async fn query_triples(
     )
     .await?;
 
-    Ok(Json(rows))
+    Ok(Json(QueryTriplesResponse {
+        count: rows.len(),
+        index_populated,
+        triples: rows,
+    }))
 }
 
 #[cfg(not(feature = "db"))]
@@ -348,7 +381,7 @@ pub async fn entity_neighborhood(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(entity_id): Path<Uuid>,
-) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
+) -> Result<Json<EntityNeighborhoodResponse>, ApiError> {
     // Resolve to canonical entity (follow merged_into chain one hop)
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -374,7 +407,12 @@ pub async fn entity_neighborhood(
 
     let rows =
         TripleRepository::entity_neighborhood(&mut *read, &viewer, canonical_id, 200).await?;
-    Ok(Json(rows))
+    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+    Ok(Json(EntityNeighborhoodResponse {
+        count: rows.len(),
+        index_populated,
+        triples: rows,
+    }))
 }
 
 #[cfg(not(feature = "db"))]
