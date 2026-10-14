@@ -512,15 +512,23 @@ async fn a_frame_squatting_the_claim_validity_name_cannot_fail_another_callers_a
     pool: PgPool,
 ) {
     let (claim, _viewer, victim) = seed_claim(&pool, "assess after a name squat").await;
-    // The attacker's create may be refused (the canonical row holds the name);
-    // whether it is, is not the point. The victim's call is.
-    let _ = epigraph_db::FrameRepository::create(
+    // With 154's seed in place the canonical row already holds the UNIQUE
+    // name, so the squat itself is refused: that is the SEED-side defence,
+    // pinned here. (The resolver-side defence, ignoring any frame merely
+    // NAMED claim_validity, is pinned by the owned-squatter arm below, which
+    // removes the canonical row so the squat can land.)
+    let squat = epigraph_db::FrameRepository::create(
         &pool,
         "claim_validity",
         Some("squatter"),
         &["supported".to_string(), "unsupported".to_string()],
     )
     .await;
+    assert!(
+        squat.is_err(),
+        "the seeded canonical row must hold the name claim_validity, so a second \
+         frame of that name is refused: {squat:?}"
+    );
 
     let result = try_assess(&pool, victim, claim, request(true, 0.8, None)).await;
     let resp = result.unwrap_or_else(|e| {
@@ -569,15 +577,106 @@ async fn a_claim_validity_frame_owned_by_another_group_never_receives_assess_evi
         rows_on(&pool, claim, squatter).await.is_empty(),
         "assess stored the victim's BBA on the attacker-owned claim_validity frame {squatter}"
     );
-    if let Ok(resp) = result {
-        assert_ne!(
-            resp.frame_id, squatter,
-            "assess reported the squatter as its frame"
-        );
-    }
+    let err = match result {
+        Ok(resp) => panic!(
+            "with the canonical frame missing, assess must refuse; it answered on frame {}",
+            resp.frame_id
+        ),
+        Err(e) => format!("{e:?}"),
+    };
+    assert!(
+        err.contains(&CANONICAL_CLAIM_VALIDITY.to_string()),
+        "the refusal must name the missing canonical frame, got: {err}"
+    );
     assert_eq!(
         mass_function_count(&pool, claim).await,
         0,
         "with the canonical frame missing, assess must write nothing"
+    );
+}
+
+async fn perspective_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM perspectives")
+        .fetch_one(pool)
+        .await
+        .expect("count perspectives")
+}
+
+/// The canonical id under ANOTHER name is not the canonical frame: refused,
+/// nothing written. (Only the resolver's NAME check sees this: the
+/// hypotheses are still the canonical ones.)
+///
+/// 9f2465e3: assess resolves by name, finds no `claim_validity`, and creates
+/// one under a random id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_renamed_canonical_row_is_refused(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess on a renamed canonical row").await;
+    sqlx::query("UPDATE frames SET name = 'not_claim_validity' WHERE id = $1")
+        .bind(CANONICAL_CLAIM_VALIDITY)
+        .execute(&pool)
+        .await
+        .expect("rename the canonical row");
+    let perspectives_before = perspective_count(&pool).await;
+
+    let result = try_assess(&pool, caller, claim, request(true, 0.8, None)).await;
+
+    assert!(
+        result.is_err(),
+        "the canonical id under another name must be refused, got frame {:?}",
+        result.as_ref().map(|r| r.frame_id)
+    );
+    assert_eq!(
+        mass_function_count(&pool, claim).await,
+        0,
+        "a refused call writes no BBA"
+    );
+    assert_eq!(
+        perspective_count(&pool).await,
+        perspectives_before,
+        "a refused call writes no evidence perspective"
+    );
+}
+
+/// With the canonical row absent and NO squatter, assess refuses and creates
+/// nothing: neither a frame of its own nor the canonical id itself (seeding is
+/// migration 154's job, never a request's).
+///
+/// 9f2465e3: the by-name get-or-create mints `claim_validity` under a random id
+/// and the call succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_missing_canonical_row_is_never_created_at_request_time(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess with no canonical row").await;
+    sqlx::query("DELETE FROM frames WHERE id = $1")
+        .bind(CANONICAL_CLAIM_VALIDITY)
+        .execute(&pool)
+        .await
+        .expect("model a database without the canonical row");
+    let frames_before = frames_besides_binary_truth(&pool).await;
+
+    let result = try_assess(&pool, caller, claim, request(true, 0.8, None)).await;
+
+    assert!(
+        result.is_err(),
+        "with the canonical frame missing, assess must refuse, got frame {:?}",
+        result.as_ref().map(|r| r.frame_id)
+    );
+    assert_eq!(
+        frames_besides_binary_truth(&pool).await,
+        frames_before,
+        "assess must not create a frame when the canonical one is missing"
+    );
+    let canonical_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM frames WHERE id = $1")
+        .bind(CANONICAL_CLAIM_VALIDITY)
+        .fetch_one(&pool)
+        .await
+        .expect("count canonical rows");
+    assert_eq!(
+        canonical_rows, 0,
+        "assess must not seed the canonical row itself"
+    );
+    assert_eq!(
+        mass_function_count(&pool, claim).await,
+        0,
+        "a refused call writes no BBA"
     );
 }
