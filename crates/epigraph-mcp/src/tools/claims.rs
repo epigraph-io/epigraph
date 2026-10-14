@@ -257,7 +257,8 @@ pub(crate) async fn submit_claim_response(
 ///   pre-check skips the gate. `source_url` is stored in `evidence.source_url`
 ///   for every evidence type, `empirical` included (whose evidence type has no
 ///   URL slot of its own, `parse_evidence_type`) — true of a fresh insert as
-///   well.
+///   well. It is also the source identity the combine step uses to fold a
+///   re-observation of the same source cautiously (backlog 4c42c0bf).
 ///
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
@@ -659,7 +660,10 @@ async fn write_submission(
     .map_err(internal_error)?;
     // The caller's URL goes in `evidence.source_url` whatever the evidence
     // type: `empirical` evidence (an `Observation`) has no URL slot of its own,
-    // so the column is the only place it can live (backlog 43ab8c73).
+    // so the column is the only place it can live (backlog 43ab8c73). With
+    // the creation BBA's `evidence_id` (below) it is the source identity that
+    // lets a later re-sighting of the same page fold as a repeat, not as
+    // corroboration (backlog 4c42c0bf).
     EvidenceRepository::create_with_source_url(
         &mut *conn,
         &evidence_with_sig,
@@ -751,6 +755,8 @@ async fn write_submission(
                     weight,
                     supports: true,
                     evidence_type: Some(&params.evidence_type),
+                    // Written above in this transaction, so the FK holds.
+                    evidence_id: Some(evidence_with_sig.id.as_uuid()),
                 },
                 /* persist_truth_from_pignistic */ true,
                 tool_name,
@@ -1370,7 +1376,10 @@ pub async fn update_with_evidence(
     .await?;
 
     // As in `write_submission`: the column holds the caller's URL for every
-    // evidence type, including `empirical` (backlog 43ab8c73).
+    // evidence type, including `empirical` (backlog 43ab8c73). It is the
+    // source identity the combine step uses to fold a re-observation of the
+    // SAME source cautiously rather than as independent corroboration
+    // (backlog 4c42c0bf, `epigraph_engine::source_dependence`).
     EvidenceRepository::create_with_source_url(
         &mut *tx,
         &evidence,

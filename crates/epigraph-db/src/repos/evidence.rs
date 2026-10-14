@@ -208,6 +208,10 @@ impl EvidenceRepository {
     /// For callers that hold a URL the evidence type has no slot for: MCP
     /// `empirical` evidence is stored as `EvidenceType::Observation`, so its
     /// caller-supplied URL can only live in the column (backlog 43ab8c73).
+    /// MCP `submit_claim` and `update_with_evidence` pass the caller's URL here
+    /// whatever the evidence type: it is also the source identity the combine
+    /// step uses to recognise a re-observation of the SAME source
+    /// (`epigraph_engine::source_dependence`, backlog 4c42c0bf).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -730,6 +734,36 @@ impl EvidenceRepository {
             }
         }
         Ok(out)
+    }
+
+    /// `source_url` of each of `ids` that has one and that `viewer` can see,
+    /// keyed by evidence id. Rows with a NULL or invisible `source_url` are
+    /// simply absent.
+    ///
+    /// Backs `epigraph_engine::source_dependence::source_keys_for_rows`: the
+    /// combine step's same-source test (backlog 4c42c0bf).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn source_urls_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_url \
+             FROM evidence e \
+             WHERE e.id = ANY($1) \
+               AND e.source_url IS NOT NULL \
+               /* {VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.

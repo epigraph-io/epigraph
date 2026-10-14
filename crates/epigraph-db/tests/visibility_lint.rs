@@ -2390,7 +2390,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "evidence.rs",
         "create_with_source_url",
-        "INSERT INTO `evidence`: the body of `evidence.rs::create` above, moved verbatim (the `query!` text is unchanged; only the `source_url` bind is now a parameter) so a caller can store a URL the evidence type has no slot for (MCP `empirical`, backlog 43ab8c73). `create` delegates to it. Same argument as `create`: a write authorized by the table's `WITH CHECK` on the stamped connection, not an in-query predicate.",
+        "INSERT INTO `evidence`: the body of `evidence.rs::create` above, moved verbatim (the `query!` text is unchanged; only the `source_url` bind is now a parameter) so a caller can store a URL the evidence type has no slot for (MCP `empirical`, backlog 43ab8c73) and the combine step can key same-source re-observations on it (backlog 4c42c0bf). `create` delegates to it. Same argument as `create`: a write authorized by the table's `WITH CHECK` on the stamped connection, not an in-query predicate.",
     ),
     (
         "edge.rs",

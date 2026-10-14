@@ -127,7 +127,8 @@ async fn submit_claim_reports_a_content_hash_hit_and_what_it_kept(pool: PgPool) 
 /// `source_url` on `empirical` evidence is stored in `evidence.source_url`
 /// (backlog 43ab8c73, drain U036): the evidence type has no URL slot, but the
 /// column does, so the hit must list it as applied — and the dedup-hit's own
-/// evidence row must carry it.
+/// evidence row must carry it. It is also the source identity the combine
+/// step keys same-source re-observations on (backlog 4c42c0bf).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_empirical_source_url_is_applied_and_stored(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -159,11 +160,11 @@ async fn an_empirical_source_url_is_applied_and_stored(pool: PgPool) {
         !strs(&d["inputs_discarded"]).contains(&"source_url".to_string()),
         "{second}"
     );
-    // MEASURED: exactly the dedup-hit's evidence row carries the url, in the
-    // column.
+    // MEASURED: exactly the dedup-hit's evidence row (evidence_data "ev two")
+    // carries the url, in the column.
     let (hits,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM evidence e JOIN claims c ON c.id = e.claim_id \
-         WHERE c.content = $1 AND e.source_url = $2",
+         WHERE c.content = $1 AND e.raw_content = 'ev two' AND e.source_url = $2",
     )
     .bind(content)
     .bind(&url)

@@ -145,7 +145,7 @@ pub async fn get_belief(
         // framed read agrees with the cached `claims.pignistic_prob` that the
         // recompute path writes. `perspective = None` → global calibration.
         let (combined, fold_conflict) =
-            recompute_framed_belief(pool, frame_id, &frame, &all_bbas, None)
+            recompute_framed_belief(pool, viewer, frame_id, &frame, &all_bbas, None)
                 .await?
                 .expect("all_bbas is non-empty so combination yields Some");
 
@@ -279,10 +279,16 @@ pub async fn get_perspective_belief(
         })
         .unwrap_or_default();
 
-    let (combined, fold_conflict) =
-        recompute_framed_belief(pool, frame_id, &frame, &all_bbas, Some(&perspective))
-            .await?
-            .expect("all_bbas is non-empty so combination yields Some");
+    let (combined, fold_conflict) = recompute_framed_belief(
+        pool,
+        viewer,
+        frame_id,
+        &frame,
+        &all_bbas,
+        Some(&perspective),
+    )
+    .await?
+    .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     Ok(BeliefInterval {
@@ -366,23 +372,28 @@ impl FramedBeliefContext {
 /// Each BBA is discounted by its effective reliability (the
 /// `effective_source_strength` tier chain: per-frame override → global
 /// calibration → stored `source_strength`, with locality applied; the
-/// perspective overrides sit at the top when present) before the SAME adaptive
-/// combination rule the recompute/write path uses (`combine_multiple`). All
-/// reliability inputs arrive pre-resolved in `ctx`, so this function issues no
-/// queries — the caller resolves `ctx` once and calls this per claim.
+/// perspective overrides sit at the top when present) before the SAME
+/// combination the recompute/write path uses
+/// ([`crate::source_dependence::combine_with_source_dependence`]). All
+/// reliability inputs arrive pre-resolved in `ctx` and the rows' source keys in
+/// `source_keys` (one per row, from
+/// [`crate::source_dependence::source_keys_for_rows`]), so this function issues
+/// no queries — the caller resolves both and calls this per claim.
 ///
 /// Returns `Ok(None)` only when `rows` is empty.
 fn combine_framed_bbas(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
+    source_keys: Vec<Option<crate::source_dependence::SourceKey>>,
     ctx: &FramedBeliefContext,
 ) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
+    debug_assert_eq!(rows.len(), source_keys.len(), "one source key per row");
 
-    let mut mass_fns: Vec<MassFunction> = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut items = Vec::with_capacity(rows.len());
+    for (row, key) in rows.iter().zip(source_keys) {
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
         let alpha = match ctx.perspective.as_ref() {
@@ -400,22 +411,27 @@ fn combine_framed_bbas(
                 &ctx.calibration,
             ),
         };
-        mass_fns.push(combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?);
+        items.push((
+            key,
+            combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?,
+        ));
     }
 
-    // Combine via the SAME rule the recompute/write path uses
-    // (`combine_multiple`: canonical sort + a Dempster step per BBA since U025).
-    // Matching it is what makes this compute-on-read result reproduce the
-    // recompute path's combination for the same discounted BBAs.
+    // Combine via the SAME function the recompute/write path uses: same-source
+    // repeats (one agent re-reading one `source_url`) are folded cautiously
+    // into one, then everything is Dempster-folded (`combine_multiple`). Using
+    // that one function is what makes this compute-on-read result reproduce
+    // the cached value for the same stored BBAs (backlog 4c42c0bf); a plain
+    // `combine_multiple` here served the inflated same-source value while the
+    // cache held the honest one.
     //
     // The conflict is reported the same way the recompute caches it
     // (`edge_factor::compute_combined_belief` -> `claims.mass_on_empty`): the
     // fold's `aggregate_conflict`, because Dempster normalises it out of the
     // combined mass. A single BBA is not folded; its own empty-set mass is
     // the conflict.
-    let (combined, reports) =
-        combination::combine_multiple(&mass_fns, 0.9).map_err(BeliefQueryError::Ds)?;
-    let conflict = combination::fold_conflict(&combined, &reports);
+    let (combined, conflict) = crate::source_dependence::combine_with_source_dependence(items, 0.9)
+        .map_err(BeliefQueryError::Ds)?;
     Ok(Some((combined, conflict)))
 }
 
@@ -433,6 +449,7 @@ fn combine_framed_bbas(
 /// Returns `Ok(None)` only when `rows` is empty.
 async fn recompute_framed_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
@@ -463,7 +480,8 @@ async fn recompute_framed_belief(
         perspective: perspective.cloned(),
     };
 
-    combine_framed_bbas(frame, rows, &ctx)
+    let source_keys = crate::source_dependence::source_keys_for_rows(pool, viewer, rows).await?;
+    combine_framed_bbas(frame, rows, source_keys, &ctx)
 }
 
 /// Batch sibling of [`get_perspective_belief`]: compute the lensed belief for a
@@ -539,7 +557,11 @@ async fn perspective_belief_for_claim(
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
-    let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, ctx)?
+    // Claim-scoped like the BBA fetch above (one query, skipped when no row
+    // can carry a source key), so the page-level hoist is unchanged.
+    let source_keys =
+        crate::source_dependence::source_keys_for_rows(pool, viewer, &all_bbas).await?;
+    let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, source_keys, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
