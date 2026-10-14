@@ -11,6 +11,13 @@
 # <base> may be empty or all zeros (a push that created the branch); then only
 # <head> itself is scanned. Run from the repository root. GITLEAKS overrides
 # the binary (default: `gitleaks` on PATH).
+#
+# Known gap: `git log -p` prints no diff for a merge commit, so a line that
+# exists ONLY in a merge commit (typed while resolving a conflict) is not
+# scanned; the commits on either side of the merge are. Adding `-m` to
+# --log-opts would close it but re-scans every change a merge brings in from
+# the base branch, which reintroduces failures on pre-existing history. An
+# operator can cover merges by hand with --log-opts="-m --first-parent <range>".
 set -euo pipefail
 
 base=${1-}
