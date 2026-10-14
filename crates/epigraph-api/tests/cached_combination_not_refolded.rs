@@ -2,20 +2,26 @@
 //! evidence (backlog b5cb3efb).
 //!
 //! `POST /api/v1/frames/:id/evidence` (`routes::belief::submit_evidence`)
-//! stores each input BBA (`combination_method = "discount"`, its agent) AND,
-//! at its step 14, the combined result of folding them, as an agent-less row
-//! on the SAME (claim, frame). Its own fold keeps only `"discount"` rows, but
-//! the recompute (`edge_factor::compute_combined_belief`, behind
+//! used to store each input BBA (`combination_method = "discount"`, its agent)
+//! AND, at its step 14, the combined result of folding them, as an agent-less
+//! row on the SAME (claim, frame). Its own fold kept only `"discount"` rows,
+//! but the recompute (`edge_factor::compute_combined_belief`, behind
 //! `recompute_beliefs` and the deferred R.4 recompute) and the framed read
 //! (`belief_query::get_belief`) loaded every row of the pair through
 //! `MassFunctionRepository::get_for_claim_frame`, so they folded the claim's
 //! previous answer in as if it were an independent source: BetP inflated past
 //! what the evidence supports and kept climbing as evidence arrived.
 //!
-//! Driven through the real writer, not a hand-planted row, because the
-//! writer's cached row has two shapes, one test each: a fold labels it with
-//! the Dempster report (`"Dempster"`, or `"cautious+…"`), but a lone BBA is
-//! not folded, so `reports` is empty and the label was NULL.
+//! No live writer stores that row any more. Since U024 `/evidence` delegates
+//! to the shared recompute and stores nothing beside its input (pinned below:
+//! no agent-less row after the submissions), and `/assess` always holds the
+//! pair's agent-less slot with its own input, so its guarded cache store never
+//! fires. The rows already on prod remain (~15.5k measured, by b5cb3efb), and
+//! the combine-input readers must keep excluding them. So the inputs are
+//! submitted through the real writer, and each legacy cached row is planted in
+//! its prod shape (no agent, no perspective), one test per label: a fold's
+//! `"Dempster"` report, and `cached_unfolded`, the label b5cb3efb gave the
+//! cached copy of a lone BBA (whose label had been NULL).
 //!
 //! Masses are submitted at reliability 1.0 by agents with no competence scopes,
 //! so the stored inputs are the submitted masses and every expected value is
@@ -27,7 +33,8 @@
 //! On origin/main 3d0ccfd4 the recompute folded the cached row in as one more
 //! source (at the fallback reliability 0.5, since it carries no
 //! `source_strength`). The red values: BetP 0.86 for A alone (expected 0.8),
-//! and 0.94 for A and B (expected 0.9).
+//! and 0.94 for A and B (expected 0.9). The planted rows carry exactly the
+//! masses the writer cached (A, and A ⊕ B), so those red values still apply.
 #![cfg(feature = "db")]
 
 mod common;
@@ -124,8 +131,34 @@ async fn submit(
     body
 }
 
-/// Rows on the pair the writer stored with no source agent: the cached
-/// combination. Non-vacuity probe — without one, a green run proves nothing.
+/// Plant a legacy cached combination row on the pair in its prod shape: no
+/// source agent, no perspective, no type, `label` as its combination method.
+async fn plant_cached_row(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    masses: &Value,
+    conflict_k: Option<f64>,
+    label: &str,
+) {
+    epigraph_db::MassFunctionRepository::store(
+        pool,
+        claim,
+        frame,
+        None, // the writers cached their result with no agent
+        masses,
+        conflict_k,
+        Some(label),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("plant the legacy cached combination row");
+}
+
+/// Rows on the pair with no source agent: the cached combination.
+/// Non-vacuity probe — without one, a green run proves nothing.
 async fn agentless_rows(pool: &PgPool, claim: Uuid, frame: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions \
@@ -240,8 +273,9 @@ fn masses_b() -> Value {
     serde_json::json!({"0": 0.5, "0,1": 0.5})
 }
 
-/// The unfolded shape: a lone BBA, whose cached copy the writer used to
-/// store with a NULL label.
+/// The unfolded shape: a lone BBA beside the cached copy of itself, labelled
+/// `cached_unfolded` (the label b5cb3efb's writers gave it; before that it
+/// was NULL, an ambiguous shape the readers keep).
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_does_not_refold_the_cached_copy_of_a_lone_bba(
     pool_opts: PgPoolOptions,
@@ -258,8 +292,22 @@ async fn recompute_does_not_refold_the_cached_copy_of_a_lone_bba(
     );
     assert_eq!(
         agentless_rows(&w.pool, w.claim, w.frame).await,
+        0,
+        "the writer stores nothing beside its input (U024)"
+    );
+    plant_cached_row(
+        &w.pool,
+        w.claim,
+        w.frame,
+        &masses_a(),
+        None,
+        epigraph_db::CACHED_COMBINATION_UNFOLDED,
+    )
+    .await;
+    assert_eq!(
+        agentless_rows(&w.pool, w.claim, w.frame).await,
         1,
-        "non-vacuity: the writer cached its result as an agent-less row"
+        "non-vacuity: the legacy cached copy sits beside the input"
     );
     let readers = fold_readers(&w.pool, w.claim, w.frame).await;
     assert_all(&readers, 0.8, "one BBA");
@@ -269,10 +317,8 @@ async fn recompute_does_not_refold_the_cached_copy_of_a_lone_bba(
     assert_all(&again, 0.8, "one BBA, recomputed a second time");
 }
 
-/// The folded shape: two inputs, whose cached combination the writer labels
+/// The folded shape: two inputs beside their cached combination, labelled
 /// "Dempster". This is the shape of the ~15,566 cached rows measured on prod.
-/// No reader runs between the two submissions, so this case fails on its own,
-/// independently of the lone-BBA case.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_does_not_refold_the_dempster_labelled_cached_combination(
     pool_opts: PgPoolOptions,
@@ -288,6 +334,21 @@ async fn recompute_does_not_refold_the_dempster_labelled_cached_combination(
             .is_some_and(|p| (p - 0.9).abs() < 1e-9),
         "fixture: the writer's own fold of A and B is BetP 0.9: {second}"
     );
+    assert_eq!(
+        agentless_rows(&w.pool, w.claim, w.frame).await,
+        0,
+        "the writer stores nothing beside its inputs (U024)"
+    );
+    // A ⊕ B, exactly what the writer used to cache: m({TRUE}) 0.8, m(Θ) 0.2.
+    plant_cached_row(
+        &w.pool,
+        w.claim,
+        w.frame,
+        &serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        Some(0.0),
+        "Dempster",
+    )
+    .await;
     let label: Option<String> = sqlx::query_scalar(
         "SELECT combination_method FROM mass_functions \
          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id IS NULL",
@@ -296,7 +357,7 @@ async fn recompute_does_not_refold_the_dempster_labelled_cached_combination(
     .bind(w.frame)
     .fetch_one(&w.pool)
     .await
-    .expect("non-vacuity: one cached combination row (upserted) beside the inputs");
+    .expect("non-vacuity: one cached combination row beside the inputs");
     assert_eq!(
         label.as_deref(),
         Some("Dempster"),
