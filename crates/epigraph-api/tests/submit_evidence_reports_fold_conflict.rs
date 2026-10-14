@@ -173,8 +173,8 @@ async fn head_on_conflict_is_reported_by_the_writer_and_the_pignistic_read(
         serde_json::json!({"1": 0.8, "0,1": 0.2}),
     )
     .await;
-    // (`total_sources` is no probe: it counts every `mass_functions` row for
-    // the pair, including rows the handler derives itself.)
+    // (The fold's own step report is the probe: `total_sources` only counts
+    // the inputs, so it says nothing about whether a fold ran.)
     let steps = second["combination_reports"]
         .as_array()
         .unwrap_or_else(|| panic!("combination_reports is an array: {second}"));

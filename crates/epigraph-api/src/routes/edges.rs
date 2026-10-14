@@ -156,6 +156,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
     "refines",               // claim → claim (refinement)
     "cites",                 // claim → claim (citation link)
+    "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
     "CONTRADICTS",           // claim → claim (contradiction)
     "supersedes",            // claim → claim (version chain)
@@ -2998,6 +2999,19 @@ mod tests {
         assert!(is_valid_relationship("alternative_of"));
         assert!(!is_valid_relationship("invalid"));
         assert!(!is_valid_relationship(""));
+    }
+
+    /// `qualifies` (backlog 99582af7, a belief-neutral scope caveat) is
+    /// accepted in its lower-case canonical spelling ONLY, per the U014 casing
+    /// ruling. The whitelist already mixes cases for older relations
+    /// (`CONTRADICTS`, `EQUIVALENT_TO`, `derived_from`/`DERIVED_FROM`); an
+    /// upper-case `QUALIFIES` alias would split one relation into two
+    /// spellings that readers and the MCP twin treat differently.
+    #[test]
+    fn qualifies_is_valid_in_lower_case_only() {
+        assert!(is_valid_relationship("qualifies"));
+        assert!(!is_valid_relationship("QUALIFIES"));
+        assert!(!is_valid_relationship("Qualifies"));
     }
 
     #[test]

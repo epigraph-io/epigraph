@@ -5,7 +5,7 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -38,9 +38,9 @@ impl ScopedBeliefRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool))]
-    pub async fn upsert(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn upsert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         frame_id: Uuid,
         claim_id: Uuid,
         scope_type: &str,
@@ -82,7 +82,7 @@ impl ScopedBeliefRepository {
         .bind(conflict_k)
         .bind(strategy_used)
         .bind(pignistic_prob)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.0)

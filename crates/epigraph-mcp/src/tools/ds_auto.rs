@@ -316,6 +316,13 @@ pub struct DsAutoInput<'a> {
     pub supports: bool,
     /// Evidence classification tag, when the caller has one.
     pub evidence_type: Option<&'a str>,
+    /// The evidence row this BBA came from, when the caller wrote one in the
+    /// same transaction. Stored as `mass_functions.evidence_id`, it is what
+    /// gives the BBA a source identity
+    /// (`epigraph_engine::source_dependence::SourceKey`), so a later
+    /// re-observation of the same `source_url` by the same agent is folded as
+    /// a repeat rather than as independent corroboration (backlog 4c42c0bf).
+    pub evidence_id: Option<Uuid>,
 }
 
 /// The future an [`optional_read_under_savepoint`] read returns: it borrows the
@@ -391,6 +398,7 @@ pub async fn auto_wire_ds_for_claim(
         weight,
         supports,
         evidence_type,
+        evidence_id,
     } = input;
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
@@ -424,7 +432,10 @@ pub async fn auto_wire_ds_for_claim(
         Some(weight),             // source_strength = evidence-type reliability
         evidence_type.as_deref(), // evidence_type (canonical key)
         "unknown", // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
-        None, // no evidence row in scope on the new-claim initial-write path (issue #197 Phase 3)
+        // The creation's evidence row, when the caller wrote one (issue #197
+        // Phase 3). perspective_id stays NULL: this is the claim's one
+        // creation BBA, not a per-evidence row.
+        evidence_id,
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
@@ -738,41 +749,33 @@ pub async fn auto_wire_ds_update(
     // reports (`aggregate_conflict`), exactly as the recompute path
     // (`edge_factor::compute_combined_belief`) does; otherwise this write and
     // the next recompute would disagree on `claims.mass_on_empty`.
-    let (combined, fold_conflict) = if all_rows.len() <= 1 {
-        // Single BBA — still apply discount
-        let r = all_rows
-            .first()
-            .expect("len <= 1 with non-empty check: store_with_perspective wrote one");
+    //
+    // Discount each BBA via the helper, then combine through the SAME
+    // function the recompute path uses (`edge_factor::compute_combined_belief`):
+    // BBAs from one agent re-reading one `source_url` are folded cautiously into
+    // one before the Dempster fold, so a re-worded re-observation of an
+    // unchanged source no longer counts as corroboration (backlog 4c42c0bf).
+    // Rows with no source identity fold exactly as before.
+    let source_keys =
+        epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+            .await
+            .map_err(|e| format!("evidence source_url read: {e}"))?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    for (row, key) in all_rows.iter().zip(source_keys) {
+        let mf = parse_stored_bba(&frame, &row.masses)?;
         let reliability = effective_source_strength(
-            r,
+            row,
             per_frame_intra,
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
-        let mf = parse_stored_bba(&frame, &r.masses)?;
-        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-        let k = d.mass_of_conflict();
-        (d, k)
-    } else {
-        // Multiple BBAs — discount each via the helper, then combine.
-        let mut mass_fns = Vec::with_capacity(all_rows.len());
-        for row in &all_rows {
-            let mf = parse_stored_bba(&frame, &row.masses)?;
-            let reliability = effective_source_strength(
-                row,
-                per_frame_intra,
-                per_frame_evidence_weights.as_ref(),
-                &calibration,
-            );
-            let discounted =
-                combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-            mass_fns.push(discounted);
-        }
-        let (combined, reports) = combination::combine_multiple(&mass_fns, 0.9)
+        let discounted =
+            combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        items.push((key, discounted));
+    }
+    let (combined, fold_conflict) =
+        epigraph_engine::source_dependence::combine_with_source_dependence(items, 0.9)
             .map_err(|e| format!("combine_multiple: {e}"))?;
-        let k = combination::fold_conflict(&combined, &reports);
-        (combined, k)
-    };
 
     let (bel, pl, mut betp, _, missing) = compute_measures(&combined);
     let conflict = fold_conflict;

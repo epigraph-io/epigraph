@@ -29,7 +29,12 @@
 //!
 //! **Three handlers are deliberately NOT converted, and the reason is not
 //! caution.** `create_frame`, `submit_evidence` and `refine_frame` each write
-//! through their alias. `read_as` is documented read-only: `ScopedRead::commit`
+//! through their alias. (`submit_evidence`'s own tier-A writes, the BBA, the
+//! frame assignment, the claim's cached belief, its Beta parameters and its
+//! global scoped belief, now go through ONE [`AppState::write_as`]
+//! transaction; its alias remains for the pre-transaction reads and the
+//! best-effort side effects after the commit.) `read_as` is documented
+//! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
 //! `DerefMut<Target = PgConnection>` means that mistake COMPILES, so the
@@ -157,23 +162,59 @@ pub struct SubmitEvidenceRequest {
     pub evidence_type: Option<String>,
     /// Conflict K at or above which a `conflict.detected` event is emitted.
     /// Since U025 it no longer selects a combination rule: `combine_multiple`
-    /// folds with Dempster at every step.
+    /// folds with Dempster at every step. It does not affect the claim's
+    /// belief, which is the shared recompute's
+    /// (`edge_factor::recompute_claim_belief_on_frame`).
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Mass assignments: keys are comma-separated hypothesis indices, values are mass.
     /// Prefix key with `~` for CDST complement (negative) elements.
     pub masses: std::collections::BTreeMap<String, f64>,
-    /// Override combination method: "conjunctive", "dempster", "yager_open",
-    /// "yager_closed", "dubois_prade", "inagaki". If omitted, uses adaptive.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). The
+    /// claim's belief is computed by the shared recompute, the one
+    /// `recompute_beliefs` and MCP `submit_ds_evidence` use. Sending it earns a
+    /// `warnings` entry.
     #[serde(default)]
     pub combination_method: Option<String>,
-    /// Inagaki gamma parameter [0, 1]. Only used when combination_method = "inagaki".
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It was
+    /// the Inagaki gamma for `combination_method = "inagaki"`. Sending it earns
+    /// a `warnings` entry.
     #[serde(default)]
     pub gamma: Option<f64>,
-    /// If true, skip independence checking. Caller asserts provenance independence.
-    /// Logged for audit purposes.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It
+    /// skipped an independence analysis the shared recompute does not run.
+    /// Sending `true` earns a `warnings` entry.
     #[serde(default)]
     pub assume_independent: Option<bool>,
+}
+
+/// One warning per deprecated `SubmitEvidenceRequest` field the caller sent
+/// (backlog 82dcff9d, the REST twin of MCP `submit_ds_evidence`'s
+/// `deprecated_parameter_warnings`). They are accepted, not refused, for
+/// parity with MCP.
+#[cfg(feature = "db")]
+fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String> {
+    const WHY: &str = "The claim's belief is always recomputed by the shared Dempster fold \
+                       (the one recompute_beliefs uses).";
+    let mut out = Vec::new();
+    if let Some(method) = &request.combination_method {
+        out.push(format!(
+            "combination_method={method} is deprecated: it did not change the returned belief. \
+             {WHY}"
+        ));
+    }
+    if let Some(gamma) = request.gamma {
+        out.push(format!(
+            "gamma={gamma} is deprecated: it did not change the returned belief. {WHY}"
+        ));
+    }
+    if request.assume_independent == Some(true) {
+        out.push(format!(
+            "assume_independent=true is deprecated: it did not change the returned belief, \
+             since no independence analysis runs. {WHY}"
+        ));
+    }
+    out
 }
 
 fn default_reliability() -> f64 {
@@ -198,6 +239,12 @@ pub struct EvidenceSubmissionResponse {
     pub pignistic_prob: Option<f64>,
     pub bayesian_posterior: f64,
     pub total_sources: i64,
+    /// What the caller should know about this submission's effect: a
+    /// deprecated request field it sent (`combination_method`, `gamma`,
+    /// `assume_independent`), or that the claim's cache was not updated (it
+    /// carries another frame). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Simplified combination report for API response
@@ -917,7 +964,12 @@ pub async fn create_frame(
 
 /// Submit mass function evidence for a claim in a frame
 ///
-/// Pipeline: discount → store → retrieve all → combine → update claim → emit events → compute divergence
+/// Pipeline: discount → (one stamped transaction: store → recompute the
+/// claim's belief on this frame with the shared pipeline
+/// `edge_factor::recompute_claim_belief_on_frame` → Beta update → global
+/// scoped belief) → emit events → compute divergence. The belief this returns is the one a later
+/// `recompute_beliefs` with no new evidence leaves (backlogs 2bffdfdc,
+/// 82dcff9d), and no derived "combined" BBA is stored beside the input.
 ///
 /// `POST /api/v1/frames/:id/evidence`
 #[cfg(feature = "db")]
@@ -1210,10 +1262,66 @@ pub async fn submit_evidence(
         }
     }
 
-    // 5. Store the individual BBA (with optional perspective)
+    // 5. ONE viewer-stamped transaction for this submission's own writes: the
+    //    BBA, the frame assignment, the claim's cached belief, its Beta
+    //    parameters and its global scoped belief (backlogs 2bffdfdc / I075 and
+    //    82dcff9d / I228, the REST twins of `submit_ds_evidence`'s #317 and
+    //    #513).
+    //
+    //    The combine and the cache write are DELEGATED to the shared pipeline,
+    //    `edge_factor::recompute_claim_belief_on_frame`, the same function
+    //    `recompute_beliefs`, the framed `get_belief` and MCP
+    //    `submit_ds_evidence` use. This handler used to run its own combine
+    //    (only `'discount'` rows, an independence analysis with cautious
+    //    combine, the caller's threshold), wrote the cache with no
+    //    `belief_frame_id`, stored the masses with `source_strength =
+    //    reliability` (which the shared pipeline discounts AGAIN), and then
+    //    stored the combined result back as a NULL-agent "system" BBA that every
+    //    later recompute folded in as one more independent source. A submit and
+    //    a recompute with no new evidence then disagreed (0.60 vs 0.72 for one
+    //    BBA), and a submission with no `agent_id` was overwritten by that
+    //    combined row (same unique key).
+    //
+    //    Every pool-side write below runs AFTER the commit: once the recompute
+    //    has updated the `claims` row on `tx`, a write to that row on another
+    //    connection would wait on this transaction forever.
+    let mut tx = state.write_as(&viewer, "submit_evidence").await?;
+
+    // 5a. The claim, read as the caller. An unreadable claim gets the same 404
+    //     as a nonexistent one, so the route is no existence oracle.
+    {
+        let sql = viewer.splice(
+            "SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(request.claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .is_none()
+        {
+            return Err(ApiError::NotFound {
+                entity: "claim".to_string(),
+                id: request.claim_id.to_string(),
+            });
+        }
+    }
+
+    // 5b. Store the individual BBA (with optional perspective).
+    //     The masses are the reliability-discounted ones (step 4), which the
+    //     REST readers of `'discount'` rows (`get_pignistic`, 18b's velocity
+    //     check, step 17's perspective scope) consume directly. So the row's
+    //     `source_strength` is 1.0: `effective_source_strength` (tier 1 when
+    //     untyped, tier 4 for an uncalibrated type) must not apply
+    //     `reliability` a second time.
     let masses_json = modified.masses_to_json();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *tx,
         request.claim_id,
         frame_id,
         request.agent_id,
@@ -1221,7 +1329,7 @@ pub async fn submit_evidence(
         &masses_json,
         None,
         Some("discount"),
-        Some(request.reliability),
+        Some(1.0), // `reliability` is already in the masses; see 5b
         // Canonical key, or the caller's own key lowercased (bc06ec6f).
         epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref())
             .as_deref(),
@@ -1230,104 +1338,39 @@ pub async fn submit_evidence(
     )
     .await?;
 
-    // 6. Ensure claim is assigned to frame + create WITHIN_FRAME edge (best-effort)
-    //    Use ON CONFLICT DO NOTHING to preserve any existing hypothesis_index assignment.
-    //    assign_claim() uses DO UPDATE which would overwrite hypothesis_index with NULL.
-    let _ = sqlx::query(
-        "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(request.claim_id)
-    .bind(frame_id)
-    .execute(pool)
-    .await;
-    let _ = epigraph_db::EdgeRepository::create(
-        pool,
-        request.claim_id,
-        "claim",
-        frame_id,
-        "frame",
-        "WITHIN_FRAME",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    // 7. Retrieve all BBAs for this (claim, frame), excluding system-combined results.
-    //    Only include user-submitted BBAs (combination_method = "discount") to avoid
-    //    double-counting derived artifacts (violates TBM independence assumption).
-    let all_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-        pool,
-        &viewer,
-        request.claim_id,
-        frame_id,
-    )
-    .await?;
-
-    // 8. Sort mass functions by row ID for canonical combination ordering.
-    //    This ensures identical results regardless of evidence submission order.
-    let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, row.source_agent_id, m))
-        })
-        .collect();
-    indexed_rows.sort_by_key(|(id, _, _)| *id);
-
-    // 9. Independence analysis (G1, G11)
-    let analysis = if request.assume_independent.unwrap_or(false) || indexed_rows.len() <= 1 {
-        super::independence::IndependenceAnalysis::all_independent(
-            indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
+    // 6. Ensure the claim is assigned to the frame (best-effort, under a
+    //    SAVEPOINT: unsavepointed, a refused INSERT would abort the transaction
+    //    and the COMMIT would silently roll the BBA back).
+    //    ON CONFLICT DO NOTHING preserves an existing hypothesis_index;
+    //    `FrameRepository::assign_claim` would overwrite it with NULL.
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let assigned = sqlx::query(
+            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
-    } else {
-        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
-    };
-
-    // 10a. Cautious-combine within each dependent group
-    let mut group_results = Vec::new();
-    for group in &analysis.dependent_groups {
-        if group.is_empty() {
-            continue;
+        .bind(request.claim_id)
+        .bind(frame_id)
+        .execute(&mut *sp)
+        .await;
+        match assigned {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: claim_frames assignment refused: {e}");
+                sp.rollback().await
+            }
         }
-        let combined_group = group
-            .iter()
-            .skip(1)
-            .try_fold(group[0].clone(), |acc, m| {
-                combination::cautious_combine(&acc, m)
-            })
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Cautious combine failed: {e}"),
-            })?;
-        group_results.push(combined_group);
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
     }
 
-    // 10b. Merge independent BBAs + group results
-    let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
-    for_combination.extend(group_results);
-
-    // 10c. Dempster fold (`combine_multiple`, U025) on the now-independent set
-    let (combined, reports) = if for_combination.len() <= 1 {
-        (
-            for_combination
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| indexed_rows[0].2.clone()),
-            vec![],
-        )
-    } else {
-        combination::combine_multiple(&for_combination, request.conflict_threshold).map_err(
-            |e| ApiError::InternalError {
-                message: format!("Combination failed: {e}"),
-            },
-        )?
-    };
-
-    // 11. Look up claim's hypothesis_index in claim_frames for correct Bel/Pl
+    // 11. Look up claim's hypothesis_index in claim_frames (Beta update, the
+    //     perspective scope and the velocity check below)
     let claim_assignment = epigraph_db::FrameRepository::get_claim_assignment(
-        pool,
+        &mut *tx,
         &viewer,
         request.claim_id,
         frame_id,
@@ -1335,36 +1378,217 @@ pub async fn submit_evidence(
     .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
-    let (final_bel, final_pl, final_betp, m_missing) =
-        compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
-    let m_empty = combination::fold_conflict(&combined, &reports);
-
     // 12. Read old belief/plausibility before updating (for event payload)
     let old_row: Option<(Option<f64>, Option<f64>)> =
         sqlx::query_as("SELECT belief, plausibility FROM claims WHERE id = $1")
             .bind(request.claim_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: e.to_string(),
             })?;
     let (old_belief, old_plausibility) = old_row.unwrap_or((None, None));
 
-    // 13. Update claim's belief, plausibility, and pignistic probability
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
+    // 13. Combine every BBA on (claim, frame) and write the claim's cache with
+    //     `belief_frame_id = frame_id`, through the shared pipeline. A
+    //     non-owner's write follows migration 114: it refreshes the cache only
+    //     on the frame the cache already carries (or seeds `binary_truth`).
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+        &mut tx,
+        &viewer,
         request.claim_id,
-        epigraph_db::CachedBelief {
-            belief: final_bel,
-            plausibility: final_pl,
-            mass_on_empty: m_empty,
-            pignistic_prob: Some(final_betp),
-            mass_on_missing: m_missing,
-            belief_frame_id: None,
-        },
+        frame_id,
     )
-    .await?;
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Belief recompute failed: {e}"),
+    })?;
+
+    // 13a. This frame's combination, by the same pipeline, for the response
+    //      and the events. When the cache now carries another frame (a
+    //      non-owner may not re-point it), say so instead of implying that the
+    //      claim's belief moved.
+    let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut tx,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Belief preview failed: {e}"),
+    })?
+    .ok_or_else(|| ApiError::InternalError {
+        message: "no BBA on this frame after storing one".to_string(),
+    })?;
+    let cache_frame: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(request.claim_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .flatten();
+    let mut warnings = deprecated_parameter_warnings(&request);
+    if cache_frame != Some(frame_id) {
+        warnings.push(format!(
+            "claim {}'s cached belief was NOT updated by this call: it carries another frame \
+             (or an older cache with no recorded frame, or none on a frame other than \
+             binary_truth), which a non-owner does not re-point or seed. updated_belief, \
+             updated_plausibility and pignistic_prob here are this frame's combination, not \
+             the claim's cache.",
+            request.claim_id
+        ));
+    }
+
+    // 13b. Parallel Beta-Bernoulli update
+    //      Compute likelihood ratio from evidence mass function and update Beta parameters.
+    //      The evidence's mass on the singleton {h_i} indicates support strength.
+    //      Best-effort, under a SAVEPOINT (the read included: a failed statement
+    //      aborts the enclosing transaction whether it read or wrote).
+    let bayesian_posterior = {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let beta_row: Result<Option<(f64, f64)>, sqlx::Error> =
+            sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
+                .bind(request.claim_id)
+                .fetch_optional(&mut *sp)
+                .await;
+
+        let (mut alpha, mut beta_param) = beta_row
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .unwrap_or((1.0, 1.0));
+
+        // Use the submitted evidence's singleton mass as the evidence strength
+        if let Some(h_i) = h_idx {
+            let singleton =
+                epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
+            let m_support = modified.mass_of(&singleton);
+            // Evidence strength: mass on the singleton hypothesis vs complement
+            // Higher m_support → stronger evidence for the hypothesis
+            if m_support > 0.0 {
+                alpha += m_support;
+            }
+            let m_complement = 1.0 - m_support - modified.mass_of_empty();
+            if m_complement > 0.0 {
+                beta_param += m_complement;
+            }
+        }
+
+        // Store updated Beta parameters
+        let stored = match beta_row {
+            Ok(_) => sqlx::query(
+                "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(request.claim_id)
+            .bind(alpha)
+            .bind(beta_param)
+            .execute(&mut *sp)
+            .await
+            .map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match stored {
+            Ok(()) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: Beta update refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+
+        // Compute posterior: E[Beta(alpha, beta)] = alpha / (alpha + beta)
+        alpha / (alpha + beta_param)
+    };
+
+    // The BBAs the shared pipeline just combined, read through the same
+    // combine-input reader it uses. `count_for_claim_frame` would also count a
+    // legacy cached combination row (an agent-less, perspective-less row the
+    // writers stored before U024, ~15.5k of them on prod), which the reader
+    // excludes (backlog b5cb3efb): one real input beside such a row would then
+    // report two sources and a Dempster fold that never happened.
+    let total_sources = i64::try_from(
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+        .len(),
+    )
+    .unwrap_or(i64::MAX);
+
+    // The values the rest of the handler reports and emits: this frame's
+    // combination by the shared pipeline. `combine_multiple` folds with
+    // Dempster at every step since U025; a single BBA is not folded, so it has
+    // no combination step and no fold conflict to report as one. `total_sources`
+    // is the number of BBAs that fold combined (see above).
+    let final_bel = preview.belief;
+    let final_pl = preview.plausibility;
+    let final_betp = preview.pignistic_prob;
+    let m_empty = preview.conflict_k;
+    let m_missing = preview.missing_mass;
+    let folded = total_sources > 1;
+    let final_k = folded.then_some(preview.conflict_k);
+    let final_method = folded.then_some("Dempster");
+    let report_responses: Vec<CombinationReportResponse> = if folded {
+        vec![CombinationReportResponse {
+            method_used: "Dempster".to_string(),
+            conflict_k: preview.conflict_k,
+            mass_on_conflict: preview.conflict_k,
+            mass_on_missing: preview.missing_mass,
+        }]
+    } else {
+        vec![]
+    };
+
+    // 15. The global scoped belief cache, on the stamped transaction
+    //     (best-effort, under a SAVEPOINT like steps 6 and 13b). On the raw
+    //     pool this write was refused under FORCE without an error, and with
+    //     it the only record of a REST fold's conflict K now that no derived
+    //     BBA is stored beside the inputs.
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let stored = epigraph_db::ScopedBeliefRepository::upsert(
+            &mut *sp,
+            frame_id,
+            request.claim_id,
+            "global",
+            None,
+            final_bel,
+            final_pl,
+            m_empty,
+            m_missing,
+            final_k,
+            final_method,
+            Some(final_betp),
+        )
+        .await;
+        match stored {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: global scoped belief refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+    }
+
+    tx.commit().await?;
 
     // 13c. CDST residual mass analysis
     {
@@ -1401,122 +1625,17 @@ pub async fn submit_evidence(
         }
     }
 
-    // 13b. Parallel Beta-Bernoulli update
-    //      Compute likelihood ratio from evidence mass function and update Beta parameters.
-    //      The evidence's mass on the singleton {h_i} indicates support strength.
-    let bayesian_posterior = {
-        let beta_row: Option<(f64, f64)> =
-            sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
-                .bind(request.claim_id)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-
-        let (mut alpha, mut beta_param) = beta_row.unwrap_or((1.0, 1.0));
-
-        // Use the submitted evidence's singleton mass as the evidence strength
-        if let Some(h_i) = h_idx {
-            let singleton =
-                epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
-            let m_support = modified.mass_of(&singleton);
-            // Evidence strength: mass on the singleton hypothesis vs complement
-            // Higher m_support → stronger evidence for the hypothesis
-            if m_support > 0.0 {
-                alpha += m_support;
-            }
-            let m_complement = 1.0 - m_support - modified.mass_of_empty();
-            if m_complement > 0.0 {
-                beta_param += m_complement;
-            }
-        }
-
-        // Store updated Beta parameters
-        let _ = sqlx::query(
-            "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(request.claim_id)
-        .bind(alpha)
-        .bind(beta_param)
-        .execute(pool)
-        .await;
-
-        // Compute posterior: E[Beta(alpha, beta)] = alpha / (alpha + beta)
-        alpha / (alpha + beta_param)
-    };
-
-    // 14. Update the combined mass function's conflict in DB (G16: record actual method)
-    let final_k = reports.last().map(|r| r.conflict_k);
-    let used_cautious = !analysis.dependent_groups.is_empty();
-    let final_method_str = if used_cautious {
-        // Independence analysis detected shared provenance → cautious + adaptive
-        let adaptive = reports
-            .last()
-            .map(|r| format!("{:?}", r.method_used))
-            .unwrap_or_else(|| "none".to_string());
-        Some(format!("cautious+{adaptive}"))
-    } else {
-        reports.last().map(|r| format!("{:?}", r.method_used))
-    };
-    let final_method = final_method_str.as_deref();
-
-    // Store the combined result as a system mass function (agent_id = None)
-    let combined_json = combined.masses_to_json();
-    // Not over an input: the cached row's (claim, frame, NULL, NULL) key is
-    // also where an agent-less, perspective-less input lives, and the
-    // combine-input readers would drop that input once a cached label
-    // replaced it (backlog b5cb3efb).
-    if !epigraph_db::cached_combination_slot_holds_input(&all_rows) {
-        let _ = epigraph_db::MassFunctionRepository::store(
-            pool,
-            request.claim_id,
-            frame_id,
-            None, // system-generated combined result
-            &combined_json,
-            final_k,
-            // A lone BBA is not folded, so `final_method` is None; label the row
-            // anyway, or the combine-input readers cannot tell this cached copy
-            // from an agent-less input and fold it twice (backlog b5cb3efb).
-            final_method.or(Some(epigraph_db::CACHED_COMBINATION_UNFOLDED)),
-            None, // combined result: a fold of several inputs has no single evidence type (bc06ec6f)
-            "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-            None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-        )
-        .await;
-    }
-
-    let report_responses: Vec<CombinationReportResponse> = reports
-        .iter()
-        .map(|r| CombinationReportResponse {
-            method_used: format!("{:?}", r.method_used),
-            conflict_k: r.conflict_k,
-            mass_on_conflict: r.mass_on_conflict,
-            mass_on_missing: r.mass_on_missing,
-        })
-        .collect();
-
-    let total_sources = epigraph_db::MassFunctionRepository::count_for_claim_frame(
+    // 14. The WITHIN_FRAME edge (best-effort, after the commit)
+    let _ = epigraph_db::EdgeRepository::create(
         pool,
-        &viewer,
         request.claim_id,
+        "claim",
         frame_id,
-    )
-    .await?;
-
-    // 15. Store global scoped belief cache
-    let _ = epigraph_db::ScopedBeliefRepository::upsert(
-        pool,
-        frame_id,
-        request.claim_id,
-        "global",
+        "frame",
+        "WITHIN_FRAME",
         None,
-        final_bel,
-        final_pl,
-        m_empty,
-        m_missing,
-        final_k,
-        final_method,
-        Some(final_betp),
+        None,
+        None,
     )
     .await;
 
@@ -1997,6 +2116,7 @@ pub async fn submit_evidence(
             pignistic_prob: Some(final_betp),
             bayesian_posterior,
             total_sources,
+            warnings,
         }),
     ))
 }
@@ -2940,6 +3060,7 @@ mod tests {
             pignistic_prob: Some(0.85),
             bayesian_posterior: 0.5,
             total_sources: 3,
+            warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pignistic_prob"));
@@ -3114,6 +3235,7 @@ mod tests {
             pignistic_prob: Some(0.76),
             bayesian_posterior: 0.71,
             total_sources: 5,
+            warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(

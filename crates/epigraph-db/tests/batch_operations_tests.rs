@@ -723,3 +723,76 @@ async fn test_batch_insert_performance(pool: PgPool) {
         "Batch insert should not be significantly slower than individual inserts"
     );
 }
+
+/// Test: Both evidence writers store a Document's URL in `evidence.source_url`,
+/// and neither copies a Testimony's free-text `source` there.
+///
+/// **Evidence**: backlog 43ab8c73 — `create` and `batch_create` both bound
+/// NULL to the column, so REST `get_evidence` / `claim_provenance` (which read
+/// it) never saw a URL.
+/// **Reasoning**: `create` has production callers (REST POST evidence,
+/// conventions) and `batch_create` is the bulk path; a Testimony's `source` is
+/// a name as often as a link, so only the Document arm may populate the column.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_evidence_writers_store_a_document_url_and_no_testimony_source(pool: PgPool) {
+    let agent = make_agent(Some("Evidence URL Agent"));
+    let agent = AgentRepository::create(&pool, &agent).await.unwrap();
+    let claim = create_test_claim_entity(agent.id, "Claim whose evidence has links", 0.7);
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+        .await
+        .expect("Create claim should succeed");
+
+    let with_type = |content: &str, evidence_type: EvidenceType| -> Evidence {
+        let mut e = create_test_evidence_entity(agent.id, claim.id, content);
+        e.evidence_type = evidence_type;
+        e
+    };
+    let document = |url: &str| EvidenceType::Document {
+        source_url: Some(url.to_string()),
+        mime_type: "text/plain".to_string(),
+        checksum: None,
+    };
+    let created = with_type("one by create", document("https://example.org/u036/create"));
+    let batched = with_type("one by batch", document("https://example.org/u036/batch"));
+    let testimony = with_type(
+        "a named witness",
+        EvidenceType::Testimony {
+            source: "Dr. X".to_string(),
+            testified_at: chrono::Utc::now(),
+            verification: None,
+        },
+    );
+
+    EvidenceRepository::create(&pool, &created)
+        .await
+        .expect("create should succeed");
+    EvidenceRepository::batch_create(&pool, &[batched.clone(), testimony.clone()])
+        .await
+        .expect("batch create should succeed");
+
+    let column = |id: epigraph_core::EvidenceId| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT source_url FROM evidence WHERE id = $1")
+                .bind(uuid::Uuid::from(id))
+                .fetch_one(&pool)
+                .await
+                .expect("read evidence.source_url")
+        }
+    };
+    assert_eq!(
+        column(created.id).await.as_deref(),
+        Some("https://example.org/u036/create"),
+        "EvidenceRepository::create must store a Document's URL in the column"
+    );
+    assert_eq!(
+        column(batched.id).await.as_deref(),
+        Some("https://example.org/u036/batch"),
+        "EvidenceRepository::batch_create must store a Document's URL in the column"
+    );
+    assert_eq!(
+        column(testimony.id).await,
+        None,
+        "a Testimony's free-text source must never be copied into the URL column"
+    );
+}

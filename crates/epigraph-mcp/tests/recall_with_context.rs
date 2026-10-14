@@ -966,6 +966,13 @@ mod diverse_fixture {
         drift_bucket: usize,
         drift: f32,
     ) -> String {
+        vec_to_pgvec(&drift_vec(bucket, value, drift_bucket, drift))
+    }
+
+    /// The raw vector behind `cluster_pgvec_with_drift`, shared with
+    /// `cluster_pgvec_with_drift_and_query_share` so the drift layout lives
+    /// in one place.
+    fn drift_vec(bucket: usize, value: f32, drift_bucket: usize, drift: f32) -> Vec<f32> {
         let mut v = vec![0.0f32; DIM];
         let start = bucket * STRIDE;
         let end = start + STRIDE;
@@ -976,6 +983,41 @@ mod diverse_fixture {
         let dend = dstart + STRIDE;
         for slot in v.iter_mut().take(dend).skip(dstart) {
             *slot = drift;
+        }
+        v
+    }
+
+    /// `cluster_pgvec_with_drift(bucket, value, drift_bucket, drift)` plus a
+    /// constant `query_share` in bucket 0 (the query bucket in these tests).
+    ///
+    /// For a "far" cluster that must stay further from the query than the
+    /// near rows, yet NOT be exactly orthogonal to them. When two clusters are
+    /// exactly orthogonal, every cross-cluster distance ties at cosine
+    /// distance 1.0 (similarity 0), and the HNSW index built on insert can
+    /// leave the near cluster unreachable from the graph's entry point. An
+    /// index scan then returns only far rows, even at `hnsw.ef_search = 1000`
+    /// with iterative scan. The shared bucket-0 component removes that exact
+    /// tie. This is a measured result, not a guarantee: the unreachable-graph
+    /// failure went from about 3% of fresh builds to 0 in 2750 (a 95% upper
+    /// bound of about 0.11% per build).
+    ///
+    /// Precondition: `bucket` and `drift_bucket` are not 0. Bucket 0 is the
+    /// query-share slot and is written last, so it would silently overwrite
+    /// either of them.
+    pub fn cluster_pgvec_with_drift_and_query_share(
+        bucket: usize,
+        value: f32,
+        drift_bucket: usize,
+        drift: f32,
+        query_share: f32,
+    ) -> String {
+        debug_assert!(
+            bucket != 0 && drift_bucket != 0,
+            "bucket 0 is the query-share slot; got bucket={bucket}, drift_bucket={drift_bucket}"
+        );
+        let mut v = drift_vec(bucket, value, drift_bucket, drift);
+        for slot in v.iter_mut().take(STRIDE) {
+            *slot = query_share;
         }
         vec_to_pgvec(&v)
     }
@@ -1819,6 +1861,58 @@ async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
     assert_eq!(
         bare_row["epistemic_edges_truncated"],
         serde_json::json!(false)
+    );
+}
+
+/// A claim's scope caveats travel with it (backlog 99582af7, design note 3): a
+/// `qualifies` edge ("A bounds the conditions under which B applies") is
+/// returned among the hit's epistemic neighbours, with direction, so a caller
+/// reading the hit also reads where it does NOT hold. Both directions are
+/// seeded: incoming = "is qualified by", outgoing = "qualifies".
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_hit_carries_its_qualifies_caveats(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-qualifies", "Scope caveats").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "anchor hub para", &pgvec, None).await;
+
+    let caveat = seed_neighbour_claim(&pool, agent, "holds only in 1 M monovalent NaCl", 0.9).await;
+    let bounded = seed_neighbour_claim(&pool, agent, "a claim the hub para bounds", 0.7).await;
+    seed_claim_edge(&pool, caveat, para, "qualifies").await; // incoming
+    seed_claim_edge(&pool, para, bounded, "qualifies").await; // outgoing
+
+    let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    assert!(
+        has_edge(&edges, caveat, "qualifies", "incoming"),
+        "the caveat is the edge SOURCE, so the hit must carry it as an incoming \
+         `qualifies` (\"is qualified by\"); got {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, bounded, "qualifies", "outgoing"),
+        "the hit is the SOURCE of the second `qualifies`, so it must be reported \
+         outgoing; got {edges:?}"
+    );
+    assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
+
+    // The contract a caller reads names the relation too.
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let limit_doc = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "recall_with_context")
+        .expect("recall_with_context is registered")["inputSchema"]["properties"]
+        ["epistemic_limit"]["description"]
+        .as_str()
+        .expect("epistemic_limit has a description")
+        .to_string();
+    assert!(
+        limit_doc.contains("elaborates / cites / qualifies"),
+        "recall_with_context's epistemic_limit must list qualifies among the carried \
+         relationships; got: {limit_doc}"
     );
 }
 
@@ -2790,7 +2884,7 @@ async fn diverse_mode_falls_back_when_tiny_theme_set_does_not_cover_query(pool: 
 }
 
 /// The guard must be PER-QUERY, not corpus-wide: here most of the corpus is
-/// unthemed (a large orthogonal cluster), but the query's own neighbourhood is
+/// unthemed (a large cluster far from the query), but the query's own neighbourhood is
 /// almost entirely themed. Diverse selection must still run — observable
 /// because diverse candidates come only from themes, so the single UNTHEMED
 /// paragraph that is the query's nearest neighbour must NOT be returned (flat
@@ -2839,16 +2933,37 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
     }
 
     // A large unthemed cluster far from the query, so corpus-wide coverage is
-    // well under half. A corpus-ratio guard would (wrongly) disable diverse
-    // mode here; a per-query guard must not.
+    // well under half (60/211). A corpus-ratio guard would (wrongly) disable
+    // diverse mode here; a per-query guard must not.
+    //
+    // The far cluster is deliberately NOT orthogonal to the query region: each
+    // far row carries a 0.5 share in the query's bucket 0. Its cosine to the
+    // query is at most 0.5/sqrt(1.25) ≈ 0.447, below the least similar themed
+    // row's 1/sqrt(1 + 0.64²) ≈ 0.842, so the themed rows stay the nearest
+    // ones. With exactly orthogonal clusters, about 3% of freshly built HNSW
+    // graphs left the near cluster unreachable from the entry point. The
+    // guard's probe then saw 40 far rows (0 covered), the request fell back
+    // to flat retrieval, and that index scan also returned far rows.
+    let mut far = std::collections::HashSet::new();
     for i in 0..150 {
-        let v = diverse_fixture::cluster_pgvec_with_drift(6, 1.0, 7, (i as f32) * 0.01);
-        diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
+        let v = diverse_fixture::cluster_pgvec_with_drift_and_query_share(
+            6,
+            1.0,
+            7,
+            (i as f32) * 0.01,
+            0.5,
+        );
+        far.insert(
+            diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None)
+                .await,
+        );
     }
     // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
     // planner statistics, so the guard's probe and the candidate query run
-    // under the plans a populated database would choose. The outcome does not
-    // depend on which plan is picked: the themed rows are the nearest ones.
+    // under the plans a populated database would choose. An index scan is
+    // approximate, so the result does not depend on the plan only as far as
+    // the HNSW graph reaches the query region. With the shared bucket-0
+    // component above, that failed in 0 of 2750 fresh builds (about 3% before).
     sqlx::query("VACUUM ANALYZE claims")
         .execute(&pool)
         .await
@@ -2872,9 +2987,13 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
          are themed only — the unthemed nearest neighbour appearing means the request fell \
          back to flat retrieval"
     );
+    let far_returned = returned.intersection(&far).count();
     assert!(
         returned.is_subset(&themed),
-        "every diverse pick must come from the covering theme; got {returned:?}"
+        "every diverse pick must come from the covering theme; got {returned:?}. \
+         {far_returned} of them are far-cluster rows: a non-zero count means the HNSW \
+         index scan never reached the query region (a fixture-geometry problem, see the \
+         far-cluster comment above), not a per-query guard regression"
     );
 }
 

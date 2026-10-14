@@ -20,7 +20,8 @@
 //! `allow-author-binding-client` exits 3 when the allowance is recorded but
 //! does not bind (ALLOWED-BUT-INEFFECTIVE); `revoke-author-binding-client`
 //! exits 1 when no allowance row names the client (NOT-ALLOWED: nothing to
-//! revoke, usually a mistyped id).
+//! revoke, usually a mistyped id). `delete-frames` exits 3 when it refused at
+//! least one listed frame (nothing is written then, even under `--apply`).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -69,12 +70,14 @@
 //!     epigraph-operator allow-author-binding-client --client <uuid> --operator <uuid> \
 //!         --reason TEXT [--revoke-foreign-writes] [--apply]
 //!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator delete-frames --ids-file frames.txt [--companion-claims-file claims.txt] \
+//!         --reason TEXT [--apply --confirm-delete N]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    elevation, hide, human, legacy, link, passkey, reown, reown_linked, restrict, reverse,
-    system_agent,
+    delete_frames, elevation, hide, human, legacy, link, passkey, reown, reown_linked, restrict,
+    reverse, system_agent,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -605,6 +608,32 @@ enum Command {
         /// How many claims the dry run lists row by row.
         #[arg(long, default_value_t = 3)]
         sample: usize,
+    },
+    /// Remove an explicit list of `frames` rows (test or probe frames), with
+    /// the rows that cascade from them, refusing any frame a real claim or
+    /// another row still depends on. Audited. Exit 3: at least one listed
+    /// frame was refused (nothing is written under `--apply` then).
+    DeleteFrames {
+        /// One frame UUID per line; only these frames are ever removed.
+        #[arg(long)]
+        ids_file: PathBuf,
+        /// One claim UUID per line: the test claims whose BBAs, frame
+        /// assignments and cached beliefs on the listed frames may be removed
+        /// with them. A frame-keyed row of any other claim refuses its frame.
+        #[arg(long)]
+        companion_claims_file: Option<PathBuf>,
+        /// Remove the frames. Needs `--confirm-delete <N>`.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the planned frame count, repeated back.
+        #[arg(long)]
+        confirm_delete: Option<usize>,
+        /// Recorded in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// `lock_timeout` for the write (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
     },
     /// Arm migration 128's admin-scope switch: from then on every mint strips
     /// the admin-only scopes and every path that hands scopes out refuses
@@ -1408,6 +1437,33 @@ async fn main_inner() -> anyhow::Result<i32> {
             };
             hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
             Ok(0)
+        }
+        Command::DeleteFrames {
+            ids_file,
+            companion_claims_file,
+            apply,
+            confirm_delete,
+            reason,
+            lock_timeout,
+        } => {
+            let frames = operator::read_ids_file(&ids_file)?;
+            if frames.is_empty() {
+                anyhow::bail!("no frame ids in {}", ids_file.display());
+            }
+            let companions = match &companion_claims_file {
+                Some(p) => operator::read_ids_file(p)?.into_iter().collect(),
+                None => std::collections::BTreeSet::new(),
+            };
+            let opts = delete_frames::Options {
+                frames,
+                companions,
+                apply,
+                confirm_delete,
+                reason,
+                lock_timeout,
+            };
+            let report = delete_frames::run(&mut conn, &opts, &mut stdout).await?;
+            Ok(if report.refused.is_empty() { 0 } else { 3 })
         }
         cmd @ (Command::ArmAdminScopes(_) | Command::DisarmAdminScopes(_)) => {
             let (arm, a) = match cmd {

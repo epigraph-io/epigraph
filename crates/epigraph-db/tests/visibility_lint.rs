@@ -1880,7 +1880,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim.rs",
         "migrate_superseded_edges",
         "WRITE. The two edge-migration statements, unchecked; called only after the caller \
-         established the privilege and the supersession.",
+         established the privilege and the supersession. Its one read classifies the pair \
+         (a shared step lineage) for the statements that follow.",
     ),
     (
         "claim.rs",
@@ -2388,6 +2389,11 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "evidence.rs",
+        "create_with_source_url",
+        "INSERT INTO `evidence`: the body of `evidence.rs::create` above, moved verbatim (the `query!` text is unchanged; only the `source_url` bind is now a parameter) so a caller can store a URL the evidence type has no slot for (MCP `empirical`, backlog 43ab8c73) and the combine step can key same-source re-observations on it (backlog 4c42c0bf). `create` delegates to it. Same argument as `create`: a write authorized by the table's `WITH CHECK` on the stamped connection, not an in-query predicate.",
+    ),
+    (
         "edge.rs",
         "create",
         "INSERT INTO `edges`. Same write-side argument as the two above. It moved because a          verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted ABOUT a row the same          submission just wrote: once that row's INSERT lives in a transaction, an edge emitted          on a different connection points at a row no other session can see yet. NOTE FOR A          CALLER PASSING A TRANSACTION, which the function's own doc also carries: a failed          statement aborts the whole PostgreSQL transaction, so `let _ = create(...)` does NOT          preserve best-effort semantics there -- it defers the failure to COMMIT as          `current transaction is aborted` with the cause gone.          `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort` wraps it in a SAVEPOINT          for exactly that reason. SCOPE: executor only; the SQL is unchanged.",
@@ -2396,7 +2402,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "community.rs",
         "add_member",
         "ONE statement, `SELECT public.epigraph_community_add_member($1, $2, $3)` (migration \
-         106, batch F). A WRITE, and its authorization is neither an in-query viewer predicate \
+         106, batch F; re-stated by 159). A WRITE, and its authorization is neither an in-query viewer predicate \
          nor the caller's `WITH CHECK`: the SECURITY DEFINER function takes the actor from the \
          CONNECTION's stamped `epigraph_principal_id()` (a differing `acting_agent` is DENIED \
          unless the session is `epigraph_bypass()`), locks the group's roster and `groups` row, \
@@ -2565,6 +2571,19 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "behavioral_execution.rs",
+        "behavioral_affinity_hierarchical",
+        "U033: scores hierarchical outcome reports. FROM `behavioral_executions` JOIN `workflows` \
+         and nothing else -- no `claims`, no `edges`. Neither relation carries a `visibility` or \
+         `owner_group_id` column, and row security is off on both (`residual_unstamped_writes.rs` \
+         records `workflows` as MEASURED `relrowsecurity = false`; `behavioral_executions` as \
+         not claim-derived with no `owner_group_id`). It projects only `(workflows.id, float8, \
+         bigint)` -- no content column. The `workflows` ids it can return are the same ones the \
+         viewer-less `search_hierarchical_by_embedding_scored` already returns to every caller of \
+         `find_workflow`. The flat (claim-rooted) twin, `behavioral_affinity_lineage`, keeps its \
+         Viewer and its markers; this is a separate fn precisely so the claim arm is unchanged.",
+    ),
+    (
+        "behavioral_execution.rs",
         "rolling_success_rate",
         "Aggregates `AVG(success::int)` over the newest `window` rows of `behavioral_executions` \
          for one workflow. The statement's FROM is `behavioral_executions` alone, and what it \
@@ -2675,6 +2694,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          further down its own pipeline — the same BBA is re-stored rather than combined twice — \
          which is why this half was convertible ahead of the pool-bound DS recompute it feeds. \
          SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "scoped_belief.rs",
+        "upsert",
+        "INSERT INTO `ds_combined_beliefs` (ON CONFLICT on `(frame_id, claim_id, scope_type, \
+         scope_id)` DO UPDATE); a WRITE with no FROM for a viewer splice. Its control is the \
+         table's FORCE'd RLS (079) against the connection's GUCs, tenancy inherited from the \
+         claim. Generic since U024 so REST `submit_evidence` can write its global scoped belief \
+         on the handler's `write_as` transaction: on the unstamped raw pool FORCE refused it \
+         without an error. Pinned by `epigraph-api/tests/frames_evidence_app_role.rs::\
+         the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role`. The other \
+         callers still pass their pool. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
         "mass_function.rs",

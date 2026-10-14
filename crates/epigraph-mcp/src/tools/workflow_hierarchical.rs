@@ -164,8 +164,9 @@ pub async fn report_hierarchical_outcome(
     let workflow_id =
         Uuid::parse_str(&params.workflow_id).map_err(|_| invalid_uuid("workflow_id"))?;
 
-    do_report_hierarchical_outcome_via_pool(
+    do_report_hierarchical_outcome_with_embedder(
         &server.pool,
+        server.embedder.as_ref(),
         workflow_id,
         params.success,
         &params.step_executions,
@@ -176,10 +177,99 @@ pub async fn report_hierarchical_outcome(
     .await
 }
 
+/// The `goal_text` the step rows fall back to when a report names no goal.
+const GOAL_PLACEHOLDER: &str = "hierarchical";
+
+/// The goal text a hierarchical outcome report should embed, if any: the
+/// trimmed `goal_text`, unless it is blank or the `"hierarchical"`
+/// placeholder. Embedding a placeholder would make every goal-less report
+/// "similar" to every other one in `behavioral_affinity_hierarchical`.
+fn report_goal_to_embed(goal_text: Option<&str>) -> Option<&str> {
+    goal_text
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != GOAL_PLACEHOLDER)
+}
+
+/// Embed the report's goal, best-effort, BEFORE the transaction (embedder
+/// latency stays out of the `workflows` row lock), then report. An embedder
+/// failure is a NULL `goal_embedding`, never a failed report: the same
+/// contract as the flat `report_workflow_outcome` path's "Embed the goal text
+/// for affinity matching". Shared by `report_hierarchical_outcome` and the
+/// hierarchical branch of `report_workflow_outcome`.
+#[allow(clippy::too_many_arguments)]
+pub async fn do_report_hierarchical_outcome_with_embedder(
+    pool: &sqlx::PgPool,
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
+    workflow_id: Uuid,
+    success: bool,
+    step_executions: &[HierarchicalStepExecution],
+    quality: Option<f64>,
+    goal_text: Option<&str>,
+    run_label: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    // Refuse a bad report before paying for an embedding.
+    validate_quality(quality)?;
+    let goal_embedding = match report_goal_to_embed(goal_text) {
+        Some(goal) => match embedder.generate(goal).await {
+            Ok(vec) => Some(vec),
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    do_report_hierarchical_outcome_via_pool(
+        pool,
+        workflow_id,
+        success,
+        step_executions,
+        quality,
+        goal_text,
+        run_label,
+        goal_embedding.as_deref(),
+    )
+    .await
+}
+
+/// Refuse a `quality` the `behavioral_executions` CHECK (migration 002:
+/// `quality IS NULL OR quality BETWEEN 0 AND 1`) would refuse anyway, before
+/// anything is written. NaN is refused too: it fails every comparison, so
+/// the CHECK would refuse it as well.
+fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
+    match quality {
+        Some(q) if !(q.is_finite() && (0.0..=1.0).contains(&q)) => Err(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Owned(format!(
+                "`quality` must be a finite number in [0, 1]; got {q}"
+            )),
+            data: None,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Pool-only outcome reporting for hierarchical workflows. Updates
 /// `workflows.metadata` rolling counters and writes per-step
 /// `behavioral_executions` rows with `step_claim_id` resolved from the
 /// workflow's `executes` edges (level=2 claims, in plan order).
+///
+/// ALL OR NOTHING (U033 / I229). The counter read, the counter write, the
+/// step lookup and every step row run on ONE transaction, and the counter
+/// read takes `FOR UPDATE` on the `workflows` row, so two concurrent reports
+/// serialize instead of both writing `use_count = n + 1`. A step row the
+/// database refuses fails the whole report and rolls the counters back; it
+/// used to be logged and skipped while the tool answered success.
+///
+/// The transaction is a plain `pool.begin()`, not an author-stamped one:
+/// neither `workflows` nor `behavioral_executions` has row security, so there
+/// is no `WITH CHECK` for a stamp to satisfy. It is named `unstamped_tx` so
+/// `tests/residual_unstamped_writes.rs` does not count it as stamped.
+///
+/// `goal_embedding` is computed by the caller BEFORE this runs (embedder
+/// latency stays out of the row lock) and is written on every step row, so
+/// the report feeds `behavioral_affinity_hierarchical`.
+#[allow(clippy::too_many_arguments)]
 pub async fn do_report_hierarchical_outcome_via_pool(
     pool: &sqlx::PgPool,
     workflow_id: Uuid,
@@ -188,12 +278,19 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     quality: Option<f64>,
     goal_text: Option<&str>,
     run_label: Option<&str>,
+    goal_embedding: Option<&[f32]>,
 ) -> Result<CallToolResult, McpError> {
-    // 1. Confirm hierarchical workflow exists.
+    // 0. Validate before touching the database.
+    validate_quality(quality)?;
+
+    let mut unstamped_tx = pool.begin().await.map_err(internal_error)?;
+
+    // 1. Confirm hierarchical workflow exists, and lock its row for the
+    //    read-modify-write of the counters below.
     let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *unstamped_tx)
             .await
             .map_err(internal_error)?;
     let mut metadata = match row {
@@ -243,7 +340,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(pool)
+        .execute(&mut *unstamped_tx)
         .await
         .map_err(internal_error)?;
 
@@ -271,15 +368,17 @@ pub async fn do_report_hierarchical_outcome_via_pool(
                   e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *unstamped_tx)
     .await
     .map_err(internal_error)?;
     let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
 
     // 5. Per-step behavioral_executions rows. Single timestamp groups them.
+    //    A refused row fails the report: `?` drops `unstamped_tx`, which rolls
+    //    back the counter UPDATE and every earlier step row.
     let report_ts = chrono::Utc::now();
-    let goal_text_owned = goal_text.unwrap_or("hierarchical").to_string();
-    let mut written = 0_usize;
+    let goal_text_owned = goal_text.unwrap_or(GOAL_PLACEHOLDER).to_string();
+    let goal_embedding_pgvec = goal_embedding.map(crate::embed::format_pgvector);
     for step_exec in step_executions {
         let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
         if step_claim_id.is_none() && !step_claim_ids.is_empty() {
@@ -308,12 +407,16 @@ pub async fn do_report_hierarchical_outcome_via_pool(
             step_claim_id,
             run_label: run_label.map(str::to_string),
         };
-        if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(pool, row, None).await {
-            tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
-            continue;
-        }
-        written += 1;
+        epigraph_db::BehavioralExecutionRepository::create(
+            &mut *unstamped_tx,
+            row,
+            goal_embedding_pgvec.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
     }
+
+    unstamped_tx.commit().await.map_err(internal_error)?;
 
     success_json(&serde_json::json!({
         "workflow_id": workflow_id,
@@ -322,7 +425,9 @@ pub async fn do_report_hierarchical_outcome_via_pool(
         "failure_count": failure_count,
         "avg_variance": avg_variance,
         "variance": variance,
-        "step_executions_written": written,
+        // All or nothing: every requested step row was written, or the call
+        // returned an error and none was.
+        "step_executions_written": step_executions.len(),
     }))
 }
 
@@ -412,6 +517,7 @@ mod tests {
             None,
             Some("smoke run"),
             None,
+            None,
         )
         .await
         .expect("outcome must succeed");
@@ -448,13 +554,390 @@ mod tests {
         );
     }
 
+    fn two_steps() -> Vec<HierarchicalStepExecution> {
+        vec![
+            HierarchicalStepExecution {
+                step_index: 0,
+                planned: "Step A".to_string(),
+                actual: "Step A done".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            },
+            HierarchicalStepExecution {
+                step_index: 1,
+                planned: "Step B".to_string(),
+                actual: "Step B done".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            },
+        ]
+    }
+
+    async fn ingest_fixture(pool: &sqlx::PgPool, canonical_name: &str) -> Uuid {
+        let viewer = epigraph_db::visibility::Viewer::resolve(pool, uuid::Uuid::nil())
+            .await
+            .expect("resolve viewer");
+        let ingest = do_ingest_workflow_via_pool(pool, &viewer, &extraction(canonical_name))
+            .await
+            .unwrap();
+        Uuid::parse_str(&ingest.workflow_id).unwrap()
+    }
+
+    async fn counters_and_rows(pool: &sqlx::PgPool, workflow_id: Uuid) -> (serde_json::Value, i64) {
+        let (metadata,): (serde_json::Value,) =
+            sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (metadata, rows)
+    }
+
+    /// U033 / I229: a step row the database refuses must fail the whole
+    /// report. Real DB failure injection (a BEFORE INSERT trigger that
+    /// refuses only the second step), not a mock. On the pre-fix code the
+    /// counters were written first in their own autocommit, step A landed,
+    /// step B was skipped with a warn, and the tool reported success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_outcome_is_all_or_nothing_when_a_step_row_fails(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-atomic").await;
+        sqlx::query(
+            "CREATE FUNCTION u033_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER u033_fail BEFORE INSERT ON behavioral_executions \
+             FOR EACH ROW EXECUTE FUNCTION u033_fail()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = do_report_hierarchical_outcome_via_pool(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some("atomicity run"),
+            None,
+            None,
+        )
+        .await;
+        let err = res.expect_err("a refused step row must fail the report");
+        // Tie the failure to the injected refusal of step B, so an unrelated
+        // early error (begin, lookup) cannot satisfy this test.
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR, "{err:?}");
+        assert!(
+            err.message.contains("u033 injected"),
+            "the error must carry the step-row refusal: {err:?}"
+        );
+
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "counters must not move when a step row fails: {metadata}"
+        );
+        assert_eq!(rows, 0, "step A must roll back with step B");
+    }
+
+    /// U033 / I229: `quality` is client-supplied and
+    /// `behavioral_executions.quality` carries CHECK (0..=1). An out-of-range
+    /// value must be refused as INVALID_PARAMS before anything is written. On
+    /// the pre-fix code the counters moved, the CHECK silently refused every
+    /// step row, and the tool reported success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_outcome_rejects_out_of_range_quality_without_side_effects(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-quality").await;
+        for bad in [1.5_f64, -0.1, f64::NAN] {
+            let err = do_report_hierarchical_outcome_via_pool(
+                &pool,
+                workflow_id,
+                true,
+                &two_steps(),
+                Some(bad),
+                Some("quality run"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("out-of-range quality must be refused");
+            assert_eq!(
+                err.code,
+                ErrorCode::INVALID_PARAMS,
+                "quality {bad}: {err:?}"
+            );
+        }
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        // Positive control: the boundary value 1.0 is accepted and lands.
+        do_report_hierarchical_outcome_via_pool(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            Some(1.0),
+            Some("quality run"),
+            None,
+            None,
+        )
+        .await
+        .expect("quality 1.0 is in range");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+    }
+
+    /// U033 / I229 regression guard (not a red test: an unlocked
+    /// read-modify-write can pass by luck). Concurrent reports must not lose
+    /// increments; `FOR UPDATE` on the `workflows` row serializes them.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_reports_do_not_lose_increments(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-concurrent").await;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                do_report_hierarchical_outcome_via_pool(
+                    &pool,
+                    workflow_id,
+                    i % 2 == 0,
+                    &two_steps(),
+                    None,
+                    Some("concurrency run"),
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message.to_string())
+            }));
+        }
+        for h in handles {
+            h.await.expect("join").expect("report must succeed");
+        }
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(8), "{metadata}");
+        assert_eq!(metadata["success_count"].as_i64(), Some(4), "{metadata}");
+        assert_eq!(metadata["failure_count"].as_i64(), Some(4), "{metadata}");
+        assert_eq!(rows, 16, "two step rows per report");
+    }
+
+    /// U033 / I229: the counter read takes `FOR UPDATE`, so a report that
+    /// arrives while another transaction holds the `workflows` row WAITS and
+    /// then increments the committed value. Deterministic, unlike
+    /// `concurrent_reports_do_not_lose_increments`: the holder writes
+    /// `use_count = 5` and keeps its lock until the report is observed blocked
+    /// in `pg_stat_activity`. Without the lock the report reads the stale row
+    /// (no `use_count`), blocks only at its UPDATE, and then overwrites the
+    /// holder's 5 with 1.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_report_waits_for_a_held_counter_row_and_increments_the_committed_value(
+        pool: sqlx::PgPool,
+    ) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-row-lock").await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{use_count}', '5') \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let report_pool = pool.clone();
+        let report = tokio::spawn(async move {
+            do_report_hierarchical_outcome_via_pool(
+                &report_pool,
+                workflow_id,
+                true,
+                &two_steps(),
+                None,
+                Some("row lock run"),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message.to_string())
+        });
+
+        // Sync point: the report is blocked on the held row. Bounded by
+        // iterations, not wall time.
+        let mut blocked = false;
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "the report never blocked on the held workflows row"
+        );
+
+        holder.commit().await.unwrap();
+        report.await.expect("join").expect("report must succeed");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(
+            metadata["use_count"].as_i64(),
+            Some(6),
+            "the report must increment the committed 5, not overwrite it: {metadata}"
+        );
+        assert_eq!(rows, 2);
+    }
+
+    fn mock_embedder() -> epigraph_embeddings::MockProvider {
+        epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536))
+    }
+
+    /// U033 / I229: only a real goal is embedded. The `"hierarchical"`
+    /// placeholder the step rows fall back to, and blank text, are not goals:
+    /// embedding them would make every such report "similar" to every other.
+    #[test]
+    fn report_goal_to_embed_skips_blank_and_placeholder() {
+        assert_eq!(report_goal_to_embed(None), None);
+        assert_eq!(report_goal_to_embed(Some("")), None);
+        assert_eq!(report_goal_to_embed(Some("   ")), None);
+        assert_eq!(report_goal_to_embed(Some("hierarchical")), None);
+        assert_eq!(
+            report_goal_to_embed(Some("  Deploy with zero downtime ")),
+            Some("Deploy with zero downtime")
+        );
+    }
+
+    /// U033 / I229 part (4): the report's goal is embedded once and written on
+    /// every step row, and those rows then reach `behavioral_affinity_hierarchical`
+    /// under the workflow's own id, which is what `find_workflow`'s
+    /// hierarchical leg looks up. Before U033 every row had a NULL
+    /// `goal_embedding`. The embedder is the deterministic `MockProvider` (the
+    /// OpenAI boundary); the database is real.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_reported_goal_is_embedded_on_every_step_row_and_reaches_affinity(
+        pool: sqlx::PgPool,
+    ) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-embedding").await;
+        let goal = "Validate hierarchical outcome reporting";
+        let embedder = mock_embedder();
+        do_report_hierarchical_outcome_with_embedder(
+            &pool,
+            &embedder,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some(goal),
+            None,
+        )
+        .await
+        .expect("report must succeed");
+
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(embedded, 2, "every step row carries the goal embedding");
+
+        let qvec = epigraph_embeddings::EmbeddingService::generate(&embedder, goal)
+            .await
+            .unwrap();
+        let hits = epigraph_db::BehavioralExecutionRepository::behavioral_affinity_hierarchical(
+            &pool,
+            &crate::embed::format_pgvector(&qvec),
+            0.5,
+            1,
+            20,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.iter()
+                .any(|(id, sim, n)| *id == workflow_id && *sim > 0.99 && *n == 1),
+            "the report must feed affinity under the workflow's id: {hits:?}"
+        );
+    }
+
+    /// Best-effort: an embedder failure leaves the rows un-embedded but never
+    /// fails the report (the flat `report_workflow_outcome` path's contract).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_embedder_failure_does_not_fail_the_report(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-embed-fail").await;
+        let failing = mock_embedder().with_failures(1.0);
+        do_report_hierarchical_outcome_with_embedder(
+            &pool,
+            &failing,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some("Validate hierarchical outcome reporting"),
+            None,
+        )
+        .await
+        .expect("an embedder failure must not fail the report");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(embedded, 0);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();
-        let err =
-            do_report_hierarchical_outcome_via_pool(&pool, bogus, true, &[], None, None, None)
-                .await
-                .expect_err("unknown workflow id must error");
+        let err = do_report_hierarchical_outcome_via_pool(
+            &pool,
+            bogus,
+            true,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown workflow id must error");
         assert!(err.message.contains("no hierarchical workflow"));
     }
 }

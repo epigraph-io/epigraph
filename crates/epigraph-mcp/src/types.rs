@@ -719,6 +719,12 @@ pub struct QueryClaimsByLabelParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
+    )]
+    #[serde(default)]
+    pub include_source_urls: bool,
 }
 
 // ── Workflows ──
@@ -834,7 +840,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching on both paths; for a workflows-table id an omitted goal is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -960,7 +966,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). A non-blank goal is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow; the 'hierarchical' default is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -1221,6 +1227,22 @@ pub struct ClaimResponse {
     /// authored value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief_score: Option<f64>,
+}
+
+/// A [`ClaimResponse`] with the claim's evidence URLs, for tools that surface
+/// them (`query_claims_by_label`'s `include_source_urls`).
+///
+/// A flattened wrapper rather than a `ClaimResponse` field so the other tools'
+/// claim literals are untouched, and so the serialized claim is byte-identical
+/// to a bare `ClaimResponse` when `source_urls` is `None`.
+#[derive(Debug, Serialize)]
+pub struct ClaimWithSources {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// URLs of the evidence attached to the claim, oldest first, deduplicated
+    /// (`EvidenceRepository::source_urls_by_claim_ids`). `None` = not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2053,7 +2075,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or the structural relations that move no belief: cites, and qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief). Use qualifies, not contradicts, for a caveat that limits where the target holds without saying it is false. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 

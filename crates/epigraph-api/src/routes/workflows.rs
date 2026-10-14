@@ -1189,7 +1189,11 @@ pub async fn find_workflow_hierarchical(
 ///
 /// Updates `workflows.metadata` counters (use_count, success_count, failure_count,
 /// avg_variance) and writes per-step `behavioral_executions` rows with
-/// `step_claim_id` populated for each step in `step_executions`.
+/// `step_claim_id` populated for each step in `step_executions`, all on one
+/// transaction: a refused step row is a 500 and nothing is written. An
+/// out-of-range `quality` is a 400. A non-blank `goal_text` is embedded
+/// (best-effort) onto every step row so the report feeds behavioral affinity.
+/// NOT idempotent: a retried report counts twice.
 ///
 /// Returns 404 if the id does not correspond to a `workflows` row. Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
@@ -1201,6 +1205,7 @@ pub async fn find_workflow_hierarchical(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "quality outside [0, 1]"),
         (status = 404),
         (status = 500),
     ),
@@ -1212,11 +1217,65 @@ pub async fn report_hierarchical_outcome(
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // 1. Confirm this is a hierarchical workflow root
+    // 0. Validate before touching the database (U033). `behavioral_executions`
+    //    carries CHECK (quality BETWEEN 0 AND 1); an out-of-range value used to
+    //    move the counters and then have every step row silently refused.
+    if let Some(q) = request.quality {
+        if !(q.is_finite() && (0.0..=1.0).contains(&q)) {
+            return Err(ApiError::BadRequest {
+                message: format!("`quality` must be a finite number in [0, 1]; got {q}"),
+            });
+        }
+    }
+
+    // Embed the goal for affinity matching, best-effort and BEFORE the
+    // transaction so embedder latency stays out of the row lock. Blank goals and
+    // the "hierarchical" placeholder are not goals. Mirrors the MCP tool's
+    // `do_report_hierarchical_outcome_with_embedder`.
+    let goal_text = request
+        .goal_text
+        .clone()
+        .unwrap_or_else(|| String::from("hierarchical"));
+    let goal_to_embed = request
+        .goal_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != "hierarchical");
+    let goal_embedding_pgvec = match (goal_to_embed, state.embedding_service()) {
+        (Some(goal), Some(embedder)) => match embedder.generate(goal).await {
+            Ok(vec) => Some(format!(
+                "[{}]",
+                vec.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // ONE transaction for the counters and every step row (U033): a refused row
+    // fails the report and rolls the counters back. A plain transaction, not an
+    // author-stamped one: neither `workflows` nor `behavioral_executions` has
+    // row security, so there is no `WITH CHECK` for a stamp to satisfy.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("transaction begin failed: {e}"),
+        })?;
+
+    // 1. Confirm this is a hierarchical workflow root, and lock its row so two
+    //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
     let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(&state.db_pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflows lookup failed: {e}"),
@@ -1276,7 +1335,7 @@ pub async fn report_hierarchical_outcome(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(&state.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("metadata update failed: {e}"),
@@ -1303,15 +1362,17 @@ pub async fn report_hierarchical_outcome(
                   e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
-    .fetch_all(&state.db_pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("step lookup failed: {e}"),
     })?;
     let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
 
-    // 5. Write per-step behavioral_executions rows. Capture timestamp once so
-    //    rows from a single outcome report group cleanly downstream.
+    // 5. Write per-step behavioral_executions rows on the same transaction; a
+    //    refused row returns 500 and rolls back everything above. Capture the
+    //    timestamp once so rows from a single outcome report group cleanly
+    //    downstream (and count as ONE report in `behavioral_affinity_hierarchical`).
     let report_ts = chrono::Utc::now();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {
@@ -1331,10 +1392,7 @@ pub async fn report_hierarchical_outcome(
             let row = epigraph_db::BehavioralExecutionRow {
                 id: Uuid::new_v4(),
                 workflow_id,
-                goal_text: request
-                    .goal_text
-                    .clone()
-                    .unwrap_or_else(|| String::from("hierarchical")),
+                goal_text: goal_text.clone(),
                 success,
                 step_beliefs,
                 tool_pattern: vec![step_exec.planned.clone()],
@@ -1345,13 +1403,21 @@ pub async fn report_hierarchical_outcome(
                 step_claim_id,
                 run_label: None,
             };
-            if let Err(e) =
-                epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
-            {
-                tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
-            }
+            epigraph_db::BehavioralExecutionRepository::create(
+                &mut *tx,
+                row,
+                goal_embedding_pgvec.as_deref(),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("behavioral_executions write failed: {e}"),
+            })?;
         }
     }
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("outcome commit failed: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": workflow_id,
@@ -1380,8 +1446,33 @@ pub struct EvolveStepResponse {
     pub step_lineage_id: uuid::Uuid,
     pub edge_type: String,
     pub edge_id: uuid::Uuid,
+    /// `supersedes` only: the Supersede admin cascade (migration 117) that
+    /// carries the retired step's edges onto the new one, as
+    /// `POST /api/v1/claims/:id/supersede` reports it (`applied`, `deferred`
+    /// or `failed`, with its `security_events` row id). Absent for `revises`,
+    /// which supersedes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub cascade: Option<epigraph_engine::admin_cascade::CascadeStatus>,
+    /// `supersedes` only: what the downstream belief cascade repaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub belief_cascade: Option<epigraph_engine::retraction_cascade::CascadeReport>,
 }
 
+/// POST /api/v1/workflows/steps/{id}/evolve - Evolve a versioned step.
+///
+/// Creates a new claim in the step's lineage that `supersedes` (linear
+/// refinement; the parent is retired) or `revises` (a concurrent branch; both
+/// stay current) the parent. With `supersedes` the new claim records
+/// `supersedes = parent` and the administrative Supersede cascade (as
+/// `POST /api/v1/claims/{id}/supersede` runs it) carries the retired step's
+/// edges onto it, reported in `cascade` (`applied`; `deferred` to the replay
+/// timer when no maintenance connection is configured; or `failed`, and
+/// replayable) and `belief_cascade`. The workflow's `executes` edge, its step
+/// chain (`step_follows` / `phase_follows`), the lineage's `revises` history
+/// and other agents' `asserts` / `AUTHORED` stay on the retired step.
+/// `revises` retires nothing and runs no cascade.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1452,15 +1543,61 @@ pub async fn evolve_step(
             message: other.to_string(),
         },
     })?;
+    // A `supersedes` step is a supersession (`claims.supersedes` names the
+    // parent), so it runs `versioning::supersede_claim`'s administrative
+    // cascade (backlog 8d3b4527): the act above moved no edge, and the retired
+    // step's decomposition, argument and support edges belong to other
+    // writers. `migrate_superseded_edges`' step-lineage rule leaves the
+    // workflow's `executes` and its `step_follows` / `phase_follows` chain,
+    // the lineage's `revises` history and agents' authorship edges on the
+    // retired step.
+    // The maintenance session is acquired BEFORE the act commits; without one
+    // the deferral commits with the act, under the caller's stamp.
+    let supersession = if result.edge_type == "supersedes" {
+        let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+            epigraph_engine::admin_cascade::CascadeCause::Supersede,
+            Some(agent),
+            Some(crate::routes::versioning::oauth_principal(&auth)),
+            parent_id,
+            Some(result.new_claim_id),
+        );
+        let (session, deferred) =
+            crate::routes::versioning::admin_session_or_deferral(&state, &mut tx, &trigger).await?;
+        Some((trigger, session, deferred))
+    } else {
+        None
+    };
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("evolve_step: commit failed: {e}"),
     })?;
+
+    // Best-effort, as in `supersede_claim`: the act has committed, so a
+    // cascade failure is reported in `cascade`, never as an error.
+    let (cascade, belief_cascade) = match supersession {
+        Some((trigger, Some(mut session), _)) => {
+            let (conn, admin_viewer) = session.split();
+            let (c, b) = epigraph_engine::admin_cascade::apply_after_supersede(
+                conn,
+                admin_viewer,
+                &viewer,
+                &trigger,
+                parent_id,
+                result.new_claim_id,
+            )
+            .await;
+            (Some(c), Some(b))
+        }
+        Some((_, None, status)) => (Some(status), Some(Default::default())),
+        None => (None, None),
+    };
 
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_type: result.edge_type,
         edge_id: result.edge_id,
+        cascade,
+        belief_cascade,
     }))
 }
 
@@ -3216,6 +3353,312 @@ mod tests {
                 .unwrap();
         assert_eq!(metadata["use_count"], 1);
         assert_eq!(metadata["success_count"], 1);
+    }
+
+    /// A bare hierarchical root plus the outcome route alone (U033 fixtures).
+    async fn outcome_fixture(pool: &PgPool, canonical_name: &str) -> (axum::Router, uuid::Uuid) {
+        use crate::state::{ApiConfig, AppState};
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome atomicity.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn post_outcome(
+        app: axum::Router,
+        workflow_id: uuid::Uuid,
+        body: serde_json::Value,
+    ) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                ))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    fn two_step_body(quality: Option<f64>) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "outcome_details": "ok",
+            "quality": quality,
+            "step_executions": [
+                {"step_index": 0, "planned": "Step A", "actual": "done", "deviated": false},
+                {"step_index": 1, "planned": "Step B", "actual": "done", "deviated": false}
+            ]
+        })
+    }
+
+    async fn outcome_counters_and_rows(
+        pool: &PgPool,
+        workflow_id: uuid::Uuid,
+    ) -> (serde_json::Value, i64) {
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (metadata, rows)
+    }
+
+    /// U033 / I229, HTTP twin: a step row the database refuses fails the
+    /// whole report (5xx) and moves nothing. Real DB failure injection: a
+    /// BEFORE INSERT trigger refusing only the second step. Before U033 the
+    /// counters autocommitted first, step A landed, step B was logged and
+    /// skipped, and the handler answered 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_is_all_or_nothing_when_a_step_row_fails(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-atomic-http").await;
+        sqlx::query(
+            "CREATE FUNCTION u033_http_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER u033_http_fail BEFORE INSERT ON behavioral_executions \
+             FOR EACH ROW EXECUTE FUNCTION u033_http_fail()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(two_step_body(None).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Tie the 500 to the injected refusal of step B, so an unrelated
+        // early error (begin, lookup) cannot satisfy this test.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("behavioral_executions write failed") && body.contains("u033 injected"),
+            "the error must carry the step-row refusal: {body}"
+        );
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "counters must not move when a step row fails: {metadata}"
+        );
+        assert_eq!(rows, 0, "step A must roll back with step B");
+    }
+
+    /// U033 / I229, HTTP twin: an out-of-range `quality` is a 400 with no side
+    /// effects, not a 200 whose step rows the CHECK silently refused.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_rejects_out_of_range_quality(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-quality-http").await;
+        for bad in [1.5_f64, -0.1] {
+            let status = post_outcome(app.clone(), workflow_id, two_step_body(Some(bad))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "quality {bad}");
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        // Positive control: the boundary value lands, both rows included.
+        let status = post_outcome(app, workflow_id, two_step_body(Some(1.0))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 1);
+        assert_eq!(rows, 2);
+    }
+
+    /// U033 / I229, HTTP twin of the MCP row-lock test: the route's counter
+    /// read takes `FOR UPDATE`, so a report arriving while another
+    /// transaction holds the `workflows` row waits and then increments the
+    /// committed value. The holder writes `use_count = 5` and keeps its lock
+    /// until the report is observed blocked in `pg_stat_activity`. Without
+    /// the lock the route reads the stale row, blocks only at its UPDATE, and
+    /// then overwrites the 5 with 1.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_waits_for_a_held_counter_row(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-row-lock-http").await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{use_count}', '5') \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let report = tokio::spawn(post_outcome(app, workflow_id, two_step_body(None)));
+
+        // Sync point: the report is blocked on the held row. Bounded by
+        // iterations, not wall time.
+        let mut blocked = false;
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "the report never blocked on the held workflows row"
+        );
+
+        holder.commit().await.unwrap();
+        assert_eq!(report.await.expect("join"), StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(
+            metadata["use_count"], 6,
+            "the report must increment the committed 5, not overwrite it: {metadata}"
+        );
+        assert_eq!(rows, 2);
+    }
+
+    /// `outcome_fixture` with a deterministic `MockProvider` as the embedding
+    /// service: the OpenAI boundary is the only thing stood in for.
+    async fn embedding_outcome_fixture(
+        pool: &PgPool,
+        canonical_name: &str,
+    ) -> (axum::Router, uuid::Uuid) {
+        use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome goal embedding.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let state = AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(
+            std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536))),
+        );
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn embedded_rows(pool: &PgPool, workflow_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// U033 / I229 part (4), HTTP twin: a real `goal_text` is embedded once
+    /// and written on every step row, so the report feeds
+    /// `behavioral_affinity_hierarchical`. Before U033 the route passed `None`
+    /// and every row's `goal_embedding` was NULL.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_embeds_a_real_goal_on_every_step_row(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-embed-http").await;
+        let mut body = two_step_body(None);
+        body["goal_text"] = serde_json::json!("Deploy with zero downtime");
+        let status = post_outcome(app, workflow_id, body).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(rows, 2, "both step rows land");
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            2,
+            "every step row carries the goal embedding"
+        );
+    }
+
+    /// The other half of the route's goal filter: the `"hierarchical"`
+    /// placeholder, blank text and an absent goal are not goals, and embedding
+    /// them would make every such report "similar" to every other. The
+    /// embedding service is configured, so a 0 here is the filter and nothing
+    /// else (the positive twin above shows the same fixture does embed).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_does_not_embed_a_placeholder_or_blank_goal(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-no-embed-http").await;
+        for goal in [
+            Some(serde_json::json!("hierarchical")),
+            Some(serde_json::json!("   ")),
+            None,
+        ] {
+            let mut body = two_step_body(None);
+            if let Some(g) = goal {
+                body["goal_text"] = g;
+            }
+            let status = post_outcome(app.clone(), workflow_id, body).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 3, "all three reports landed");
+        assert_eq!(rows, 6);
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            0,
+            "no placeholder, blank or absent goal is embedded"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

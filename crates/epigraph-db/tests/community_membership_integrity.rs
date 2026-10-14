@@ -202,6 +202,10 @@ async fn a_revoked_admin_readded_stays_a_reader(pool: PgPool) {
 
 /// F4b: a community whose members were all removed does NOT re-open to the
 /// first stranger — only a group that has never had a membership row does.
+///
+/// Since 159 only a maintenance session bootstraps a never-populated group, so
+/// the stranger's refusal no longer tells "emptied" from "never populated"; the
+/// maintenance session's refusal at the end is where that property lives now.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_emptied_group_does_not_rebootstrap(pool: PgPool) {
     let first = agent(&pool, "f4-first").await;
@@ -212,14 +216,14 @@ async fn an_emptied_group_does_not_rebootstrap(pool: PgPool) {
         .expect("create")
         .id;
     let first_p = perspective(&pool, first, "f4-first-p").await;
-    let out =
-        CommunityRepository::add_member(&as_actor(&pool, first).await, Some(first), c, first_p)
-            .await
-            .expect("bootstrap");
+    // The operator's maintenance session seeds the first member (159).
+    let out = CommunityRepository::add_member(&pool, Some(first), c, first_p)
+        .await
+        .expect("bootstrap");
     assert_eq!(
         out,
         MembershipOutcome::Applied,
-        "a never-populated group bootstraps"
+        "a never-populated group bootstraps from a maintenance session"
     );
     let out = CommunityRepository::remove_member(&pool, Some(first), c, first_p)
         .await
@@ -239,10 +243,81 @@ async fn an_emptied_group_does_not_rebootstrap(pool: PgPool) {
     assert_eq!(out, MembershipOutcome::DeniedNotAMember);
     assert_eq!(state(&pool, c, stranger).await, "none");
     assert!(!listed(&pool, c, stranger_p).await);
+
+    // Not even the maintenance session re-bootstraps it: the group has had a
+    // membership row, so a non-member is refused there too.
+    let out = CommunityRepository::add_member(&pool, Some(stranger), c, stranger_p)
+        .await
+        .expect("a refusal is an outcome, not an error");
+    assert_eq!(out, MembershipOutcome::DeniedNotAMember);
+    assert_eq!(state(&pool, c, stranger).await, "none");
+    assert!(!listed(&pool, c, stranger_p).await);
+}
+
+/// X14 (backlog `7cdea6f1`, the half PR #447 left): a community group that has
+/// NEVER had a membership row — exactly what migration 068 projected for every
+/// legacy community (no creator, no admin, no member) — must not admit its
+/// first joiner from the deployed role. Before 159 the first `groups:admin`
+/// principal to list a perspective there became a live member, and from then
+/// on could admit anyone: the group was claimed by whoever arrived first.
+///
+/// Bootstrapping such a group is an operator decision, so the maintenance
+/// session (`epigraph_bypass()`, here the superuser fixture pool) still may:
+/// that arm is what tells this rule apart from "refuse everything".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_memberless_legacy_group_does_not_admit_a_first_joiner(pool: PgPool) {
+    let stranger = agent(&pool, "x14-stranger").await;
+    let operator_pick = agent(&pool, "x14-operator-pick").await;
+    // No creator: memberless, exactly as migration 068 left projected groups.
+    let c = CommunityRepository::create(&pool, "x14-legacy", None, None, None, None)
+        .await
+        .expect("create")
+        .id;
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "fixture: the group must never have had a member");
+
+    let stranger_p = perspective(&pool, stranger, "x14-stranger-p").await;
+    let out = CommunityRepository::add_member(
+        &as_actor(&pool, stranger).await,
+        Some(stranger),
+        c,
+        stranger_p,
+    )
+    .await
+    .expect("a refusal is an outcome, not an error");
+    assert_eq!(
+        out,
+        MembershipOutcome::DeniedNotAMember,
+        "a non-admin must not become the first member of a memberless legacy group"
+    );
+    assert_eq!(state(&pool, c, stranger).await, "none");
+    assert!(
+        !listed(&pool, c, stranger_p).await,
+        "nothing may be written on the refusal"
+    );
+
+    // The operator's maintenance session can still bootstrap it.
+    let pick_p = perspective(&pool, operator_pick, "x14-operator-pick-p").await;
+    let out = CommunityRepository::add_member(&pool, Some(operator_pick), c, pick_p)
+        .await
+        .expect("maintenance bootstrap");
+    assert_eq!(out, MembershipOutcome::Applied);
+    assert_eq!(state(&pool, c, operator_pick).await, "reader(live)");
+    assert!(listed(&pool, c, pick_p).await);
 }
 
 /// F4b: two concurrent FIRST joiners of a never-populated group — exactly one
 /// bootstraps, the other is refused.
+///
+/// Since 159 only a maintenance session bootstraps, so the race that the
+/// `groups` row lock serialises is between two maintenance-session calls (the
+/// superuser fixture pool, one connection each); the deployed role's two first
+/// joiners are both refused (`concurrent_app_first_joiners_admit_none`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_first_joiners_admit_exactly_one(pool: PgPool) {
     let a = agent(&pool, "f4-race-a").await;
@@ -253,11 +328,10 @@ async fn concurrent_first_joiners_admit_exactly_one(pool: PgPool) {
         .id;
     let pa = perspective(&pool, a, "f4-race-a-p").await;
     let pb = perspective(&pool, b, "f4-race-b-p").await;
-    let (as_a, as_b) = (as_actor(&pool, a).await, as_actor(&pool, b).await);
 
     let (ra, rb) = tokio::join!(
-        CommunityRepository::add_member(&as_a, Some(a), c, pa),
-        CommunityRepository::add_member(&as_b, Some(b), c, pb),
+        CommunityRepository::add_member(&pool, Some(a), c, pa),
+        CommunityRepository::add_member(&pool, Some(b), c, pb),
     );
     let mut outcomes = vec![ra.expect("a"), rb.expect("b")];
     outcomes.sort_by_key(|o| format!("{o:?}"));
@@ -277,6 +351,50 @@ async fn concurrent_first_joiners_admit_exactly_one(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(live, 1);
+}
+
+/// X14: two concurrent first joiners of a never-populated group, both as the
+/// deployed role — neither is admitted, and nothing is written.
+///
+/// This pins that there is no race-window admission for an app session. It is
+/// NOT a lock-order property: under 159 an app session's refusal depends on
+/// neither the other caller nor the `groups` row lock, so each call alone is
+/// the sequential stranger arm of
+/// `a_memberless_legacy_group_does_not_admit_a_first_joiner`. The lock-order
+/// race lives on the maintenance path (`concurrent_first_joiners_admit_exactly_one`).
+/// On 106 one of the two callers here was admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_app_first_joiners_admit_none(pool: PgPool) {
+    let a = agent(&pool, "x14-race-a").await;
+    let b = agent(&pool, "x14-race-b").await;
+    let c = CommunityRepository::create(&pool, "x14-race", None, None, None, None)
+        .await
+        .expect("create")
+        .id;
+    let pa = perspective(&pool, a, "x14-race-a-p").await;
+    let pb = perspective(&pool, b, "x14-race-b-p").await;
+    let (as_a, as_b) = (as_actor(&pool, a).await, as_actor(&pool, b).await);
+
+    let (ra, rb) = tokio::join!(
+        CommunityRepository::add_member(&as_a, Some(a), c, pa),
+        CommunityRepository::add_member(&as_b, Some(b), c, pb),
+    );
+    assert_eq!(
+        (ra.expect("a"), rb.expect("b")),
+        (
+            MembershipOutcome::DeniedNotAMember,
+            MembershipOutcome::DeniedNotAMember
+        ),
+        "no app-session first joiner may bootstrap"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0);
+    assert!(!listed(&pool, c, pa).await && !listed(&pool, c, pb).await);
 }
 
 /// A member may still LEAVE (its own perspective), as the deployed role: the

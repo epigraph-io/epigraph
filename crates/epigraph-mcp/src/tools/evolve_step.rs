@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
+use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeStatus, CascadeTrigger};
+use epigraph_engine::retraction_cascade::CascadeReport;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EvolveStepParams {
@@ -48,6 +50,15 @@ pub struct EvolveStepResponse {
     pub claim_id: Uuid,
     pub step_lineage_id: Uuid,
     pub edge_id: Uuid,
+    /// `supersedes` only: the Supersede admin cascade that carried the retired
+    /// step's edges onto this one (applied, or deferred for the replay), as
+    /// `supersede_claim` reports it. Absent for `revises`, which supersedes
+    /// nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<CascadeStatus>,
+    /// `supersedes` only: the belief re-derivation that cascade ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_cascade: Option<CascadeReport>,
 }
 
 pub async fn evolve_step(
@@ -101,7 +112,7 @@ pub async fn evolve_step(
     // form remains only for a server built without a ScopedPool (test
     // fixtures); on such a process's application role the database refuses the
     // write once armed, so it cannot fail open.
-    let result = if server.scoped.is_some() {
+    let (result, cascade, belief_cascade) = if server.scoped.is_some() {
         let mut tx =
             crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
@@ -115,10 +126,53 @@ pub async fn evolve_step(
         )
         .await
         .map_err(crate::errors::db_caller_error)?;
-        tx.commit().await.map_err(internal_error)?;
-        r
+        if params.edge_type != "supersedes" {
+            tx.commit().await.map_err(internal_error)?;
+            (r, None, None)
+        } else {
+            // A `supersedes` step is a supersession (`claims.supersedes` names
+            // the parent), so it runs `supersede_claim`'s cascade: the act
+            // above moved no edge, and the retired step's decomposition,
+            // argument and support edges belong to other writers, which only
+            // the administrative cascade re-points (backlog 8d3b4527). The
+            // step-lineage rule in `migrate_superseded_edges` leaves the
+            // workflow's `executes` and its `step_follows` / `phase_follows`
+            // chain, the lineage's `revises` history and agents' authorship
+            // edges on the retired step. The maintenance session is acquired
+            // before the act commits; without one the deferral commits with
+            // the act, attributed to the principal this transaction is
+            // stamped with.
+            let trigger = CascadeTrigger::new(
+                CascadeCause::Supersede,
+                Some(agent_id),
+                crate::tools::supersede::oauth_principal(auth),
+                parent_uuid,
+                Some(r.new_claim_id),
+            );
+            let (mut session, deferred) =
+                crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &trigger)
+                    .await?;
+            tx.commit().await.map_err(internal_error)?;
+            // Best-effort, as in `supersede_claim`: the act has committed.
+            let (cascade, belief) = match (session.as_mut(), deferred) {
+                (Some(session), _) => {
+                    let (conn, v) = session.split();
+                    admin_cascade::apply_after_supersede(
+                        conn,
+                        v,
+                        viewer,
+                        &trigger,
+                        parent_uuid,
+                        r.new_claim_id,
+                    )
+                    .await
+                }
+                (None, status) => (status, CascadeReport::default()),
+            };
+            (r, Some(cascade), Some(belief))
+        }
     } else {
-        epigraph_db::ClaimRepository::evolve_step(
+        let r = epigraph_db::ClaimRepository::evolve_step(
             &server.pool,
             parent,
             &params.content,
@@ -128,13 +182,18 @@ pub async fn evolve_step(
             agent_id,
         )
         .await
-        .map_err(crate::errors::db_caller_error)?
+        .map_err(crate::errors::db_caller_error)?;
+        // No ScopedPool (test fixtures): the act only, as before; there is no
+        // maintenance session to run the cascade on.
+        (r, None, None)
     };
 
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_id: result.edge_id,
+        cascade,
+        belief_cascade,
     })
 }
 

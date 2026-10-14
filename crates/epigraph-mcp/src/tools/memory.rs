@@ -261,6 +261,9 @@ pub async fn memorize(
                     // resolves the tag to its canonical key, `testimonial`, whose
                     // calibrated weight is the 0.6 stored above (bc06ec6f).
                     evidence_type: Some("testimony"),
+                    // memorize takes no source_url, so its evidence row can
+                    // carry no source identity; the BBA stays unkeyed.
+                    evidence_id: None,
                 },
                 /* persist_truth_from_pignistic */ false,
                 "memorize",

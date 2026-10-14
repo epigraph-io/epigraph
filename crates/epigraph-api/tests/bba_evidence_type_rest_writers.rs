@@ -1,12 +1,15 @@
 //! `POST /api/v1/frames/:id/evidence` must store the canonical evidence type
-//! it is given, and never type the combined system row (backlog bc06ec6f).
+//! it is given (backlog bc06ec6f), and store nothing beside the inputs.
 //!
 //! The caller's `evidence_type` is resolved through `calibration.toml
-//! [evidence_type_aliases]`. The combined row the handler caches beside the
-//! inputs (`source_agent_id IS NULL`) aggregates every input, so it has no
-//! single type and stays NULL. An input sent without `evidence_type` stays
-//! NULL too: its masses are already discounted by `reliability`, and a type
-//! the writer invented would discount them again.
+//! [evidence_type_aliases]`. An input sent without `evidence_type` stays
+//! NULL: its masses are already discounted by `reliability`, and a type the
+//! writer invented would discount them again.
+//!
+//! The handler used to cache a NULL-agent "combined" row beside the inputs,
+//! which this file pinned as untyped. Since U024 (backlogs 2bffdfdc,
+//! 82dcff9d) the handler delegates to the shared recompute and stores no
+//! derived row at all, so the pins below say that instead.
 #![cfg(feature = "db")]
 
 mod common;
@@ -120,7 +123,7 @@ async fn post_evidence(addr: &SocketAddr, frame: Uuid, claim: Uuid, agent: Uuid,
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_untyped(
+async fn submit_evidence_stores_the_canonical_type_and_no_combined_row(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -168,25 +171,22 @@ async fn submit_evidence_stores_the_canonical_type_and_leaves_the_combined_row_u
         "an input sent with no `evidence_type` must stay untyped: {rows:?}"
     );
 
-    // Non-vacuity: the combined system row exists, and it carries no type.
-    let combined: Vec<_> = rows
-        .iter()
-        .filter(|(agent, _, _)| agent.is_none())
-        .collect();
-    assert_eq!(combined.len(), 1, "one combined system row: {rows:?}");
+    // Exactly the three inputs: no NULL-agent combined row beside them.
     assert_eq!(
-        combined[0].2, None,
-        "the combined row must stay untyped: {rows:?}"
+        rows.len(),
+        3,
+        "one BBA per input, nothing derived: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(agent, _, _)| agent.is_some()),
+        "no combined system row may be stored: {rows:?}"
     );
 }
 
-/// A single input is not folded (`reports.last()` is `None`), yet the handler
-/// still caches a copy as a combined row: no agent, no perspective, and the
-/// `cached_unfolded` label (backlog b5cb3efb; it was NULL, which no
-/// combine-input reader could tell from an agent-less input). It must stay
-/// untyped like every other combined row.
+/// A single input is stored typed, and it is the only row: the handler used
+/// to fold it into a NULL-agent, NULL-method combined row beside it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_single_input_fold_leaves_an_untyped_cached_unfolded_combined_row(
+async fn a_single_input_is_stored_typed_and_alone(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -218,14 +218,5 @@ async fn a_single_input_fold_leaves_an_untyped_cached_unfolded_combined_row(
         )),
         "the input is stored typed: {rows:?}"
     );
-    let combined: Vec<_> = rows
-        .iter()
-        .filter(|(agent, _, _)| agent.is_none())
-        .collect();
-    assert_eq!(combined.len(), 1, "one combined system row: {rows:?}");
-    assert_eq!(
-        (combined[0].1.as_deref(), combined[0].2.as_deref()),
-        (Some(epigraph_db::CACHED_COMBINATION_UNFOLDED), None),
-        "a single-input combined row is labelled cached_unfolded and has no type: {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "the input is the only row: {rows:?}");
 }

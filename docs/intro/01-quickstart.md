@@ -7,8 +7,8 @@ This guide takes you from a clean PostgreSQL + Rust toolchain to a first success
 - **Rust** ≥ 1.75 (`rustup show` to check)
 - **PostgreSQL** 16+ with the `pgvector` extension installed and available (`SELECT extname FROM pg_extension;` should be runnable as a superuser)
 - **Claude Code** installed and authenticated — this is the MCP client we'll use to drive EpiGraph
-- **OpenAI API key** — exported as `OPENAI_API_KEY`. **Mandatory** for the walkthroughs: `recall_with_context` embeds the query string on every call (see `crates/epigraph-mcp/src/tools/recall.rs`) and fails without a configured embedding provider, even against an empty corpus.
-- **~$5 of OpenAI credit** for the embedding calls in the walkthroughs
+- **OpenAI API key** — exported as `OPENAI_API_KEY`. **Mandatory** for this guide's first MCP call: `recall_with_context` embeds the query string on every call (see `crates/epigraph-mcp/src/tools/recall.rs`) and fails without a configured embedding provider, even against an empty corpus.
+- **~$5 of OpenAI credit** for the embedding calls that `recall_with_context` and the other embedding-backed MCP tools make
 
 Time budget: ~10 minutes to first MCP call if your prereqs are in place; ~30 minutes including a fresh Postgres/pgvector install.
 

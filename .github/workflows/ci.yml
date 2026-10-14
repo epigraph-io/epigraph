@@ -306,3 +306,53 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+
+  # Secret scan, a HARD gate (no continue-on-error). epigraph is a public repo,
+  # so a credential committed on a PR branch is published the moment it is
+  # pushed; this job catches it before it reaches main. It scans ONLY the
+  # commits the PR (or the push to main) adds — .github/scripts/gitleaks-scan.sh
+  # — so history that predates the job can never fail it; the full-history
+  # audit is an operator step documented at the top of .gitleaks.toml.
+  # Findings are printed redacted (CI logs of a public repo are public).
+  #
+  # The gitleaks binary is a release tarball pinned by version AND sha256
+  # rather than gitleaks/gitleaks-action: the action requires a
+  # GITLEAKS_LICENSE secret for repositories owned by an organization, and the
+  # checksum pin gives the same tamper-resistance as the SHA-pinned actions
+  # above. The self-test step proves the config still has the properties the
+  # scan relies on (range-only, value-scoped fixture allowlist, default rules
+  # active) before the scan's verdict is trusted.
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    # Install + self-test + scan take well under a minute.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The PR's base commit must be present for a <base>..<head> range.
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+      - name: Self-test the scan config
+        run: .github/scripts/test-gitleaks-scan.sh
+      - name: Scan the commits this change adds
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. On a push, `before` is all zeros when the push created
+          # the branch; the script then scans the head commit alone.
+          SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: .github/scripts/gitleaks-scan.sh "$SCAN_BASE" "$SCAN_HEAD"
