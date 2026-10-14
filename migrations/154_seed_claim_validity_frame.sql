@@ -39,9 +39,15 @@
 --       differs is never corrected here: correcting it would silently rewrite
 --       the axis every stored BBA on it was written against.
 --
--- ROW SECURITY. `frames` is under 077/079's policies. Apply as a role that
--- bypasses row security (the superuser owner, as every migration is applied).
--- A role that does not fails closed: (c) cannot see the row and RAISEs.
+-- ROW SECURITY. `frames` is under 077's registry policy (FORCE'd by 079). Its
+-- USING admits every `visibility = 'public'` row to every role, and its WITH
+-- CHECK admits `('public', world)`, so (b) and (c) work under ANY role: the
+-- canonical row is public. What a role that does not bypass row security
+-- loses is (a): it cannot see a NON-public squatter, so the INSERT then fails
+-- with a bare 23505 on `frames_name_key` instead of (a)'s named error. That
+-- still fails closed, but apply as a role that bypasses row security (the
+-- superuser owner, as every migration is applied) so the error names the
+-- squatter.
 --
 -- UNDO: `DELETE FROM frames WHERE id = '8a594393-c343-4f1a-b942-5c5b7862f792'`
 -- on a database where THIS file inserted it and nothing references it yet.

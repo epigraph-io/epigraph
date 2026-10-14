@@ -1331,7 +1331,12 @@ restart.
   the first caller to name a frame `claim_validity` (`frames.name` is UNIQUE)
   refuse every later assess or receive its evidence. Adds no object, so no
   register edit. Sets `lock_timeout = '3s'`. Apply as a role that bypasses
-  row security (the verify fails closed otherwise). Behaviour in
+  row security: under any other role the seed and verify of the public
+  canonical row still work (077's registry policy admits public rows and
+  `('public', world)`), but a NON-public name squatter is invisible to the
+  pre-check and surfaces only as a bare 23505 from the INSERT. A non-prod
+  database that already holds `claim_validity` under ANOTHER id RAISEs here
+  by design and needs that frame resolved by hand first. Behaviour in
   `epigraph-db/tests/claim_validity_frame_seed.rs` and
   `epigraph-api/tests/assess_canonical_frame.rs`. Undo: delete the row only on
   a database where this file inserted it and nothing references it; never on
