@@ -980,6 +980,41 @@ mod diverse_fixture {
         vec_to_pgvec(&v)
     }
 
+    /// `cluster_pgvec_with_drift(bucket, value, drift_bucket, drift)` plus a
+    /// constant `query_share` in bucket 0 (the query bucket in these tests).
+    ///
+    /// For a "far" cluster that must stay further from the query than the
+    /// near rows, yet NOT be exactly orthogonal to them. When two clusters are
+    /// exactly orthogonal, every cross-cluster distance ties at cosine 1.0, and
+    /// the HNSW index built on insert can leave the near cluster unreachable
+    /// from the graph's entry point. An index scan then returns only far rows,
+    /// even at `hnsw.ef_search = 1000` with iterative scan. The shared bucket-0
+    /// component removes the tie and keeps the graph connected to the query
+    /// region.
+    pub fn cluster_pgvec_with_drift_and_query_share(
+        bucket: usize,
+        value: f32,
+        drift_bucket: usize,
+        drift: f32,
+        query_share: f32,
+    ) -> String {
+        let mut v = vec![0.0f32; DIM];
+        let start = bucket * STRIDE;
+        let end = start + STRIDE;
+        for slot in v.iter_mut().take(end).skip(start) {
+            *slot = value;
+        }
+        let dstart = drift_bucket * STRIDE;
+        let dend = dstart + STRIDE;
+        for slot in v.iter_mut().take(dend).skip(dstart) {
+            *slot = drift;
+        }
+        for slot in v.iter_mut().take(STRIDE) {
+            *slot = query_share;
+        }
+        vec_to_pgvec(&v)
+    }
+
     /// Pgvector that overlays mass in bucket 0 (the query bucket in
     /// these tests) AND in `far_bucket`. Used so theme_b candidates
     /// have meaningful similarity to the query (~0.7) — enough that
@@ -2790,7 +2825,7 @@ async fn diverse_mode_falls_back_when_tiny_theme_set_does_not_cover_query(pool: 
 }
 
 /// The guard must be PER-QUERY, not corpus-wide: here most of the corpus is
-/// unthemed (a large orthogonal cluster), but the query's own neighbourhood is
+/// unthemed (a large cluster far from the query), but the query's own neighbourhood is
 /// almost entirely themed. Diverse selection must still run — observable
 /// because diverse candidates come only from themes, so the single UNTHEMED
 /// paragraph that is the query's nearest neighbour must NOT be returned (flat
@@ -2839,16 +2874,32 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
     }
 
     // A large unthemed cluster far from the query, so corpus-wide coverage is
-    // well under half. A corpus-ratio guard would (wrongly) disable diverse
-    // mode here; a per-query guard must not.
+    // well under half (60/211). A corpus-ratio guard would (wrongly) disable
+    // diverse mode here; a per-query guard must not.
+    //
+    // The far cluster is deliberately NOT orthogonal to the query region: each
+    // far row carries a 0.5 share in the query's bucket 0. Its cosine to the
+    // query is at most 0.5/sqrt(1.25) ≈ 0.447, below the least similar themed
+    // row's 1/sqrt(1 + 0.64²) ≈ 0.842, so the themed rows stay the nearest
+    // ones. With exactly orthogonal clusters, about 3% of freshly built HNSW
+    // graphs left the near cluster unreachable from the entry point. The
+    // guard's probe then saw 40 far rows (0 covered), the request fell back
+    // to flat retrieval, and that index scan also returned far rows.
     for i in 0..150 {
-        let v = diverse_fixture::cluster_pgvec_with_drift(6, 1.0, 7, (i as f32) * 0.01);
+        let v = diverse_fixture::cluster_pgvec_with_drift_and_query_share(
+            6,
+            1.0,
+            7,
+            (i as f32) * 0.01,
+            0.5,
+        );
         diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
     }
     // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
     // planner statistics, so the guard's probe and the candidate query run
-    // under the plans a populated database would choose. The outcome does not
-    // depend on which plan is picked: the themed rows are the nearest ones.
+    // under the plans a populated database would choose. An index scan is
+    // approximate, so the result is plan-independent only because the far
+    // cluster above stays connected to the query region in the HNSW graph.
     sqlx::query("VACUUM ANALYZE claims")
         .execute(&pool)
         .await
