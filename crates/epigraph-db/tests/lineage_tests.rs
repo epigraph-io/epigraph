@@ -923,8 +923,13 @@ async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
 /// (`decomposition_priority.rs`: "verb edges are stored upper-case"), and the
 /// unfiltered walk followed an upper-case `SUPPORTS` edge.
 /// **Reasoning**: Moving from "every edge" to a relationship filter must not
-/// silently drop a derivation edge because of its spelling. Green before and
-/// after U042; a regression guard on the filter, not the red test.
+/// silently drop a derivation edge because of its spelling. The `SUPPORTS` /
+/// `Elaborates` half is green before and after U042, a regression guard on
+/// the filter. The upper-case `SUPERSEDES` half (accepted by the
+/// `routes/edges.rs` allowlist as an alias of `supersedes`) pins both the
+/// SQL's `lower()` on the outgoing branch and the parent map's lower-cased
+/// orientation: a case-sensitive orientation would make R the parent of its
+/// own predecessor.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_lineage_relationship_match_is_case_insensitive(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -934,6 +939,8 @@ async fn test_lineage_relationship_match_is_case_insensitive(pool: PgPool) {
 
     create_claim_edge(&pool, upper, root, "SUPPORTS").await;
     create_claim_edge(&pool, grandparent, upper, "Elaborates").await;
+    let predecessor = create_test_claim(&pool, "Superseded by the root", 0.6).await;
+    create_claim_edge(&pool, root, predecessor, "SUPERSEDES").await;
 
     let lineage = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
         .await
@@ -947,7 +954,21 @@ async fn test_lineage_relationship_match_is_case_insensitive(pool: PgPool) {
         lineage.claims.contains_key(&grandparent),
         "a mixed-case Elaborates edge is still a derivation edge"
     );
-    assert_eq!(lineage.claims[&root].parent_ids, vec![upper]);
+    assert!(
+        lineage.claims.contains_key(&predecessor),
+        "an upper-case SUPERSEDES edge still reaches the predecessor"
+    );
+    let root_parents: std::collections::HashSet<Uuid> =
+        lineage.claims[&root].parent_ids.iter().copied().collect();
+    assert_eq!(
+        root_parents,
+        [upper, predecessor].into_iter().collect(),
+        "an upper-case SUPERSEDES edge names its TARGET as the root's parent"
+    );
+    assert!(
+        lineage.claims[&predecessor].parent_ids.is_empty(),
+        "the root is not the parent of the predecessor it superseded"
+    );
     assert_eq!(lineage.claims[&upper].parent_ids, vec![grandparent]);
 }
 
