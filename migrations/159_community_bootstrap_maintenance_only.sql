@@ -34,6 +34,15 @@
 -- from 106, so the operator can still seed the first member of a legacy
 -- community, and the `groups` row lock still serialises two first joiners.
 --
+-- The same condition closes one more case, which 106 left open. A community
+-- with NO projected group of kind 'community' (068's projection skipped it
+-- because a group of another kind already held the id, or the community row
+-- was written without its projection) has no membership row under its id, so
+-- under 106 any actor's call answered 'applied' and wrote a bare
+-- `community_members` row. Under 159 an app session that is not a live member
+-- of a group with that id gets 'denied' there too, with nothing written. A
+-- maintenance session still gets 106's 'applied'.
+--
 -- The alternative, naming the platform custodian as each legacy group's admin
 -- here, was not taken: the D1 ruling makes administration a timestamped role
 -- assignment, never a standing account, so a migration has no agent it may
@@ -125,8 +134,10 @@ BEGIN
     ON CONFLICT (community_id, perspective_id) DO NOTHING;
 
     -- The projection. No group of kind 'community' with this id, or a
-    -- perspective with no owner: no membership, exactly as before (068's
-    -- behaviour, a silent no-op by necessity).
+    -- perspective with no owner: no membership (068's behaviour, a silent
+    -- no-op by necessity). Since 159 an app session reaches this line for a
+    -- missing group only if it is a live member of a group with this id; a
+    -- maintenance session reaches it as before.
     IF v_group IS NULL OR v_owner IS NULL THEN
         RETURN 'applied';
     END IF;

@@ -1328,7 +1328,9 @@ restart.
   `groups:admin` principal to list a perspective into such a group became its
   live member and could then admit anyone. Every outcome for a maintenance
   session, and every other rule of 106 (actor, locks, `'denied_readmit'`,
-  projection), is unchanged. Pinned as `epigraph_app` by
+  projection), is unchanged. The same condition also closes a community with
+  no projected group of kind `'community'` to app sessions: under 106 it
+  accepted a bare `community_members` row from any actor. Pinned as `epigraph_app` by
   `epigraph-db/tests/community_membership_integrity.rs`. Undo: re-run 106's
   `CREATE OR REPLACE FUNCTION public.epigraph_community_add_member` statement
   (re-opens the hole); it creates and changes no rows. **Deploy order:** none
