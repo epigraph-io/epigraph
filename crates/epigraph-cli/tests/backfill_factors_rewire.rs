@@ -207,6 +207,13 @@ async fn seed_world(pool: &PgPool, tag: &str) -> World {
 #[sqlx::test(migrations = "../../migrations")]
 async fn rewire_selects_already_wired_edge_factor_and_keeps_one_row_per_edge(pool: PgPool) {
     let w = seed_world(&pool, "a").await;
+    // A sentinel cache, so the rewire's recompute of the target is visible.
+    sqlx::query("UPDATE claims SET belief = $2, pignistic_prob = $2 WHERE id = $1")
+        .bind(w.target)
+        .bind(SENTINEL)
+        .execute(&pool)
+        .await
+        .expect("sentinel target cache");
     let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
 
     // Why the old remedy is a no-op: the edge phase never selects a target
@@ -284,6 +291,23 @@ async fn rewire_selects_already_wired_edge_factor_and_keeps_one_row_per_edge(poo
     assert_close(mass(masses, "0,1"), 0.32, "closed-world Θ mass");
     assert_close(mass(masses, "0"), 0.16, "TRUE mass");
     assert_close(mass(masses, "1"), 0.04, "FALSE mass");
+
+    // The target was recomputed over its evidence plus the REWRITTEN BBA.
+    let cached = cached_belief(&pool, w.target)
+        .await
+        .expect("T stays backed");
+    assert!(
+        (cached - SENTINEL).abs() > 1e-6,
+        "T was not recomputed: {cached}"
+    );
+    let mut conn = pool.acquire().await.expect("conn");
+    let fresh = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut conn, &viewer, w.target, w.frame,
+    )
+    .await
+    .expect("preview")
+    .expect("T has BBAs");
+    assert_close(cached, fresh.belief, "T's cache matches its current BBAs");
 
     // The target's own evidence BBA is untouched.
     assert_eq!(claim_rows(&pool, w.target).await, 2);
