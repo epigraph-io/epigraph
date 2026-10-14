@@ -906,7 +906,7 @@ fn readability_violations(
 }
 
 /// The operator process and connection, for an audit row.
-async fn operator_details(conn: &mut PgConnection) -> anyhow::Result<Value> {
+pub(super) async fn operator_details(conn: &mut PgConnection) -> anyhow::Result<Value> {
     let session_user: String = sqlx::query_scalar("SELECT session_user::text")
         .fetch_one(&mut *conn)
         .await?;

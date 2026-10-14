@@ -1318,6 +1318,29 @@ restart.
   current successors and confirm the world group has no live writer
   (`docs/deploy.md`, migration 153, steps 3 and 4).
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **158**: public `maintenance_delete_frames` (drain U048, backlog 34b3175c) —
+  `GRANT DELETE ON public.frames TO epigraph_maintenance`, role-guarded like
+  117 section 4, and nothing else. 070 gives the maintenance role no DELETE;
+  `epigraph-operator delete-frames` removes listed test/probe frames on a
+  NOSUPERUSER maintenance login and failed there with "permission denied for
+  table frames". The four cascade tables are emptied by their FKs' ON DELETE
+  CASCADE, which runs as the child table's owner, so 158 grants no DELETE on
+  them (the role already holds DELETE on `mass_functions` from 115, and none
+  on `claim_frames`, `ds_combined_beliefs` or `ds_bayesian_divergence`); the
+  tool's plan, `FOR UPDATE` re-plan and `pg_stat_xact_user_tables` census
+  account for every cascaded row. **Effective reach:** any session acting as
+  `epigraph_maintenance` (not only `delete-frames`) can now delete a frame,
+  and through the cascade that also deletes the frame's rows in those three
+  tables. A bare `DELETE FROM frames` on the maintenance DSN neither refuses
+  nor audits; only the tool does. Row security is unchanged (115's
+  `frames_delete_owner` admits a maintenance session through
+  `epigraph_bypass()`). Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-cli/tests/operator_delete_frames.rs`. Undo in the file's header.
+  Slot from the drain register (155-157 reserved); checked before claiming: no
+  migration on main and no open PR branch carries a `158`. **Deploy order:**
+  none against other migrations or the binaries (a grant; an older binary has
+  no `delete-frames`). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
