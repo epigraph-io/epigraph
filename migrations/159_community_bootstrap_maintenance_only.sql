@@ -64,6 +64,13 @@
 -- UNDO: re-run 106's `CREATE OR REPLACE FUNCTION
 -- public.epigraph_community_add_member` statement (it re-opens the bootstrap
 -- to every actor). No rows are created or changed by this file.
+--
+-- RESTATING THIS FUNCTION LATER: start from THIS body, not 106's, and keep the
+-- `OR NOT public.epigraph_bypass()` term. A copy of 106's body silently
+-- re-opens the bootstrap to every actor. A fresh database applies files in
+-- numeric order, so no test would notice. A deployed database can apply a
+-- lower-numbered file after this one (missing versions are applied late),
+-- and the older copy would then win.
 -- ===================================================================
 
 SET LOCAL lock_timeout = '3s';

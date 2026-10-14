@@ -1330,7 +1330,11 @@ restart.
   session, and every other rule of 106 (actor, locks, `'denied_readmit'`,
   projection), is unchanged. The same condition also closes a community with
   no projected group of kind `'community'` to app sessions: under 106 it
-  accepted a bare `community_members` row from any actor. Pinned as `epigraph_app` by
+  accepted a bare `community_members` row from any actor. A later migration
+  that re-states this function must start from 159's body and keep its
+  `OR NOT public.epigraph_bypass()` term. A copy of 106's body re-opens the
+  bootstrap, and an out-of-order apply on a deployed database would let it
+  win. Pinned as `epigraph_app` by
   `epigraph-db/tests/community_membership_integrity.rs`. Undo: re-run 106's
   `CREATE OR REPLACE FUNCTION public.epigraph_community_add_member` statement
   (re-opens the hole); it creates and changes no rows. **Deploy order:** none
