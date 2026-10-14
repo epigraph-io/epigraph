@@ -1937,6 +1937,14 @@ async fn get_with_token(
 ///   told apart by a caller without the scope;
 /// - a `claims:read` token is admitted on the same claim (the route is not
 ///   simply locked).
+///
+/// The two refusals are compared byte for byte, not only by status, matching
+/// the 404-parity standard in `tenant_isolation_http.rs`.
+///
+/// The handler's own 401 arm (no `AuthContext`) is deliberately untested: both
+/// registrations of this path sit behind `bearer_auth_middleware`, which
+/// answers 401 before the handler runs, so a router-level no-credential test
+/// would pass with or without that arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cross_source_matches_requires_claims_read_like_list_candidates(pool: PgPool) {
     let agent = insert_agent(&pool).await;
@@ -1986,6 +1994,16 @@ async fn cross_source_matches_requires_claims_read_like_list_candidates(pool: Pg
         StatusCode::FORBIDDEN,
         "the scope check must run before the existence probe: an absent id answers \
          the same as a present one to a caller without claims:read"
+    );
+    let present_body = present.into_body().collect().await.unwrap().to_bytes();
+    let missing_body = missing.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        !present_body.is_empty(),
+        "the 403 must carry an error body for the comparison to mean anything"
+    );
+    assert_eq!(
+        present_body, missing_body,
+        "the 403 for a present id and for an absent id must be byte-identical"
     );
 
     let reader = decide_bearer_token_with_scopes(
