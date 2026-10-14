@@ -106,6 +106,18 @@ struct FrameRow {
     created_at: String,
 }
 
+/// Which kinds of reason refused the listed frames, for the operator's hint.
+/// The two kinds have different remedies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RefusalKinds {
+    /// A cascade-table row of a claim outside the companion set. Listing that
+    /// claim as a companion clears it, if it is a test claim.
+    cascade: bool,
+    /// A factor, a child frame, a `claims.belief_frame_id` or an edge.
+    /// The companion set does not affect these.
+    reference: bool,
+}
+
 /// The plan for a list of frames, derived from the database.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Plan {
@@ -114,6 +126,8 @@ struct Plan {
     /// Per cascade table, the companion rows on the deletable frames.
     cascade: BTreeMap<&'static str, i64>,
     refused: Vec<(Uuid, Vec<String>)>,
+    /// Over every refused frame, which kinds of reason occurred.
+    refusal_kinds: RefusalKinds,
     missing: Vec<Uuid>,
 }
 
@@ -165,6 +179,7 @@ async fn plan(
         .collect();
 
     let mut reasons: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+    let mut kinds: BTreeMap<Uuid, RefusalKinds> = BTreeMap::new();
     // Per cascade table and frame: the companion rows that may go with it.
     let mut companion_rows: BTreeMap<&'static str, BTreeMap<Uuid, i64>> = BTreeMap::new();
     for &table in CASCADE_TABLES {
@@ -187,6 +202,7 @@ async fn plan(
                 reasons.entry(frame).or_default().push(format!(
                     "{table}: {n} row(s) of claim {claim}, which is not a companion claim"
                 ));
+                kinds.entry(frame).or_default().cascade = true;
             }
         }
     }
@@ -223,6 +239,7 @@ async fn plan(
                 .entry(frame)
                 .or_default()
                 .push(format!("{what}: {n} row(s)"));
+            kinds.entry(frame).or_default().reference = true;
         }
     }
 
@@ -236,6 +253,9 @@ async fn plan(
             continue;
         };
         if let Some(r) = reasons.remove(id) {
+            let k = kinds.get(id).copied().unwrap_or_default();
+            out.refusal_kinds.cascade |= k.cascade;
+            out.refusal_kinds.reference |= k.reference;
             out.refused.push((*id, r));
             continue;
         }
@@ -294,10 +314,27 @@ pub async fn run(
         writeln!(
             out,
             "REFUSED: {} listed frame(s) carry rows a real claim or another row depends on; \
-             nothing was written. Drop them from the ids file (or list their test claims as \
-             companions) and re-run.",
+             nothing was written.",
             p.refused.len()
         )?;
+        if p.refusal_kinds.cascade {
+            writeln!(
+                out,
+                "HINT: a {} row of a claim outside the companion set: if that claim is a test \
+                 claim that came with the frame, list that claim in --companion-claims-file; if \
+                 it is a real claim, drop the frame from the ids file.",
+                CASCADE_TABLES.join(" / ")
+            )?;
+        }
+        if p.refusal_kinds.reference {
+            writeln!(
+                out,
+                "HINT: a factor, a child frame, a claims.belief_frame_id or a frame-endpoint \
+                 edge is not affected by --companion-claims-file: drop the frame from the ids \
+                 file, or first resolve that row through its own reviewed path."
+            )?;
+        }
+        writeln!(out, "Then re-run the dry run.")?;
         return Ok(report);
     }
     let n = p.deletable.len();

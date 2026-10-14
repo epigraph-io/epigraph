@@ -238,6 +238,11 @@ async fn delete_frames_refuses_a_frame_carrying_a_bba_on_a_real_claim(pool: PgPo
         audit_rows(&pool).await.is_empty(),
         "a refused run wrote an audit row"
     );
+    assert!(
+        r.stdout.contains(COMPANION_HINT) && !r.stdout.contains(REFERENCE_HINT),
+        "a cascade-table refusal gets the companion hint and only that\n{}",
+        r.show()
+    );
 }
 
 /// Edges carry no foreign key to `frames` (055's existence trigger fires on
@@ -291,6 +296,11 @@ async fn delete_frames_refuses_a_frame_that_is_an_edge_endpoint(pool: PgPool) {
         1
     );
     assert!(audit_rows(&pool).await.is_empty());
+    assert!(
+        r.stdout.contains(REFERENCE_HINT) && !r.stdout.contains(COMPANION_HINT),
+        "companions cannot clear an edge, so the hint must not suggest them\n{}",
+        r.show()
+    );
 }
 
 /// The fixture both apply tests share: `t1` carries its companion test claim's
@@ -522,6 +532,13 @@ async fn delete_frames_applies_as_a_non_superuser_maintenance_login(pool: PgPool
     assert_swept(&pool, &r, s, missing).await;
 }
 
+/// The two refusal hints `run` prints after the REFUSED lines. A row of one
+/// of the four cascade tables can be licensed by naming its (test) claim a
+/// companion; every other reason cannot, and the hint must not send the
+/// operator to a remedy that does nothing.
+const COMPANION_HINT: &str = "list that claim in --companion-claims-file";
+const REFERENCE_HINT: &str = "not affected by --companion-claims-file";
+
 /// `REFUSED\t<id>\t...` lines for one frame.
 fn refused_lines(r: &Run, id: Uuid) -> Vec<String> {
     let p = format!("REFUSED\t{id}\t");
@@ -702,6 +719,11 @@ async fn delete_frames_refuses_every_blocker_kind_on_a_dry_run_and_under_apply(p
                 .lines()
                 .any(|l| l.starts_with(&format!("FRAME\t{c2}\t"))),
             "{label}: the listed child stays in the plan\n{}",
+            r.show()
+        );
+        assert!(
+            r.stdout.contains(COMPANION_HINT) && r.stdout.contains(REFERENCE_HINT),
+            "{label}: both kinds of reason are present, so both hints must be\n{}",
             r.show()
         );
     }
