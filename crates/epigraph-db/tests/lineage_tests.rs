@@ -825,36 +825,151 @@ async fn test_lineage_nonexistent_claim_returns_empty(pool: PgPool) {
     assert_eq!(lineage.max_depth_reached, 0);
 }
 
-/// Test: Lineage with mixed relationship types
+/// Test: the ancestry walk follows derivation edges only, each in the
+/// direction its relationship is written
 ///
-/// **Evidence**: Different edge relationships should all be traversed
-/// **Reasoning**: Provenance includes supports, derives_from, etc.
+/// **Evidence**: I104 / U042. `get_lineage_conn`'s recursive term joined
+/// every incoming claim->claim edge with no relationship predicate, so
+/// `get_provenance` reported a claim that DISPUTES the root, a cross-source
+/// matcher corroboration and -- because `ClaimRepository::supersede` writes
+/// `supersedes` new->old -- the NEWER claim that replaced the root as
+/// "ancestors", while never reaching the predecessor the root replaced.
+/// This test replaces `test_lineage_with_mixed_relationship_types`, which
+/// pinned that defect ("All claims included regardless of relationship type").
+/// **Reasoning**: Direction is a property of the relationship, the same table
+/// `provenance_chain.rs` walks: `supports` is written ancestor->claim, so the
+/// ancestor is behind an INCOMING edge; `supersedes` is written new->old, so
+/// the predecessor is behind an OUTGOING edge.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_lineage_with_mixed_relationship_types(pool: PgPool) {
+async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    // Setup: Claims with different relationship types
-    let source_id = create_test_claim(&pool, "Source claim", 0.9).await;
-    let derived_id = create_test_claim(&pool, "Derived claim", 0.8).await;
-    let refined_id = create_test_claim(&pool, "Refined claim", 0.85).await;
-    let final_id = create_test_claim(&pool, "Final claim", 0.7).await;
+    let root = create_test_claim(&pool, "Root claim R", 0.7).await;
+    let supporter = create_test_claim(&pool, "S supports R", 0.8).await;
+    let disputer = create_test_claim(&pool, "X contradicts R", 0.6).await;
+    let successor = create_test_claim(&pool, "N supersedes R", 0.75).await;
+    let predecessor = create_test_claim(&pool, "P, superseded by R", 0.65).await;
+    let matched = create_test_claim(&pool, "M, a cross-source match of R", 0.7).await;
 
-    // Different relationship types
-    create_claim_edge(&pool, source_id, derived_id, "supports").await;
-    create_claim_edge(&pool, source_id, refined_id, "refines").await;
-    create_claim_edge(&pool, derived_id, final_id, "derives_from").await;
-    create_claim_edge(&pool, refined_id, final_id, "supports").await;
+    create_claim_edge(&pool, supporter, root, "supports").await;
+    create_claim_edge(&pool, disputer, root, "contradicts").await;
+    create_claim_edge(&pool, successor, root, "supersedes").await;
+    create_claim_edge(&pool, root, predecessor, "supersedes").await;
+    // The spelling the matcher writes (`match_candidate.rs`).
+    create_claim_edge(&pool, matched, root, "CORROBORATES").await;
+    // OUTGOING non-supersedes edges from R lead to descendants / disputed
+    // claims, never to ancestors: they pin the relationship filter on the
+    // walk's outgoing branch (descendants reported as ancestors otherwise).
+    let descendant = create_test_claim(&pool, "D, supported by R", 0.7).await;
+    let disputed = create_test_claim(&pool, "Y, contradicted by R", 0.6).await;
+    create_claim_edge(&pool, root, descendant, "supports").await;
+    create_claim_edge(&pool, root, disputed, "contradicts").await;
+    // A non-derivation edge BETWEEN two lineage members (S and P are both
+    // R's ancestors; the walk from P never follows an incoming contradicts
+    // edge, so membership is unchanged): pins the parent-edge query filter.
+    create_claim_edge(&pool, supporter, predecessor, "contradicts").await;
 
-    // Execute
-    let lineage = LineageRepository::get_lineage(&pool, &viewer, final_id, None, None)
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
         .await
         .expect("Failed to query lineage");
 
-    // Verify: All claims included regardless of relationship type
-    assert_eq!(lineage.claims.len(), 4);
-    assert!(lineage.claims.contains_key(&source_id));
-    assert!(lineage.claims.contains_key(&derived_id));
-    assert!(lineage.claims.contains_key(&refined_id));
-    assert!(lineage.claims.contains_key(&final_id));
+    // Control: a derivation parent is still walked.
+    assert!(
+        lineage.claims.contains_key(&supporter),
+        "a supporting claim is an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&disputer),
+        "a contradicting claim is not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&descendant),
+        "a claim R supports is a descendant, not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&disputed),
+        "a claim R contradicts is not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&successor),
+        "the superseding (newer) claim is not an ancestor"
+    );
+    assert!(
+        !lineage.claims.contains_key(&matched),
+        "a cross-source corroboration is independent support, not ancestry"
+    );
+    assert!(
+        lineage.claims.contains_key(&predecessor),
+        "the superseded predecessor is R's ancestor"
+    );
+
+    let parents: std::collections::HashSet<Uuid> =
+        lineage.claims[&root].parent_ids.iter().copied().collect();
+    assert_eq!(
+        parents,
+        [supporter, predecessor].into_iter().collect(),
+        "R's parent_ids name exactly its derivation parents"
+    );
+    assert!(
+        lineage.claims[&predecessor].parent_ids.is_empty(),
+        "a contradicts edge between two lineage members is not a parent link"
+    );
+    assert_eq!(lineage.claims[&predecessor].depth, 1);
+    assert_eq!(lineage.claims.len(), 3, "R, S and P only");
+}
+
+/// Test: the relationship match is case-insensitive
+///
+/// **Evidence**: verb edges are stored upper-case in parts of the graph
+/// (`decomposition_priority.rs`: "verb edges are stored upper-case"), and the
+/// unfiltered walk followed an upper-case `SUPPORTS` edge.
+/// **Reasoning**: Moving from "every edge" to a relationship filter must not
+/// silently drop a derivation edge because of its spelling. The `SUPPORTS` /
+/// `Elaborates` half is green before and after U042, a regression guard on
+/// the filter. The upper-case `SUPERSEDES` half (accepted by the
+/// `routes/edges.rs` allowlist as an alias of `supersedes`) pins both the
+/// SQL's `lower()` on the outgoing branch and the parent map's lower-cased
+/// orientation: a case-sensitive orientation would make R the parent of its
+/// own predecessor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_relationship_match_is_case_insensitive(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = create_test_claim(&pool, "Root claim", 0.7).await;
+    let upper = create_test_claim(&pool, "Upper-case supporter", 0.8).await;
+    let grandparent = create_test_claim(&pool, "Elaborated by the supporter", 0.8).await;
+
+    create_claim_edge(&pool, upper, root, "SUPPORTS").await;
+    create_claim_edge(&pool, grandparent, upper, "Elaborates").await;
+    let predecessor = create_test_claim(&pool, "Superseded by the root", 0.6).await;
+    create_claim_edge(&pool, root, predecessor, "SUPERSEDES").await;
+
+    let lineage = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
+        .await
+        .expect("Failed to query lineage");
+
+    assert!(
+        lineage.claims.contains_key(&upper),
+        "an upper-case SUPPORTS edge is still a derivation edge"
+    );
+    assert!(
+        lineage.claims.contains_key(&grandparent),
+        "a mixed-case Elaborates edge is still a derivation edge"
+    );
+    assert!(
+        lineage.claims.contains_key(&predecessor),
+        "an upper-case SUPERSEDES edge still reaches the predecessor"
+    );
+    let root_parents: std::collections::HashSet<Uuid> =
+        lineage.claims[&root].parent_ids.iter().copied().collect();
+    assert_eq!(
+        root_parents,
+        [upper, predecessor].into_iter().collect(),
+        "an upper-case SUPERSEDES edge names its TARGET as the root's parent"
+    );
+    assert!(
+        lineage.claims[&predecessor].parent_ids.is_empty(),
+        "the root is not the parent of the predecessor it superseded"
+    );
+    assert_eq!(lineage.claims[&upper].parent_ids, vec![grandparent]);
 }
 
 /// Test: `max_nodes` trims to the target claim plus its nearest ancestors

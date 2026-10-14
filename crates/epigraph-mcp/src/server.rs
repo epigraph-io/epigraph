@@ -1396,7 +1396,7 @@ impl EpiGraphMcpFull {
     // ── Provenance (1 tool) ──
 
     #[tool(
-        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order."
+        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those."
     )]
     async fn get_provenance(
         &self,
