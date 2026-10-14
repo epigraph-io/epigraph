@@ -241,6 +241,63 @@ async fn an_emptied_group_does_not_rebootstrap(pool: PgPool) {
     assert!(!listed(&pool, c, stranger_p).await);
 }
 
+/// X14 (backlog `7cdea6f1`, the half PR #447 left): a community group that has
+/// NEVER had a membership row — exactly what migration 068 projected for every
+/// legacy community (no creator, no admin, no member) — must not admit its
+/// first joiner from the deployed role. Before 159 the first `groups:admin`
+/// principal to list a perspective there became a live member, and from then
+/// on could admit anyone: the group was claimed by whoever arrived first.
+///
+/// Bootstrapping such a group is an operator decision, so the maintenance
+/// session (`epigraph_bypass()`, here the superuser fixture pool) still may:
+/// that arm is what tells this rule apart from "refuse everything".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_memberless_legacy_group_does_not_admit_a_first_joiner(pool: PgPool) {
+    let stranger = agent(&pool, "x14-stranger").await;
+    let operator_pick = agent(&pool, "x14-operator-pick").await;
+    // No creator: memberless, exactly as migration 068 left projected groups.
+    let c = CommunityRepository::create(&pool, "x14-legacy", None, None, None, None)
+        .await
+        .expect("create")
+        .id;
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "fixture: the group must never have had a member");
+
+    let stranger_p = perspective(&pool, stranger, "x14-stranger-p").await;
+    let out = CommunityRepository::add_member(
+        &as_actor(&pool, stranger).await,
+        Some(stranger),
+        c,
+        stranger_p,
+    )
+    .await
+    .expect("a refusal is an outcome, not an error");
+    assert_eq!(
+        out,
+        MembershipOutcome::DeniedNotAMember,
+        "a non-admin must not become the first member of a memberless legacy group"
+    );
+    assert_eq!(state(&pool, c, stranger).await, "none");
+    assert!(
+        !listed(&pool, c, stranger_p).await,
+        "nothing may be written on the refusal"
+    );
+
+    // The operator's maintenance session can still bootstrap it.
+    let pick_p = perspective(&pool, operator_pick, "x14-operator-pick-p").await;
+    let out = CommunityRepository::add_member(&pool, Some(operator_pick), c, pick_p)
+        .await
+        .expect("maintenance bootstrap");
+    assert_eq!(out, MembershipOutcome::Applied);
+    assert_eq!(state(&pool, c, operator_pick).await, "reader(live)");
+    assert!(listed(&pool, c, pick_p).await);
+}
+
 /// F4b: two concurrent FIRST joiners of a never-populated group — exactly one
 /// bootstraps, the other is refused.
 #[sqlx::test(migrations = "../../migrations")]
