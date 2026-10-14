@@ -78,8 +78,8 @@ pub struct RewireSummary {
     pub removed_vacuous: usize,
     pub removed_source_factorless: usize,
     pub skipped_non_epistemic: usize,
-    /// The selected row was gone (or, see below, the edge no longer in
-    /// force) by the time its turn came; nothing written.
+    /// By the time the edge's turn came, the edge was retracted, an endpoint
+    /// was no longer current, or the selected row was gone; nothing written.
     pub skipped_stale: usize,
     /// Rows deleted beyond each edge's one rewritten or removed row: a second
     /// agent key or another frame for the same edge, merged into one row.
@@ -166,7 +166,7 @@ enum EdgeRewrite {
     RemovedVacuous,
     RemovedSourceFactorless,
     SkippedNonEpistemic,
-    /// The selected row is gone by the time the edge's turn came.
+    /// No longer in force, or the selected row is gone, at the edge's turn.
     SkippedStale,
 }
 
@@ -355,6 +355,33 @@ async fn rewire_one(
     }
 
     let mut tx = pool.begin().await.map_err(|e| format!("begin: {e}"))?;
+
+    // The selection is a snapshot that can be hours old by now. Re-check the
+    // in-force predicate of REWIRE_EDGE_QUERY here, or an edge retracted
+    // since (whose BBA the retraction cascade deleted) would be re-wired:
+    // auto_wire_ds_for_edge does not check it. FOR SHARE OF e holds a
+    // concurrent retraction's UPDATE of valid_to until this edge commits, so
+    // its cascade then deletes what we wrote. The claims are NOT locked: the
+    // wire UPDATEs the target's cache in this transaction, and a SHARE lock
+    // upgraded to a write deadlocks against a concurrent writer of the same
+    // claim (migration 114's W6 note); a supersede racing this one statement
+    // window is left to the supersede path.
+    let in_force: Option<Uuid> = sqlx::query_scalar(
+        "SELECT e.id FROM edges e \
+           JOIN claims tgt ON tgt.id = e.target_id \
+           JOIN claims src ON src.id = e.source_id \
+          WHERE e.id = $1 \
+            AND (e.valid_to IS NULL OR e.valid_to > now()) \
+            AND tgt.is_current AND src.is_current \
+          FOR SHARE OF e",
+    )
+    .bind(edge.edge_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("re-check edge in force: {e}"))?;
+    if in_force.is_none() {
+        return Ok(EdgeResult::only(EdgeRewrite::SkippedStale));
+    }
 
     // The row the selection chose (same order as REWIRE_EDGE_QUERY's
     // DISTINCT ON), locked, with the tenancy a rewrite must keep.
