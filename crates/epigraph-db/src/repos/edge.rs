@@ -26,10 +26,13 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
-/// The subset of [`EPISTEMIC_RELATIONSHIPS`] that WEAKENS its target's belief.
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] with NEGATIVE polarity: they
+/// transmit the source's belief AGAINST the target.
 ///
-/// Every other member of that list strengthens the target; these two are the
-/// only ones that subtract. The distinction is not cosmetic — it decides what
+/// Every other member of that list transmits it toward the target; these two
+/// are the only ones that argue against it. (Polarity is not a guarantee of
+/// direction: a positive edge also carries the source's disbelief and
+/// open-world mass, so it can lower the target's belief.) The distinction is not cosmetic — it decides what
 /// may be re-pointed when a claim is replaced. A `refutes`/`contradicts` edge
 /// is an assertion about a *specific pair of contents* ("this text refutes
 /// THAT text"), so re-pointing either endpoint at a different text silently
