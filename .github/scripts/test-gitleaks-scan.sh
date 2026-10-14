@@ -2,7 +2,7 @@
 # Self-test for the CI secret scan: .gitleaks.toml + .github/scripts/gitleaks-scan.sh.
 #
 # Runs the real gitleaks binary against throwaway git repos that carry this
-# checkout's config and scan script, and asserts the four properties the CI job
+# checkout's config and scan script, and asserts the six properties the CI job
 # depends on:
 #   1. range-only   — a secret already in the base history does not fail a PR
 #                     whose own commits are clean (the job must not fail on
@@ -14,7 +14,12 @@
 #                     secret in the very file that holds the fixtures is still
 #                     caught;
 #   4. defaults     — the default gitleaks ruleset is still active (an AWS
-#                     access key id is caught).
+#                     access key id is caught);
+#   5. no-base      — with an empty or all-zeros <base> (a push that created
+#                     the branch) only <head> itself is scanned: a secret in
+#                     older history passes, one added by <head> fails;
+#   6. redacted     — every failing scan's log names the finding REDACTED and
+#                     never contains the planted value (public CI logs).
 #
 # Planted secrets are deterministic and assembled from pieces at run time, so
 # no secret-shaped literal appears in this file (it is itself scanned in CI).
@@ -63,6 +68,21 @@ expect() {
   fi
 }
 
+# redacted <name> <value>: the log of case <name> reports the finding redacted
+# and never carries the secret value itself.
+redacted() {
+  local name=$1 value=$2
+  if grep -qF -- "$value" "$work/$name.log"; then
+    echo "FAIL - redacted: $name: the log contains the planted secret value"
+    failures=$((failures + 1))
+  elif ! grep -q 'REDACTED' "$work/$name.log"; then
+    echo "FAIL - redacted: $name: the log has no REDACTED finding"
+    failures=$((failures + 1))
+  else
+    echo "ok   - redacted: $name"
+  fi
+}
+
 # --- 1. range-only -----------------------------------------------------------
 r=$work/range
 new_repo "$r"
@@ -76,6 +96,7 @@ expect "range-only: secret in base history, clean PR passes" 0 "$r" "$base" "$(g
 printf 'let secret = "%s";\n' "$generic_secret" >"$r/src/new.rs"
 commit "$r" "pr: adds the secret again"
 expect "range-only: the same secret added inside the range fails" 1 "$r" "$base" "$(git -C "$r" rev-parse HEAD)"
+redacted "range-only: the same secret added inside the range fails" "$generic_secret"
 
 # --- 2. fixtures -------------------------------------------------------------
 f=$work/fixtures
@@ -99,6 +120,7 @@ expect "fixtures: allowlisted fixtures and did:key ids pass" 0 "$f" "$base" "$(g
 printf 'let secret = "%s";\n' "$generic_secret" >>"$f/crates/epigraph-api/src/routes/webhooks.rs"
 commit "$f" "pr: a new secret next to the fixtures"
 expect "value-scoped: new secret in the fixture file fails" 1 "$f" "$base" "$(git -C "$f" rev-parse HEAD)"
+redacted "value-scoped: new secret in the fixture file fails" "$generic_secret"
 
 # --- 4. defaults -------------------------------------------------------------
 d=$work/defaults
@@ -107,6 +129,26 @@ base=$(git -C "$d" rev-parse HEAD)
 printf 'aws_access_key_id = %s\n' "$aws_key_id" >"$d/creds.ini"
 commit "$d" "pr: an AWS access key id"
 expect "defaults: AWS access key id fails" 1 "$d" "$base" "$(git -C "$d" rev-parse HEAD)"
+redacted "defaults: AWS access key id fails" "$aws_key_id"
+
+# --- 5. no-base --------------------------------------------------------------
+# ci.yml passes `github.event.before`, which is all zeros on a push that created
+# the branch (and empty for a trigger without `before`). The scan must then
+# cover <head> alone: never the history reachable from it, never the base.
+n=$work/nobase
+new_repo "$n"
+mkdir -p "$n/src"
+printf 'let secret = "%s";\n' "$generic_secret" >"$n/src/old.rs"
+commit "$n" "history: a secret that predates the pushed head"
+printf 'fn clean() {}\n' >"$n/src/clean.rs"
+commit "$n" "head: clean change"
+zeros=0000000000000000000000000000000000000000
+expect "no-base: all-zeros base, clean head passes" 0 "$n" "$zeros" "$(git -C "$n" rev-parse HEAD)"
+expect "no-base: empty base, clean head passes" 0 "$n" "" "$(git -C "$n" rev-parse HEAD)"
+printf 'aws_access_key_id = %s\n' "$aws_key_id" >"$n/creds.ini"
+commit "$n" "head: adds an AWS access key id"
+expect "no-base: all-zeros base, secret in head fails" 1 "$n" "$zeros" "$(git -C "$n" rev-parse HEAD)"
+expect "no-base: empty base, secret in head fails" 1 "$n" "" "$(git -C "$n" rev-parse HEAD)"
 
 if ((failures)); then
   echo "test-gitleaks-scan: $failures case(s) failed" >&2
