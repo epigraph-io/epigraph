@@ -92,12 +92,28 @@ pub struct CrossSourceMatchesResponse {
 /// The existence probe is scoped too: a claim the viewer cannot read must 404
 /// exactly as a nonexistent one does (§8.5), or this endpoint is an existence
 /// oracle for every private claim id.
+///
+/// # Scope
+///
+/// Requires `claims:read`, checked here rather than left to router placement,
+/// for the same reason `list_candidates` below gives. It matches the MCP twin
+/// (`find_cross_source_matches` in `epigraph-mcp/src/scope_map.rs`). The check
+/// runs before the existence probe, so a caller without the scope gets the
+/// same 403 for an absent id as for a present one.
 #[cfg(feature = "db")]
 pub async fn get_cross_source_matches(
     State(state): State<AppState>,
     ViewerExtractor(viewer): ViewerExtractor,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<CrossSourceMatchesResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "get_cross_source_matches requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:read"])?;
+
     // 404 if the claim doesn't exist *for this viewer*. Using count(*) so we
     // don't pay for the full row hydration we'd get from
     // ClaimRepository::get_by_id.
