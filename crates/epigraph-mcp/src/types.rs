@@ -840,7 +840,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching on both paths; for a workflows-table id an omitted goal is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -966,7 +966,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). A non-blank goal is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow; the 'hierarchical' default is not embedded."
     )]
     pub goal_text: Option<String>,
 }

@@ -639,7 +639,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// refused. `routes/workflows.rs` 14 -> 12, keeping sites, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// (`recorded 14, measured 12`).
-const HIGH_WATER: usize = 256;
+///
+/// 256 -> 253 in U033 (2026-10-13): `report_hierarchical_outcome` runs its
+/// counter read, counter write, step lookup and step rows on one
+/// `state.db_pool.begin()` transaction (`routes/workflows.rs` 12 -> 9, keeping
+/// sites), read off `the_unconverted_register_is_exactly_what_was_measured`'s
+/// own failure (`recorded 12, measured 9`).
+const HIGH_WATER: usize = 253;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1010,7 +1016,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // stores on a system-agent-stamped transaction. This ratchet had kept the
     // two sites as allowed count, which is how the refusal stayed hidden. Read
     // off this test's failure output (`recorded 14, measured 12`).
-    ("routes/workflows.rs", 12),
+    //
+    // 12 -> 9 (U033, 2026-10-13): `report_hierarchical_outcome`'s four
+    // `state.db_pool` statements (metadata read, counter UPDATE, step lookup,
+    // step-row inserts) now run on ONE `state.db_pool.begin()` transaction, so
+    // a refused step row rolls the counters back. A plain transaction: neither
+    // `workflows` nor `behavioral_executions` has row security. Read off this
+    // test's failure output (`recorded 12, measured 9`).
+    ("routes/workflows.rs", 9),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is
