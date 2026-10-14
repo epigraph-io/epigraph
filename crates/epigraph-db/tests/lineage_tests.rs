@@ -863,6 +863,10 @@ async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
     let disputed = create_test_claim(&pool, "Y, contradicted by R", 0.6).await;
     create_claim_edge(&pool, root, descendant, "supports").await;
     create_claim_edge(&pool, root, disputed, "contradicts").await;
+    // A non-derivation edge BETWEEN two lineage members (S and P are both
+    // R's ancestors; the walk from P never follows an incoming contradicts
+    // edge, so membership is unchanged): pins the parent-edge query filter.
+    create_claim_edge(&pool, supporter, predecessor, "contradicts").await;
 
     let lineage = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
         .await
@@ -904,6 +908,10 @@ async fn test_lineage_walks_derivation_edges_only(pool: PgPool) {
         parents,
         [supporter, predecessor].into_iter().collect(),
         "R's parent_ids name exactly its derivation parents"
+    );
+    assert!(
+        lineage.claims[&predecessor].parent_ids.is_empty(),
+        "a contradicts edge between two lineage members is not a parent link"
     );
     assert_eq!(lineage.claims[&predecessor].depth, 1);
     assert_eq!(lineage.claims.len(), 3, "R, S and P only");
