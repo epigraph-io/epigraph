@@ -344,6 +344,13 @@ const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
          `reader` role, reachable only by a live admin actor (`'denied_readmit'` otherwise); \
          pinned by `community_membership_integrity.rs`.",
     ),
+    (
+        "migrations/159_community_bootstrap_maintenance_only.sql",
+        1,
+        "159 re-states `epigraph_community_add_member` (bootstrap of a never-populated group \
+         only from a maintenance session); the revival is 106's restore, unchanged: a REVOKED \
+         community row at `reader`, only for a live admin actor.",
+    ),
 ];
 
 /// Every function whose LATEST migration definition arm 3 checks, with the
