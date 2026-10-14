@@ -1341,6 +1341,32 @@ restart.
   none against other migrations or the binaries (a grant; an older binary has
   no `delete-frames`). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **159**: public `community_bootstrap_maintenance_only` (drain X14, backlog
+  `7cdea6f1`). Re-states 106's `epigraph_community_add_member(uuid, uuid,
+  uuid)` (`CREATE OR REPLACE`, same signature; owner and grants kept, so no
+  re-own and no `REVOKE`/`GRANT`) with ONE condition changed: a group that has
+  NEVER had a membership row (migration 068's legacy communities) is
+  bootstrapped only by a maintenance session (`epigraph_bypass()`); any other
+  actor answers `'denied'`, nothing written. Before it, the first
+  `groups:admin` principal to list a perspective into such a group became its
+  live member and could then admit anyone. Every outcome for a maintenance
+  session, and every other rule of 106 (actor, locks, `'denied_readmit'`,
+  projection), is unchanged. The same condition also closes a community with
+  no projected group of kind `'community'` to app sessions: under 106 it
+  accepted a bare `community_members` row from any actor. A later migration
+  that re-states this function must start from 159's body and keep its
+  `OR NOT public.epigraph_bypass()` term. A copy of 106's body re-opens the
+  bootstrap, and an out-of-order apply on a deployed database would let it
+  win. Pinned as `epigraph_app` by
+  `epigraph-db/tests/community_membership_integrity.rs`. Undo: re-run 106's
+  `CREATE OR REPLACE FUNCTION public.epigraph_community_add_member` statement
+  (re-opens the hole); it creates and changes no rows. **Deploy order:** none
+  against the binaries (the refusal is the existing `'denied'` outcome, already
+  mapped to 403). After it applies, a legacy community with no member stays
+  closed until an operator seeds a member from a maintenance session or gives
+  it an admin (PR-18). Slot 159 per the drain's slot register; 154-158 are
+  claimed elsewhere. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -2402,7 +2402,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "community.rs",
         "add_member",
         "ONE statement, `SELECT public.epigraph_community_add_member($1, $2, $3)` (migration \
-         106, batch F). A WRITE, and its authorization is neither an in-query viewer predicate \
+         106, batch F; re-stated by 159). A WRITE, and its authorization is neither an in-query viewer predicate \
          nor the caller's `WITH CHECK`: the SECURITY DEFINER function takes the actor from the \
          CONNECTION's stamped `epigraph_principal_id()` (a differing `acting_agent` is DENIED \
          unless the session is `epigraph_bypass()`), locks the group's roster and `groups` row, \

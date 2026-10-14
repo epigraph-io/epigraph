@@ -207,7 +207,8 @@ pub async fn create_community(
         // `Viewer::principal()` is `None` only for a bypass/system viewer,
         // which is not a principal that should own a community — that case
         // still lands on the memberless-group bootstrap path, which
-        // `CommunityRepository::add_member` treats as open.
+        // `CommunityRepository::add_member` opens to a maintenance session
+        // only (migration 159).
         //
         // This route is on the PROTECTED router, so `ViewerExtractor` already
         // 401s an unauthenticated caller; taking the viewer here changes who
@@ -318,8 +319,8 @@ pub async fn get_community(
 /// already uses and the one `epigraph_core::canonical_scopes` prescribes for
 /// managing an existing group's membership. Membership is enforced in the repo
 /// layer (`CommunityRepository::add_member`: the acting agent must hold a live
-/// membership in the community's projected group, with a bootstrap exception for
-/// a group that has none). Scope was the missing half, and it is the half a
+/// membership in the community's projected group; a group that has never had a
+/// member is bootstrapped by a maintenance session only, since migration 159). Scope was the missing half, and it is the half a
 /// scope-less route cannot supply: without it a token that may not manage a
 /// group through `POST /api/v1/groups/:id/members` could grant the same
 /// `group_memberships` row through this route, because migration 068 projects a
