@@ -4,8 +4,10 @@
 //! `mass_functions` is unique on (claim, frame, source_agent_id,
 //! perspective_id) `NULLS NOT DISTINCT` (migration 034), so a pair has ONE
 //! agent-less, perspective-less slot. Two writers put an input there:
-//! * `POST /api/v1/claims/:id/assess` always stores its input BBA with no agent
-//!   and no perspective;
+//! * `POST /api/v1/claims/:id/assess` stored its input BBA with no agent and
+//!   no perspective until U027 (it now keys each input by its own evidence
+//!   perspective and stores no cached row, so the arms below pin that it
+//!   still folds exactly once);
 //! * `POST /api/v1/frames/:id/evidence` does when the body omits both
 //!   `agent_id` and `perspective_id`.
 //!
