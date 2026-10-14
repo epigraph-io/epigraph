@@ -2892,6 +2892,7 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
     // graphs left the near cluster unreachable from the entry point. The
     // guard's probe then saw 40 far rows (0 covered), the request fell back
     // to flat retrieval, and that index scan also returned far rows.
+    let mut far = std::collections::HashSet::new();
     for i in 0..150 {
         let v = diverse_fixture::cluster_pgvec_with_drift_and_query_share(
             6,
@@ -2900,7 +2901,10 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
             (i as f32) * 0.01,
             0.5,
         );
-        diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
+        far.insert(
+            diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None)
+                .await,
+        );
     }
     // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
     // planner statistics, so the guard's probe and the candidate query run
@@ -2931,9 +2935,13 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
          are themed only — the unthemed nearest neighbour appearing means the request fell \
          back to flat retrieval"
     );
+    let far_returned = returned.intersection(&far).count();
     assert!(
         returned.is_subset(&themed),
-        "every diverse pick must come from the covering theme; got {returned:?}"
+        "every diverse pick must come from the covering theme; got {returned:?}. \
+         {far_returned} of them are far-cluster rows: a non-zero count means the HNSW \
+         index scan never reached the query region (a fixture-geometry problem, see the \
+         far-cluster comment above), not a per-query guard regression"
     );
 }
 
