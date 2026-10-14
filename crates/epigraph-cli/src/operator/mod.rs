@@ -85,6 +85,13 @@
 //!   own trigger. Armed, every mint strips them and every path that hands
 //!   scopes out refuses them; an admin act then needs an elevation.
 //!
+//! And a graph cleanup (drain U048; see [`delete_frames`]):
+//!
+//! * `delete-frames` — remove an explicit list of test or probe `frames` rows
+//!   with the companion test-claim rows that cascade from them, refusing every
+//!   frame a real claim's BBA, a factor, a child frame, a cached belief or an
+//!   edge still depends on. Audited (`operator.frames_deleted`).
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.

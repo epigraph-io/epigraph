@@ -20,7 +20,8 @@
 //! `allow-author-binding-client` exits 3 when the allowance is recorded but
 //! does not bind (ALLOWED-BUT-INEFFECTIVE); `revoke-author-binding-client`
 //! exits 1 when no allowance row names the client (NOT-ALLOWED: nothing to
-//! revoke, usually a mistyped id).
+//! revoke, usually a mistyped id). `delete-frames` exits 3 when it refused at
+//! least one listed frame (nothing is written then, even under `--apply`).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -69,6 +70,8 @@
 //!     epigraph-operator allow-author-binding-client --client <uuid> --operator <uuid> \
 //!         --reason TEXT [--revoke-foreign-writes] [--apply]
 //!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator delete-frames --ids-file frames.txt [--companion-claims-file claims.txt] \
+//!         --reason TEXT [--apply --confirm-delete N]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
