@@ -685,3 +685,60 @@ async fn rewire_written_before_selects_only_older_rows_and_rewritten_rows_drop_o
         "a rewritten row is restamped and drops out of the same cutoff"
     );
 }
+
+/// A stored edge-factor row whose relationship now maps to no epistemic
+/// restriction (`cites`) is left untouched and counted, and it PERSISTS in the
+/// selection: paging must step past it (`RewireSummary::persisting`), or a
+/// page at the same offset reselects it forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_leaves_a_non_epistemic_edge_factor_and_reports_it_as_persisting(pool: PgPool) {
+    let author = seed_agent(&pool, "rewire-author-cites").await;
+    let wirer = seed_agent(&pool, "rewire-wirer-cites").await;
+    let frame = binary_frame(&pool).await;
+    let source = seed_claim(&pool, author, "cites source", Some((0.20, 0.95, 0.60))).await;
+    let target = seed_claim(&pool, author, "cites target", Some((0.75, 1.0, 0.0))).await;
+    let edge = seed_edge(&pool, source, target, "cites").await;
+    seed_stale_edge_factor(&pool, edge, target, frame, wirer).await;
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let page = RewireOptions {
+        limit: 1,
+        ..RewireOptions::default()
+    };
+
+    let summary = run_rewire_phase(&pool, &viewer, &page)
+        .await
+        .expect("rewire");
+    assert_eq!(
+        (
+            summary.eligible,
+            summary.skipped_non_epistemic,
+            summary.rewired
+        ),
+        (1, 1, 0),
+        "{summary:?}"
+    );
+    assert_eq!(summary.persisting(), 1, "{summary:?}");
+    assert!(!summary.made_progress(), "{summary:?}");
+    let rows = edge_rows(&pool, edge).await;
+    assert_eq!(rows.len(), 1);
+    assert_close(mass(&rows[0].1, "~0,1"), 0.60, "the cites row is untouched");
+
+    let again: Vec<Uuid> = select_rewire_edges(&pool, &page)
+        .await
+        .expect("reselect")
+        .into_iter()
+        .map(|e| e.edge_id)
+        .collect();
+    assert_eq!(again, vec![edge], "it persists at offset 0");
+    let past = RewireOptions {
+        offset: summary.persisting(),
+        ..page
+    };
+    assert!(
+        select_rewire_edges(&pool, &past)
+            .await
+            .expect("next page")
+            .is_empty(),
+        "advancing --offset by persisting() steps past it"
+    );
+}

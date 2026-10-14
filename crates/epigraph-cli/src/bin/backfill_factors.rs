@@ -21,7 +21,8 @@
 //! written under an older BBA shape (before #401's open-world discount) are
 //! rewritten. A full refresh of every edge factor it selects; see
 //! `epigraph_cli::backfill_factors` for the selection rules and the paging
-//! idiom (`--written-before <run start>`, repeat `--limit N` at offset 0).
+//! idiom (fixed `--written-before`, `--limit N`, `--offset` advanced by the
+//! printed `next --offset`, done when a page makes no progress).
 
 use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
@@ -112,6 +113,21 @@ async fn run(
         };
         let summary = run_rewire_phase(&pool, viewer, &opts).await?;
         println!("rewire-edges phase: {summary}");
+        if !cli.dry_run && summary.eligible > 0 {
+            // Skipped-non-epistemic and failed rows stay selected; the next
+            // page must step past them or it reselects them forever.
+            println!(
+                "rewire-edges paging: next --offset {} (same --written-before)",
+                cli.offset + summary.persisting()
+            );
+            if !summary.made_progress() {
+                eprintln!(
+                    "rewire-edges: this page rewrote or removed nothing ({} persisting rows); \
+                     do not repeat it at the same --offset",
+                    summary.persisting()
+                );
+            }
+        }
     }
     Ok(())
 }

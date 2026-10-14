@@ -102,10 +102,23 @@ pub struct RewireSummary {
 ///   `SheafRepository::get_epistemic_edge_pairs` uses: `auto_wire_ds_for_edge`
 ///   does not check `is_in_force`, so selecting one would resurrect it.
 /// - `$3` (`--written-before`) restricts to rows last written before an
-///   instant. The upsert stamps `created_at = NOW()`, so a rewritten row drops
-///   out: repeating `--limit N` at offset 0 with a fixed `--written-before`
-///   pages through the population without skipping rows. Plain `--offset`
-///   paging over a run that deletes rows does skip them.
+///   instant. The upsert stamps `created_at = NOW()`, so a REWRITTEN or
+///   REMOVED row drops out of a fixed cutoff, and so does a `skipped_stale`
+///   one (no longer in force). Two outcomes do NOT drop out and come back at
+///   the head of every page: `skipped_non_epistemic` (the selection has no
+///   relationship filter, on purpose, so it cannot drift from
+///   `restriction_kind_with_profile`) and `failed` (rolled back).
+///
+/// # Paging
+///
+/// With a fixed `--written-before`, page with `--limit N` and an `--offset`
+/// that starts at 0 and advances by each page's
+/// [`RewireSummary::persisting`] (skipped_non_epistemic + failed), which the
+/// binary prints as the next offset. The run is done when a page makes no
+/// progress ([`RewireSummary::made_progress`] is false), NOT when `eligible`
+/// reaches 0: repeating offset 0 alone stalls once N persisting rows lead the
+/// order. Plain `--offset N, 2N, ...` paging skips rows, because rewritten
+/// rows leave the selection.
 pub const REWIRE_EDGE_QUERY: &str = r#"
 SELECT DISTINCT ON (e.id)
        e.id,
@@ -474,6 +487,21 @@ async fn rewire_one(
         outcome: result,
         duplicate_rows_deleted,
     })
+}
+
+impl RewireSummary {
+    /// Rows this page left in place that a re-selection with the same
+    /// `--written-before` returns again: `skipped_non_epistemic + failed`.
+    #[must_use]
+    pub fn persisting(&self) -> usize {
+        self.skipped_non_epistemic + self.failed
+    }
+
+    /// Whether this page rewrote or removed any edge factor.
+    #[must_use]
+    pub fn made_progress(&self) -> bool {
+        self.rewired + self.removed_vacuous + self.removed_source_factorless > 0
+    }
 }
 
 impl std::fmt::Display for RewireSummary {
