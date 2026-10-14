@@ -121,7 +121,7 @@ pub struct RecallWithContextParams {
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
     /// Max epistemic-edge neighbours returned **per relationship** per hit
-    /// (supports / refutes / contradicts / specializes / elaborates / cites).
+    /// (supports / refutes / contradicts / specializes / elaborates / cites / qualifies).
     /// Default 4, minimum 1 (0 is raised to 1). Per-relationship rather than
     /// per-hit so a claim with many `supports` edges cannot crowd out its single
     /// `refutes`. The floor keeps `epistemic_edges_total` honest: the total rides
@@ -564,8 +564,9 @@ pub struct RecallHit {
     pub corroborates_total: usize,
     pub corroborates_truncated: bool,
     /// Epistemic-edge neighbours (supports / refutes / contradicts / specializes /
-    /// elaborates / cites), capped at `epistemic_limit` PER RELATIONSHIP. `direction`
-    /// is from this paragraph's view: incoming `refutes` = "is refuted by".
+    /// elaborates / cites / qualifies), capped at `epistemic_limit` PER RELATIONSHIP.
+    /// `direction` is from this paragraph's view: incoming `refutes` = "is refuted
+    /// by", incoming `qualifies` = "is qualified by" (a scope caveat).
     /// Always serialized (like `corroborates`), so an empty list means "none
     /// visible", not "not computed" (backlog 922a1e54).
     pub epistemic_edges: Vec<EpistemicEdgeNeighbor>,
@@ -649,6 +650,10 @@ const EPISTEMIC_EDGE_RELATIONSHIPS: &[&str] = &[
     "specializes",
     "elaborates",
     "cites",
+    // A scope caveat ("A bounds the conditions under which B applies"; backlog
+    // 99582af7) travels with the claim it bounds, so a reader of the hit also
+    // reads where it does not hold. Belief-neutral, so not in `is_contested`.
+    "qualifies",
 ];
 
 /// Whether a returned epistemic-edge hit is the source or the target of the

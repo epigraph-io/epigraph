@@ -18,11 +18,11 @@
 //! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
 //!   [`STRUCTURAL_RELATIONSHIPS`] (lowercase canonical strings; `supersedes`
 //!   is intentionally excluded — it has dedicated semantics in
-//!   `supersede_claim`). The structural set (currently just `cites`) is kept
+//!   `supersede_claim`). The structural set (`cites`, `qualifies`) is kept
 //!   separate because its members map to `RestrictionKind::Neutral` by
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
-//!   here just lets citation/provenance edges be created MCP-natively
-//!   without a doomed detour through the raw HTTP edges route.
+//!   here just lets citation/provenance links and scope caveats be created
+//!   MCP-natively without a doomed detour through the raw HTTP edges route.
 //! - idempotent on `(source, target, relationship)` — and for the SYMMETRIC
 //!   relationships (`contradicts`, `corroborates`, see
 //!   [`SYMMETRIC_RELATIONSHIPS`]) on the UNORDERED pair, so filing one in both
@@ -97,7 +97,17 @@ fn is_epistemic_relationship(s: &str) -> bool {
 /// allow-list instead. `auto_wire_edge_if_epistemic` already no-ops safely on
 /// `Neutral` relationships (see `epigraph_engine::edge_factor`'s
 /// short-circuit), so no changes are needed to the belief-wiring path itself.
-pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
+///
+/// `qualifies` (backlog 99582af7) is a SCOPE CAVEAT: `A qualifies B` says A
+/// bounds the conditions under which B applies (a salt regime, a geometry, a
+/// population), not whether B is true. Before it existed the only way to wire
+/// such a caveat was `contradicts`/`refutes`, which depresses B's belief for a
+/// reason that is not about B's truth. It is directional (deliberately absent
+/// from [`SYMMETRIC_RELATIONSHIPS`]), lower-case only (the U014 casing
+/// ruling), and an optional condition can ride in the edge's `properties`.
+/// `get_neighborhood` returns every relationship unfiltered, so a claim's
+/// qualifiers already travel with it there.
+pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites", "qualifies"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
@@ -171,7 +181,7 @@ pub async fn do_link_epistemic(
     let target_id = parse_uuid(&params.target_claim_id)?;
 
     // Tight allow-list — lowercase canonical epistemic relations, plus the
-    // separate structural set (currently just `cites`; see
+    // separate structural set (`cites`, `qualifies`; see
     // STRUCTURAL_RELATIONSHIPS doc comment for why it isn't folded into
     // EPISTEMIC_RELATIONSHIPS).
     if !is_epistemic_relationship(&params.relationship)
@@ -497,6 +507,24 @@ mod tests {
         }
     }
 
+    /// The mirror of the guard above, for the whole structural set:
+    /// `link_epistemic` advertises every `STRUCTURAL_RELATIONSHIPS` member as
+    /// moving no belief, and `auto_wire_edge_if_epistemic` only no-ops on
+    /// `Neutral`. A structural entry the engine maps to `Positive` or
+    /// `Negative` would be advertised as inert and still wire belief.
+    #[test]
+    fn every_structural_relationship_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        for rel in STRUCTURAL_RELATIONSHIPS {
+            let kind = restriction_kind_with_profile(rel, &profile);
+            assert!(
+                matches!(kind, RestrictionKind::Neutral),
+                "structural relationship '{rel}' maps to {kind:?}, not Neutral — it would \
+                 move belief while link_epistemic advertises it as belief-neutral"
+            );
+        }
+    }
+
     /// `cites` is a citation/provenance link, not an epistemic claim about the
     /// relationship between two nodes — it is DELIBERATELY `Neutral` (does not
     /// move belief). This is the mirror image of the coverage guard above:
@@ -525,6 +553,39 @@ mod tests {
             ),
             "'cites' must map to RestrictionKind::Neutral — a citation link is not an \
              epistemic claim and must not move belief"
+        );
+    }
+
+    /// `qualifies` is a SCOPE CAVEAT ("A bounds the conditions under which B
+    /// applies"), not a verdict on B's truth (backlog 99582af7). It is accepted
+    /// through the structural, belief-neutral set — never the epistemic one, or
+    /// a caveat would be wired like a refutation. It is directional (it is not
+    /// in the symmetric set) and lower-case only, per the U014 casing ruling.
+    #[test]
+    fn qualifies_is_structural_directional_and_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            is_structural_relationship("qualifies"),
+            "'qualifies' must be accepted via STRUCTURAL_RELATIONSHIPS"
+        );
+        assert!(
+            !is_epistemic_relationship("qualifies"),
+            "'qualifies' must NOT be in EPISTEMIC_RELATIONSHIPS (it moves no belief)"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("qualifies", &profile),
+                RestrictionKind::Neutral
+            ),
+            "'qualifies' must map to RestrictionKind::Neutral — a scope caveat must not move belief"
+        );
+        assert!(
+            !is_symmetric_relationship("qualifies"),
+            "'A qualifies B' is not 'B qualifies A'"
+        );
+        assert!(
+            !is_structural_relationship("QUALIFIES"),
+            "lower-case canonical spelling only"
         );
     }
 
