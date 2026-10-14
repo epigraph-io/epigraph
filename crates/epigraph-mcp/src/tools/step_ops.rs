@@ -147,14 +147,29 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
-        crate::tools::workflow_authority::audit_admin_workflow_write(
+    // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
+    // over HTTP, this server's pinned agent on stdio) AUTHORED the step claim
+    // this call created; the claim itself stays the system agent's.
+    if r.claim_created {
+        epigraph_ingest_executor::record_caller_authorship(
+            &mut tx,
+            caller.agent_id(),
+            &[r.step_claim_id],
+            "add_step",
+        )
+        .await
+        .map_err(|e| internal_error(format!("add_step: could not record authorship: {e}")))?;
+    }
+    // The arm that admitted the caller is recorded with the write: the admin
+    // arm's audit row, or the provenance row of any other authenticated arm.
+    if let Some((head, grant)) = authority {
+        crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             caller,
             "add_step",
             head,
-            grant.owner,
+            grant,
             serde_json::json!({
                 "canonical_name": params.canonical_name,
                 "step_claim_id": r.step_claim_id,
@@ -224,14 +239,16 @@ pub async fn delete_step(
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
-        crate::tools::workflow_authority::audit_admin_workflow_write(
+    // The arm that admitted the caller is recorded with the write: the admin
+    // arm's audit row, or the provenance row of any other authenticated arm.
+    if let Some((head, grant)) = authority {
+        crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             caller,
             "delete_step",
             head,
-            grant.owner,
+            grant,
             serde_json::json!({
                 "canonical_name": params.canonical_name,
                 "step_claim_id": r.step_claim_id,

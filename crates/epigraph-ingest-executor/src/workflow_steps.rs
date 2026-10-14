@@ -50,6 +50,12 @@ pub struct AddStepResult {
     /// `None` if the step was already present (idempotent re-add). The
     /// caller embeds when `Some(_)`; see CLAUDE.md "Embedding policy".
     pub inserted_content: Option<String>,
+    /// `true` only when THIS call's INSERT created the step claim row. `false`
+    /// for an idempotent re-add, and also when the step was spliced into the
+    /// chain but its claim id (content-addressed per workflow) already existed,
+    /// e.g. a step a deprecation retired. The caller records authorship
+    /// (`AUTHORED`) only for a claim it created.
+    pub claim_created: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +273,7 @@ pub async fn add_step(
             step_lineage_id: existing_lineage.unwrap_or_else(Uuid::nil),
             already_present: true,
             inserted_content: None,
+            claim_created: false,
         });
     }
 
@@ -356,7 +363,7 @@ pub async fn add_step(
     // derived from the author the row already names.
     let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?;
 
-    sqlx::query(
+    let claim_created = sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \
                              visibility, owner_group_id) \
          VALUES ($1, $2, $3, $4, 0.99, ARRAY['claim','workflow_step'], $5, $6, $7, $8) \
@@ -385,7 +392,9 @@ pub async fn add_step(
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected()
+        == 1;
 
     epigraph_db::EdgeRepository::create_if_not_exists_conn(
         &mut *conn,
@@ -475,6 +484,7 @@ pub async fn add_step(
         step_lineage_id: step_lineage,
         already_present: false,
         inserted_content: Some(step_text.to_string()),
+        claim_created,
     })
 }
 

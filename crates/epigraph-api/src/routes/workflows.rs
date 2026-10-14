@@ -336,6 +336,8 @@ pub async fn store_workflow(
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         None,
@@ -1752,6 +1754,8 @@ pub async fn ingest_workflow(
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         auth,
@@ -2258,15 +2262,37 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
     }
 }
 
+/// Which arm of [`workflow_authority`] admitted the caller (the MCP twin's
+/// `WorkflowArm`, without its stdio arm: every route here is authenticated or
+/// names its caller through the viewer).
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiWorkflowArm {
+    /// The caller is the recorded submitter.
+    Submitter,
+    /// The caller is the operator of the submitter (#503).
+    Operator,
+    /// The AUDITED admin arm.
+    Admin,
+}
+
 /// What [`workflow_authority`] admitted (batch H-b, H3).
 #[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug)]
 struct ApiWorkflowGrant {
     /// The recorded submitter, if any.
     owner: Option<Uuid>,
-    /// Admitted only through the audited admin arm: the write must then record
-    /// [`audit_api_admin_workflow_write`] on its own transaction.
-    admin: bool,
+    /// The arm that admitted the caller. The admin arm's write must record
+    /// [`audit_api_admin_workflow_write`] on its own transaction; every other
+    /// arm's write records [`record_api_caller_workflow_write`].
+    arm: ApiWorkflowArm,
+}
+
+#[cfg(feature = "db")]
+impl ApiWorkflowGrant {
+    fn is_admin(&self) -> bool {
+        matches!(self.arm, ApiWorkflowArm::Admin)
+    }
 }
 
 /// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
@@ -2303,7 +2329,7 @@ async fn workflow_authority(
         if api_admin_arm(conn, auth, caller, &subject).await? {
             return Ok(ApiWorkflowGrant {
                 owner: None,
-                admin: true,
+                arm: ApiWorkflowArm::Admin,
             });
         }
         return Err(ApiError::Forbidden {
@@ -2313,12 +2339,12 @@ async fn workflow_authority(
             ),
         });
     };
-    let allowed = ApiWorkflowGrant {
+    let allowed = |arm| ApiWorkflowGrant {
         owner: Some(owner),
-        admin: false,
+        arm,
     };
     if caller == Some(owner) {
-        return Ok(allowed);
+        return Ok(allowed(ApiWorkflowArm::Submitter));
     }
     if let Some(caller) = caller {
         // On the request's own transaction, not the raw pool (`no_unscoped_pool`).
@@ -2328,15 +2354,12 @@ async fn workflow_authority(
                 message: format!("could not read the submitter's operator: {e}"),
             })?;
         if op.is_some_and(|l| l.operator_id == caller) {
-            return Ok(allowed);
+            return Ok(allowed(ApiWorkflowArm::Operator));
         }
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     if api_admin_arm(conn, auth, caller, &subject).await? {
-        return Ok(ApiWorkflowGrant {
-            owner: Some(owner),
-            admin: true,
-        });
+        return Ok(allowed(ApiWorkflowArm::Admin));
     }
     Err(ApiError::Forbidden {
         reason: format!(
@@ -2345,6 +2368,48 @@ async fn workflow_authority(
              written."
         ),
     })
+}
+
+/// The PROVENANCE of a write admitted through the submitter or operator arm
+/// (the MCP twin's `record_caller_workflow_write`, the same
+/// `workflows.caller_write` row and fields), on the write's own transaction.
+/// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
+/// The token fields are null on a route that carries no token
+/// (`store_workflow`, which names its caller through the viewer).
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+async fn record_api_caller_workflow_write(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    acting: Uuid,
+    action: &str,
+    workflow_id: Uuid,
+    grant: ApiWorkflowGrant,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    let (arm, operator) = match grant.arm {
+        ApiWorkflowArm::Admin => return Ok(()),
+        ApiWorkflowArm::Submitter => ("submitter", None),
+        ApiWorkflowArm::Operator => ("operator", Some(acting)),
+    };
+    let record = serde_json::json!({
+        "action": action,
+        "workflow_id": workflow_id,
+        "submitter": grant.owner,
+        "arm": arm,
+        "acting_agent": acting,
+        "operator": operator,
+        "client_id": auth.map(|a| a.client_id),
+        "token_jti": auth.map(|a| a.jti),
+        "write": details,
+    });
+    epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!(
+                "{action}: could not record the write's provenance: {e}. Nothing was written."
+            ),
+        })
 }
 
 /// The AUDITED admin arm of [`workflow_authority`], shared by a submitted
@@ -2447,6 +2512,29 @@ async fn require_api_workflow_authority(
     Ok(Some((head, grant)))
 }
 
+/// AUTHORSHIP (operator rulings, 2026-10-13; the MCP twin's
+/// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
+/// edge from the acting principal to each claim this request CREATED, on its
+/// own (system-stamped) transaction. The claims stay the system agent's. A
+/// request with no principal records nothing (it names no agent).
+#[cfg(feature = "db")]
+async fn record_api_authorship(
+    conn: &mut sqlx::PgConnection,
+    acting: Option<Uuid>,
+    created: &[Uuid],
+    route: &str,
+) -> Result<(), ApiError> {
+    let Some(acting) = acting else {
+        return Ok(());
+    };
+    epigraph_ingest_executor::record_caller_authorship(conn, acting, created, route)
+        .await
+        .map(|_| ())
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{route}: could not record authorship: {e}. Nothing was written."),
+        })
+}
+
 /// What an ingest records, decided BEFORE the plan walk on the same
 /// transaction (see [`workflow_ingest_submitter`]).
 #[cfg(feature = "db")]
@@ -2457,6 +2545,9 @@ struct ApiIngestDecision {
     submitter: Option<Uuid>,
     /// Admitted through the audited admin arm over an existing lineage.
     admin: bool,
+    /// Every anchor checked and the grant that admitted the caller over it,
+    /// for the provenance rows.
+    grants: Vec<(Uuid, ApiWorkflowGrant)>,
     /// The anchors checked, for the audit row.
     anchors: epigraph_db::repos::workflow::IngestAnchors,
 }
@@ -2491,6 +2582,7 @@ async fn workflow_ingest_submitter(
     let creating = anchors.existing.is_none();
     let mut inherited: Option<Option<Uuid>> = None;
     let mut admin = false;
+    let mut grants = Vec::with_capacity(2);
     if creating {
         let mut checked: Vec<Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -2502,14 +2594,16 @@ async fn workflow_ingest_submitter(
             }
             checked.push(anchor);
             let grant = workflow_authority(conn, auth, caller, anchor).await?;
-            admin |= grant.admin;
+            admin |= grant.is_admin();
             inherited.get_or_insert(grant.owner);
+            grants.push((anchor, grant));
         }
     }
     Ok(ApiIngestDecision {
         creating,
         submitter: inherited.unwrap_or(caller),
         admin,
+        grants,
         anchors,
     })
 }
@@ -2532,6 +2626,30 @@ async fn record_workflow_submitter(
                 .map_err(|e| ApiError::InternalError {
                     message: format!("workflow ingest: could not record the submitter: {e}"),
                 })?;
+        }
+    }
+    // The provenance of the authority exercised over each existing anchor
+    // through a non-admin arm (the MCP twin's per-anchor rows).
+    if let Some(acting) = viewer.principal() {
+        for (anchor, grant) in &decision.grants {
+            record_api_caller_workflow_write(
+                conn,
+                auth,
+                acting,
+                "workflow_ingest",
+                *anchor,
+                *grant,
+                serde_json::json!({
+                    "created_workflow_id": workflow_id,
+                    "canonical_name": extraction.source.canonical_name,
+                    "generation": extraction.source.generation,
+                    "parent_canonical_name": extraction.source.parent_canonical_name,
+                    "lineage_head_before": decision.anchors.lineage_head,
+                    "linked_parent": decision.anchors.linked_parent,
+                    "recorded_submitter": decision.submitter,
+                }),
+            )
+            .await?;
         }
     }
     if decision.admin {
@@ -2579,24 +2697,40 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
-    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
-    {
-        audit_api_admin_workflow_write(
-            &mut tx,
-            &auth,
-            admin,
-            "add_step",
-            head,
-            grant.owner,
-            serde_json::json!({
-                "canonical_name": req.canonical_name,
-                "step_claim_id": r.step_claim_id,
-                "step_lineage_id": r.step_lineage_id,
-                "step_index": r.step_index,
-                "already_present": r.already_present,
-            }),
-        )
-        .await?;
+    if r.claim_created {
+        record_api_authorship(&mut tx, auth.agent_id, &[r.step_claim_id], "add_step").await?;
+    }
+    if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
+        let details = serde_json::json!({
+            "canonical_name": req.canonical_name,
+            "step_claim_id": r.step_claim_id,
+            "step_lineage_id": r.step_lineage_id,
+            "step_index": r.step_index,
+            "already_present": r.already_present,
+        });
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut tx,
+                &auth,
+                acting,
+                "add_step",
+                head,
+                grant.owner,
+                details,
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut tx,
+                Some(&auth),
+                acting,
+                "add_step",
+                head,
+                grant,
+                details,
+            )
+            .await?;
+        }
     }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("add_step: could not commit: {e}"),
@@ -2630,23 +2764,36 @@ pub async fn delete_step(
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
             .await
             .map_err(map_step_err)?;
-    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
-    {
-        audit_api_admin_workflow_write(
-            &mut tx,
-            &auth,
-            admin,
-            "delete_step",
-            head,
-            grant.owner,
-            serde_json::json!({
-                "canonical_name": req.canonical_name,
-                "step_claim_id": r.step_claim_id,
-                "step_lineage_id": r.step_lineage_id,
-                "truth_value_after": r.truth_value,
-            }),
-        )
-        .await?;
+    if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
+        let details = serde_json::json!({
+            "canonical_name": req.canonical_name,
+            "step_claim_id": r.step_claim_id,
+            "step_lineage_id": r.step_lineage_id,
+            "truth_value_after": r.truth_value,
+        });
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut tx,
+                &auth,
+                acting,
+                "delete_step",
+                head,
+                grant.owner,
+                details,
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut tx,
+                Some(&auth),
+                acting,
+                "delete_step",
+                head,
+                grant,
+                details,
+            )
+            .await?;
+        }
     }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("delete_step: could not commit: {e}"),
@@ -2828,6 +2975,23 @@ mod tests {
         }
     }
 
+    /// [`test_auth`] whose principal is a registered `agents` row, for a caller
+    /// whose write succeeds: the `AUTHORED` edge it gets from every claim it
+    /// creates is refused by `edges_validate_refs` for an agent that does not
+    /// exist (in production a token's agent always does).
+    async fn registered_auth(pool: &PgPool) -> crate::middleware::bearer::AuthContext {
+        let auth = test_auth();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'test caller')",
+        )
+        .bind(auth.agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        auth
+    }
+
     /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
     /// `state.db_pool`: the rows the executor writes are owned by the
     /// `workflow-ingest-system` agent's personal group, and a connection that
@@ -2844,9 +3008,10 @@ mod tests {
     async fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
+        let auth = registered_auth(&pool).await;
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
-            .layer(axum::Extension(test_auth()))
+            .layer(axum::Extension(auth))
             .with_state(state)
     }
 
@@ -3243,7 +3408,7 @@ mod tests {
     async fn workflow_steps_refuse_a_caller_who_did_not_submit_the_workflow(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3322,7 +3487,7 @@ mod tests {
     async fn workflow_lineage_and_admin_arm_are_checked_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3451,7 +3616,7 @@ mod tests {
     async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let ingester = test_auth();
+        let ingester = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3672,5 +3837,250 @@ mod tests {
             vec![Some("null".to_string())],
             "one audit row, \"submitter\": null"
         );
+    }
+
+    /// An agent row, and (when `client_type` is given) an ACTIVE OAuth client
+    /// of that type for it; returns `(agent, client)`.
+    async fn seed_bound_agent(pool: &PgPool, label: &str, client_type: &str) -> (Uuid, Uuid) {
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) \
+             VALUES (decode(md5(random()::text) || md5(random()::text), 'hex'), $1) RETURNING id",
+        )
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let client: Uuid = sqlx::query_scalar(
+            "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                        status, agent_id, legal_entity_name, legal_contact_email) \
+             VALUES ($1, $2, $3, ARRAY['claims:write'], 'active', $4, \
+                     'Fixture Org', 'fixture@example.invalid') RETURNING id",
+        )
+        .bind(format!("{label}-{agent}"))
+        .bind(label)
+        .bind(client_type)
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (agent, client)
+    }
+
+    /// A registered human operator (migration 122 section 1c).
+    async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+        let (agent, client) = seed_bound_agent(pool, label, "human").await;
+        sqlx::query(
+            "INSERT INTO human_operators (agent_id, client_id, reason) VALUES ($1, $2, 'test')",
+        )
+        .bind(agent)
+        .bind(client)
+        .execute(pool)
+        .await
+        .unwrap();
+        (agent, client)
+    }
+
+    /// The agent of a service client ALLOWLISTED for `operator` (migration
+    /// 149, arm (c)), through the real maintenance definer.
+    async fn seed_allowlisted_agent(pool: &PgPool, operator: Uuid, label: &str) -> (Uuid, Uuid) {
+        use sqlx::Executor;
+        let (agent, client) = seed_bound_agent(pool, label, "service").await;
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+            .await
+            .unwrap();
+        let binding: Option<String> = sqlx::query_scalar(
+            "SELECT effective_binding \
+               FROM public.epigraph_allow_author_binding_client($1, $2, 'test')",
+        )
+        .bind(client)
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        conn.execute("RESET SESSION AUTHORIZATION").await.unwrap();
+        assert_eq!(
+            binding.as_deref(),
+            Some(epigraph_db::CLIENT_ALLOWLIST_BINDING),
+            "calibration: {label} is allowlisted"
+        );
+        (agent, client)
+    }
+
+    /// The operator ruling over HTTP (2026-10-13; the MCP twin is
+    /// `epigraph-mcp/tests/workflow_write_provenance.rs`): on a workflow whose
+    /// recorded submitter is the human H, an agent bound to H (an allowlisted
+    /// client of H, the shape a host's shared credential takes) is REFUSED 403
+    /// with nothing written and no provenance row; H itself is admitted (the
+    /// submitter arm) with one `workflows.caller_write` row naming it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_bound_agent_is_refused_and_the_submitting_human_admitted_over_http(pool: PgPool) {
+        use axum::routing::post;
+        let state = scoped_test_state(&pool).await;
+        let router_as = |auth: crate::middleware::bearer::AuthContext| {
+            axum::Router::new()
+                .route("/api/v1/workflows/ingest", post(ingest_workflow))
+                .route("/api/v1/workflows/steps", post(add_step))
+                .layer(axum::Extension(auth))
+                .with_state(state.clone())
+        };
+        let post_json = |uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let as_agent = |agent: Uuid, client: Uuid| {
+            let mut a = test_auth();
+            a.client_id = client;
+            a.owner_id = Some(client);
+            a.agent_id = Some(agent);
+            a
+        };
+        let (h, h_client) = seed_human_operator(&pool, "h3-la-human").await;
+        let (agent, client) = seed_allowlisted_agent(&pool, h, "h3-la-agent").await;
+        let authored_sql = "SELECT source_id FROM edges \
+                            WHERE relationship = 'AUTHORED' AND source_type = 'agent' \
+                              AND target_type = 'claim' AND target_id = $1";
+        let authored_total = "SELECT count(*) FROM edges WHERE relationship = 'AUTHORED'";
+
+        let ingester = registered_auth(&pool).await;
+        let resp = router_as(ingester.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/ingest",
+                ingest_payload("h3-http-linked"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wf: Uuid = sqlx::query_scalar(
+            "UPDATE workflows \
+                SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($1::text)) \
+              WHERE canonical_name = 'h3-http-linked' RETURNING id",
+        )
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Authorship of what the ingest created: one AUTHORED edge from the
+        // ingesting principal per executed claim (all new in this database).
+        let executed: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'executes'",
+        )
+        .bind(wf)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!executed.is_empty());
+        for c in &executed {
+            let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+                .bind(c)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(sources, vec![ingester.agent_id.unwrap()], "claim {c}");
+        }
+        let authored_before: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-linked' AND e.relationship = 'executes'";
+        let provenance_sql = "SELECT agent_id, details FROM security_events \
+                              WHERE event_type = 'workflows.caller_write' \
+                                AND details->>'workflow_id' = $1::text";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let resp = router_as(as_agent(agent, client))
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's agent's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an agent bound to the submitting human is not admitted over HTTP"
+        );
+        let mid: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mid, before, "nothing written");
+        let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
+            .bind(wf)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "no provenance for a refusal: {rows:?}");
+        let authored_mid: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            authored_mid, authored_before,
+            "no AUTHORED edge for a refusal"
+        );
+
+        let auth = as_agent(h, h_client);
+        let resp = router_as(auth.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's own step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the submitting human");
+        let step = parse_body(resp).await["step_claim_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before + 1);
+        let stamp: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1::uuid")
+            .bind(&step)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(stamp, h, "the system agent still authors the step");
+        let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+            .bind(Uuid::parse_str(&step).unwrap())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sources,
+            vec![h],
+            "one AUTHORED edge from the acting principal"
+        );
+        let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
+            .bind(wf)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (row_agent, d) = &rows[0];
+        assert_eq!(
+            *row_agent,
+            Some(stamp),
+            "attributed to the session's system stamp"
+        );
+        assert_eq!(d["action"], "add_step");
+        assert_eq!(d["submitter"], h.to_string());
+        assert_eq!(d["arm"], "submitter");
+        assert_eq!(d["acting_agent"], h.to_string());
+        assert_eq!(d["operator"], serde_json::Value::Null);
+        assert_eq!(d["client_id"], h_client.to_string());
+        assert_eq!(d["token_jti"], auth.jti.to_string());
+        assert_eq!(d["write"]["step_claim_id"], step.as_str());
     }
 }

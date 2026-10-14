@@ -527,7 +527,14 @@ async fn two_callers_chain_edges_share_the_workflow_ingest_owner(pool: PgPool) {
             Some(shared),
             "{rel}: the author record is the shared agent's"
         );
-        let want = if rel == "executes" { world } else { shared };
+        // `executes` (a workflow endpoint) and `AUTHORED` (an agent endpoint,
+        // the acting caller's authorship of the step it created) are outside
+        // migration 120's writer scope, so the trigger owns them by the world.
+        let want = if rel == "executes" || rel == "AUTHORED" {
+            world
+        } else {
+            shared
+        };
         assert_eq!(*owner, want, "{rel}: {owners:?}");
     }
     for g in [
