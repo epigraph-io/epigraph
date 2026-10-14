@@ -622,3 +622,66 @@ async fn rewire_rechecks_that_the_edge_is_still_in_force(pool: PgPool) {
     let rows = edge_rows(&pool, live.edge).await;
     assert_close(mass(&rows[0].1, "~0,1"), 0.48, "the live edge was rewired");
 }
+
+/// `--written-before` limits the rewrite to rows last written before an
+/// instant (the operator's lever for "only pre-#401 rows"), and a rewritten
+/// row drops out of it because the upsert restamps `created_at`: re-selecting
+/// with the same cutoff finds nothing left to do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_written_before_selects_only_older_rows_and_rewritten_rows_drop_out(pool: PgPool) {
+    let old = seed_world(&pool, "old").await;
+    let new = seed_world(&pool, "new").await;
+    sqlx::query(
+        "UPDATE mass_functions SET created_at = now() - interval '1 day' WHERE perspective_id = $1",
+    )
+    .bind(old.edge)
+    .execute(&pool)
+    .await
+    .expect("backdate the old row");
+    // The DB's clock, not this host's: the cutoff is compared with now().
+    let cutoff: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT now() - interval '1 hour'")
+            .fetch_one(&pool)
+            .await
+            .expect("cutoff");
+    let opts = RewireOptions {
+        written_before: Some(cutoff),
+        ..RewireOptions::default()
+    };
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let selected: Vec<Uuid> = select_rewire_edges(&pool, &opts)
+        .await
+        .expect("select")
+        .into_iter()
+        .map(|e| e.edge_id)
+        .collect();
+    assert_eq!(
+        selected,
+        vec![old.edge],
+        "only the row written before the cutoff"
+    );
+
+    let summary = run_rewire_phase(&pool, &viewer, &opts)
+        .await
+        .expect("rewire");
+    assert_eq!((summary.eligible, summary.rewired), (1, 1), "{summary:?}");
+    assert_close(
+        mass(&edge_rows(&pool, old.edge).await[0].1, "~0,1"),
+        0.48,
+        "the old row was rewritten",
+    );
+    assert_close(
+        mass(&edge_rows(&pool, new.edge).await[0].1, "~0,1"),
+        0.60,
+        "the newer row was left alone",
+    );
+
+    assert!(
+        select_rewire_edges(&pool, &opts)
+            .await
+            .expect("re-select")
+            .is_empty(),
+        "a rewritten row is restamped and drops out of the same cutoff"
+    );
+}
