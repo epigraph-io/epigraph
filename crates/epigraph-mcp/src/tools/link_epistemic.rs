@@ -9,7 +9,9 @@
 //! emits the `edge.added` durable event.
 //!
 //! Direction convention: `source -> target` means "source `relationship`
-//! target" (a `supports` edge: source is evidence for / strengthens target),
+//! target" (a `supports` edge: source is evidence for target, transmitting
+//! its belief toward it; it can still lower the target's belief, see the
+//! tool description),
 //! matching `epigraph_engine::sheaf::restriction_kind_with_profile`.
 //!
 //! Tight contract:
