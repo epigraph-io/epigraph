@@ -966,6 +966,13 @@ mod diverse_fixture {
         drift_bucket: usize,
         drift: f32,
     ) -> String {
+        vec_to_pgvec(&drift_vec(bucket, value, drift_bucket, drift))
+    }
+
+    /// The raw vector behind `cluster_pgvec_with_drift`, shared with
+    /// `cluster_pgvec_with_drift_and_query_share` so the drift layout lives
+    /// in one place.
+    fn drift_vec(bucket: usize, value: f32, drift_bucket: usize, drift: f32) -> Vec<f32> {
         let mut v = vec![0.0f32; DIM];
         let start = bucket * STRIDE;
         let end = start + STRIDE;
@@ -977,7 +984,7 @@ mod diverse_fixture {
         for slot in v.iter_mut().take(dend).skip(dstart) {
             *slot = drift;
         }
-        vec_to_pgvec(&v)
+        v
     }
 
     /// `cluster_pgvec_with_drift(bucket, value, drift_bucket, drift)` plus a
@@ -1008,17 +1015,7 @@ mod diverse_fixture {
             bucket != 0 && drift_bucket != 0,
             "bucket 0 is the query-share slot; got bucket={bucket}, drift_bucket={drift_bucket}"
         );
-        let mut v = vec![0.0f32; DIM];
-        let start = bucket * STRIDE;
-        let end = start + STRIDE;
-        for slot in v.iter_mut().take(end).skip(start) {
-            *slot = value;
-        }
-        let dstart = drift_bucket * STRIDE;
-        let dend = dstart + STRIDE;
-        for slot in v.iter_mut().take(dend).skip(dstart) {
-            *slot = drift;
-        }
+        let mut v = drift_vec(bucket, value, drift_bucket, drift);
         for slot in v.iter_mut().take(STRIDE) {
             *slot = query_share;
         }
