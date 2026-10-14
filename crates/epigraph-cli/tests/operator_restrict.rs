@@ -581,10 +581,14 @@ async fn apply_moves_the_claim_and_everything_that_follows(pool: PgPool) {
         ("mass_functions", fx.mf_w),
         ("claim_versions", fx.cv),
         ("challenges", fx.challenge),
-        ("harvester_fragments", fx.frag),
     ] {
         assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
     }
+    assert_eq!(
+        row(&pool, "harvester_fragments", fx.frag).await,
+        publ(WORLD),
+        "a fragment that is also B's provenance is a shared NODE: it does not narrow"
+    );
     assert!(!writer_owned(&pool, "evidence", fx.ev_w).await);
     assert!(!writer_owned(&pool, "mass_functions", fx.mf_w).await);
     let cf: (Uuid, String) = sqlx::query_as(
@@ -1223,4 +1227,484 @@ async fn an_edge_is_not_widened_while_its_other_moved_endpoint_is_held(pool: PgP
     let rv = reverse(&pool, &[&mf], &["--batch-size", "1"], true).await;
     assert_eq!(rv.code, 0, "{}", rv.show());
     assert_same(&before, &snapshot(&pool, true).await, "held then finished");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edges with an EVIDENCE endpoint: the narrowest of their endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An edge between any two nodes (`claim` or `evidence`), stamped by the
+/// tenancy trigger from its endpoints; with `force`, its tenancy is then set
+/// to exactly `(visibility, owner, co_owner)`.
+async fn node_edge(
+    pool: &PgPool,
+    (src, src_ty): (Uuid, &str),
+    (tgt, tgt_ty): (Uuid, &str),
+    force: Option<(&str, Uuid, Option<Uuid>)>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, $5, 'supports')",
+    )
+    .bind(id)
+    .bind(src)
+    .bind(src_ty)
+    .bind(tgt)
+    .bind(tgt_ty)
+    .execute(pool)
+    .await
+    .expect("seed node edge");
+    if let Some((v, o, co)) = force {
+        sqlx::query(
+            "UPDATE edges SET visibility = $2, owner_group_id = $3, co_owner_group_id = $4 \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(v)
+        .bind(o)
+        .bind(co)
+        .execute(pool)
+        .await
+        .expect("force edge tenancy");
+    }
+    id
+}
+
+/// Edges touching `claims` or their evidence that are PUBLIC while one of their
+/// endpoints is not: the shape the operator's rule forbids ("an edge goes
+/// invisible if one endpoint is invisible").
+async fn visible_edges_with_an_invisible_endpoint(pool: &PgPool, claims: &[Uuid]) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT e.id FROM edges e \
+           CROSS JOIN LATERAL public.epigraph_node_tenancy(e.source_id, e.source_type) s \
+           CROSS JOIN LATERAL public.epigraph_node_tenancy(e.target_id, e.target_type) t \
+          WHERE e.visibility = 'public' AND (s.v <> 'public' OR t.v <> 'public') \
+            AND (e.source_id = ANY($1) OR e.target_id = ANY($1) \
+                 OR e.source_id IN (SELECT id FROM evidence WHERE claim_id = ANY($1)) \
+                 OR e.target_id IN (SELECT id FROM evidence WHERE claim_id = ANY($1))) \
+          ORDER BY 1",
+    )
+    .bind(claims)
+    .fetch_all(pool)
+    .await
+    .expect("visible edges with an invisible endpoint")
+}
+
+/// claim->evidence and evidence->evidence edges whose evidence endpoint moves
+/// with its claim narrow to the narrowest of their endpoints, exactly as a
+/// claim-endpoint edge does; an edge already narrower than that keeps its
+/// tuple; no visible edge is left with an invisible endpoint; the dry run
+/// reports the count; and the reversal restores every one byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evidence_endpoint_edges_narrow_on_apply_and_restore_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let ev_b = evidence(&pool, fx.b, "B's evidence").await;
+    let x_ce = node_edge(&pool, (fx.b, "claim"), (fx.ev_a, "evidence"), None).await;
+    let x_ee = node_edge(&pool, (fx.ev_a, "evidence"), (ev_b, "evidence"), None).await;
+    let x_narrow = node_edge(
+        &pool,
+        (fx.ev_a, "evidence"),
+        (ev_b, "evidence"),
+        Some(("group", fx.target, Some(fx.k_group))),
+    )
+    .await;
+    assert_eq!(edge(&pool, x_ce).await, (WORLD, "public".into(), None));
+    assert_eq!(edge(&pool, x_ee).await, (WORLD, "public".into(), None));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let before = snapshot(&pool, true).await;
+
+    let dry = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("EVIDENCE-ENDPOINT-EDGES\t3\t") && dry.stdout.contains("narrowed"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("edges: rows moved: 4"),
+        "{}",
+        dry.show()
+    );
+
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let g = fx.target;
+    assert_eq!(row(&pool, "evidence", fx.ev_a).await, grp(g));
+    assert_eq!(
+        edge(&pool, x_ce).await,
+        (g, "group".into(), None),
+        "claim(public) -> evidence(now in the target): the narrow tuple, as for a claim endpoint"
+    );
+    assert_eq!(
+        edge(&pool, x_ee).await,
+        (g, "group".into(), None),
+        "evidence(now in the target) -> evidence(public): the narrow tuple"
+    );
+    assert_eq!(
+        edge(&pool, x_narrow).await,
+        (g, "group".into(), Some(fx.k_group)),
+        "an edge already narrower than its endpoints keeps its tuple"
+    );
+    assert_eq!(
+        visible_edges_with_an_invisible_endpoint(&pool, &[fx.a]).await,
+        Vec::<Uuid>::new()
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "evidence edges reversed",
+    );
+}
+
+/// An evidence->evidence edge between two claims the run moved is not put back
+/// on its recorded PUBLIC tuple while the other claim is still restricted
+/// (held by the reversal); once that claim is reversed, the edge is restored
+/// exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_evidence_edge_is_not_widened_while_its_other_moved_endpoint_is_held(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c2 = fixture::seed_public_claim(&pool, fx.operator, "second").await;
+    let ev_c2 = evidence(&pool, c2, "c2's evidence").await;
+    let x = node_edge(&pool, (fx.ev_a, "evidence"), (ev_c2, "evidence"), None).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, c2]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(edge(&pool, x).await, (fx.target, "group".into(), None));
+    let late = evidence(&pool, c2, "written after the restriction").await;
+    let rv = reverse(&pool, &[&mf], &["--batch-size", "1"], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert_eq!(row(&pool, "evidence", fx.ev_a).await, publ(WORLD));
+    assert_eq!(row(&pool, "evidence", ev_c2).await, grp(fx.target));
+    assert_eq!(
+        edge(&pool, x).await,
+        (fx.target, "group".into(), None),
+        "the edge must stay narrow while its other moved endpoint is still restricted"
+    );
+    assert_eq!(
+        visible_edges_with_an_invisible_endpoint(&pool, &[fx.a, c2]).await,
+        Vec::<Uuid>::new()
+    );
+    exec(&pool, &format!("DELETE FROM evidence WHERE id = '{late}'")).await;
+    let rv = reverse(&pool, &[&mf], &["--batch-size", "1"], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "held then finished");
+}
+
+/// A claim whose EVIDENCE carries another group's declared edge is held:
+/// narrowing that edge into the target would make it readable to the target's
+/// members. Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_whose_evidence_edge_would_widen_is_held(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let h2 = fixture::seed_public_claim(&pool, fx.operator, "carries H's evidence edge").await;
+    let ev_h2 = evidence(&pool, h2, "h2's evidence").await;
+    let x = node_edge(
+        &pool,
+        (ev_h2, "evidence"),
+        (fx.b, "claim"),
+        Some(("group", fx.other_group, None)),
+    )
+    .await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[h2]);
+    let before = snapshot(&pool, false).await;
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &dir.join("m.jsonl"),
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains(&format!("HELD-UNDER-LOCK\t{h2}\tedges {x}")),
+        "{}",
+        r.show()
+    );
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "held evidence-edge claim",
+    );
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nodes stay; only this claim's dependent and link rows narrow
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The classification of every table a restriction touches: DEPENDENT rows
+/// (the claim's own) and LINK rows (an association of the claim with another
+/// node) narrow; harvester fragments are NODES and narrow only when every
+/// claim they are the provenance of is restricted with them. A table the
+/// cascade gains without a decision here fails this test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_touched_table_is_classified_node_link_or_dependent(pool: PgPool) {
+    use epigraph_cli::operator::restrict::{role_of, Role};
+    let mut conn = pool.acquire().await.unwrap();
+    let specs = epigraph_cli::operator::tables::propagated_tables(&mut conn)
+        .await
+        .expect("propagated tables");
+    let mut got: Vec<(String, Role)> = specs
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                role_of(&s.name).expect("unclassified table"),
+            )
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let want: Vec<(String, Role)> = [
+        ("challenges", Role::Dependent),
+        ("claim_cluster_membership", Role::Link),
+        ("claim_clusters", Role::Link),
+        ("claim_frames", Role::Link),
+        ("claim_neighborhood_membership", Role::Link),
+        ("claim_signature_revocations", Role::Dependent),
+        ("claim_versions", Role::Dependent),
+        ("claims", Role::Dependent),
+        ("ds_bayesian_divergence", Role::Dependent),
+        ("ds_combined_beliefs", Role::Dependent),
+        ("edges", Role::Link),
+        ("entity_mentions", Role::Link),
+        ("evidence", Role::Dependent),
+        ("experiment_entity_mentions", Role::Link),
+        ("experiment_triples", Role::Dependent),
+        ("harvester_claim_provenance", Role::Link),
+        ("harvester_fragments", Role::SharedNode),
+        ("mass_functions", Role::Dependent),
+        ("reasoning_traces", Role::Dependent),
+        ("triples", Role::Dependent),
+    ]
+    .into_iter()
+    .map(|(t, r)| (t.to_string(), r))
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// A cluster, a frame, a shared fragment and the far-end claim and evidence
+/// of A's edges are NODES: after restricting A they are byte-identical, the
+/// other member's link rows are unchanged, and only A's own link rows (graph
+/// cluster membership, k-means assignment, frame assignment, provenance) and
+/// A's edges narrow. A fragment that is A's alone narrows with A. The reversal
+/// restores every row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.target;
+    let run = Uuid::new_v4();
+    let gc = Uuid::new_v4();
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO graph_clusters (id, run_id, label, size) VALUES ('{gc}', '{run}', 'c', 2)"
+        ),
+    )
+    .await;
+    for c in [fx.a, fx.b] {
+        exec(
+            &pool,
+            &format!(
+                "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) \
+                 VALUES ('{c}', '{gc}', '{run}')"
+            ),
+        )
+        .await;
+        exec(
+            &pool,
+            &format!(
+                "INSERT INTO claim_clusters (claim_id, cluster_id, centroid_distance, \
+                   second_centroid_dist, boundary_ratio, silhouette_score, cluster_run_id) \
+                 VALUES ('{c}', 7, 0.1, 0.2, 0.5, 0.3, '{run}')"
+            ),
+        )
+        .await;
+    }
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ('{}', '{}')",
+            fx.b, fx.frame
+        ),
+    )
+    .await;
+    let ev_b = evidence(&pool, fx.b, "B's evidence").await;
+    let x_ee = node_edge(&pool, (fx.ev_a, "evidence"), (ev_b, "evidence"), None).await;
+    let src: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
+    )
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let frag_a: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
+                                          visibility) \
+         VALUES ($1, $2, 'A only', $3, 'public') RETURNING id",
+    )
+    .bind(src)
+    .bind(h32(Uuid::new_v4()))
+    .bind(WORLD)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) \
+             VALUES ('{}', '{frag_a}')",
+            fx.a
+        ),
+    )
+    .await;
+
+    let node_rows = |t: &'static str, cond: String| {
+        let pool = pool.clone();
+        async move {
+            let rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(t)::text FROM {t} t WHERE {cond} ORDER BY 1"
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            rows
+        }
+    };
+    let b_links = |pool: PgPool, b: Uuid| async move {
+        let mut out = Vec::new();
+        for t in [
+            "claim_cluster_membership",
+            "claim_clusters",
+            "claim_frames",
+            "harvester_claim_provenance",
+            "evidence",
+        ] {
+            let rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(t)::text FROM {t} t WHERE claim_id = $1 ORDER BY 1"
+            ))
+            .bind(b)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            out.push((t, rows));
+        }
+        out
+    };
+    let nodes_before = (
+        node_rows("graph_clusters", format!("id = '{gc}'")).await,
+        node_rows("frames", format!("id = '{}'", fx.frame)).await,
+        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
+        node_rows("claims", format!("id = '{}'", fx.b)).await,
+    );
+    let b_before = b_links(pool.clone(), fx.b).await;
+    let before = snapshot(&pool, true).await;
+
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    let nodes_after = (
+        node_rows("graph_clusters", format!("id = '{gc}'")).await,
+        node_rows("frames", format!("id = '{}'", fx.frame)).await,
+        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
+        node_rows("claims", format!("id = '{}'", fx.b)).await,
+    );
+    assert_eq!(nodes_before, nodes_after, "a connected NODE changed");
+    assert_eq!(
+        b_before,
+        b_links(pool.clone(), fx.b).await,
+        "B's own rows changed"
+    );
+    for t in [
+        "claim_cluster_membership",
+        "claim_clusters",
+        "claim_frames",
+        "harvester_claim_provenance",
+    ] {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT owner_group_id, visibility::text FROM {t} WHERE claim_id = $1"
+        ))
+        .bind(fx.a)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty(), "{t}: A has no row");
+        assert!(
+            rows.iter().all(|r| *r == grp(g)),
+            "{t}: A's link rows {rows:?}"
+        );
+    }
+    assert_eq!(row(&pool, "harvester_fragments", frag_a).await, grp(g));
+    assert_eq!(edge(&pool, x_ee).await, (g, "group".into(), None));
+    assert_eq!(row(&pool, "evidence", ev_b).await, publ(WORLD));
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "nodes and links reversed",
+    );
 }
