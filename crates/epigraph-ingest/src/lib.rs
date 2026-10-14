@@ -276,6 +276,61 @@ mod tests {
         assert_eq!(alice_edges.len(), 5);
     }
 
+    /// Backlog a55aac45 / U039: a placeholder author name ("Unknown") must not
+    /// get per-claim `author_placeholder` edges, and the real author after it
+    /// keeps her ORIGINAL `author_index` (1) — the MCP walk resolves that index
+    /// against its own map keyed by the unfiltered position.
+    #[test]
+    fn test_build_plan_skips_placeholder_authors_keeping_original_index() {
+        let json = r#"{
+            "source": {
+                "title": "Test",
+                "source_type": "Paper",
+                "authors": [
+                    {"name": "Unknown"},
+                    {"name": "Alice", "affiliations": ["MIT"]}
+                ],
+                "metadata": {}
+            },
+            "thesis": "Main claim",
+            "thesis_derivation": "TopDown",
+            "sections": [
+                {
+                    "title": "Intro",
+                    "paragraphs": [
+                        {
+                            "text": "Compound claim.",
+                            "atoms": ["Atom one.", "Atom two."],
+                            "generality": [0, 1],
+                            "confidence": 0.9
+                        }
+                    ]
+                }
+            ],
+            "relationships": []
+        }"#;
+
+        let extraction: DocumentExtraction = serde_json::from_str(json).unwrap();
+        let plan = build_ingest_plan(&extraction);
+
+        let author_edges: Vec<_> = plan
+            .edges
+            .iter()
+            .filter(|e| e.relationship == "asserts" && e.source_type == "author_placeholder")
+            .collect();
+        assert_eq!(
+            author_edges.len(),
+            plan.claims.len(),
+            "one asserts edge per claim, for the single real author only"
+        );
+        assert!(
+            author_edges
+                .iter()
+                .all(|e| e.properties["author_index"] == 1),
+            "every edge keeps Alice's original index 1; none for the placeholder at 0"
+        );
+    }
+
     #[test]
     fn test_atom_deterministic_ids() {
         let json = r#"{
