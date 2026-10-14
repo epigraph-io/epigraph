@@ -46,7 +46,18 @@ const EPS: f64 = 1e-9;
 /// this call's frame afterwards.
 const CACHE_NOT_UPDATED: &str = "cached belief was NOT updated";
 
-async fn spawn_app(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
+/// Which role the handler's raw `db_pool` connects as.
+#[derive(Clone, Copy)]
+enum RawPool {
+    /// The harness superuser (`privileged_raw_state`'s shape): only the
+    /// stamped transaction is held to the policies.
+    Superuser,
+    /// `epigraph_app` too (`app_role_state`'s shape), as on prod: an
+    /// unstamped write through the alias is refused.
+    AppRole,
+}
+
+async fn spawn_app(pool: &PgPool, raw: RawPool) -> (SocketAddr, oneshot::Sender<()>) {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
             .fetch_one(pool)
@@ -61,7 +72,11 @@ async fn spawn_app(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
-    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let raw = match raw {
+        RawPool::Superuser => pool.clone(),
+        RawPool::AppRole => fixture::downgraded_pool(pool, "epigraph_app").await,
+    };
+    let mut state = AppState::with_db(raw, ApiConfig::default());
     state.scoped = Some(scoped);
     state
         .load_entity_type_cache()
@@ -106,7 +121,7 @@ async fn seed_frame(pool: &PgPool, tag: &str) -> Uuid {
     .expect("seed frame")
 }
 
-async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) -> World {
+async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions, raw: RawPool) -> World {
     let pool = pool_opts
         .connect_with(conn_opts)
         .await
@@ -131,7 +146,7 @@ async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions) -> World {
     .expect("seed claim");
     let frame = seed_frame(&pool, "target").await;
 
-    let (addr, shutdown) = spawn_app(&pool).await;
+    let (addr, shutdown) = spawn_app(&pool, raw).await;
     World {
         pool,
         addr,
@@ -220,7 +235,7 @@ async fn the_owners_submission_lands_and_attributes_the_cache(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
-    let w = world(pool_opts, conn_opts).await;
+    let w = world(pool_opts, conn_opts, RawPool::Superuser).await;
     let resp = submit(&w, w.owner).await;
 
     assert_eq!(
@@ -256,7 +271,7 @@ async fn a_non_owner_on_another_frame_keeps_the_owners_cache_and_is_told(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
-    let w = world(pool_opts, conn_opts).await;
+    let w = world(pool_opts, conn_opts, RawPool::Superuser).await;
     let other = seed_frame(&w.pool, "owners").await;
     seed_cache(&w, other).await;
 
@@ -309,7 +324,7 @@ async fn a_non_owner_on_the_carried_frame_refreshes_the_cache(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
-    let w = world(pool_opts, conn_opts).await;
+    let w = world(pool_opts, conn_opts, RawPool::Superuser).await;
     seed_cache(&w, w.frame).await;
 
     let resp = submit(&w, w.stranger).await;
@@ -332,7 +347,7 @@ async fn a_non_owner_seeds_no_cache_off_binary_truth_and_is_told(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
-    let w = world(pool_opts, conn_opts).await;
+    let w = world(pool_opts, conn_opts, RawPool::Superuser).await;
 
     let resp = submit(&w, w.stranger).await;
 
@@ -347,5 +362,39 @@ async fn a_non_owner_seeds_no_cache_off_binary_truth_and_is_told(
             .iter()
             .any(|m| m.contains(CACHE_NOT_UPDATED)),
         "the response must say the cache was not updated: {resp}"
+    );
+}
+
+/// With the raw pool on the application role too, as on prod, the owner's
+/// global scoped belief (`ds_combined_beliefs`, scope `global`) still lands:
+/// it is written on the stamped transaction. On the unstamped raw pool FORCE
+/// refused it without an error, and since no derived BBA is stored beside the
+/// inputs any more it is the only record of a REST fold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts, RawPool::AppRole).await;
+    let resp = submit(&w, w.owner).await;
+
+    assert_eq!(
+        bbas(&w).await,
+        vec![Some(w.owner)],
+        "the owner's BBA persisted"
+    );
+    let scoped: Option<f64> = sqlx::query_scalar(
+        "SELECT belief FROM ds_combined_beliefs \
+          WHERE frame_id = $1 AND claim_id = $2 AND scope_type = 'global' AND scope_id IS NULL",
+    )
+    .bind(w.frame)
+    .bind(w.claim)
+    .fetch_optional(&w.pool)
+    .await
+    .expect("read ds_combined_beliefs");
+    assert!(
+        scoped.is_some_and(|b| (b - 0.6).abs() < EPS),
+        "the global scoped belief must be stored with this frame's belief 0.6: {scoped:?} \
+         (response {resp})"
     );
 }

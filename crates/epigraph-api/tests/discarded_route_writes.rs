@@ -71,11 +71,12 @@ const WRITE_CALLEES: &[&str] = &[
 const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 6),
     // 16 before U024 moved `submit_evidence`'s writes onto its stamped
-    // transaction. Of the three gone, the combined system BBA (`store`) was
-    // deleted outright; the `claim_frames` INSERT and the Beta UPDATE are STILL
-    // best-effort, under a SAVEPOINT with the refusal logged, a form this
-    // register does not see: lowered because the `let _ =` writes are gone.
-    ("belief.rs", 13),
+    // transaction. Of the four gone, the combined system BBA (`store`) was
+    // deleted outright; the `claim_frames` INSERT, the Beta UPDATE and the
+    // global `ScopedBeliefRepository::upsert` are STILL best-effort, under a
+    // SAVEPOINT with the refusal logged, a form this register does not see:
+    // lowered because the `let _ =` writes are gone.
+    ("belief.rs", 12),
     ("challenge.rs", 1),
     ("claims.rs", 3),
     ("community.rs", 1),
@@ -98,8 +99,8 @@ const REGISTER: &[(&str, usize)] = &[
 
 /// Ceiling on the total, so growth fails structurally even if a row and the
 /// total were raised together.
-/// 46 until U024 removed three of `belief.rs`'s rows.
-const HIGH_WATER: usize = 43;
+/// 46 until U024 removed four of `belief.rs`'s rows.
+const HIGH_WATER: usize = 42;
 
 fn routes_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes")

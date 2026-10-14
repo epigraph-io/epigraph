@@ -30,9 +30,11 @@
 //! **Three handlers are deliberately NOT converted, and the reason is not
 //! caution.** `create_frame`, `submit_evidence` and `refine_frame` each write
 //! through their alias. (`submit_evidence`'s own tier-A writes, the BBA, the
-//! frame assignment, the claim's cached belief and its Beta parameters, now go
-//! through ONE [`AppState::write_as`] transaction; its alias remains for the
-//! pre-transaction reads and the best-effort side effects after the commit.) `read_as` is documented read-only: `ScopedRead::commit`
+//! frame assignment, the claim's cached belief, its Beta parameters and its
+//! global scoped belief, now go through ONE [`AppState::write_as`]
+//! transaction; its alias remains for the pre-transaction reads and the
+//! best-effort side effects after the commit.) `read_as` is documented
+//! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
 //! `DerefMut<Target = PgConnection>` means that mistake COMPILES, so the
@@ -964,8 +966,8 @@ pub async fn create_frame(
 ///
 /// Pipeline: discount → (one stamped transaction: store → recompute the
 /// claim's belief on this frame with the shared pipeline
-/// `edge_factor::recompute_claim_belief_on_frame` → Beta update) → emit events
-/// → compute divergence. The belief this returns is the one a later
+/// `edge_factor::recompute_claim_belief_on_frame` → Beta update → global
+/// scoped belief) → emit events → compute divergence. The belief this returns is the one a later
 /// `recompute_beliefs` with no new evidence leaves (backlogs 2bffdfdc,
 /// 82dcff9d), and no derived "combined" BBA is stored beside the input.
 ///
@@ -1261,9 +1263,10 @@ pub async fn submit_evidence(
     }
 
     // 5. ONE viewer-stamped transaction for this submission's own writes: the
-    //    BBA, the frame assignment, the claim's cached belief and its Beta
-    //    parameters (backlogs 2bffdfdc / I075 and 82dcff9d / I228, the REST
-    //    twins of `submit_ds_evidence`'s #317 and #513).
+    //    BBA, the frame assignment, the claim's cached belief, its Beta
+    //    parameters and its global scoped belief (backlogs 2bffdfdc / I075 and
+    //    82dcff9d / I228, the REST twins of `submit_ds_evidence`'s #317 and
+    //    #513).
     //
     //    The combine and the cache write are DELEGATED to the shared pipeline,
     //    `edge_factor::recompute_claim_belief_on_frame`, the same function
@@ -1524,8 +1527,6 @@ pub async fn submit_evidence(
     )
     .unwrap_or(i64::MAX);
 
-    tx.commit().await?;
-
     // The values the rest of the handler reports and emits: this frame's
     // combination by the shared pipeline. `combine_multiple` folds with
     // Dempster at every step since U025; a single BBA is not folded, so it has
@@ -1549,6 +1550,45 @@ pub async fn submit_evidence(
     } else {
         vec![]
     };
+
+    // 15. The global scoped belief cache, on the stamped transaction
+    //     (best-effort, under a SAVEPOINT like steps 6 and 13b). On the raw
+    //     pool this write was refused under FORCE without an error, and with
+    //     it the only record of a REST fold's conflict K now that no derived
+    //     BBA is stored beside the inputs.
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let stored = epigraph_db::ScopedBeliefRepository::upsert(
+            &mut *sp,
+            frame_id,
+            request.claim_id,
+            "global",
+            None,
+            final_bel,
+            final_pl,
+            m_empty,
+            m_missing,
+            final_k,
+            final_method,
+            Some(final_betp),
+        )
+        .await;
+        match stored {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: global scoped belief refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+    }
+
+    tx.commit().await?;
 
     // 13c. CDST residual mass analysis
     {
@@ -1596,23 +1636,6 @@ pub async fn submit_evidence(
         None,
         None,
         None,
-    )
-    .await;
-
-    // 15. Store global scoped belief cache
-    let _ = epigraph_db::ScopedBeliefRepository::upsert(
-        pool,
-        frame_id,
-        request.claim_id,
-        "global",
-        None,
-        final_bel,
-        final_pl,
-        m_empty,
-        m_missing,
-        final_k,
-        final_method,
-        Some(final_betp),
     )
     .await;
 
