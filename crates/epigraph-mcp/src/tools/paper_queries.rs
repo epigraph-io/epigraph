@@ -345,19 +345,38 @@ pub async fn query_claims_by_label(
     .await
     .map_err(internal_error)?;
 
-    let mut results: Vec<ClaimResponse> = Vec::with_capacity(rows.len());
+    // Opt-in only: without the flag no evidence query runs and the response
+    // carries no `source_urls` key (backlog 43ab8c73).
+    let mut source_urls = if params.include_source_urls {
+        let ids: Vec<uuid::Uuid> = rows.iter().map(|(c, _)| c.id.as_uuid()).collect();
+        Some(
+            EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &ids)
+                .await
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
+
+    let mut results: Vec<ClaimWithSources> = Vec::with_capacity(rows.len());
     for (c, labels) in rows {
-        results.push(ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels,
-            is_current: c.is_current,
-            supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
-            belief_score: None,
+        let id = c.id.as_uuid();
+        results.push(ClaimWithSources {
+            claim: ClaimResponse {
+                id: id.to_string(),
+                content: c.content.clone(),
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash: ContentHasher::to_hex(&c.content_hash),
+                created_at: c.created_at.to_rfc3339(),
+                labels,
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
+                belief_score: None,
+            },
+            source_urls: source_urls
+                .as_mut()
+                .map(|m| m.remove(&id).unwrap_or_default()),
         });
     }
 

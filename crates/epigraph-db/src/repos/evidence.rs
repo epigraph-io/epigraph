@@ -181,6 +181,42 @@ impl EvidenceRepository {
         executor: E,
         evidence: &Evidence,
     ) -> Result<Evidence, DbError> {
+        Self::create_with_source_url(
+            executor,
+            evidence,
+            Self::source_url_of(&evidence.evidence_type),
+        )
+        .await
+    }
+
+    /// The URL an evidence type carries that belongs in `evidence.source_url`:
+    /// a `Document`'s `source_url`, and nothing else.
+    ///
+    /// A `Testimony`'s `source` is free text (a person's name, or the MCP
+    /// default `"unknown"`), and `Literature`/`Figure` carry a DOI rather than
+    /// a URL, so none of those is a column value.
+    #[must_use]
+    pub fn source_url_of(evidence_type: &EvidenceType) -> Option<&str> {
+        match evidence_type {
+            EvidenceType::Document { source_url, .. } => source_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::create`] with an explicit `evidence.source_url`.
+    ///
+    /// For callers that hold a URL the evidence type has no slot for: MCP
+    /// `empirical` evidence is stored as `EvidenceType::Observation`, so its
+    /// caller-supplied URL can only live in the column (backlog 43ab8c73).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, evidence))]
+    pub async fn create_with_source_url<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        evidence: &Evidence,
+        source_url: Option<&str>,
+    ) -> Result<Evidence, DbError> {
         let id: Uuid = evidence.id.into();
         let agent_id: Uuid = evidence.agent_id.into();
         let claim_id: Uuid = evidence.claim_id.into();
@@ -209,7 +245,7 @@ impl EvidenceRepository {
             id,
             content_hash.as_slice(),
             evidence_type_str,
-            None::<String>, // source_url extracted from evidence_type if needed
+            source_url,
             raw_content,
             claim_id,
             signature,
@@ -620,6 +656,80 @@ impl EvidenceRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// The link of each evidence row attached to each of `claim_ids`, keyed by
+    /// claim, in evidence `created_at` order, deduplicated per claim. A claim
+    /// with no linked evidence has no entry.
+    ///
+    /// Backs `get_claim`'s `source_urls` and `query_claims_by_label`'s opt-in
+    /// `include_source_urls` (backlog 43ab8c73): one batched query rather than
+    /// a `get_provenance` per claim.
+    ///
+    /// The `evidence.source_url` column wins when it holds an `http(s)` URL.
+    /// It may hold free text instead: MCP `testimonial` evidence stores the
+    /// caller's `source_url` parameter there, and that parameter is the
+    /// witness's name as often as a link. Rows written before that column
+    /// was populated (it was always NULL) fall back to `properties`: a
+    /// Document's `source_url`, a Testimony's `source` only when it is an
+    /// `http(s)` URL (otherwise it is free text such as `"unknown"`), and a
+    /// Literature/Figure DOI as `https://doi.org/<doi>` only when it is a DOI
+    /// (`10.` prefix; ingestion spells any other identifier `doi:<id>`, which
+    /// has no doi.org link).
+    ///
+    /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), not per claim: a hidden
+    /// evidence row may hang off a public claim (operator hide, foreign
+    /// attach), and its URL must not reach a viewer outside its group.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn source_urls_by_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<String>>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, Vec<String>> =
+            std::collections::HashMap::new();
+        if claim_ids.is_empty() {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            "SELECT e.claim_id, \
+                    COALESCE( \
+                      CASE WHEN e.source_url ~* '^https?://' THEN e.source_url END, \
+                      CASE e.properties->>'type' \
+                        WHEN 'document' THEN e.properties->>'source_url' \
+                        WHEN 'testimony' THEN \
+                          CASE WHEN e.properties->>'source' ~* '^https?://' \
+                               THEN e.properties->>'source' END \
+                        WHEN 'literature' THEN \
+                          CASE WHEN e.properties->>'doi' ~ '^10\\.' \
+                               THEN 'https://doi.org/' || (e.properties->>'doi') END \
+                        WHEN 'figure' THEN \
+                          CASE WHEN e.properties->>'doi' ~ '^10\\.' \
+                               THEN 'https://doi.org/' || (e.properties->>'doi') END \
+                      END) AS url \
+             FROM evidence e \
+             WHERE e.claim_id = ANY($1) \
+               /* {VISIBILITY:e} */ \
+             ORDER BY e.claim_id, e.created_at, e.id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<String>)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (claim_id, url) in q.fetch_all(executor).await? {
+            let Some(url) = url.filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            let urls = out.entry(claim_id).or_default();
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        Ok(out)
     }
 
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.
@@ -1083,7 +1193,7 @@ impl EvidenceRepository {
                 .bind(id)
                 .bind(e.content_hash.as_slice())
                 .bind(evidence_type_str)
-                .bind(None::<String>) // source_url extracted from evidence_type if needed
+                .bind(Self::source_url_of(&e.evidence_type))
                 .bind(e.raw_content.as_deref())
                 .bind(claim_id)
                 .bind(signature)
