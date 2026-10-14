@@ -1324,9 +1324,15 @@ restart.
   `epigraph-operator delete-frames` removes listed test/probe frames on a
   NOSUPERUSER maintenance login and failed there with "permission denied for
   table frames". The four cascade tables are emptied by their FKs' ON DELETE
-  CASCADE, which runs as the child table's owner, so no DELETE is granted on
-  them; the tool's plan, `FOR UPDATE` re-plan and `pg_stat_xact_user_tables`
-  census account for every cascaded row. Row security is unchanged (115's
+  CASCADE, which runs as the child table's owner, so 158 grants no DELETE on
+  them (the role already holds DELETE on `mass_functions` from 115, and none
+  on `claim_frames`, `ds_combined_beliefs` or `ds_bayesian_divergence`); the
+  tool's plan, `FOR UPDATE` re-plan and `pg_stat_xact_user_tables` census
+  account for every cascaded row. **Effective reach:** any session acting as
+  `epigraph_maintenance` (not only `delete-frames`) can now delete a frame,
+  and through the cascade that also deletes the frame's rows in those three
+  tables. A bare `DELETE FROM frames` on the maintenance DSN neither refuses
+  nor audits; only the tool does. Row security is unchanged (115's
   `frames_delete_owner` admits a maintenance session through
   `epigraph_bypass()`). Sets `lock_timeout = '3s'`. Behaviour in
   `epigraph-cli/tests/operator_delete_frames.rs`. Undo in the file's header.
