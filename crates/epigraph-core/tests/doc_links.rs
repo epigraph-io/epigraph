@@ -16,6 +16,13 @@
 //! in-page (`#anchor`) targets, strips a `#fragment` and an optional
 //! `"title"`, and resolves the rest against the directory of the file that
 //! contains the link.
+//!
+//! Known limits, acceptable while the scope is README + `docs/intro/` (widen
+//! the scanner before widening the scope): reference-style definitions
+//! (`[x]: path`) are not checked; `](` inside fenced blocks or inline code is
+//! scanned as a link; a target containing `)` is cut at the first `)`; a
+//! root-absolute target (`/docs/...`) is not resolved against the repo root;
+//! and on a case-insensitive filesystem a wrong-case target passes locally.
 
 use std::path::{Path, PathBuf};
 
