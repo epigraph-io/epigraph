@@ -486,24 +486,17 @@ async fn delete_frames_apply_removes_only_listed_frames_and_their_companion_rows
 
 /// The same apply as a REAL maintenance login (`NOSUPERUSER`, a member of
 /// `epigraph_maintenance`), the shape the runbook uses. Every other test here
-/// connects as the cluster superuser, which no row-security policy filters; a
-/// plan read filtered to nothing would let the frame's ON DELETE CASCADE take
-/// rows the plan never counted.
+/// except the group-private refusal below connects as the cluster superuser.
+/// What this pins is that the login can carry the whole apply: DELETE on
+/// `frames` (migration 158), the cascade, the census and the audit row. Every
+/// fixture row here is public, so it does NOT pin that the plan sees
+/// non-public rows; `delete_frames_refuses_a_group_private_claims_bba_as_a_
+/// non_superuser_maintenance_login` does.
 #[sqlx::test(migrations = "../../migrations")]
 async fn delete_frames_applies_as_a_non_superuser_maintenance_login(pool: PgPool) {
     let s = seed_sweep(&pool).await;
     let missing = Uuid::new_v4();
-    let url = fixture::database_url_for(&pool).await;
-    let role = format!("u048_maint_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
-        "CREATE ROLE {role} LOGIN PASSWORD 'probe-only' NOSUPERUSER IN ROLE epigraph_maintenance"
-    ))
-    .execute(&pool)
-    .await
-    .expect("create role");
-    let (scheme, rest) = url.split_once("://").expect("scheme");
-    let (_, host) = rest.split_once('@').expect("credentials");
-    let dsn = format!("{scheme}://{role}:probe-only@{host}");
+    let (role, dsn) = maintenance_login(&pool).await;
     let ids = ids_file(&[s.0, s.1, missing]);
     let companions = ids_file(&[s.3]);
     let r = run_with_dsn(
@@ -527,4 +520,365 @@ async fn delete_frames_applies_as_a_non_superuser_maintenance_login(pool: PgPool
         .await
         .expect("drop role");
     assert_swept(&pool, &r, s, missing).await;
+}
+
+/// `REFUSED\t<id>\t...` lines for one frame.
+fn refused_lines(r: &Run, id: Uuid) -> Vec<String> {
+    let p = format!("REFUSED\t{id}\t");
+    r.stdout
+        .lines()
+        .filter(|l| l.starts_with(&p))
+        .map(|l| l[p.len()..].to_string())
+        .collect()
+}
+
+async fn table_rows(pool: &PgPool, table: &str) -> i64 {
+    count(pool, &format!("SELECT count(*) FROM {table}")).await
+}
+
+/// Every refusal reason other than a companion-less BBA and an edge, one frame
+/// per reason: a `factors` row, a child frame, a claim whose cached belief is
+/// the frame's, and a non-companion row in each of `claim_frames`,
+/// `ds_combined_beliefs` and `ds_bayesian_divergence`. Three of these are FK
+/// RESTRICT / NO ACTION references that would fail the DELETE anyway; the tool
+/// must name them as a refusal (exit 3) instead of surfacing a raw FK error,
+/// and the three cascade tables must refuse like `mass_functions` does or a
+/// real claim's frame assignment or cached belief would cascade away.
+///
+/// Listing a parent AND its child refuses the parent (the child row still
+/// exists when the plan is read): the child itself is not refused.
+///
+/// A refusal exits 3 on a dry run too, before the DRY RUN line, and under
+/// `--apply` writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_refuses_every_blocker_kind_on_a_dry_run_and_under_apply(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let rc = seed_claim(&pool, agent, "a real claim several frames depend on").await;
+
+    let f_factor = seed_frame(&pool, "blocker-factor").await;
+    sqlx::query(
+        "INSERT INTO factors (factor_type, variable_ids, frame_id) \
+         VALUES ('evidential_support', ARRAY[gen_random_uuid(), gen_random_uuid()], $1)",
+    )
+    .bind(f_factor)
+    .execute(&pool)
+    .await
+    .expect("seed factor");
+
+    let f_parent = seed_frame(&pool, "blocker-parent").await;
+    let child = seed_frame(&pool, "blocker-child (not listed)").await;
+    let p2 = seed_frame(&pool, "listed-parent").await;
+    let c2 = seed_frame(&pool, "listed-child").await;
+    for (c, p) in [(child, f_parent), (c2, p2)] {
+        sqlx::query("UPDATE frames SET parent_frame_id = $2 WHERE id = $1")
+            .bind(c)
+            .bind(p)
+            .execute(&pool)
+            .await
+            .expect("seed child frame");
+    }
+
+    let f_belief = seed_frame(&pool, "blocker-belief").await;
+    let believer = seed_claim(&pool, agent, "a claim whose cached belief is this frame's").await;
+    sqlx::query("UPDATE claims SET belief_frame_id = $2 WHERE id = $1")
+        .bind(believer)
+        .bind(f_belief)
+        .execute(&pool)
+        .await
+        .expect("seed belief_frame_id");
+
+    let f_cf = seed_frame(&pool, "blocker-claim-frames").await;
+    assign(&pool, rc, f_cf).await;
+
+    let f_dcb = seed_frame(&pool, "blocker-combined-belief").await;
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, belief, plausibility) \
+         VALUES ($1, $2, 'global', 0.6, 0.9)",
+    )
+    .bind(f_dcb)
+    .bind(rc)
+    .execute(&pool)
+    .await
+    .expect("seed ds_combined_beliefs");
+
+    let f_dbd = seed_frame(&pool, "blocker-divergence").await;
+    sqlx::query(
+        "INSERT INTO ds_bayesian_divergence \
+             (claim_id, frame_id, pignistic_prob, bayesian_posterior, kl_divergence) \
+         VALUES ($1, $2, 0.6, 0.5, 0.01)",
+    )
+    .bind(rc)
+    .bind(f_dbd)
+    .execute(&pool)
+    .await
+    .expect("seed ds_bayesian_divergence");
+
+    // (frame, the start of its one expected reason)
+    let expected: Vec<(Uuid, String)> = vec![
+        (f_factor, "factors: 1 row(s)".into()),
+        (
+            f_parent,
+            "frames.parent_frame_id (child frames): 1 row(s)".into(),
+        ),
+        (
+            f_belief,
+            "claims.belief_frame_id (claims whose cached belief is this frame's): 1 row(s)".into(),
+        ),
+        (f_cf, format!("claim_frames: 1 row(s) of claim {rc}")),
+        (
+            f_dcb,
+            format!("ds_combined_beliefs: 1 row(s) of claim {rc}"),
+        ),
+        (
+            f_dbd,
+            format!("ds_bayesian_divergence: 1 row(s) of claim {rc}"),
+        ),
+        (p2, "frames.parent_frame_id (child frames): 1 row(s)".into()),
+    ];
+    let mut listed: Vec<Uuid> = expected.iter().map(|(f, _)| *f).collect();
+    listed.push(c2);
+    let ids = ids_file(&listed);
+
+    let tables = [
+        "frames",
+        "factors",
+        "claim_frames",
+        "ds_combined_beliefs",
+        "ds_bayesian_divergence",
+        "security_events",
+    ];
+    let mut before = Vec::new();
+    for t in tables {
+        before.push(table_rows(&pool, t).await);
+    }
+
+    let dry = run_op(
+        &pool,
+        &["delete-frames", "--ids-file", &ids, "--reason", "u048 test"],
+    )
+    .await;
+    let apply = run_op(
+        &pool,
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--apply",
+            "--confirm-delete",
+            "1",
+            "--reason",
+            "u048 test",
+        ],
+    )
+    .await;
+
+    for (label, r) in [("dry run", &dry), ("apply", &apply)] {
+        assert_eq!(
+            r.code,
+            3,
+            "{label}: a refused frame must exit 3\n{}",
+            r.show()
+        );
+        assert!(
+            !r.stdout.contains("DRY RUN"),
+            "{label}: a refusal stops before the dry-run line\n{}",
+            r.show()
+        );
+        for (frame, want) in &expected {
+            let got = refused_lines(r, *frame);
+            assert!(
+                got.len() == 1 && got[0].starts_with(want.as_str()),
+                "{label}: frame {frame} must be refused for exactly `{want}`, got {got:?}\n{}",
+                r.show()
+            );
+        }
+        assert!(
+            refused_lines(r, c2).is_empty(),
+            "{label}: the listed child frame is not itself refused\n{}",
+            r.show()
+        );
+        assert!(
+            r.stdout
+                .lines()
+                .any(|l| l.starts_with(&format!("FRAME\t{c2}\t"))),
+            "{label}: the listed child stays in the plan\n{}",
+            r.show()
+        );
+    }
+    for (t, b) in tables.iter().zip(before) {
+        assert_eq!(table_rows(&pool, t).await, b, "a refused run changed {t}");
+    }
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// The census is the only accounting for the ON DELETE CASCADE: the tool
+/// deletes `frames` alone and trusts `pg_stat_xact_user_tables` to prove that
+/// exactly the planned companion rows went with them. A fixture-only trigger
+/// makes the frame delete also remove a REAL claim's BBA on an UNLISTED frame,
+/// a write the plan cannot see; the run must roll back, real BBA included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_rolls_back_when_the_census_finds_an_unplanned_change(pool: PgPool) {
+    let s = seed_sweep(&pool).await;
+    let (t1, t2, k, tc, rc) = s;
+    sqlx::query(&format!(
+        "CREATE FUNCTION u048_unplanned_delete() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN DELETE FROM mass_functions WHERE frame_id = '{k}'; RETURN NULL; END $f$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create trigger function");
+    sqlx::query(
+        "CREATE TRIGGER u048_unplanned_delete AFTER DELETE ON frames \
+         FOR EACH STATEMENT EXECUTE FUNCTION u048_unplanned_delete()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create trigger");
+
+    let ids = ids_file(&[t1, t2]);
+    let companions = ids_file(&[tc]);
+    let r = run_op(
+        &pool,
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--companion-claims-file",
+            &companions,
+            "--apply",
+            "--confirm-delete",
+            "2",
+            "--reason",
+            "u048 test",
+        ],
+    )
+    .await;
+    assert_eq!(
+        r.code,
+        1,
+        "an unplanned change must fail the run\n{}",
+        r.show()
+    );
+    assert!(
+        r.stderr.contains("census found changes outside the plan"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        frame_exists(&pool, t1).await && frame_exists(&pool, t2).await,
+        "the frame delete was not rolled back\n{}",
+        r.show()
+    );
+    assert_eq!(
+        bbas_on(&pool, tc).await,
+        1,
+        "the companion BBA was not rolled back"
+    );
+    assert_eq!(bbas_on(&pool, rc).await, 1, "the real claim lost its BBA");
+    assert!(
+        audit_rows(&pool).await.is_empty(),
+        "a rolled-back run wrote an audit row"
+    );
+}
+
+/// Create a NOSUPERUSER login in `epigraph_maintenance` and return
+/// `(role, dsn)`. The caller drops the role.
+async fn maintenance_login(pool: &PgPool) -> (String, String) {
+    let url = fixture::database_url_for(pool).await;
+    let role = format!("u048_maint_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'probe-only' NOSUPERUSER IN ROLE epigraph_maintenance"
+    ))
+    .execute(pool)
+    .await
+    .expect("create role");
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    let dsn = format!("{scheme}://{role}:probe-only@{host}");
+    (role, dsn)
+}
+
+/// The refusal as a REAL maintenance login, over a real claim that is NOT
+/// public: `rc` and its BBA on the listed frame belong to a group the login is
+/// no member of. The plan's reads must see that row through
+/// `epigraph_bypass()`; a plan read that row security filtered to public rows
+/// would miss it and plan the frame as deletable, and the frame's ON DELETE
+/// CASCADE (which runs without row security) would then take the hidden BBA.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_refuses_a_group_private_claims_bba_as_a_non_superuser_maintenance_login(
+    pool: PgPool,
+) {
+    let agent = seed_agent(&pool).await;
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "u048-private").await;
+    let t = seed_frame(&pool, &format!("test-frame-all-{}", Uuid::new_v4())).await;
+    let tc = seed_claim(
+        &pool,
+        agent,
+        &format!("test-mass-frame-1-{}", Uuid::new_v4()),
+    )
+    .await;
+    let rc =
+        fixture::seed_group_claim(&pool, owner, group, "a private real claim on this frame").await;
+    seed_bba(&pool, tc, t, agent).await;
+    let real_bba = seed_bba(&pool, rc, t, owner).await;
+    // Precondition: the row the plan must see is not public, or this test
+    // would pass the same way a superuser run does.
+    let (vis, og): (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM mass_functions WHERE id = $1")
+            .bind(real_bba)
+            .fetch_one(&pool)
+            .await
+            .expect("bba tenancy");
+    assert_eq!(
+        (vis.as_str(), og),
+        ("group", group),
+        "fixture: the real BBA must be group-private"
+    );
+
+    let (role, dsn) = maintenance_login(&pool).await;
+    let ids = ids_file(&[t]);
+    let companions = ids_file(&[tc]);
+    let r = run_with_dsn(
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--companion-claims-file",
+            &companions,
+            "--apply",
+            "--confirm-delete",
+            "1",
+            "--reason",
+            "u048 test",
+        ],
+        &dsn,
+    );
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await
+        .expect("drop role");
+
+    assert_eq!(
+        r.code,
+        3,
+        "the private claim's BBA must refuse the frame\n{}",
+        r.show()
+    );
+    assert!(
+        refused_lines(&r, t)
+            .iter()
+            .any(|l| l.starts_with(&format!("mass_functions: 1 row(s) of claim {rc}"))),
+        "the refusal must name the private claim\n{}",
+        r.show()
+    );
+    assert!(
+        frame_exists(&pool, t).await,
+        "the refused frame was deleted"
+    );
+    assert_eq!(
+        bbas_on(&pool, rc).await,
+        1,
+        "the private claim lost its BBA"
+    );
+    assert!(audit_rows(&pool).await.is_empty());
 }
