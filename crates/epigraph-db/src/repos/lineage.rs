@@ -117,6 +117,30 @@ struct EdgeQueryRow {
     target_id: Uuid,
 }
 
+/// Row for `get_lineage_conn`'s parent-edge query. Carries the relationship
+/// because a parent link's direction depends on it: an incoming derivation
+/// edge names its SOURCE as the parent, a `supersedes` edge its TARGET.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct LineageEdgeRow {
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: String,
+}
+
+/// Relationships whose ancestor sits behind an INCOMING edge
+/// (`ancestor -> claim`), as walked by [`LineageRepository::get_lineage_conn`]
+/// (MCP `get_provenance`, REST `GET /lineage/:claim_id`).
+///
+/// This is [`crate::repos::provenance_chain::PROVENANCE_INCOMING`] minus
+/// `corroborates`: a cross-source corroboration (the matcher writes
+/// `CORROBORATES`) is independent support for a claim, not a claim it was
+/// derived from, and lineage answers "what was this derived from". Compared
+/// lower-cased, so `SUPPORTS` / `supports` are one relationship. The
+/// outgoing set is [`crate::repos::provenance_chain::PROVENANCE_OUTGOING`]
+/// itself (`supersedes`, written new->old), so the two walks cannot drift on
+/// direction.
+pub const LINEAGE_INCOMING: &[&str] = &["supports", "elaborates", "decomposes_to"];
+
 /// Row for evidence queries
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EvidenceQueryRow {
@@ -193,6 +217,14 @@ impl LineageRepository {
     /// Returns all ancestor claims, their evidence, and reasoning traces
     /// in topological order (ancestors before descendants).
     ///
+    /// "Ancestor" means reached over DERIVATION edges only, each in the
+    /// direction its relationship is written: [`LINEAGE_INCOMING`]
+    /// (`supports`, `elaborates`, `decomposes_to`) names the edge's SOURCE as
+    /// the ancestor, and `supersedes` (written new->old) names its TARGET,
+    /// the predecessor. `contradicts`, `refutes`, cross-source
+    /// `CORROBORATES` and every other relationship are not ancestry and are
+    /// not walked. Relationship names are compared case-insensitively.
+    ///
     /// # Arguments
     /// * `pool` - Database connection pool
     /// * `claim_id` - The claim to trace lineage from
@@ -227,9 +259,13 @@ impl LineageRepository {
     ///     FROM claims WHERE id = $1
     ///     UNION ALL
     ///     SELECT c.id, l.depth + 1, l.path || c.id
-    ///     FROM claims c
-    ///     JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-    ///     JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
+    ///     FROM lineage l
+    ///     JOIN edges e
+    ///       ON e.source_type = 'claim' AND e.target_type = 'claim'
+    ///      AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3))  -- LINEAGE_INCOMING
+    ///         OR (e.source_id = l.id AND lower(e.relationship) = ANY($4)) ) -- supersedes
+    ///     JOIN claims c
+    ///       ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
     ///     WHERE l.depth < $2 AND NOT c.id = ANY(l.path)
     /// )
     /// SELECT DISTINCT ON (id) * FROM lineage ORDER BY id, depth;
@@ -314,6 +350,15 @@ impl LineageRepository {
     ) -> Result<LineageResult, DbError> {
         let max_depth = max_depth.unwrap_or(100);
 
+        // The derivation relationships the walk follows, by direction (see
+        // [`LINEAGE_INCOMING`]). Already lower-case; the SQL lower-cases the
+        // stored relationship, so an upper-case verb edge matches too.
+        let incoming: Vec<String> = LINEAGE_INCOMING.iter().map(|r| (*r).to_string()).collect();
+        let outgoing: Vec<String> = crate::repos::provenance_chain::PROVENANCE_OUTGOING
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
+
         // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
         // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
         // the walk. Marking only the anchor is the classic half-conversion: an
@@ -338,7 +383,10 @@ impl LineageRepository {
 
                 UNION ALL
 
-                -- Recursive case: find parent claims via edges
+                -- Recursive case: find parent claims via DERIVATION edges.
+                -- Direction is a property of the relationship: an incoming
+                -- derivation edge ($3) names its source as the parent; a
+                -- `supersedes` edge ($4, written new->old) names its target.
                 SELECT
                     c.id,
                     c.content,
@@ -347,9 +395,14 @@ impl LineageRepository {
                     l.depth + 1,
                     l.path || c.id,
                     c.id = ANY(l.path) as cycle_detected
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
+                FROM lineage l
+                JOIN edges e
+                  ON e.source_type = 'claim'
+                 AND e.target_type = 'claim'
+                 AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3::text[]))
+                    OR (e.source_id = l.id AND lower(e.relationship) = ANY($4::text[])) )
+                JOIN claims c
+                  ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
                 WHERE l.depth < $2
                   AND NOT c.id = ANY(l.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
@@ -365,11 +418,13 @@ impl LineageRepository {
             FROM lineage
             ORDER BY id, depth
             "#,
-            3,
+            5,
         );
         let mut lq = sqlx::query_as::<_, LineageRow>(&sql)
             .bind(claim_id)
-            .bind(max_depth);
+            .bind(max_depth)
+            .bind(&incoming)
+            .bind(&outgoing);
         if let Some(g) = viewer.group_bind() {
             lq = lq.bind(g);
         }
@@ -386,32 +441,42 @@ impl LineageRepository {
             return Ok(LineageResult::default());
         }
 
-        // Query edges to build parent relationships
+        // Query edges to build parent relationships: the same derivation set
+        // the walk follows, so `parent_ids` names derivation parents only.
         let esql = viewer.splice(
             r#"
-            SELECT source_id, target_id
+            SELECT source_id, target_id, relationship
             FROM edges
             WHERE source_type = 'claim'
               AND target_type = 'claim'
               AND source_id = ANY($1)
               AND target_id = ANY($1)
+              AND (lower(relationship) = ANY($2::text[])
+                   OR lower(relationship) = ANY($3::text[]))
               /* {EDGE_VISIBILITY:edges} */
             "#,
-            2,
+            4,
         );
-        let mut eq = sqlx::query_as::<_, EdgeQueryRow>(&esql).bind(&claim_ids);
+        let mut eq = sqlx::query_as::<_, LineageEdgeRow>(&esql)
+            .bind(&claim_ids)
+            .bind(&incoming)
+            .bind(&outgoing);
         if let Some(g) = viewer.group_bind() {
             eq = eq.bind(g);
         }
-        let edges: Vec<EdgeQueryRow> = eq.fetch_all(&mut *conn).await?;
+        let edges: Vec<LineageEdgeRow> = eq.fetch_all(&mut *conn).await?;
 
-        // Build parent map
+        // Build parent map. An incoming derivation edge `parent -> child`
+        // names its source; a `supersedes` edge `new -> old` names its target,
+        // the predecessor, as the parent of the claim that replaced it.
         let mut parent_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         for edge in &edges {
-            parent_map
-                .entry(edge.target_id)
-                .or_default()
-                .push(edge.source_id);
+            let (child, parent) = if outgoing.contains(&edge.relationship.to_lowercase()) {
+                (edge.source_id, edge.target_id)
+            } else {
+                (edge.target_id, edge.source_id)
+            };
+            parent_map.entry(child).or_default().push(parent);
         }
 
         // Query all evidence for claims in lineage
