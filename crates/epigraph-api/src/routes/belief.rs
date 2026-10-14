@@ -1506,20 +1506,31 @@ pub async fn submit_evidence(
         alpha / (alpha + beta_param)
     };
 
-    let total_sources = epigraph_db::MassFunctionRepository::count_for_claim_frame(
-        &mut *tx,
-        &viewer,
-        request.claim_id,
-        frame_id,
+    // The BBAs the shared pipeline just combined, read through the same
+    // combine-input reader it uses. `count_for_claim_frame` would also count a
+    // legacy cached combination row (an agent-less, perspective-less row the
+    // writers stored before U024, ~15.5k of them on prod), which the reader
+    // excludes (backlog b5cb3efb): one real input beside such a row would then
+    // report two sources and a Dempster fold that never happened.
+    let total_sources = i64::try_from(
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+        .len(),
     )
-    .await?;
+    .unwrap_or(i64::MAX);
 
     tx.commit().await?;
 
     // The values the rest of the handler reports and emits: this frame's
     // combination by the shared pipeline. `combine_multiple` folds with
     // Dempster at every step since U025; a single BBA is not folded, so it has
-    // no combination step and no fold conflict to report as one.
+    // no combination step and no fold conflict to report as one. `total_sources`
+    // is the number of BBAs that fold combined (see above).
     let final_bel = preview.belief;
     let final_pl = preview.plausibility;
     let final_betp = preview.pignistic_prob;
