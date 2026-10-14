@@ -188,3 +188,44 @@ async fn replaying_154_beside_a_name_squatter_raises_naming_it(pool: PgPool) {
         "nothing may be seeded beside a squatter"
     );
 }
+
+/// A row with the canonical id under ANOTHER name is refused too. The
+/// pre-check does not see it (no other id holds `claim_validity`), so only the
+/// verify's name clause can.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replaying_154_over_a_renamed_canonical_row_raises(pool: PgPool) {
+    sqlx::query("UPDATE frames SET name = 'not_claim_validity' WHERE id = $1")
+        .bind(CANONICAL)
+        .execute(&pool)
+        .await
+        .expect("rename the canonical row");
+
+    let err = replay_154(&pool)
+        .await
+        .expect_err("154 must refuse a canonical-id row under another name");
+    assert!(
+        message(&err).contains("is not the canonical claim_validity frame"),
+        "154 must raise its own verify error, got: {err}"
+    );
+}
+
+/// The hypotheses are an ORDERED axis (index 0 = supported). The same three
+/// names in another order are a different frame, and are refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replaying_154_over_a_reordered_axis_raises(pool: PgPool) {
+    sqlx::query(
+        "UPDATE frames SET hypotheses = ARRAY['refuted','supported','uncertain'] WHERE id = $1",
+    )
+    .bind(CANONICAL)
+    .execute(&pool)
+    .await
+    .expect("reorder the canonical row's axis");
+
+    let err = replay_154(&pool)
+        .await
+        .expect_err("154 must refuse a canonical-id row over a reordered axis");
+    assert!(
+        message(&err).contains("is not the canonical claim_validity frame"),
+        "154 must raise its own verify error, got: {err}"
+    );
+}
