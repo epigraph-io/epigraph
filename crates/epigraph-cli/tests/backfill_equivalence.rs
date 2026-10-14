@@ -213,9 +213,12 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     .await;
     // Delta review DIS-D9: a row in EVERY one of the 17 derived tables, so each
     // arm of 122 section 8's `derived` array is compared on at least one row
-    // (a fresh database has no frame, so the mass_functions seed below used to
+    // (a fresh database had no frame, so the mass_functions seed below used to
     // insert nothing, and 13 of the 17 tables were compared empty). Owner and
-    // visibility are left to the inherit trigger, as for the rows above.
+    // visibility are left to the inherit trigger, as for the rows above. The
+    // seed names THIS frame: since migration 154 a fresh database also carries
+    // the canonical `claim_validity` frame, so an unordered `LIMIT 1` would
+    // pick either one.
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
          VALUES ('equivalence frame', ARRAY['h0','h1'], $1, 'public') RETURNING id",
@@ -228,8 +231,8 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         &pool,
         &format!(
             "INSERT INTO mass_functions (claim_id, frame_id, masses, source_agent_id) \
-             SELECT '{}', f.id, '{{}}'::jsonb, NULL FROM frames f LIMIT 1",
-            claims[4]
+             SELECT '{}', f.id, '{{}}'::jsonb, NULL FROM frames f WHERE f.id = '{}'",
+            claims[4], frame
         ),
     )
     .await;
