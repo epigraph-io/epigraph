@@ -985,12 +985,14 @@ mod diverse_fixture {
     ///
     /// For a "far" cluster that must stay further from the query than the
     /// near rows, yet NOT be exactly orthogonal to them. When two clusters are
-    /// exactly orthogonal, every cross-cluster distance ties at cosine 1.0, and
-    /// the HNSW index built on insert can leave the near cluster unreachable
-    /// from the graph's entry point. An index scan then returns only far rows,
-    /// even at `hnsw.ef_search = 1000` with iterative scan. The shared bucket-0
-    /// component removes the tie and keeps the graph connected to the query
-    /// region.
+    /// exactly orthogonal, every cross-cluster distance ties at cosine
+    /// distance 1.0 (similarity 0), and the HNSW index built on insert can
+    /// leave the near cluster unreachable from the graph's entry point. An
+    /// index scan then returns only far rows, even at `hnsw.ef_search = 1000`
+    /// with iterative scan. The shared bucket-0 component removes that exact
+    /// tie. This is a measured result, not a guarantee: the unreachable-graph
+    /// failure went from about 3% of fresh builds to 0 in 2750 (a 95% upper
+    /// bound of about 0.11% per build).
     pub fn cluster_pgvec_with_drift_and_query_share(
         bucket: usize,
         value: f32,
@@ -2898,8 +2900,9 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
     // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
     // planner statistics, so the guard's probe and the candidate query run
     // under the plans a populated database would choose. An index scan is
-    // approximate, so the result is plan-independent only because the far
-    // cluster above stays connected to the query region in the HNSW graph.
+    // approximate, so the result does not depend on the plan only as far as
+    // the HNSW graph reaches the query region. With the shared bucket-0
+    // component above, that failed in 0 of 2750 fresh builds (about 3% before).
     sqlx::query("VACUUM ANALYZE claims")
         .execute(&pool)
         .await
