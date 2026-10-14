@@ -40,9 +40,11 @@
 //! 5. Only the frames are deleted by this module; the companion rows go by the
 //!    foreign keys' `ON DELETE CASCADE`. A referential action runs as the
 //!    child table's owner and consults no row-security policy, which is why
-//!    `epigraph_maintenance` needs DELETE on `frames` alone (migration 158;
-//!    070 grants it no DELETE anywhere) and why the cascade, not a policy, is
-//!    what has to be accounted for.
+//!    `epigraph_maintenance` needs DELETE on `frames` alone (migration 158)
+//!    and why the cascade, not a policy, is what has to be accounted for.
+//!    The role holds DELETE on `mass_functions` (115) and none on
+//!    `claim_frames`, `ds_combined_beliefs` or `ds_bayesian_divergence`
+//!    (070); the cascade reaches all four regardless.
 //! 6. The transaction's census (`pg_stat_xact_user_tables`, which counts the
 //!    cascade's deletes too) must be exactly the planned frames in `frames`,
 //!    the planned companion rows in each cascade table, and nothing anywhere
@@ -51,6 +53,18 @@
 //!    rolled back.
 //! 7. One `security_events` row (`operator.frames_deleted`) naming the frames,
 //!    the cascade counts and the reason, then the commit.
+//!
+//! # Residual race: edges
+//!
+//! The `FOR UPDATE` locks stop every FK child insert (those take `FOR KEY
+//! SHARE` on the frame), but edges have no FK to `frames`, and 055's existence
+//! trigger checks with a plain `EXISTS`. Another session can therefore insert a
+//! `'frame'`-endpoint edge after the in-transaction re-plan and commit it; the
+//! edge then dangles. The census counts only this transaction's own changes,
+//! so it cannot see that write. The window is the milliseconds between the
+//! re-plan and the commit, over test frames nothing writes to. Closing it would
+//! need the edge trigger to take `FOR KEY SHARE` on the frame, which is out of
+//! this tool's scope.
 
 use super::reown::{counter_delta, counter_violations};
 use super::tables;
@@ -65,8 +79,9 @@ use uuid::Uuid;
 pub const EVENT: &str = "operator.frames_deleted";
 
 /// The tables that `ON DELETE CASCADE` from `frames.id`, each keyed on
-/// `(frame_id, claim_id)`. Deleted explicitly, in this order, before the
-/// frames.
+/// `(frame_id, claim_id)`. This module never deletes from them: the FK
+/// cascade empties them when the frames are deleted, the plan counts their
+/// rows, and the census checks those counts.
 pub const CASCADE_TABLES: &[&str] = &[
     "mass_functions",
     "claim_frames",
@@ -396,9 +411,11 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
     let before = tables::xact_counters(&mut tx).await?;
     // The four cascade tables are emptied by the foreign keys' own ON DELETE
     // CASCADE, which PostgreSQL runs as the child table's owner and without
-    // row security: `epigraph_maintenance` holds no DELETE on them (070), and
-    // needs none. The census below is what proves the cascade removed exactly
-    // the planned companion rows and nothing else.
+    // row security. The caller needs no DELETE on them: `epigraph_maintenance`
+    // holds it on `mass_functions` (115) but not on `claim_frames`,
+    // `ds_combined_beliefs` or `ds_bayesian_divergence`. The census below is
+    // what proves the cascade removed exactly the planned companion rows and
+    // nothing else.
     let mut expected: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     for &table in CASCADE_TABLES {
         let want = dry.cascade.get(table).copied().unwrap_or(0);
