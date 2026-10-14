@@ -766,3 +766,105 @@ async fn rewire_leaves_a_non_epistemic_edge_factor_and_reports_it_as_persisting(
         "advancing --offset by persisting() steps past it"
     );
 }
+
+/// Every test above runs as the harness superuser, which skips row security
+/// and every grant. The binary runs on a maintenance LOGIN: a member of
+/// `epigraph_maintenance`, NOSUPERUSER NOBYPASSRLS. The phase's row locks
+/// (`FOR SHARE OF e`, `FOR UPDATE` on the selected BBA), its deletes and its
+/// tenancy-restoring UPDATE must all work there; a lock read that row
+/// security filtered would come back empty and be miscounted as
+/// `skipped_stale` with no error at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_runs_on_a_maintenance_login_without_bypassrls(pool: PgPool) {
+    // In place, writer-owned.
+    let owned = seed_world(&pool, "maint-owned").await;
+    let (_wa, writer_group) = viewer_fixture::seed_agent_with_group(&pool, "maint-writer").await;
+    sqlx::query(
+        "UPDATE mass_functions SET owner_group_id = $2, visibility = 'public', writer_owned = true \
+          WHERE perspective_id = $1",
+    )
+    .bind(owned.edge)
+    .bind(writer_group)
+    .execute(&pool)
+    .await
+    .expect("writer-owned row");
+    // Replaced off the wire key (NULL agent), writer-owned: the restore UPDATE.
+    let replaced = seed_world(&pool, "maint-replaced").await;
+    sqlx::query(
+        "UPDATE mass_functions SET source_agent_id = NULL, owner_group_id = $2, \
+                visibility = 'public', writer_owned = true WHERE perspective_id = $1",
+    )
+    .bind(replaced.edge)
+    .bind(writer_group)
+    .execute(&pool)
+    .await
+    .expect("NULL-agent writer-owned row");
+    // Removed: a vacuous source.
+    let author = seed_agent(&pool, "maint-author").await;
+    let vacuous = seed_claim(&pool, author, "maint vacuous source", Some((0.0, 1.0, 0.0))).await;
+    let removed = seed_edge(&pool, vacuous, owned.target, "supports").await;
+    seed_stale_edge_factor(&pool, removed, owned.target, owned.frame, author).await;
+
+    let role = format!("u028_maint_{}", Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{password}' \
+         IN ROLE epigraph_maintenance"
+    ))
+    .execute(&pool)
+    .await
+    .expect("maintenance login");
+    let base = viewer_fixture::database_url_for(&pool).await;
+    let scheme_end = base.find("://").expect("scheme") + 3;
+    let host_path = &base[base.find('@').expect("credentials") + 1..];
+    let url = format!("{}{role}:{password}@{host_path}", &base[..scheme_end]);
+    let maint = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&url)
+        .await
+        .expect("connect as the maintenance login");
+    let privileged: bool =
+        sqlx::query_scalar("SELECT public.epigraph_session_is_privileged_writer()")
+            .fetch_one(&maint)
+            .await
+            .expect("privilege probe");
+    assert!(
+        privileged,
+        "precondition: a maintenance member is a privileged writer"
+    );
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&maint, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire as the maintenance login");
+    maint.close().await;
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(&pool)
+        .await;
+
+    assert_eq!(
+        (
+            summary.eligible,
+            summary.rewired,
+            summary.removed_vacuous,
+            summary.skipped_stale,
+            summary.failed
+        ),
+        (3, 2, 1, 0, 0),
+        "{summary:?}"
+    );
+    for (edge, what) in [(owned.edge, "in place"), (replaced.edge, "replaced")] {
+        let rows = edge_rows(&pool, edge).await;
+        assert_eq!(rows.len(), 1, "{what}: {rows:?}");
+        assert_close(mass(&rows[0].1, "~0,1"), 0.48, what);
+        assert_eq!(
+            edge_row_tenancy(&pool, edge).await,
+            vec![(writer_group, "public".to_string(), true)],
+            "{what}: still the writer's"
+        );
+    }
+    assert!(
+        edge_rows(&pool, removed).await.is_empty(),
+        "vacuous row removed"
+    );
+}
