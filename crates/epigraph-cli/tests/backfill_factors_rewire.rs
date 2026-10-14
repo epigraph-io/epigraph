@@ -479,3 +479,88 @@ async fn rewire_keeps_a_writer_owned_edge_factor_owned_by_its_writer(pool: PgPoo
         "the rewire must not re-own a writer-owned edge factor"
     );
 }
+
+/// A stored row that is NOT at the key the wire writes (here: a NULL
+/// `source_agent_id`, so the selection keys it on the source's author) is
+/// replaced by a fresh INSERT, which 114 stamps with the claim's tenancy. The
+/// rewire copies the selected row's tenancy back onto it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_replacing_a_row_off_the_wire_key_keeps_its_writer_owner(pool: PgPool) {
+    let w = seed_world(&pool, "nullagent").await;
+    let (_writer_agent, writer_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "rewire-writer-null").await;
+    sqlx::query(
+        "UPDATE mass_functions SET source_agent_id = NULL, owner_group_id = $2, \
+                visibility = 'public', writer_owned = true WHERE perspective_id = $1",
+    )
+    .bind(w.edge)
+    .bind(writer_group)
+    .execute(&pool)
+    .await
+    .expect("NULL-agent writer-owned edge factor");
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(w.source)
+        .fetch_one(&pool)
+        .await
+        .expect("source author");
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!(
+        (
+            summary.rewired,
+            summary.duplicate_rows_deleted,
+            summary.failed
+        ),
+        (1, 0, 0),
+        "the replaced row is not a duplicate: {summary:?}"
+    );
+    let rows = edge_rows(&pool, w.edge).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].0, author,
+        "keyed on COALESCE(signer, source author)"
+    );
+    assert_close(mass(&rows[0].1, "~0,1"), 0.48, "rewritten missing mass");
+    assert_eq!(
+        edge_row_tenancy(&pool, w.edge).await,
+        vec![(writer_group, "public".to_string(), true)],
+        "the fresh row carries the replaced row's owner"
+    );
+}
+
+/// An edge wired twice (two agent keys) is merged into ONE row under the
+/// selected (earliest) row's agent, and the merge is counted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_merges_a_double_wired_edge_and_counts_it(pool: PgPool) {
+    let w = seed_world(&pool, "double").await;
+    let second = seed_agent(&pool, "rewire-second-wirer").await;
+    // Strictly later than the first row, so the selection is deterministic.
+    sqlx::query("UPDATE mass_functions SET created_at = now() - interval '1 minute' WHERE perspective_id = $1")
+        .bind(w.edge)
+        .execute(&pool)
+        .await
+        .expect("age the first row");
+    seed_stale_edge_factor(&pool, w.edge, w.target, w.frame, second).await;
+    assert_eq!(edge_rows(&pool, w.edge).await.len(), 2, "precondition");
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!(
+        (
+            summary.eligible,
+            summary.rewired,
+            summary.duplicate_rows_deleted
+        ),
+        (1, 1, 1),
+        "{summary:?}"
+    );
+    let rows = edge_rows(&pool, w.edge).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, w.stale_agent, "the earliest row's agent wins");
+    assert_close(mass(&rows[0].1, "~0,1"), 0.48, "rewritten missing mass");
+}

@@ -78,6 +78,12 @@ pub struct RewireSummary {
     pub removed_vacuous: usize,
     pub removed_source_factorless: usize,
     pub skipped_non_epistemic: usize,
+    /// The selected row was gone (or, see below, the edge no longer in
+    /// force) by the time its turn came; nothing written.
+    pub skipped_stale: usize,
+    /// Rows deleted beyond each edge's one rewritten or removed row: a second
+    /// agent key or another frame for the same edge, merged into one row.
+    pub duplicate_rows_deleted: usize,
     pub failed: usize,
 }
 
@@ -89,8 +95,9 @@ pub struct RewireSummary {
 ///   `link_epistemic` path and migration 114's writer-owned rows store other
 ///   agents, and the upsert key is `(claim, frame, source_agent, perspective)`,
 ///   so re-wiring under a different agent would add a second BBA for the edge
-///   that double-counts in combine. (The phase also deletes the edge's rows
-///   before re-wiring, so the agent decides attribution, not row count.)
+///   that double-counts in combine, and the stored row would be replaced
+///   rather than rewritten in place (losing its owner; see
+///   [`run_rewire_phase`]).
 /// - Retracted edges (`valid_to` in the past) are skipped, with the predicate
 ///   `SheafRepository::get_epistemic_edge_pairs` uses: `auto_wire_ds_for_edge`
 ///   does not check `is_in_force`, so selecting one would resurrect it.
@@ -159,6 +166,23 @@ enum EdgeRewrite {
     RemovedVacuous,
     RemovedSourceFactorless,
     SkippedNonEpistemic,
+    /// The selected row is gone by the time the edge's turn came.
+    SkippedStale,
+}
+
+/// One edge's outcome plus the rows it deleted beyond the one it rewrote.
+struct EdgeResult {
+    outcome: EdgeRewrite,
+    duplicate_rows_deleted: usize,
+}
+
+impl EdgeResult {
+    fn only(outcome: EdgeRewrite) -> Self {
+        Self {
+            outcome,
+            duplicate_rows_deleted: 0,
+        }
+    }
 }
 
 /// Re-derive every selected edge factor from its source's current interval.
@@ -167,15 +191,27 @@ enum EdgeRewrite {
 /// 1. a relationship that no longer maps to an epistemic restriction is left
 ///    untouched (it cannot be re-derived, and deleting it is not this phase's
 ///    call);
-/// 2. the edge's stored BBA rows are deleted, then `auto_wire_ds_for_edge`
-///    re-wires it under the stored agent, which writes the current shape and
-///    recomputes the target;
-/// 3. if the source is now factorless or the restriction vacuous, a fresh
-///    wire would store nothing, so nothing is stored: the target is
-///    recomputed from the BBAs that remain, and its cached belief is cleared
-///    when none remain (a stale cache must not outlive its last supporter).
+/// 2. the edge's other `edge_factor` rows on the target (a second agent key,
+///    or a frame other than `binary_truth`) are deleted and counted in
+///    `duplicate_rows_deleted`, so the edge ends with ONE row;
+/// 3. `auto_wire_ds_for_edge` re-wires the edge under the stored agent. Its
+///    upsert is keyed on `(target, binary_truth, agent, edge)`, so the stored
+///    row is rewritten IN PLACE: `ON CONFLICT DO UPDATE` leaves
+///    `owner_group_id`, `visibility` and `writer_owned` alone. A
+///    delete-then-insert would not: on this privileged pool migration 114's
+///    insert trigger stamps the CLAIM's tenancy, which would hand a writer's
+///    BBA (`writer_owned`) to the claim's owner for good. When the stored row
+///    was not at that key (another frame, or a NULL agent) the wire inserts a
+///    fresh row, and the selected row's tenancy is copied onto it;
+/// 4. if the source is now factorless or the restriction vacuous, a fresh
+///    wire would store nothing, so nothing is stored: the edge's row is
+///    deleted, the target is recomputed from the BBAs that remain, and its
+///    cached belief is cleared when none remain (a stale cache must not
+///    outlive its last supporter).
 ///
-/// Any error rolls that edge back (its old row survives) and counts as failed.
+/// Any error rolls that edge back (its old rows survive) and counts as failed.
+/// `pool` must be privileged (the binary's maintenance pool): the deletes are
+/// plain owner-scoped DELETEs.
 ///
 /// # Errors
 /// Only the selection's error; per-edge failures are counted.
@@ -205,10 +241,18 @@ pub async fn run_rewire_phase(
 
     for edge in &edges {
         match rewire_one(pool, viewer, edge).await {
-            Ok(EdgeRewrite::Rewired) => summary.rewired += 1,
-            Ok(EdgeRewrite::RemovedVacuous) => summary.removed_vacuous += 1,
-            Ok(EdgeRewrite::RemovedSourceFactorless) => summary.removed_source_factorless += 1,
-            Ok(EdgeRewrite::SkippedNonEpistemic) => summary.skipped_non_epistemic += 1,
+            Ok(r) => {
+                summary.duplicate_rows_deleted += r.duplicate_rows_deleted;
+                match r.outcome {
+                    EdgeRewrite::Rewired => summary.rewired += 1,
+                    EdgeRewrite::RemovedVacuous => summary.removed_vacuous += 1,
+                    EdgeRewrite::RemovedSourceFactorless => {
+                        summary.removed_source_factorless += 1;
+                    }
+                    EdgeRewrite::SkippedNonEpistemic => summary.skipped_non_epistemic += 1,
+                    EdgeRewrite::SkippedStale => summary.skipped_stale += 1,
+                }
+            }
             Err(e) => {
                 tracing::warn!(edge = %edge.edge_id, target = %edge.target_id, "edge rewire failed: {e}");
                 summary.failed += 1;
@@ -218,14 +262,75 @@ pub async fn run_rewire_phase(
     Ok(summary)
 }
 
+/// Delete `edge`'s `edge_factor` rows on its target, except the one at
+/// `keep` = `(frame, source_agent_id)` when given; return each deleted row's
+/// `(id, frame)`.
+async fn delete_edge_rows(
+    conn: &mut sqlx::PgConnection,
+    edge: &RewireEdge,
+    keep: Option<(Uuid, Uuid)>,
+) -> Result<Vec<(Uuid, Uuid)>, String> {
+    let (keep_frame, keep_agent) = keep.unzip();
+    sqlx::query_as(
+        "DELETE FROM mass_functions \
+          WHERE perspective_id = $1 AND claim_id = $2 \
+            AND combination_method = 'edge_factor' \
+            AND NOT ($3::uuid IS NOT NULL AND frame_id = $3 \
+                     AND source_agent_id IS NOT DISTINCT FROM $4) \
+         RETURNING id, frame_id",
+    )
+    .bind(edge.edge_id)
+    .bind(edge.target_id)
+    .bind(keep_frame)
+    .bind(keep_agent)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("delete edge rows: {e}"))
+}
+
+/// Recompute `target` on every frame in `frames` (deduplicated, `last`
+/// recomputed last because the claim's cached scalars are last-writer-wins);
+/// clear its cache when it holds no BBA at all any more.
+async fn recompute_after_removal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    target: Uuid,
+    frames: &[Uuid],
+    last: Uuid,
+) -> Result<(), String> {
+    use epigraph_db::MassFunctionRepository;
+    use epigraph_engine::edge_factor::recompute_claim_belief_on_frame;
+
+    let mut ordered: Vec<Uuid> = Vec::new();
+    for f in frames.iter().copied().filter(|f| *f != last) {
+        if !ordered.contains(&f) {
+            ordered.push(f);
+        }
+    }
+    if frames.contains(&last) {
+        ordered.push(last);
+    }
+    for frame in ordered {
+        recompute_claim_belief_on_frame(&mut *conn, viewer, target, frame).await?;
+    }
+    let remaining = MassFunctionRepository::get_for_claim(&mut *conn, viewer, target)
+        .await
+        .map_err(|e| format!("surviving BBAs: {e}"))?;
+    if remaining.is_empty() {
+        MassFunctionRepository::clear_claim_belief(&mut *conn, target)
+            .await
+            .map_err(|e| format!("clear unbacked belief: {e}"))?;
+    }
+    Ok(())
+}
+
 async fn rewire_one(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     edge: &RewireEdge,
-) -> Result<EdgeRewrite, String> {
-    use epigraph_db::MassFunctionRepository;
+) -> Result<EdgeResult, String> {
     use epigraph_engine::edge_factor::{
-        auto_wire_ds_for_edge, recompute_claim_belief_on_frame, EdgeFactorOutcome,
+        auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome,
     };
     use epigraph_engine::sheaf::{
         restriction_kind_with_profile, RestrictionKind, RestrictionProfile,
@@ -235,13 +340,34 @@ async fn rewire_one(
         restriction_kind_with_profile(&edge.relationship, &RestrictionProfile::scientific()),
         RestrictionKind::Neutral
     ) {
-        return Ok(EdgeRewrite::SkippedNonEpistemic);
+        return Ok(EdgeResult::only(EdgeRewrite::SkippedNonEpistemic));
     }
 
     let mut tx = pool.begin().await.map_err(|e| format!("begin: {e}"))?;
-    MassFunctionRepository::delete_for_perspective(&mut *tx, edge.edge_id)
-        .await
-        .map_err(|e| format!("delete stale edge BBA: {e}"))?;
+
+    // The row the selection chose (same order as REWIRE_EDGE_QUERY's
+    // DISTINCT ON), locked, with the tenancy a rewrite must keep.
+    let selected: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
+        "SELECT id, owner_group_id, visibility::text, writer_owned FROM mass_functions \
+          WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+          ORDER BY created_at, id LIMIT 1 FOR UPDATE",
+    )
+    .bind(edge.edge_id)
+    .bind(edge.target_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("lock selected row: {e}"))?;
+    let Some((selected_id, owner_group_id, visibility, writer_owned)) = selected else {
+        return Ok(EdgeResult::only(EdgeRewrite::SkippedStale));
+    };
+
+    let binary = ensure_binary_frame(&mut tx, viewer).await?;
+    let keep = (binary, edge.agent_id);
+    let others = delete_edge_rows(&mut tx, edge, Some(keep)).await?;
+    // The selected row itself is replaced, not a duplicate, when it was not
+    // at the key the wire writes.
+    let duplicate_rows_deleted = others.iter().filter(|(id, _)| *id != selected_id).count();
+    let other_frames: Vec<Uuid> = others.iter().map(|(_, f)| *f).collect();
     let outcome = auto_wire_ds_for_edge(
         &mut tx,
         viewer,
@@ -253,22 +379,47 @@ async fn rewire_one(
     )
     .await?;
     let result = match outcome {
-        EdgeFactorOutcome::Wired => EdgeRewrite::Rewired,
-        EdgeFactorOutcome::Vacuous | EdgeFactorOutcome::SourceFactorless => {
-            let backed_on_frame =
-                recompute_claim_belief_on_frame(&mut tx, viewer, edge.target_id, edge.frame_id)
-                    .await?;
-            if !backed_on_frame {
-                let remaining =
-                    MassFunctionRepository::get_for_claim(&mut *tx, viewer, edge.target_id)
-                        .await
-                        .map_err(|e| format!("surviving BBAs: {e}"))?;
-                if remaining.is_empty() {
-                    MassFunctionRepository::clear_claim_belief(&mut *tx, edge.target_id)
-                        .await
-                        .map_err(|e| format!("clear unbacked belief: {e}"))?;
-                }
+        EdgeFactorOutcome::Wired => {
+            // In place: a no-op. Freshly inserted: restores the selected
+            // row's owner, which 114 re-stamped from the claim.
+            sqlx::query(
+                "UPDATE mass_functions \
+                    SET owner_group_id = $5, visibility = $6, writer_owned = $7 \
+                  WHERE perspective_id = $1 AND claim_id = $2 AND frame_id = $3 \
+                    AND source_agent_id = $4 \
+                    AND (owner_group_id, visibility::text, writer_owned) \
+                        IS DISTINCT FROM ($5, $6, $7)",
+            )
+            .bind(edge.edge_id)
+            .bind(edge.target_id)
+            .bind(binary)
+            .bind(edge.agent_id)
+            .bind(owner_group_id)
+            .bind(&visibility)
+            .bind(writer_owned)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("keep the selected row's owner: {e}"))?;
+            // A frame other than binary_truth that lost a row is recomputed,
+            // then binary_truth again so it stays the cache's last writer
+            // (the wire recomputed it before those).
+            if other_frames.iter().any(|f| *f != binary) {
+                let mut frames = other_frames.clone();
+                frames.push(binary);
+                recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
             }
+            EdgeRewrite::Rewired
+        }
+        EdgeFactorOutcome::Vacuous | EdgeFactorOutcome::SourceFactorless => {
+            let mut frames = other_frames.clone();
+            frames.extend(
+                delete_edge_rows(&mut tx, edge, None)
+                    .await?
+                    .into_iter()
+                    .map(|(_, f)| f),
+            );
+            frames.push(binary);
+            recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
             if outcome == EdgeFactorOutcome::Vacuous {
                 EdgeRewrite::RemovedVacuous
             } else {
@@ -276,22 +427,29 @@ async fn rewire_one(
             }
         }
         // Ruled out by the restriction check above; keep the old row.
-        EdgeFactorOutcome::NonEpistemic => return Ok(EdgeRewrite::SkippedNonEpistemic),
+        EdgeFactorOutcome::NonEpistemic => {
+            return Ok(EdgeResult::only(EdgeRewrite::SkippedNonEpistemic));
+        }
     };
     tx.commit().await.map_err(|e| format!("commit: {e}"))?;
-    Ok(result)
+    Ok(EdgeResult {
+        outcome: result,
+        duplicate_rows_deleted,
+    })
 }
 
 impl std::fmt::Display for RewireSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "eligible={} rewired={} removed_vacuous={} removed_source_factorless={} skipped_non_epistemic={} failed={}",
+            "eligible={} rewired={} removed_vacuous={} removed_source_factorless={} skipped_non_epistemic={} skipped_stale={} duplicate_rows_deleted={} failed={}",
             self.eligible,
             self.rewired,
             self.removed_vacuous,
             self.removed_source_factorless,
             self.skipped_non_epistemic,
+            self.skipped_stale,
+            self.duplicate_rows_deleted,
             self.failed
         )
     }
