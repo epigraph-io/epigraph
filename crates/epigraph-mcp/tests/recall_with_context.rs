@@ -993,6 +993,10 @@ mod diverse_fixture {
     /// tie. This is a measured result, not a guarantee: the unreachable-graph
     /// failure went from about 3% of fresh builds to 0 in 2750 (a 95% upper
     /// bound of about 0.11% per build).
+    ///
+    /// Precondition: `bucket` and `drift_bucket` are not 0. Bucket 0 is the
+    /// query-share slot and is written last, so it would silently overwrite
+    /// either of them.
     pub fn cluster_pgvec_with_drift_and_query_share(
         bucket: usize,
         value: f32,
@@ -1000,6 +1004,10 @@ mod diverse_fixture {
         drift: f32,
         query_share: f32,
     ) -> String {
+        debug_assert!(
+            bucket != 0 && drift_bucket != 0,
+            "bucket 0 is the query-share slot; got bucket={bucket}, drift_bucket={drift_bucket}"
+        );
         let mut v = vec![0.0f32; DIM];
         let start = bucket * STRIDE;
         let end = start + STRIDE;
