@@ -177,6 +177,14 @@ pub struct QueryClaimsParams {
                        merge the results."
     )]
     pub is_current: Option<bool>,
+
+    #[schemars(
+        description = "When true, drop verbatim document-spine nodes (thesis/section/paragraph, \
+                       properties.level 0-2) in SQL before LIMIT, so headings, keyword lists, \
+                       captions and transcript turns do not consume the page; atoms (level 3) and \
+                       unleveled claims are kept. Default false (no spine filter)."
+    )]
+    pub exclude_spine: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

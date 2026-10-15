@@ -915,6 +915,11 @@ pub async fn query_claims(
     // gates on (GitHub #395). This used to filter the stale authored
     // `truth_value`, so a refuted claim (BetP 0.18, `truth_value` 0.78) never
     // entered a `max_truth=0.4` assessment queue.
+    //
+    // `exclude_spine` drops verbatim document-spine nodes (properties.level
+    // 0-2) in the same pre-LIMIT pass: on the `max_truth=0.4` queue they were
+    // most of the page (backlog 31e7b727). Off unless the caller asks.
+    let exclude_spine = params.exclude_spine.unwrap_or(false);
     let claims = ClaimRepository::list_by_belief_range(
         &server.pool,
         viewer,
@@ -923,7 +928,7 @@ pub async fn query_claims(
         is_current,
         limit,
         0,
-        false,
+        exclude_spine,
     )
     .await
     .map_err(internal_error)?;
