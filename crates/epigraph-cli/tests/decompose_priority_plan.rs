@@ -1053,3 +1053,93 @@ async fn an_empty_answer_is_not_recorded_as_judged_atomic(pool: PgPool) {
     );
     std::fs::remove_file(&ledger_path).ok();
 }
+
+/// The ledger is consulted AFTER every other rule, so `skipped_judged_atomic`
+/// counts only parents a model call would otherwise have been spent on. A
+/// recorded parent that is also backlog-labelled is reported as `Backlog`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ledger_is_consulted_after_every_other_rule(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let text = "The ratchet holds. Its pawl spring is stiff at room temperature.";
+    let b = seed_claim(&pool, agent, text, 300, &["backlog"]).await;
+    let path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+    ledger.record(b, text, "m").unwrap();
+
+    let sel = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        None,
+        EligibilityFilters::default(),
+        Some(&ledger),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    let why: Vec<&Ineligible> = sel
+        .skipped
+        .iter()
+        .filter(|(id, _)| *id == b)
+        .map(|(_, w)| w)
+        .collect();
+    assert_eq!(why, vec![&Ineligible::Backlog], "{sel:?}");
+    std::fs::remove_file(&path).ok();
+}
+
+/// Verdicts are appended per chunk: a normal run that aborts on a later
+/// chunk (a persist failure) keeps the verdicts it already paid for.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_aborts_later_keeps_the_verdicts_of_earlier_chunks(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s_text = "The escapement ticks. Its period is one microsecond.";
+    let s = seed_claim(&pool, agent, s_text, 300, &[]).await;
+    let c_text = compound("u040-aborting-chunk");
+    let c = seed_claim(&pool, agent, &c_text, 300, &[]).await;
+    let llm = FixtureLlmClient::from_json(&serde_json::json!({
+        s_text: {"atoms": [s_text], "generality": [0]},
+        c_text.clone(): {
+            "atoms": ["Claim u040-aborting-chunk has a first part.",
+                      "Claim u040-aborting-chunk also has a second part."],
+            "generality": [0, 1]
+        },
+    }))
+    .unwrap();
+    let claims = vec![
+        BatchClaim {
+            claim_id: s,
+            agent_id: agent,
+            content: s_text.to_string(),
+        },
+        BatchClaim {
+            claim_id: c,
+            agent_id: agent,
+            content: c_text.clone(),
+        },
+    ];
+    let path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+    let err = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
+        &llm,
+        1,
+        None,
+        Some(&mut ledger),
+        |_t: String, _g: i64, _p: AtomParent| async move {
+            Err::<Uuid, Box<dyn std::error::Error>>("API down".into())
+        },
+    )
+    .await
+    .expect_err("the second chunk's submit failure aborts the run");
+    assert!(err.to_string().contains("API down"), "{err}");
+    assert!(
+        SingletonLedger::load(&path).unwrap().contains(s, s_text),
+        "the first chunk's verdict was lost with the aborted run"
+    );
+    std::fs::remove_file(&path).ok();
+}
