@@ -3306,3 +3306,253 @@ async fn diverse_mode_falls_back_under_index_backed_plans(pool: PgPool) {
     let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
     assert_eq!(returned, flat_top_5, "the fallback returns the flat top-5");
 }
+
+// ============================================================================
+// Whole-corpus seeding (drain U082, backlog a1d89aab; operator ruling
+// 2026-10-14). `recall_with_context` seeds on EVERY embedded claim the viewer
+// can see, not only on level-2 paragraphs with a paper attribution. Paper and
+// section parentage are enrichment attributes: a parentless hit omits `paper`
+// (and `section`) instead of being dropped.
+// ============================================================================
+
+/// An embedded claim that is NOT an `ingest_document` paragraph: no paper
+/// `asserts` edge, and `properties` as given (`{}` for a `submit_claim` /
+/// `memorize` claim, `{"level": 2, "kind": "workflow_step"}` for a workflow
+/// step). Public, current.
+async fn seed_parentless_claim(
+    pool: &PgPool,
+    agent: Uuid,
+    content: &str,
+    properties: &str,
+    embedding_pgvec: &str,
+    theme_id: Option<Uuid>,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, \
+                             properties, embedding, theme_id) \
+         VALUES ($1, sha256($1::bytea), 0.7, $2, true, $3::jsonb, $4::vector, $5) \
+         RETURNING id",
+    )
+    .bind(content)
+    .bind(agent)
+    .bind(properties)
+    .bind(embedding_pgvec)
+    .bind(theme_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed parentless claim")
+}
+
+/// The full `results` array as raw JSON. Raw `serde_json::Value`, not a typed
+/// struct: one assertion is about a key being ABSENT, which a typed struct
+/// with `Option` + `#[serde(default)]` cannot distinguish from `null`.
+async fn recall_results_json(
+    pool: &PgPool,
+    params: epigraph_mcp::tools::recall::RecallWithContextParams,
+    pgvec: &str,
+) -> Vec<serde_json::Value> {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+    let viewer = viewerfx::public_viewer(pool).await;
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, pgvec)
+        .await
+        .expect("recall_with_context ok");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse JSON");
+    json["results"].as_array().expect("results array").clone()
+}
+
+fn result_ids(results: &[serde_json::Value]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| r["paragraph_id"].as_str().unwrap_or("<no id>").to_string())
+        .collect()
+}
+
+/// The backlog's own regression test (a1d89aab): a parentless claim that is
+/// the BEST semantic match is returned AHEAD of a weaker, paper-attributed
+/// paragraph — and it is returned without a `paper` key rather than with a
+/// fabricated one.
+///
+/// Pre-fix the parentless claim is never a candidate (the flat kNN is
+/// `level = 2` only, and the assembly loop drops any hit without paper meta),
+/// so the page is `[paragraph]` and the first assertion fails on the ids.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_returns_a_parentless_best_match_ahead_of_a_weaker_paragraph(
+    pool: PgPool,
+) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/parentless", "Parentless test").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    // Exact match (cosine 1.0), no level, no paper: a submit_claim claim.
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "EpiGraph is installed correctly.",
+        "{}",
+        &query,
+        None,
+    )
+    .await;
+    // Weaker match (cosine ~0.894). Direction drift, not magnitude: scaling
+    // `cluster_pgvec` leaves the cosine unchanged.
+    let para = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a real paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(false, None, None, /*limit=*/ 2),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![parentless.to_string(), para.to_string()],
+        "the parentless exact match must be a candidate and rank first; a level-2/paper-only \
+         seed never considers it"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless hit omits `paper` (never null, never fabricated); got {}",
+        results[0]
+    );
+    assert!(
+        results[0].get("section").is_none(),
+        "a parentless hit omits `section`; got {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["paper"]["doi"], "10.1/parentless",
+        "a paper paragraph still carries its paper attribution"
+    );
+}
+
+/// A level-2 claim with NO paper attribution — a workflow step, which
+/// `crates/epigraph-ingest/src/workflow/builder.rs` writes as
+/// `{"level": 2, "kind": "workflow_step"}` with only author `asserts` edges —
+/// is a hit in its own right.
+///
+/// Pre-fix it is the worst case of the old filter pair: the level-2 kNN
+/// spends the page's only slot (`limit = 1`) on it, and the assembly loop then
+/// drops it for having no paper, so the page comes back EMPTY.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_returns_a_level_2_claim_without_paper_attribution(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/wfstep", "Workflow step test").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let step = seed_parentless_claim(
+        &pool,
+        agent,
+        "workflow step: install the toolchain",
+        r#"{"level": 2, "kind": "workflow_step"}"#,
+        &query,
+        None,
+    )
+    .await;
+    diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a weaker paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(false, None, None, /*limit=*/ 1),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![step.to_string()],
+        "limit=1 must return the best match, the unattributed workflow step"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "an unattributed hit omits `paper`; got {}",
+        results[0]
+    );
+}
+
+/// The diverse surface seeds on the whole corpus too: a parentless claim
+/// inside the selected theme is a candidate for `diverse_select`.
+///
+/// Every row sits in the one theme, so the theme-coverage guard passes and
+/// the DIVERSE path serves the page (not the flat fallback). That is what
+/// makes this test independent of the flat-path tests above: with the diverse
+/// candidate query still restricted to paragraphs, the parentless claim is
+/// absent here even when the flat path is fixed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/div-parentless", "Diverse").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let theme = diverse_fixture::seed_theme_with_centroid(&pool, "only-theme", &query).await;
+
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "a memorized note that matches exactly",
+        "{}",
+        &query,
+        Some(theme),
+    )
+    .await;
+    let mut paragraphs = Vec::new();
+    for i in 0..3 {
+        paragraphs.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("themed paragraph {i}"),
+                &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.3 + 0.1 * i as f32),
+                Some(theme),
+            )
+            .await,
+        );
+    }
+
+    // alpha = 0.0: pure relevance, so the exact match must be selected.
+    let results = recall_results_json(
+        &pool,
+        diverse_params(true, Some(5), Some(0.0), /*limit=*/ 3),
+        &query,
+    )
+    .await;
+
+    let ids = result_ids(&results);
+    assert_eq!(
+        ids.len(),
+        3,
+        "the diverse page must fill its budget; got {ids:?}"
+    );
+    assert_eq!(
+        ids[0],
+        parentless.to_string(),
+        "the parentless exact match must be a diverse candidate and rank first; got {ids:?}"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless diverse hit omits `paper`; got {}",
+        results[0]
+    );
+}
