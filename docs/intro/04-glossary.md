@@ -70,7 +70,7 @@ A `claims` row treated as an entity with stable identity: at most one row per `(
 
 ## paragraph
 
-A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between the paper and its atoms. Paragraphs are the primary target of semantic search (`recall_with_context` searches at level 2, then batches in atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between the paper and its atoms. Paragraphs are the unit the structural context of semantic search is built around (`recall_with_context` searches every embedded claim, then batches in each hit's paper, section, atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## perspective
 
@@ -86,7 +86,7 @@ The cryptographically-audited trail of every write: each create or patch lands a
 
 ## recall
 
-The graph's semantic-search entry point, exposed via the `recall_with_context` MCP tool. It performs paragraph-primary vector search at level 2, batches in structural context (atoms, sibling paragraphs, `CORROBORATES` edges, neighbor paragraphs), and always returns a `corpus_scope` summary so callers can tell how big the searched corpus was. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The graph's semantic-search entry point, exposed via the `recall_with_context` MCP tool. It performs vector search over every embedded claim, batches in structural context where a hit has it (paper, section, atoms, sibling paragraphs, `CORROBORATES` edges, neighbor paragraphs; a parentless hit omits `paper`), and always returns a `corpus_scope` summary so callers can tell how big the searched corpus was. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## signature
 
