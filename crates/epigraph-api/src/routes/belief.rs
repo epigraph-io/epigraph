@@ -32,8 +32,8 @@
 //! through their alias. (`submit_evidence`'s own tier-A writes, the BBA, the
 //! frame assignment, the claim's cached belief, its Beta parameters, its
 //! global scoped belief and its edges, now go through ONE [`AppState::write_as`]
-//! transaction; its alias remains for the pre-transaction reads and the
-//! best-effort side effects after the commit.) `read_as` is documented
+//! transaction, and its best-effort derived rows after the commit through a
+//! second; its alias remains for unstamped reads only.) `read_as` is documented
 //! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
@@ -266,6 +266,46 @@ async fn create_edge_under_savepoint(
     .map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to close a savepoint: {e}"),
     })
+}
+
+/// A scoped belief `submit_evidence` derives after its commit (step 17) and
+/// writes on a stamped transaction (step 20).
+#[cfg(feature = "db")]
+struct ScopedBeliefWrite {
+    scope_type: &'static str,
+    scope_id: Uuid,
+    belief: f64,
+    plausibility: f64,
+    mass_on_empty: f64,
+    mass_on_missing: f64,
+    conflict_k: Option<f64>,
+    strategy: Option<String>,
+    pignistic_prob: f64,
+}
+
+/// Close a best-effort write's SAVEPOINT: release it when the write landed,
+/// roll back to it (logging `what`) when it was refused.
+///
+/// # Errors
+/// The savepoint's own RELEASE / ROLLBACK error (logged here too); the
+/// enclosing transaction is then unusable.
+#[cfg(feature = "db")]
+async fn finish_savepoint<T>(
+    sp: sqlx::Transaction<'_, sqlx::Postgres>,
+    result: Result<T, epigraph_db::DbError>,
+    what: &str,
+) -> Result<(), sqlx::Error> {
+    let closed = match result {
+        Ok(_) => sp.commit().await,
+        Err(e) => {
+            tracing::warn!("submit_evidence: {what} refused: {e}");
+            sp.rollback().await
+        }
+    };
+    if let Err(e) = &closed {
+        tracing::warn!("submit_evidence: could not close the {what} savepoint: {e}");
+    }
+    closed
 }
 
 fn default_reliability() -> f64 {
@@ -1336,9 +1376,12 @@ pub async fn submit_evidence(
     //    The submission's edges (WITHIN_FRAME and the DS relationships) are on
     //    this transaction too, so they carry the caller's writer group.
     //
-    //    Every pool-side write below runs AFTER the commit: once the recompute
-    //    has updated the `claims` row on `tx`, a write to that row on another
-    //    connection would wait on this transaction forever.
+    //    The derived rows computed after the commit (the perspective and
+    //    community scoped beliefs, the divergence record) are written on a
+    //    SECOND stamped transaction in step 20, never on the raw pool, and only
+    //    AFTER this one commits: once the recompute has updated the `claims`
+    //    row on `tx`, a write that touches that row on another connection
+    //    would wait on this transaction forever.
     let mut tx = state.write_as(&viewer, "submit_evidence").await?;
 
     // 5a. The claim, read as the caller. An unreadable claim gets the same 404
@@ -1746,12 +1789,27 @@ pub async fn submit_evidence(
         }
     }
 
-    // 17. Compute perspective-scoped and community-scoped beliefs
-    if let Some(perspective_id) = request.perspective_id {
+    // 17. Compute perspective-scoped and community-scoped beliefs.
+    //     The BBAs are read as the caller (an unstamped read sees no group
+    //     row), and the scoped beliefs are collected here and written in step
+    //     20 on a stamped transaction, never on the raw pool: there, FORCE'd
+    //     row security refused them without an error.
+    let mut scoped_beliefs: Vec<ScopedBeliefWrite> = Vec::new();
+    let mut scoped_read = match request.perspective_id {
+        Some(_) => match state.read_as(&viewer).await {
+            Ok(read) => Some(read),
+            Err(e) => {
+                tracing::warn!("submit_evidence: no stamped read for the scoped beliefs: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    if let (Some(perspective_id), Some(read)) = (request.perspective_id, scoped_read.as_mut()) {
         // Perspective scope: combine only BBAs from this perspective
         let perspective_rows =
             epigraph_db::MassFunctionRepository::get_for_claim_frame_perspective(
-                pool,
+                &mut **read,
                 &viewer,
                 request.claim_id,
                 frame_id,
@@ -1780,44 +1838,35 @@ pub async fn submit_evidence(
                 let p_m_empty = combination::fold_conflict(&p_combined, &p_reports);
                 let p_k = p_reports.last().map(|r| r.conflict_k);
                 let p_method_str = p_reports.last().map(|r| format!("{:?}", r.method_used));
-                let p_method = p_method_str.as_deref();
 
-                let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                    pool,
-                    frame_id,
-                    request.claim_id,
-                    "perspective",
-                    Some(perspective_id),
-                    p_bel,
-                    p_pl,
-                    p_m_empty,
-                    p_m_missing,
-                    p_k,
-                    p_method,
-                    Some(p_betp),
-                )
-                .await;
+                scoped_beliefs.push(ScopedBeliefWrite {
+                    scope_type: "perspective",
+                    scope_id: perspective_id,
+                    belief: p_bel,
+                    plausibility: p_pl,
+                    mass_on_empty: p_m_empty,
+                    mass_on_missing: p_m_missing,
+                    conflict_k: p_k,
+                    strategy: p_method_str,
+                    pignistic_prob: p_betp,
+                });
             }
         } else if perspective_masses.len() == 1 {
             let (p_bel, p_pl, p_betp, p_m_missing) =
                 compute_hypothesis_belief(&perspective_masses[0], &ds_frame, h_idx);
             let p_m_empty = perspective_masses[0].mass_of_empty();
 
-            let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                pool,
-                frame_id,
-                request.claim_id,
-                "perspective",
-                Some(perspective_id),
-                p_bel,
-                p_pl,
-                p_m_empty,
-                p_m_missing,
-                None,
-                None,
-                Some(p_betp),
-            )
-            .await;
+            scoped_beliefs.push(ScopedBeliefWrite {
+                scope_type: "perspective",
+                scope_id: perspective_id,
+                belief: p_bel,
+                plausibility: p_pl,
+                mass_on_empty: p_m_empty,
+                mass_on_missing: p_m_missing,
+                conflict_k: None,
+                strategy: None,
+                pignistic_prob: p_betp,
+            });
         }
 
         // Community scope: for each community this perspective belongs to
@@ -1828,7 +1877,8 @@ pub async fn submit_evidence(
             for community_id in community_ids {
                 // Check for community mass_override before combining member BBAs
                 let use_override = if let Ok(Some(comm)) =
-                    epigraph_db::CommunityRepository::get_by_id(pool, &viewer, community_id).await
+                    epigraph_db::CommunityRepository::get_by_id(&mut **read, &viewer, community_id)
+                        .await
                 {
                     if let Some(ref overrides) = comm.mass_override {
                         // Look up override for this specific frame
@@ -1841,21 +1891,17 @@ pub async fn submit_evidence(
                                     compute_hypothesis_belief(&override_mf, &ds_frame, h_idx);
                                 let o_m_empty = override_mf.mass_of_empty();
 
-                                let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                                    pool,
-                                    frame_id,
-                                    request.claim_id,
-                                    "community",
-                                    Some(community_id),
-                                    o_bel,
-                                    o_pl,
-                                    o_m_empty,
-                                    o_m_missing,
-                                    None,
-                                    Some("override"),
-                                    Some(o_betp),
-                                )
-                                .await;
+                                scoped_beliefs.push(ScopedBeliefWrite {
+                                    scope_type: "community",
+                                    scope_id: community_id,
+                                    belief: o_bel,
+                                    plausibility: o_pl,
+                                    mass_on_empty: o_m_empty,
+                                    mass_on_missing: o_m_missing,
+                                    conflict_k: None,
+                                    strategy: Some("override".to_string()),
+                                    pignistic_prob: o_betp,
+                                });
                                 true
                             } else {
                                 false
@@ -1880,7 +1926,7 @@ pub async fn submit_evidence(
                 {
                     let community_rows =
                         epigraph_db::MassFunctionRepository::get_for_claim_frame_perspectives(
-                            pool,
+                            &mut **read,
                             &viewer,
                             request.claim_id,
                             frame_id,
@@ -1912,49 +1958,42 @@ pub async fn submit_evidence(
                             let c_k = c_reports.last().map(|r| r.conflict_k);
                             let c_method_str =
                                 c_reports.last().map(|r| format!("{:?}", r.method_used));
-                            let c_method = c_method_str.as_deref();
 
-                            let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                                pool,
-                                frame_id,
-                                request.claim_id,
-                                "community",
-                                Some(community_id),
-                                c_bel,
-                                c_pl,
-                                c_m_empty,
-                                c_m_missing,
-                                c_k,
-                                c_method,
-                                Some(c_betp),
-                            )
-                            .await;
+                            scoped_beliefs.push(ScopedBeliefWrite {
+                                scope_type: "community",
+                                scope_id: community_id,
+                                belief: c_bel,
+                                plausibility: c_pl,
+                                mass_on_empty: c_m_empty,
+                                mass_on_missing: c_m_missing,
+                                conflict_k: c_k,
+                                strategy: c_method_str,
+                                pignistic_prob: c_betp,
+                            });
                         }
                     } else if community_masses.len() == 1 {
                         let (c_bel, c_pl, c_betp, c_m_missing) =
                             compute_hypothesis_belief(&community_masses[0], &ds_frame, h_idx);
                         let c_m_empty = community_masses[0].mass_of_empty();
 
-                        let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                            pool,
-                            frame_id,
-                            request.claim_id,
-                            "community",
-                            Some(community_id),
-                            c_bel,
-                            c_pl,
-                            c_m_empty,
-                            c_m_missing,
-                            None,
-                            None,
-                            Some(c_betp),
-                        )
-                        .await;
+                        scoped_beliefs.push(ScopedBeliefWrite {
+                            scope_type: "community",
+                            scope_id: community_id,
+                            belief: c_bel,
+                            plausibility: c_pl,
+                            mass_on_empty: c_m_empty,
+                            mass_on_missing: c_m_missing,
+                            conflict_k: None,
+                            strategy: None,
+                            pignistic_prob: c_betp,
+                        });
                     }
                 }
             }
         }
     }
+
+    drop(scoped_read);
 
     // 17b. Emit evidence.submitted event
     let event_store = super::events::global_event_store();
@@ -2118,20 +2157,65 @@ pub async fn submit_evidence(
     }
 
     // 20. Compute and store DS vs Bayesian divergence (using live Beta posterior)
+    //     and step 17's scoped beliefs: derived rows, best-effort, on ONE
+    //     stamped transaction after the main COMMIT, each under a SAVEPOINT so
+    //     one refusal does not discard the others. On the raw pool, FORCE'd row
+    //     security refused every one of them without an error. Nothing here may
+    //     fail the request: the submission is already committed.
     {
+        use sqlx::Acquire as _;
         let kl = kl_divergence_bernoulli(final_betp, bayesian_posterior);
 
-        // Store divergence record (best-effort; don't fail the whole request)
-        let _ = epigraph_db::DivergenceRepository::store(
-            pool,
-            request.claim_id,
-            frame_id,
-            final_betp,
-            bayesian_posterior,
-            kl,
-            Some(frame_row.version),
-        )
-        .await;
+        match state.write_as(&viewer, "submit_evidence.derived_rows").await {
+            Ok(mut side) => {
+                for w in &scoped_beliefs {
+                    let mut sp = match side.begin().await {
+                        Ok(sp) => sp,
+                        Err(e) => {
+                            tracing::warn!("submit_evidence: no savepoint for a scoped belief: {e}");
+                            break;
+                        }
+                    };
+                    let stored = epigraph_db::ScopedBeliefRepository::upsert(
+                        &mut *sp,
+                        frame_id,
+                        request.claim_id,
+                        w.scope_type,
+                        Some(w.scope_id),
+                        w.belief,
+                        w.plausibility,
+                        w.mass_on_empty,
+                        w.mass_on_missing,
+                        w.conflict_k,
+                        w.strategy.as_deref(),
+                        Some(w.pignistic_prob),
+                    )
+                    .await;
+                    if finish_savepoint(sp, stored, "scoped belief").await.is_err() {
+                        break;
+                    }
+                }
+                if let Ok(mut sp) = side.begin().await {
+                    let stored = epigraph_db::DivergenceRepository::store(
+                        &mut *sp,
+                        request.claim_id,
+                        frame_id,
+                        final_betp,
+                        bayesian_posterior,
+                        kl,
+                        Some(frame_row.version),
+                    )
+                    .await;
+                    let _ = finish_savepoint(sp, stored, "divergence record").await;
+                }
+                if let Err(e) = side.commit().await {
+                    tracing::warn!("submit_evidence: derived rows not committed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("submit_evidence: no stamped transaction for the derived rows: {e:?}");
+            }
+        }
 
         // Emit divergence.spike if KL exceeds threshold
         if kl >= DIVERGENCE_SPIKE_THRESHOLD {
