@@ -161,7 +161,7 @@ pub struct RecallWithContextParams {
     pub diversity_weight: Option<f32>,
     /// Candidate-pool top-K — the second-stage cutoff after theme
     /// selection. The diverse pipeline first picks the `max_themes`
-    /// most-similar themes, then pulls up to this many paragraphs from
+    /// most-similar themes, then pulls up to this many claims from
     /// them as input to submodular `diverse_select`. Bigger pool =
     /// finer cluster granularity reaches retrieval, at the cost of more
     /// SQL work and a quadratic in-memory similarity matrix.
@@ -1022,8 +1022,8 @@ async fn recall_with_context_post_embed(
             // recall_with_context seeds on the whole corpus (drain U082,
             // backlog a1d89aab), like the flat path above: a parentless claim
             // in a selected theme is a candidate, and the batched context
-            // fetch degrades to an empty structure for it rather than
-            // dropping it.
+            // fetch omits what it has no edges for (`paper`, `section`, the
+            // hierarchy lists) rather than dropping it.
             paragraph_only: false,
             // The diverse pipeline bypasses `search_by_embedding` entirely,
             // so the window has to reach it here or `diverse=true` would
@@ -1299,9 +1299,14 @@ async fn recall_with_context_post_embed(
             continue;
         }
         // No paper attribution is NOT a reason to drop the hit (drain U082,
-        // backlog a1d89aab): `paper` is omitted from it instead. Its
-        // structural context below degrades the same way — every map is keyed
-        // by edges a parentless claim does not have, so they come back empty.
+        // backlog a1d89aab): `paper` is omitted from it instead. Below,
+        // `section`, `atoms`, `siblings` and `neighbor_paragraphs` are keyed by
+        // the paper hierarchy's edges (decomposes_to / continues_argument /
+        // atom bridges), so in practice only a level-2 paragraph hit gets them
+        // filled — an atom or section hit keeps its `paper` with those empty.
+        // `corroborates` and `epistemic_edges` are keyed by the hit's OWN
+        // edges with no level or paper predicate, so a parentless claim with
+        // supports / refutes / corroborates edges gets them populated.
         let paper = ctx.paper_meta.get(&paragraph_id).cloned();
 
         let atoms = ctx

@@ -33,9 +33,32 @@ fn recall_with_context_description_states_the_whole_corpus_seed_and_optional_pap
     for needle in [
         "Semantic search over every embedded claim in the graph",
         "submit_claim / memorize claims",
-        "a hit with no paper attribution omits `paper`, has `section: null`",
+        "a hit with no paper attribution omits `paper` and has `section: null`",
         "`paragraph_id` is the hit's claim id whatever its level",
         "from all embedded claims",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}
+
+/// Which context lists a non-paragraph hit gets. `fetch_batched_context` keys
+/// `atoms`, `siblings` and `neighbor_paragraphs` by the paper hierarchy's
+/// edges, but `corroborates` and `epistemic_edges` by the hit's OWN edges
+/// with no level or paper predicate. An earlier wording said a parentless
+/// hit's "structural lists come back empty", which would tell an agent to
+/// skip the epistemic context a `submit_claim` claim with supports / refutes
+/// edges does carry.
+#[test]
+fn recall_with_context_description_says_which_lists_a_non_paragraph_hit_gets() {
+    let d = recall_with_context_description();
+    assert!(
+        !d.contains("structural lists come back empty"),
+        "a parentless hit's corroborates / epistemic_edges are NOT empty: {d}"
+    );
+    for needle in [
+        "only level-2 paragraph hits get them filled",
+        "an atom or section hit still carries `paper`",
+        "corroborates and epistemic_edges come from the hit's own edges at any level",
     ] {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
     }
