@@ -30,8 +30,8 @@
 //! **Three handlers are deliberately NOT converted, and the reason is not
 //! caution.** `create_frame`, `submit_evidence` and `refine_frame` each write
 //! through their alias. (`submit_evidence`'s own tier-A writes, the BBA, the
-//! frame assignment, the claim's cached belief, its Beta parameters and its
-//! global scoped belief, now go through ONE [`AppState::write_as`]
+//! frame assignment, the claim's cached belief, its Beta parameters, its
+//! global scoped belief and its edges, now go through ONE [`AppState::write_as`]
 //! transaction; its alias remains for the pre-transaction reads and the
 //! best-effort side effects after the commit.) `read_as` is documented
 //! read-only: `ScopedRead::commit`
@@ -215,6 +215,57 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
         ));
     }
     out
+}
+
+/// One of `submit_evidence`'s best-effort edges, written on its viewer-stamped
+/// transaction under a SAVEPOINT.
+///
+/// Stamped, the edges trigger records the caller's writer group, and row
+/// security decides the INSERT against the caller's writable set. A refused
+/// INSERT (row security, or `trigger_validate_edge_refs` on an endpoint that
+/// is not a row of its declared type) is logged and rolled back to the
+/// savepoint, so it neither fails the request nor aborts the transaction and
+/// silently rolls the BBA back at the COMMIT.
+///
+/// # Errors
+/// `ApiError::DatabaseError` only when the savepoint itself cannot be opened
+/// or closed.
+#[cfg(feature = "db")]
+async fn create_edge_under_savepoint(
+    conn: &mut sqlx::PgConnection,
+    source_id: Uuid,
+    source_type: &str,
+    target_id: Uuid,
+    target_type: &str,
+    relationship: &str,
+    properties: Option<serde_json::Value>,
+) -> Result<(), ApiError> {
+    use sqlx::Acquire as _;
+    let mut sp = conn.begin().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to open a savepoint: {e}"),
+    })?;
+    let created = epigraph_db::EdgeRepository::create(
+        &mut *sp,
+        source_id,
+        source_type,
+        target_id,
+        target_type,
+        relationship,
+        properties,
+        None,
+        None,
+    )
+    .await;
+    match created {
+        Ok(_) => sp.commit().await,
+        Err(e) => {
+            tracing::warn!("submit_evidence: {relationship} edge refused: {e}");
+            sp.rollback().await
+        }
+    }
+    .map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to close a savepoint: {e}"),
+    })
 }
 
 fn default_reliability() -> f64 {
@@ -967,7 +1018,7 @@ pub async fn create_frame(
 /// Pipeline: discount → (one stamped transaction: store → recompute the
 /// claim's belief on this frame with the shared pipeline
 /// `edge_factor::recompute_claim_belief_on_frame` → Beta update → global
-/// scoped belief) → emit events → compute divergence. The belief this returns is the one a later
+/// scoped belief → edges) → emit events → compute divergence. The belief this returns is the one a later
 /// `recompute_beliefs` with no new evidence leaves (backlogs 2bffdfdc,
 /// 82dcff9d), and no derived "combined" BBA is stored beside the input.
 ///
@@ -1282,6 +1333,9 @@ pub async fn submit_evidence(
     //    BBA), and a submission with no `agent_id` was overwritten by that
     //    combined row (same unique key).
     //
+    //    The submission's edges (WITHIN_FRAME and the DS relationships) are on
+    //    this transaction too, so they carry the caller's writer group.
+    //
     //    Every pool-side write below runs AFTER the commit: once the recompute
     //    has updated the `claims` row on `tx`, a write to that row on another
     //    connection would wait on this transaction forever.
@@ -1588,6 +1642,73 @@ pub async fn submit_evidence(
         })?;
     }
 
+    // 14 / 16. The edges this submission records, on the stamped transaction
+    //     (each best-effort, under a SAVEPOINT like steps 6, 13b and 15). On
+    //     the raw pool after the commit they were written UNSTAMPED: the edges
+    //     trigger records the writer from the session, so every one landed
+    //     with no writer group, a public claim's WITHIN_FRAME edge owned by
+    //     the world group, and a group claim's refused outright by row
+    //     security.
+    create_edge_under_savepoint(
+        &mut tx,
+        request.claim_id,
+        "claim",
+        frame_id,
+        "frame",
+        "WITHIN_FRAME",
+        None,
+    )
+    .await?;
+    //     DS relationships. "evidence" is the entity type for mass functions
+    //     (constraint-compatible).
+    if final_bel > 0.5 {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            request.claim_id,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"belief": final_bel})),
+        )
+        .await?;
+    } else if final_bel < 0.3 {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            request.claim_id,
+            "claim",
+            "CONTRADICTS",
+            Some(serde_json::json!({"belief": final_bel})),
+        )
+        .await?;
+    }
+    if let Some(agent_id) = request.agent_id {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            agent_id,
+            "agent",
+            "GENERATED_BY",
+            None,
+        )
+        .await?;
+    }
+    if let Some(perspective_id) = request.perspective_id {
+        create_edge_under_savepoint(
+            &mut tx,
+            perspective_id,
+            "perspective",
+            request.claim_id,
+            "claim",
+            "CONTRIBUTES_TO",
+            None,
+        )
+        .await?;
+    }
+
     tx.commit().await?;
 
     // 13c. CDST residual mass analysis
@@ -1623,80 +1744,6 @@ pub async fn submit_evidence(
                 )
                 .await;
         }
-    }
-
-    // 14. The WITHIN_FRAME edge (best-effort, after the commit)
-    let _ = epigraph_db::EdgeRepository::create(
-        pool,
-        request.claim_id,
-        "claim",
-        frame_id,
-        "frame",
-        "WITHIN_FRAME",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    // 16. Create edges reflecting DS relationships (best-effort)
-    //     Use "evidence" as entity type for mass functions (constraint-compatible)
-    if final_bel > 0.5 {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            request.claim_id,
-            "claim",
-            "SUPPORTS",
-            Some(serde_json::json!({"belief": final_bel})),
-            None,
-            None,
-        )
-        .await;
-    } else if final_bel < 0.3 {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            request.claim_id,
-            "claim",
-            "CONTRADICTS",
-            Some(serde_json::json!({"belief": final_bel})),
-            None,
-            None,
-        )
-        .await;
-    }
-
-    if let Some(agent_id) = request.agent_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            agent_id,
-            "agent",
-            "GENERATED_BY",
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
-
-    if let Some(perspective_id) = request.perspective_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            perspective_id,
-            "perspective",
-            request.claim_id,
-            "claim",
-            "CONTRIBUTES_TO",
-            None,
-            None,
-            None,
-        )
-        .await;
     }
 
     // 17. Compute perspective-scoped and community-scoped beliefs
