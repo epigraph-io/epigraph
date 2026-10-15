@@ -1256,7 +1256,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow; feed the returned claim_ids to the decompose_claims CLI."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
     )]
     async fn query_undecomposed_claims(
         &self,

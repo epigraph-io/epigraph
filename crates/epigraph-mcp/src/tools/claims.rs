@@ -2558,11 +2558,16 @@ pub async fn query_undecomposed_claims(
         .await
         .map_err(internal_error)?;
 
-    let results: Vec<ClaimResponse> = claims
+    // `looks_atomic`: the same heuristic `decompose_claims` skips on, so an
+    // agent can tell the terminal-by-policy rows (U073, backlog `5e1debbc`)
+    // from the ones the CLI will actually decompose. Computed per row, not
+    // filtered: dropping rows after the LIMIT would break offset paging.
+    let results: Vec<crate::types::UndecomposedClaimResponse> = claims
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            ClaimResponse {
+            let looks_atomic = epigraph_core::atomicity::looks_atomic(&c.content);
+            let claim = ClaimResponse {
                 id: id.to_string(),
                 content: c.content.clone(),
                 truth_value: c.truth_value.value(),
@@ -2577,6 +2582,10 @@ pub async fn query_undecomposed_claims(
                 // `list_undecomposed` projects and post-fixes it.
                 supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
                 belief_score: None,
+            };
+            crate::types::UndecomposedClaimResponse {
+                claim,
+                looks_atomic,
             }
         })
         .collect();
