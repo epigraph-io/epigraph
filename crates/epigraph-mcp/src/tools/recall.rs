@@ -1045,6 +1045,7 @@ async fn recall_with_context_post_embed(
                 flat_limit,
                 params.paper_doi_filter.as_deref(),
                 params.since,
+                epigraph_db::EmbeddingSeedScope::Paragraphs,
             )
             .await
             .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
@@ -1069,6 +1070,7 @@ async fn recall_with_context_post_embed(
             flat_limit,
             params.paper_doi_filter.as_deref(),
             params.since,
+            epigraph_db::EmbeddingSeedScope::Paragraphs,
         )
         .await
         .map_err(|e| internal_error(format!("kNN: {e}")))?
