@@ -272,6 +272,51 @@ mod tests {
         assert!((restricted.open_world - 0.08).abs() < 1e-10);
     }
 
+    /// `contradicts` is mutual exclusion (migration 001 labels it
+    /// `'mutual_exclusion'`), not negation: a DISBELIEVED contradictor says
+    /// nothing about its target. Under the old complement law a source
+    /// [0.05, 0.20] at f = 0.90 restricted to bel (1 − 0.20)·0.90 = 0.72, i.e.
+    /// it became strong SUPPORT for the claim it contradicts (backlog I014).
+    #[test]
+    fn test_restrict_negative_disbelieved_source_carries_no_support() {
+        let restricted =
+            restrict_epistemic_negative(&EpistemicInterval::new(0.05, 0.20, 0.0), 0.90);
+        assert!(
+            restricted.bel < 1e-12,
+            "a disbelieved contradictor must transfer no support, got bel {}",
+            restricted.bel
+        );
+        // Its belief 0.05 still caps the target: pl = 1 − 0.05·0.90.
+        assert!(
+            (restricted.pl - 0.955).abs() < 1e-12,
+            "pl = {}",
+            restricted.pl
+        );
+    }
+
+    /// No contradictor, however disbelieved or ignorant, may put mass on its
+    /// target being TRUE: the restricted Bel is 0 for every source and factor.
+    #[test]
+    fn test_restrict_negative_never_supports_the_target() {
+        for &(bel, pl, ow) in &[
+            (0.00, 0.00, 0.00),
+            (0.05, 0.20, 0.10),
+            (0.00, 1.00, 0.50),
+            (0.30, 0.60, 0.00),
+            (0.90, 0.95, 0.05),
+        ] {
+            for &f in &[0.1, 0.5, 0.8, 0.9, 1.0] {
+                let src = EpistemicInterval::new(bel, pl, ow);
+                let r = restrict_epistemic_negative(&src, f);
+                assert!(
+                    r.bel < 1e-12,
+                    "src={src} f={f}: restricted bel must be 0, got {}",
+                    r.bel
+                );
+            }
+        }
+    }
+
     /// The load-bearing invariant behind discounting `open_world`:
     /// `restrict_epistemic_positive` must BE the Shafer reliability discount.
     ///

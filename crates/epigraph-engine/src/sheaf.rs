@@ -515,6 +515,57 @@ mod tests {
     }
 
     #[test]
+    fn test_section_disbelieved_pair_is_consistent() {
+        // Node BetP 0.30 contradicted by a source at BetP 0.125, f = 0.9:
+        // mutual exclusion caps the node at 1 − 0.125·0.9 = 0.8875, and
+        // 0.30 is under it, so radius 0. (The complement average expected
+        // (1 − 0.125)·0.9 = 0.7875 and gave |0.30 − 0.7875| = 0.4875.)
+        let section = compute_section(
+            Uuid::new_v4(),
+            0.30,
+            0.20,
+            0.40,
+            &[(0.125, RestrictionKind::Negative(0.9))],
+        );
+        assert!(
+            section.consistency_radius < 1e-9,
+            "disbelieved pair must have radius 0, got {}",
+            section.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_section_negative_radius_equals_worst_contradicts_edge() {
+        // The node twin of compute_edge_inconsistency's Negative ceiling: a
+        // Negative-only node's radius is its worst contradicts-edge excess.
+        // Node 0.70; contradicters 0.40 (ceiling 0.64), 0.10 (ceiling 0.91):
+        // binding ceiling 0.64 -> 0.06.
+        let section = compute_section(
+            Uuid::new_v4(),
+            0.70,
+            0.6,
+            0.8,
+            &[
+                (0.40, RestrictionKind::Negative(0.9)),
+                (0.10, RestrictionKind::Negative(0.9)),
+            ],
+        );
+        let worst_edge = compute_edge_inconsistency(0.40, 0.70, "contradicts")
+            .0
+            .max(compute_edge_inconsistency(0.10, 0.70, "contradicts").0);
+        assert!(
+            (worst_edge - 0.06).abs() < 1e-9,
+            "edge path gave {worst_edge}"
+        );
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst contradicts-edge excess {}",
+            section.consistency_radius,
+            worst_edge
+        );
+    }
+
+    #[test]
     fn test_section_no_epistemic_neighbors() {
         let id = Uuid::new_v4();
         let section = compute_section(id, 0.7, 0.5, 0.9, &[]);

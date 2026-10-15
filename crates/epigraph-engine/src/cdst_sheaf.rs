@@ -969,6 +969,142 @@ mod tests {
         assert_eq!(s.neighbor_count, 2);
     }
 
+    // ── Negative ceiling (mutual exclusion, U075) ─────────────────────────
+
+    #[test]
+    fn test_cdst_section_disbelieved_pair_is_consistent() {
+        // Both claims disbelieved and linked by contradicts: "not both true"
+        // holds, so there is nothing to flag. Local [0.20, 0.40]; contradicter
+        // [0.05, 0.20] at f = 0.9 caps the node at pl = 1 − 0.05·0.9 = 0.955,
+        // and 0.20 ≤ 0.955. (The complement law expected [0.72, 0.955]:
+        // Hausdorff 0.555, radius |0.30 − 0.8375| = 0.5375.)
+        let local = EpistemicInterval::new(0.20, 0.40, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[(
+                EpistemicInterval::new(0.05, 0.20, 0.0),
+                RestrictionKind::Negative(0.9),
+            )],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "disbelieved pair interval_inconsistency must be 0, got {}",
+            s.interval_inconsistency
+        );
+        assert!(
+            s.consistency_radius < 1e-9,
+            "disbelieved pair consistency_radius must be 0, got {}",
+            s.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_weak_contradicter_does_not_flag_believed_node() {
+        // A believed node [0.80, 0.90] under a weak contradicter [0.05, 0.20]
+        // at f = 0.9: ceiling 0.955, 0.80 ≤ 0.955, so 0 on BOTH fields. A
+        // symmetric metric over the mutual-exclusion expectation [0, 0.955]
+        // would give 0.80 here (every believed target of every weak
+        // contradicter flagged); the complement law gave Hausdorff 0.08.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[(
+                EpistemicInterval::new(0.05, 0.20, 0.0),
+                RestrictionKind::Negative(0.9),
+            )],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "interval_inconsistency must be 0, got {}",
+            s.interval_inconsistency
+        );
+        assert!(
+            s.consistency_radius < 1e-9,
+            "consistency_radius must be 0, got {}",
+            s.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_negative_radius_equals_worst_contradicts_edge() {
+        // Node and edge must agree, the dual of
+        // test_cdst_section_positive_radius_equals_worst_supports_edge: for a
+        // Negative-only node both fields are its worst contradicts-edge
+        // excess over the ceiling, as scored by the independent edge path.
+        let node = EpistemicInterval::new(0.60, 0.80, 0.0);
+        let contradicters = [
+            EpistemicInterval::new(0.30, 0.50, 0.0),
+            EpistemicInterval::new(0.55, 0.70, 0.0),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+        ];
+        let node_id = Uuid::new_v4();
+        let neighbors: Vec<_> = contradicters
+            .iter()
+            .map(|c| (*c, RestrictionKind::Negative(sci().contradicts)))
+            .collect();
+        let section = compute_cdst_section(node_id, node, &neighbors);
+        let worst_edge = contradicters
+            .iter()
+            .map(|c| {
+                compute_cdst_edge_inconsistency(
+                    Uuid::new_v4(),
+                    node_id,
+                    *c,
+                    node,
+                    "contradicts",
+                    &sci(),
+                )
+                .interval_inconsistency
+            })
+            .fold(0.0f64, f64::max);
+        // Binding ceiling: 1 − 0.55·0.9 = 0.505, so 0.60 − 0.505 = 0.095.
+        assert!(
+            (worst_edge - 0.095).abs() < 1e-9,
+            "edge path gave {worst_edge}"
+        );
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst contradicts-edge excess {}",
+            section.consistency_radius,
+            worst_edge
+        );
+        assert!((section.interval_inconsistency - worst_edge).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cdst_section_negative_and_frame_evidence_scored_separately() {
+        // Negative neighbours are a ceiling, FrameEvidence ones keep the
+        // symmetric metric over their OWN average: the two must not be
+        // averaged together. Local [0.80, 0.90]; FE neighbour [0.80, 0.90]
+        // (distance 0) and a weak contradicter [0.05, 0.20] at f = 0.9
+        // (ceiling 0.955, not binding). Expected 0 on both fields; averaging
+        // the FE and Negative restrictions ([0.40, 0.9275]) would give 0.40.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.80, 0.90, 0.0),
+                    RestrictionKind::FrameEvidence(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.05, 0.20, 0.0),
+                    RestrictionKind::Negative(0.9),
+                ),
+            ],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+        assert!(s.consistency_radius < 1e-9, "got {}", s.consistency_radius);
+        assert_eq!(s.neighbor_count, 2);
+    }
+
     // ── build_cdst_sections tests ────────────────────────────────────────
 
     fn weak() -> EpistemicInterval {
@@ -1601,6 +1737,34 @@ mod tests {
         assert!(
             (obs.conflict_component - 0.655).abs() < 1e-9,
             "contradicts conflict must stay symmetric at 0.655, got {}",
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_contradicts_between_two_disbelieved_claims_is_consistent() {
+        // Mutual exclusion ("not both true") is satisfied by two disbelieved
+        // claims. Source [0.05, 0.20] at f = 0.90 caps the target at
+        // pl = 0.955; target [0.20, 0.40] sits under it, so both twin fields
+        // are 0. The complement law expected [0.72, 0.955] and scored
+        // max(|0.20 − 0.72|, |0.40 − 0.955|) = 0.555 on both (backlog I014's
+        // "low-BetP sources triggering high edge inconsistency").
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+            EpistemicInterval::new(0.20, 0.40, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "interval_inconsistency must be 0, got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.conflict_component < 1e-9,
+            "conflict_component must be 0, got {}",
             obs.conflict_component
         );
     }
