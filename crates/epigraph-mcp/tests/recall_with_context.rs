@@ -3323,7 +3323,8 @@ async fn diverse_mode_falls_back_under_index_backed_plans(pool: PgPool) {
 // 2026-10-14). `recall_with_context` seeds on EVERY embedded claim the viewer
 // can see, not only on level-2 paragraphs with a paper attribution. Paper and
 // section parentage are enrichment attributes: a parentless hit omits `paper`
-// (and `section`) instead of being dropped.
+// (and carries `section: null`, as any section-less hit always did) instead of
+// being dropped.
 // ============================================================================
 
 /// An embedded claim that is NOT an `ingest_document` paragraph: no paper
@@ -3441,8 +3442,9 @@ async fn recall_with_context_returns_a_parentless_best_match_ahead_of_a_weaker_p
         results[0]
     );
     assert!(
-        results[0].get("section").is_none(),
-        "a parentless hit omits `section`; got {}",
+        results[0]["section"].is_null() && results[0].get("section").is_some(),
+        "a parentless hit carries `section: null` (the key set of a section-less hit is \
+         unchanged); got {}",
         results[0]
     );
     assert_eq!(

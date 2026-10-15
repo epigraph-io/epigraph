@@ -576,9 +576,10 @@ pub struct RecallHit {
     /// enrichment attribute, not an eligibility filter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paper: Option<PaperMeta>,
-    /// The level-1 section this hit decomposes from. Omitted when there is
-    /// none (every non-paragraph hit, and a paragraph with no section).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The level-1 section this hit decomposes from; `null` when there is
+    /// none (every non-paragraph hit, and a paragraph with no section). Kept
+    /// serialized as `null`, as it always was, so existing paragraph hits
+    /// keep the same key set; only `paper` changed shape in drain U082.
     pub section: Option<SectionMeta>,
     pub atoms: Vec<AtomChild>,
     pub atoms_total: usize,

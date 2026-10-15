@@ -33,7 +33,7 @@ fn recall_with_context_description_states_the_whole_corpus_seed_and_optional_pap
     for needle in [
         "Semantic search over every embedded claim in the graph",
         "submit_claim / memorize claims",
-        "a hit with no paper attribution omits `paper` (and `section`)",
+        "a hit with no paper attribution omits `paper`, has `section: null`",
         "`paragraph_id` is the hit's claim id whatever its level",
         "from all embedded claims",
     ] {

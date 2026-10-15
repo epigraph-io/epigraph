@@ -324,7 +324,7 @@ never re-embedded.
 
 Every `recall_with_context` response also carries a `corpus_scope` summary — `claims_total`, `paragraph_total`, `paper_total`, `themes_total` — so callers can tell how big the corpus was at query time. That number changes as ingest runs, and the LLM consuming the result needs to know whether it just searched 200 paragraphs or 200,000 before deciding how much faith to place in "we found nothing relevant".
 
-A single recall hit for an ingested paragraph, abbreviated, looks like this — note the structural batches around it (a hit with no parent paper omits `paper` and `section` and has empty lists):
+A single recall hit for an ingested paragraph, abbreviated, looks like this — note the structural batches around it (a hit with no parent paper omits `paper`, has `section: null` and empty lists):
 
 ```json
 {
