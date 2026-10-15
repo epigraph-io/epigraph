@@ -3458,6 +3458,13 @@ async fn recall_with_context_returns_a_parentless_best_match_ahead_of_a_weaker_p
 /// `{"level": 2, "kind": "workflow_step"}` with only author `asserts` edges —
 /// is a hit in its own right.
 ///
+/// The fixture carries that author edge in the shape `ingest_workflow`
+/// persists it (`crates/epigraph-mcp/src/tools/ingestion.rs` resolves the
+/// planner's `author_placeholder` source to the author's agent: `source_type =
+/// 'agent'`, `relationship = 'asserts'`), so the "omits `paper`" assertion
+/// covers the production edge shape: an `asserts` edge that is not from a
+/// paper must not produce paper meta.
+///
 /// Pre-fix it is the worst case of the old filter pair: the level-2 kNN
 /// spends the page's only slot (`limit = 1`) on it, and the assembly loop then
 /// drops it for having no paper, so the page comes back EMPTY.
@@ -3476,6 +3483,17 @@ async fn recall_with_context_returns_a_level_2_claim_without_paper_attribution(p
         None,
     )
     .await;
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES (gen_random_uuid(), $1, 'agent', $2, 'claim', 'asserts', \
+                 '{\"role\": \"author\", \"source\": \"workflow_attribution\"}'::jsonb)",
+    )
+    .bind(agent)
+    .bind(step)
+    .execute(&pool)
+    .await
+    .expect("seed the workflow step's author asserts edge");
     diverse_fixture::seed_paragraph(
         &pool,
         agent,
