@@ -253,10 +253,13 @@ pub async fn ingest_document(
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
-/// but the COMMON refusal — this server's agent has no live writable
-/// membership of its PERSONAL group (which owns every row the walk writes), or
-/// the process was built without a `ScopedPool` — is knowable before the task
-/// starts. This opens exactly the transaction the task will open, from the same
+/// but the COMMON refusals are knowable before the task starts: the author
+/// cannot write the group that owns every row the walk writes (its own
+/// personal group, or its operator's when it is operator-linked and acting;
+/// see `owner_decl`), the author is bound to no human operator once operator
+/// binding is armed (`OPL01`), a linked agent whose link is not acting would
+/// fall back to a group its operator does not write (`OPL02`), or the process
+/// was built without a `ScopedPool`. This opens exactly the transaction the task will open, from the same
 /// author, runs the same owner-group check ([`IngestTx::owner_decl`]), and
 /// drops it: so that refusal is returned to the caller as an error with nothing
 /// written, instead of a `queued` over a task that cannot write.
@@ -281,8 +284,10 @@ async fn preflight_write_authority(
     let mut tx = begin_ingest_tx(server, author, tool_name).await?;
     // The OWNER group, not merely "some writable group": the same read-only
     // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
-    // personal membership is revoked or read-only is refused HERE, to the
-    // caller, instead of being told `queued` over a task that writes nothing.
+    // owner-group membership is revoked or read-only, an unbound author once
+    // armed (OPL01), and a linked agent whose link is not acting (OPL02) are
+    // refused HERE, to the caller, instead of being told `queued` over a task
+    // that writes nothing.
     tx.owner_decl(agent_id, tool_name).await?;
     // Nothing was written on it; dropping it rolls back.
     drop(tx);
@@ -667,11 +672,30 @@ impl IngestTx<'_> {
         }
     }
 
-    /// The tenancy declaration every row of this ingest is owned under: the
-    /// ingesting agent's PERSONAL group — proved live and writable on THIS
-    /// transaction, never minted.
+    /// The tenancy declaration every row of this ingest is owned under — the
+    /// same owner rule `submit_claim` / `memorize` apply
+    /// (`ClaimRepository::default_decl_for_author`), resolved without ever
+    /// minting:
     ///
-    /// # Why not `ClaimRepository::default_decl_for_author`
+    /// * an operator-linked agent that is ACTING for its operator (migration
+    ///   107's `epigraph_operator_actor`): the OPERATOR's personal group;
+    /// * any other author: its OWN personal group, proved live and writable on
+    ///   THIS transaction.
+    ///
+    /// # Why the operator branch comes first
+    ///
+    /// Once operator binding is armed (migration 122), the claims trigger
+    /// refuses a linked agent's claim owned by a group its operator does not
+    /// write (`OPL02`). A linked agent's own personal group is such a group.
+    /// This arm used to read ONLY that group, so a linked agent that still
+    /// held a live membership there passed the synchronous preflight, was
+    /// told `queued`, and then lost the whole detached walk to `OPL02` on the
+    /// first claim INSERT, where only the server log saw it. A linked agent
+    /// with no personal group of its own was refused outright. The operator
+    /// branch is what `default_decl_for_author` has done since migration 107;
+    /// this arm predated it and was never re-pointed.
+    ///
+    /// # Why not call `ClaimRepository::default_decl_for_author`
     ///
     /// That helper resolves through `ensure_personal_group`, which on migration
     /// 077's body revived a revoked admin membership (`ON CONFLICT … DO UPDATE
@@ -680,7 +704,8 @@ impl IngestTx<'_> {
     /// transaction stamped from the author, "not visible" already means "no
     /// LIVE membership", and a read-only check can refuse with the
     /// operator-facing reason without spending the function's RAISE on an
-    /// ingest transaction.
+    /// ingest transaction. So it mirrors that helper's ORDER with reads and
+    /// refusals only.
     ///
     /// `begin_author_stamped_tx` only proves the author has SOME writable
     /// group, and "some writable group is not the same question"
@@ -690,13 +715,38 @@ impl IngestTx<'_> {
     /// group, `ingest_document_inline` twice — `personal:admin(revoked)` became
     /// `personal:admin(live)` and +3 / +4 claims committed under it.
     ///
-    /// So on the Stamped arm this is a pure read plus a refusal:
-    /// * [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
-    ///   — `None` means no live membership; refuse.
-    /// * [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
-    ///   — `group = ANY(epigraph_writable_groups())` on the same transaction,
-    ///   the exact question migration 077's `WITH CHECK` will ask of every row;
-    ///   a live `reader` membership fails it; refuse.
+    /// So on the Stamped arm this is, in order, the claims trigger's own
+    /// questions asked before anything is written:
+    /// 1. [`epigraph_db::AgentRepository::require_bound_author`] — an author
+    ///    bound to no registered human operator is refused by name (`OPL01`)
+    ///    once armed; quiet when unarmed. Asked FIRST and of every author,
+    ///    because an acting link (step 2) does not read the human registry: a
+    ///    link whose operator was de-registered still acts, and still does not
+    ///    bind.
+    /// 2. [`epigraph_db::AgentRepository::operator_actor`] (a definer read) —
+    ///    `Some` gives the operator's personal group. An acting link means the
+    ///    agent AND the operator hold live writer/admin rows there, so the
+    ///    trigger's writer-scope check passes and the stamp carries the group.
+    /// 3. Otherwise [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
+    ///    — `None` means no live membership; refuse (`OPL02`, by name, when
+    ///    the agent is live-linked: its link is not acting and it has no group
+    ///    it may write).
+    /// 4. [`epigraph_db::AgentRepository::require_writer_authority`] with the
+    ///    author as the writer — the trigger's writer-scope question on the
+    ///    resolved group. A live link that is NOT acting (the operator revoked
+    ///    the agent's row in its group, or no longer holds the group itself)
+    ///    falls back to the agent's own personal group, which its operator
+    ///    does not write: `OPL02`. So does an author bound only through the
+    ///    client allowlist (migration 149), whose own personal group is not
+    ///    one its human writes. Quiet for an unlinked agent and when unarmed.
+    /// 5. [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
+    ///    — `group = ANY(epigraph_writable_groups())` on the same transaction,
+    ///    the exact question migration 077's `WITH CHECK` will ask of every row;
+    ///    a live `reader` membership fails it; refuse.
+    ///
+    /// Every refusal here reaches the caller synchronously, because
+    /// [`preflight_write_authority`] runs this same check before the detached
+    /// walk is spawned and before the `papers` row is written.
     ///
     /// The Privileged arm (the operator CLI on `MaintenancePool`, BYPASSRLS)
     /// calls `default_decl_for_author`: there is no stamp to reason about. Since
@@ -726,27 +776,80 @@ impl IngestTx<'_> {
             );
             internal_error(format!("{tool_name}: {why}"))
         };
-        let Some(group) =
-            epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
-                .await
-                .map_err(internal_error)?
-        else {
-            return Err(refuse(format!(
-                "the ingesting agent ({agent_id}) holds no LIVE membership of its personal group, \
-                 which owns every row this ingest would write. Refusing: if the membership was \
-                 revoked, restoring it is an operator decision, and nothing on this path will \
-                 restore it. Nothing was written"
-            )));
+        // 1. The claims trigger's first question, asked of EVERY author: is it
+        //    bound to a registered human operator? OPL01 by name once armed.
+        //    Unconditional, because an acting link (107) does not read the
+        //    human registry: a link whose operator was de-registered still
+        //    "acts", and only this check sees that it no longer binds.
+        epigraph_db::AgentRepository::require_bound_author(tx, agent_id)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+        // 2. Operator-linked and ACTING: the operator's personal group.
+        let group = if let Some(link) = epigraph_db::AgentRepository::operator_actor(tx, agent_id)
+            .await
+            .map_err(crate::errors::db_caller_error)?
+        {
+            link.operator_group_id
+        } else {
+            // 3. The author's own personal group, a pure read.
+            let Some(own) =
+                epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
+                    .await
+                    .map_err(internal_error)?
+            else {
+                // A live-linked agent whose link is not acting has no group
+                // it may write: say that (OPL02), not "restore your personal
+                // membership", which would not help.
+                let binding = epigraph_db::AgentRepository::author_binding(tx, agent_id)
+                    .await
+                    .map_err(crate::errors::db_caller_error)?;
+                if binding.as_deref() == Some(epigraph_db::LIVE_LINK_BINDING) {
+                    let why = format!(
+                        "the ingesting agent ({agent_id}) is operator-linked, but its link is not \
+                         acting (its membership in its operator's personal group was revoked, or \
+                         the operator no longer holds that group), and it has no personal group \
+                         of its own; a linked agent writes only where its operator writes. \
+                         Nothing was written"
+                    );
+                    tracing::error!(
+                        target: "tenancy.scoped_write",
+                        tool = tool_name,
+                        author = %agent_id,
+                        "{why}"
+                    );
+                    return Err(crate::errors::db_caller_error(
+                        epigraph_db::DbError::OperatorScopeRefused { message: why },
+                    ));
+                }
+                return Err(refuse(format!(
+                    "the ingesting agent ({agent_id}) holds no LIVE membership of its personal \
+                     group, which owns every row this ingest would write. Refusing: if the \
+                     membership was revoked, restoring it is an operator decision, and nothing on \
+                     this path will restore it. Nothing was written"
+                )));
+            };
+            own
         };
+        // 4. The trigger's own writer-scope question on the resolved group
+        //    (bound writer, writer scope, attribution; the author IS the
+        //    writer here). OPL02 by name for a live link that is not acting
+        //    (its fallback is a group its operator does not write), an author
+        //    bound only through the client allowlist (149: its own group is
+        //    not one its human writes), and a retired link under the valve.
+        epigraph_db::AgentRepository::require_writer_authority(tx, agent_id, Some(agent_id), group)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+        // 5. The stamp must carry the owner group (077's WITH CHECK).
         let writable =
             epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, group)
                 .await
                 .map_err(|e| internal_error(format!("{tool_name}: writable-group check: {e}")))?;
         if !writable {
             return Err(refuse(format!(
-                "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of its \
-                 personal group ({group}), which owns every row this ingest would write, so \
-                 every INSERT would be refused. Nothing was written"
+                "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of the \
+                 group that owns every row this ingest would write ({group}: its own personal \
+                 group, or its operator's when it is operator-linked), so every INSERT would be \
+                 refused. Nothing was written"
             )));
         }
         Ok(epigraph_core::TenancyDecl::public(group))
@@ -859,8 +962,9 @@ pub async fn do_ingest_document(
 
     // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
-    // Every claim below is authored by the write identity and owned by that
-    // agent's personal group (`decl`), so that agent's viewer is the one
+    // Every claim below is authored by the write identity and owned by `decl`
+    // (that agent's personal group, or its operator's when it is
+    // operator-linked; see `IngestTx::owner_decl`), so that agent's viewer is the one
     // migration 077's `WITH CHECK` asks about — the sibling-tool identity, which
     // here IS the row's author (contrast the workflow executor, which authors as
     // its own system agent).
@@ -1665,8 +1769,9 @@ async fn persist_planned_claim(
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
-    // Tenancy declaration (PR-16): the ingesting agent's own personal group,
-    // resolved ONCE by the caller above its loop. It was resolved here per
+    // Tenancy declaration (PR-16): the owner group `IngestTx::owner_decl`
+    // resolves (the ingesting agent's own personal group, or its operator's
+    // when it is operator-linked), resolved ONCE by the caller above its loop. It was resolved here per
     // planned claim until review: an N-claim document then performed N
     // `pool.acquire()` calls and N identical `SELECT id FROM groups WHERE
     // did_key = ...` round trips for the same agent.
