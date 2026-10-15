@@ -1195,25 +1195,38 @@ pub async fn submit_evidence(
         }
     }
 
-    // 4c. Apply perspective confidence_calibration as additional discount
+    // 4c. Apply perspective confidence_calibration as additional discount.
+    //     The perspective is read AS THE CALLER, and one it cannot read is a
+    //     404 before anything is written. On the raw pool this read saw no
+    //     group-private perspective, and a miss (or an error) went ahead:
+    //     the BBA was filed under a perspective the caller cannot see (the
+    //     foreign key ignores row security), its CONTRIBUTES_TO edge and
+    //     scoped belief followed, and the calibration was skipped.
     if let Some(perspective_id) = request.perspective_id {
-        if let Ok(Some(perspective)) =
-            epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, perspective_id).await
-        {
-            if let Some(calibration) = perspective.confidence_calibration {
-                if (0.0..1.0).contains(&calibration) {
-                    match combination::discount(&modified, calibration) {
-                        Ok(m) => {
-                            tracing::debug!(
-                                "Applied confidence_calibration={calibration} for perspective {perspective_id}"
-                            );
-                            modified = m;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Confidence calibration discount failed for perspective {perspective_id}: {e}"
-                            );
-                        }
+        let perspective = {
+            let mut read = state.read_as(&viewer).await?;
+            epigraph_db::PerspectiveRepository::get_by_id(&mut *read, &viewer, perspective_id)
+                .await?
+        };
+        let Some(perspective) = perspective else {
+            return Err(ApiError::NotFound {
+                entity: "perspective".to_string(),
+                id: perspective_id.to_string(),
+            });
+        };
+        if let Some(calibration) = perspective.confidence_calibration {
+            if (0.0..1.0).contains(&calibration) {
+                match combination::discount(&modified, calibration) {
+                    Ok(m) => {
+                        tracing::debug!(
+                            "Applied confidence_calibration={calibration} for perspective {perspective_id}"
+                        );
+                        modified = m;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Confidence calibration discount failed for perspective {perspective_id}: {e}"
+                        );
                     }
                 }
             }
