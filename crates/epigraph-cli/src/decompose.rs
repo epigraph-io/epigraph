@@ -515,40 +515,52 @@ impl SingletonLedger {
     /// Read `path` for selection only. A missing file is an empty ledger and
     /// is NOT created (`--dry-run` and `--plan` write nothing).
     ///
+    /// A final line with no newline that does not parse is a TORN append (a
+    /// crash or a full disk mid-write): it is skipped with a warning, so the
+    /// scheduled job does not fail at startup until someone edits the file.
+    /// [`open_for_append`](Self::open_for_append) cuts it off. Any other bad
+    /// line is refused.
+    ///
     /// # Errors
     /// I/O failure other than not-found, or a line that is not a
     /// [`JudgedAtomicEntry`] (reported as `path:line`; nothing is loaded).
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(s) => s,
+        let raw = match std::fs::read(path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
                 return Err(format!("cannot read singleton ledger {}: {e}", path.display()).into())
             }
         };
+        let torn_tail = (!raw.is_empty() && !raw.ends_with('\n'))
+            .then(|| raw.lines().count())
+            .filter(|_| {
+                raw.lines()
+                    .last()
+                    .is_some_and(|l| parse_ledger_line(l).is_err())
+            });
         let mut entries = std::collections::HashSet::new();
         for (n, line) in raw.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let bad = |why: String| -> Box<dyn std::error::Error> {
+            if torn_tail == Some(n + 1) {
+                eprintln!(
+                    "WARNING: {}:{}: skipping a torn final line (an interrupted append); the \
+                     next recording run removes it",
+                    path.display(),
+                    n + 1
+                );
+                continue;
+            }
+            let (id, digest) = parse_ledger_line(line).map_err(|why| {
                 format!(
                     "{}:{}: not a singleton-ledger line ({why}); fix or remove the line",
                     path.display(),
                     n + 1
                 )
-                .into()
-            };
-            let e: JudgedAtomicEntry =
-                serde_json::from_str(line).map_err(|e| bad(e.to_string()))?;
-            if e.kind != Self::KIND {
-                return Err(bad(format!("kind {:?} is not {:?}", e.kind, Self::KIND)));
-            }
-            let digest: [u8; 32] = hex::decode(&e.content_blake3)
-                .ok()
-                .and_then(|b| b.try_into().ok())
-                .ok_or_else(|| bad("content_blake3 is not 32 hex bytes".to_string()))?;
-            entries.insert((e.claim_id, digest));
+            })?;
+            entries.insert((id, digest));
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -561,19 +573,40 @@ impl SingletonLedger {
     /// path that cannot be written fails BEFORE any LLM call rather than after
     /// the verdicts are paid for.
     ///
+    /// An unterminated final line is settled first, so the next append starts
+    /// on a line of its own: a torn one (it does not parse) is cut off, a
+    /// complete one gets its newline.
+    ///
     /// # Errors
     /// As [`load`](Self::load), or the file cannot be opened for append.
     pub fn open_for_append(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        std::fs::OpenOptions::new()
+        use std::io::Write;
+        let cannot = |e: std::io::Error| {
+            format!(
+                "cannot open singleton ledger {} for append: {e}",
+                path.display()
+            )
+        };
+        let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-            .map_err(|e| {
-                format!(
-                    "cannot open singleton ledger {} for append: {e}",
-                    path.display()
-                )
-            })?;
+            .map_err(cannot)?;
+        let raw = std::fs::read(path).map_err(cannot)?;
+        if !raw.is_empty() && !raw.ends_with(b"\n") {
+            let start = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            if parse_ledger_line(&String::from_utf8_lossy(&raw[start..])).is_ok() {
+                f.write_all(b"\n").map_err(cannot)?;
+            } else {
+                f.set_len(start as u64).map_err(cannot)?;
+                eprintln!(
+                    "WARNING: {}: removed a torn final line ({} bytes) left by an interrupted \
+                     append",
+                    path.display(),
+                    raw.len() - start
+                );
+            }
+        }
         let mut ledger = Self::load(path)?;
         ledger.writable = true;
         Ok(ledger)
@@ -645,6 +678,23 @@ impl SingletonLedger {
         self.entries.insert((claim_id, digest));
         Ok(())
     }
+}
+
+/// One ledger line as `(claim id, BLAKE3 of the judged text)`, or why not.
+fn parse_ledger_line(line: &str) -> Result<(uuid::Uuid, [u8; 32]), String> {
+    let e: JudgedAtomicEntry = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if e.kind != SingletonLedger::KIND {
+        return Err(format!(
+            "kind {:?} is not {:?}",
+            e.kind,
+            SingletonLedger::KIND
+        ));
+    }
+    let digest: [u8; 32] = hex::decode(&e.content_blake3)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| "content_blake3 is not 32 hex bytes".to_string())?;
+    Ok((e.claim_id, digest))
 }
 
 fn content_digest(content: &str) -> [u8; 32] {
@@ -1667,6 +1717,48 @@ mod tests {
             .to_string();
         assert!(err.contains("read-only"), "{err}");
         assert!(!path.exists());
+    }
+
+    /// A crash or a full disk mid-append can leave a final line with no
+    /// newline. That torn tail must not take the daily job down at startup
+    /// (every later load would refuse the file until someone edits it): the
+    /// reader skips it, and the next recording run cuts it off before it
+    /// appends. A COMPLETE final line that only lacks its newline is kept.
+    #[test]
+    fn a_torn_final_line_is_skipped_and_cut_off_before_the_next_append() {
+        let path = temp_ledger_path();
+        let (a, b, c) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(a, "Text A. More A.", "m").unwrap();
+        let whole = std::fs::read_to_string(&path).unwrap();
+        // Half of a second record, as an interrupted append leaves it.
+        std::fs::write(&path, format!("{whole}{}", &whole[..whole.len() / 2])).unwrap();
+
+        let back = SingletonLedger::load(&path).expect("a torn final line is skipped");
+        assert_eq!(back.len(), 1);
+        assert!(back.contains(a, "Text A. More A."));
+
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(b, "Text B. More B.", "m").unwrap();
+        let back = SingletonLedger::load(&path).expect("the torn tail was cut off");
+        assert_eq!(back.len(), 2);
+        assert!(back.contains(b, "Text B. More B."));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+        // A complete last line without its newline (a hand edit) is a verdict.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.trim_end_matches('\n')).unwrap();
+        assert_eq!(SingletonLedger::load(&path).unwrap().len(), 2);
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(c, "Text C. More C.", "m").unwrap();
+        let back = SingletonLedger::load(&path).unwrap();
+        assert_eq!(back.len(), 3, "the unterminated verdict was kept");
+        assert!(back.contains(a, "Text A. More A.") && back.contains(c, "Text C. More C."));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
