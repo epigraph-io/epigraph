@@ -4786,8 +4786,11 @@ impl ClaimRepository {
     /// skip-patterns. Also drops trivially short content (`length > 10`), the
     /// one filter ported verbatim from V2.
     ///
-    /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
-    /// monotonic progress through the backlog across scheduled runs.
+    /// Ordered `created_at ASC` (oldest first) so offset paging is stable.
+    /// Claims that `epigraph_core::atomicity::looks_atomic` accepts are
+    /// terminal by policy (U073, backlog `5e1debbc`): `decompose_claims` skips
+    /// them, so they never leave this population and its row count is not a
+    /// progress measure.
     ///
     /// Every returned row is current by the `WHERE` clause, so `claim_from_row`'s
     /// `is_current = true` default is already true here; `supersedes` is NOT
