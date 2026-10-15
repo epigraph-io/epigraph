@@ -1253,7 +1253,8 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 }
 
 /// Test: diverse=false leaves the existing flat-ANN ordering unchanged.
-/// Compares against `ClaimRepository::search_by_embedding` directly.
+/// Compares against `ClaimRepository::search_by_embedding_since` in the
+/// whole-corpus scope (drain U082) — the exact call the flat path makes.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let viewer = viewerfx::public_viewer(&pool).await;
@@ -1266,8 +1267,11 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
     let mut paragraph_ids = Vec::new();
     for i in 0..5 {
-        // Slight reduction in value moves the cosine score down monotonically.
-        let para_vec = diverse_fixture::cluster_pgvec(0, 1.0 - (i as f32) * 0.05);
+        // Direction drift, not magnitude, so every paragraph has its own
+        // cosine and the order is fully determined (scaling `cluster_pgvec`
+        // leaves the cosine unchanged, and an all-tie page's order is just
+        // the plan's).
+        let para_vec = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.1 * i as f32);
         let id = diverse_fixture::seed_paragraph(
             &pool,
             agent,
@@ -1283,17 +1287,23 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // Reference: direct call to the same repo function recall_with_context
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
-    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding(
+    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding_since(
         &pool,
         &viewer,
         &query_pgvec,
         1536,
         10,
         None,
+        None,
+        epigraph_db::EmbeddingSeedScope::AllClaims,
     )
     .await
     .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
+    assert_eq!(
+        direct_order, paragraph_ids,
+        "calibration: the drifted fixture ranks the paragraphs in seed order"
+    );
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ false, None, None, 10);
@@ -1305,7 +1315,8 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let recall_order: Vec<Uuid> = resp.results.iter().map(|r| r.paragraph_id).collect();
     assert_eq!(
         recall_order, direct_order,
-        "diverse=false ordering must match direct ClaimRepository::search_by_embedding ordering"
+        "diverse=false ordering must match direct ClaimRepository::search_by_embedding_since \
+         (AllClaims) ordering"
     );
 }
 
