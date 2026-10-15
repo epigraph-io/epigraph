@@ -2715,7 +2715,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          GUCs, tenancy inherited from the claim (070's inheritor list, 114's writer-owned arm). \
          Generic so REST `submit_evidence` can write its divergence record on a `write_as` \
          transaction: on the unstamped raw pool FORCE refused it without an error. Pinned by \
-         `epigraph-api/tests/frames_evidence_postcommit_armed.rs`. SCOPE: executor only; the \
+         `epigraph-api/tests/frames_evidence_armed.rs`. SCOPE: executor only; the \
          SQL is unchanged.",
     ),
     (
