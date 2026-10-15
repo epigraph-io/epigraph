@@ -915,10 +915,24 @@ pub async fn query_claims(
     // gates on (GitHub #395). This used to filter the stale authored
     // `truth_value`, so a refuted claim (BetP 0.18, `truth_value` 0.78) never
     // entered a `max_truth=0.4` assessment queue.
-    let claims =
-        ClaimRepository::list_by_belief_range(&server.pool, viewer, min, max, is_current, limit, 0)
-            .await
-            .map_err(internal_error)?;
+    //
+    // `exclude_spine` drops every claim at properties.level 0-2 (document
+    // spine nodes, and workflow thesis/phase/step nodes too) in the same
+    // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
+    // most of the page (backlog 31e7b727). Off unless the caller asks.
+    let exclude_spine = params.exclude_spine.unwrap_or(false);
+    let claims = ClaimRepository::list_by_belief_range(
+        &server.pool,
+        viewer,
+        min,
+        max,
+        is_current,
+        limit,
+        0,
+        exclude_spine,
+    )
+    .await
+    .map_err(internal_error)?;
 
     // No per-id access map. `list_by_belief_range` is spliced with `viewer`, so
     // a claim this caller may not read is not in `claims`. The map existed to
