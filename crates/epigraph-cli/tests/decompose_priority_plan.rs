@@ -12,7 +12,7 @@ mod viewer_fixture;
 use epigraph_cli::decompose::{
     persist_planned, plan_decomposition_batches, read_plan_jsonl, run_decomposition_batches,
     select_candidates, verify_plan, write_plan_jsonl, AtomParent, BatchClaim, EligibilityFilters,
-    Ineligible, PlanDrift, Priority,
+    Ineligible, PlanDrift, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::FixtureLlmClient;
 use sqlx::PgPool;
@@ -129,6 +129,7 @@ async fn conflict_priority_orders_by_edge_count_then_newest_edge(pool: PgPool) {
         Priority::Conflict,
         None,
         EligibilityFilters::default(),
+        None,
         100,
         10_000,
     )
@@ -171,6 +172,7 @@ async fn conflict_priority_ignores_edges_from_retired_sources(pool: PgPool) {
         Priority::Conflict,
         None,
         EligibilityFilters::default(),
+        None,
         100,
         10_000,
     )
@@ -194,10 +196,10 @@ async fn recent_and_oldest_are_reverse_orders_of_the_same_population(pool: PgPoo
     let new = seed_claim(&pool, agent, &compound("new"), 100, &[]).await;
     let f = EligibilityFilters::default();
 
-    let recent = select_candidates(&pool, &viewer, Priority::Recent, None, f, 100, 10_000)
+    let recent = select_candidates(&pool, &viewer, Priority::Recent, None, f, None, 100, 10_000)
         .await
         .unwrap();
-    let oldest = select_candidates(&pool, &viewer, Priority::Oldest, None, f, 100, 10_000)
+    let oldest = select_candidates(&pool, &viewer, Priority::Oldest, None, f, None, 100, 10_000)
         .await
         .unwrap();
     assert_eq!(ids(&recent), vec![new, mid, old]);
@@ -231,6 +233,7 @@ async fn filters_page_past_a_head_of_skipped_claims(pool: PgPool) {
         Priority::Oldest,
         None,
         EligibilityFilters::default(),
+        None,
         1,
         10_000,
     )
@@ -247,6 +250,7 @@ async fn filters_page_past_a_head_of_skipped_claims(pool: PgPool) {
         Priority::Oldest,
         None,
         EligibilityFilters::default(),
+        None,
         1,
         500,
     )
@@ -279,6 +283,7 @@ async fn ids_file_reports_every_named_id_it_does_not_decompose(pool: PgPool) {
         Priority::Oldest,
         Some(&named),
         EligibilityFilters::default(),
+        None,
         100,
         10_000,
     )
@@ -309,6 +314,7 @@ async fn ids_file_reports_every_named_id_it_does_not_decompose(pool: PgPool) {
         Priority::Oldest,
         Some(&repeated),
         EligibilityFilters::default(),
+        None,
         1,
         10_000,
     )
@@ -334,6 +340,7 @@ async fn ids_file_reports_every_named_id_it_does_not_decompose(pool: PgPool) {
             skip_backlog: false,
             skip_short: false,
         },
+        None,
         100,
         10_000,
     )
@@ -436,7 +443,7 @@ async fn plan_then_apply_plan_persists_the_reviewed_atoms_with_no_second_llm_cal
         let pool_c = pool_c.clone();
         async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
     };
-    let totals = persist_planned(&pool, &viewer, &ok, None, &submit)
+    let totals = persist_planned(&pool, &viewer, &ok, None, None, &submit)
         .await
         .unwrap();
     assert_eq!(llm.call_count(), 1, "--apply-plan makes no LLM call");
@@ -543,7 +550,7 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         }
     };
     let (ok, _) = verify_plan(&pool, &viewer, plan.clone()).await.unwrap();
-    let totals = persist_planned(&pool, &viewer, &ok, None, &flaky)
+    let totals = persist_planned(&pool, &viewer, &ok, None, None, &flaky)
         .await
         .unwrap();
 
@@ -575,7 +582,7 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         let pool_h = pool_h.clone();
         async move { Ok(get_or_insert_atom(&pool_h, a, &t).await) }
     };
-    let totals2 = persist_planned(&pool, &viewer, &ok2, None, &healthy)
+    let totals2 = persist_planned(&pool, &viewer, &ok2, None, None, &healthy)
         .await
         .unwrap();
     assert!(totals2.failed.is_empty(), "{totals2:?}");
@@ -655,6 +662,7 @@ async fn non_public_parents_are_never_selected_under_the_bypass_viewer(pool: PgP
         Priority::Oldest,
         None,
         EligibilityFilters::default(),
+        None,
         100,
         10_000,
     )
@@ -686,6 +694,7 @@ async fn non_public_parents_are_never_selected_under_the_bypass_viewer(pool: PgP
             skip_backlog: false,
             skip_short: false,
         },
+        None,
         100,
         10_000,
     )
@@ -752,6 +761,9 @@ async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
             content: c_text.clone(),
         },
     ];
+    // The run records its own verdicts; the test never writes the ledger.
+    let ledger_path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    let mut ledger = SingletonLedger::open_for_append(&ledger_path).unwrap();
     let pool_c = pool.clone();
     let totals = run_decomposition_batches(
         &pool,
@@ -760,6 +772,7 @@ async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
         &llm,
         10,
         None,
+        Some(&mut ledger),
         move |t: String, _g: i64, p: AtomParent| {
             let pool_c = pool_c.clone();
             async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
@@ -770,13 +783,17 @@ async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
     assert_eq!(totals.singletons, vec![s], "the model judged `s` atomic");
     assert_eq!(atoms_of(&pool, c).await.len(), 2, "the control decomposed");
 
-    // The next run's selection.
+    // The next run's selection, through a ledger read back from the FILE: a
+    // verdict held only in the first run's memory would not survive to the
+    // next scheduled run.
+    let next_run = SingletonLedger::load(&ledger_path).unwrap();
     let sel = select_candidates(
         &pool,
         &viewer,
         Priority::Oldest,
         None,
         EligibilityFilters::default(),
+        Some(&next_run),
         100,
         10_000,
     )
@@ -795,4 +812,128 @@ async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
         "a parent the model judged atomic was re-selected; it will cost an LLM call every run \
          forever: {sel:?}"
     );
+    assert!(
+        sel.skipped
+            .iter()
+            .any(|(id, why)| *id == s && *why == Ineligible::JudgedAtomic),
+        "the passed-over parent is reported as JudgedAtomic: {sel:?}"
+    );
+
+    // Named in --ids-file, it is reported with the reason, not silently dropped.
+    let named = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        Some(&[s, u]),
+        EligibilityFilters::default(),
+        Some(&next_run),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&named), vec![u]);
+    assert!(
+        named
+            .skipped
+            .iter()
+            .any(|(id, why)| *id == s && *why == Ineligible::JudgedAtomic),
+        "the named judged-atomic parent is reported: {named:?}"
+    );
+
+    // Without the ledger (no flag, or --include-judged-atomic) it is chosen
+    // again: the ledger, not some other rule, is what passed it over.
+    let without = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        None,
+        EligibilityFilters::default(),
+        None,
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert!(ids(&without).contains(&s), "{without:?}");
+    std::fs::remove_file(&ledger_path).ok();
+}
+
+/// Whether a default-filter `oldest` crawl, reading the ledger at `path` the
+/// way the next scheduled run would, chooses `id`.
+async fn crawl_chooses(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    path: &std::path::Path,
+    id: Uuid,
+) -> bool {
+    let ledger = SingletonLedger::load(path).unwrap();
+    let sel = select_candidates(
+        pool,
+        viewer,
+        Priority::Oldest,
+        None,
+        EligibilityFilters::default(),
+        Some(&ledger),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    ids(&sel).contains(&id)
+}
+
+/// `--apply-plan` records the singleton lines of a reviewed plan (a `--plan`
+/// records nothing, so applying it is where the verdict is made), keyed on
+/// the text the model judged: once the parent's text changes, the old
+/// verdict no longer covers it and it is selected again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_plan_records_singletons_and_an_edited_parent_requalifies(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let text = "The stator ring is rigid. Its thermal expansion is negligible at 300 K.";
+    let s = seed_claim(&pool, agent, text, 300, &[]).await;
+    let llm = FixtureLlmClient::from_json(&serde_json::json!({
+        text: {"atoms": [text], "generality": [0]},
+    }))
+    .unwrap();
+    let claims = vec![BatchClaim {
+        claim_id: s,
+        agent_id: agent,
+        content: text.to_string(),
+    }];
+    let plans = plan_decomposition_batches(&claims, &llm, 10).await;
+    assert_eq!(plans.len(), 1);
+    let ledger_path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    assert!(
+        SingletonLedger::load(&ledger_path).unwrap().is_empty(),
+        "planning records nothing"
+    );
+
+    let (ok, _) = verify_plan(&pool, &viewer, plans).await.unwrap();
+    let mut ledger = SingletonLedger::open_for_append(&ledger_path).unwrap();
+    let submit = |_t: String, _g: i64, _p: AtomParent| async move {
+        Err::<Uuid, Box<dyn std::error::Error>>("a singleton must submit nothing".into())
+    };
+    let totals = persist_planned(&pool, &viewer, &ok, None, Some(&mut ledger), &submit)
+        .await
+        .unwrap();
+    assert_eq!(totals.singletons, vec![s]);
+    assert!(totals.failed.is_empty(), "{:?}", totals.failed);
+
+    assert!(
+        !crawl_chooses(&pool, &viewer, &ledger_path, s).await,
+        "the applied singleton verdict passes the parent over"
+    );
+
+    sqlx::query("UPDATE claims SET content = content || ' It was re-measured.' WHERE id = $1")
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        crawl_chooses(&pool, &viewer, &ledger_path, s).await,
+        "the verdict was on the old text; the edited parent must be asked again"
+    );
+    std::fs::remove_file(&ledger_path).ok();
 }

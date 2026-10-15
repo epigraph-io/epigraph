@@ -233,6 +233,9 @@ pub enum Ineligible {
     /// evidence copies the parent's text; decomposing a group-private parent
     /// would republish it. Not overridable.
     NotPublic { visibility: String },
+    /// The model already answered this exact text with one atom (recorded in
+    /// the [`SingletonLedger`]); asking again would buy the same answer.
+    JudgedAtomic,
 }
 
 impl std::fmt::Display for Ineligible {
@@ -251,6 +254,11 @@ impl std::fmt::Display for Ineligible {
                 f,
                 "visibility is `{visibility}`, not `public` (atoms are public and carry the \
                  parent's text as derivation evidence; never decomposed)"
+            ),
+            Self::JudgedAtomic => write!(
+                f,
+                "the model already judged this text atomic (singleton ledger; pass \
+                 --include-judged-atomic to ask again)"
             ),
         }
     }
@@ -459,6 +467,190 @@ pub fn read_plan_jsonl(
     Ok(out)
 }
 
+// =============================================================================
+// SINGLETON LEDGER: parents the model already judged atomic
+// =============================================================================
+
+/// One `--singleton-ledger` line: the model answered this parent's text with
+/// a single atom ("already atomic"), so nothing was written for it.
+///
+/// [`persist_decomposition`](db_writes::persist_decomposition) deliberately
+/// writes no self-equivalent child and no edge for such a parent, so it stays
+/// in the undecomposed population; without this record every later run would
+/// select it again and spend another LLM call on the same answer (backlog
+/// 68d03c24). The verdict is keyed on the parent's id AND the BLAKE3 of the
+/// exact text the model judged, so a parent whose text changes is asked again.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JudgedAtomicEntry {
+    /// Always [`SingletonLedger::KIND`], so a plan or retarget manifest
+    /// handed to `--singleton-ledger` by mistake is refused.
+    pub kind: String,
+    pub claim_id: uuid::Uuid,
+    /// Lower-case hex BLAKE3 of the parent text the model judged.
+    pub content_blake3: String,
+    /// `LlmProvider::model_name()` of the provider that judged it.
+    pub model: String,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The JSONL file of [`JudgedAtomicEntry`] lines that takes LLM-judged
+/// singletons out of `decompose_claims` selection.
+///
+/// A file, not a DB marker (U040 ruling, 2026-10-14): labelling the parent
+/// would mutate other agents' claims from a maintenance job, and a verdict
+/// table is a migration plus four transcribed predicates. Selection reads it
+/// through [`SingletonLedger::contains`]; the persist path appends to it
+/// (`persist_planned`), so a run records its own verdicts and a `--plan`
+/// records nothing until the plan is applied.
+#[derive(Debug, Default)]
+pub struct SingletonLedger {
+    path: std::path::PathBuf,
+    entries: std::collections::HashSet<(uuid::Uuid, [u8; 32])>,
+    writable: bool,
+}
+
+impl SingletonLedger {
+    pub const KIND: &'static str = "judged_atomic";
+
+    /// Read `path` for selection only. A missing file is an empty ledger and
+    /// is NOT created (`--dry-run` and `--plan` write nothing).
+    ///
+    /// # Errors
+    /// I/O failure other than not-found, or a line that is not a
+    /// [`JudgedAtomicEntry`] (reported as `path:line`; nothing is loaded).
+    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(format!("cannot read singleton ledger {}: {e}", path.display()).into())
+            }
+        };
+        let mut entries = std::collections::HashSet::new();
+        for (n, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let bad = |why: String| -> Box<dyn std::error::Error> {
+                format!(
+                    "{}:{}: not a singleton-ledger line ({why}); fix or remove the line",
+                    path.display(),
+                    n + 1
+                )
+                .into()
+            };
+            let e: JudgedAtomicEntry =
+                serde_json::from_str(line).map_err(|e| bad(e.to_string()))?;
+            if e.kind != Self::KIND {
+                return Err(bad(format!("kind {:?} is not {:?}", e.kind, Self::KIND)));
+            }
+            let digest: [u8; 32] = hex::decode(&e.content_blake3)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| bad("content_blake3 is not 32 hex bytes".to_string()))?;
+            entries.insert((e.claim_id, digest));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+            writable: false,
+        })
+    }
+
+    /// [`load`](Self::load), and also create the file if it is missing, so a
+    /// path that cannot be written fails BEFORE any LLM call rather than after
+    /// the verdicts are paid for.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load), or the file cannot be opened for append.
+    pub fn open_for_append(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| {
+                format!(
+                    "cannot open singleton ledger {} for append: {e}",
+                    path.display()
+                )
+            })?;
+        let mut ledger = Self::load(path)?;
+        ledger.writable = true;
+        Ok(ledger)
+    }
+
+    /// Whether the model already judged `claim_id`, with exactly this text,
+    /// atomic.
+    pub fn contains(&self, claim_id: uuid::Uuid, content: &str) -> bool {
+        self.entries.contains(&(claim_id, content_digest(content)))
+    }
+
+    /// Number of distinct `(claim, text)` verdicts held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Append one verdict as a single JSONL line (one `write_all`, so a crash
+    /// cannot interleave two records). A verdict already held is not written
+    /// twice.
+    ///
+    /// # Errors
+    /// The ledger was [`load`](Self::load)ed read-only, or the append failed.
+    pub fn record(
+        &mut self,
+        claim_id: uuid::Uuid,
+        content: &str,
+        model: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        if !self.writable {
+            return Err(format!(
+                "singleton ledger {} was opened read-only",
+                self.path.display()
+            )
+            .into());
+        }
+        let digest = content_digest(content);
+        if self.entries.contains(&(claim_id, digest)) {
+            return Ok(());
+        }
+        let entry = JudgedAtomicEntry {
+            kind: Self::KIND.to_string(),
+            claim_id,
+            content_blake3: hex::encode(digest),
+            model: model.to_string(),
+            decided_at: chrono::Utc::now(),
+        };
+        let mut line = serde_json::to_vec(&entry)?;
+        line.push(b'\n');
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                format!(
+                    "cannot append to singleton ledger {}: {e}",
+                    self.path.display()
+                )
+            })?;
+        f.write_all(&line)?;
+        f.flush()?;
+        self.entries.insert((claim_id, digest));
+        Ok(())
+    }
+}
+
+fn content_digest(content: &str) -> [u8; 32] {
+    *blake3::hash(content.as_bytes()).as_bytes()
+}
+
 pub(crate) fn strip_code_fence(raw: &str) -> String {
     let t = raw.trim();
     if let Some(start) = t.find("```") {
@@ -640,7 +832,9 @@ mod db_writes {
     /// captured once by the caller.
     ///
     /// A batch whose LLM call fails is logged and skipped (the run continues);
-    /// a persist failure aborts the run.
+    /// a persist failure aborts the run. With `ledger`, every parent the model
+    /// answers with one atom is recorded (see [`persist_planned`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_decomposition_batches<F, Fut>(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
@@ -648,6 +842,7 @@ mod db_writes {
         llm: &dyn epigraph_interfaces::LlmProvider,
         batch_size: usize,
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
+        mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
@@ -658,8 +853,17 @@ mod db_writes {
         for chunk in claims.chunks(batch_size.max(1)) {
             let (planned, gaps) = plan_chunk(chunk, llm).await;
             totals.gaps.extend(gaps);
-            let chunk_totals =
-                persist_planned(pool, viewer, &planned, embedder.clone(), &submit_via).await?;
+            // Verdicts are appended per chunk, so a run that aborts later
+            // keeps the ones it already paid for.
+            let chunk_totals = persist_planned(
+                pool,
+                viewer,
+                &planned,
+                embedder.clone(),
+                ledger.as_deref_mut(),
+                &submit_via,
+            )
+            .await?;
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
             totals.singletons.extend(chunk_totals.singletons);
@@ -809,13 +1013,20 @@ mod db_writes {
     /// REQUIRED field of CreateClaimRequest (POST /api/v1/claims), and omitting
     /// it returned 422, which silently dropped every decomposition atom.
     ///
+    /// With `ledger`, every line the model answered with one atom is appended
+    /// to it, so the next selection passes the parent over
+    /// ([`super::Ineligible::JudgedAtomic`]). This is where a run records its
+    /// verdicts — not the binary — so `--apply-plan` records them too and
+    /// `--plan` (which never persists) records none.
+    ///
     /// # Errors
-    /// None today; the `Result` is kept for callers.
+    /// The ledger append failed.
     pub async fn persist_planned<F, Fut>(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
         planned: &[super::PlannedDecomposition],
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
+        mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: &F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
@@ -843,6 +1054,12 @@ mod db_writes {
                     totals.edges += outcome.edges_created;
                     if outcome.skipped_singletons > 0 {
                         totals.singletons.push(plan.claim_id);
+                        // The verdict is on the text the model judged, which
+                        // is the plan's `content` (verified equal to the live
+                        // parent before an apply).
+                        if let Some(l) = ledger.as_deref_mut() {
+                            l.record(plan.claim_id, &plan.content, &plan.model)?;
+                        }
                     }
                 }
                 Err(e) => totals.failed.push((plan.claim_id, e.to_string())),
@@ -974,11 +1191,23 @@ mod db_writes {
         priority: Priority,
         ids: Option<&[Uuid]>,
         filters: super::EligibilityFilters,
+        judged_atomic: Option<&super::SingletonLedger>,
         limit: usize,
         max_scan: usize,
     ) -> Result<Selection, Box<dyn std::error::Error>> {
         use epigraph_db::repos::decomposition_priority::{
-            DecompositionPriorityRepository as R, UndecomposedOrder,
+            DecomposeCandidate, DecompositionPriorityRepository as R, UndecomposedOrder,
+        };
+        // Every rule a candidate must pass, in reporting order. The ledger is
+        // consulted last, so `skipped_judged_atomic` counts exactly the LLM
+        // calls it saved.
+        let verdict = |r: &DecomposeCandidate| -> Result<(), super::Ineligible> {
+            super::check_publicly_decomposable(&r.visibility)?;
+            super::check_eligibility(&r.content, &r.labels, filters)?;
+            if judged_atomic.is_some_and(|l| l.contains(r.id, &r.content)) {
+                return Err(super::Ineligible::JudgedAtomic);
+            }
+            Ok(())
         };
         let mut sel = Selection::default();
         if let Some(ids) = ids {
@@ -1000,11 +1229,7 @@ mod db_writes {
                 if !taken.insert(r.id) {
                     continue;
                 }
-                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
-                    sel.skipped.push((r.id, why));
-                    continue;
-                }
-                match super::check_eligibility(&r.content, &r.labels, filters) {
+                match verdict(&r) {
                     // Past `--limit`: named, eligible, and NOT silently dropped.
                     Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
                     Ok(()) => sel.chosen.push(r),
@@ -1056,11 +1281,7 @@ mod db_writes {
                 if sel.chosen.len() >= limit {
                     break;
                 }
-                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
-                    sel.skipped.push((r.id, why));
-                    continue;
-                }
-                match super::check_eligibility(&r.content, &r.labels, filters) {
+                match verdict(&r) {
                     Ok(()) => sel.chosen.push(r),
                     Err(why) => sel.skipped.push((r.id, why)),
                 }
@@ -1376,5 +1597,94 @@ mod tests {
             vec![0, -1, -1],
             "only 0/1/2 are valid tiers; others -> -1"
         );
+    }
+
+    // --- singleton ledger ---
+
+    fn temp_ledger_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn singleton_ledger_round_trips_and_keys_on_content_hash() {
+        let path = temp_ledger_path();
+        let id = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger
+            .record(id, "Text A. Still text A.", "model-x")
+            .unwrap();
+        // The same verdict again is not appended twice.
+        ledger
+            .record(id, "Text A. Still text A.", "model-x")
+            .unwrap();
+
+        let back = SingletonLedger::load(&path).unwrap();
+        assert!(back.contains(id, "Text A. Still text A."));
+        assert!(
+            !back.contains(id, "Text B. Edited since."),
+            "a changed text is a new question"
+        );
+        assert!(
+            !back.contains(other, "Text A. Still text A."),
+            "the verdict belongs to one claim id"
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1, "{raw}");
+        let line: JudgedAtomicEntry = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(line.kind, SingletonLedger::KIND);
+        assert_eq!(line.model, "model-x");
+        assert_eq!(
+            line.content_blake3,
+            blake3::hash(b"Text A. Still text A.").to_hex().to_string()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_read_only_ledger_creates_nothing_and_refuses_to_record() {
+        let path = temp_ledger_path();
+        let mut ledger = SingletonLedger::load(&path).unwrap();
+        assert!(ledger.is_empty());
+        assert!(
+            !path.exists(),
+            "--dry-run / --plan must not create the file"
+        );
+        let err = ledger
+            .record(uuid::Uuid::new_v4(), "x", "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-only"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_malformed_or_foreign_ledger_line_is_refused_with_its_line_number() {
+        let path = temp_ledger_path();
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(uuid::Uuid::new_v4(), "ok", "m").unwrap();
+        std::fs::write(
+            &path,
+            format!("{}not json\n", std::fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+        let err = SingletonLedger::load(&path).unwrap_err().to_string();
+        assert!(err.contains(&format!("{}:2:", path.display())), "{err}");
+
+        // A decomposition plan line handed over by mistake.
+        let plan = serde_json::json!({
+            "kind": "decomposition",
+            "claim_id": uuid::Uuid::new_v4(),
+            "content_blake3": "00".repeat(32),
+            "model": "m",
+            "decided_at": "2026-10-15T00:00:00Z",
+        });
+        std::fs::write(&path, format!("{plan}\n")).unwrap();
+        let err = SingletonLedger::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(":1:") && err.contains("judged_atomic"),
+            "{err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
