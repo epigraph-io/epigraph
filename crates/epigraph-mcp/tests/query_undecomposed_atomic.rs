@@ -108,19 +108,29 @@ async fn query_undecomposed_claims_flags_looks_atomic_rows(pool: PgPool) {
 #[test]
 fn query_undecomposed_claims_description_says_atomic_rows_are_terminal() {
     let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
-    let description = tools
+    let tool = tools
         .as_array()
         .expect("all_tools_json returns an array")
         .iter()
         .find(|t| t["name"] == "query_undecomposed_claims")
-        .and_then(|t| t["description"].as_str())
-        .expect("query_undecomposed_claims is registered with a description")
+        .expect("query_undecomposed_claims is registered")
+        .clone();
+    let description = tool["description"]
+        .as_str()
+        .expect("query_undecomposed_claims has a description")
         .to_string();
+    // The published cap must track the heuristic's constant: if
+    // ATOMIC_MAX_CHARS changes, this fails until the description does too.
+    let cap = format!(
+        "one sentence, at most {} chars",
+        epigraph_core::atomicity::ATOMIC_MAX_CHARS
+    );
     for needle in [
         "Rows with looks_atomic=true are terminal by policy",
-        "one sentence, at most 160 chars",
+        cap.as_str(),
         "they are NOT a backlog or a defect",
         "Feed only looks_atomic=false claim_ids to the decompose_claims CLI",
+        "row count is not a progress measure",
     ] {
         assert!(
             description.contains(needle),
@@ -130,6 +140,22 @@ fn query_undecomposed_claims_description_says_atomic_rows_are_terminal() {
     assert!(
         !description.contains("feed the returned claim_ids to the decompose_claims CLI"),
         "the description must no longer tell agents to feed every row to the CLI: {description}"
+    );
+
+    // Agents also read the `limit` parameter's doc through inputSchema. The old
+    // "monotonic progress" framing invited them to treat the raw row count as
+    // a drain metric; atomic rows never leave the list.
+    let limit_doc = tool["inputSchema"]["properties"]["limit"]["description"]
+        .as_str()
+        .expect("query_undecomposed_claims' limit parameter has a description")
+        .to_string();
+    assert!(
+        limit_doc.contains("row count is not a progress measure"),
+        "the limit doc must say the row count is not a progress measure; got: {limit_doc}"
+    );
+    assert!(
+        !limit_doc.contains("monotonic progress"),
+        "the limit doc must no longer promise monotonic progress; got: {limit_doc}"
     );
 }
 
