@@ -904,11 +904,9 @@ async fn apply_plan_records_singletons_and_an_edited_parent_requalifies(pool: Pg
     }];
     let plans = plan_decomposition_batches(&claims, &llm, 10).await;
     assert_eq!(plans.len(), 1);
+    // That `--plan` records nothing is covered through the binary
+    // (decompose_claims_bin_ledger.rs): planning never sees the ledger here.
     let ledger_path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
-    assert!(
-        SingletonLedger::load(&ledger_path).unwrap().is_empty(),
-        "planning records nothing"
-    );
 
     let (ok, _) = verify_plan(&pool, &viewer, plans).await.unwrap();
     let mut ledger = SingletonLedger::open_for_append(&ledger_path).unwrap();
