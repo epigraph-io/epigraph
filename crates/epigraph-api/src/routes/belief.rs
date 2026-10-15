@@ -1075,6 +1075,21 @@ pub async fn submit_evidence(
 
     let pool = &state.db_pool;
 
+    // 0. The body's `agent_id` is the BBA's author and half its upsert key
+    //    `(claim, frame, source_agent_id, perspective)`. A caller may name only
+    //    itself (or no one): naming another agent would attribute evidence to
+    //    it and, where row security lets the caller write that agent's row,
+    //    overwrite its BBA. MCP `submit_ds_evidence` takes the author from the
+    //    authenticated identity for the same reason.
+    if let Some(named) = request.agent_id {
+        if viewer.principal() != Some(named) {
+            return Err(ApiError::Forbidden {
+                reason: "agent_id must be the authenticated caller's own agent id, or omitted"
+                    .to_string(),
+            });
+        }
+    }
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
@@ -2171,13 +2186,18 @@ pub async fn submit_evidence(
         use sqlx::Acquire as _;
         let kl = kl_divergence_bernoulli(final_betp, bayesian_posterior);
 
-        match state.write_as(&viewer, "submit_evidence.derived_rows").await {
+        match state
+            .write_as(&viewer, "submit_evidence.derived_rows")
+            .await
+        {
             Ok(mut side) => {
                 for w in &scoped_beliefs {
                     let mut sp = match side.begin().await {
                         Ok(sp) => sp,
                         Err(e) => {
-                            tracing::warn!("submit_evidence: no savepoint for a scoped belief: {e}");
+                            tracing::warn!(
+                                "submit_evidence: no savepoint for a scoped belief: {e}"
+                            );
                             break;
                         }
                     };
@@ -2218,7 +2238,9 @@ pub async fn submit_evidence(
                 }
             }
             Err(e) => {
-                tracing::warn!("submit_evidence: no stamped transaction for the derived rows: {e:?}");
+                tracing::warn!(
+                    "submit_evidence: no stamped transaction for the derived rows: {e:?}"
+                );
             }
         }
 
