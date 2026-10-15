@@ -172,15 +172,29 @@ pub fn restrict_epistemic_positive(source: &EpistemicInterval, factor: f64) -> E
     }
 }
 
-/// Negative restriction (contradicts/refutes): the polarity-flipped source
-/// opinion, Shafer-discounted by the edge's transmission `factor`.
+/// Negative restriction (contradicts/refutes): MUTUAL EXCLUSION, the source
+/// and target cannot both be true.
 ///
-/// Same discount law as [`restrict_epistemic_positive`] (see its doc comment):
-/// `open_world` is attenuated by `factor` so the map is `discount` composed
-/// with the `TRUE`/`FALSE` swap, and reduces to the neutral BBA at `factor = 0`.
+/// Only the source's belief transfers: its mass on TRUE becomes mass on the
+/// target being FALSE, Shafer-discounted by the edge's transmission `factor`
+/// (`pl = 1 − src.bel·f`). The source's disbelief (`1 − src.pl`) says nothing
+/// about the target and transfers nothing, so the restricted `bel` is always
+/// 0: a contradictor can lower its target, never raise it. This is the law
+/// migration 001 labels `'mutual_exclusion'` and the one
+/// `cdst_bp::anti_support_mass` and `sheaf::compute_edge_inconsistency`'s
+/// Negative ceiling already apply.
+///
+/// The previous map was the complement law (target ≡ ¬source, `bel = (1 −
+/// src.pl)·f`): a disbelieved contradictor [0.05, 0.20] at f = 0.90 became
+/// strong SUPPORT (bel 0.72) for the claim it contradicts (backlog I014,
+/// drain U075).
+///
+/// `open_world` keeps the [`restrict_epistemic_positive`] discount law
+/// (`src.ow·f`), so the map still reduces to the combination-neutral BBA
+/// `m(Θ) = 1` at `factor = 0`.
 pub fn restrict_epistemic_negative(source: &EpistemicInterval, factor: f64) -> EpistemicInterval {
     EpistemicInterval {
-        bel: (1.0 - source.pl) * factor,
+        bel: 0.0,
         pl: source.bel.mul_add(-factor, 1.0),
         open_world: source.open_world * factor,
     }
@@ -261,15 +275,61 @@ mod tests {
     }
 
     #[test]
-    fn test_restrict_negative_flips_and_attenuates_ow() {
+    fn test_restrict_negative_transfers_only_source_belief() {
         let src = EpistemicInterval::new(0.7, 0.9, 0.1);
         let restricted = restrict_epistemic_negative(&src, 0.8);
-        // bel = (1-0.9)*0.8 = 0.08
-        assert!((restricted.bel - 0.08).abs() < 1e-10);
+        // Mutual exclusion: the source's disbelief (1-0.9) transfers nothing,
+        // so bel = 0 (the complement law gave (1-0.9)*0.8 = 0.08).
+        assert!(restricted.bel.abs() < 1e-10);
         // pl = 1 - 0.7*0.8 = 0.44
         assert!((restricted.pl - 0.44).abs() < 1e-10);
         // open_world discounted: 0.1 * 0.8
         assert!((restricted.open_world - 0.08).abs() < 1e-10);
+    }
+
+    /// `contradicts` is mutual exclusion (migration 001 labels it
+    /// `'mutual_exclusion'`), not negation: a DISBELIEVED contradictor says
+    /// nothing about its target. Under the old complement law a source
+    /// [0.05, 0.20] at f = 0.90 restricted to bel (1 − 0.20)·0.90 = 0.72, i.e.
+    /// it became strong SUPPORT for the claim it contradicts (backlog I014).
+    #[test]
+    fn test_restrict_negative_disbelieved_source_carries_no_support() {
+        let restricted =
+            restrict_epistemic_negative(&EpistemicInterval::new(0.05, 0.20, 0.0), 0.90);
+        assert!(
+            restricted.bel < 1e-12,
+            "a disbelieved contradictor must transfer no support, got bel {}",
+            restricted.bel
+        );
+        // Its belief 0.05 still caps the target: pl = 1 − 0.05·0.90.
+        assert!(
+            (restricted.pl - 0.955).abs() < 1e-12,
+            "pl = {}",
+            restricted.pl
+        );
+    }
+
+    /// No contradictor, however disbelieved or ignorant, may put mass on its
+    /// target being TRUE: the restricted Bel is 0 for every source and factor.
+    #[test]
+    fn test_restrict_negative_never_supports_the_target() {
+        for &(bel, pl, ow) in &[
+            (0.00, 0.00, 0.00),
+            (0.05, 0.20, 0.10),
+            (0.00, 1.00, 0.50),
+            (0.30, 0.60, 0.00),
+            (0.90, 0.95, 0.05),
+        ] {
+            for &f in &[0.1, 0.5, 0.8, 0.9, 1.0] {
+                let src = EpistemicInterval::new(bel, pl, ow);
+                let r = restrict_epistemic_negative(&src, f);
+                assert!(
+                    r.bel < 1e-12,
+                    "src={src} f={f}: restricted bel must be 0, got {}",
+                    r.bel
+                );
+            }
+        }
     }
 
     /// The load-bearing invariant behind discounting `open_world`:

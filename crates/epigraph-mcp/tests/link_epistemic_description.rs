@@ -53,3 +53,40 @@ fn link_epistemic_description_states_how_a_positive_edge_can_lower_belief() {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
     }
 }
+
+/// `contradicts` / `refutes` transfer belief by MUTUAL EXCLUSION (drain U075):
+/// only the source's belief crosses the edge, as disbelief in the target; the
+/// source's disbelief transfers nothing. So, unlike a positive edge, a
+/// negative edge cannot move its target the "wrong" way, and the contract an
+/// agent reads must say so (the smoke test
+/// `contradicts_from_disbelieved_source_does_not_raise_target_belief`
+/// measures it through the real write path).
+#[test]
+fn link_epistemic_description_states_a_negative_edge_cannot_raise_belief() {
+    let d = link_epistemic_description();
+    for needle in [
+        "A negative edge means mutual exclusion",
+        "the source's disbelief transfers nothing",
+        "a negative edge puts no mass on the target being true",
+        "a negative edge cannot RAISE the target's belief or pignistic_prob",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+    // The old blanket claim covered negative edges too; it must now be scoped
+    // to positive ones.
+    assert!(
+        !d.contains("Polarity is not a guarantee of direction: the edge carries"),
+        "the unscoped 'whole interval' claim must be gone: {d}"
+    );
+}
+
+/// Under mutual exclusion a refuted or ~unbelieved contradictor restricts to
+/// the vacuous [0, 1] and writes no mass function (drain U075), so
+/// `belief_wired=false` has one more ordinary cause the contract must list
+/// (pinned end to end by `contradicts_from_refuted_source_writes_no_belief`).
+#[test]
+fn link_epistemic_description_lists_vacuous_restriction_as_a_no_wire_reason() {
+    let d = link_epistemic_description();
+    let needle = "the source's restricted mass is vacuous (e.g. a contradictor with ~no belief)";
+    assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+}

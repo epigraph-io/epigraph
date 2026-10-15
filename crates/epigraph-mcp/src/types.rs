@@ -177,12 +177,21 @@ pub struct QueryClaimsParams {
                        merge the results."
     )]
     pub is_current: Option<bool>,
+
+    #[schemars(
+        description = "When true, drop EVERY claim whose properties.level is 0, 1 or 2, in SQL \
+                       before LIMIT: document thesis/section/paragraph nodes (headings, keyword \
+                       lists, captions, transcript turns) AND workflow thesis/phase/step nodes \
+                       (including evolve_step rows). Atoms (level 3) and unleveled claims are \
+                       kept. Default false (no level filter)."
+    )]
+    pub exclude_spine: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryUndecomposedClaimsParams {
     #[schemars(
-        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first), so paging with offset is stable. Atomic rows (looks_atomic=true) never leave this list, so the row count is not a progress measure."
     )]
     pub limit: Option<i64>,
 
@@ -1243,6 +1252,22 @@ pub struct ClaimWithSources {
     /// (`EvidenceRepository::source_urls_by_claim_ids`). `None` = not requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_urls: Option<Vec<String>>,
+}
+
+/// A [`ClaimResponse`] row of `query_undecomposed_claims`, with whether the
+/// claim is atomic and so terminal.
+///
+/// A flattened wrapper, like [`ClaimWithSources`], so the other tools' claim
+/// literals are untouched and the claim fields serialize as before.
+#[derive(Debug, Serialize)]
+pub struct UndecomposedClaimResponse {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// `epigraph_core::atomicity::looks_atomic(content)`: one sentence and at
+    /// most 160 chars. `decompose_claims` skips these by default, and the
+    /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
+    /// backlog and not a defect.
+    pub looks_atomic: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3038,15 +3063,23 @@ pub struct UpdatePartitionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryTriplesParams {
-    #[schemars(description = "Subject entity name (optional — omit to wildcard)")]
+    #[schemars(
+        description = "Subject entity name (optional; omit to match any subject). Requires subject_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub subject: Option<String>,
-    #[schemars(description = "Subject entity type: Material, Molecule, Method, etc. (optional)")]
+    #[schemars(
+        description = "Subject entity type_top: Material, Molecule, Method, etc. Required when subject is given; there is no default."
+    )]
     pub subject_type: Option<String>,
     #[schemars(description = "Predicate pattern — matches via trigram similarity (optional)")]
     pub predicate: Option<String>,
-    #[schemars(description = "Object entity name (optional)")]
+    #[schemars(
+        description = "Object entity name (optional; omit to match any object). Requires object_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub object: Option<String>,
-    #[schemars(description = "Object entity type (optional)")]
+    #[schemars(
+        description = "Object entity type_top. Required when object is given; there is no default."
+    )]
     pub object_type: Option<String>,
     #[schemars(
         description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"

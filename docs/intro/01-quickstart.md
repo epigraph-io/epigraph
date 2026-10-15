@@ -108,13 +108,13 @@ Open Claude Code (in any working directory). Tell it:
 
 > Use the `recall_with_context` MCP tool to search for "test".
 
-Claude should call `mcp__epigraph__recall_with_context({"query": "test"})` and you should see a JSON response with a `corpus_scope` object showing zero claims, paragraphs, papers, and themes (assuming a fresh database). For background on what `recall_with_context` is actually doing — embedding the query, scoring against paragraph- and claim-level vectors, returning a hybrid result — see [`02-concepts.md#5--hierarchical-extraction`](02-concepts.md#5--hierarchical-extraction).
+Claude should call `mcp__epigraph__recall_with_context({"query": "test"})` and you should see a JSON response with an empty `results` list and a `corpus_scope` object showing zero claims, paragraphs, papers, and themes (assuming a fresh database). For background on what `recall_with_context` is actually doing — embedding the query, running a vector nearest-neighbour search over every embedded claim, then batching in each hit's structural context (paper, section, atoms, sibling and neighbour paragraphs, epistemic edges) — see [`02-concepts.md#5--hierarchical-extraction`](02-concepts.md#5--hierarchical-extraction).
 
 Next, ask:
 
 > Use `submit_claim` to add this claim: "EpiGraph is installed correctly."
 
-Claude calls `mcp__epigraph__submit_claim(...)` and returns the created claim's UUID. This newly written row is a noun-claim authored by your agent; the conceptual model behind that split is in [`02-concepts.md#1--noun-claims-vs-verb-edges`](02-concepts.md#1--noun-claims-vs-verb-edges). Call `recall_with_context "installed"` again — you should now see the freshly submitted claim in the results.
+Claude calls `mcp__epigraph__submit_claim(...)` and returns the created claim's UUID. This newly written row is a noun-claim authored by your agent; the conceptual model behind that split is in [`02-concepts.md#1--noun-claims-vs-verb-edges`](02-concepts.md#1--noun-claims-vs-verb-edges). `submit_claim` embeds the claim as it writes it, so call `recall_with_context "installed"` again — you should now see the freshly submitted claim in the results, with its UUID as the hit's `paragraph_id` (the field holds the hit's claim id whatever kind of claim it is). The hit has **no `paper` key**, `section: null` and empty `atoms` / `siblings` lists: those are filled from `ingest_document`'s paper → section → paragraph → atom tree, and a claim submitted on its own has no parent paper. That is expected, not a failure. (The flat `recall` tool finds the claim too.)
 
 If you see the claim, your install is working end-to-end.
 
