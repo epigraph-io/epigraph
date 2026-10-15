@@ -2516,6 +2516,17 @@ pub mod __test_only {
     };
     use rmcp::model::CallToolResult;
 
+    /// The `centroid_dim` auto-detect decision `recall_with_context` makes
+    /// when the caller omits `centroid_dim` (the private
+    /// `detect_centroid_dim`), so tests can pin the decision itself, not only
+    /// the fraction it is computed from.
+    pub async fn detect_centroid_dim(
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<u32, sqlx::Error> {
+        super::detect_centroid_dim(pool, viewer).await
+    }
+
     /// Integration-test entry point that skips the OpenAI embedder.
     ///
     /// Tests cannot call the real embedder (no API key in CI / sandbox),

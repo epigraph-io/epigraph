@@ -3706,4 +3706,15 @@ async fn centroid_auto_detect_counts_every_embedded_claim_not_just_paragraphs(po
          denominator reports 1.0 and auto-selects 3072, hiding both parentless claims. \
          Got {frac}"
     );
+
+    // The decision the caller sees (`centroid_dim_used`), not just its input:
+    // a threshold change or a call site reading the wrong helper flips this.
+    use epigraph_mcp::tools::recall::__test_only::detect_centroid_dim;
+    let dim = detect_centroid_dim(&pool, &viewerfx::public_viewer(&pool).await)
+        .await
+        .expect("detect_centroid_dim");
+    assert_eq!(
+        dim, 1536,
+        "auto-detect must stay on 1536, where the two parentless claims have vectors"
+    );
 }
