@@ -16,8 +16,9 @@
 //!    0/1/2: thesis, section heading, paragraph — "Keywords:" lists, captions,
 //!    transcript turns) filled the newest-first `max_truth=0.4` page before the
 //!    assessment agent could discard them. `exclude_spine` drops them in SQL
-//!    *before* `LIMIT`, keeps atoms (level 3) and unleveled claims, and is off
-//!    by default.
+//!    *before* `LIMIT`, keeps atoms (level 3) and unleveled claims, is off by
+//!    default, and binds correctly for a bind-less (bypass) viewer as well as a
+//!    scoped one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -300,9 +301,11 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
          newest first"
     );
 
-    // ---- Same filter through a viewer that binds a real group set ----
-    // The group bind follows exclude_spine in the bind list; a viewer with
-    // groups must still get the filtered page, not a bind error.
+    // ---- Same filter through a viewer with a NON-EMPTY group set ----
+    // `public_viewer` above is Scoped with an EMPTY group set: it still binds
+    // the group array, so it binds all seven values. This section varies the
+    // group CONTENT only (a real membership); it says nothing about the bind
+    // COUNT, which the bypass section below pins.
     let (member, _group) = fixture::seed_agent_with_group(&pool, "u056").await;
     let grouped = epigraph_db::visibility::Viewer::resolve(&pool, member)
         .await
@@ -312,4 +315,23 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
             .await
             .unwrap();
     assert_eq!(ids(&wide_grouped), vec![atom, plain]);
+
+    // ---- A bind-less viewer: the group bind must stay LAST ----
+    // A bypass viewer (and an elevated one: an MCP `query_claims` caller with a
+    // live elevation, `tools/viewer.rs`) returns `group_bind() == None`, so the
+    // statement carries six binds, not
+    // seven. With `exclude_spine` at `$6` and the conditional group bind at
+    // `$7`, that is exactly right; were the group spliced at `$6` and the flag
+    // moved to `$7`, this call would be one bind short and fail.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let wide_bypass =
+        ClaimRepository::list_by_belief_range(&pool, &bypass, 0.0, 0.4, Some(true), 10, 0, true)
+            .await
+            .expect("a bind-less viewer must bind exclude_spine at $6 with no group bind");
+    assert_eq!(
+        ids(&wide_bypass),
+        vec![atom, plain],
+        "a bypass viewer sees every row, so exactly [atom, plain] also pins that no \
+         level-0/1/2 row leaks through the bind-less path"
+    );
 }
