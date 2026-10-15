@@ -1005,3 +1005,51 @@ async fn a_ledger_append_failure_fails_its_line_and_the_plan_goes_on(pool: PgPoo
         "an unwritten verdict is not held"
     );
 }
+
+/// Only a ONE-atom answer is a verdict that the text is atomic. A plan line
+/// with no atoms at all (a hand-edited `--apply-plan` file; live parsing
+/// drops such entries) persists nothing as before, but it is not recorded,
+/// so the parent is asked again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_answer_is_not_recorded_as_judged_atomic(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let text = "The cam follower slips. Its contact force is under one nanonewton.";
+    let e = seed_claim(&pool, agent, text, 300, &[]).await;
+    let one_text = "The pawl engages. Its tooth count is twelve.";
+    let one = seed_claim(&pool, agent, one_text, 300, &[]).await;
+    let line = |claim_id: Uuid, content: &str, atoms: Vec<String>| {
+        epigraph_cli::decompose::PlannedDecomposition {
+            kind: epigraph_cli::decompose::PlannedDecomposition::KIND.to_string(),
+            claim_id,
+            agent_id: agent,
+            content: content.to_string(),
+            generality: vec![0; atoms.len()],
+            atoms,
+            model: "hand-edited".to_string(),
+        }
+    };
+    let planned = vec![
+        line(e, text, vec![]),
+        line(one, one_text, vec![one_text.to_string()]),
+    ];
+    let ledger_path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    let mut ledger = SingletonLedger::open_for_append(&ledger_path).unwrap();
+    let submit = |_t: String, _g: i64, _p: AtomParent| async move {
+        Err::<Uuid, Box<dyn std::error::Error>>("nothing is submitted here".into())
+    };
+    let totals = persist_planned(&pool, &viewer, &planned, None, Some(&mut ledger), &submit)
+        .await
+        .unwrap();
+    assert!(totals.failed.is_empty(), "{:?}", totals.failed);
+    let back = SingletonLedger::load(&ledger_path).unwrap();
+    assert!(
+        back.contains(one, one_text),
+        "the one-atom answer is recorded"
+    );
+    assert!(
+        !back.contains(e, text),
+        "an empty answer is not a verdict that the text is atomic"
+    );
+    std::fs::remove_file(&ledger_path).ok();
+}

@@ -1060,8 +1060,10 @@ mod db_writes {
                         // parent before an apply). A failed append fails this
                         // LINE, like a failed submit: the parent stays
                         // undecomposed and unrecorded, a re-run records it,
-                        // and the rest of the plan is still applied.
-                        if let Some(l) = ledger.as_deref_mut() {
+                        // and the rest of the plan is still applied. Only a
+                        // ONE-atom answer is a verdict that the text is
+                        // atomic: an empty line (hand-edited plan) is not.
+                        if let Some(l) = ledger.as_deref_mut().filter(|_| plan.atoms.len() == 1) {
                             if let Err(e) = l.record(plan.claim_id, &plan.content, &plan.model) {
                                 totals.failed.push((
                                     plan.claim_id,
