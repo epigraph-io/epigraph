@@ -4268,8 +4268,27 @@ impl ClaimRepository {
     /// currency it never read — the defect `ClaimRepository::list` had in
     /// backlog `f1992766` and this query still had in `a85ee585`.
     ///
-    /// `is_current` occupies `$3`, so the viewer's group bind is `$6`, not the
-    /// `$5` the pre-`a85ee585` shape used.
+    /// # `exclude_spine`
+    ///
+    /// When `true`, verbatim document-spine nodes, `properties.level` 0, 1 or 2
+    /// (thesis, section heading, paragraph), are dropped in SQL *before*
+    /// `LIMIT`. Backlog `31e7b727`: the `max_truth=0.4` assessment page is
+    /// newest-first, and "Keywords:" lists, captions, headings and transcript
+    /// turns, each carrying its paragraph's low extraction confidence, filled
+    /// it (64% of the newest 50 low-truth rows on prod, 2026-10-14) before the
+    /// agent could discard them; the same reason the range itself is filtered
+    /// before `LIMIT` (`5a55a48e`). Atoms (level 3) and claims with no `level`
+    /// at all (`submit_claim`, `memorize`) are kept. The comparison is on the
+    /// text value, never a cast, so an absent or odd `level` cannot raise.
+    /// `false` folds the predicate away and leaves the page unchanged.
+    ///
+    /// # Bind layout
+    ///
+    /// `is_current` occupies `$3` and `exclude_spine` `$6`, so the viewer's
+    /// group bind is `$7`. The group bind is conditional (a `Bypass` or
+    /// elevated viewer binds nothing), so it must stay LAST: were it `$6`, a
+    /// bind-less viewer would leave the statement one value short of the
+    /// `$7` it references.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -4281,8 +4300,6 @@ impl ClaimRepository {
         offset: i64,
         exclude_spine: bool,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
-        // RED STUB: accepted, not yet applied.
-        let _ = exclude_spine;
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
         // SELECT omits them, and at runtime rather than at compile time.
@@ -4314,6 +4331,7 @@ impl ClaimRepository {
                 r#" AS belief_score
                 FROM claims
                 WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
+                  AND (NOT $6::bool OR COALESCE(properties->>'level', '') NOT IN ('0', '1', '2'))
                   /* {VISIBILITY:claims} */
             ) scored
             WHERE belief_score >= $1 AND belief_score <= $2
@@ -4322,14 +4340,15 @@ impl ClaimRepository {
             "#,
             ]
             .concat(),
-            6,
+            7,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(min_belief)
             .bind(max_belief)
             .bind(is_current)
             .bind(limit)
-            .bind(offset);
+            .bind(offset)
+            .bind(exclude_spine);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
