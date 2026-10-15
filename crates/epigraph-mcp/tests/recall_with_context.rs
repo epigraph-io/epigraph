@@ -23,7 +23,7 @@ mod viewerfx;
 #[rustfmt::skip]
 use epigraph_mcp::tools::recall::{
     EdgeDirection,
-    __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
+    __test_only::{assemble_neighbor_paragraphs, embedded_3072_population, fetch_batched_context},
     NeighborPath,
 };
 use sqlx::PgPool;
@@ -662,12 +662,12 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let _fx = fixture::build(&pool).await;
 
     // Sanity: helper reports 0.0 for the unpopulated 3072 column.
-    let frac = paragraph_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
+    let frac = embedded_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
         .await
-        .expect("paragraph_3072_population helper");
+        .expect("embedded_3072_population helper");
     assert_eq!(
         frac, 0.0,
-        "fixture should leave embedding_3072 unpopulated on level=2 paragraphs"
+        "fixture should leave embedding_3072 unpopulated on every embedded claim"
     );
 
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
@@ -3565,5 +3565,44 @@ async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool:
         results[0].get("paper").is_none(),
         "a parentless diverse hit omits `paper`; got {}",
         results[0]
+    );
+}
+
+/// `centroid_dim` auto-detect measures the population the seed searches: every
+/// embedded claim, not only level-2 paragraphs.
+///
+/// One paragraph re-embedded at 3072 (both columns) beside two `submit_claim`
+/// style claims that, like every MCP write path, carry only the 1536-d vector.
+/// Paragraph-only, the fraction is 1/1 and auto-detect would pick 3072 — where
+/// the two parentless claims have no vector, so they could never be returned.
+/// Whole-corpus, it is 1/3 and auto-detect stays on 1536, where all three are
+/// candidates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn centroid_auto_detect_counts_every_embedded_claim_not_just_paragraphs(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/detect", "Detect test").await;
+    let v1536 = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "re-embedded para", &v1536, None)
+            .await;
+    let v3072 = format!("[{}]", vec!["0.5"; 3072].join(","));
+    sqlx::query("UPDATE claims SET embedding_3072 = $2::vector WHERE id = $1")
+        .bind(para)
+        .bind(&v3072)
+        .execute(&pool)
+        .await
+        .expect("set embedding_3072 on the paragraph");
+    for content in ["memorized note one", "memorized note two"] {
+        seed_parentless_claim(&pool, agent, content, "{}", &v1536, None).await;
+    }
+
+    let frac = embedded_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
+        .await
+        .expect("embedded_3072_population");
+    assert!(
+        (frac - 1.0 / 3.0).abs() < 1e-9,
+        "1 of the 3 embedded claims carries a 3072-d vector; a paragraph-only \
+         denominator reports 1.0 and auto-selects 3072, hiding both parentless claims. \
+         Got {frac}"
     );
 }

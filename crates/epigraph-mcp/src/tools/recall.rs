@@ -18,15 +18,24 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-/// Fraction of level-2 paragraphs carrying a 3072-d embedding, viewer-scoped.
+/// Fraction of the claims `recall_with_context` can seed on — every claim
+/// carrying a vector in EITHER column — that carry a 3072-d one,
+/// viewer-scoped.
+///
+/// Drain U082: the denominator was level-2 paragraphs while the seed was
+/// level-2 paragraphs. Now that the seed is the whole corpus it must be the
+/// whole embedded corpus too, or auto-detect hides exactly the claims the
+/// ruling made candidates: the `submit_claim` / `memorize` write paths embed
+/// only the 1536-d `embedding` column (`epigraph-cli reembed` alone writes
+/// `embedding_3072`), so a corpus whose PARAGRAPHS were re-embedded at 3072
+/// would auto-select 3072 and every parentless claim would silently stop
+/// being a candidate.
 ///
 /// PR-09: took a bare pool. The ratio itself is not the disclosure — the
-/// denominator is: `COUNT(*) FROM claims WHERE level = 2` told any caller the
-/// exact paragraph population of the whole corpus, and the result is surfaced
-/// through `recall_with_context`'s `corpus_scope`. Scoped, both counts are the
-/// reader's own, and the auto-detect decision is made on the corpus the reader
-/// will actually search — which is also the more correct answer.
-pub async fn paragraph_3072_population(
+/// denominator is, and the auto-detect decision is surfaced through
+/// `centroid_dim_used`. Scoped, both counts are the reader's own, and the
+/// decision is made on the corpus the reader will actually search.
+pub async fn embedded_3072_population(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<f64, sqlx::Error> {
@@ -36,7 +45,7 @@ pub async fn paragraph_3072_population(
             COUNT(*) FILTER (WHERE c.embedding_3072 IS NOT NULL)::float8
               / NULLIF(COUNT(*), 0)::float8 AS frac_3072
         FROM claims c
-        WHERE (c.properties->>'level')::int = 2
+        WHERE (c.embedding IS NOT NULL OR c.embedding_3072 IS NOT NULL)
           AND ($1::bool OR c.visibility = 'public'
                OR c.owner_group_id = ANY($2::uuid[]))
         "#,
@@ -52,7 +61,7 @@ async fn detect_centroid_dim(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<u32, sqlx::Error> {
-    let frac = paragraph_3072_population(pool, viewer).await?;
+    let frac = embedded_3072_population(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
@@ -751,12 +760,12 @@ pub async fn recall_with_context(
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = paragraph_3072_population(&server.pool, viewer)
+        let frac = embedded_3072_population(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
         if frac == 0.0 {
             return Err(invalid_params(
-                "centroid_dim=3072 requested but embedding_3072 has no populated rows on level=2 paragraphs; re-run with centroid_dim=1536 or omit to auto-detect"
+                "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
                     .to_string(),
             ));
         }
@@ -2493,7 +2502,7 @@ pub fn assemble_neighbor_paragraphs(
 #[doc(hidden)]
 pub mod __test_only {
     pub use super::{
-        assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
+        assemble_neighbor_paragraphs, embedded_3072_population, fetch_batched_context,
         BatchedContext, ParagraphCore,
     };
     use super::{
