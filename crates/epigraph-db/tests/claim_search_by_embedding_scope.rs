@@ -315,3 +315,85 @@ async fn all_claims_scope_fills_its_limit_past_rows_a_post_filter_rejects(pool: 
          ef_search batch returns none of them"
     );
 }
+
+/// `paper_doi_filter` composes with the scope. In `AllClaims` the DOI shape
+/// returns EVERY embedded claim the named paper `asserts` (a paragraph and an
+/// atom here) and nothing of another paper; in `Paragraphs` it keeps the
+/// level-2 contract and returns that paper's paragraph only. A deliberate
+/// change in drain U082: a DOI-filtered `recall_with_context` page now carries
+/// that paper's atoms and sections too, not only its paragraphs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn doi_filter_returns_every_claim_the_paper_asserts_in_all_claims_scope(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let q = vec_angle(0.0);
+
+    async fn seed_paper(pool: &PgPool, doi: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(doi)
+            .bind(format!("paper {doi}"))
+            .execute(pool)
+            .await
+            .expect("seed paper");
+        id
+    }
+    async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+        )
+        .bind(paper)
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("seed paper asserts edge");
+    }
+
+    let ours = seed_paper(&pool, "10.1/doi-scope-ours").await;
+    let theirs = seed_paper(&pool, "10.1/doi-scope-theirs").await;
+
+    let paragraph = seed_claim(&pool, agent, 1, r#"{"level": 2}"#, Some(&vec_angle(3.0))).await;
+    let atom = seed_claim(&pool, agent, 2, r#"{"level": 3}"#, Some(&vec_angle(2.0))).await;
+    // Nearest of all, but asserted by the OTHER paper.
+    let other = seed_claim(&pool, agent, 3, r#"{"level": 2}"#, Some(&vec_angle(1.0))).await;
+    // Nearest-but-one, asserted by no paper at all.
+    let _memorized = seed_claim(&pool, agent, 4, "{}", Some(&vec_angle(1.5))).await;
+    asserts(&pool, ours, paragraph).await;
+    asserts(&pool, ours, atom).await;
+    asserts(&pool, theirs, other).await;
+
+    let search = |scope| {
+        let (pool, viewer, q) = (&pool, &viewer, &q);
+        async move {
+            ClaimRepository::search_by_embedding_since(
+                pool,
+                viewer,
+                q,
+                1536,
+                10,
+                Some("10.1/doi-scope-ours"),
+                None,
+                scope,
+            )
+            .await
+            .expect("search_by_embedding_since with a DOI")
+            .into_iter()
+            .map(|h| h.claim_id)
+            .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(
+        search(EmbeddingSeedScope::AllClaims).await,
+        vec![atom, paragraph],
+        "DOI + AllClaims: every claim the paper asserts (its atom too), nearest first, and \
+         nothing asserted by another paper or by none"
+    );
+    assert_eq!(
+        search(EmbeddingSeedScope::Paragraphs).await,
+        vec![paragraph],
+        "DOI + Paragraphs: the paper's level-2 paragraph only"
+    );
+}
