@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use epigraph_cli::recompute_betp::{preview_claim, run_claim, select_cohort};
+use epigraph_cli::recompute_betp::{predict_cached_after, run_claim, select_cohort};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -138,14 +138,13 @@ async fn run_dry(
                 .await?
                 .flatten();
 
-        let previews = preview_claim(pool, viewer, claim_id).await?;
-        // claims.pignistic_prob is frame-agnostic — last writer wins across
-        // a claim's frames, same ordering `run_claim` writes in. Report the
-        // last preview's value as "what a real run would leave cached".
-        let Some((_, last)) = previews.last() else {
+        // A real run caches only the owner frame's value (`run_claim` ->
+        // `recompute_claim_cached_belief`); report that as "what a real run
+        // would leave cached".
+        let Some((_, owned)) = predict_cached_after(pool, viewer, claim_id).await? else {
             continue;
         };
-        let recomputed_after = last.pignistic_prob;
+        let recomputed_after = owned.pignistic_prob;
         let delta = match cached_before {
             Some(before) => recomputed_after - before,
             None => f64::NAN,

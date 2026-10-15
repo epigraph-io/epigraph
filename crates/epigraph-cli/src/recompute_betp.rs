@@ -76,12 +76,9 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
 }
 
 /// Discover every distinct `frame_id` a claim has BBAs on, ordered by the
-/// frame's name. Identical query to
-/// `recompute_claim_belief.rs::recompute_one_claim_all_frames`'s frame
-/// discovery — kept in lock-step so both operator binaries process a
-/// claim's frames in the same deterministic order (matters because
-/// `claims.{belief, pl, betp, ...}` are frame-agnostic scalars — last
-/// writer wins across frames).
+/// frame's name. Name order is only a stable listing order for the dry-run
+/// preview; which frame's value a real run caches is decided by
+/// `MassFunctionRepository::cache_owner_frame_for_claim`, never by name.
 async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String> {
     let rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT DISTINCT mf.frame_id, f.name \
@@ -99,8 +96,8 @@ async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String
 
 /// Dry-run half: preview the recomputed belief for every frame this claim
 /// has BBAs on, without writing anything. Returns `(frame_id, preview)`
-/// pairs in the same frame-name order `run_claim` would write them, so a
-/// caller can print "last one wins" alongside each candidate.
+/// pairs in frame-name order. `run_claim` writes only the owner frame's
+/// value; [`predict_cached_after`] returns that one.
 ///
 /// # Errors
 /// Propagates any error from the frame-discovery query or from
@@ -128,11 +125,39 @@ pub async fn preview_claim(
     Ok(out)
 }
 
-/// Real-write half: recompute and persist the belief for every frame this
-/// claim has BBAs on, via the canonical
-/// `epigraph_engine::edge_factor::recompute_claim_belief_on_frame` write
-/// path (the same one `recompute_claim_belief.rs` uses). Returns the number
-/// of (claim, frame) pairs that produced a write.
+/// Dry-run prediction: the `(owner frame, preview)` a real run (`run_claim`)
+/// would leave in the claim's cache, or `None` when the claim has no input.
+///
+/// # Errors
+/// Propagates any error from the owner lookup or the preview.
+pub async fn predict_cached_after(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<(Uuid, epigraph_engine::edge_factor::CombinedBeliefPreview)>, String> {
+    // Same read-only owner lookup `run_claim`'s recompute uses, on one
+    // connection, then the write-free preview of that frame alone.
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let Some(owner) = epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(
+        &mut *conn, viewer, claim_id,
+    )
+    .await
+    .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+    else {
+        return Ok(None);
+    };
+    Ok(epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut conn, viewer, claim_id, owner,
+    )
+    .await?
+    .map(|preview| (owner, preview)))
+}
+
+/// Real-write half: recompute and persist the claim's cached belief from
+/// its owner frame via
+/// `epigraph_engine::edge_factor::recompute_claim_cached_belief` (the same
+/// path `recompute_claim_belief.rs` uses). Returns 1 when the cache was
+/// written, 0 otherwise.
 ///
 /// # Errors
 /// Propagates any error from the frame-discovery query or from the engine's
@@ -143,7 +168,8 @@ pub async fn run_claim(
     claim_id: Uuid,
 ) -> Result<usize, String> {
     // Backlog 696d3a1c: one frame owns the shared claims.* cache. Looping over
-    // every frame wrote it repeatedly and let the alphabetically last win.
+    // every frame wrote it repeatedly and let the alphabetically last win; the
+    // owner is now resolved independently of frame names.
     // An operator one-shot, run on whatever DSN the operator supplies — in
     // practice a superuser, where a stamp is inert. The acquire is mechanical:
     // the whole recompute rides ONE connection instead of a checkout per

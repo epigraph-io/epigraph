@@ -1102,12 +1102,9 @@ impl MassFunctionRepository {
     /// List every distinct `frame_id` a claim carries BBAs on, paired with the
     /// frame's name and **ordered by frame name**.
     ///
-    /// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-    /// frame-agnostic scalars (last-writer-wins), so callers that recompute a
-    /// claim across all its frames must process them in a deterministic order
-    /// for two runs to converge to the same cached value. Frame-name order is
-    /// that canonical order — it matches the `epigraph-recompute-belief`
-    /// operator binary.
+    /// Name order is a stable LISTING order only. It does not say which frame
+    /// owns the claim's cached `claims.{belief, plausibility, pignistic_prob,
+    /// ...}` scalars: that is [`Self::cache_owner_frame_for_claim`].
     #[instrument(skip(executor, viewer))]
     pub async fn list_frames_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -1132,6 +1129,79 @@ impl MassFunctionRepository {
         let rows: Vec<(Uuid, String)> = vq.fetch_all(executor).await?;
 
         Ok(rows)
+    }
+
+    /// The frame that owns a claim's cached `claims.{belief, plausibility,
+    /// mass_on_empty, pignistic_prob, mass_on_missing, belief_frame_id}`
+    /// scalars, or `None` when the claim has no combine input the viewer can see.
+    ///
+    /// Only combine inputs count: cached combination rows are excluded exactly
+    /// as [`Self::get_for_claim_frame`] excludes them, so the owner is always a
+    /// frame the recompute can fold. Among the frames holding the claim's inputs:
+    ///
+    /// 1. the frame named `binary_truth`, when the claim has an input on it;
+    /// 2. else the frame named `claim_validity`, when the claim has an input on it;
+    /// 3. else the claim's recorded owner (`claims.belief_frame_id`), while that
+    ///    frame still holds an input;
+    /// 4. else the first-writer frame: the frame holding the claim's earliest
+    ///    input (`mass_functions.created_at`), ties broken by frame id.
+    ///
+    /// `frames.name` is UNIQUE, so the two canonical names identify at most one
+    /// frame each (migration 114 treats the frame named `binary_truth` the same
+    /// way). No other frame name plays a part.
+    ///
+    /// Once a claim's cache has an owner, a later input on another non-canonical
+    /// frame does not move it (rule 3): `belief_frame_id` is written only by the
+    /// claim's owner or by migration 114's definer, which keeps the recorded
+    /// frame. Rule 3 also means the owner does not follow `created_at` once
+    /// recorded; `created_at` is set by the database and is reset when an agent
+    /// replaces its own BBA ([`Self::store_with_perspective`]'s upsert), so it
+    /// decides only a claim with no recorded owner, or one whose recorded owner
+    /// no longer holds an input. A canonical frame still outranks the recorded
+    /// owner as soon as the claim has an input on it.
+    ///
+    /// Read-only: no frame is created.
+    #[instrument(skip(executor, viewer))]
+    pub async fn cache_owner_frame_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &with_cached_combination_excluded(
+                r#"
+            SELECT mf.frame_id
+            FROM mass_functions mf
+            JOIN frames f ON f.id = mf.frame_id
+            WHERE mf.claim_id = $1
+              /* {NOT_CACHED_COMBINATION} */
+              /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
+            ORDER BY CASE
+                       WHEN f.name = 'binary_truth' THEN 0
+                       WHEN f.name = 'claim_validity' THEN 1
+                       WHEN mf.frame_id = (
+                           SELECT c.belief_frame_id
+                           FROM claims c
+                           WHERE c.id = $1
+                             /* {VISIBILITY:c} */
+                       ) THEN 2
+                       ELSE 3
+                     END,
+                     mf.created_at,
+                     mf.frame_id
+            LIMIT 1
+            "#,
+                "mf.",
+            ),
+            2,
+        );
+        let mut vq = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let owner: Option<Uuid> = vq.fetch_optional(executor).await?;
+
+        Ok(owner)
     }
 
     /// List distinct `claim_id`s of **current** claims that have at least one
