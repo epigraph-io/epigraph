@@ -12,6 +12,10 @@
 //! - `POST /api/v1/triples/query` — Query triples with optional filters
 //! - `GET /api/v1/entities/:id/neighborhood` — Get all triples for an entity
 //!
+//! Both return `{count, index_populated, triples}`. No pipeline populates the
+//! triple index today; `index_populated` (whether any triple is visible to the
+//! caller) is what tells an empty index apart from a query that matched nothing.
+//!
 //! # Tenancy: 5 of this file's 8 raw-pool sites are converted
 //!
 //! Conversion shard 7, and the largest single-file drop in it.
@@ -133,6 +137,34 @@ pub struct EntityResponse {
     pub type_sub: Option<String>,
     pub is_canonical: bool,
     pub created_at: String,
+}
+
+/// Response for `POST /api/v1/triples/query`.
+///
+/// `index_populated` says whether any triple is visible to the caller. No
+/// pipeline populates the triple index today, so `false` means an empty
+/// `triples` list is not evidence that the corpus lacks the fact.
+///
+/// `unresolved` names each of `"subject"` / `"object"` whose name matched no
+/// entity. When it is non-empty, `triples` is empty: a filter on a name that
+/// does not exist matches nothing.
+#[cfg(feature = "db")]
+#[derive(Serialize)]
+pub struct QueryTriplesResponse {
+    pub count: usize,
+    pub index_populated: bool,
+    pub unresolved: Vec<&'static str>,
+    pub triples: Vec<epigraph_db::TripleRow>,
+}
+
+/// Response for `GET /api/v1/entities/:id/neighborhood`. `index_populated` as
+/// on [`QueryTriplesResponse`].
+#[cfg(feature = "db")]
+#[derive(Serialize)]
+pub struct EntityNeighborhoodResponse {
+    pub count: usize,
+    pub index_populated: bool,
+    pub triples: Vec<epigraph_db::TripleRow>,
 }
 
 /// Response carrying a list of inserted UUIDs
@@ -272,15 +304,29 @@ pub async fn batch_create_triples(
 /// POST /api/v1/triples/query — query triples with optional filters
 ///
 /// Entity names are resolved to UUIDs server-side via `EntityRepository::find_by_name_and_type`.
-/// Returns an empty list when a named entity does not exist (rather than an error), so that
-/// callers can distinguish "no entity found" from "entity found but no triples."
+/// A name needs its type (`subject_type` / `object_type`); a name without one is a 400.
+/// When a named entity does not exist the response is empty and names the side in
+/// `unresolved` (rather than an error), so that callers can distinguish "no entity found"
+/// from "entity found but no triples". It never drops the filter and matches everything.
 #[cfg(feature = "db")]
 pub async fn query_triples(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<QueryTriplesRequest>,
-) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
-    // Resolve optional subject name → UUID
+) -> Result<Json<QueryTriplesResponse>, ApiError> {
+    // Entities are keyed by `(canonical_name, type_top)`. A name without a type
+    // was silently dropped from the filter, which matched everything.
+    if req.subject_name.is_some() && req.subject_type.is_none() {
+        return Err(ApiError::BadRequest {
+            message: "subject_type is required when subject_name is given".to_string(),
+        });
+    }
+    if req.object_name.is_some() && req.object_type.is_none() {
+        return Err(ApiError::BadRequest {
+            message: "object_type is required when object_name is given".to_string(),
+        });
+    }
+
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -293,12 +339,23 @@ pub async fn query_triples(
         }
     })?;
 
+    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+
+    // A name that resolves to no entity means no triple can match. It must not
+    // become a `None` filter, which the repo reads as "any subject/object".
+    let mut unresolved: Vec<&'static str> = Vec::new();
+
+    // Resolve optional subject name → UUID
     let subject_id = if let (Some(name), Some(type_top)) =
         (req.subject_name.as_deref(), req.subject_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
+        let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
-            .map(|e| e.id)
+            .map(|e| e.id);
+        if id.is_none() {
+            unresolved.push("subject");
+        }
+        id
     } else {
         None
     };
@@ -307,12 +364,25 @@ pub async fn query_triples(
     let object_id = if let (Some(name), Some(type_top)) =
         (req.object_name.as_deref(), req.object_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
+        let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
-            .map(|e| e.id)
+            .map(|e| e.id);
+        if id.is_none() {
+            unresolved.push("object");
+        }
+        id
     } else {
         None
     };
+
+    if !unresolved.is_empty() {
+        return Ok(Json(QueryTriplesResponse {
+            count: 0,
+            index_populated,
+            unresolved,
+            triples: Vec::new(),
+        }));
+    }
 
     let min_confidence = req.min_confidence.unwrap_or(0.0);
     let limit = req.limit.unwrap_or(50).min(500);
@@ -328,7 +398,12 @@ pub async fn query_triples(
     )
     .await?;
 
-    Ok(Json(rows))
+    Ok(Json(QueryTriplesResponse {
+        count: rows.len(),
+        index_populated,
+        unresolved,
+        triples: rows,
+    }))
 }
 
 #[cfg(not(feature = "db"))]
@@ -348,7 +423,7 @@ pub async fn entity_neighborhood(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(entity_id): Path<Uuid>,
-) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
+) -> Result<Json<EntityNeighborhoodResponse>, ApiError> {
     // Resolve to canonical entity (follow merged_into chain one hop)
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -374,7 +449,12 @@ pub async fn entity_neighborhood(
 
     let rows =
         TripleRepository::entity_neighborhood(&mut *read, &viewer, canonical_id, 200).await?;
-    Ok(Json(rows))
+    let index_populated = TripleRepository::index_populated(&mut *read, &viewer).await?;
+    Ok(Json(EntityNeighborhoodResponse {
+        count: rows.len(),
+        index_populated,
+        triples: rows,
+    }))
 }
 
 #[cfg(not(feature = "db"))]

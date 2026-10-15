@@ -3038,15 +3038,23 @@ pub struct UpdatePartitionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryTriplesParams {
-    #[schemars(description = "Subject entity name (optional — omit to wildcard)")]
+    #[schemars(
+        description = "Subject entity name (optional; omit to match any subject). Requires subject_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub subject: Option<String>,
-    #[schemars(description = "Subject entity type: Material, Molecule, Method, etc. (optional)")]
+    #[schemars(
+        description = "Subject entity type_top: Material, Molecule, Method, etc. Required when subject is given; there is no default."
+    )]
     pub subject_type: Option<String>,
     #[schemars(description = "Predicate pattern — matches via trigram similarity (optional)")]
     pub predicate: Option<String>,
-    #[schemars(description = "Object entity name (optional)")]
+    #[schemars(
+        description = "Object entity name (optional; omit to match any object). Requires object_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub object: Option<String>,
-    #[schemars(description = "Object entity type (optional)")]
+    #[schemars(
+        description = "Object entity type_top. Required when object is given; there is no default."
+    )]
     pub object_type: Option<String>,
     #[schemars(
         description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"

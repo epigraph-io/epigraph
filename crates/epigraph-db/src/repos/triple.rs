@@ -440,6 +440,38 @@ impl TripleRepository {
         Ok(row.exists)
     }
 
+    /// Return `true` if at least one triple is visible to `viewer`.
+    ///
+    /// The RDF read surfaces (`query_triples`, `search_triples`,
+    /// `entity_neighborhood`, over MCP and HTTP) report this as
+    /// `index_populated`. No pipeline populates the triple index today, so an
+    /// empty answer from those reads usually means the index is empty, not that
+    /// the corpus lacks the fact. This flag lets a caller tell the two apart.
+    ///
+    /// **Viewer-relative, unlike [`Self::index_counts`].** It is an `EXISTS`
+    /// through the ordinary tenancy predicate, so it stops at the first visible
+    /// row and cannot report that a row private to another group exists. On a
+    /// viewer-stamped connection RLS narrows it the same way, which is what lets
+    /// the HTTP handlers evaluate it on the connection they already hold.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn index_populated<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS(SELECT 1 FROM triples t WHERE true /* {VISIBILITY:t} */)",
+            1,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Return total row counts for the structured triple/entity index.
     ///
     /// One round-trip over the three index tables (`triples`, `entities`,
