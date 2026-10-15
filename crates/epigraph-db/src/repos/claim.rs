@@ -198,6 +198,23 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// Which claims [`ClaimRepository::search_by_embedding_since`] draws its kNN
+/// candidates from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingSeedScope {
+    /// Level-2 (`(properties->>'level')::int = 2`) claims only: the paragraph
+    /// layer of `ingest_document`'s hierarchy, plus anything else written at
+    /// level 2 (workflow steps). The historical contract, kept by the
+    /// [`ClaimRepository::search_by_embedding`] wrapper.
+    Paragraphs,
+    /// Every claim with a vector in the searched column, at any level or
+    /// none: memorized and `submit_claim` claims, sections, atoms, workflow
+    /// steps and paragraphs alike. MCP `recall_with_context` seeds here
+    /// (drain U082, backlog a1d89aab): parentage is an enrichment attribute,
+    /// not an eligibility filter.
+    AllClaims,
+}
+
 /// One link in the supersession chain returned by
 /// [`ClaimRepository::version_history`], ordered oldest-first by
 /// `(depth, id)`.
@@ -1514,58 +1531,6 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
-    /// The subset of `claim_ids` that occupy the **paragraph** role —
-    /// `(properties->>'level')::int = 2` — as the viewer sees them.
-    ///
-    /// Backlog `4e856a99`. `recall_with_context` is paragraph-primary on every
-    /// ANN surface it has: the flat kNN is level=2 only and the diverse path
-    /// coerces to level=2. Its graph-expansion pool
-    /// ([`Self::graph_expand_seeds_since`]) had no level predicate at all, so a
-    /// level-3 atom reached over a `supports`/`elaborates` edge could be folded
-    /// straight into the top-level hit list beside paragraphs — and
-    /// `ingest_document` writes a `paper -asserts-> claim` edge for EVERY
-    /// planned claim including atoms, so the paper-attribution drop downstream
-    /// does not catch it. This is the predicate that does.
-    ///
-    /// The spelling is deliberately IDENTICAL to the one the seed surfaces use
-    /// (`recall.rs`'s flat kNN and sibling queries, `Self::nearest_by_embedding`
-    /// and friends), so the two candidate-producing surfaces cannot drift into
-    /// disagreeing about what a paragraph is.
-    ///
-    /// A claim with NO `level` property is therefore also excluded — `NULL` is
-    /// not `2`. That is the `decompose_claims` population, which carries no
-    /// level property at all and was never reachable as a top-level
-    /// `recall_with_context` hit on any path, so excluding it here changes
-    /// nothing; it is stated because the arm is silent in the SQL.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
-    pub async fn paragraph_level_ids<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        claim_ids: &[Uuid],
-    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
-        if claim_ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-        let sql = viewer.splice(
-            "SELECT id FROM claims \
-             WHERE id = ANY($1) AND (properties->>'level')::int = 2 \
-             /* {VISIBILITY:claims} */",
-            2,
-        );
-        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(claim_ids);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        Ok(q.fetch_all(executor)
-            .await?
-            .into_iter()
-            .map(|(id,)| id)
-            .collect())
-    }
-
     /// Walk a claim's supersession chain and return every version the viewer
     /// may see, oldest first (`depth` 0 = root).
     ///
@@ -2788,28 +2753,67 @@ impl ClaimRepository {
             limit,
             paper_doi_filter,
             None,
+            EmbeddingSeedScope::Paragraphs,
         )
         .await
     }
 
     /// [`Self::search_by_embedding`] plus an optional `created_at >= since`
-    /// window.
+    /// window and a choice of candidate population ([`EmbeddingSeedScope`]).
     ///
     /// The predicate sits in the same WHERE clause as the level/NULL guards,
     /// i.e. before `ORDER BY … LIMIT`, so the window narrows the candidate
     /// pool rather than trimming an already-truncated top-K (see
     /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
     /// correctness rather than performance).
+    ///
+    /// # Scope
+    ///
+    /// [`EmbeddingSeedScope::Paragraphs`] keeps the `level = 2` predicate (and
+    /// so, at 1536d, the partial HNSW index from migration 029).
+    /// [`EmbeddingSeedScope::AllClaims`] drops it, so the 1536d statement is
+    /// served by `idx_claims_embedding_hnsw` (migration 001, `WHERE embedding
+    /// IS NOT NULL`). No `is_current` predicate is needed in either scope:
+    /// `chk_deprecated_no_embedding` guarantees a retired claim carries no
+    /// vector in either column.
+    ///
+    /// # Iterative HNSW scan
+    ///
+    /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
+    /// default 40), and the predicates the index does not encode (`since`, the
+    /// DOI `EXISTS`, the visibility splice, and in the `AllClaims` scope every
+    /// row the viewer cannot see out of the whole corpus) are applied AFTER
+    /// it. So, exactly as in [`Self::semantic_search_flat`], the statement
+    /// runs in a short transaction that first sets, `is_local`:
+    ///
+    ///  - `hnsw.iterative_scan = strict_order`: keep scanning past
+    ///    `ef_search` until `LIMIT $2` matching rows are found, in exact
+    ///    distance order;
+    ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`.
+    ///
+    /// The transaction is ROLLED BACK, not committed: on a caller's own
+    /// transaction `begin()` opens a savepoint, and releasing it would carry
+    /// the `SET LOCAL` values into the caller's later HNSW reads.
+    /// `hnsw.max_scan_tuples` stays at its default (20,000). The 3072d column
+    /// has no ANN index, so there the settings are inert and the statement is
+    /// an exact scan.
+    ///
+    /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`).
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn search_by_embedding_since<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         dim: u32,
         limit: i64,
         paper_doi_filter: Option<&str>,
         since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        scope: EmbeddingSeedScope,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let column = match dim {
             1536 => "embedding",
             3072 => "embedding_3072",
@@ -2821,8 +2825,16 @@ impl ClaimRepository {
         };
 
         // Two query shapes — paper-filter vs no-filter — to keep both
-        // index-friendly. The shared WHERE predicate matches the partial
-        // HNSW index from migration 029 for the 1536d path.
+        // index-friendly. In the `Paragraphs` scope the shared WHERE
+        // predicate matches the partial HNSW index from migration 029 for the
+        // 1536d path; in the `AllClaims` scope it matches migration 001's
+        // `idx_claims_embedding_hnsw`.
+        //
+        // `level_clause` is one of two static literals, never caller input.
+        let level_clause = match scope {
+            EmbeddingSeedScope::Paragraphs => "(c.properties->>'level')::int = 2 AND",
+            EmbeddingSeedScope::AllClaims => "",
+        };
         //
         // `since` is bound at a FIXED $3 in BOTH shapes and the conditional
         // DOI moves to $4. Appending `since` after a conditionally-bound
@@ -2839,8 +2851,7 @@ impl ClaimRepository {
                 SELECT c.id AS claim_id,
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
-                WHERE (c.properties->>'level')::int = 2
-                  AND c.{column} IS NOT NULL
+                WHERE {level_clause} c.{column} IS NOT NULL
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
@@ -2860,8 +2871,7 @@ impl ClaimRepository {
                 SELECT c.id AS claim_id,
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
-                WHERE (c.properties->>'level')::int = 2
-                  AND c.{column} IS NOT NULL
+                WHERE {level_clause} c.{column} IS NOT NULL
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -2887,7 +2897,19 @@ impl ClaimRepository {
             q = q.bind(g);
         }
 
-        Ok(q.fetch_all(executor).await?)
+        // See "Iterative HNSW scan" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+
+        Ok(rows)
     }
 
     /// Search **current** claims by embedding similarity across **all levels**.

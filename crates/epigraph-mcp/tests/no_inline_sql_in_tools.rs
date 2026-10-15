@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 /// Four groups, all reviewed:
 ///
 /// * **`recall.rs` (12, all production).** `fetch_batched_context`'s ten
-///   statements plus `paragraph_3072_population` and `compute_corpus_scope`.
+///   statements plus `embedded_3072_population` and `compute_corpus_scope`.
 ///   All twelve are viewer-filtered as of PR-09 — they carry the static
 ///   three-bind `visibility = 'public' OR owner_group_id = ANY(...)` form,
 ///   because `sqlx::query!` needs a compile-time literal of fixed arity and so

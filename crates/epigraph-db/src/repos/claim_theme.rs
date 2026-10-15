@@ -590,9 +590,9 @@ impl ClaimThemeRepository {
     /// cannot carry user input.
     ///
     /// When `paragraph_only` is true, restricts to `level=2` claims (the
-    /// hierarchical-paragraph level), used by MCP `recall_with_context`
-    /// where the downstream batched-context fetch assumes paragraphs.
-    /// REST passes `false` to match its historical behaviour.
+    /// hierarchical-paragraph level). MCP `recall_with_context` passed `true`
+    /// until drain U082 made its seed the whole corpus; it and REST now both
+    /// pass `false`.
     ///
     /// Retained at its original arity as a delegating wrapper over
     /// [`Self::claims_in_themes_at_dim_since`].
