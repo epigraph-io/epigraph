@@ -10,8 +10,9 @@
 mod viewer_fixture;
 
 use epigraph_cli::decompose::{
-    persist_planned, plan_decomposition_batches, read_plan_jsonl, select_candidates, verify_plan,
-    write_plan_jsonl, AtomParent, BatchClaim, EligibilityFilters, Ineligible, PlanDrift, Priority,
+    persist_planned, plan_decomposition_batches, read_plan_jsonl, run_decomposition_batches,
+    select_candidates, verify_plan, write_plan_jsonl, AtomParent, BatchClaim, EligibilityFilters,
+    Ineligible, PlanDrift, Priority,
 };
 use epigraph_cli::enrichment::llm_client::FixtureLlmClient;
 use sqlx::PgPool;
@@ -701,5 +702,97 @@ async fn non_public_parents_are_never_selected_under_the_bypass_viewer(pool: PgP
             .iter()
             .any(|(id, why)| *id == private && matches!(why, Ineligible::NotPublic { .. })),
         "the named private parent is reported, not silently dropped: {named:?}"
+    );
+}
+
+/// Backlog 68d03c24 (U040): a parent the model answers with ONE atom ("already
+/// atomic") gets no `decomposes_to` edge, so it stays in the undecomposed
+/// population. Unless the verdict is recorded, the next run selects it again
+/// and spends another LLM call on the same answer, every run, forever; the
+/// weekly `oldest` crawl's head filled with exactly these (atoms per run fell
+/// 457 -> 284 -> 158 -> 13). The parent here is two sentences, so the
+/// `looks_atomic` filter does NOT skip it: only a recorded verdict can.
+///
+/// The control `c` (two atoms, decomposed) and the untouched compound `u`
+/// prove selection reads the real predicate: `c` leaves the population through
+/// its edges, and `u` is still chosen, so `s` is not "not chosen" merely
+/// because selection saw nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s_text = "The rotor arm turns freely. Its friction coefficient is about 4e-22 N m s.";
+    let s = seed_claim(&pool, agent, s_text, 300, &[]).await;
+    let c_text = compound("u040-control");
+    let c = seed_claim(&pool, agent, &c_text, 300, &[]).await;
+    let u = seed_claim(&pool, agent, &compound("u040-untouched"), 300, &[]).await;
+    assert!(
+        epigraph_cli::decompose::check_eligibility(s_text, &[], EligibilityFilters::default())
+            .is_ok(),
+        "precondition: the singleton parent passes the default filters"
+    );
+
+    let llm = FixtureLlmClient::from_json(&serde_json::json!({
+        s_text: {"atoms": [s_text], "generality": [0]},
+        c_text.clone(): {
+            "atoms": ["Claim u040-control has a first part.", "Claim u040-control also has a second part."],
+            "generality": [0, 1]
+        },
+    }))
+    .unwrap();
+    let claims = vec![
+        BatchClaim {
+            claim_id: s,
+            agent_id: agent,
+            content: s_text.to_string(),
+        },
+        BatchClaim {
+            claim_id: c,
+            agent_id: agent,
+            content: c_text.clone(),
+        },
+    ];
+    let pool_c = pool.clone();
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
+        &llm,
+        10,
+        None,
+        move |t: String, _g: i64, p: AtomParent| {
+            let pool_c = pool_c.clone();
+            async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(totals.singletons, vec![s], "the model judged `s` atomic");
+    assert_eq!(atoms_of(&pool, c).await.len(), 2, "the control decomposed");
+
+    // The next run's selection.
+    let sel = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        None,
+        EligibilityFilters::default(),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ids(&sel).contains(&u),
+        "the untouched compound is still chosen: {sel:?}"
+    );
+    assert!(
+        !ids(&sel).contains(&c),
+        "the decomposed control left the population: {sel:?}"
+    );
+    assert!(
+        !ids(&sel).contains(&s),
+        "a parent the model judged atomic was re-selected; it will cost an LLM call every run \
+         forever: {sel:?}"
     );
 }
