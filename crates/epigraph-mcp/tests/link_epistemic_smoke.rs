@@ -320,6 +320,70 @@ async fn contradicts_from_disbelieved_source_does_not_raise_target_belief(pool: 
     );
 }
 
+/// The most-inverted case on the complement law: a fully REFUTED claim
+/// (bel 0, pl 0) filed as a contradictor. The complement law restricted it to
+/// [0.9, 1.0] at f = 0.9 and wired m(TRUE) = 0.9 onto the target, so refuting
+/// a claim and filing it against another made that other claim near-certain.
+///
+/// Under mutual exclusion the refuted source transfers nothing: its restricted
+/// interval is [0, 1], which `auto_wire_ds_for_edge` short-circuits as
+/// `EdgeFactorOutcome::Vacuous`. The edge is still written, but no BBA is
+/// stored and `belief_wired` is false (the `link_epistemic` contract lists
+/// this reason).
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_from_refuted_source_writes_no_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.0, 0.0, Some(0.0)).await;
+    let target = seed_claim(&pool, "target of a refuted contradictor", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("contradicts wire succeeds"),
+    );
+    assert!(resp.was_created, "the durable edge is written either way");
+    let edge_id = Uuid::parse_str(&resp.edge_id).expect("edge_id is a uuid");
+
+    // The inversion first, so a regression names it: no target belief and no
+    // edge-factor BBA.
+    let belief = read_belief(&pool, target).await;
+    assert!(
+        belief.is_none_or(|b| b < 1e-9),
+        "a refuted contradictor (bel 0, pl 0) must put no mass on the target being TRUE; \
+         got target belief {belief:?}"
+    );
+    let betp = read_betp(&pool, target).await;
+    assert!(
+        betp.is_none_or(|p| p <= 0.5 + 1e-9),
+        "a refuted contradictor must not raise its target above neutral; got {betp:?}"
+    );
+    let bba_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edge-factor BBA rows");
+    assert_eq!(
+        bba_count, 0,
+        "a refuted contradictor restricts to the vacuous [0, 1]: no BBA may be stored"
+    );
+    assert!(
+        !resp.belief_wired,
+        "no belief moved, so belief_wired must be false (restricted mass is vacuous)"
+    );
+}
+
 // ── SourceFactorless: durable edge written even when belief is NOT wired ─────
 
 /// The common production case: the SOURCE claim has an agent but no stored

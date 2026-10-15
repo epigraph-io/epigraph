@@ -79,3 +79,14 @@ fn link_epistemic_description_states_a_negative_edge_cannot_raise_belief() {
         "the unscoped 'whole interval' claim must be gone: {d}"
     );
 }
+
+/// Under mutual exclusion a refuted or ~unbelieved contradictor restricts to
+/// the vacuous [0, 1] and writes no mass function (drain U075), so
+/// `belief_wired=false` has one more ordinary cause the contract must list
+/// (pinned end to end by `contradicts_from_refuted_source_writes_no_belief`).
+#[test]
+fn link_epistemic_description_lists_vacuous_restriction_as_a_no_wire_reason() {
+    let d = link_epistemic_description();
+    let needle = "the source's restricted mass is vacuous (e.g. a contradictor with ~no belief)";
+    assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+}
