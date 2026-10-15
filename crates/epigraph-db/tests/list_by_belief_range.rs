@@ -15,10 +15,11 @@
 //! 4. Backlog `31e7b727`: verbatim document-spine nodes (`properties.level`
 //!    0/1/2: thesis, section heading, paragraph — "Keywords:" lists, captions,
 //!    transcript turns) filled the newest-first `max_truth=0.4` page before the
-//!    assessment agent could discard them. `exclude_spine` drops them in SQL
-//!    *before* `LIMIT`, keeps atoms (level 3) and unleveled claims, is off by
-//!    default, and binds correctly for a bind-less (bypass) viewer as well as a
-//!    scoped one.
+//!    assessment agent could discard them. `exclude_spine` drops EVERY claim at
+//!    level 0-2 in SQL *before* `LIMIT` (workflow thesis/phase/step nodes
+//!    included: the predicate reads `level` alone), keeps atoms (level 3) and
+//!    unleveled claims, is off by default, and binds correctly for a bind-less
+//!    (bypass) viewer as well as a scoped one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -255,6 +256,15 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
         r#"{"level": 2, "spine_text_kind": "paragraph"}"#,
     )
     .await;
+    // A workflow step (builder / evolve_step) also sits at level 2. It is newer
+    // than the atom, so the `limit = 1` slot below pins it as excluded too.
+    let wf_step = seed_claim(&pool, agent, 0.30, "2026-09-01T12:00:00Z").await;
+    set_properties(
+        &pool,
+        wf_step,
+        r#"{"level": 2, "source_type": "workflow", "kind": "workflow_step"}"#,
+    )
+    .await;
     let atom = seed_claim(&pool, agent, 0.30, "2026-09-01T00:00:00Z").await;
     set_properties(&pool, atom, r#"{"level": 3}"#).await;
     // Thesis (level 0) and section heading (level 1) are spine too.
@@ -274,7 +284,8 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
         ids(&one),
         vec![atom],
         "exclude_spine=true with limit=1 must skip the newer level-2 paragraph \
-         ({para}) in SQL and return the older level-3 atom"
+         ({para}) and level-2 workflow step ({wf_step}) in SQL and return the \
+         older level-3 atom"
     );
 
     // ---- Default unchanged: off means the paragraph still takes the slot ----
@@ -297,8 +308,8 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
         ids(&wide),
         vec![atom, plain],
         "exclude_spine=true must drop levels 0, 1 and 2 (thesis {thesis}, section \
-         {section}, paragraph {para}) and keep the atom and the unleveled claim, \
-         newest first"
+         {section}, paragraph {para}, workflow step {wf_step}) and keep the atom \
+         and the unleveled claim, newest first"
     );
 
     // ---- Same filter through a viewer with a NON-EMPTY group set ----
@@ -332,6 +343,6 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
         ids(&wide_bypass),
         vec![atom, plain],
         "a bypass viewer sees every row, so exactly [atom, plain] also pins that no \
-         level-0/1/2 row leaks through the bind-less path"
+         spine or workflow level-0/1/2 row leaks through the bind-less path"
     );
 }

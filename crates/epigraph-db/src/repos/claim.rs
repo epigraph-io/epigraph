@@ -4270,9 +4270,15 @@ impl ClaimRepository {
     ///
     /// # `exclude_spine`
     ///
-    /// When `true`, verbatim document-spine nodes, `properties.level` 0, 1 or 2
-    /// (thesis, section heading, paragraph), are dropped in SQL *before*
-    /// `LIMIT`. Backlog `31e7b727`: the `max_truth=0.4` assessment page is
+    /// When `true`, every claim whose `properties.level` is 0, 1 or 2 is
+    /// dropped in SQL *before* `LIMIT`. The target is the verbatim document
+    /// spine (thesis, section heading, paragraph), but the predicate reads
+    /// `level` alone, so workflow thesis/phase/step nodes (the workflow
+    /// builder, the ingest executor's steps, `evolve_step` rows, which carry
+    /// no `source_type`) go too. Narrowing by `source_type` would leak the
+    /// `evolve_step` rows, so the predicate deliberately does not.
+    ///
+    /// Backlog `31e7b727`: the `max_truth=0.4` assessment page is
     /// newest-first, and "Keywords:" lists, captions, headings and transcript
     /// turns, each carrying its paragraph's low extraction confidence, filled
     /// it (64% of the newest 50 low-truth rows on prod, 2026-10-14) before the

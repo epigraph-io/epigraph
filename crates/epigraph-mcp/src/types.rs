@@ -179,10 +179,11 @@ pub struct QueryClaimsParams {
     pub is_current: Option<bool>,
 
     #[schemars(
-        description = "When true, drop verbatim document-spine nodes (thesis/section/paragraph, \
-                       properties.level 0-2) in SQL before LIMIT, so headings, keyword lists, \
-                       captions and transcript turns do not consume the page; atoms (level 3) and \
-                       unleveled claims are kept. Default false (no spine filter)."
+        description = "When true, drop EVERY claim whose properties.level is 0, 1 or 2, in SQL \
+                       before LIMIT: document thesis/section/paragraph nodes (headings, keyword \
+                       lists, captions, transcript turns) AND workflow thesis/phase/step nodes \
+                       (including evolve_step rows). Atoms (level 3) and unleveled claims are \
+                       kept. Default false (no level filter)."
     )]
     pub exclude_spine: Option<bool>,
 }

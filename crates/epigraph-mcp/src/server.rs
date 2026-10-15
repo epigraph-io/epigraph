@@ -1243,7 +1243,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. exclude_spine=true drops verbatim document-spine nodes (headings, keyword lists, captions, transcript turns: properties.level 0-2) before the limit applies, keeping atoms and unleveled claims. Returns claims with their labels and retirement state."
+        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. exclude_spine=true drops every claim whose properties.level is 0-2 before the limit applies: document thesis/section/paragraph nodes (headings, keyword lists, captions, transcript turns) and workflow thesis/phase/step nodes alike, keeping atoms (level 3) and unleveled claims. Returns claims with their labels and retirement state."
     )]
     async fn query_claims(
         &self,
