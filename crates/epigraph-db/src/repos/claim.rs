@@ -4270,6 +4270,7 @@ impl ClaimRepository {
     ///
     /// `is_current` occupies `$3`, so the viewer's group bind is `$6`, not the
     /// `$5` the pre-`a85ee585` shape used.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -4278,7 +4279,10 @@ impl ClaimRepository {
         is_current: Option<bool>,
         limit: i64,
         offset: i64,
+        exclude_spine: bool,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
+        // RED STUB: accepted, not yet applied.
+        let _ = exclude_spine;
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
         // SELECT omits them, and at runtime rather than at compile time.
