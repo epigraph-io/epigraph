@@ -1017,10 +1017,11 @@ mod db_writes {
     /// to it, so the next selection passes the parent over
     /// ([`super::Ineligible::JudgedAtomic`]). This is where a run records its
     /// verdicts — not the binary — so `--apply-plan` records them too and
-    /// `--plan` (which never persists) records none.
+    /// `--plan` (which never persists) records none. A failed append is a
+    /// failed line in [`BatchTotals::failed`], not an abort.
     ///
     /// # Errors
-    /// The ledger append failed.
+    /// None today; the `Result` is kept for callers.
     pub async fn persist_planned<F, Fut>(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
@@ -1056,9 +1057,17 @@ mod db_writes {
                         totals.singletons.push(plan.claim_id);
                         // The verdict is on the text the model judged, which
                         // is the plan's `content` (verified equal to the live
-                        // parent before an apply).
+                        // parent before an apply). A failed append fails this
+                        // LINE, like a failed submit: the parent stays
+                        // undecomposed and unrecorded, a re-run records it,
+                        // and the rest of the plan is still applied.
                         if let Some(l) = ledger.as_deref_mut() {
-                            l.record(plan.claim_id, &plan.content, &plan.model)?;
+                            if let Err(e) = l.record(plan.claim_id, &plan.content, &plan.model) {
+                                totals.failed.push((
+                                    plan.claim_id,
+                                    format!("judged atomic, but not recorded: {e}"),
+                                ));
+                            }
                         }
                     }
                 }

@@ -935,3 +935,73 @@ async fn apply_plan_records_singletons_and_an_edited_parent_requalifies(pool: Pg
     );
     std::fs::remove_file(&ledger_path).ok();
 }
+
+/// A ledger append that fails (the disk filled, the file was moved away) is
+/// a failed LINE, like a failed atom submit: the rest of a reviewed plan is
+/// still applied and the summary still names it. Aborting would strand every
+/// later line and print no `FAILED` / summary lines for the ones already
+/// persisted. The failed parent stays undecomposed and unrecorded, so a
+/// re-run of the plan records it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_ledger_append_failure_fails_its_line_and_the_plan_goes_on(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s_text = "The idler gear is stiff. Its backlash is below one picometre.";
+    let s = seed_claim(&pool, agent, s_text, 300, &[]).await;
+    let c_text = compound("u040-after-ledger-failure");
+    let c = seed_claim(&pool, agent, &c_text, 300, &[]).await;
+    let llm = FixtureLlmClient::from_json(&serde_json::json!({
+        s_text: {"atoms": [s_text], "generality": [0]},
+        c_text.clone(): {
+            "atoms": ["Claim u040-after-ledger-failure has a first part.",
+                      "Claim u040-after-ledger-failure also has a second part."],
+            "generality": [0, 1]
+        },
+    }))
+    .unwrap();
+    let claims = vec![
+        BatchClaim {
+            claim_id: s,
+            agent_id: agent,
+            content: s_text.to_string(),
+        },
+        BatchClaim {
+            claim_id: c,
+            agent_id: agent,
+            content: c_text.clone(),
+        },
+    ];
+    let plans = plan_decomposition_batches(&claims, &llm, 10).await;
+    let (ok, _) = verify_plan(&pool, &viewer, plans).await.unwrap();
+    assert_eq!(ok.len(), 2);
+    assert_eq!(ok[0].claim_id, s, "the singleton line comes first");
+
+    let ledger_path = std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", Uuid::new_v4()));
+    let mut ledger = SingletonLedger::open_for_append(&ledger_path).unwrap();
+    // `record` reopens the file without creating it: the append now fails.
+    std::fs::remove_file(&ledger_path).unwrap();
+    let pool_c = pool.clone();
+    let submit = move |t: String, _g: i64, p: AtomParent| {
+        let pool_c = pool_c.clone();
+        async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
+    };
+    let totals = persist_planned(&pool, &viewer, &ok, None, Some(&mut ledger), &submit)
+        .await
+        .expect("a ledger append failure must not abort the whole plan");
+    assert_eq!(totals.failed.len(), 1, "{:?}", totals.failed);
+    assert_eq!(totals.failed[0].0, s);
+    assert!(
+        totals.failed[0].1.contains("singleton ledger"),
+        "the reason names the ledger: {:?}",
+        totals.failed
+    );
+    assert_eq!(
+        atoms_of(&pool, c).await.len(),
+        2,
+        "the line after the failed append was still applied"
+    );
+    assert!(
+        !ledger.contains(s, s_text),
+        "an unwritten verdict is not held"
+    );
+}
