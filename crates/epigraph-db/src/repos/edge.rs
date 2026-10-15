@@ -30,9 +30,11 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 /// transmit the source's belief AGAINST the target.
 ///
 /// Every other member of that list transmits it toward the target; these two
-/// are the only ones that argue against it. (Polarity is not a guarantee of
-/// direction: a positive edge also carries the source's disbelief and
-/// open-world mass, so it can lower the target's belief.) The distinction is not cosmetic — it decides what
+/// are the only ones that argue against it. (For a positive edge polarity is
+/// not a guarantee of direction: it also carries the source's disbelief and
+/// open-world mass, so it can lower the target's belief. These two are mutual
+/// exclusion: only the source's belief transfers, as disbelief in the target,
+/// so they never put mass on the target being true; drain U075.) The distinction is not cosmetic — it decides what
 /// may be re-pointed when a claim is replaced. A `refutes`/`contradicts` edge
 /// is an assertion about a *specific pair of contents* ("this text refutes
 /// THAT text"), so re-pointing either endpoint at a different text silently

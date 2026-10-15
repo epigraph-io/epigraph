@@ -72,6 +72,16 @@ async fn read_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
         .expect("read pignistic_prob")
 }
 
+/// Read the target's cached `belief` (Bel of TRUE) from the same recompute
+/// output as [`read_betp`]. `None` while the column is still NULL.
+async fn read_belief(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT belief FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read belief")
+}
+
 async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM edges \
@@ -246,6 +256,131 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
     assert!(
         betp < 0.5,
         "contradicts edge must lower the target's pignistic_prob below the 0.5 neutral point, got {betp}"
+    );
+}
+
+/// The direction the guard above leaves open: a contradictor that is itself
+/// DISBELIEVED (bel 0.05, pl 0.20). `contradicts` means mutual exclusion (the
+/// two cannot both be true; migration 001 labels it `'mutual_exclusion'`), so
+/// only the source's belief may transfer, as disbelief in the target. The
+/// source's disbelief says nothing about the target and must not become
+/// support for it.
+///
+/// Under the old complement law (`restrict_epistemic_negative` as a polarity
+/// flip) this edge wrote a BBA with m(TRUE) = (1 - 0.20) * 0.90 = 0.72 onto the
+/// target, so filing a weak or refuted claim as a contradictor made its target
+/// MORE believed (backlog I014, drain U075).
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_from_disbelieved_source_does_not_raise_target_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.05, 0.20, Some(0.125)).await;
+    let target = seed_claim(&pool, "target of a weak contradictor", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("contradicts wire succeeds"),
+    );
+
+    // The restricted interval is not vacuous under either law (width 0.235
+    // under the complement, 0.955 under mutual exclusion; the cutoff is
+    // 0.999), so a BBA really is written: this cannot pass by not wiring.
+    assert!(resp.was_created);
+    assert!(
+        resp.belief_wired,
+        "contradicts from a source with bel 0.05 must still wire belief"
+    );
+
+    let belief = read_belief(&pool, target)
+        .await
+        .expect("target must have a computed belief after the contradicts wire");
+    assert!(
+        belief < 1e-9,
+        "a contradicts edge from a disbelieved source (bel 0.05, pl 0.20) must put no mass on the \
+         target being TRUE; got target belief {belief}"
+    );
+    let betp = read_betp(&pool, target)
+        .await
+        .expect("target must have a computed pignistic_prob after the contradicts wire");
+    assert!(
+        betp <= 0.5 + 1e-9,
+        "a contradicts edge from a disbelieved source (bel 0.05, pl 0.20) must not raise its \
+         target above neutral; got {betp}"
+    );
+}
+
+/// The most-inverted case on the complement law: a fully REFUTED claim
+/// (bel 0, pl 0) filed as a contradictor. The complement law restricted it to
+/// [0.9, 1.0] at f = 0.9 and wired m(TRUE) = 0.9 onto the target, so refuting
+/// a claim and filing it against another made that other claim near-certain.
+///
+/// Under mutual exclusion the refuted source transfers nothing: its restricted
+/// interval is [0, 1], which `auto_wire_ds_for_edge` short-circuits as
+/// `EdgeFactorOutcome::Vacuous`. The edge is still written, but no BBA is
+/// stored and `belief_wired` is false (the `link_epistemic` contract lists
+/// this reason).
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_from_refuted_source_writes_no_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.0, 0.0, Some(0.0)).await;
+    let target = seed_claim(&pool, "target of a refuted contradictor", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("contradicts wire succeeds"),
+    );
+    assert!(resp.was_created, "the durable edge is written either way");
+    let edge_id = Uuid::parse_str(&resp.edge_id).expect("edge_id is a uuid");
+
+    // The inversion first, so a regression names it: no target belief and no
+    // edge-factor BBA.
+    let belief = read_belief(&pool, target).await;
+    assert!(
+        belief.is_none_or(|b| b < 1e-9),
+        "a refuted contradictor (bel 0, pl 0) must put no mass on the target being TRUE; \
+         got target belief {belief:?}"
+    );
+    let betp = read_betp(&pool, target).await;
+    assert!(
+        betp.is_none_or(|p| p <= 0.5 + 1e-9),
+        "a refuted contradictor must not raise its target above neutral; got {betp:?}"
+    );
+    let bba_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edge-factor BBA rows");
+    assert_eq!(
+        bba_count, 0,
+        "a refuted contradictor restricts to the vacuous [0, 1]: no BBA may be stored"
+    );
+    assert!(
+        !resp.belief_wired,
+        "no belief moved, so belief_wired must be false (restricted mass is vacuous)"
     );
 }
 

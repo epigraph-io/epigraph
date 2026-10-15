@@ -48,10 +48,10 @@ pub struct CdstSheafSection {
     pub local_betp: f64,
     /// BetP of `expected_interval` (all-neighbour average; display only).
     pub expected_betp: f64,
-    /// Node inconsistency: the max of the Positive-group Bel-floor shortfall
-    /// and the Negative/FrameEvidence-group `|local_betp − expected_betp|`.
-    /// Equals `|local_betp − expected_betp|` only for a node with no Positive
-    /// neighbour. See [`compute_cdst_section`].
+    /// Node inconsistency: the max of the Positive-group Bel-floor shortfall,
+    /// the Negative-group BetP-ceiling excess and the FrameEvidence-group
+    /// `|local_betp − expected_betp|`. Equals `|local_betp − expected_betp|`
+    /// only for a FrameEvidence-only node. See [`compute_cdst_section`].
     pub consistency_radius: f64,
 
     // Interval fields
@@ -59,8 +59,9 @@ pub struct CdstSheafSection {
     /// All-neighbour average of the restricted neighbour intervals.
     pub expected_interval: EpistemicInterval,
 
-    /// The max of the Positive-group Bel-floor shortfall and the Hausdorff
-    /// distance to the Negative/FrameEvidence group's expected interval.
+    /// The max of the Positive-group Bel-floor shortfall, the Negative-group
+    /// Bel-ceiling excess and the Hausdorff distance to the FrameEvidence
+    /// group's expected interval.
     pub interval_inconsistency: f64,
 
     // Open-world decomposition
@@ -241,7 +242,7 @@ pub fn compute_cdst_expected(
 
 /// Build a CDST sheaf section for a single node.
 ///
-/// The neighbours are scored in two groups:
+/// The neighbours are scored in three groups:
 /// - **Positive** (`supports`-like) neighbours are a one-sided Bel FLOOR, the
 ///   node twin of the Positive arm of
 ///   [`compute_cdst_edge_inconsistency_with_properties`]: each supporter
@@ -251,17 +252,37 @@ pub fn compute_cdst_expected(
 ///   supporter's discounted floor) is benign and scores 0. With this, a
 ///   Positive-only node's radius equals its worst incoming supports-edge
 ///   shortfall.
-/// - **Other** (Negative / FrameEvidence) neighbours keep the symmetric
-///   metric over their own average: Hausdorff distance for
-///   `interval_inconsistency` and `|local_betp − expected_betp|` for
-///   `consistency_radius`. A node with only such neighbours is scored exactly
-///   as before.
+/// - **Negative** (`contradicts` / `refutes`) neighbours are a one-sided
+///   CEILING (mutual exclusion, U075), scored on each field's own side:
+///   - `interval_inconsistency` uses the Bel ceiling, the node twin of the
+///     Negative arm of [`compute_cdst_edge_inconsistency_with_properties`]:
+///     each contradicter caps the node at
+///     `restrict_epistemic_negative(n, f).pl = 1 − n.bel·f`, the binding
+///     ceiling is the MIN over contradicters, and only the node's bel above
+///     it counts. A Negative-only node's `interval_inconsistency` equals its
+///     worst contradicts-edge excess.
+///   - `consistency_radius` uses the BetP ceiling `min(1 − n.betp·f)` and
+///     scores `(local_betp − ceiling)+`, the same term as the scalar twin
+///     `sheaf::compute_section` (the 2026-10-14 U075 ruling: the radius gets
+///     "its own one-sided term on the BetP side"). A wide node whose bel is
+///     under the Bel ceiling can still have its BetP above the BetP ceiling.
+///     (The Positive radius is a Bel floor, #578/#581; the asymmetry is the
+///     ruling's.)
+///
+///   A disbelieved contradicter (low `n.bel`, low `n.betp`) imposes almost no
+///   ceiling on either side, so a believed node is not flagged by it, and two
+///   disbelieved claims are consistent.
+/// - **FrameEvidence** neighbours keep the symmetric metric over their own
+///   average: Hausdorff distance for `interval_inconsistency` and
+///   `|local_betp − expected_betp|` for `consistency_radius`. A node with only
+///   such neighbours is scored exactly as before.
 ///
 /// `consistency_radius` and `interval_inconsistency` are each the max of the
-/// two groups' terms (0 for an empty group). `expected_interval` /
-/// `expected_betp` stay the all-neighbour average for display, so the radius
-/// is no longer `|local_betp − expected_betp|` when Positive neighbours are
-/// present.
+/// three groups' terms (0 for an empty group); the Positive term is Bel-based
+/// and enters both fields, the Negative term is Bel-based for
+/// `interval_inconsistency` and BetP-based for `consistency_radius`. `expected_interval` / `expected_betp`
+/// stay the all-neighbour average for display, so the radius is
+/// `|local_betp − expected_betp|` only for a FrameEvidence-only node.
 pub fn compute_cdst_section(
     node_id: Uuid,
     local_interval: EpistemicInterval,
@@ -285,23 +306,47 @@ pub fn compute_cdst_section(
         .reduce(f64::max)
         .map_or(0.0, |floor| (floor - local_interval.bel).max(0.0));
 
-    // Other group (Negative / FrameEvidence): the symmetric metric over the
-    // group's own average. Order-preserving filter, so a node with no
-    // Positive neighbour gets bit-for-bit the pre-split values.
-    let others: Vec<(EpistemicInterval, RestrictionKind)> = neighbors
+    // Negative group: min ceiling over contradicters, one-sided excess. The
+    // Bel ceiling scores interval_inconsistency; the BetP ceiling (the scalar
+    // twin's term) scores consistency_radius.
+    let negative_ceilings = neighbors
         .iter()
-        .filter(|(_, k)| !matches!(k, RestrictionKind::Positive(_)))
+        .filter_map(|(interval, kind)| match kind {
+            RestrictionKind::Negative(factor) => Some((
+                restrict_epistemic_negative(interval, *factor).pl,
+                interval.betp().mul_add(-factor, 1.0),
+            )),
+            _ => None,
+        })
+        .reduce(|(a_bel, a_betp), (b_bel, b_betp)| (a_bel.min(b_bel), a_betp.min(b_betp)));
+    let (negative_bel_excess, negative_betp_excess) =
+        negative_ceilings.map_or((0.0, 0.0), |(bel_ceiling, betp_ceiling)| {
+            (
+                (local_interval.bel - bel_ceiling).max(0.0),
+                (local_betp - betp_ceiling).max(0.0),
+            )
+        });
+
+    // FrameEvidence group: the symmetric metric over the group's own average.
+    // Order-preserving filter, so a node whose only neighbours are
+    // FrameEvidence (and Neutral) gets bit-for-bit the pre-split values.
+    let frame_evidence: Vec<(EpistemicInterval, RestrictionKind)> = neighbors
+        .iter()
+        .filter(|(_, k)| matches!(k, RestrictionKind::FrameEvidence(_)))
         .copied()
         .collect();
-    let (other_hausdorff, other_radius) = compute_cdst_expected(&others).map_or((0.0, 0.0), |e| {
-        (
-            local_interval.hausdorff_distance(&e),
-            (local_betp - e.betp()).abs(),
-        )
-    });
+    let (fe_hausdorff, fe_radius) =
+        compute_cdst_expected(&frame_evidence).map_or((0.0, 0.0), |e| {
+            (
+                local_interval.hausdorff_distance(&e),
+                (local_betp - e.betp()).abs(),
+            )
+        });
 
-    let interval_inconsistency = positive_shortfall.max(other_hausdorff);
-    let consistency_radius = positive_shortfall.max(other_radius);
+    let interval_inconsistency = positive_shortfall
+        .max(negative_bel_excess)
+        .max(fe_hausdorff);
+    let consistency_radius = positive_shortfall.max(negative_betp_excess).max(fe_radius);
 
     let neighbor_count = neighbors
         .iter()
@@ -347,7 +392,8 @@ pub struct NeighborRow {
 ///
 /// `corroborates` is NOT here: it is symmetric (idempotent on the unordered
 /// pair), so both sides keep it. Negative kinds and `frame_validates` keep
-/// both sides too (the Negative metric is unchanged; U080). `informs` and
+/// both sides too: mutual exclusion is symmetric, so each end of a
+/// `contradicts` edge is capped by the other (U075; U080). `informs` and
 /// `supersedes` are left out because the neighbourhood query
 /// (`SheafRepository::get_claim_neighbor_betp_pairs`) never returns them;
 /// adding them is a separate change.
@@ -401,15 +447,21 @@ pub fn build_cdst_sections(
 ///
 /// The expected interval is computed by applying the restriction map for
 /// `relationship` to `source_interval`.  The obstruction components are:
-/// - `interval_inconsistency` / `conflict_component`: for `contradicts` / frame-
-///   evidence / neutral, the symmetric Bel/Pl distance (Hausdorff); for
-///   `supports` (Positive), the directional floor *shortfall*
+/// - `interval_inconsistency` / `conflict_component`: for frame-evidence /
+///   neutral, the symmetric Bel/Pl distance (Hausdorff); for `contradicts` /
+///   `refutes` (Negative, mutual exclusion), the directional ceiling *excess*
+///   `max(0, target.bel − expected.pl)` with `expected.pl = 1 − source.bel·f`
+///   (two disbelieved claims are consistent); for `supports` (Positive), the
+///   directional floor *shortfall*
 ///   `max(0, expected.bel − target.bel)` — only the target's bel sitting below
 ///   the corroborated `expected` bel floor counts (plausibility is neither a
 ///   floor nor a ceiling), so over-support is benign corroboration and
 ///   contributes 0 to both fields and to H¹.
 /// - `open_world_component`: |source_ow − expected_ow|
-/// - `ignorance_component`: |width_target − width_expected|
+/// - `ignorance_component`: |width_target − width_expected|; for `contradicts`
+///   / `refutes` (a ceiling, not an estimate) the target's plausibility above
+///   the ceiling, `max(0, target.pl − expected.pl)`, and 0 once its bel
+///   breaches the ceiling (that breach is a belief conflict)
 pub fn compute_cdst_edge_inconsistency(
     source_id: Uuid,
     target_id: Uuid,
@@ -476,8 +528,17 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
     // over-support obstruction listed under `interval_inconsistency` so H¹ never
     // dropped and the nightly conflict-resolution scan re-observed it forever.
     //
-    // contradicts / frame-evidence / neutral are NOT one-sided floors, so they
-    // keep the symmetric Bel/Pl distance: `interval_inconsistency` stays the
+    // A `contradicts` / `refutes` edge is the dual: mutual exclusion ("not
+    // both true", `restrict_epistemic_negative`) gives the target a one-sided
+    // CEILING `expected.pl = 1 − source.bel·f` and no floor (`expected.bel` is
+    // always 0). Only the target's bel sitting ABOVE the ceiling is a genuine
+    // conflict; two disbelieved claims linked by contradicts are consistent.
+    // A symmetric distance against `[0, ceiling]` would instead flag every
+    // believed target of every weak contradictor. Both twin fields are the
+    // excess, as for the Positive floor.
+    //
+    // frame-evidence / neutral are neither floors nor ceilings, so they keep
+    // the symmetric Bel/Pl distance: `interval_inconsistency` stays the
     // Hausdorff distance and `conflict_component` its (equal) symmetric form.
     let (interval_inconsistency, conflict_component) = match kind {
         RestrictionKind::Positive(_) => {
@@ -485,6 +546,12 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
             // inconsistency; over-support contributes 0.
             let below = (expected_interval.bel - target_interval.bel).max(0.0);
             (below, below)
+        }
+        RestrictionKind::Negative(_) => {
+            // Bel-over-ceiling excess: only belief ABOVE the contradictor-
+            // permitted ceiling is inconsistency.
+            let over = (target_interval.bel - expected_interval.pl).max(0.0);
+            (over, over)
         }
         _ => {
             let hausdorff = target_interval.hausdorff_distance(&expected_interval);
@@ -500,8 +567,26 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
     // Open-world component: divergence in open-world mass
     let open_world_component = (target_interval.open_world - expected_interval.open_world).abs();
 
-    // Ignorance component: width mismatch (closed-world ignorance)
-    let ignorance_component = (target_interval.width() - expected_interval.width()).abs();
+    // Ignorance component: width mismatch (closed-world ignorance) — except
+    // for the Negative ceiling. Mutual exclusion's expected interval
+    // `[0, 1 − source.bel·f]` is a constraint, not an estimate whose width is
+    // anyone's ignorance: a width mismatch against it would charge ~0.85 to
+    // every believed target of a weak contradicter and outrank genuine
+    // ceiling breaches (relabelling them IgnoranceDrift). For a contradicts
+    // edge the ignorance is the part of the target's plausibility that
+    // reaches above the ceiling while its bel stays under it (the pair's
+    // consistency then turns on resolving the target's ignorance); once the
+    // bel breaches the ceiling the breach is a belief conflict, not ignorance.
+    let ignorance_component = match kind {
+        RestrictionKind::Negative(_) => {
+            if target_interval.bel > expected_interval.pl {
+                0.0
+            } else {
+                (target_interval.pl - expected_interval.pl).max(0.0)
+            }
+        }
+        _ => (target_interval.width() - expected_interval.width()).abs(),
+    };
 
     // Use default frame_closure_width_max = 0.2
     let obstruction_kind = classify_obstruction(
@@ -798,41 +883,43 @@ mod tests {
     }
 
     #[test]
-    fn test_cdst_section_negative_only_unchanged() {
-        // U080 / I143 guard: Negative-only nodes keep the symmetric metric
-        // bit-for-bit. Local [0.80, 0.95], contradicter [0.80, 0.95], f = 0.9:
-        // restricted = [(1-0.95)*0.9, 1-0.8*0.9] = [0.045, 0.28], BetP 0.1625;
-        // local BetP 0.875 -> radius 0.7125;
-        // Hausdorff = max(|0.80-0.045|, |0.95-0.28|) = 0.755.
+    fn test_cdst_section_negative_only_scores_over_ceiling() {
+        // U080 / I143 node, re-pinned by U075: a Negative-only node is scored
+        // on the mutual-exclusion CEILING, not a symmetric distance. Two
+        // believed claims that contradict each other still flag.
+        // Local [0.80, 0.95], contradicter [0.80, 0.95], f = 0.9:
+        // - interval_inconsistency, Bel side: ceiling 1 - 0.80*0.9 = 0.28,
+        //   excess 0.80 - 0.28 = 0.52;
+        // - consistency_radius, BetP side: ceiling 1 - 0.875*0.9 = 0.2125,
+        //   excess 0.875 - 0.2125 = 0.6625.
+        // (The complement law's symmetric metric gave radius 0.7125 and
+        // Hausdorff 0.755.)
         let local = EpistemicInterval::new(0.80, 0.95, 0.0);
         let neighbors = vec![(
             EpistemicInterval::new(0.80, 0.95, 0.0),
             RestrictionKind::Negative(0.9),
         )];
         let s = compute_cdst_section(Uuid::new_v4(), local, &neighbors);
-        let expected = compute_cdst_expected(&neighbors).unwrap();
-        assert_eq!(
-            s.consistency_radius.to_bits(),
-            (local.betp() - expected.betp()).abs().to_bits(),
-            "Negative-only radius must stay |local_betp - expected_betp|"
+        assert!(
+            (s.consistency_radius - 0.6625).abs() < 1e-9,
+            "got {}",
+            s.consistency_radius
         );
-        assert_eq!(
-            s.interval_inconsistency.to_bits(),
-            local.hausdorff_distance(&expected).to_bits(),
-            "Negative-only interval_inconsistency must stay the Hausdorff distance"
+        assert!(
+            (s.interval_inconsistency - 0.52).abs() < 1e-9,
+            "got {}",
+            s.interval_inconsistency
         );
-        assert!((s.consistency_radius - 0.7125).abs() < 1e-9);
-        assert!((s.interval_inconsistency - 0.755).abs() < 1e-9);
     }
 
     #[test]
-    fn test_cdst_section_mixed_takes_max_of_floor_and_negative_distance() {
+    fn test_cdst_section_mixed_disbelieved_contradicter_leaves_floor_shortfall() {
         // Local [0.50, 0.60]; supporter [0.9, 0.9] Positive(0.8) -> shortfall
-        // 0.22; contradicter [0.1, 0.1] Negative(0.9) -> restricted
-        // [0.81, 0.91], BetP 0.86, symmetric distance |0.55 - 0.86| = 0.31,
-        // Hausdorff max(0.31, 0.31) = 0.31. The supporter does NOT enter the
-        // Negative group's average, so radius = max(0.22, 0.31) = 0.31.
-        // (The old all-neighbour average gave |0.55 - 0.84| = 0.29.)
+        // 0.22; contradicter [0.1, 0.1] Negative(0.9) -> ceiling
+        // 1 - 0.1*0.9 = 0.91, and 0.50 is under it -> 0. So both fields are
+        // max(0.22, 0) = 0.22. (Under the complement law the disbelieved
+        // contradicter restricted to [0.81, 0.91] and its symmetric distance
+        // 0.31 dominated.)
         let local = EpistemicInterval::new(0.50, 0.60, 0.0);
         let s = compute_cdst_section(
             Uuid::new_v4(),
@@ -849,13 +936,18 @@ mod tests {
             ],
         );
         assert!(
-            (s.consistency_radius - 0.31).abs() < 1e-9,
-            "mixed node radius should be max(0.22, 0.31) = 0.31, got {}",
+            (s.consistency_radius - 0.22).abs() < 1e-9,
+            "mixed node radius should be max(0.22, 0) = 0.22, got {}",
             s.consistency_radius
         );
-        assert!((s.interval_inconsistency - 0.31).abs() < 1e-9);
-        // expected_betp stays the all-neighbour average for display.
-        assert!((s.expected_betp - 0.84).abs() < 1e-9);
+        assert!((s.interval_inconsistency - 0.22).abs() < 1e-9);
+        // expected_betp stays the all-neighbour average for display:
+        // restricted [0.72, 0.92] and [0, 0.91] -> [0.36, 0.915], BetP 0.6375.
+        assert!(
+            (s.expected_betp - 0.6375).abs() < 1e-9,
+            "got {}",
+            s.expected_betp
+        );
     }
 
     #[test]
@@ -864,10 +956,9 @@ mod tests {
         // must not hide its floor shortfall behind a small Negative distance.
         // Local [0.10, 0.20], BetP 0.15.
         // Supporter [0.9, 0.9] Positive(0.8): floor 0.72 -> shortfall 0.62.
-        // Contradicter [0.9, 0.9] Negative(0.9): restricted
-        // [(1-0.9)*0.9, 1-0.9*0.9] = [0.09, 0.19], BetP 0.14 -> distance
-        // 0.01, Hausdorff max(0.01, 0.01) = 0.01.
-        // max(0.62, 0.01) = 0.62. (The old all-neighbour average
+        // Contradicter [0.9, 0.9] Negative(0.9): ceiling 1 - 0.9*0.9 = 0.19,
+        // and 0.10 is under it -> 0.
+        // max(0.62, 0) = 0.62. (The old all-neighbour average
         // [0.405, 0.555], BetP 0.48, gave |0.15 - 0.48| = 0.33.)
         let local = EpistemicInterval::new(0.10, 0.20, 0.0);
         let s = compute_cdst_section(
@@ -886,12 +977,12 @@ mod tests {
         );
         assert!(
             (s.consistency_radius - 0.62).abs() < 1e-9,
-            "mixed node radius should be max(0.62, 0.01) = 0.62, got {}",
+            "mixed node radius should be max(0.62, 0) = 0.62, got {}",
             s.consistency_radius
         );
         assert!(
             (s.interval_inconsistency - 0.62).abs() < 1e-9,
-            "mixed node interval_inconsistency should be max(0.62, 0.01) = 0.62, got {}",
+            "mixed node interval_inconsistency should be max(0.62, 0) = 0.62, got {}",
             s.interval_inconsistency
         );
     }
@@ -966,6 +1057,197 @@ mod tests {
             "got {}",
             s.interval_inconsistency
         );
+        assert_eq!(s.neighbor_count, 2);
+    }
+
+    // ── Negative ceiling (mutual exclusion, U075) ─────────────────────────
+
+    #[test]
+    fn test_cdst_section_disbelieved_pair_is_consistent() {
+        // Both claims disbelieved and linked by contradicts: "not both true"
+        // holds, so there is nothing to flag. Local [0.20, 0.40]; contradicter
+        // [0.05, 0.20] at f = 0.9 caps the node at pl = 1 − 0.05·0.9 = 0.955,
+        // and 0.20 ≤ 0.955. (The complement law expected [0.72, 0.955]:
+        // Hausdorff 0.555, radius |0.30 − 0.8375| = 0.5375.)
+        let local = EpistemicInterval::new(0.20, 0.40, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[(
+                EpistemicInterval::new(0.05, 0.20, 0.0),
+                RestrictionKind::Negative(0.9),
+            )],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "disbelieved pair interval_inconsistency must be 0, got {}",
+            s.interval_inconsistency
+        );
+        assert!(
+            s.consistency_radius < 1e-9,
+            "disbelieved pair consistency_radius must be 0, got {}",
+            s.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_weak_contradicter_does_not_flag_believed_node() {
+        // A believed node [0.80, 0.90] under a weak contradicter [0.05, 0.20]
+        // at f = 0.9: ceiling 0.955, 0.80 ≤ 0.955, so 0 on BOTH fields. A
+        // symmetric metric over the mutual-exclusion expectation [0, 0.955]
+        // would give 0.80 here (every believed target of every weak
+        // contradicter flagged); the complement law gave Hausdorff 0.08.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[(
+                EpistemicInterval::new(0.05, 0.20, 0.0),
+                RestrictionKind::Negative(0.9),
+            )],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "interval_inconsistency must be 0, got {}",
+            s.interval_inconsistency
+        );
+        assert!(
+            s.consistency_radius < 1e-9,
+            "consistency_radius must be 0, got {}",
+            s.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_negative_matches_worst_edge_and_scalar_twin() {
+        // Node and edge must agree, the dual of
+        // test_cdst_section_positive_radius_equals_worst_supports_edge: for a
+        // Negative-only node `interval_inconsistency` is its worst
+        // contradicts-edge Bel excess over the ceiling, as scored by the
+        // independent edge path, and `consistency_radius` is the BetP-side
+        // excess, as scored by the independent scalar twin
+        // `sheaf::compute_section` on the same BetPs.
+        let node = EpistemicInterval::new(0.60, 0.80, 0.0);
+        let contradicters = [
+            EpistemicInterval::new(0.30, 0.50, 0.0),
+            EpistemicInterval::new(0.55, 0.70, 0.0),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+        ];
+        let node_id = Uuid::new_v4();
+        let neighbors: Vec<_> = contradicters
+            .iter()
+            .map(|c| (*c, RestrictionKind::Negative(sci().contradicts)))
+            .collect();
+        let section = compute_cdst_section(node_id, node, &neighbors);
+        let worst_edge = contradicters
+            .iter()
+            .map(|c| {
+                compute_cdst_edge_inconsistency(
+                    Uuid::new_v4(),
+                    node_id,
+                    *c,
+                    node,
+                    "contradicts",
+                    &sci(),
+                )
+                .interval_inconsistency
+            })
+            .fold(0.0f64, f64::max);
+        // Binding Bel ceiling: 1 − 0.55·0.9 = 0.505, so 0.60 − 0.505 = 0.095.
+        assert!(
+            (worst_edge - 0.095).abs() < 1e-9,
+            "edge path gave {worst_edge}"
+        );
+        assert!(
+            (section.interval_inconsistency - worst_edge).abs() < 1e-12,
+            "node interval_inconsistency {} must equal the worst contradicts-edge excess {}",
+            section.interval_inconsistency,
+            worst_edge
+        );
+        // Binding BetP ceiling: 1 − 0.625·0.9 = 0.4375, so 0.70 − 0.4375 =
+        // 0.2625.
+        let scalar_neighbors: Vec<_> = contradicters
+            .iter()
+            .map(|c| (c.betp(), RestrictionKind::Negative(sci().contradicts)))
+            .collect();
+        let scalar = crate::sheaf::compute_section(
+            node_id,
+            node.betp(),
+            node.bel,
+            node.pl,
+            &scalar_neighbors,
+        );
+        assert!(
+            (scalar.consistency_radius - 0.2625).abs() < 1e-9,
+            "scalar twin gave {}",
+            scalar.consistency_radius
+        );
+        assert!(
+            (section.consistency_radius - scalar.consistency_radius).abs() < 1e-12,
+            "node radius {} must equal the scalar twin's BetP-ceiling excess {}",
+            section.consistency_radius,
+            scalar.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_negative_radius_flags_wide_node_on_betp_ceiling() {
+        // The radius is a BetP-side quantity (U075 ruling: "its own one-sided
+        // term on the BetP side"), so a WIDE node whose bel is under the Bel
+        // ceiling but whose BetP is above the BetP ceiling is flagged on the
+        // radius only. Node [0.20, 0.90] (BetP 0.55), contradicter
+        // [0.60, 0.70] (BetP 0.65) at f = 0.9:
+        // - Bel side: ceiling 1 − 0.60·0.9 = 0.46, bel 0.20 under it -> 0;
+        // - BetP side: ceiling 1 − 0.65·0.9 = 0.415, BetP 0.55 -> 0.135.
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.20, 0.90, 0.0),
+            &[(
+                EpistemicInterval::new(0.60, 0.70, 0.0),
+                RestrictionKind::Negative(0.9),
+            )],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "interval_inconsistency must be 0 (bel under the Bel ceiling), got {}",
+            s.interval_inconsistency
+        );
+        assert!(
+            (s.consistency_radius - 0.135).abs() < 1e-9,
+            "consistency_radius must be the BetP-ceiling excess 0.135, got {}",
+            s.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_cdst_section_negative_and_frame_evidence_scored_separately() {
+        // Negative neighbours are a ceiling, FrameEvidence ones keep the
+        // symmetric metric over their OWN average: the two must not be
+        // averaged together. Local [0.80, 0.90]; FE neighbour [0.80, 0.90]
+        // (distance 0) and a weak contradicter [0.05, 0.20] at f = 0.9
+        // (ceiling 0.955, not binding). Expected 0 on both fields; averaging
+        // the FE and Negative restrictions ([0.40, 0.9275]) would give 0.40.
+        let local = EpistemicInterval::new(0.80, 0.90, 0.0);
+        let s = compute_cdst_section(
+            Uuid::new_v4(),
+            local,
+            &[
+                (
+                    EpistemicInterval::new(0.80, 0.90, 0.0),
+                    RestrictionKind::FrameEvidence(0.8),
+                ),
+                (
+                    EpistemicInterval::new(0.05, 0.20, 0.0),
+                    RestrictionKind::Negative(0.9),
+                ),
+            ],
+        );
+        assert!(
+            s.interval_inconsistency < 1e-9,
+            "got {}",
+            s.interval_inconsistency
+        );
+        assert!(s.consistency_radius < 1e-9, "got {}", s.consistency_radius);
         assert_eq!(s.neighbor_count, 2);
     }
 
@@ -1090,21 +1372,31 @@ mod tests {
         );
         assert_eq!(section_of(&sections, b).neighbor_count, 1);
 
-        // Negative kinds are kept on the source side too (unchanged, U080).
-        // [0.80, 0.95] vs [0.80, 0.95], local BetP 0.875:
-        // - contradicts f = 0.9: restricted [0.045, 0.28], BetP 0.1625 -> 0.7125.
-        // - refutes f = 0.8 (Q2: treated symmetric): restricted
-        //   [(1-0.95)*0.8, 1-0.80*0.8] = [0.04, 0.36], BetP 0.20 -> 0.675.
+        // Negative kinds are kept on the source side too (U080): mutual
+        // exclusion caps each end by the other (U075). [0.80, 0.95] vs
+        // [0.80, 0.95], local bel 0.80:
+        // - contradicts f = 0.9: Bel ceiling 1 - 0.80*0.9 = 0.28 -> 0.52;
+        //   BetP ceiling 1 - 0.875*0.9 = 0.2125 -> radius 0.6625.
+        // - refutes f = 0.8 (Q2: treated symmetric): Bel ceiling
+        //   1 - 0.80*0.8 = 0.36 -> 0.44; BetP ceiling 1 - 0.875*0.8 = 0.30
+        //   -> radius 0.575.
         let iv = EpistemicInterval::new(0.80, 0.95, 0.0);
-        for (rel, want) in [("contradicts", 0.7125), ("refutes", 0.675)] {
+        for (rel, want_interval, want_radius) in
+            [("contradicts", 0.52, 0.6625), ("refutes", 0.44, 0.575)]
+        {
             let (e, f) = (Uuid::new_v4(), Uuid::new_v4());
             let sections = build_cdst_sections(&edge_rows((e, iv), (f, iv), rel), &sci());
             for id in [e, f] {
                 let s = section_of(&sections, id);
                 assert_eq!(s.neighbor_count, 1, "{rel}: both sides must be kept");
                 assert!(
-                    (s.consistency_radius - want).abs() < 1e-9,
-                    "{rel}: expected {want}, got {}",
+                    (s.interval_inconsistency - want_interval).abs() < 1e-9,
+                    "{rel}: expected interval_inconsistency {want_interval}, got {}",
+                    s.interval_inconsistency
+                );
+                assert!(
+                    (s.consistency_radius - want_radius).abs() < 1e-9,
+                    "{rel}: expected radius {want_radius}, got {}",
                     s.consistency_radius
                 );
             }
@@ -1582,14 +1874,15 @@ mod tests {
     }
 
     #[test]
-    fn test_contradicts_conflict_unchanged() {
-        // The Negative (contradicts) arm must keep the symmetric Bel/Pl distance
-        // unchanged by this fix. Pin the exact pre-fix value.
+    fn test_contradicts_believed_pair_flags_bel_over_ceiling() {
+        // A believed pair linked by contradicts is a real conflict and must
+        // still flag, on the mutual-exclusion ceiling (U075).
         //
         // contradicts → Negative(0.90); restrict_epistemic_negative on
-        // source [0.80, 0.95] gives expected bel = (1-0.95)*0.90 = 0.045,
-        // pl = 1 - 0.80*0.90 = 0.28. Against target [0.70, 0.90]:
-        //   conflict = max(|0.70-0.045|, |0.90-0.28|) = max(0.655, 0.62) = 0.655.
+        // source [0.80, 0.95] gives expected [0, 1 - 0.80*0.90] = [0, 0.28].
+        // Target [0.70, 0.90] sits 0.70 - 0.28 = 0.42 above the ceiling, on
+        // both twin fields. (The complement law's symmetric distance gave
+        // max(|0.70-0.045|, |0.90-0.28|) = 0.655.)
         let src_id = Uuid::new_v4();
         let tgt_id = Uuid::new_v4();
         let source = EpistemicInterval::new(0.80, 0.95, 0.0);
@@ -1599,9 +1892,148 @@ mod tests {
             compute_cdst_edge_inconsistency(src_id, tgt_id, source, target, "contradicts", &sci());
 
         assert!(
-            (obs.conflict_component - 0.655).abs() < 1e-9,
-            "contradicts conflict must stay symmetric at 0.655, got {}",
+            (obs.conflict_component - 0.42).abs() < 1e-9,
+            "contradicts conflict should be the ceiling excess 0.42, got {}",
             obs.conflict_component
         );
+        assert!(
+            (obs.interval_inconsistency - 0.42).abs() < 1e-9,
+            "contradicts interval_inconsistency should be 0.42, got {}",
+            obs.interval_inconsistency
+        );
+    }
+
+    #[test]
+    fn test_contradicts_between_two_disbelieved_claims_is_consistent() {
+        // Mutual exclusion ("not both true") is satisfied by two disbelieved
+        // claims. Source [0.05, 0.20] at f = 0.90 caps the target at
+        // pl = 0.955; target [0.20, 0.40] sits under it, so both twin fields
+        // are 0. The complement law expected [0.72, 0.955] and scored
+        // max(|0.20 − 0.72|, |0.40 − 0.955|) = 0.555 on both (backlog I014's
+        // "low-BetP sources triggering high edge inconsistency").
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+            EpistemicInterval::new(0.20, 0.40, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "interval_inconsistency must be 0, got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.conflict_component < 1e-9,
+            "conflict_component must be 0, got {}",
+            obs.conflict_component
+        );
+        // Nor is the pair an ignorance obstruction: the target's whole
+        // interval sits under the ceiling. (A width mismatch against the
+        // permissive [0, 0.955] gave |0.20 − 0.955| = 0.755, which every such
+        // edge added to ignorance_h1.)
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "ignorance_component must be 0, got {}",
+            obs.ignorance_component
+        );
+    }
+
+    // ── Negative-arm ignorance and classification (U075) ──────────────────
+
+    #[test]
+    fn test_contradicts_weak_contradicter_adds_no_ignorance_to_believed_target() {
+        // A believed target [0.80, 0.90] under a weak contradicter
+        // [0.05, 0.20] at f = 0.9 is consistent: ceiling 0.955 sits above its
+        // whole interval. It must add nothing to ignorance_h1 either; a width
+        // mismatch against [0, 0.955] gave |0.10 − 0.955| = 0.855 per edge.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+            EpistemicInterval::new(0.80, 0.90, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "ignorance_component must be 0, got {}",
+            obs.ignorance_component
+        );
+    }
+
+    #[test]
+    fn test_contradicts_ceiling_breach_is_a_belief_conflict() {
+        // A moderately believed contradicter [0.50, 0.60] at f = 0.9 caps the
+        // target at 1 − 0.50·0.9 = 0.55. Target [0.75, 0.85] sits 0.20 above
+        // it: a genuine breach, labelled BeliefConflict. A width mismatch
+        // against [0, 0.55] (|0.10 − 0.55| = 0.45) would outrank the 0.20
+        // conflict and mislabel it IgnoranceDrift.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.50, 0.60, 0.0),
+            EpistemicInterval::new(0.75, 0.85, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            (obs.interval_inconsistency - 0.20).abs() < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "a breached ceiling carries no ignorance term, got {}",
+            obs.ignorance_component
+        );
+        assert_eq!(obs.obstruction_kind, ObstructionKind::BeliefConflict);
+
+        // Even a small breach by a wide target stays a BeliefConflict:
+        // [0.60, 0.99] is 0.05 over the ceiling.
+        let wide = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.50, 0.60, 0.0),
+            EpistemicInterval::new(0.60, 0.99, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!((wide.conflict_component - 0.05).abs() < 1e-9);
+        assert_eq!(wide.obstruction_kind, ObstructionKind::BeliefConflict);
+    }
+
+    #[test]
+    fn test_contradicts_target_spanning_the_ceiling_is_ignorance() {
+        // Target [0.20, 0.90] under contradicter [0.60, 0.70] at f = 0.9
+        // (ceiling 0.46): its bel is under the ceiling (no conflict), but its
+        // plausibility reaches 0.44 above it. Whether the pair is consistent
+        // depends on resolving the target's ignorance, so the edge is
+        // IgnoranceDrift with ignorance_component 0.90 − 0.46 = 0.44.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.60, 0.70, 0.0),
+            EpistemicInterval::new(0.20, 0.90, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            (obs.ignorance_component - 0.44).abs() < 1e-9,
+            "got {}",
+            obs.ignorance_component
+        );
+        assert_eq!(obs.obstruction_kind, ObstructionKind::IgnoranceDrift);
     }
 }
