@@ -199,8 +199,15 @@ async fn hnsw_scans(conn: &mut sqlx::PgConnection) -> i64 {
 
 /// The whole-corpus statement is served by migration 001's full HNSW index
 /// (not a seq scan + sort over every embedded claim), AND it fills a `limit`
-/// beyond the default `ef_search` of 40 — the iterative scan. Without
-/// `hnsw.iterative_scan` the page stops at 40 rows.
+/// beyond the default `ef_search` of 40. With NEITHER of the call's settings
+/// the page stops at 40 rows; either one alone fills it here (`ef_search` is
+/// widened to `clamp(60, 40, 1000) = 60`), so this test does not isolate the
+/// iterative scan — `all_claims_scope_fills_its_limit_past_rows_a_post_filter_rejects`
+/// below does.
+///
+/// Its distinct job is the LEAK check: the call runs inside the caller's
+/// transaction, where `begin()` opens a savepoint; it must roll that back so
+/// the `SET LOCAL` values do not survive into the caller's later HNSW reads.
 #[sqlx::test(migrations = "../../migrations")]
 async fn all_claims_scope_on_the_index_fills_a_limit_beyond_ef_search(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -247,8 +254,8 @@ async fn all_claims_scope_on_the_index_fills_a_limit_beyond_ef_search(pool: PgPo
     assert_eq!(
         got.len(),
         limit,
-        "an index scan capped at hnsw.ef_search returns 40 rows; the call must widen it to \
-         fill LIMIT {limit}"
+        "an index scan at the default hnsw.ef_search returns 40 rows; the call's widened \
+         ef_search / iterative scan must fill LIMIT {limit}"
     );
     assert_eq!(
         got,
