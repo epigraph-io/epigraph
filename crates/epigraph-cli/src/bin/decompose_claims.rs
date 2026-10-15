@@ -110,6 +110,12 @@
 //!   ephemeral container, and pass the SAME path to `--apply-plan` catch-up
 //!   runs. Add the flag to a schedule only after this binary is deployed: an
 //!   older binary rejects it and the run fails.
+//! * Measuring the drain: `--count-eligible` reads on past `--limit` (up to
+//!   `--max-scan`) and prints `selection: eligible=N` — the parents that pass
+//!   every filter, judged-atomic verdicts included. A scheduled run that
+//!   carries it shows week over week whether the eligible population falls;
+//!   `--dry-run --count-eligible --max-scan <population>` is the one-off
+//!   measurement (OFFSET paging: run it off-hours).
 
 use clap::Parser;
 use epigraph_cli::decompose::{
@@ -187,6 +193,12 @@ struct Cli {
     /// verdicts are still recorded).
     #[arg(long, default_value_t = false)]
     include_judged_atomic: bool,
+    /// Keep reading past --limit (up to --max-scan rows) and print how many
+    /// eligible parents remain (`eligible=`; `>=` when --max-scan stopped the
+    /// count). The parents processed are exactly those a run without it
+    /// chooses. Not with --ids-file.
+    #[arg(long, default_value_t = false)]
+    count_eligible: bool,
     /// Stop reading the undecomposed population after this many rows.
     #[arg(long, default_value_t = 20_000)]
     max_scan: usize,
@@ -279,6 +291,13 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     }
     if cli.include_judged_atomic && cli.singleton_ledger.is_none() {
         return Err("--include-judged-atomic needs --singleton-ledger".into());
+    }
+    if cli.count_eligible && (cli.ids_file.is_some() || cli.apply_plan.is_some() || cli.retarget) {
+        return Err(
+            "--count-eligible counts the paged population; it does not apply to --ids-file, \
+             --apply-plan or --retarget"
+                .into(),
+        );
     }
     if cli.retarget && cli.singleton_ledger.is_some() {
         return Err(
@@ -844,18 +863,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ledger.as_ref()
             };
-            let sel = select_candidates(
+            // `--count-eligible` reads on past `--limit`; the first `limit`
+            // chosen are the same parents, in the same order, either way.
+            let scan_limit = if cli.count_eligible {
+                limit.max(cli.max_scan)
+            } else {
+                limit
+            };
+            let mut sel = select_candidates(
                 pool,
                 viewer,
                 cli.priority.into(),
                 ids.as_deref(),
                 filters,
                 judged_atomic,
-                limit,
+                scan_limit,
                 cli.max_scan,
             )
             .await?;
-            report_selection(&sel, ids.is_some(), cli.priority);
+            let eligible = cli
+                .count_eligible
+                .then(|| keep_within_limit(&mut sel, limit, scan_limit));
+            report_selection(&sel, ids.is_some(), cli.priority, eligible);
             if cli.priority == PriorityArg::Conflict {
                 report_decomposed_conflict_parents(pool, viewer).await?;
             }
@@ -973,12 +1002,40 @@ fn report_unplanned(gaps: &PlanGaps, singletons: &[uuid::Uuid]) {
     }
 }
 
+/// How many eligible parents a `--count-eligible` scan saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EligibleCount {
+    seen: usize,
+    /// The scan stopped (at `--max-scan`) before the population ran out, so
+    /// `seen` is a lower bound.
+    at_least: bool,
+}
+
+/// `--count-eligible`: `sel` was filled up to `scan_limit`. Keep the first
+/// `limit` chosen — the parents a plain run would process — and return the
+/// count of eligible parents the scan saw.
+fn keep_within_limit(
+    sel: &mut epigraph_cli::decompose::Selection,
+    limit: usize,
+    scan_limit: usize,
+) -> EligibleCount {
+    let seen = sel.chosen.len();
+    sel.chosen.truncate(limit);
+    // Filling `scan_limit` also stops the scan, without setting `scan_capped`.
+    let at_least = sel.scan_capped || seen >= scan_limit;
+    // The capped warning is about not reaching `--limit`; the count reports
+    // its own bound.
+    sel.scan_capped = sel.scan_capped && sel.chosen.len() < limit;
+    EligibleCount { seen, at_least }
+}
+
 /// Summarize what selection chose and passed over. Every explicit
 /// `--ids-file` id that is not decomposed is printed WITH its reason.
 fn report_selection(
     sel: &epigraph_cli::decompose::Selection,
     explicit: bool,
     priority: PriorityArg,
+    eligible: Option<EligibleCount>,
 ) {
     use epigraph_cli::decompose::Ineligible;
     let count = |f: fn(&Ineligible) -> bool| sel.skipped.iter().filter(|(_, w)| f(w)).count();
@@ -996,6 +1053,14 @@ fn report_selection(
         sel.scanned,
         sel.chosen.len(),
     );
+    if let Some(e) = eligible {
+        eprintln!(
+            "selection: eligible={}{} (parents that pass every filter, in {} rows read)",
+            if e.at_least { ">=" } else { "" },
+            e.seen,
+            sel.scanned
+        );
+    }
     if sel.scan_capped {
         eprintln!(
             "selection: stopped at --max-scan={} rows before reaching --limit; raise --max-scan \
@@ -1185,6 +1250,78 @@ mod tests {
         assert!(
             !cli.include_backlog && !cli.include_short,
             "filters default ON"
+        );
+    }
+
+    /// `--count-eligible` keeps exactly the parents a plain run chooses (the
+    /// first `--limit`, in order) and reports how many eligible parents the
+    /// scan saw, as a lower bound when the scan was cut off. It counts the
+    /// paged population only.
+    #[test]
+    fn count_eligible_keeps_the_plain_runs_choice_and_bounds_the_count() {
+        use epigraph_db::repos::decomposition_priority::DecomposeCandidate;
+        let cand = |n: u128| DecomposeCandidate {
+            id: uuid::Uuid::from_u128(n),
+            agent_id: uuid::Uuid::from_u128(0),
+            content: format!("Parent {n}. Second sentence."),
+            content_hash: vec![],
+            labels: vec![],
+            created_at: chrono::Utc::now(),
+            visibility: "public".into(),
+            conflict_edges: 0,
+            newest_conflict_at: None,
+        };
+        let sel_of = |n: u128, capped: bool| epigraph_cli::decompose::Selection {
+            chosen: (1..=n).map(cand).collect(),
+            scanned: 9_000,
+            scan_capped: capped,
+            ..Default::default()
+        };
+
+        // Population exhausted: an exact count, and the first `limit` kept.
+        let mut sel = sel_of(5, false);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert_eq!(
+            e,
+            super::EligibleCount {
+                seen: 5,
+                at_least: false
+            }
+        );
+        assert_eq!(
+            sel.chosen.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+        );
+        assert!(!sel.scan_capped);
+
+        // --max-scan stopped the scan: a lower bound, and the "did not reach
+        // --limit" warning is withdrawn once --limit is met.
+        let mut sel = sel_of(5, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && e.seen == 5, "{e:?}");
+        assert!(!sel.scan_capped);
+
+        // Filling the scan limit also stops the scan, without `scan_capped`.
+        let mut sel = sel_of(4, false);
+        let e = super::keep_within_limit(&mut sel, 2, 4);
+        assert!(e.at_least, "{e:?}");
+
+        // Fewer eligible than --limit and capped: the warning stays.
+        let mut sel = sel_of(1, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && sel.scan_capped, "{e:?}");
+
+        for bad in [
+            &["--count-eligible", "--ids-file", "ids.txt"][..],
+            &["--count-eligible", "--apply-plan", "p.jsonl"][..],
+            &["--count-eligible", "--retarget"][..],
+        ] {
+            let err = mode_of(bad).unwrap_err();
+            assert!(err.contains("--count-eligible"), "{bad:?}: {err}");
+        }
+        assert_eq!(
+            mode_of(&["--dry-run", "--count-eligible"]).unwrap(),
+            Mode::Enumerate
         );
     }
 
