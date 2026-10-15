@@ -1260,8 +1260,10 @@ mod db_writes {
             DecomposeCandidate, DecompositionPriorityRepository as R, UndecomposedOrder,
         };
         // Every rule a candidate must pass, in reporting order. The ledger is
-        // consulted last, so `skipped_judged_atomic` counts exactly the LLM
-        // calls it saved.
+        // consulted last, so `skipped_judged_atomic` counts only parents an
+        // LLM call would otherwise have gone to: up to `limit`, exactly the
+        // calls it saved (with `--count-eligible`, `limit` is the whole scan,
+        // so it counts every judged parent read).
         let verdict = |r: &DecomposeCandidate| -> Result<(), super::Ineligible> {
             super::check_publicly_decomposable(&r.visibility)?;
             super::check_eligibility(&r.content, &r.labels, filters)?;

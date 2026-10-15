@@ -196,7 +196,8 @@ struct Cli {
     /// Keep reading past --limit (up to --max-scan rows) and print how many
     /// eligible parents remain (`eligible=`; `>=` when --max-scan stopped the
     /// count). The parents processed are exactly those a run without it
-    /// chooses. Not with --ids-file.
+    /// chooses, but the `skipped_*` counts then cover every row read, not only
+    /// the rows a plain run would read. Not with --ids-file.
     #[arg(long, default_value_t = false)]
     count_eligible: bool,
     /// Stop reading the undecomposed population after this many rows.
@@ -1055,7 +1056,8 @@ fn report_selection(
     );
     if let Some(e) = eligible {
         eprintln!(
-            "selection: eligible={}{} (parents that pass every filter, in {} rows read)",
+            "selection: eligible={}{} (parents that pass every filter, in {} rows read; the \
+             skipped_* counts cover the same rows)",
             if e.at_least { ">=" } else { "" },
             e.seen,
             sel.scanned
