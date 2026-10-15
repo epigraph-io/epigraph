@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Theme · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("graph.css") }}">
+<script src="{{ ctx.static_url("graph.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<h1 class="graph-title">Theme</h1>
+<p class="small muted mono">{{ theme_id }}</p>
+{%- if expired %}
+{% include "graph/_expired.html" %}
+{%- else %}
+{% include "graph/_not_permalink.html" %}
+
+<section class="section" aria-labelledby="nbh-title">
+  <h2 id="nbh-title" class="section__title">Neighbourhoods <span class="small muted">{{ rows.len() }}</span></h2>
+  {%- if rows.is_empty() %}
+  <p class="muted">This theme has no neighbourhoods.</p>
+  {%- else %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th scope="col">Neighbourhood</th><th scope="col" class="num">Claims</th><th scope="col" class="num">Mean belief</th><th scope="col">Dominant frame</th></tr>
+      </thead>
+      <tbody>
+        {%- for r in rows %}
+        <tr>
+          <td><a href="{{ r.href }}">{{ r.name }}</a></td>
+          <td class="num">{{ r.size }}</td>
+          <td class="num">{{ r.mean_betp }}</td>
+          <td>{% if let Some(f) = r.frame_href %}<a href="{{ f }}">Frame</a>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  {%- if maybe_more %}
+  <p class="small muted">Showing the {{ rows.len() }} largest neighbourhoods; there may be more.</p>
+  {%- endif %}
+  {%- endif %}
+</section>
+
+<section class="section" aria-labelledby="links-title">
+  <h2 id="links-title" class="section__title">Links between neighbourhoods <span class="small muted">{{ edges.len() }}</span></h2>
+  {%- if edges.is_empty() %}
+  <p class="muted">No links between these neighbourhoods.</p>
+  {%- else %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th scope="col">Neighbourhood</th><th scope="col">Neighbourhood</th><th scope="col" class="num">Weight</th></tr>
+      </thead>
+      <tbody>
+        {%- for e in edges %}
+        <tr>
+          <td>{% if let Some(h) = e.a_href %}<a href="{{ h }}">{{ e.a }}</a>{% else %}<span class="mono">{{ e.a }}</span>{% endif %}</td>
+          <td>{% if let Some(h) = e.b_href %}<a href="{{ h }}">{{ e.b }}</a>{% else %}<span class="mono">{{ e.b }}</span>{% endif %}</td>
+          <td class="num">{{ e.weight }}</td>
+        </tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  {%- endif %}
+</section>
+{%- endif %}
+{% endblock %}

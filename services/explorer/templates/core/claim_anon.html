@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}{{ og.title }} · {{ ctx.product_name() }}{% endblock %}
+
+{% block og %}
+{% include "core/og.html" %}
+{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<section class="notice signin-prompt" aria-labelledby="signin-title">
+  <p class="claim__kicker">Claim <code>{{ id }}</code></p>
+  <h1 id="signin-title">Sign in to read this claim</h1>
+  <p class="lead">EpiGraph Explorer shows a claim’s text, its evidence and its connections to signed-in readers.</p>
+  <p><a class="button" href="{{ ctx.login_url() }}">Sign in</a></p>
+</section>
+{% endblock %}

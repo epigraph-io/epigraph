@@ -1,0 +1,96 @@
+name: Explorer
+
+# services/explorer is a standalone crate: its own empty [workspace] table,
+# its own Cargo.lock and its own target/. Every cargo step in ci.yml is
+# `--workspace` or `-p <member>` at the repo root, so none of them compiles,
+# lints, tests or audits it. This workflow is its only CI signal.
+#
+# The paths filter keeps kernel-only PRs from paying for an explorer build.
+# `.cargo/config.toml` is included because cargo reads config from parent
+# directories: the root file's `[env] RUST_TEST_THREADS` applies to the
+# explorer's tests too. If this workflow is ever made a required status check,
+# drop the filter — a required check that never starts blocks the PR forever.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/explorer/**"
+      - ".github/workflows/explorer.yml"
+      - ".cargo/config.toml"
+  pull_request:
+    paths:
+      - "services/explorer/**"
+      - ".github/workflows/explorer.yml"
+      - ".cargo/config.toml"
+
+permissions:
+  contents: read
+
+# Actions are pinned to the same full commit SHAs as ci.yml (see the note
+# there): a compromised or force-pushed upstream tag cannot change what runs.
+# dtolnay/rust-toolchain picks the channel from the ref name, which pinning by
+# SHA defeats, so the channel stays explicit via the `toolchain` input.
+# `defaults.run.working-directory` applies to `run:` steps only, not `uses:`.
+jobs:
+  test:
+    name: fmt, clippy, test, release build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/explorer
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          # Key the cache on the explorer's own lockfile and target dir, not
+          # the root workspace's.
+          workspaces: services/explorer -> target
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        # --all-targets is load-bearing: without it tests/ is never linted
+        # (see the Clippy step in ci.yml for how that blind spot bit the kernel).
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        # Tests stub the API with wiremock; no database or network is needed.
+        run: cargo test --locked
+      - name: Release build
+        # The Dockerfile and the systemd install both ship the release binary;
+        # build it the same way here so a release-only break is caught.
+        run: cargo build --release --locked
+
+  # Advisory, NOT a merge gate — same rationale as the audit job in ci.yml:
+  # cargo audit checks against the RustSec DB fetched at run time, so a
+  # blocking gate would red-light every open PR the moment a new advisory lands
+  # on any transitive dependency, and Foreman auto-merges epigraph PRs.
+  #
+  # The root audit job reads only the root Cargo.lock, so the explorer's
+  # separately resolved dependency graph is audited nowhere else. cargo-audit
+  # loads `.cargo/audit.toml` from the current directory only, so the kernel's
+  # triaged ignores (which target kernel dependencies) deliberately do not
+  # apply here; any explorer advisory is triaged on its own merits.
+  audit:
+    name: Security audit (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: services/explorer
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          workspaces: services/explorer -> target
+      # Installed from source rather than via a prebuilt-binary action so the
+      # trust surface stays the three actions pinned above — no extra upstream.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit --file Cargo.lock
