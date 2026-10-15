@@ -715,22 +715,30 @@ impl IngestTx<'_> {
     /// group, `ingest_document_inline` twice — `personal:admin(revoked)` became
     /// `personal:admin(live)` and +3 / +4 claims committed under it.
     ///
-    /// So on the Stamped arm this is, in order:
-    /// 1. [`epigraph_db::AgentRepository::operator_actor`] (a definer read) —
+    /// So on the Stamped arm this is, in order, the claims trigger's own
+    /// questions asked before anything is written:
+    /// 1. [`epigraph_db::AgentRepository::require_bound_author`] — an author
+    ///    bound to no registered human operator is refused by name (`OPL01`)
+    ///    once armed; quiet when unarmed. Asked FIRST and of every author,
+    ///    because an acting link (step 2) does not read the human registry: a
+    ///    link whose operator was de-registered still acts, and still does not
+    ///    bind.
+    /// 2. [`epigraph_db::AgentRepository::operator_actor`] (a definer read) —
     ///    `Some` gives the operator's personal group. An acting link means the
     ///    agent AND the operator hold live writer/admin rows there, so the
     ///    trigger's writer-scope check passes and the stamp carries the group.
-    /// 2. Otherwise [`epigraph_db::AgentRepository::require_bound_author`] —
-    ///    an author bound to no human operator is refused by name (`OPL01`)
-    ///    once armed, before anything is written; quiet when unarmed.
-    /// 3. [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
-    ///    — `None` means no live membership; refuse.
-    /// 4. [`epigraph_db::AgentRepository::require_operator_scope`] — a live
-    ///    link that is NOT acting (the operator revoked the agent's row in its
-    ///    group, or no longer holds the group itself) falls back to the
-    ///    agent's own personal group, which its operator does not write:
-    ///    refused by name (`OPL02`) here, instead of by the trigger inside
-    ///    the detached walk. Quiet for an unlinked agent and when unarmed.
+    /// 3. Otherwise [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
+    ///    — `None` means no live membership; refuse (`OPL02`, by name, when
+    ///    the agent is live-linked: its link is not acting and it has no group
+    ///    it may write).
+    /// 4. [`epigraph_db::AgentRepository::require_writer_authority`] with the
+    ///    author as the writer — the trigger's writer-scope question on the
+    ///    resolved group. A live link that is NOT acting (the operator revoked
+    ///    the agent's row in its group, or no longer holds the group itself)
+    ///    falls back to the agent's own personal group, which its operator
+    ///    does not write: `OPL02`. So does an author bound only through the
+    ///    client allowlist (migration 149), whose own personal group is not
+    ///    one its human writes. Quiet for an unlinked agent and when unarmed.
     /// 5. [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
     ///    — `group = ANY(epigraph_writable_groups())` on the same transaction,
     ///    the exact question migration 077's `WITH CHECK` will ask of every row;
@@ -768,23 +776,51 @@ impl IngestTx<'_> {
             );
             internal_error(format!("{tool_name}: {why}"))
         };
-        // 1. Operator-linked and ACTING: the operator's personal group.
+        // 1. The claims trigger's first question, asked of EVERY author: is it
+        //    bound to a registered human operator? OPL01 by name once armed.
+        //    Unconditional, because an acting link (107) does not read the
+        //    human registry: a link whose operator was de-registered still
+        //    "acts", and only this check sees that it no longer binds.
+        epigraph_db::AgentRepository::require_bound_author(tx, agent_id)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+        // 2. Operator-linked and ACTING: the operator's personal group.
         let group = if let Some(link) = epigraph_db::AgentRepository::operator_actor(tx, agent_id)
             .await
             .map_err(crate::errors::db_caller_error)?
         {
             link.operator_group_id
         } else {
-            // 2. Unbound author, armed: OPL01 by name, before anything else.
-            epigraph_db::AgentRepository::require_bound_author(tx, agent_id)
-                .await
-                .map_err(crate::errors::db_caller_error)?;
             // 3. The author's own personal group, a pure read.
             let Some(own) =
                 epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
                     .await
                     .map_err(internal_error)?
             else {
+                // A live-linked agent whose link is not acting has no group
+                // it may write: say that (OPL02), not "restore your personal
+                // membership", which would not help.
+                let binding = epigraph_db::AgentRepository::author_binding(tx, agent_id)
+                    .await
+                    .map_err(crate::errors::db_caller_error)?;
+                if binding.as_deref() == Some(epigraph_db::LIVE_LINK_BINDING) {
+                    let why = format!(
+                        "the ingesting agent ({agent_id}) is operator-linked, but its link is not \
+                         acting (its membership in its operator's personal group was revoked, or \
+                         the operator no longer holds that group), and it has no personal group \
+                         of its own; a linked agent writes only where its operator writes. \
+                         Nothing was written"
+                    );
+                    tracing::error!(
+                        target: "tenancy.scoped_write",
+                        tool = tool_name,
+                        author = %agent_id,
+                        "{why}"
+                    );
+                    return Err(crate::errors::db_caller_error(
+                        epigraph_db::DbError::OperatorScopeRefused { message: why },
+                    ));
+                }
                 return Err(refuse(format!(
                     "the ingesting agent ({agent_id}) holds no LIVE membership of its personal \
                      group, which owns every row this ingest would write. Refusing: if the \
@@ -792,13 +828,17 @@ impl IngestTx<'_> {
                      this path will restore it. Nothing was written"
                 )));
             };
-            // 4. A live link that is not acting: the operator does not write
-            //    the agent's own group, so OPL02 by name, now.
-            epigraph_db::AgentRepository::require_operator_scope(tx, agent_id, own)
-                .await
-                .map_err(crate::errors::db_caller_error)?;
             own
         };
+        // 4. The trigger's own writer-scope question on the resolved group
+        //    (bound writer, writer scope, attribution; the author IS the
+        //    writer here). OPL02 by name for a live link that is not acting
+        //    (its fallback is a group its operator does not write), an author
+        //    bound only through the client allowlist (149: its own group is
+        //    not one its human writes), and a retired link under the valve.
+        epigraph_db::AgentRepository::require_writer_authority(tx, agent_id, Some(agent_id), group)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
         // 5. The stamp must carry the owner group (077's WITH CHECK).
         let writable =
             epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, group)
