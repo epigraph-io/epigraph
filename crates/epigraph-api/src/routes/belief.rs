@@ -1147,6 +1147,9 @@ pub async fn submit_evidence(
         .await
         .unwrap_or_default();
     let now = chrono::Utc::now();
+    // The contexts whose modifier applied, for the SCOPED_BY edges step 14
+    // writes on the stamped transaction.
+    let mut scoped_by: Vec<(Uuid, String)> = Vec::new();
     for ctx in &active_contexts {
         // Check temporal validity
         if let Some(from) = ctx.valid_from {
@@ -1164,19 +1167,7 @@ pub async fn submit_evidence(
             match combination::apply_context_modifier(&modified, modifier_type, &params) {
                 Ok(m) => {
                     modified = m;
-                    // Create SCOPED_BY edge from claim to context (best-effort)
-                    let _ = epigraph_db::EdgeRepository::create(
-                        pool,
-                        request.claim_id,
-                        "claim",
-                        ctx.id,
-                        "context",
-                        "SCOPED_BY",
-                        Some(serde_json::json!({"modifier_type": modifier_type})),
-                        None,
-                        None,
-                    )
-                    .await;
+                    scoped_by.push((ctx.id, modifier_type.clone()));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1373,8 +1364,9 @@ pub async fn submit_evidence(
     //    BBA), and a submission with no `agent_id` was overwritten by that
     //    combined row (same unique key).
     //
-    //    The submission's edges (WITHIN_FRAME and the DS relationships) are on
-    //    this transaction too, so they carry the caller's writer group.
+    //    The submission's edges (WITHIN_FRAME, SCOPED_BY and the DS
+    //    relationships) are on this transaction too, so they carry the
+    //    caller's writer group.
     //
     //    The derived rows computed after the commit (the perspective and
     //    community scoped beliefs, the divergence record) are written on a
@@ -1702,6 +1694,19 @@ pub async fn submit_evidence(
         None,
     )
     .await?;
+    //     SCOPED_BY, claim -> each context whose modifier step 4b applied.
+    for (context_id, modifier_type) in &scoped_by {
+        create_edge_under_savepoint(
+            &mut tx,
+            request.claim_id,
+            "claim",
+            *context_id,
+            "context",
+            "SCOPED_BY",
+            Some(serde_json::json!({"modifier_type": modifier_type})),
+        )
+        .await?;
+    }
     //     DS relationships. "evidence" is the entity type for mass functions
     //     (constraint-compatible).
     if final_bel > 0.5 {
