@@ -85,7 +85,10 @@ pub async fn auto_wire_ds_for_edge(
     // into the BBA mass shape via `restrict_epistemic_*` — that shape and
     // the stored source_strength are independent Dempster-Shafer levers:
     // the shape encodes WHAT the supporter says about the target, and
-    // source_strength encodes HOW reliable the supporter is.)
+    // source_strength encodes HOW reliable the supporter is. For a Negative
+    // edge the shape is mutual exclusion: only the contradictor's belief
+    // arrives, as mass on the target being FALSE, so the BBA never puts mass
+    // on TRUE and a disbelieved contradictor writes a near-vacuous BBA.)
     let transmission_factor: f64 = match restriction {
         RestrictionKind::Positive(f)
         | RestrictionKind::Negative(f)

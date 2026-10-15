@@ -65,8 +65,9 @@ fn link_epistemic_description_states_how_a_positive_edge_can_lower_belief() {
 fn link_epistemic_description_states_a_negative_edge_cannot_raise_belief() {
     let d = link_epistemic_description();
     for needle in [
-        "mutual exclusion",
+        "A negative edge means mutual exclusion",
         "the source's disbelief transfers nothing",
+        "a negative edge puts no mass on the target being true",
         "a negative edge cannot RAISE the target's belief or pignistic_prob",
     ] {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
