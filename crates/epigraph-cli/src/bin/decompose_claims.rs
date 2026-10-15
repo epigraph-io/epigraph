@@ -54,6 +54,16 @@
 //! The population is paged so filters never starve a run; `--max-scan` bounds
 //! the rows read.
 //!
+//! `--singleton-ledger <file>` (backlog 68d03c24, U040): a parent the model
+//! answers with ONE atom gets no edge, so it stays undecomposed; without a
+//! record every later run re-selects it and pays for the same answer again.
+//! With the flag, a normal run and `--apply-plan` append each such verdict
+//! (claim id + BLAKE3 of the judged text) to the JSONL file, and selection
+//! skips a parent whose id and exact text the file holds
+//! (`skipped_judged_atomic=` on the `selection:` line; `--include-judged-atomic`
+//! asks again). `--dry-run` and `--plan` only read it. A parent whose text
+//! changes is asked again.
+//!
 //! # Modes
 //!
 //! * default — select, decompose through the LLM, persist.
@@ -93,12 +103,25 @@
 //!   extracts the filter skips; such a run may read `--max-scan` rows and
 //!   choose few. Point the schedule at `--priority conflict` (then `recent`)
 //!   before redeploying this binary.
+//! * Steady state (U040 ruling, 2026-10-14): a DAILY `--priority recent
+//!   --limit L --singleton-ledger <durable path>` run, with L sized so
+//!   `7 × L ≥ 1.5 ×` the measured weekly inflow (≈410/week on 2026-10-14, so
+//!   L = 100). Keep the ledger next to the durable run logs, never in the
+//!   ephemeral container, and pass the SAME path to `--apply-plan` catch-up
+//!   runs. Add the flag to a schedule only after this binary is deployed: an
+//!   older binary rejects it and the run fails.
+//! * Measuring the drain: `--count-eligible` reads on past `--limit` (up to
+//!   `--max-scan`) and prints `selection: eligible=N` — the parents that pass
+//!   every filter, judged-atomic verdicts included. A scheduled run that
+//!   carries it shows week over week whether the eligible population falls;
+//!   `--dry-run --count-eligible --max-scan <population>` is the one-off
+//!   measurement (OFFSET paging: run it off-hours).
 
 use clap::Parser;
 use epigraph_cli::decompose::{
     atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
     run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
-    BatchClaim, EligibilityFilters, PlanGaps, Priority,
+    BatchClaim, EligibilityFilters, PlanGaps, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -159,6 +182,24 @@ struct Cli {
     /// Do not skip claims that look atomic (one sentence, <= 160 chars).
     #[arg(long, default_value_t = false)]
     include_short: bool,
+    /// JSONL ledger of parents the model already answered with one atom
+    /// ("already atomic"). A normal run and `--apply-plan` append every such
+    /// verdict to it; selection skips a parent whose id and exact text it
+    /// holds, so the same claim is never re-asked. `--dry-run` and `--plan`
+    /// only read it. Absent: nothing is recorded and nothing is skipped.
+    #[arg(long)]
+    singleton_ledger: Option<PathBuf>,
+    /// With --singleton-ledger: select parents the ledger holds anyway (their
+    /// verdicts are still recorded).
+    #[arg(long, default_value_t = false)]
+    include_judged_atomic: bool,
+    /// Keep reading past --limit (up to --max-scan rows) and print how many
+    /// eligible parents remain (`eligible=`; `>=` when --max-scan stopped the
+    /// count). The parents processed are exactly those a run without it
+    /// chooses, but the `skipped_*` counts then cover every row read, not only
+    /// the rows a plain run would read. Not with --ids-file.
+    #[arg(long, default_value_t = false)]
+    count_eligible: bool,
     /// Stop reading the undecomposed population after this many rows.
     #[arg(long, default_value_t = 20_000)]
     max_scan: usize,
@@ -248,6 +289,21 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     }
     if cli.dry_run && (cli.apply || cli.apply_plan.is_some()) {
         return Err("--dry-run cannot be combined with --apply or --apply-plan".into());
+    }
+    if cli.include_judged_atomic && cli.singleton_ledger.is_none() {
+        return Err("--include-judged-atomic needs --singleton-ledger".into());
+    }
+    if cli.count_eligible && (cli.ids_file.is_some() || cli.apply_plan.is_some() || cli.retarget) {
+        return Err(
+            "--count-eligible counts the paged population; it does not apply to --ids-file, \
+             --apply-plan or --retarget"
+                .into(),
+        );
+    }
+    if cli.retarget && cli.singleton_ledger.is_some() {
+        return Err(
+            "--singleton-ledger records decomposition verdicts; --retarget makes none".into(),
+        );
     }
     if cli.apply_plan.is_some() && cli.ids_file.is_some() {
         return Err(
@@ -664,6 +720,9 @@ fn fresh_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mode = resolve_mode(&cli, chrono::Utc::now())?;
+    // Before the DB, auth and any LLM call: a ledger path a recording mode
+    // cannot write must fail now, not after the verdicts are paid for.
+    let mut ledger = open_singleton_ledger(cli.singleton_ledger.as_deref(), &mode)?;
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
@@ -775,7 +834,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let submit = move |t: String, g: i64, p: AtomParent| {
                 submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
-            let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
+            let totals =
+                persist_planned(pool, viewer, &ok, embedder, ledger.as_mut(), &submit).await?;
             for (id, why) in &totals.failed {
                 eprintln!("FAILED {id}: {why}");
             }
@@ -799,17 +859,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => None,
             };
             let limit = usize::try_from(cli.limit.max(1)).unwrap_or(1);
-            let sel = select_candidates(
+            let judged_atomic = if cli.include_judged_atomic {
+                None
+            } else {
+                ledger.as_ref()
+            };
+            // `--count-eligible` reads on past `--limit`; the first `limit`
+            // chosen are the same parents, in the same order, either way.
+            let scan_limit = if cli.count_eligible {
+                limit.max(cli.max_scan)
+            } else {
+                limit
+            };
+            let mut sel = select_candidates(
                 pool,
                 viewer,
                 cli.priority.into(),
                 ids.as_deref(),
                 filters,
-                limit,
+                judged_atomic,
+                scan_limit,
                 cli.max_scan,
             )
             .await?;
-            report_selection(&sel, ids.is_some(), cli.priority);
+            let eligible = cli
+                .count_eligible
+                .then(|| keep_within_limit(&mut sel, limit, scan_limit));
+            report_selection(&sel, ids.is_some(), cli.priority, eligible);
             if cli.priority == PriorityArg::Conflict {
                 report_decomposed_conflict_parents(pool, viewer).await?;
             }
@@ -875,6 +951,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 llm.as_ref(),
                 cli.batch_size,
                 embedder,
+                ledger.as_mut(),
                 move |t, g, p| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p),
             )
             .await?;
@@ -886,6 +963,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Load `--singleton-ledger`. A mode that records verdicts (a normal run,
+/// `--apply-plan`) opens it for append, creating it if missing; every other
+/// mode only reads it and creates nothing.
+fn open_singleton_ledger(
+    path: Option<&Path>,
+    mode: &Mode,
+) -> Result<Option<SingletonLedger>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let ledger = if matches!(mode, Mode::Run | Mode::ApplyPlan(_)) {
+        SingletonLedger::open_for_append(path)?
+    } else {
+        SingletonLedger::load(path)?
+    };
+    eprintln!(
+        "singleton ledger: {} judged-atomic verdicts in {}",
+        ledger.len(),
+        ledger.path().display()
+    );
+    Ok(Some(ledger))
 }
 
 /// Name every chosen claim that was sent to the LLM and produced nothing to
@@ -903,32 +1003,66 @@ fn report_unplanned(gaps: &PlanGaps, singletons: &[uuid::Uuid]) {
     }
 }
 
+/// How many eligible parents a `--count-eligible` scan saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EligibleCount {
+    seen: usize,
+    /// The scan stopped (at `--max-scan`) before the population ran out, so
+    /// `seen` is a lower bound.
+    at_least: bool,
+}
+
+/// `--count-eligible`: `sel` was filled up to `scan_limit`. Keep the first
+/// `limit` chosen — the parents a plain run would process — and return the
+/// count of eligible parents the scan saw.
+fn keep_within_limit(
+    sel: &mut epigraph_cli::decompose::Selection,
+    limit: usize,
+    scan_limit: usize,
+) -> EligibleCount {
+    let seen = sel.chosen.len();
+    sel.chosen.truncate(limit);
+    // Filling `scan_limit` also stops the scan, without setting `scan_capped`.
+    let at_least = sel.scan_capped || seen >= scan_limit;
+    // The capped warning is about not reaching `--limit`; the count reports
+    // its own bound.
+    sel.scan_capped = sel.scan_capped && sel.chosen.len() < limit;
+    EligibleCount { seen, at_least }
+}
+
 /// Summarize what selection chose and passed over. Every explicit
 /// `--ids-file` id that is not decomposed is printed WITH its reason.
 fn report_selection(
     sel: &epigraph_cli::decompose::Selection,
     explicit: bool,
     priority: PriorityArg,
+    eligible: Option<EligibleCount>,
 ) {
     use epigraph_cli::decompose::Ineligible;
-    let backlog = sel
-        .skipped
-        .iter()
-        .filter(|(_, w)| matches!(w, Ineligible::Backlog))
-        .count();
-    let not_public = sel
-        .skipped
-        .iter()
-        .filter(|(_, w)| matches!(w, Ineligible::NotPublic { .. }))
-        .count();
-    let atomic = sel.skipped.len() - backlog - not_public;
+    let count = |f: fn(&Ineligible) -> bool| sel.skipped.iter().filter(|(_, w)| f(w)).count();
+    // Each reason counted by its own variant: a remainder would silently fold
+    // a new reason into another's column.
+    let backlog = count(|w| matches!(w, Ineligible::Backlog));
+    let not_public = count(|w| matches!(w, Ineligible::NotPublic { .. }));
+    let atomic = count(|w| matches!(w, Ineligible::LooksAtomic { .. }));
+    let judged = count(|w| matches!(w, Ineligible::JudgedAtomic));
     eprintln!(
         "selection: priority={priority:?}{} scanned={} chosen={} skipped_backlog={backlog} \
-         skipped_looks_atomic={atomic} skipped_not_public={not_public}",
+         skipped_looks_atomic={atomic} skipped_judged_atomic={judged} \
+         skipped_not_public={not_public}",
         if explicit { " (ids-file order)" } else { "" },
         sel.scanned,
         sel.chosen.len(),
     );
+    if let Some(e) = eligible {
+        eprintln!(
+            "selection: eligible={}{} (parents that pass every filter, in {} rows read; the \
+             skipped_* counts cover the same rows)",
+            if e.at_least { ">=" } else { "" },
+            e.seen,
+            sel.scanned
+        );
+    }
     if sel.scan_capped {
         eprintln!(
             "selection: stopped at --max-scan={} rows before reaching --limit; raise --max-scan \
@@ -1119,6 +1253,117 @@ mod tests {
             !cli.include_backlog && !cli.include_short,
             "filters default ON"
         );
+    }
+
+    /// `--count-eligible` keeps exactly the parents a plain run chooses (the
+    /// first `--limit`, in order) and reports how many eligible parents the
+    /// scan saw, as a lower bound when the scan was cut off. It counts the
+    /// paged population only.
+    #[test]
+    fn count_eligible_keeps_the_plain_runs_choice_and_bounds_the_count() {
+        use epigraph_db::repos::decomposition_priority::DecomposeCandidate;
+        let cand = |n: u128| DecomposeCandidate {
+            id: uuid::Uuid::from_u128(n),
+            agent_id: uuid::Uuid::from_u128(0),
+            content: format!("Parent {n}. Second sentence."),
+            content_hash: vec![],
+            labels: vec![],
+            created_at: chrono::Utc::now(),
+            visibility: "public".into(),
+            conflict_edges: 0,
+            newest_conflict_at: None,
+        };
+        let sel_of = |n: u128, capped: bool| epigraph_cli::decompose::Selection {
+            chosen: (1..=n).map(cand).collect(),
+            scanned: 9_000,
+            scan_capped: capped,
+            ..Default::default()
+        };
+
+        // Population exhausted: an exact count, and the first `limit` kept.
+        let mut sel = sel_of(5, false);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert_eq!(
+            e,
+            super::EligibleCount {
+                seen: 5,
+                at_least: false
+            }
+        );
+        assert_eq!(
+            sel.chosen.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+        );
+        assert!(!sel.scan_capped);
+
+        // --max-scan stopped the scan: a lower bound, and the "did not reach
+        // --limit" warning is withdrawn once --limit is met.
+        let mut sel = sel_of(5, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && e.seen == 5, "{e:?}");
+        assert!(!sel.scan_capped);
+
+        // Filling the scan limit also stops the scan, without `scan_capped`.
+        let mut sel = sel_of(4, false);
+        let e = super::keep_within_limit(&mut sel, 2, 4);
+        assert!(e.at_least, "{e:?}");
+
+        // Fewer eligible than --limit and capped: the warning stays.
+        let mut sel = sel_of(1, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && sel.scan_capped, "{e:?}");
+
+        for bad in [
+            &["--count-eligible", "--ids-file", "ids.txt"][..],
+            &["--count-eligible", "--apply-plan", "p.jsonl"][..],
+            &["--count-eligible", "--retarget"][..],
+        ] {
+            let err = mode_of(bad).unwrap_err();
+            assert!(err.contains("--count-eligible"), "{bad:?}: {err}");
+        }
+        assert_eq!(
+            mode_of(&["--dry-run", "--count-eligible"]).unwrap(),
+            Mode::Enumerate
+        );
+    }
+
+    /// `--singleton-ledger` is a decomposition flag: it composes with every
+    /// decomposition mode, `--include-judged-atomic` is meaningless without
+    /// it, and `--retarget` (which makes no decomposition verdict) refuses it.
+    /// A recording mode opens the file for append; the read-only modes do not
+    /// create it.
+    #[test]
+    fn singleton_ledger_flags_compose_only_with_decomposition_modes() {
+        let ledger = std::env::temp_dir().join(format!("ledger-{}.jsonl", uuid::Uuid::new_v4()));
+        let l = ledger.to_str().unwrap();
+        assert_eq!(
+            mode_of(&["--priority", "recent", "--singleton-ledger", l]).unwrap(),
+            Mode::Run
+        );
+        assert_eq!(
+            mode_of(&["--apply-plan", "p.jsonl", "--singleton-ledger", l]).unwrap(),
+            Mode::ApplyPlan(PathBuf::from("p.jsonl"))
+        );
+        let err = mode_of(&["--include-judged-atomic"]).unwrap_err();
+        assert!(err.contains("--singleton-ledger"), "{err}");
+        let err = mode_of(&["--retarget", "--singleton-ledger", l]).unwrap_err();
+        assert!(err.contains("--retarget"), "{err}");
+
+        let r = super::open_singleton_ledger(Some(&ledger), &Mode::Enumerate).unwrap();
+        assert!(r.is_some_and(|l| l.is_empty()));
+        assert!(!ledger.exists(), "--dry-run creates no ledger file");
+        let r = super::open_singleton_ledger(Some(&ledger), &Mode::Plan("p".into())).unwrap();
+        assert!(r.is_some());
+        assert!(!ledger.exists(), "--plan creates no ledger file");
+        super::open_singleton_ledger(Some(&ledger), &Mode::Run).unwrap();
+        assert!(
+            ledger.exists(),
+            "a recording run proves the path writable before any LLM call"
+        );
+        std::fs::remove_file(&ledger).ok();
+        assert!(super::open_singleton_ledger(None, &Mode::Run)
+            .unwrap()
+            .is_none());
     }
 
     /// `--retarget` is a DRY RUN unless `--apply` is given, and neither dry
