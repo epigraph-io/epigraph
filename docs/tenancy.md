@@ -541,6 +541,13 @@ CLIs, workflow ingest, default and explicit tenancy declarations, and a raw
 `INSERT` on any role (an unstamped application session included, as above).
 `ClaimRepository::default_decl_for_author` runs the same check before it
 resolves a personal group, so no group is provisioned for a refused author.
+The MCP document ingests (`ingest_document`, `ingest_document_inline`,
+`ingest_document_spine`) resolve their owner group in the same order, with
+reads only (`IngestTx::owner_decl`): an acting link's operator group first,
+then `OPL01` for an unbound author, then the author's own personal group with
+`OPL02` for a link that is not acting. The detached ingests run that check
+before they write the paper row, so a refusal reaches the caller instead of
+the background task.
 Workflow ingest authors every row as ONE shared system agent under that agent's
 own stamp, so the database sees only it; its request paths therefore bind their
 real CALLER before writing (`OPL01` for an unbound caller, `OPL02` for a caller

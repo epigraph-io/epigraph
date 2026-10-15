@@ -922,8 +922,9 @@ pub async fn do_ingest_document(
 
     // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
-    // Every claim below is authored by the write identity and owned by that
-    // agent's personal group (`decl`), so that agent's viewer is the one
+    // Every claim below is authored by the write identity and owned by `decl`
+    // (that agent's personal group, or its operator's when it is
+    // operator-linked; see `IngestTx::owner_decl`), so that agent's viewer is the one
     // migration 077's `WITH CHECK` asks about — the sibling-tool identity, which
     // here IS the row's author (contrast the workflow executor, which authors as
     // its own system agent).
@@ -1728,8 +1729,9 @@ async fn persist_planned_claim(
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
-    // Tenancy declaration (PR-16): the ingesting agent's own personal group,
-    // resolved ONCE by the caller above its loop. It was resolved here per
+    // Tenancy declaration (PR-16): the owner group `IngestTx::owner_decl`
+    // resolves (the ingesting agent's own personal group, or its operator's
+    // when it is operator-linked), resolved ONCE by the caller above its loop. It was resolved here per
     // planned claim until review: an N-claim document then performed N
     // `pool.acquire()` calls and N identical `SELECT id FROM groups WHERE
     // did_key = ...` round trips for the same agent.
