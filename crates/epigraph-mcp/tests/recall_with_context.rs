@@ -3526,11 +3526,16 @@ async fn recall_with_context_returns_a_level_2_claim_without_paper_attribution(p
 /// The diverse surface seeds on the whole corpus too: a parentless claim
 /// inside the selected theme is a candidate for `diverse_select`.
 ///
-/// Every row sits in the one theme, so the theme-coverage guard passes and
-/// the DIVERSE path serves the page (not the flat fallback). That is what
-/// makes this test independent of the flat-path tests above: with the diverse
-/// candidate query still restricted to paragraphs, the parentless claim is
-/// absent here even when the flat path is fixed.
+/// Four of the five rows sit in the one theme, so the theme-coverage guard
+/// passes (4/5 probed rows reachable; 3/4 if the probe were paragraph-only)
+/// and the DIVERSE path serves the page. The fifth row is an UNTHEMED
+/// paragraph nearer the query than any themed paragraph: the flat fallback
+/// would put it second, the diverse path cannot return it. Its absence is
+/// what proves the diverse path served the page, so a regression that always
+/// falls back cannot pass here. That is also what makes this test independent
+/// of the flat-path tests above: with the diverse candidate query still
+/// restricted to paragraphs, the parentless claim is absent here even when
+/// the flat path is fixed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool: PgPool) {
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -3561,6 +3566,15 @@ async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool:
             .await,
         );
     }
+    let unthemed = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "an unthemed paragraph nearer than every themed one",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.05),
+        None,
+    )
+    .await;
 
     // alpha = 0.0: pure relevance, so the exact match must be selected.
     let results = recall_results_json(
@@ -3584,6 +3598,73 @@ async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool:
     assert!(
         results[0].get("paper").is_none(),
         "a parentless diverse hit omits `paper`; got {}",
+        results[0]
+    );
+    assert!(
+        !ids.contains(&unthemed.to_string()),
+        "the unthemed paragraph is the flat path's second hit; its presence means the \
+         page came from the flat fallback, not the diverse path. Got {ids:?}"
+    );
+}
+
+/// The diverse path's flat FALLBACK seeds on the whole corpus too. With no
+/// themes at all the diverse pipeline selects nothing and
+/// `recall_with_context_post_embed` falls back to
+/// `search_by_embedding_since` (the `kNN fallback` call site), a separate
+/// call from the `diverse=false` path, with its own scope argument.
+///
+/// Pre-fix (or with that one argument at `EmbeddingSeedScope::Paragraphs`)
+/// the parentless exact match is never a candidate and the page is
+/// `[paragraph]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_diverse_fallback_returns_a_parentless_best_match(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/fallback-parentless", "Fallback").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "a memorized note, no themes anywhere",
+        "{}",
+        &query,
+        None,
+    )
+    .await;
+    let para = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a weaker paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+    let themes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claim_themes")
+        .fetch_one(&pool)
+        .await
+        .expect("count themes");
+    assert_eq!(
+        themes, 0,
+        "calibration: no themes, so diverse must fall back"
+    );
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(true, Some(5), Some(0.0), /*limit=*/ 2),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![parentless.to_string(), para.to_string()],
+        "the diverse fallback must seed on every embedded claim: the parentless exact \
+         match first, then the weaker paragraph"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless fallback hit omits `paper`; got {}",
         results[0]
     );
 }
