@@ -458,7 +458,10 @@ pub fn build_cdst_sections(
 ///   floor nor a ceiling), so over-support is benign corroboration and
 ///   contributes 0 to both fields and to H¹.
 /// - `open_world_component`: |source_ow − expected_ow|
-/// - `ignorance_component`: |width_target − width_expected|
+/// - `ignorance_component`: |width_target − width_expected|; for `contradicts`
+///   / `refutes` (a ceiling, not an estimate) the target's plausibility above
+///   the ceiling, `max(0, target.pl − expected.pl)`, and 0 once its bel
+///   breaches the ceiling (that breach is a belief conflict)
 pub fn compute_cdst_edge_inconsistency(
     source_id: Uuid,
     target_id: Uuid,
@@ -564,8 +567,26 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
     // Open-world component: divergence in open-world mass
     let open_world_component = (target_interval.open_world - expected_interval.open_world).abs();
 
-    // Ignorance component: width mismatch (closed-world ignorance)
-    let ignorance_component = (target_interval.width() - expected_interval.width()).abs();
+    // Ignorance component: width mismatch (closed-world ignorance) — except
+    // for the Negative ceiling. Mutual exclusion's expected interval
+    // `[0, 1 − source.bel·f]` is a constraint, not an estimate whose width is
+    // anyone's ignorance: a width mismatch against it would charge ~0.85 to
+    // every believed target of a weak contradicter and outrank genuine
+    // ceiling breaches (relabelling them IgnoranceDrift). For a contradicts
+    // edge the ignorance is the part of the target's plausibility that
+    // reaches above the ceiling while its bel stays under it (the pair's
+    // consistency then turns on resolving the target's ignorance); once the
+    // bel breaches the ceiling the breach is a belief conflict, not ignorance.
+    let ignorance_component = match kind {
+        RestrictionKind::Negative(_) => {
+            if target_interval.bel > expected_interval.pl {
+                0.0
+            } else {
+                (target_interval.pl - expected_interval.pl).max(0.0)
+            }
+        }
+        _ => (target_interval.width() - expected_interval.width()).abs(),
+    };
 
     // Use default frame_closure_width_max = 0.2
     let obstruction_kind = classify_obstruction(
@@ -1908,5 +1929,111 @@ mod tests {
             "conflict_component must be 0, got {}",
             obs.conflict_component
         );
+        // Nor is the pair an ignorance obstruction: the target's whole
+        // interval sits under the ceiling. (A width mismatch against the
+        // permissive [0, 0.955] gave |0.20 − 0.955| = 0.755, which every such
+        // edge added to ignorance_h1.)
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "ignorance_component must be 0, got {}",
+            obs.ignorance_component
+        );
+    }
+
+    // ── Negative-arm ignorance and classification (U075) ──────────────────
+
+    #[test]
+    fn test_contradicts_weak_contradicter_adds_no_ignorance_to_believed_target() {
+        // A believed target [0.80, 0.90] under a weak contradicter
+        // [0.05, 0.20] at f = 0.9 is consistent: ceiling 0.955 sits above its
+        // whole interval. It must add nothing to ignorance_h1 either; a width
+        // mismatch against [0, 0.955] gave |0.10 − 0.955| = 0.855 per edge.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.05, 0.20, 0.0),
+            EpistemicInterval::new(0.80, 0.90, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "ignorance_component must be 0, got {}",
+            obs.ignorance_component
+        );
+    }
+
+    #[test]
+    fn test_contradicts_ceiling_breach_is_a_belief_conflict() {
+        // A moderately believed contradicter [0.50, 0.60] at f = 0.9 caps the
+        // target at 1 − 0.50·0.9 = 0.55. Target [0.75, 0.85] sits 0.20 above
+        // it: a genuine breach, labelled BeliefConflict. A width mismatch
+        // against [0, 0.55] (|0.10 − 0.55| = 0.45) would outrank the 0.20
+        // conflict and mislabel it IgnoranceDrift.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.50, 0.60, 0.0),
+            EpistemicInterval::new(0.75, 0.85, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            (obs.interval_inconsistency - 0.20).abs() < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.ignorance_component < 1e-9,
+            "a breached ceiling carries no ignorance term, got {}",
+            obs.ignorance_component
+        );
+        assert_eq!(obs.obstruction_kind, ObstructionKind::BeliefConflict);
+
+        // Even a small breach by a wide target stays a BeliefConflict:
+        // [0.60, 0.99] is 0.05 over the ceiling.
+        let wide = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.50, 0.60, 0.0),
+            EpistemicInterval::new(0.60, 0.99, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!((wide.conflict_component - 0.05).abs() < 1e-9);
+        assert_eq!(wide.obstruction_kind, ObstructionKind::BeliefConflict);
+    }
+
+    #[test]
+    fn test_contradicts_target_spanning_the_ceiling_is_ignorance() {
+        // Target [0.20, 0.90] under contradicter [0.60, 0.70] at f = 0.9
+        // (ceiling 0.46): its bel is under the ceiling (no conflict), but its
+        // plausibility reaches 0.44 above it. Whether the pair is consistent
+        // depends on resolving the target's ignorance, so the edge is
+        // IgnoranceDrift with ignorance_component 0.90 − 0.46 = 0.44.
+        let obs = compute_cdst_edge_inconsistency(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            EpistemicInterval::new(0.60, 0.70, 0.0),
+            EpistemicInterval::new(0.20, 0.90, 0.0),
+            "contradicts",
+            &sci(),
+        );
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            (obs.ignorance_component - 0.44).abs() < 1e-9,
+            "got {}",
+            obs.ignorance_component
+        );
+        assert_eq!(obs.obstruction_kind, ObstructionKind::IgnoranceDrift);
     }
 }
