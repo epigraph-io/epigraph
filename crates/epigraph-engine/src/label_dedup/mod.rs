@@ -152,7 +152,7 @@ pub enum LabelDedupError {
     InvalidRunTag(String),
     #[error("INVALID_LABEL: {label:?}: {reason}")]
     InvalidLabel { label: String, reason: String },
-    #[error("TRUNCATED: a family read hit its cap; refusing to apply a plan built on a prefix")]
+    #[error("TRUNCATED: a family read hit its cap; refusing to act on a prefix of the family")]
     Truncated,
     #[error("TOO_MANY_CANDIDATES: {got} candidates, at most {max} per call")]
     TooManyCandidates { got: usize, max: usize },

@@ -55,7 +55,10 @@ pub struct ProbeVerdict {
 /// excluded), then, for a candidate still `new`, against `closed_signals`.
 ///
 /// # Errors
-/// [`LabelDedupError::TooManyCandidates`] above [`PROBE_MAX_CANDIDATES`].
+/// [`LabelDedupError::TooManyCandidates`] above [`PROBE_MAX_CANDIDATES`];
+/// [`LabelDedupError::Truncated`] when `index` or `closed_signals` hit their
+/// read cap. A twin past the cap would otherwise read as `new`, and the
+/// writer would file the duplicate the probe exists to prevent.
 pub fn probe(
     profile: &LabelDedupProfile,
     index: &Snapshot,
@@ -67,6 +70,9 @@ pub fn probe(
             got: candidates.len(),
             max: PROBE_MAX_CANDIDATES,
         });
+    }
+    if index.truncated || closed_signals.is_some_and(|s| s.truncated) {
+        return Err(LabelDedupError::Truncated);
     }
     let pass = &profile.pass;
     let sorted = |snap: &Snapshot| {

@@ -116,3 +116,67 @@ fn a_probe_is_capped() {
     let out = probe(&profile(), &index(), None, &many[..PROBE_MAX_CANDIDATES]).expect("at the cap");
     assert_eq!(out.len(), PROBE_MAX_CANDIDATES);
 }
+
+#[test]
+fn a_probe_over_a_truncated_read_is_refused() {
+    // The candidate's twin sorts past the read cap. A `new` verdict here
+    // would tell the writer to file a duplicate, so the probe refuses.
+    let rows = || {
+        vec![
+            claim(
+                1,
+                f::MURAL_MSB,
+                &["notice", "src-direct-a"],
+                "2026-06-22T00:00:00Z",
+            ),
+            claim(2, f::STEAM_A, &["notice"], "2026-07-01T00:00:00Z"),
+            claim(
+                9,
+                f::WING_FEED,
+                &["notice", "src-feed"],
+                "2026-06-28T00:00:00Z",
+            ),
+        ]
+    };
+    let twin = [cand("same", f::WING_DIRECT, &[])];
+    let capped = Snapshot::from_capped(rows(), 2);
+    assert!(capped.truncated, "precondition: the twin is past the cap");
+    let err = probe(&profile(), &capped, None, &twin).expect_err("truncated index");
+    assert_eq!(err.code(), "TRUNCATED");
+    // Control: a cap that fits the family finds the twin.
+    let whole = Snapshot::from_capped(rows(), 3);
+    let out = probe(&profile(), &whole, None, &twin).expect("complete index");
+    assert_eq!(out[0].verdict, ProbeVerdictKind::Match);
+    assert_eq!(out[0].matched_id, Some(id(9)));
+
+    // A truncated closed-signal read is refused the same way.
+    let closed = |cap| {
+        Snapshot::from_capped(
+            vec![
+                claim(
+                    7,
+                    f::LEAD_PERMIT_OLD,
+                    &["lead", "resolved"],
+                    "2026-06-29T00:00:00Z",
+                ),
+                claim(
+                    8,
+                    f::LEAD_CHILLER,
+                    &["lead", "resolved"],
+                    "2026-06-29T00:00:00Z",
+                ),
+            ],
+            cap,
+        )
+    };
+    let lead = [cand(
+        "lab-lead",
+        "Lead: Cold Room Chiller Swap PRJ-007731 | Acme Medical Center | sector:univ",
+        &["lead"],
+    )];
+    let err = probe(&profile(), &whole, Some(&closed(1)), &lead).expect_err("truncated signals");
+    assert_eq!(err.code(), "TRUNCATED");
+    let out = probe(&profile(), &whole, Some(&closed(2)), &lead).expect("complete signals");
+    assert_eq!(out[0].verdict, ProbeVerdictKind::MatchOnly);
+    assert_eq!(out[0].matched_id, Some(id(8)));
+}
