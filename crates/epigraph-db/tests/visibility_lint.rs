@@ -1855,6 +1855,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "find_by_content_hash_legacy_conn",
+        "WRITE-PATH READ. `create_conn`'s legacy `content_hash` dedup probe, moved into one \
+         function so the unlocked hit check and the re-check under the (content_hash, agent_id) \
+         dedup lock run the same SQL (backlog 00f1a517). It is the existing VISIBILITY-EXEMPT \
+         write-path read: its only callers are create_conn and create_conn_serialized, which \
+         return the row as the answer to their own create, not a disclosure to a viewer.",
+    ),
+    (
+        "claim.rs",
         "set_properties_conn",
         "WRITE. `UPDATE claims SET properties` by primary key on a claim the same transaction \
          just created — the ingest walk's hierarchy metadata. Authorised by claims_tenancy's \
