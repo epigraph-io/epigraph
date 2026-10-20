@@ -10,11 +10,14 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::classify::{classify_pair, cluster_conflict, hygiene_reason, ConflictKind, PairVerdict};
+use super::classify::{is_non_member, is_partially_retired};
+use super::ids::{carried_id, is_iso_date, is_us_date};
 use super::profile::{
-    expand, label_problem, Bindings, LabelDedupProfile, PassProfile, SupersedeMatch, TieBreak, Tier,
+    expand, label_problem, AgeKey, AgeKeyName, Bindings, CloseoutSpec, LabelDedupProfile,
+    LifecycleSpec, PassProfile, ReadPurpose, SupersedeMatch, TieBreak, Tier,
 };
 use super::record::{parse_record, unknown_count, ParsedRecord};
-use super::{iso_prefix_date, DedupClaim, LabelDedupError, Section, Snapshot};
+use super::{iso_prefix_date, normalize_text, DedupClaim, LabelDedupError, Section, Snapshot};
 
 /// What to plan.
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +348,24 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
         }
     }
 
+    let lifecycle_inputs = if has(Section::Lifecycle) {
+        let signals = inputs
+            .lifecycle_signals
+            .as_ref()
+            .ok_or(LabelDedupError::InputMissing {
+                purpose: ReadPurpose::LifecycleSignals,
+            })?;
+        let targets = inputs
+            .lifecycle_targets
+            .as_ref()
+            .ok_or(LabelDedupError::InputMissing {
+                purpose: ReadPurpose::LifecycleTargets,
+            })?;
+        Some((signals, targets))
+    } else {
+        None
+    };
+
     let main = run_pass(
         &profile.pass,
         &inputs.members.claims,
@@ -389,6 +410,27 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
         signal_dedup: None,
         signal_superseded: Vec::new(),
     };
+    if let (Some(cs), Some(as_of)) = (
+        profile.closeout.as_ref().filter(|_| has(Section::Closeout)),
+        req.as_of,
+    ) {
+        plan.past_due = plan_closeout(&profile.pass, cs, &main, as_of, req.run_tag)?;
+    }
+    if let (Some(lc), Some((signals, targets)), Some(as_of)) =
+        (profile.lifecycle.as_ref(), lifecycle_inputs, req.as_of)
+    {
+        let closed_now: BTreeSet<Uuid> = plan.past_due.iter().map(|p| p.id).collect();
+        plan.lifecycle = plan_lifecycle(
+            &profile.pass,
+            lc,
+            signals,
+            targets,
+            &main,
+            &closed_now,
+            as_of,
+            req.run_tag,
+        )?;
+    }
     plan.plan_hash = compute_plan_hash(
         req.profile_hash,
         req.run_tag,
@@ -922,4 +964,245 @@ fn build_cluster(
         carry_add,
         stranded_due,
     })
+}
+
+// ── Close-out ───────────────────────────────────────────────────────────────
+
+/// Live members (never a loser, never hygiene) whose date is strictly before
+/// `as_of`. A survivor is judged by the latest date across its cluster, but
+/// only when it has a date of its own: no date is ever invented.
+fn plan_closeout(
+    pass: &PassProfile,
+    cs: &CloseoutSpec,
+    main: &PassResult,
+    as_of: NaiveDate,
+    run_tag: &str,
+) -> Result<Vec<PastDue>, LabelDedupError> {
+    let bind = Bindings {
+        run_tag,
+        family: &pass.family_label,
+        survivor: None,
+        target: None,
+    };
+    let add = expand_all(&cs.add, &bind)?;
+    let field = cs.date_field.as_str();
+    let by_id: BTreeMap<Uuid, &ParsedRecord> = main.records.iter().map(|r| (rid(r), r)).collect();
+    let mut out = Vec::new();
+    for r in &main.records {
+        let id = rid(r);
+        if main.loser_of.contains_key(&id) {
+            continue;
+        }
+        let (own, eff) = effective_date(pass, r, field);
+        let Some(eff) = eff.filter(|_| own.is_some()) else {
+            continue;
+        };
+        let latest = main.cluster_of.get(&id).map_or(eff, |members| {
+            members
+                .iter()
+                .filter(|m| **m != id)
+                .filter_map(|m| by_id.get(m))
+                .filter_map(|l| effective_date(pass, l, field).1)
+                .fold(eff, std::cmp::max)
+        });
+        if latest < as_of {
+            out.push(PastDue {
+                id,
+                due: latest,
+                reason: format!("{field} {latest} is before {as_of}"),
+                add: add.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────────────────
+
+/// Graduation, then age-out, for each open signal. The graduation index is
+/// the post-plan family: survivors (with their carried ids), unclustered and
+/// just-closed members, and closed members; never a loser, a hygiene claim or
+/// a partial retirement. A live target beats a closed one, then the smallest
+/// id wins.
+#[allow(clippy::too_many_arguments)]
+fn plan_lifecycle(
+    pass: &PassProfile,
+    lc: &LifecycleSpec,
+    signals: &Snapshot,
+    targets: &Snapshot,
+    main: &PassResult,
+    closed_now: &BTreeSet<Uuid>,
+    as_of: NaiveDate,
+    run_tag: &str,
+) -> Result<Vec<LifecycleAction>, LabelDedupError> {
+    let carry_prefix_ids = pass.ids.carry_label_prefix.as_deref().unwrap_or_default();
+    let mut index: BTreeMap<String, BTreeSet<(bool, Uuid)>> = BTreeMap::new();
+    let mut target_claims: Vec<&DedupClaim> = targets.claims.iter().collect();
+    target_claims.sort_by_key(|c| c.id);
+    for c in target_claims {
+        if c.labels
+            .iter()
+            .any(|l| lc.target_exclude_labels.contains(l))
+            || main.loser_of.contains_key(&c.id)
+            || main.hygiene_ids.contains(&c.id)
+        {
+            continue;
+        }
+        let r = parse_record(pass, c);
+        if is_non_member(pass, &r) || is_partially_retired(pass, &r) {
+            continue;
+        }
+        let closed = pass
+            .closed_label
+            .as_ref()
+            .is_some_and(|l| c.labels.contains(l))
+            || closed_now.contains(&c.id);
+        let mut strong = r.keys.strong_ids.clone();
+        if let Some(extra) = main.carried_ids.get(&c.id) {
+            strong.extend(
+                extra
+                    .iter()
+                    .filter_map(|n| carried_id(&pass.ids, &format!("{carry_prefix_ids}{n}")))
+                    .filter(|t| t.strong)
+                    .map(|t| t.norm),
+            );
+        }
+        for id in strong {
+            index.entry(id).or_default().insert((closed, c.id));
+        }
+    }
+
+    let mut signal_claims: Vec<&DedupClaim> = signals.claims.iter().collect();
+    signal_claims.sort_by_key(|c| c.id);
+    signal_claims.dedup_by_key(|c| c.id);
+    let mut out = Vec::new();
+    for s in signal_claims {
+        let closed = s
+            .labels
+            .iter()
+            .any(|l| lc.signal_exclude_labels.contains(l) || pass.closed_label.as_ref() == Some(l));
+        if closed {
+            continue;
+        }
+        let r = parse_record(pass, s);
+        let target = if is_umbrella(lc, &s.content) {
+            None
+        } else {
+            r.keys
+                .strong_ids
+                .iter()
+                .filter_map(|i| index.get(i))
+                .flat_map(|v| v.iter())
+                .min()
+                .map(|(_, t)| *t)
+        };
+        if let Some(target) = target {
+            let t = target.to_string();
+            let bind = Bindings {
+                run_tag,
+                family: &lc.signal_family_label,
+                survivor: None,
+                target: Some(&t),
+            };
+            out.push(LifecycleAction {
+                id: s.id,
+                kind: LifecycleKind::Graduated { target },
+                add: expand_all(&lc.graduate_add, &bind)?,
+            });
+            continue;
+        }
+        let (Some(max_age), Some(key_date)) = (lc.max_age_days, age_key(lc, s)) else {
+            continue;
+        };
+        if (as_of - key_date).num_days() > max_age {
+            let bind = Bindings {
+                run_tag,
+                family: &lc.signal_family_label,
+                survivor: None,
+                target: None,
+            };
+            out.push(LifecycleAction {
+                id: s.id,
+                kind: LifecycleKind::AgedOut { key_date },
+                add: expand_all(&lc.age_out_add, &bind)?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Signals that cover many items (programs, batches, budgets) never graduate
+/// on one shared id: a false positive only means the signal ages out.
+fn is_umbrella(lc: &LifecycleSpec, content: &str) -> bool {
+    let u = &lc.umbrella;
+    let n = normalize_text(content);
+    let body = u
+        .strip_prefix
+        .as_deref()
+        .and_then(|p| n.strip_prefix(p.to_lowercase().as_str()))
+        .unwrap_or(&n);
+    let tokens: BTreeSet<&str> = body.split(' ').collect();
+    u.body_prefixes.iter().any(|p| {
+        let p = normalize_text(p);
+        !p.is_empty() && body.starts_with(&p)
+    }) || u
+        .tokens
+        .iter()
+        .any(|t| tokens.contains(normalize_text(t).as_str()))
+        || u.phrases.iter().any(|p| {
+            let p = normalize_text(p);
+            !p.is_empty() && body.contains(&p)
+        })
+}
+
+/// The first date the age-key chain yields.
+fn age_key(lc: &LifecycleSpec, claim: &DedupClaim) -> Option<NaiveDate> {
+    let lower = claim.content.to_ascii_lowercase();
+    lc.age_key.iter().find_map(|k| match k {
+        AgeKey::AfterKeywords { after_keywords } => date_after_keyword(&lower, after_keywords),
+        AgeKey::Named(AgeKeyName::CreatedAt) => claim.created_at.map(|t| t.date_naive()),
+    })
+}
+
+/// The first date directly after one of `keywords` (a whole word on its
+/// left, then optional spaces, `:` or `=`), in `M/D/YY(YY)` or ISO form.
+fn date_after_keyword(lower: &str, keywords: &[String]) -> Option<NaiveDate> {
+    keywords.iter().find_map(|kw| {
+        let kw = kw.to_ascii_lowercase();
+        if kw.is_empty() {
+            return None;
+        }
+        lower.match_indices(kw.as_str()).find_map(|(at, _)| {
+            let boundary = lower[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if !boundary {
+                return None;
+            }
+            let rest = lower[at + kw.len()..].trim_start_matches([' ', ':', '=']);
+            let token = rest
+                .split(|c: char| c.is_whitespace() || matches!(c, ')' | '(' | '|' | ',' | ';'))
+                .next()?;
+            parse_signal_date(token)
+        })
+    })
+}
+
+fn parse_signal_date(token: &str) -> Option<NaiveDate> {
+    let token = token.trim_end_matches('.');
+    if is_iso_date(token) {
+        return NaiveDate::parse_from_str(token, "%Y-%m-%d").ok();
+    }
+    if !is_us_date(token) {
+        return None;
+    }
+    let mut parts = token.split('/').map(str::parse::<u32>);
+    let (m, d, y) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    let year = if y < 100 { 2000 + y } else { y };
+    NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, m, d)
 }
