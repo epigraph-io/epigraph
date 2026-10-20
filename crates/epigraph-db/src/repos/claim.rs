@@ -1271,8 +1271,8 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
         // Serialize against every other find-then-insert of this
-        // `(content_hash, agent_id)` — `create_or_get`, POST /claims, and
-        // another caller of this method — before the find
+        // `(content_hash, agent_id)` — `create_or_get`, POST /claims, a
+        // consolidation, and another caller of this method — before the find
         // (backlog 00f1a517). Without it two first creates both miss the find
         // (neither can see the other's uncommitted row) and both insert. The
         // find below stays content-hash-only (the legacy contract); the lock
@@ -5671,8 +5671,9 @@ impl ClaimRepository {
     /// a miss: [`Self::create_or_get`] / [`Self::create_or_get_signed`], POST
     /// /claims' duplicate check (`if_not_exists=false`), the legacy
     /// content-hash creates ([`Self::create_conn`], and [`Self::create`] /
-    /// [`Self::create_with_tx`], which delegate to it). Each takes it BEFORE its
-    /// find, and before any row lock of its own.
+    /// [`Self::create_with_tx`], which delegate to it), and
+    /// [`Self::consolidate_act_conn`]'s "identical merged claim already exists"
+    /// probe. Each takes it BEFORE its find, and before any row lock of its own.
     ///
     /// Writers that do not take it, and why that is not a check-then-act race:
     /// [`Self::create_strict`] and the other unconditional INSERTs (supersede,
@@ -9317,6 +9318,19 @@ impl ClaimRepository {
 
         let mut tx = conn.begin().await?;
 
+        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
+
+        // Serialize every find-then-insert of the merged claim's
+        // `(content_hash, acting agent)` — another consolidation into the same
+        // content, `create_or_get`, POST /claims, the legacy creates — before
+        // the "already exists" probe below (backlog 00f1a517). Without it two
+        // concurrent merges into identical content both miss the probe and
+        // both insert. Taken FIRST, before the sources' row locks: a merge
+        // then never holds a source row lock while it waits on the pair, which
+        // is the order every other holder of this lock uses (pair lock, then
+        // its own row writes).
+        Self::lock_content_hash_agent(&mut tx, content_hash.as_slice(), acting_agent_id).await?;
+
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.
         let locked = sqlx::query!(
@@ -9491,11 +9505,10 @@ impl ClaimRepository {
             }
         }
 
-        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
-
-        // Post-107 (content_hash, agent_id) uniqueness: an identical merged
-        // claim by this agent is returned rather than erroring (novelty-gate
-        // style), so a retried merge is idempotent instead of fatal.
+        // An identical merged claim by this agent is returned rather than
+        // inserted again (novelty-gate style), so a retried merge is idempotent
+        // instead of minting a second row. Runs under the pair lock taken above,
+        // so a concurrent merge's committed row is visible here.
         if let Some(existing) = sqlx::query!(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2"#,

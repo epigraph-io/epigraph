@@ -1062,7 +1062,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          no row for a viewer to filter. Its callers follow it with their own find: \
          create_or_get_signed and POST /claims' if_not_exists=false branch with \
          find_by_content_hash_and_agent, which takes the caller's viewer; create_conn_serialized \
-         with its existing VISIBILITY-EXEMPT write-path probe.",
+         and consolidate_act_conn with their existing VISIBILITY-EXEMPT write-path probes.",
     ),
     (
         "claim.rs",
