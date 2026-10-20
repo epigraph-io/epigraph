@@ -918,15 +918,18 @@ fn auth_for(agent: Uuid) -> epigraph_auth::AuthContext {
 /// MCP `add_step` as `agent` on the authenticated transport, which is where
 /// `require_workflow_authority` runs its arms.
 async fn mcp_add_step(
-    pool: &PgPool,
     server: &epigraph_mcp::server::EpiGraphMcpFull,
     agent: Uuid,
     canonical_name: &str,
     text: &str,
 ) -> Result<(), String> {
-    let viewer = epigraph_db::Viewer::resolve(pool, agent)
+    // The viewer the served tool builds: `request_viewer` on the server's
+    // app-role pool, with its refusal of an operated principal, from the same
+    // `AuthContext` the tool then authorizes.
+    let auth = auth_for(agent);
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, Some(&auth))
         .await
-        .expect("viewer");
+        .map_err(|e| e.message.to_string())?;
     epigraph_mcp::tools::step_ops::add_step(
         server,
         &viewer,
@@ -935,7 +938,7 @@ async fn mcp_add_step(
             step_text: text.to_string(),
             position: None,
         },
-        Some(&auth_for(agent)),
+        Some(&auth),
     )
     .await
     .map(|_| ())
@@ -1033,10 +1036,10 @@ async fn workflow_authority_keeps_the_first_operator_because_a_relink_is_refused
     let (s, b) = api.add_step(&o2_t, name, "second operator, after").await;
     assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
     // MCP (`require_workflow_authority`): the same.
-    mcp_add_step(&pool, &server, o1, name, "first operator, mcp")
+    mcp_add_step(&server, o1, name, "first operator, mcp")
         .await
         .expect("MCP: the first operator keeps the operator arm");
-    let refused = mcp_add_step(&pool, &server, o2, name, "second operator, mcp")
+    let refused = mcp_add_step(&server, o2, name, "second operator, mcp")
         .await
         .expect_err("MCP: the second operator is refused");
     assert!(refused.contains("was submitted by agent"), "{refused}");
@@ -1399,19 +1402,20 @@ async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_s
     .expect("level-2 steps");
     assert_eq!(level2, 2, "the harness sees both steps the report lost");
 
-    // The MCP twin, on the app-role pool exactly as served.
-    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let execs: Vec<epigraph_mcp::types::HierarchicalStepExecution> =
-        serde_json::from_value(json!(steps)).expect("step executions");
-    let r = epigraph_mcp::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
-        &app,
-        w.workflow_id,
-        true,
-        &execs,
-        Some(0.9),
-        Some("workflow-plan goal"),
-        Some("mcp-report"),
-        None,
+    // The MCP twin, through the served tool entrypoint on an app-role server
+    // (it picks the server's pool and embedder itself).
+    let server = mcp_server(&pool, 0x0C).await;
+    let r = epigraph_mcp::tools::workflow_hierarchical::report_hierarchical_outcome(
+        &server,
+        epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            workflow_id: w.workflow_id.to_string(),
+            success: true,
+            step_executions: serde_json::from_value(json!(steps)).expect("step executions"),
+            outcome_details: "mcp report".to_string(),
+            quality: Some(0.9),
+            run_label: Some("mcp-report".to_string()),
+            goal_text: Some("workflow-plan goal".to_string()),
+        },
     )
     .await
     .expect("the MCP report succeeds");
