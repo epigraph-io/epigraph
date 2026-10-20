@@ -1411,3 +1411,59 @@ async fn characterization_a_foreign_public_family_claim_is_a_member(pool: PgPool
         "{out}"
     );
 }
+
+/// The profile's own closed label is a retirement label: on stdio a free
+/// label is ungated, but closing another author's claim with the profile's
+/// closed label takes the same ownership gate as `resolved`. The server's
+/// own past-due claim closes (control); a stranger's fails its unit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_profiles_closed_label_takes_the_retirement_gate(pool: PgPool) {
+    let mut v = profile_value();
+    v["closed_label"] = json!("done");
+    v["closeout"] = json!({"date_field": "deadline", "add": ["done", "{run_tag}"]});
+    let bytes = serde_json::to_vec(&v).expect("profile");
+    let root = profile_root(&bytes);
+    let server = superuser_server(&pool, config(Some(&root), None, 5000)).await;
+    let agent = server.server_agent_id().await.expect("agent");
+    let group = personal_group_of(&pool, agent).await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("viewer");
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "item-closer").await;
+    // Both owned by the server agent's group, so only authorship differs.
+    let mine = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        FENCE,
+        &[FAMILY],
+        "2026-07-01T00:00:00Z",
+    )
+    .await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        group,
+        "public",
+        GATE,
+        &[FAMILY],
+        "2026-07-02T00:00:00Z",
+    )
+    .await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), &["closeout"]);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    assert_eq!(plan["past_due"].as_array().map(Vec::len), Some(2), "{plan}");
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(
+        result_for(&out, &format!("closeout:{mine}"))["ok"],
+        true,
+        "{out}"
+    );
+    assert_eq!(
+        result_for(&out, &format!("closeout:{theirs}"))["ok"],
+        false,
+        "{out}"
+    );
+    assert!(labels_of(&pool, mine).await.contains(&"done".to_string()));
+    assert!(!labels_of(&pool, theirs).await.contains(&"done".to_string()));
+}
