@@ -2345,11 +2345,6 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
-    // `db_caller_error`, not `internal_error`: a label refused by
-    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
-    // repo layer refuses it inside the same statement that would have written
-    // it, so nothing is persisted — only the reported code was wrong here.
-    //
     // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
     // WITH CHECK refuses it on an unstamped session. The stamp is the CALLER's
     // (batch H-b, D1): an author, or an operator over its agents' claims, writes
@@ -2360,6 +2355,59 @@ pub async fn update_labels(
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "update_labels").await?;
+    let out = relabel_claim(
+        server,
+        &mut tx,
+        viewer,
+        auth,
+        caller,
+        id,
+        &params.add,
+        &params.remove,
+    )
+    .await?;
+    tx.commit().await.map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "claim_id": id,
+        "labels": out.labels,
+        "admin_path": out.admin_path,
+    }))
+}
+
+/// What one label write through [`relabel_claim`] left on the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelabelOutcome {
+    /// The claim's labels after the write, as the statement returned them.
+    pub labels: Vec<String>,
+    /// Whether the write went through the audited admin path.
+    pub admin_path: bool,
+}
+
+/// The per-claim body of [`update_labels`]: every gate it runs and the write
+/// itself, on a transaction the CALLER opened (stamped from `caller` by
+/// `begin_author_stamped_tx`) and commits.
+///
+/// Shared so a tool that writes several claims in ONE transaction
+/// (`apply_label_dedup`'s write units) takes exactly `update_labels`' path per
+/// claim and adds no ungated label path of its own. A refusal returns before
+/// the write; the caller drops `tx`, which rolls back everything the
+/// transaction wrote, earlier claims included.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relabel_claim(
+    server: &EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    id: Uuid,
+    add: &[String],
+    remove: &[String],
+) -> Result<RelabelOutcome, McpError> {
+    // `db_caller_error`, not `internal_error`: a label refused by
+    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
+    // repo layer refuses it inside the same statement that would have written
+    // it, so nothing is persisted — only the reported code was wrong here.
+    //
     // OWNERSHIP OF THE WHOLE MUTATION on the authenticated transport, exactly as
     // `patch_claim` and the HTTP twin (`PATCH /api/v1/claims/:id/labels`,
     // `require_owner_or_admin`) require. Batch H-b review, measured on config A:
@@ -2380,18 +2428,9 @@ pub async fn update_labels(
     } else {
         None
     };
-    let retirement_grant = gate_retirement_label(
-        server,
-        &mut tx,
-        viewer,
-        auth,
-        caller,
-        id,
-        &params.add,
-        &params.remove,
-    )
-    .await?;
-    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let retirement_grant =
+        gate_retirement_label(server, tx, viewer, auth, caller, id, add, remove).await?;
+    let owner_group = crate::tools::admin_write::owner_group_of(tx, viewer, id).await?;
     let admin_path = crate::tools::admin_write::takes_admin_path(
         grant.or(retirement_grant),
         viewer,
@@ -2399,28 +2438,23 @@ pub async fn update_labels(
     );
     let labels = if admin_path {
         crate::tools::admin_write::admin_patch(
-            &mut tx,
+            tx,
             auth,
             id,
             epigraph_db::AdminClaimAction::UpdateLabels,
-            &params.add,
-            &params.remove,
+            add,
+            remove,
             None,
             None,
         )
         .await?
         .labels
     } else {
-        ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
+        ClaimRepository::update_labels_conn(tx, id, add, remove)
             .await
             .map_err(db_caller_error)?
     };
-    tx.commit().await.map_err(internal_error)?;
-    success_json(&serde_json::json!({
-        "claim_id": id,
-        "labels": labels,
-        "admin_path": admin_path,
-    }))
+    Ok(RelabelOutcome { labels, admin_path })
 }
 
 pub async fn patch_claim(
