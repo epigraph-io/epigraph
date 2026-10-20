@@ -374,3 +374,50 @@ fn closeout_writes_keep_the_family_label() {
         w.remove
     );
 }
+
+#[test]
+fn a_carried_date_alone_never_closes_a_claim() {
+    // Close-out acts only on a claim whose own content carries a date; a
+    // carried date extends that date, it never stands in for it.
+    let hand_labelled = claim(
+        1,
+        f::FENDER_DIRECT_NO_DUE,
+        &["notice", "src-direct-a", "due-carried:2026-06-01"],
+        "2026-05-01T00:00:00Z",
+    );
+    let p = plan_graph(
+        &profile(),
+        &[hand_labelled],
+        &closeout_sections(),
+        Some(date("2026-10-05")),
+    );
+    assert!(p.past_due.is_empty(), "{:?}", p.past_due);
+    // Control: the same label on a claim WITH its own date is honoured.
+    let dated = claim(
+        1,
+        f::FENDER_DIRECT_HELD,
+        &["notice", "src-direct-a", "due-carried:2026-11-01"],
+        "2026-05-01T00:00:00Z",
+    );
+    let p = plan_graph(
+        &profile(),
+        std::slice::from_ref(&dated),
+        &closeout_sections(),
+        Some(date("2026-10-05")),
+    );
+    assert!(
+        p.past_due.is_empty(),
+        "the carried 11-01 keeps it open: {:?}",
+        p.past_due
+    );
+    let p = plan_graph(
+        &profile(),
+        &[dated],
+        &closeout_sections(),
+        Some(date("2026-11-02")),
+    );
+    assert_eq!(
+        p.past_due.iter().map(|x| x.due).collect::<Vec<_>>(),
+        vec![date("2026-11-01")]
+    );
+}
