@@ -268,3 +268,185 @@ fn a_federated_tool_is_refused_for_a_dlg_token() {
     .expect_err("a delegated token must never reach a federated tool");
     assert!(err.message.contains("delegated"), "{}", err.message);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The whole chain on the real HTTP listener: a SIGNED token carrying `dlg`,
+// through `auth::bearer_auth_middleware` (`claims.into()`), `call_tool` and a
+// tool's `request_viewer`, on application-role pools as `main` wires them. The
+// tests above build `AuthContext` by hand, so none of them would notice a
+// layer between the JWT and the tool that dropped the claim.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHAIN_SECRET: &[u8] = b"delegated-run-token-chain-test-secret-32-bytes!!";
+
+/// A streamable-HTTP MCP listener behind the production bearer middleware,
+/// with the run-token switch as given. Its URL.
+async fn listener(pool: &PgPool, run_tokens: RunTokens) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+    let scoped = fixture::scoped_pool(pool).await;
+    let app = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
+        app.clone(),
+    ));
+    let signer = Arc::new(AgentSigner::from_bytes(&[0x76; 32]).expect("signer"));
+    let embedder = Arc::new(McpEmbedder::new(app.clone(), None).with_scoped_pool(scoped.clone()));
+    let template = EpiGraphMcpFull::new_shared(app, signer, embedder, false)
+        .with_scoped_pool(scoped)
+        .with_run_tokens(run_tokens);
+    let sessions = SessionFactory::new(template);
+    let service = StreamableHttpService::new(
+        move || Ok(sessions.session()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let state = epigraph_mcp::auth::McpAuthState {
+        jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(CHAIN_SECRET)),
+        resource_metadata_url: None,
+        revocation,
+    };
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(state, epigraph_mcp::auth::bearer_auth_middleware),
+    );
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(tcp, router).await.expect("serve");
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// A signed `agent` token for `principal`, `sub` = `client`, `dlg` as given.
+fn signed(client: Uuid, principal: Uuid, delegated_by: Option<Uuid>) -> String {
+    epigraph_auth::JwtConfig::from_secret(CHAIN_SECRET)
+        .issue_access_token(
+            client,
+            vec!["claims:read".to_string()],
+            "agent",
+            None,
+            Some(principal),
+            chrono::Duration::minutes(15),
+            epigraph_auth::AccessTokenBinding {
+                delegated_by,
+                ..epigraph_auth::AccessTokenBinding::NONE
+            },
+        )
+        .expect("mint")
+        .0
+}
+
+async fn post(
+    url: &str,
+    token: &str,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(s) = session {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    req.send().await.expect("POST")
+}
+
+/// The first SSE `data:` payload of `resp`, parsed.
+async fn data(mut resp: reqwest::Response) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut acc = String::new();
+    while let Ok(Ok(Some(bytes))) = tokio::time::timeout_at(deadline, resp.chunk()).await {
+        acc.push_str(&String::from_utf8_lossy(&bytes));
+        if let Some(line) = acc
+            .lines()
+            .find(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+        {
+            return serde_json::from_str(line.trim_start_matches("data:").trim())
+                .unwrap_or_else(|e| panic!("SSE data is JSON ({e}): {line}"));
+        }
+    }
+    panic!("no SSE data: {acc}");
+}
+
+/// `tools/call get_claim {claim}` on a fresh session; the JSON-RPC answer.
+async fn get_claim(url: &str, token: &str, claim: Uuid) -> serde_json::Value {
+    let init = post(
+        url,
+        token,
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "delegated-chain-test", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(init.status().as_u16(), 200, "initialize");
+    let session = init
+        .headers()
+        .get("Mcp-Session-Id")
+        .expect("session header")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let _ = data(init).await;
+    let notif = post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+    let resp = post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_claim", "arguments": {"claim_id": claim.to_string()}}
+        }),
+    )
+    .await;
+    data(resp).await
+}
+
+/// A signed delegated token reaches a tool on a listener built ON, and is
+/// refused as a delegation (not as a plain operated principal) on one built
+/// OFF; the same principal's token without `dlg` is refused as operated. So
+/// the claim survives every layer between the JWT and the tool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signed_dlg_token_reaches_a_tool_through_the_real_http_listener(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-chain").await;
+    let claim = fixture::seed_public_claim(&pool, d.operator, "delegated chain claim").await;
+    let on = listener(&pool, RunTokens::On).await;
+    let off = listener(&pool, RunTokens::Off).await;
+    let dlg_token = signed(d.delegator_client, d.principal, Some(d.delegator));
+
+    let admitted = get_claim(&on, &dlg_token, claim).await;
+    assert!(
+        admitted.get("error").is_none()
+            && admitted["result"]["isError"] != serde_json::json!(true)
+            && admitted.to_string().contains(&claim.to_string()),
+        "switch on: the delegated token must read the claim: {admitted}"
+    );
+
+    let refused = get_claim(&off, &dlg_token, claim).await;
+    assert!(
+        refused.to_string().contains("delegation is not live"),
+        "switch off: refused as a delegation, so the `dlg` claim reached the tool: {refused}"
+    );
+
+    let plain = get_claim(&on, &signed(d.delegator_client, d.principal, None), claim).await;
+    assert!(
+        plain.to_string().contains("stdio-only"),
+        "CALIBRATION: without `dlg` the operated principal is refused: {plain}"
+    );
+}
