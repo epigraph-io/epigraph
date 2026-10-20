@@ -106,13 +106,47 @@ fn delegation_not_live(principal: Option<uuid::Uuid>, delegator: uuid::Uuid) -> 
     }
 }
 
+/// The scope ceiling of a DELEGATED run token, checked before its delegation
+/// is (no read): a token carrying any scope outside
+/// `epigraph_auth::DELEGATED_SCOPE_CEILING` is refused whatever its
+/// delegation says.
+fn refuse_outside_ceiling(
+    auth: &AuthContext,
+    delegator: uuid::Uuid,
+    route: &str,
+) -> Result<(), ApiError> {
+    let outside = epigraph_auth::outside_delegated_ceiling(&auth.scopes);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "auth.delegation.rejected",
+        reason = "scope_outside_ceiling",
+        route = %route,
+        principal = ?auth.agent_id,
+        delegator = %delegator,
+        jti = %auth.jti,
+        scopes = ?outside,
+        "delegated run token refused: it carries scopes outside the delegated ceiling"
+    );
+    Err(ApiError::Forbidden {
+        reason: format!(
+            "a delegated run token may carry only the delegated scope ceiling ({}); this one \
+             also carries {}",
+            epigraph_auth::DELEGATED_SCOPE_CEILING.join(" "),
+            outside.join(" ")
+        ),
+    })
+}
+
 /// THE per-request check of a DELEGATED run token (a token carrying `dlg`),
 /// run by both bearer middlewares on EVERY request that carries one, before
 /// any route, extractor or handler: a route that never resolves a viewer is
 /// covered exactly like one that does. A token without `dlg` reads nothing
 /// here.
 ///
-/// One read, `AgentRepository::delegated_principal_pool` (no read at all while
+/// First the scope ceiling ([`refuse_outside_ceiling`], no read). Then one
+/// read, `AgentRepository::delegated_principal_pool` (no read at all while
 /// the process's `EPIGRAPH_RUN_TOKENS` switch is off, which refuses every such
 /// token). A live delegation is recorded in `extensions` as
 /// [`AdmittedDelegation`] for [`extract_viewer`]. Fails CLOSED: an answer the
@@ -132,6 +166,7 @@ async fn admit_delegated(
     let Some(delegator) = auth.delegated_by else {
         return Ok(());
     };
+    refuse_outside_ceiling(auth, delegator, route)?;
     let Some(principal) = auth.agent_id else {
         tracing::warn!(
             target: "auth.delegation.rejected",
@@ -194,11 +229,14 @@ async fn admit_delegated(
     _state: &AppState,
     auth: &AuthContext,
     _extensions: &mut axum::http::Extensions,
-    _route: &str,
+    route: &str,
 ) -> Result<(), ApiError> {
     match auth.delegated_by {
         None => Ok(()),
-        Some(delegator) => Err(delegation_not_live(auth.agent_id, delegator)),
+        Some(delegator) => {
+            refuse_outside_ceiling(auth, delegator, route)?;
+            Err(delegation_not_live(auth.agent_id, delegator))
+        }
     }
 }
 

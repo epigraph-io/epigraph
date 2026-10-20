@@ -388,6 +388,128 @@ async fn a_dlg_token_for_an_agent_of_another_operator_is_refused(pool: PgPool) {
     );
 }
 
+/// A delegated token is refused at admission when it carries ANY scope outside
+/// the delegated ceiling (no group or agent management, no webhooks, no client
+/// or admin scope), with a reason naming the ceiling. Calibration: a token
+/// carrying exactly the ceiling, for the same live delegation, is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dlg_token_with_a_scope_outside_the_ceiling_is_refused(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "ceiling").await;
+    let st = state(&pool, RunTokens::On);
+    let ceiling = [
+        "claims:read",
+        "claims:write",
+        "claims:challenge",
+        "evidence:read",
+        "evidence:submit",
+        "edges:read",
+        "edges:write",
+        "agents:read",
+    ];
+    assert_admitted(
+        "CALIBRATION: exactly the ceiling",
+        read(
+            &st,
+            &token_with(
+                &st,
+                d.delegator_client,
+                d.principal,
+                Some(d.delegator),
+                &ceiling,
+            ),
+        )
+        .await,
+    );
+    for extra in [
+        "claims:admin",
+        "webhooks:write",
+        "groups:write",
+        "groups:admin",
+        "agents:write",
+        "clients:admin",
+    ] {
+        let (status, body) = read(
+            &st,
+            &token_with(
+                &st,
+                d.delegator_client,
+                d.principal,
+                Some(d.delegator),
+                &["claims:read", extra],
+            ),
+        )
+        .await;
+        assert!(
+            status == StatusCode::FORBIDDEN
+                && body.contains("scope ceiling")
+                && body.contains(extra),
+            "a delegated token carrying {extra} must be refused at admission: {status} {body}"
+        );
+    }
+}
+
+/// `POST /api/v1/webhooks` with `access` and an EMPTY url, which the handler
+/// itself refuses (400) before storing anything.
+async fn register_webhook(state: &AppState, access: &str) -> (StatusCode, String) {
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/webhooks")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"url": " ", "event_types": [], "secret": SECRET})
+                        .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// A delegated identity never REGISTERS a webhook: a `dlg` token carrying
+/// `webhooks:write` is refused before the registration handler runs, and
+/// nothing is stored. Calibration: an unlinked agent's own token with the same
+/// scope and body reaches the handler (its own 400 for the empty url).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dlg_token_cannot_register_a_webhook(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "webhook-register").await;
+    let (unlinked, _) = delegation::agent_with_group(&pool, "webhook-register-unlinked").await;
+    let st = state(&pool, RunTokens::On);
+    let (status, body) = register_webhook(
+        &st,
+        &token_with(&st, d.delegator_client, unlinked, None, &["webhooks:write"]),
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST && body.contains("must not be empty"),
+        "CALIBRATION: a plain token reaches the registration handler: {status} {body}"
+    );
+    let (status, body) = register_webhook(
+        &st,
+        &token_with(
+            &st,
+            d.delegator_client,
+            d.principal,
+            Some(d.delegator),
+            &["claims:read", "webhooks:write"],
+        ),
+    )
+    .await;
+    assert!(
+        status == StatusCode::FORBIDDEN && body.contains("scope ceiling"),
+        "a delegated token must never reach webhook registration: {status} {body}"
+    );
+    assert!(
+        st.webhook_store.read().await.is_empty(),
+        "nothing may be registered"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Webhooks stay refused. A subscription is keyed on its PRINCIPAL, not on the
 // token that registered it, so a delegated identity must never receive

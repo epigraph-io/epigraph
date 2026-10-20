@@ -299,8 +299,9 @@ pub(crate) async fn with_admitted_delegation<F: std::future::Future>(
 /// read.
 ///
 /// # Errors
-/// INVALID_REQUEST (logged, never with the token) when the delegation is not
-/// live or the token names no principal; an internal error with a fixed
+/// INVALID_REQUEST (logged, never with the token) when the token carries a
+/// scope outside `epigraph_auth::DELEGATED_SCOPE_CEILING` (checked first, no
+/// read), when the delegation is not live, or when it names no principal; an internal error with a fixed
 /// message when the check cannot answer (fails closed).
 pub(crate) async fn admit_delegated_call(
     server: &EpiGraphMcpFull,
@@ -313,6 +314,28 @@ pub(crate) async fn admit_delegated_call(
     let Some(delegator) = auth.delegated_by else {
         return Ok(None);
     };
+    let outside = epigraph_auth::outside_delegated_ceiling(&auth.scopes);
+    if !outside.is_empty() {
+        tracing::warn!(
+            target: "auth.delegation.rejected",
+            reason = "scope_outside_ceiling",
+            tool = %tool,
+            principal = ?auth.agent_id,
+            delegator = %delegator,
+            jti = %auth.jti,
+            scopes = ?outside,
+            "MCP call refused: a delegated run token carrying scopes outside the delegated ceiling"
+        );
+        return Err(McpError::invalid_request(
+            format!(
+                "a delegated run token may carry only the delegated scope ceiling ({}); this one \
+                 also carries {}",
+                epigraph_auth::DELEGATED_SCOPE_CEILING.join(" "),
+                outside.join(" ")
+            ),
+            None,
+        ));
+    }
     let Some(principal) = auth.agent_id else {
         tracing::warn!(
             target: "auth.delegation.rejected",

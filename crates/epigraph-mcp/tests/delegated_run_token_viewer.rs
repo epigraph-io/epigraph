@@ -246,6 +246,49 @@ async fn the_actor_arm_is_admitted_for_a_dlg_token_and_not_for_a_plain_one(pool:
     );
 }
 
+/// The `claims:admin` arm of the ownership gate never runs for a delegated
+/// token, whatever it carries and with the admin-scope switch UNARMED (the
+/// switch state in which a standing `claims:admin` is honoured). The target is
+/// authored by an UNRELATED agent but owned by the operator's group, so only
+/// the admin arm could admit it. Calibration: the same principal's context
+/// without `dlg` and with the same scopes is admitted through that arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claims_admin_arm_never_runs_for_a_dlg_token(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-admin-arm").await;
+    let (stranger, _) = delegation::agent_with_group(&pool, "mcp-admin-arm-stranger").await;
+    let server = session(&pool, 0x77, RunTokens::On).await;
+    let scopes = ["claims:read", "claims:write", "claims:admin"];
+    let unarmed = |mut ctx: AuthContext| {
+        ctx.admin_scopes = epigraph_auth::AdminScopePosture::Unarmed;
+        ctx
+    };
+
+    let first = backlog_claim(&pool, stranger, d.operator_group).await;
+    resolve(
+        &server,
+        &pool,
+        first,
+        &unarmed(auth(d.delegator_client, d.principal, None, &scopes)),
+    )
+    .await
+    .expect("CALIBRATION: a plain context with claims:admin passes the admin arm");
+
+    let second = backlog_claim(&pool, stranger, d.operator_group).await;
+    let err = resolve(&server, &pool, second, &unarmed(dlg(&d, &scopes)))
+        .await
+        .expect_err("a delegated token must never pass the claims:admin arm");
+    assert!(
+        err.contains("requires claims:admin scope or ownership"),
+        "the ownership gate refused: {err}"
+    );
+    assert!(
+        !labels(&pool, second)
+            .await
+            .contains(&"resolved".to_string()),
+        "a refused retirement wrote"
+    );
+}
+
 /// Every federated tool refuses a delegated token, BEFORE its bearer could be
 /// forwarded downstream, whatever scope it carries. Calibration: the same
 /// context without `dlg` passes the same gate.
@@ -648,4 +691,42 @@ async fn a_long_lived_session_refuses_the_next_call_after_each_revocation(pool: 
 
     delegation::revoke_allowance(&pool, d.delegator_client).await;
     refused("the allowance revoked").await;
+}
+
+/// A delegated token carrying ANY scope outside the delegated ceiling is
+/// refused at dispatch, before any tool, with a reason naming the ceiling.
+/// Calibration: the same live delegation with `claims:read` alone reads.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dlg_token_with_a_scope_outside_the_ceiling_is_refused_at_dispatch(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-ceiling").await;
+    let claim = fixture::seed_public_claim(&pool, d.operator, "ceiling claim").await;
+    let on = listener(&pool, RunTokens::On).await;
+    let inside = get_claim(
+        &on,
+        &signed(d.delegator_client, d.principal, Some(d.delegator)),
+        claim,
+    )
+    .await;
+    assert!(
+        succeeded(&inside),
+        "CALIBRATION: within the ceiling: {inside}"
+    );
+    for extra in ["claims:admin", "groups:admin", "agents:write"] {
+        let answer = get_claim(
+            &on,
+            &signed_with(
+                d.delegator_client,
+                d.principal,
+                Some(d.delegator),
+                &["claims:read", extra],
+            ),
+            claim,
+        )
+        .await;
+        let text = answer.to_string();
+        assert!(
+            !succeeded(&answer) && text.contains("scope ceiling") && text.contains(extra),
+            "a delegated token carrying {extra} must be refused at dispatch: {answer}"
+        );
+    }
 }

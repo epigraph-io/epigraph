@@ -153,6 +153,35 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
     "instance:admin",
 ];
 
+/// The ONLY scopes a DELEGATED run token (an access token carrying `dlg`) may
+/// hold: claim, evidence and edge reads and writes, challenges, and agent
+/// reads. Never group or agent management, webhooks, clients, or any
+/// admin-only or elevated scope. The bearer layers refuse a delegated token
+/// that carries anything else ([`outside_delegated_ceiling`]), and
+/// [`AuthContext::has_scope`] never answers `true` outside it for a delegated
+/// context, so no out-of-ceiling gate (a `claims:admin` arm included) runs for
+/// one even where admission was skipped.
+pub const DELEGATED_SCOPE_CEILING: &[&str] = &[
+    "claims:read",
+    "claims:write",
+    "claims:challenge",
+    "evidence:read",
+    "evidence:submit",
+    "edges:read",
+    "edges:write",
+    "agents:read",
+];
+
+/// The scopes of `scopes` outside [`DELEGATED_SCOPE_CEILING`], in order.
+#[must_use]
+pub fn outside_delegated_ceiling(scopes: &[String]) -> Vec<&str> {
+    scopes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !DELEGATED_SCOPE_CEILING.contains(s))
+        .collect()
+}
+
 /// Whether `scope` is one of [`ADMIN_ONLY_SCOPES`].
 #[must_use]
 pub fn is_admin_only_scope(scope: &str) -> bool {
@@ -348,8 +377,14 @@ impl AuthContext {
     ///   [`AdminScopePosture::Unarmed`], ABSENT while it is
     ///   [`AdminScopePosture::Armed`].
     /// * Every other scope: as the token says.
+    ///
+    /// Before all of these: a DELEGATED context ([`Self::delegated_by`]) holds
+    /// nothing outside [`DELEGATED_SCOPE_CEILING`], whatever its token carries.
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
+        if self.delegated_by.is_some() && !DELEGATED_SCOPE_CEILING.contains(&scope) {
+            return false;
+        }
         let carried = self.scopes.iter().any(|s| s == scope);
         let elevated = self.elevation.is_some();
         if scope == ELEVATED_ONLY_SCOPE {
@@ -762,6 +797,59 @@ mod tests {
             "the old shape reads the token as one for the same agent, which it refuses if \
              that agent is operated"
         );
+    }
+
+    /// A DELEGATED context (one carrying `dlg`) holds no scope outside the
+    /// delegated ceiling, whatever its token carries and whatever the
+    /// admin-scope switch says, so no `claims:admin` arm (or any other
+    /// out-of-ceiling gate) can run for it even where the bearer layer's
+    /// admission refusal was skipped. Calibration: the same context without
+    /// `dlg`, switch unarmed, holds every scope it carries.
+    #[test]
+    fn a_delegated_context_holds_no_scope_outside_the_ceiling() {
+        let carried = [
+            "claims:read",
+            "claims:write",
+            "claims:admin",
+            "webhooks:write",
+            "groups:write",
+            "groups:admin",
+            "agents:write",
+            "clients:admin",
+        ];
+        let ctx = |delegated_by: Option<Uuid>| AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(Uuid::new_v4()),
+            owner_id: None,
+            client_type: ClientType::Agent,
+            scopes: carried.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: AdminScopePosture::Unarmed,
+            delegated_by,
+        };
+        let plain = ctx(None);
+        for scope in carried {
+            assert!(plain.has_scope(scope), "CALIBRATION: {scope}");
+        }
+        let delegated = ctx(Some(Uuid::new_v4()));
+        assert!(delegated.has_scope("claims:read"));
+        assert!(delegated.has_scope("claims:write"));
+        for scope in [
+            "claims:admin",
+            "webhooks:write",
+            "groups:write",
+            "groups:admin",
+            "agents:write",
+            "clients:admin",
+        ] {
+            assert!(
+                !delegated.has_scope(scope),
+                "a delegated context must not hold {scope}"
+            );
+        }
     }
 
     #[test]
