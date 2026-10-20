@@ -57,7 +57,9 @@
 
 use std::collections::BTreeMap;
 
-use epigraph_db::repos::mass_function::{MassFunctionRepository, UntypedBbaProvenance};
+use epigraph_db::repos::mass_function::{
+    MassFunctionRepository, UntypedBbaProvenance, COMBINATION_METHOD_LABELS,
+};
 use epigraph_engine::calibration::CalibrationConfig;
 use serde::Serialize;
 use uuid::Uuid;
@@ -92,7 +94,9 @@ pub enum LeaveNull {
     CachedCombination,
     UnlabelledSharedSlot,
     UntypedByDesign,
+    /// The assess shape: masses the writer already sized with a weight.
     MassesAlreadyWeighted,
+    /// An input labelled with a combination-rule name (any case).
     CombinationLabelledInput,
     NotEvidence,
     RelationshipNotStored,
@@ -116,9 +120,22 @@ pub enum Decision {
 }
 
 /// Writers #573 keeps untyped on purpose: their only type source is declared
-/// by the submitter and would raise the weight (`error_derived`), or the row
-/// is not evidence at all (`prior`, a vacuous hypothesis prior).
-const UNTYPED_BY_DESIGN: [&str; 2] = ["error_derived", "prior"];
+/// by the submitter and would raise the weight (`error_derived`), the row is
+/// not evidence at all (`prior`, a vacuous hypothesis prior), or its NULL type
+/// is what keeps it undiscounted (the `truth_value` seed: `source_strength`
+/// 1.0 through `effective_source_strength`'s exempt arm, so its BetP stays the
+/// claim's `truth_value`).
+const UNTYPED_BY_DESIGN: [&str; 3] = [
+    "error_derived",
+    "prior",
+    epigraph_mcp::tools::ds_auto::TRUTH_VALUE_SEED_METHOD,
+];
+
+/// Whether `frame` is one `routes/assess.rs::assess_claim` auto-creates:
+/// `research_validity`, or `paper_validity_<slug>`.
+fn is_assess_frame(frame: Option<&str>) -> bool {
+    frame.is_some_and(|f| f == "research_validity" || f.starts_with("paper_validity_"))
+}
 
 /// Methodologies that decide nothing about the kind of support (the typing
 /// study's rules fall through them to the evidence row). Any other non-blank
@@ -174,6 +191,34 @@ pub fn decide(row: &UntypedBbaProvenance, calibration: &CalibrationConfig) -> De
     let method = row.combination_method.as_deref().unwrap_or("");
     if UNTYPED_BY_DESIGN.contains(&method) {
         return Decision::LeaveNull(N::UntypedByDesign);
+    }
+
+    // Masses that already carry a weight: a typed row would be weighed twice,
+    // and no #573 writer types these shapes.
+    let agentless_unscoped = row.source_agent_id.is_none() && row.perspective_id.is_none();
+    // The assess input: agent-less, perspective-less `discount`, its masses
+    // sized by `build_bba_directed` with the type weight. An anonymous REST
+    // input has the same stored shape and cannot be told apart, so both stay.
+    if agentless_unscoped && method == "discount" {
+        return Decision::LeaveNull(N::MassesAlreadyWeighted);
+    }
+    // A lone unlabelled agent-less row on an assess auto-frame: the
+    // single-input fold that replaced that input in the shared slot.
+    if agentless_unscoped
+        && row.combination_method.is_none()
+        && is_assess_frame(row.frame_name.as_deref())
+    {
+        return Decision::LeaveNull(N::MassesAlreadyWeighted);
+    }
+    // Not a cache (checked above), so an input: `submit_ds_evidence` stores
+    // its rule's name, and without a caller type it stored masses already
+    // discounted by the caller's reliability (with a type, it stores RAW
+    // masses). Any case, so an out-of-repo writer's `dempster` stays too.
+    if COMBINATION_METHOD_LABELS
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(method))
+    {
+        return Decision::LeaveNull(N::CombinationLabelledInput);
     }
     let not_evidence_label = row
         .claim_labels

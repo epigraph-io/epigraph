@@ -113,9 +113,12 @@ const fn combination_method_label(method: epigraph_ds::CombinationMethod) -> &'s
     }
 }
 
-/// Every `combination_method` label a cached combination row can carry, other
-/// than the `cautious+…` family.
-const CACHED_COMBINATION_LABELS: [&str; 8] = {
+/// The `combination_method` label of every [`epigraph_ds::CombinationMethod`]
+/// (its `Debug` name). A cached combination row carries one, and so does a
+/// `submit_ds_evidence` INPUT row (which has an agent), so a label alone does
+/// not mark a cache. Public so the legacy evidence-type backfill recognises
+/// these inputs by the same list.
+pub const COMBINATION_METHOD_LABELS: [&str; 7] = {
     use epigraph_ds::CombinationMethod as M;
     [
         combination_method_label(M::Conjunctive),
@@ -125,6 +128,21 @@ const CACHED_COMBINATION_LABELS: [&str; 8] = {
         combination_method_label(M::DuboisPrade),
         combination_method_label(M::Inagaki),
         combination_method_label(M::TbmConjunctive),
+    ]
+};
+
+/// Every `combination_method` label a cached combination row can carry, other
+/// than the `cautious+…` family.
+const CACHED_COMBINATION_LABELS: [&str; 8] = {
+    let l = COMBINATION_METHOD_LABELS;
+    [
+        l[0],
+        l[1],
+        l[2],
+        l[3],
+        l[4],
+        l[5],
+        l[6],
         CACHED_COMBINATION_UNFOLDED,
     ]
 };
@@ -1277,6 +1295,12 @@ impl MassFunctionRepository {
 pub struct UntypedBbaProvenance {
     pub id: Uuid,
     pub combination_method: Option<String>,
+    /// `mass_functions.source_agent_id`.
+    pub source_agent_id: Option<Uuid>,
+    /// `mass_functions.perspective_id`.
+    pub perspective_id: Option<Uuid>,
+    /// `frames.name` of the BBA's frame.
+    pub frame_name: Option<String>,
     /// TRUE for a cached combination row, by [`cached_combination_predicate`].
     pub cached_combination: bool,
     /// TRUE for an UNLABELLED (`combination_method` NULL) row with no agent and
@@ -1327,6 +1351,9 @@ impl MassFunctionRepository {
             r#"
             SELECT m.id,
                    m.combination_method,
+                   m.source_agent_id,
+                   m.perspective_id,
+                   f.name::text AS frame_name,
                    {cached} AS cached_combination,
                    (m.combination_method IS NULL
                     AND m.source_agent_id IS NULL AND m.perspective_id IS NULL
@@ -1343,6 +1370,7 @@ impl MassFunctionRepository {
                    COALESCE(sa.display_name, ca.display_name)::text AS agent_name
               FROM mass_functions m
               LEFT JOIN claims c        ON c.id = m.claim_id
+              LEFT JOIN frames f        ON f.id = m.frame_id
               LEFT JOIN evidence e      ON e.id = m.evidence_id
               LEFT JOIN perspectives p  ON p.id = m.perspective_id
               LEFT JOIN agents sa       ON sa.id = m.source_agent_id
