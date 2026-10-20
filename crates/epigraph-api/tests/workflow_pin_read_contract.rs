@@ -52,8 +52,8 @@
 //!   system agent live-linked to the first human: that human over REST; its
 //!   linked curator over stdio (the REST ingest refuses its token); an
 //!   unlinked curator nowhere over REST
-//!   (`OPL01`); and a curator of a SECOND human nowhere (`OPL02` over stdio,
-//!   nothing written). A curator re-linked to the second human cannot be
+//!   (`OPL01`); and a curator of a SECOND human nowhere (refused by the REST
+//!   ingest as an operated agent, `OPL02` over stdio, nothing written). A curator re-linked to the second human cannot be
 //!   constructed, as in (e).
 //! * (g) An `epigraph_app` session that sets `epigraph.group_ids` itself reads
 //!   a G-private claim and its `executes` edge: the GUCs are session
@@ -1095,9 +1095,10 @@ async fn plan_owners(pool: &PgPool, name: &str) -> Vec<Uuid> {
 /// * NOT a curator linked to the first human over REST: the REST ingest
 ///   refuses an operated agent's token. Over stdio it publishes, into the
 ///   first human's group;
-/// * NOT a curator linked to a SECOND human, on any transport: over stdio the
+/// * NOT a curator linked to a SECOND human, on either transport: the REST
+///   ingest refuses its token as an operated agent's, and over stdio the
 ///   caller check refuses it `OPL02` (it must belong to the system agent's
-///   human), and it writes nothing. This is the nearest shipped shape of "a
+///   human); it writes nothing on either. This is the nearest shipped shape of "a
 ///   curator re-linked to a second human": the re-link itself is refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
@@ -1173,7 +1174,17 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
     // It cannot be re-linked to the second human.
     assert_relink_refused(&pool, first_curator, o2).await;
 
-    // The second human's curator: OPL02 over stdio, nothing written.
+    // The second human's curator: refused by the REST ingest as an operated
+    // agent, OPL02 over stdio, nothing written on either.
+    let (s, b) = api
+        .post(
+            "/api/v1/workflows/ingest",
+            &token(second_curator, WRITE_SCOPES),
+            &small_extraction("acme-armed-second-http", 1),
+        )
+        .await;
+    assert_operated_refusal(s, &b, "a curator of another human over REST");
+    assert_eq!(workflows_named(&pool, "acme-armed-second-http").await, 0);
     let refused = stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
         .await
         .expect_err("a curator of another human must not publish through the system agent");
