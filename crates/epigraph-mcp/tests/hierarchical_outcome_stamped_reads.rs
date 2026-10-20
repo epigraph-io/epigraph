@@ -49,6 +49,9 @@ struct PrivateWorkflow {
     steps: Vec<Uuid>,
     member: Viewer,
     stranger: Viewer,
+    member_id: Uuid,
+    stranger_id: Uuid,
+    group: Uuid,
 }
 
 async fn app_role_server(pool: &PgPool) -> EpiGraphMcpFull {
@@ -148,6 +151,9 @@ async fn seed_private_workflow(pool: &PgPool, name: &str) -> PrivateWorkflow {
     PrivateWorkflow {
         workflow_id,
         steps,
+        member_id: member,
+        stranger_id: stranger,
+        group,
         member: Viewer::resolve(pool, member).await.expect("member viewer"),
         stranger: Viewer::resolve(pool, stranger)
             .await
@@ -515,4 +521,329 @@ async fn a_plan_without_ordinals_still_resolves_by_position(pool: PgPool) {
         "{json}"
     );
     assert!(unresolved(&json).is_empty(), "{json}");
+}
+
+// ── Through the transports ──────────────────────────────────────────────────
+//
+// The tests above call the tool functions with a viewer the test resolved. The
+// two below go through the served tool router, so they also pin how each
+// transport DERIVES the viewer: over HTTP from the bearer token's agent (the
+// `AuthContext` the middleware attaches), over stdio from the server's own
+// signing agent. A wrapper that passed a fixed or default viewer (for example
+// `request_viewer(self, None)` in the HTTP arm, which resolves the server's
+// own agent) records a member's rows with NULL step ids and fails here.
+
+const HTTP_SECRET: &[u8] = b"outcome-transport-test-secret-at-least-32-bytes";
+
+/// The streamable-HTTP listener `main` builds for `--listen --jwt-secret`,
+/// with both pools on the application role and the production revocation
+/// store, bound to an ephemeral port. The server's own signer belongs to no
+/// group.
+async fn http_listener(pool: &PgPool) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let app = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
+        app.clone(),
+    ));
+    let signer = Arc::new(epigraph_crypto::AgentSigner::from_bytes(&[0x5D; 32]).expect("signer"));
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(app.clone(), None).with_scoped_pool(scoped.clone()),
+    );
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(
+                EpiGraphMcpFull::new_shared(app.clone(), signer.clone(), embedder.clone(), false)
+                    .with_scoped_pool(scoped.clone()),
+            )
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let state = epigraph_mcp::auth::McpAuthState {
+        jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(HTTP_SECRET)),
+        resource_metadata_url: None,
+        revocation,
+    };
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(state, epigraph_mcp::auth::bearer_auth_middleware),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// An agent token for `agent` holding `claims:write`, the scope both outcome
+/// tools require.
+fn agent_token(agent: Uuid) -> String {
+    epigraph_auth::JwtConfig::from_secret(HTTP_SECRET)
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string(), "claims:write".to_string()],
+            "agent",
+            None,
+            Some(agent),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("mint")
+        .0
+}
+
+async fn http_post(
+    url: &str,
+    token: &str,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(s) = session {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    req.send().await.expect("POST")
+}
+
+/// The first non-empty SSE `data:` payload of `resp`, parsed.
+async fn sse_json(resp: &mut reqwest::Response) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut acc = String::new();
+    loop {
+        if let Some(line) = acc
+            .lines()
+            .find(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+        {
+            return serde_json::from_str(line["data:".len()..].trim()).expect("JSON-RPC payload");
+        }
+        match tokio::time::timeout_at(deadline, resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => acc.push_str(&String::from_utf8_lossy(&bytes)),
+            other => panic!("no SSE data before the stream ended: {other:?} after {acc:?}"),
+        }
+    }
+}
+
+/// `tools/call` `tool` with `arguments` over a fresh HTTP MCP session as the
+/// holder of `token`; returns the tool's JSON response.
+async fn http_call(
+    url: &str,
+    token: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let mut init = http_post(
+        url,
+        token,
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "outcome-transport-test", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(init.status().as_u16(), 200, "initialize");
+    let session = init
+        .headers()
+        .get("Mcp-Session-Id")
+        .expect("session header")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let _ = sse_json(&mut init).await;
+    let notif = http_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+    let mut resp = http_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}
+        }),
+    )
+    .await;
+    let rpc = sse_json(&mut resp).await;
+    let result = rpc
+        .get("result")
+        .unwrap_or_else(|| panic!("{tool}: JSON-RPC error: {rpc}"));
+    assert_eq!(result["isError"], false, "{tool}: {rpc}");
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{tool}: no text content: {rpc}"));
+    serde_json::from_str(text).expect("tool JSON")
+}
+
+/// The arguments for a two-step report on `workflow_id`, for each tool's
+/// parameter shape.
+fn transport_args(tool: &str, workflow_id: Uuid) -> serde_json::Value {
+    let log: Vec<serde_json::Value> = (0..2)
+        .map(|i| {
+            serde_json::json!({"step_index": i, "planned": format!("planned {i}"),
+                               "actual": "done", "deviated": false})
+        })
+        .collect();
+    match tool {
+        "report_hierarchical_outcome" => serde_json::json!({
+            "workflow_id": workflow_id.to_string(), "success": true,
+            "step_executions": log, "outcome_details": "transport probe", "quality": 0.9
+        }),
+        "report_workflow_outcome" => serde_json::json!({
+            "workflow_id": workflow_id.to_string(), "success": true,
+            "execution_log": log, "outcome_details": "transport probe", "quality": 0.9
+        }),
+        other => panic!("no arguments for {other}"),
+    }
+}
+
+async fn delete_rows(pool: &PgPool, workflow_id: Uuid) {
+    sqlx::query("DELETE FROM behavioral_executions WHERE workflow_id = $1")
+        .bind(workflow_id)
+        .execute(pool)
+        .await
+        .expect("reset rows");
+}
+
+/// Over HTTP MCP, each outcome tool resolves the steps through the TOKEN's
+/// agent: a member's token attributes every row; a non-member's token records
+/// NULL ids and is told which indices did not resolve.
+///
+/// RED at the base commit: the member's rows carried NULL step ids (the report
+/// ran unstamped) and the response named no unresolved indices.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_http_each_outcome_tool_reads_as_the_token_agent(pool: PgPool) {
+    let w = seed_private_workflow(&pool, "stamped-outcome-http").await;
+    let url = http_listener(&pool).await;
+
+    for tool in ["report_hierarchical_outcome", "report_workflow_outcome"] {
+        let json = http_call(
+            &url,
+            &agent_token(w.member_id),
+            tool,
+            transport_args(tool, w.workflow_id),
+        )
+        .await;
+        assert_eq!(
+            rows(&pool, w.workflow_id).await,
+            vec![
+                ("planned 0".to_string(), Some(w.steps[0])),
+                ("planned 1".to_string(), Some(w.steps[1])),
+            ],
+            "{tool}: a member's token resolves its group's steps: {json}"
+        );
+        assert!(unresolved(&json).is_empty(), "{tool}: {json}");
+        delete_rows(&pool, w.workflow_id).await;
+
+        let json = http_call(
+            &url,
+            &agent_token(w.stranger_id),
+            tool,
+            transport_args(tool, w.workflow_id),
+        )
+        .await;
+        assert_eq!(
+            rows(&pool, w.workflow_id).await,
+            vec![
+                ("planned 0".to_string(), None),
+                ("planned 1".to_string(), None),
+            ],
+            "{tool}: a non-member's token resolves nothing: {json}"
+        );
+        assert_eq!(unresolved(&json), vec![0, 1], "{tool}: {json}");
+        delete_rows(&pool, w.workflow_id).await;
+    }
+}
+
+/// Over stdio there is no token: the process's own signing agent is the
+/// principal. Served in-process over a duplex pipe (no `AuthContext` reaches
+/// the router, as on a real stdio transport), with that agent made a member
+/// of the plan's group, both tools resolve the group's steps.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_stdio_each_outcome_tool_reads_as_the_server_agent(pool: PgPool) {
+    use rmcp::ServiceExt;
+    let w = seed_private_workflow(&pool, "stamped-outcome-stdio").await;
+
+    // The server's agent, made a writer of the plan's group.
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x6E; 32]).expect("signer");
+    let server_agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(server_agent)
+        .bind(&signer.public_key()[..])
+        .execute(&pool)
+        .await
+        .expect("server agent");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(w.group)
+    .bind(server_agent)
+    .execute(&pool)
+    .await
+    .expect("server agent membership");
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(app.clone(), None).with_scoped_pool(scoped.clone());
+    let server = EpiGraphMcpFull::new(app, signer, embedder, false).with_scoped_pool(scoped);
+
+    let (server_io, client_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_io).await.expect("stdio-shaped client");
+
+    for tool in ["report_hierarchical_outcome", "report_workflow_outcome"] {
+        let result = client
+            .call_tool(rmcp::model::CallToolRequestParams {
+                meta: None,
+                name: tool.to_string().into(),
+                arguments: transport_args(tool, w.workflow_id).as_object().cloned(),
+                task: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{tool}: {e}"));
+        assert_eq!(result.is_error, Some(false), "{tool}: {result:?}");
+        let json = first_text(&result);
+        assert_eq!(
+            rows(&pool, w.workflow_id).await,
+            vec![
+                ("planned 0".to_string(), Some(w.steps[0])),
+                ("planned 1".to_string(), Some(w.steps[1])),
+            ],
+            "{tool}: the server agent is a member and resolves the steps: {json}"
+        );
+        assert!(unresolved(&json).is_empty(), "{tool}: {json}");
+        delete_rows(&pool, w.workflow_id).await;
+    }
+    let _ = client.cancel().await;
 }
