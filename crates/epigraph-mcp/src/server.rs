@@ -121,9 +121,9 @@ pub struct EpiGraphMcpFull {
     /// liveness round trip at all.
     pub(crate) connector_elevation: bool,
     /// Whether an HTTP request may carry a DELEGATED run token (a token with
-    /// `dlg`): admitted by `tools::viewer::request_viewer` and the ownership
-    /// gate only while its delegation is live, refused by every federated
-    /// tool whatever this says. OFF in every constructor; `main` sets it from
+    /// `dlg`): admitted by `call_tool`'s dispatch check
+    /// (`tools::viewer::admit_delegated_call`) only while its delegation is
+    /// live, refused by every federated tool whatever this says. OFF in every constructor; `main` sets it from
     /// `EPIGRAPH_RUN_TOKENS` at boot ([`Self::with_run_tokens`]).
     pub(crate) run_tokens: epigraph_db::RunTokens,
     /// The admin-scope switch (migration 128) as this process reads it,

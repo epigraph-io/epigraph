@@ -1,21 +1,28 @@
-//! A delegated run token at the REST viewer.
+//! A delegated run token on the REST surface.
 //!
 //! An operated agent (migration 107) is stdio-only: its writer membership in
 //! its operator's group would otherwise ride any HTTP token onto the surface.
 //! A DELEGATED run token is the one carve-out. It names its delegator (`dlg`),
 //! the agent of an OAuth client on migration 149's allowlist for the same
-//! operator, and the viewer admits it only while ALL of these hold, checked on
-//! every request:
+//! operator. The bearer middleware checks it on EVERY request that carries
+//! one, whether or not the route resolves a viewer, and admits it only while
+//! ALL of these hold:
 //!
-//! * the delegator's allowance is live (row not revoked, client `active`);
+//! * it carries no scope outside the delegated ceiling
+//!   (`epigraph_auth::DELEGATED_SCOPE_CEILING`);
+//! * the delegator's allowance is live (row not revoked, client `active`, the
+//!   agent's only client);
 //! * the principal's operator link is acting (not retired, writer row live)
 //!   and names the delegator's operator;
 //! * the delegator itself holds a live `writer`/`admin` membership in that
-//!   operator's group (so the token hands out nothing the delegator lacks);
+//!   operator's group (a precondition; what the token may WRITE is bounded by
+//!   the database's operator-scope rule, `OPL02`);
 //! * the process read `EPIGRAPH_RUN_TOKENS=on` at boot.
 //!
 //! A token carrying `dlg` whose delegation is not live is refused whatever the
-//! principal's link state: an unlinked principal cannot be delegated to.
+//! principal's link state: an unlinked principal cannot be delegated to. The
+//! viewer reuses the middleware's answer and is the principal's own
+//! membership set.
 //!
 //! Tokens are hand-signed with the state's own `JwtConfig` (no grant mints
 //! them yet). Passing the viewer shows as the handler's own "scoped
@@ -308,8 +315,8 @@ async fn revoking_the_registry_row_refuses_the_next_request(pool: PgPool) {
     assert_refused("allowance revoked", read(&st, &access).await);
 }
 
-/// The no-escalation conjunct: the delegator must itself be a live writer of
-/// the operator's group. Revoking its row refuses the next request.
+/// The delegator must itself be a live writer of the operator's group (a
+/// precondition of admission). Revoking its row refuses the next request.
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_the_delegators_membership_refuses_the_next_request(pool: PgPool) {
     let d = delegation::live_delegation(&pool, "revoke-delegator").await;

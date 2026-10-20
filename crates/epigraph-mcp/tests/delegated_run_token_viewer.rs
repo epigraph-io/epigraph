@@ -1,9 +1,12 @@
 //! A delegated run token on the MCP HTTP surface.
 //!
-//! Three sites read a token's `dlg` claim here:
+//! `call_tool` checks a token's `dlg` claim FIRST, on every tool call (the
+//! delegated scope ceiling, then the delegation's liveness), whether or not
+//! the tool resolves a viewer; the sites below reuse that answer:
 //!
 //! * `tools::viewer::request_viewer` admits an OPERATED principal only through
-//!   a live delegation, and then the viewer carries the operator's group;
+//!   a live delegation, and then the viewer is the principal's own membership
+//!   set, which carries the operator's group;
 //! * `require_owner_or_admin` gives a live delegation the ACTOR arm (stdio
 //!   parity: an agent acting for its operator over another of the operator's
 //!   agents' claims), which a plain HTTP token never gets;

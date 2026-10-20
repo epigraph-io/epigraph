@@ -1554,8 +1554,10 @@ impl AgentRepository {
 
     /// "May a token that `delegator_agent` asked for act as `principal`?" —
     /// THE per-request liveness check of a delegated run token (a token whose
-    /// `dlg` claim names `delegator_agent`), shared by every site that admits
-    /// one. `Some` iff ALL of these hold at the moment of the read:
+    /// `dlg` claim names `delegator_agent`), run once per request by the REST
+    /// bearer middlewares and the MCP dispatch, whose answer the viewers and
+    /// the ownership gate reuse. `Some` iff ALL of these hold at the moment of
+    /// the read:
     ///
     /// * `run_tokens` is [`RunTokens::On`] (else `None` with no read at all);
     /// * `delegator_agent` is bound to a human through migration 149's
@@ -1568,8 +1570,11 @@ impl AgentRepository {
     ///   record and a live writer membership of the operator's group);
     /// * `delegator_agent` ITSELF holds a live `writer`/`admin` membership of
     ///   that operator's group (`epigraph_live_memberships`, the read the
-    ///   viewer resolves on). This is the no-escalation conjunct: a delegated
-    ///   token hands out only write authority its delegator already holds.
+    ///   viewer resolves on). A PRECONDITION of admission, not a bound on
+    ///   what the token may do: the admitted viewer is the principal's own
+    ///   membership set, as on stdio, and its writes are bounded by the
+    ///   database's operator-scope rule (migration 122, `OPL02`) to groups
+    ///   the operator writes.
     ///
     /// An unlinked `principal` is never delegated to: it has no acting link.
     ///

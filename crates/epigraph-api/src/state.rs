@@ -315,8 +315,8 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub admin_cascade: bool,
     /// Whether this process admits a DELEGATED run token (a token carrying
-    /// `dlg`) at the request sites that check its delegation per request
-    /// (`middleware::bearer::extract_viewer`). OFF in every constructor;
+    /// `dlg`), which the bearer middlewares check on every request
+    /// (`middleware::bearer::admit_delegated`). OFF in every constructor;
     /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
     #[cfg(feature = "db")]
     pub run_tokens: epigraph_db::RunTokens,

@@ -252,8 +252,9 @@ pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
 /// it keeps minting; and an allowlisted agent that also holds a link record is
 /// refused here like any other. The registry IS read on the request path, for
 /// one kind of token only: a delegated run token's `dlg` delegator, through
-/// `AgentRepository::delegated_principal_pool` (the bearer and MCP viewers and
-/// the MCP ownership gate). No grant here mints such a token yet.
+/// `AgentRepository::delegated_principal_pool` (the REST bearer middlewares
+/// and the MCP dispatch, on every request that carries one). No grant here
+/// mints such a token yet.
 ///
 /// # Errors
 /// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
