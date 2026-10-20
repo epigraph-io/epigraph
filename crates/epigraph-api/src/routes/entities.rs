@@ -49,11 +49,10 @@
 //!
 //! # The writes are authorized against their target claim (backlog 850dcc61)
 //!
-//! `create_entity`, `batch_create_mentions` and `batch_create_triples` were the
-//! other 3 sites. They checked the `claims:write` scope and then inserted on the
-//! raw pool, so a `claims:write` caller could attach mentions and triples to any
-//! claim id it named, in any group. Each now runs on ONE
-//! [`AppState::write_as`] transaction stamped with the caller's viewer:
+//! `create_entity`, `batch_create_mentions` and `batch_create_triples` are the
+//! other 3 sites. Each mention or triple write is authorized against the claim
+//! it attaches to, through the caller's viewer, and every one of the three runs
+//! on ONE [`AppState::write_as`] transaction stamped with that viewer:
 //!
 //! * The two batch writes first resolve EVERY distinct `claim_id` in the batch
 //!   through the caller's viewer (`ClaimRepository::write_target_of`, the read
@@ -69,9 +68,12 @@
 //!   insert, and a refusal drops the transaction, so a batch is all or nothing.
 //! * `create_entity` has no target claim: `entities` is an instance-wide
 //!   dictionary with no tenancy columns and no row security. It stays at
-//!   `claims:write` and now writes on the stamped transaction, which also
-//!   refuses an elevated (read-only) token. Who may extend the dictionary
-//!   beyond `claims:write` is an open operator decision, recorded on 850dcc61.
+//!   `claims:write` and writes on the stamped transaction (so `write_as`'s
+//!   `ElevatedReadOnly` refusal applies to it as to every stamped write). Who
+//!   may add to the dictionary, or change an existing entry through the upsert's
+//!   conflict arm (`canonical_name`, merged `properties`, `embedding`), beyond
+//!   `claims:write` is an open operator decision, tracked as a backlog
+//!   follow-up; this change does not settle it.
 //!
 //! The MCP server has no entity / mention / triple WRITE tool (its three RDF
 //! tools, `query_triples`, `entity_neighborhood` and `search_triples`, read), so
