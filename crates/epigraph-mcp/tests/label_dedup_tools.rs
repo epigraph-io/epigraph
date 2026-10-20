@@ -471,6 +471,19 @@ async fn profile_path_is_refused_without_a_root_outside_it_through_a_symlink_or_
     )
     .await;
 
+    // A FIFO must be refused, not opened (an open would block forever).
+    let fifo = root.join("pipe.json");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|st| st.success()),
+        "mkfifo must work on the test host: the FIFO case is not optional"
+    );
+
+    // Every case runs and every mismatch is collected before asserting, so one
+    // weakened check shows up as its own named case, never hidden behind the
+    // first failure.
     let outside_abs = outside.join("profile.json");
     let cases: Vec<(String, &str)> = vec![
         (
@@ -484,52 +497,47 @@ async fn profile_path_is_refused_without_a_root_outside_it_through_a_symlink_or_
         ("link.json".to_string(), "symlinked file"),
         ("dir-link/p.json".to_string(), "symlinked directory"),
         ("real-dir".to_string(), "a directory"),
+        ("pipe.json".to_string(), "a FIFO"),
     ];
+    let mut failures: Vec<String> = Vec::new();
     for (path, why) in cases {
-        let err = plan_label_dedup(
-            &server,
-            &viewer,
-            plan_params_path(&path, &hash, DEDUP),
-            None,
-        )
-        .await
-        .expect_err(why);
-        assert_eq!(code(&err), "PROFILE_PATH_REFUSED", "{why}: {err:?}");
-    }
-
-    // A FIFO must be refused, not opened (an open would block forever).
-    let fifo = root.join("pipe.json");
-    if std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .is_ok_and(|st| st.success())
-    {
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             plan_label_dedup(
                 &server,
                 &viewer,
-                plan_params_path("pipe.json", &hash, DEDUP),
+                plan_params_path(&path, &hash, DEDUP),
                 None,
             ),
         )
-        .await
-        .expect("a FIFO profile must not hang the call");
-        let err = res.expect_err("a FIFO is not a regular file");
-        assert_eq!(code(&err), "PROFILE_PATH_REFUSED", "{err:?}");
+        .await;
+        match res {
+            Err(_) => failures.push(format!("{why}: the call hung")),
+            Ok(Ok(_)) => failures.push(format!("{why}: loaded")),
+            Ok(Err(e)) if code(&e) != "PROFILE_PATH_REFUSED" => {
+                failures.push(format!("{why}: {} ({})", code(&e), e.message));
+            }
+            Ok(Err(_)) => {}
+        }
     }
 
     // No root configured: path mode is off.
     let rootless = superuser_server(&pool, config(None, None, 5000)).await;
-    let err = plan_label_dedup(
+    match plan_label_dedup(
         &rootless,
         &viewer,
         plan_params_path("profile.json", &hash, DEDUP),
         None,
     )
     .await
-    .expect_err("no root");
-    assert_eq!(code(&err), "PROFILE_PATH_REFUSED", "{err:?}");
+    {
+        Ok(_) => failures.push("no root: loaded".to_string()),
+        Err(e) if code(&e) != "PROFILE_PATH_REFUSED" => {
+            failures.push(format!("no root: {} ({})", code(&e), e.message));
+        }
+        Err(_) => {}
+    }
+    assert!(failures.is_empty(), "refusals not taken: {failures:#?}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -619,6 +627,15 @@ async fn http_refuses_profile_path_and_reads_inline_json(pool: PgPool) {
     .await
     .expect_err("HTTP refuses path mode, even with a root configured");
     assert_eq!(code(&err), "PROFILE_PATH_REFUSED", "{err:?}");
+
+    // Inline bytes are checked against profile_hash too: the hash of other
+    // bytes is refused, the control above used the matching one.
+    let mut p = plan_params_json(&bytes, DEDUP);
+    p.profile_hash = profile_hash(&profile_bytes_respaced());
+    let err = plan_label_dedup(&server, &viewer, p, Some(&auth))
+        .await
+        .expect_err("inline bytes that do not hash to profile_hash");
+    assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1012,7 +1029,9 @@ async fn the_plan_hash_covers_the_profile_hash(pool: PgPool) {
 /// Over HTTP: the caller owns the survivor and one loser; a stranger owns the
 /// other loser. The cluster unit fails as a whole (the survivor gets no carry
 /// labels, the owned loser is not retired), the plan's write_check predicted
-/// the refusal, and a later unit (a close-out) still commits.
+/// the refusal, and a later unit (a close-out) still commits. A refusal after
+/// an earlier write of the unit landed is
+/// `a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cluster_with_one_unwritable_loser_writes_nothing_and_later_units_continue(pool: PgPool) {
     let bytes = profile_bytes();
@@ -1124,9 +1143,11 @@ async fn a_cluster_with_one_unwritable_loser_writes_nothing_and_later_units_cont
     assert_eq!(out["counts"]["failed"], 1, "{out}");
 }
 
-/// On an application-role server over stdio: the database refuses the write
-/// into a group the server agent cannot write. That close-out unit fails
-/// alone; the agent's own close-out commits.
+/// On an application-role server over stdio: a stranger's past-due claim in
+/// the stranger's own group. Its close-out adds `resolved`, so the retirement
+/// gate refuses it (the author arm) before the database is reached; that unit
+/// fails alone and the agent's own close-out commits. The database-only
+/// refusal is `a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unwritable_closeout_target_fails_only_its_own_unit(pool: PgPool) {
     let bytes = profile_bytes();
@@ -1165,10 +1186,13 @@ async fn an_unwritable_closeout_target_fails_only_its_own_unit(pool: PgPool) {
         true,
         "{out}"
     );
-    assert_eq!(
-        result_for(&out, &format!("closeout:{theirs}"))["ok"],
-        false,
-        "{out}"
+    let failed = result_for(&out, &format!("closeout:{theirs}"));
+    assert_eq!(failed["ok"], false, "{out}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cannot retire")),
+        "refused by the retirement gate: {out}"
     );
     assert!(labels_of(&pool, mine)
         .await
@@ -1877,3 +1901,110 @@ async fn a_foreign_survivor_with_no_write_of_its_own_is_refused_over_http(pool: 
 async fn a_one_sided_revision_label_cannot_make_a_stranger_the_survivor(pool: PgPool) {
     a_foreign_survivor_never_absorbs_the_callers_claims(pool, Join::RevisionLabel).await;
 }
+
+/// On an application-role server over stdio, every member the agent's own:
+/// the survivor and one loser in the agent's group, the other loser in a
+/// stranger's group the agent can read (public) but not write. The survivor
+/// is written FIRST, so the database's refusal of the last write must roll
+/// back writes that already landed in the unit. No ownership check refuses
+/// anything here; a later close-out unit still commits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-host").await;
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let owned_loser = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_B,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let elsewhere = seed(
+        &pool,
+        agent,
+        stranger_group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let fence = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        FENCE,
+        &[FAMILY],
+        "2026-07-01T00:00:00Z",
+    )
+    .await;
+    let cluster_ids = [survivor, owned_loser, elsewhere];
+    let before = snapshot(&pool, &cluster_ids).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), ALL);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let unit = format!("cluster:{survivor}");
+    let writes = unit_writes(&plan)
+        .into_iter()
+        .find(|u| u["unit"] == unit)
+        .unwrap_or_else(|| panic!("no write unit {unit}: {plan}"));
+    assert_eq!(
+        writes["writes"][0]["claim_id"],
+        survivor.to_string(),
+        "precondition: the survivor is written before the refused loser: {plan}"
+    );
+    let target = |id: Uuid| {
+        plan["write_check"]
+            .as_array()
+            .expect("write_check")
+            .iter()
+            .find(|c| c["claim_id"] == id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("no write_check for {id}: {plan}"))
+    };
+    assert_eq!(target(elsewhere)["writable"], false, "predicted: {plan}");
+    assert_eq!(target(survivor)["writable"], true, "{plan}");
+
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let refused = result_for(&out, &unit);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert_eq!(
+        snapshot(&pool, &cluster_ids).await,
+        before,
+        "the survivor's landed write rolled back with the refused one"
+    );
+    let error = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        !error.is_empty()
+            && !error.contains("CROSS_OWNER_MEMBER")
+            && !error.contains("cannot retire"),
+        "refused by the database, not by an ownership check: {out}"
+    );
+    assert_eq!(
+        result_for(&out, &format!("closeout:{fence}"))["ok"],
+        true,
+        "{out}"
+    );
+    assert!(labels_of(&pool, fence)
+        .await
+        .contains(&"resolved".to_string()));
+    assert_eq!(out["counts"]["failed"], 1, "{out}");
+}
+
