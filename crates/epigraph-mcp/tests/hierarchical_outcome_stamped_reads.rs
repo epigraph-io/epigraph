@@ -279,3 +279,240 @@ async fn a_non_member_is_told_its_rows_are_unattributed(pool: PgPool) {
         "{json}"
     );
 }
+
+// ── Partial visibility within one plan ──────────────────────────────────────
+
+/// A group-private plan as the ingest executor writes it (a level-1 phase at
+/// `plan_index` 0, two level-2 steps at 1 and 2, every row owned by the
+/// group) followed by a PUBLIC step whose `executes` edge carries no ordinal:
+/// the shape `add_step` leaves, since it declares its step public through the
+/// system agent's default declaration and writes no `plan_index`. Returns the
+/// workflow, the planned steps in order, and the appended step.
+struct MixedPlan {
+    workflow_id: Uuid,
+    planned: Vec<Uuid>,
+    appended: Uuid,
+    member: Viewer,
+    stranger: Viewer,
+}
+
+async fn executes(pool: &PgPool, workflow_id: Uuid, claim: Uuid, plan_index: Option<i32>) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, 'workflow', $2, 'claim', 'executes', \
+                 CASE WHEN $3::int IS NULL THEN jsonb_build_object('level', 2) \
+                      ELSE jsonb_build_object('plan_index', $3::int) END)",
+    )
+    .bind(workflow_id)
+    .bind(claim)
+    .bind(plan_index)
+    .execute(pool)
+    .await
+    .expect("executes edge");
+}
+
+async fn set_level(pool: &PgPool, claim: Uuid, level: i32) {
+    sqlx::query(
+        "UPDATE claims SET properties = jsonb_build_object('level', $2::int) WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(level)
+    .execute(pool)
+    .await
+    .expect("level");
+}
+
+async fn seed_mixed_plan(pool: &PgPool, name: &str) -> MixedPlan {
+    let (member, group) = fixture::seed_agent_with_group(pool, &format!("{name}-member")).await;
+    let (stranger, _) = fixture::seed_agent_with_group(pool, &format!("{name}-stranger")).await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        pool,
+        workflow_id,
+        name,
+        0,
+        "A private plan with one public step appended.",
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("insert workflow root");
+
+    let phase =
+        fixture::seed_group_claim(pool, member, group, &format!("{name} phase {workflow_id}"))
+            .await;
+    set_level(pool, phase, 1).await;
+    executes(pool, workflow_id, phase, Some(0)).await;
+    let mut planned = Vec::new();
+    for i in 0..2 {
+        let c = fixture::seed_group_claim(
+            pool,
+            member,
+            group,
+            &format!("{name} step {i} {workflow_id}"),
+        )
+        .await;
+        set_level(pool, c, 2).await;
+        executes(pool, workflow_id, c, Some(i + 1)).await;
+        planned.push(c);
+    }
+    let appended =
+        fixture::seed_public_claim(pool, stranger, &format!("{name} appended {workflow_id}")).await;
+    set_level(pool, appended, 2).await;
+    executes(pool, workflow_id, appended, None).await;
+
+    // Fixture shape: the plan's rows are the group's, the appended step and
+    // its edge are public.
+    let shapes: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT e.target_id, e.visibility::text, c.visibility::text \
+           FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes'",
+    )
+    .bind(workflow_id)
+    .fetch_all(pool)
+    .await
+    .expect("tenancy read-back");
+    assert_eq!(shapes.len(), 4, "{shapes:?}");
+    for (target, edge_vis, claim_vis) in &shapes {
+        let want = if *target == appended {
+            "public"
+        } else {
+            "group"
+        };
+        assert_eq!(
+            (edge_vis.as_str(), claim_vis.as_str()),
+            (want, want),
+            "{shapes:?}"
+        );
+    }
+
+    MixedPlan {
+        workflow_id,
+        planned,
+        appended,
+        member: Viewer::resolve(pool, member).await.expect("member viewer"),
+        stranger: Viewer::resolve(pool, stranger)
+            .await
+            .expect("stranger viewer"),
+    }
+}
+
+/// A non-member reads only the appended public step. Counting what it can see
+/// would make that step "step 0" and attribute the reporter's first row to it
+/// with no warning; its position is unknown to the reporter, so the row is
+/// unattributed and disclosed instead.
+///
+/// RED before the provable-prefix rule: the row for index 0 carried the
+/// appended step's id and `unresolved_step_indices` was empty.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_plan_does_not_shift_a_visible_appended_step(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_mixed_plan(&pool, "stamped-outcome-mixed-stranger").await;
+
+    let json = report(&server, &w.stranger, w.workflow_id, &[0]).await;
+
+    assert_eq!(
+        rows(&pool, w.workflow_id).await,
+        vec![("planned 0".to_string(), None)],
+        "step 0 is a private step; the visible appended step must not take its index: {json}"
+    );
+    assert_eq!(unresolved(&json), vec![0], "{json}");
+    assert!(
+        json["warning"].as_str().is_some(),
+        "an unattributed row is disclosed: {json}"
+    );
+}
+
+/// A member reads the whole plan, so the appended step's position (after
+/// every planned step) is provable and every index resolves, through the
+/// direct `report_hierarchical_outcome` tool function this time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_member_resolves_the_appended_step_after_the_plan(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_mixed_plan(&pool, "stamped-outcome-mixed-member").await;
+
+    let result = epigraph_mcp::tools::workflow_hierarchical::report_hierarchical_outcome(
+        &server,
+        &w.member,
+        epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            workflow_id: w.workflow_id.to_string(),
+            success: true,
+            step_executions: [0usize, 1, 2]
+                .iter()
+                .map(|i| epigraph_mcp::types::HierarchicalStepExecution {
+                    step_index: *i,
+                    planned: format!("planned {i}"),
+                    actual: "done".to_string(),
+                    deviated: false,
+                    deviation_reason: None,
+                })
+                .collect(),
+            outcome_details: "mixed-plan probe".to_string(),
+            quality: Some(0.8),
+            run_label: None,
+            goal_text: None,
+        },
+    )
+    .await
+    .expect("the report is recorded");
+    let json = first_text(&result);
+
+    assert_eq!(
+        rows(&pool, w.workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(w.planned[0])),
+            ("planned 1".to_string(), Some(w.planned[1])),
+            ("planned 2".to_string(), Some(w.appended)),
+        ],
+        "{json}"
+    );
+    assert!(unresolved(&json).is_empty(), "{json}");
+}
+
+/// No regression for a plan written before the `plan_index` ordinal existed:
+/// every edge is unordered, the phase is visible, and the steps resolve by
+/// position for any reader, as they always did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_plan_without_ordinals_still_resolves_by_position(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-legacy").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-legacy-r").await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-legacy",
+        0,
+        "A public plan with no ordinals.",
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("insert workflow root");
+    let phase =
+        fixture::seed_public_claim(&pool, author, &format!("legacy phase {workflow_id}")).await;
+    set_level(&pool, phase, 1).await;
+    executes(&pool, workflow_id, phase, None).await;
+    let mut steps = Vec::new();
+    for i in 0..2 {
+        let c =
+            fixture::seed_public_claim(&pool, author, &format!("legacy step {i} {workflow_id}"))
+                .await;
+        set_level(&pool, c, 2).await;
+        executes(&pool, workflow_id, c, None).await;
+        steps.push(c);
+    }
+    let reader = Viewer::resolve(&pool, reader).await.expect("reader viewer");
+
+    let json = report(&server, &reader, workflow_id, &[0, 1]).await;
+
+    assert_eq!(
+        rows(&pool, workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(steps[0])),
+            ("planned 1".to_string(), Some(steps[1])),
+        ],
+        "{json}"
+    );
+    assert!(unresolved(&json).is_empty(), "{json}");
+}
