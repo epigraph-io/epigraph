@@ -71,10 +71,9 @@
 //! Without the flag the binary is a maintenance job: it connects through
 //! `epigraph_cli::MaintenancePool` and refuses to start unless the connection
 //! satisfies `epigraph_bypass()`. An agent container holds only the ordinary
-//! application login in `DATABASE_URL`, so every scheduled run there failed
-//! with that refusal (2026-10-17 onward). Operator ruling 2026-10-20: no
-//! maintenance DSN in agent containers and no host timer, so the scheduled
-//! run takes this path instead:
+//! application login in `DATABASE_URL`, which that refusal rejects. A
+//! scheduled run in an agent container therefore takes this path, which
+//! needs no maintenance DSN:
 //!
 //! * the application login in `DATABASE_URL` as a `ScopedPool`; no
 //!   maintenance DSN is read and no privilege is asserted;
@@ -83,26 +82,50 @@
 //!   its own groups), and the `decomposes_to` edges in a transaction stamped
 //!   for it, so each edge records the agent's group as its writer (migration
 //!   120) rather than landing ownerless. Atoms still go through
-//!   `POST /api/v1/claims` with the API token. Pass the agent that token acts
-//!   as (the service client's agent); a writing run refuses an agent with no
-//!   writable group;
+//!   `POST /api/v1/claims` with the API token;
+//! * a writing run asks the database which group its edges would record
+//!   (`epigraph_writer_group()`, the trigger's own function), prints it on
+//!   the `connection:` line (`writer_group=`), and refuses when there is none
+//!   (`has no writer group`);
 //! * the old refusal's purpose, no silent zero-row run, is kept by the
-//!   result: a population scan that reads NO undecomposed claim fails
-//!   (`sees no undecomposed claim`). `chosen=0` over a visible population is
-//!   the steady state and exits 0. `--ids-file` names every id it skips, so
-//!   it is not subject to this;
+//!   result: a `--priority oldest|recent` scan that reads NO undecomposed
+//!   claim fails (`sees no undecomposed claim`); judged-atomic and short
+//!   parents stay in that population, so on a live corpus it is never empty.
+//!   `--priority conflict` reads only the targets of a live conflict edge,
+//!   which may legitimately be none: it fails only when the session sees no
+//!   claim at all (`sees no claim at all`). `chosen=0` over a visible
+//!   population is the steady state and exits 0. `--ids-file` names every id
+//!   it skips, so it is not subject to this;
 //! * `--retarget` stays on the maintenance path, and `--priority conflict`'s
 //!   report of decomposed conflict parents is printed only there.
 //!
+//! Pass the agent the API token acts as (the service client's agent). The
+//! binary does not check that the two match: atoms are created as the
+//! token's agent and edges as `--as-agent`, so a mismatch splits their
+//! attribution. That is an operator check at deploy time, not a privilege
+//! question (the application login can already stamp any agent).
+//!
 //! Coverage against the maintenance view (measured on a fixture in
-//! `tests/decompose_claims_as_agent.rs`): (1) a group-private parent outside
-//! the agent's groups is not read at all, which loses nothing, because only
-//! public parents are ever decomposed (`skipped_not_public` on the
-//! maintenance path); (2) a PUBLIC parent whose only `decomposes_to` edges
-//! are private to a group the agent is not in reads as undecomposed, because
-//! row security also filters the `NOT EXISTS` edge probe, so the run would
-//! decompose it a second time. The `--singleton-ledger` and `--count-eligible`
-//! flags behave identically on both paths.
+//! `tests/decompose_claims_as_agent.rs`):
+//!
+//! 1. a group-private parent outside the agent's groups is not read at all.
+//!    That loses nothing: only public parents are ever decomposed
+//!    (`skipped_not_public` on the maintenance path);
+//! 2. a PUBLIC parent whose only `decomposes_to` edges are hidden from the
+//!    agent (private to a group it is not in) reads as undecomposed, because
+//!    row security also filters the `NOT EXISTS` edge probe. The run
+//!    decomposes it again. Where the hidden edge points at a private atom,
+//!    the result is a second set of public atoms. Where it points at a
+//!    PUBLIC atom and the model returns the same text, `if_not_exists`
+//!    returns that same atom, and the edge dedup probe
+//!    (`EdgeRepository::create_if_absent_including_retracted_conn`) is
+//!    filtered by row security on this login too, so a second, public
+//!    `(parent, atom, decomposes_to)` edge is written next to the hidden
+//!    one (no unique index stops it since migration 018). The second case is
+//!    derived from the code, not measured.
+//!
+//! The `--singleton-ledger` and `--count-eligible` flags behave identically
+//! on both paths.
 //!
 //! # Modes
 //!

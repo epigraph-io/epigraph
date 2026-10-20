@@ -677,7 +677,12 @@ mod db_writes {
     ///   so the in-query predicate and row security agree, and a
     ///   `decomposes_to` edge records the acting agent's group as its writer
     ///   (migration 120) instead of landing ownerless through the world arm an
-    ///   unstamped insert would take. Both refuse a bypass viewer.
+    ///   unstamped insert would take. Both refuse a bypass viewer. The edge
+    ///   dedup probe inside `persist_decomposition`
+    ///   (`EdgeRepository::create_if_absent_including_retracted_conn`, marked
+    ///   VISIBILITY-EXEMPT) is NOT exempt here: on this login row security
+    ///   filters it, so an existing edge the agent cannot see does not stop
+    ///   a second identical one.
     ///
     /// The library functions take `&dyn DecomposeDb`, so a caller holding a
     /// `PgPool` passes `&pool` unchanged.
