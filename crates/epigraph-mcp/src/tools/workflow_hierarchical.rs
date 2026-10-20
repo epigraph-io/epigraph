@@ -1076,6 +1076,52 @@ mod tests {
         assert_eq!(embedded, 0);
     }
 
+    /// A process with no `ScopedPool` cannot stamp the step lookup, so the
+    /// report is REFUSED and writes nothing: no fallback to an unstamped
+    /// transaction, which would be the silently-NULL path this replaced.
+    /// Positive control on the same workflow: with a `ScopedPool` the same
+    /// report lands.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_report_without_a_scoped_pool_is_refused_and_writes_nothing(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-no-scope").await;
+        let err = do_report_hierarchical_outcome_as(
+            None,
+            &test_viewer(&pool).await,
+            workflow_id,
+            true,
+            &two_steps(),
+            Some(0.5),
+            Some("no scope"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("no ScopedPool: the report must be refused");
+        assert!(err.message.contains("ScopedPool"), "{err:?}");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        report_on_test_scope(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            Some(0.5),
+            Some("no scope"),
+            None,
+            None,
+        )
+        .await
+        .expect("with a ScopedPool the report lands");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();

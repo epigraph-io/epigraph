@@ -245,6 +245,7 @@ async fn a_member_resolves_its_groups_private_steps(pool: PgPool) {
 /// A caller outside the group still records the run, but every row it writes
 /// carries a NULL `step_claim_id` and the response says so, without naming any
 /// step id. An out-of-range index from a member gets the same signal.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_is_told_its_rows_are_unattributed(pool: PgPool) {
     let server = app_role_server(&pool).await;
@@ -266,6 +267,13 @@ async fn a_non_member_is_told_its_rows_are_unattributed(pool: PgPool) {
         .unwrap_or_else(|| panic!("an unresolved row is disclosed: {json}"));
     assert!(warning.contains("step_claim_id"), "{warning}");
     assert_eq!(json["use_count"], 1, "the run itself is recorded: {json}");
+    // Logged as well as disclosed: the all-invisible case is the one the old
+    // `!step_claim_ids.is_empty()` guard kept silent.
+    assert!(
+        logs_contain("unresolved_step_indices=[0, 1]")
+            && logs_contain("recorded with a NULL step_claim_id"),
+        "an unattributed report is logged at WARN"
+    );
     let text = json.to_string();
     for step in &w.steps {
         assert!(
