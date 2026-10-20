@@ -15,6 +15,7 @@ pub mod events;
 pub mod evolve_step;
 pub mod graph;
 pub mod ingestion;
+pub mod label_dedup;
 pub mod lens;
 pub mod link_alternative;
 pub mod link_epistemic;

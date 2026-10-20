@@ -64,6 +64,8 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_claims", "claims:read"),
     ("query_claims_by_evidence", "claims:read"),
     ("query_claims_by_label", "claims:read"),
+    ("plan_label_dedup", "claims:read"),
+    ("probe_label_dedup", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
@@ -139,6 +141,8 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
+    // Writes label sets only, each claim through the `update_labels` path.
+    ("apply_label_dedup", "claims:write"),
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────

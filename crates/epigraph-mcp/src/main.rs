@@ -762,7 +762,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The ceremony page's public origin, for the URL `sudo` returns
         // (elevation plan EL-11): the API's own variable. Unset, `sudo`
         // refuses.
-        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok());
+        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok())
+        // `max_claims` cap only: HTTP refuses `profile_path` and ignores the pin.
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         let template = if identity_declared {
             template
         } else {
@@ -941,7 +943,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stdio transport writes too — epiclaw's scheduled agents reach
         // `submit_claim` / `memorize` over stdio — so it needs the same stamped
         // pool as the HTTP factory above, not a read-only subset of it.
-        .with_scoped_pool(scoped);
+        .with_scoped_pool(scoped)
+        // The label-dedup profile root and pin (set by the host when a
+        // workflow ships a dedup profile).
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         // Rung-4 signer: the owner-equality fallback in
         // `require_owner_or_admin` has no stable identity to compare against.
         // See `EpiGraphMcpFull::with_generated_signer_identity`.

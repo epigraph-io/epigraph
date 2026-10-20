@@ -129,6 +129,11 @@ pub struct EpiGraphMcpFull {
     /// plan EL-11). `None` in every constructor and unless `main` reads it:
     /// with none, `sudo` refuses (it cannot name a page).
     pub(crate) public_base_url: Option<String>,
+    /// The label-dedup tools' profile root, stdio pin and `max_claims` cap,
+    /// read once at startup ([`Self::with_label_dedup_config`]). The default
+    /// has no root and no pin, so stdio `profile_path` is refused until `main`
+    /// sets one.
+    pub(crate) label_dedup: Arc<crate::tools::label_dedup::LabelDedupConfig>,
 }
 
 impl EpiGraphMcpFull {
@@ -1067,6 +1072,7 @@ impl EpiGraphMcpFull {
             connector_elevation: false,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
+            label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
         }
     }
 
@@ -1114,6 +1120,17 @@ impl EpiGraphMcpFull {
         self.public_base_url = base
             .map(|b| b.trim().trim_end_matches('/').to_string())
             .filter(|b| !b.is_empty());
+        self
+    }
+
+    /// Set the label-dedup tools' profile root, stdio pin and `max_claims`
+    /// cap (`main` passes `LabelDedupConfig::from_env()`).
+    #[must_use]
+    pub fn with_label_dedup_config(
+        mut self,
+        config: crate::tools::label_dedup::LabelDedupConfig,
+    ) -> Self {
+        self.label_dedup = Arc::new(config);
         self
     }
 
@@ -1184,6 +1201,7 @@ impl EpiGraphMcpFull {
             connector_elevation: false,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
+            label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
         }
     }
 
@@ -1334,6 +1352,46 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::supersede::mark_duplicate(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Plan a label-family dedup pass. READ-ONLY. The family and its rules come from a dedup profile (schema label-dedup-profile/v1) pinned by profile_hash: on stdio a profile_path under this server's profile root (EPIGRAPH_MCP_PROFILE_ROOT), and profile_hash must equal the server's pin (EPIGRAPH_MCP_PROFILE_PIN) when one is set; over HTTP inline profile_json. Reads every family claim YOU can read (rows you cannot read are invisible), in id order, up to max_claims (default and server cap 5000; a larger request is clamped and reported). Returns plan_hash, coverage (members, truncated, snapshot_at), hygiene, clusters (survivor, losers, carry labels), review_pairs, vetoed_chains, past_due, lifecycle, signal sections, the write units apply would run, and write_check: a prediction, per write target, of whether your identity may write it. plan_hash covers profile_hash, run_tag, as_of, sections and the writes only."
+    )]
+    async fn plan_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::PlanLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::plan_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Apply a label-family dedup plan you reviewed. Takes the plan_label_dedup arguments plus plan_hash. Re-plans from live state first and writes nothing when the family read was truncated (refused TRUNCATED) or the fresh plan_hash differs (refused PLAN_DRIFT, with the fresh plan to review). Otherwise writes each unit (a cluster: survivor carry labels plus every loser's retirement; a hygiene, close-out or lifecycle claim) in ONE transaction through the update_labels path: over HTTP every claim needs ownership or claims:admin (the audited admin path for a group you cannot write), and the 'resolved' label and the profile's closed label need ownership on every transport. A refused write fails its whole unit (nothing of it lands) and later units continue. Returns status applied | nothing_to_do | refused, per-unit results, counts, and applied_units: every label each committed write actually added or removed, the input of the revert procedure (apply the inverse newest first through update_labels)."
+    )]
+    async fn apply_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::ApplyLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::apply_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Classify up to 100 would-be claims against a label family before filing them. READ-ONLY. Same profile arguments as plan_label_dedup. Each candidate gets verdict new (file it), match (an auto-merge rule matched a live member: matched_id, tier), review (similar, a human decides), or match_only (matched only a closed signal, with include_closed_signals). Reads only claims you can read; a family read that hit max_claims is refused (TRUNCATED) rather than answered new."
+    )]
+    async fn probe_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::ProbeLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::probe_label_dedup(self, viewer, params, auth).await
     }
 
     #[tool(
