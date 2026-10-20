@@ -14,9 +14,10 @@
 //!
 //! * CONTRACT tests ((a1), (a2), (b), (c), (d)) pin behaviour the resolver is
 //!   built on. A change that fails one of them breaks every resolver.
-//! * CHARACTERIZATION tests ((e), (f), (g), (h)) record what the code does
-//!   TODAY, including behaviour nobody would design. They are evidence for a
-//!   decision, not an endorsement, and they say so where they pin a gap.
+//! * CHARACTERIZATION tests ((e), (f), (g), (h), the outcome report) record
+//!   what the code does TODAY, including behaviour nobody would design. They
+//!   are evidence for a decision, not an endorsement, and they say so where
+//!   they pin a gap.
 //!
 //! # The cases
 //!
@@ -60,6 +61,10 @@
 //! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
 //!   `workflows` has no row security. A rewritten submitter is then honoured by
 //!   the workflow authority gate.
+//! * Outcome report: `POST /api/v1/workflows/hierarchical/:id/outcome`
+//!   succeeds for a caller that cannot read the steps (and for one holding
+//!   only `claims:read`), moves the counters, and records every step of a
+//!   group-private plan with a NULL `step_claim_id`, for members too.
 //!
 //! # How a workflow becomes group-private here
 //!
@@ -1282,5 +1287,125 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
         s,
         StatusCode::FORBIDDEN,
         "the real submitter is refused: {b}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The outcome report on a group-private plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn step_rows(pool: &PgPool, wf: Uuid, label: &str) -> Vec<Option<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT step_claim_id FROM behavioral_executions WHERE workflow_id = $1 AND run_label = $2",
+    )
+    .bind(wf)
+    .bind(label)
+    .fetch_all(pool)
+    .await
+    .expect("behavioral rows")
+}
+
+async fn use_count(pool: &PgPool, wf: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE((metadata->>'use_count')::bigint, 0) FROM workflows WHERE id = $1",
+    )
+    .bind(wf)
+    .fetch_one(pool)
+    .await
+    .expect("use_count")
+}
+
+/// CHARACTERIZATION. A hierarchical outcome report reads the plan on an
+/// unstamped transaction. On a G-private plan it therefore succeeds for a
+/// non-member holding only `claims:read`, moves the counters, and records
+/// every step with a NULL `step_claim_id`; a member's report records NULL too.
+/// The MCP twin behaves the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_steps(pool: PgPool) {
+    let w = private_workflow(&pool, small_extraction("acme-outcome-plan", 2)).await;
+    let steps: Vec<Value> = (0..2)
+        .map(|i| json!({"step_index": i, "planned": format!("step {i}"), "actual": "done", "deviated": false}))
+        .collect();
+    let uri = format!("/api/v1/workflows/hierarchical/{}/outcome", w.workflow_id);
+    let body = |label: &str| {
+        json!({"success": true, "outcome_details": label, "quality": 0.9,
+               "step_executions": steps, "goal_text": null})
+    };
+    // REST records no run label, so its rows are the NULL-label ones.
+    let rest_rows = |pool: PgPool, wf: Uuid| async move {
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT step_claim_id FROM behavioral_executions \
+              WHERE workflow_id = $1 AND run_label IS NULL",
+        )
+        .bind(wf)
+        .fetch_all(&pool)
+        .await
+        .expect("rows")
+    };
+    let mut expected_count = use_count(&pool, w.workflow_id).await;
+    let mut expected_rows = 0;
+    for (who, label, scopes) in [
+        (
+            w.stranger,
+            "non-member holding claims:read only",
+            READ_SCOPES,
+        ),
+        (w.reader, "member", WRITE_SCOPES),
+    ] {
+        let (status, resp) = w.api.post(&uri, &token(who, scopes), &body(label)).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {resp}");
+        expected_count += 1;
+        expected_rows += 2;
+        assert_eq!(
+            use_count(&pool, w.workflow_id).await,
+            expected_count,
+            "{label}"
+        );
+        let rows = rest_rows(pool.clone(), w.workflow_id).await;
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "{label}: one row per reported step"
+        );
+        assert!(
+            rows.iter().all(Option::is_none),
+            "{label}: every step row is unattributed: {rows:?}"
+        );
+    }
+    // Calibration: the steps exist and are the workflow's level-2 claims.
+    let level2: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND (c.properties->>'level')::int = 2",
+    )
+    .bind(w.workflow_id)
+    .fetch_one(&pool)
+    .await
+    .expect("level-2 steps");
+    assert_eq!(level2, 2, "the harness sees both steps the report lost");
+
+    // The MCP twin, on the app-role pool exactly as served.
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let execs: Vec<epigraph_mcp::types::HierarchicalStepExecution> =
+        serde_json::from_value(json!(steps)).expect("step executions");
+    let r = epigraph_mcp::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
+        &app,
+        w.workflow_id,
+        true,
+        &execs,
+        Some(0.9),
+        Some("workflow-plan goal"),
+        Some("mcp-report"),
+        None,
+    )
+    .await
+    .expect("the MCP report succeeds");
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    assert_eq!(use_count(&pool, w.workflow_id).await, expected_count + 1);
+    let mcp_rows = step_rows(&pool, w.workflow_id, "mcp-report").await;
+    assert_eq!(
+        mcp_rows,
+        vec![None, None],
+        "the MCP twin loses the steps too"
     );
 }
