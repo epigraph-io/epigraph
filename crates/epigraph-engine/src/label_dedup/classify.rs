@@ -211,21 +211,33 @@ fn strong_ids_conflict(a: &ParsedRecord, b: &ParsedRecord) -> bool {
         && a.keys.strong_ids.is_disjoint(&b.keys.strong_ids)
 }
 
-/// `<prefix><p>` on `from`, where `<p>` is a non-empty prefix of `to`'s id.
-fn names_by_prefix(prefix: Option<&str>, from: &ParsedRecord, to: &ParsedRecord) -> bool {
+/// The shortest id prefix a `distinct-from:` ruling may use. A ruling vetoes
+/// a merge, so a short prefix that names a large slice of the family would
+/// silently split real duplicates; 8 hex digits name about one id in 4e9.
+pub const MIN_DISTINCT_ID_PREFIX: usize = 8;
+
+/// `<prefix><p>` on `from`, where `<p>` is a prefix of `to`'s id at least
+/// `min_len` characters long.
+fn names_by_prefix(
+    prefix: Option<&str>,
+    from: &ParsedRecord,
+    to: &ParsedRecord,
+    min_len: usize,
+) -> bool {
     let Some(prefix) = prefix.filter(|p| !p.is_empty()) else {
         return false;
     };
     !to.id_str.is_empty()
         && from.labels.iter().any(|l| {
             l.strip_prefix(prefix)
-                .is_some_and(|p| !p.is_empty() && to.id_str.starts_with(p))
+                .is_some_and(|p| !p.is_empty() && p.len() >= min_len && to.id_str.starts_with(p))
         })
 }
 
 fn revision_linked(pass: &PassProfile, a: &ParsedRecord, b: &ParsedRecord) -> bool {
+    // Any non-empty prefix links, as in the planner this one replaces.
     let p = pass.revision_label_prefix.as_deref();
-    names_by_prefix(p, a, b) || names_by_prefix(p, b, a)
+    names_by_prefix(p, a, b, 1) || names_by_prefix(p, b, a, 1)
 }
 
 fn label_values<'a>(
@@ -244,7 +256,9 @@ fn hard_conflict(
     b: &ParsedRecord,
 ) -> Option<(ConflictKind, String)> {
     let distinct = pass.distinct_label_prefix.as_deref();
-    if names_by_prefix(distinct, a, b) || names_by_prefix(distinct, b, a) {
+    if names_by_prefix(distinct, a, b, MIN_DISTINCT_ID_PREFIX)
+        || names_by_prefix(distinct, b, a, MIN_DISTINCT_ID_PREFIX)
+    {
         return Some((
             ConflictKind::DistinctLabel,
             "a human ruled the two distinct".to_string(),

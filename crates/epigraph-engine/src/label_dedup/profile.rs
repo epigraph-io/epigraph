@@ -87,6 +87,9 @@ pub struct PassProfile {
     pub revision_label_prefix: Option<String>,
     /// `<prefix><id-prefix>` on either claim is a human ruling that the two
     /// are distinct: the pair never merges and is never queued for review.
+    /// The id prefix must be at least
+    /// [`MIN_DISTINCT_ID_PREFIX`](super::classify::MIN_DISTINCT_ID_PREFIX)
+    /// characters; a shorter one is ignored.
     #[serde(default)]
     pub distinct_label_prefix: Option<String>,
     #[serde(default)]

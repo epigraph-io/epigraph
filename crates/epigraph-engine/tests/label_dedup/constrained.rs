@@ -253,3 +253,22 @@ fn a_no_strong_id_class_pairs_only_through_a_shared_strong_id() {
     );
     assert_eq!(p.clusters.len(), 1);
 }
+
+#[test]
+fn a_distinct_from_ruling_needs_an_unambiguous_id_prefix() {
+    // `distinct-from:0` would name every claim whose id starts with `0`
+    // (all of these fixtures), silently splitting real duplicates.
+    let short = item(1, "", &["distinct-from:0"]);
+    let other = item(2, "", &[]);
+    let p = plan_graph(&profile(), &[short, other.clone()], &dedup_sections(), None);
+    assert_eq!(
+        cluster_shape(&p),
+        vec![(id(1), vec![id(2)])],
+        "a 1-char prefix is not a ruling: {:?}",
+        p.vetoed_chains
+    );
+    // Control: the 8-hex prefix of the other claim's id is a ruling.
+    let ruled = item(1, "", &[&format!("distinct-from:{}", prefix(2))]);
+    let p = plan_graph(&profile(), &[ruled, other], &dedup_sections(), None);
+    assert!(p.clusters.is_empty(), "{:?}", p.clusters);
+}
