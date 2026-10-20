@@ -229,13 +229,7 @@ Return 3-8 claims."#,
             // already in the graph is skipped without paying for an embedding.
             // `insert_unless_hash_exists` repeats the find, so this check is an
             // optimization, not the dedup.
-            let exists: Option<(i32,)> =
-                sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
-                    .bind(content_hash.as_slice())
-                    .fetch_optional(&pool)
-                    .await?;
-
-            if exists.is_some() {
+            if content_hash_exists(&pool, content_hash.as_slice()).await? {
                 tracing::info!(
                     "Duplicate claim skipped: {}",
                     &content[..content.len().min(60)]
@@ -360,6 +354,22 @@ struct WebSearchClaim<'a> {
     embedding: &'a str,
 }
 
+/// Whether any claim (by any author) has this `content_hash`. The ONE
+/// existence probe of this binary: the run loop's unlocked pre-check and
+/// [`insert_unless_hash_exists`]'s check under the dedup lock both call it.
+/// `SELECT 1` is an INT4, so it decodes as `i32`; decoding it as anything
+/// wider failed every time a match existed and aborted the run.
+async fn content_hash_exists<'e, E>(exec: E, content_hash: &[u8]) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
+        .bind(content_hash)
+        .fetch_optional(exec)
+        .await?;
+    Ok(exists.is_some())
+}
+
 /// Insert `claim` authored by `agent_id`, unless a claim with its
 /// `content_hash` already exists. Returns the new row's id, or `None` when the
 /// content was already present.
@@ -395,11 +405,7 @@ async fn insert_unless_hash_exists(
     )
     .await?;
 
-    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
-        .bind(content_hash.as_slice())
-        .fetch_optional(&mut *scope)
-        .await?;
-    if exists.is_some() {
+    if content_hash_exists(&mut *scope, content_hash.as_slice()).await? {
         scope.commit().await?;
         return Ok(None);
     }
