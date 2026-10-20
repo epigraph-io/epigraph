@@ -1249,20 +1249,20 @@ async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool
 
 /// (h) CHARACTERIZATION. `workflows` has no row security: the application
 /// role rewrites a workflow's truth and its recorded submitter, and the
-/// workflow authority gate then honours the forged submitter (it reads the
-/// row) and refuses the real one.
+/// workflow authority gate then honours the rewritten submitter (it reads the
+/// row) and refuses the original one.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
     let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
-    let (forger, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-forger").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
     let api = Api::prod_shaped(&pool).await;
-    let name = "acme-forged-plan";
+    let name = "acme-rewritten-plan";
     let wf = uuid_of(
         &api.ingest(&token(curator, WRITE_SCOPES), &small_extraction(name, 1))
             .await["workflow_id"],
     );
     let (s, b) = api
-        .add_step(&token(forger, WRITE_SCOPES), name, "forger, before")
+        .add_step(&token(other, WRITE_SCOPES), name, "other agent, before")
         .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "calibration: {b}");
 
@@ -1279,7 +1279,7 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
                  to_jsonb($2::text)) WHERE id = $1",
             )
             .bind(wf)
-            .bind(forger.to_string())
+            .bind(other.to_string())
             .execute(&mut *conn)
             .await
             .expect("the app role rewrites the submitter")
@@ -1299,15 +1299,15 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
     assert_eq!(body["truth_value"].as_f64(), Some(0.05));
     assert_eq!(
         body["properties"]["epigraph_submitted_by"],
-        json!(forger.to_string())
+        json!(other.to_string())
     );
     let (s, b) = api
-        .add_step(&token(forger, WRITE_SCOPES), name, "forger, after")
+        .add_step(&token(other, WRITE_SCOPES), name, "other agent, after")
         .await;
     assert_eq!(
         s,
         StatusCode::OK,
-        "the forged submitter passes the gate: {b}"
+        "the rewritten submitter passes the gate: {b}"
     );
     let (s, b) = api
         .add_step(&token(curator, WRITE_SCOPES), name, "curator, after")
@@ -1315,7 +1315,7 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
-        "the real submitter is refused: {b}"
+        "the original submitter is refused: {b}"
     );
 }
 
