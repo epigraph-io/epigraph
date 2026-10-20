@@ -1,4 +1,5 @@
-//! The read contract a PINNED-workflow resolver depends on.
+//! The read contract a PINNED-workflow resolver depends on, and a
+//! characterization of the paths around it.
 //!
 //! A pinned-workflow resolver (a host that runs a stored workflow by
 //! `(canonical_name, generation)` and refuses anything it cannot verify)
@@ -9,8 +10,13 @@
 //! so `db_pool` is the app role too), and every request carries a real JWT
 //! through `create_router`. The harness superuser only seeds and inspects.
 //!
-//! These are CONTRACT tests: a change that fails one of them breaks every
-//! resolver.
+//! Two kinds of test live here, and the difference matters to a reader:
+//!
+//! * CONTRACT tests ((a1), (a2), (b), (c), (d)) pin behaviour the resolver is
+//!   built on. A change that fails one of them breaks every resolver.
+//! * CHARACTERIZATION tests ((e), (f)) record what the code does TODAY,
+//!   including behaviour nobody would design. They are evidence for a
+//!   decision, not an endorsement, and they say so where they pin a gap.
 //!
 //! # The cases
 //!
@@ -30,6 +36,23 @@
 //!   (`fixtures/workflow-ids-vectors.json`) computed by an implementation
 //!   independent of these crates, and a real ingest writes exactly those ids
 //!   and stored hashes.
+//! * (e) Workflow authority and an operator RE-LINK. No shipped path re-points
+//!   an agent's operator (`epigraph_link_operator` and
+//!   `epigraph_link_retired_agent` both refuse a second operator with 55000,
+//!   and neither application role may UPDATE or DELETE `operator_links`). So
+//!   the test characterizes the refusal: after the curator's acting link is
+//!   ended the documented way (its writer row in the operator group revoked),
+//!   `operator_of_author` still names the FIRST operator, who keeps the
+//!   operator arm over the curator's workflows on REST and on MCP, and the
+//!   second human never gains it. A linked curator itself holds no HTTP
+//!   authority (operated agents are stdio-only), before or after the
+//!   revocation.
+//! * (f) Who can publish once operator binding is ARMED, with the ingest
+//!   system agent live-linked to the first human: that human over REST; its
+//!   linked curator over stdio only; an unlinked curator nowhere over REST
+//!   (`OPL01`); and a curator of a SECOND human nowhere (`OPL02` over stdio,
+//!   nothing written). A curator re-linked to the second human cannot be
+//!   constructed, as in (e).
 //!
 //! # How a workflow becomes group-private here
 //!
@@ -51,7 +74,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::repos::privatization::PrivatizationRepository;
-use epigraph_db::{GroupRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{AgentRepository, GroupRepository, ScopedPool, SessionGucMode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -78,6 +101,13 @@ fn uuid_of(v: &Value) -> Uuid {
 fn hex32(v: &Value) -> [u8; 32] {
     let bytes = hex::decode(v.as_str().expect("hex string")).expect("hex");
     bytes.try_into().expect("32 bytes")
+}
+
+fn sqlstate(e: &sqlx::Error) -> String {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(|c| c.to_string())
+        .unwrap_or_default()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -677,4 +707,444 @@ async fn get_workflow_returns_the_submitter(pool: PgPool) {
         body["properties"]["epigraph_submitted_by"],
         json!(curator.to_string())
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (e) / (f): authority and an operator re-link
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `sql` (binding two uuids) as `epigraph_maintenance`, the role
+/// `epigraph-operator link` connects as.
+async fn as_maintenance(
+    pool: &PgPool,
+    sql: &'static str,
+    a: Uuid,
+    b: Uuid,
+) -> Result<(), sqlx::Error> {
+    fixture::as_role(pool, "epigraph_maintenance", move |mut conn| async move {
+        let r = sqlx::query(sql)
+            .bind(a)
+            .bind(b)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ());
+        (conn, r)
+    })
+    .await
+}
+
+async fn link_as_maintenance(
+    pool: &PgPool,
+    agent: Uuid,
+    operator: Uuid,
+) -> Result<(), sqlx::Error> {
+    as_maintenance(
+        pool,
+        "SELECT * FROM public.epigraph_link_operator($1, $2)",
+        agent,
+        operator,
+    )
+    .await
+}
+
+/// Every shipped way to re-point `agent` from its operator to `second` is
+/// refused, and refused as a re-point (55000 naming the out-of-band act).
+async fn assert_relink_refused(pool: &PgPool, agent: Uuid, second: Uuid) {
+    for (what, sql) in [
+        (
+            "epigraph_link_operator",
+            "SELECT * FROM public.epigraph_link_operator($1, $2)",
+        ),
+        (
+            "epigraph_link_retired_agent",
+            "SELECT * FROM public.epigraph_link_retired_agent($1, $2)",
+        ),
+    ] {
+        let err = as_maintenance(pool, sql, agent, second)
+            .await
+            .expect_err("a second operator must be refused");
+        assert_eq!(sqlstate(&err), "55000", "{what}: {err}");
+        assert!(
+            err.to_string().contains("out-of-band"),
+            "{what} names the re-point as an out-of-band act: {err}"
+        );
+    }
+    for (role, sql) in [
+        (
+            "epigraph_maintenance",
+            "UPDATE public.operator_links SET operator_id = $2 WHERE agent_id = $1",
+        ),
+        (
+            "epigraph_maintenance",
+            "DELETE FROM public.operator_links WHERE agent_id = $1 AND operator_id <> $2",
+        ),
+    ] {
+        let err = as_maintenance(pool, sql, agent, second)
+            .await
+            .expect_err("the link row is not writable");
+        assert_eq!(sqlstate(&err), "42501", "{role}: {err}");
+    }
+    let app = fixture::as_role(pool, "epigraph_app", move |mut conn| async move {
+        let r =
+            sqlx::query("UPDATE public.operator_links SET operator_id = $2 WHERE agent_id = $1")
+                .bind(agent)
+                .bind(second)
+                .execute(&mut *conn)
+                .await;
+        (conn, r.map(|_| ()))
+    })
+    .await
+    .expect_err("the app role cannot write the link row");
+    assert_eq!(sqlstate(&app), "42501", "{app}");
+}
+
+/// End `agent`'s acting link the documented way: revoke its live rows in the
+/// operator's group (harness, standing in for the maintenance revocation).
+async fn revoke_membership(pool: &PgPool, group: Uuid, agent: Uuid) {
+    let n = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("revoke")
+    .rows_affected();
+    assert!(n >= 1, "the agent held a live row in {group}");
+}
+
+/// An app-role stdio server whose own agent is keyed by `seed`, as a
+/// container's `epigraph-mcp` is. Without an `AuthContext` its tools run on
+/// the stdio transport; with one, on the authenticated transport.
+async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMcpFull {
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
+    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped)
+}
+
+/// The stdio server's own agent: resolving its viewer creates the row (and its
+/// personal group) on first use, as its first tool call would.
+async fn stdio_agent(
+    pool: &PgPool,
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    seed: u8,
+) -> Uuid {
+    epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("the stdio viewer");
+    let key = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32])
+        .expect("signer")
+        .public_key();
+    sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(pool)
+        .await
+        .expect("the stdio server's agent row")
+}
+
+/// MCP `ingest_workflow` on the stdio transport, as the server's own agent.
+async fn stdio_ingest(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    extraction: &Value,
+) -> Result<(), String> {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .map_err(|e| e.message.to_string())?;
+    let extraction: epigraph_ingest::workflow::WorkflowExtraction =
+        serde_json::from_value(extraction.clone()).expect("extraction");
+    epigraph_mcp::tools::workflow_ingest::ingest_workflow(
+        server,
+        &viewer,
+        epigraph_mcp::types::IngestWorkflowParams { extraction },
+        None,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
+fn auth_for(agent: Uuid) -> epigraph_auth::AuthContext {
+    epigraph_auth::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_auth::ClientType::Agent,
+        scopes: WRITE_SCOPES.iter().map(|s| (*s).to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+    }
+}
+
+/// MCP `add_step` as `agent` on the authenticated transport, which is where
+/// `require_workflow_authority` runs its arms.
+async fn mcp_add_step(
+    pool: &PgPool,
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    agent: Uuid,
+    canonical_name: &str,
+    text: &str,
+) -> Result<(), String> {
+    let viewer = epigraph_db::Viewer::resolve(pool, agent)
+        .await
+        .expect("viewer");
+    epigraph_mcp::tools::step_ops::add_step(
+        server,
+        &viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: canonical_name.to_string(),
+            step_text: text.to_string(),
+            position: None,
+        },
+        Some(&auth_for(agent)),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
+/// The REST refusal of an operated agent's token.
+fn assert_operated_refusal(status: StatusCode, body: &Value, what: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+    assert!(
+        body.to_string().contains("operated agents are stdio-only"),
+        "{what}: refused as an operated agent: {body}"
+    );
+}
+
+/// (e) CHARACTERIZATION. Workflow authority does not "follow a re-link",
+/// because no shipped path can make one: both link definers refuse a second
+/// operator and neither application role can write `operator_links`.
+///
+/// The curator ingests over REST while UNLINKED: a linked (operated) agent
+/// holds no HTTP authority at all, which the test also pins. Once linked, its
+/// first operator holds the operator arm over its workflow. Ending the
+/// curator's acting link the documented way (revoking its writer row in the
+/// operator group) leaves `operator_of_author` on the FIRST operator, so that
+/// human keeps the operator arm, on REST and on MCP, the second human never
+/// gets it, and the curator itself stays refused on HTTP.
+#[sqlx::test(migrations = "../../migrations")]
+async fn workflow_authority_keeps_the_first_operator_because_a_relink_is_refused(pool: PgPool) {
+    let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
+    let (o2, _og2) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let server = mcp_server(&pool, 0x5E).await;
+    let name = "acme-handover-plan";
+    let curator_t = token(curator, WRITE_SCOPES);
+    api.ingest(&curator_t, &small_extraction(name, 1)).await;
+
+    link_as_maintenance(&pool, curator, o1)
+        .await
+        .expect("link the curator to the first operator");
+    let next_generation = |g: u64| {
+        let mut e = small_extraction(name, 1);
+        e["source"]["generation"] = json!(g);
+        e
+    };
+    let (s, b) = api
+        .post("/api/v1/workflows/ingest", &curator_t, &next_generation(1))
+        .await;
+    assert_operated_refusal(s, &b, "the linked curator publishing over REST");
+
+    let o1_t = token(o1, WRITE_SCOPES);
+    let o2_t = token(o2, WRITE_SCOPES);
+    let (s, b) = api.add_step(&o1_t, name, "first operator, before").await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the first operator holds the operator arm: {b}"
+    );
+    let (s, b) = api.add_step(&o2_t, name, "second operator, before").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+
+    // The re-link the handover needs is refused through every shipped path.
+    assert_relink_refused(&pool, curator, o2).await;
+    // End the acting link the documented way, then try the re-link again.
+    revoke_membership(&pool, og1, curator).await;
+    let err = link_as_maintenance(&pool, curator, o2)
+        .await
+        .expect_err("still refused after the acting link ended");
+    assert_eq!(sqlstate(&err), "55000", "{err}");
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let author = AgentRepository::operator_of_author_pool(&app, curator)
+        .await
+        .expect("operator_of_author")
+        .expect("the curator still has an author operator");
+    assert_eq!(
+        author.operator_id, o1,
+        "ownership stays with the first operator"
+    );
+    assert!(
+        AgentRepository::operator_actor_pool(&app, curator)
+            .await
+            .expect("operator_actor")
+            .is_none(),
+        "the curator no longer acts for anyone"
+    );
+
+    // REST: the first operator keeps the arm; the second never gains it.
+    let (s, b) = api.add_step(&o1_t, name, "first operator, after").await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the first operator keeps the operator arm: {b}"
+    );
+    let (s, b) = api.add_step(&o2_t, name, "second operator, after").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    // MCP (`require_workflow_authority`): the same.
+    mcp_add_step(&pool, &server, o1, name, "first operator, mcp")
+        .await
+        .expect("MCP: the first operator keeps the operator arm");
+    let refused = mcp_add_step(&pool, &server, o2, name, "second operator, mcp")
+        .await
+        .expect_err("MCP: the second operator is refused");
+    assert!(refused.contains("was submitted by agent"), "{refused}");
+    // The curator's refusal is keyed on the link record, not on acting.
+    let (s, b) = api
+        .post("/api/v1/workflows/ingest", &curator_t, &next_generation(1))
+        .await;
+    assert_operated_refusal(s, &b, "the curator after its acting link ended");
+}
+
+async fn arm(pool: &PgPool) {
+    let armed: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let armed: bool =
+            sqlx::query_scalar("SELECT armed_now FROM public.epigraph_arm_operator_binding()")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("arm");
+        (conn, armed)
+    })
+    .await;
+    assert!(armed, "the database arms");
+}
+
+async fn workflows_named(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("count workflows")
+}
+
+/// The owner groups of the claims a workflow named `name` executes.
+async fn plan_owners(pool: &PgPool, name: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT c.owner_group_id FROM workflows w \
+           JOIN edges e ON e.source_id = w.id AND e.relationship = 'executes' \
+           JOIN claims c ON c.id = e.target_id \
+          WHERE w.canonical_name = $1",
+    )
+    .bind(name)
+    .fetch_all(pool)
+    .await
+    .expect("plan owners")
+}
+
+/// (f) CHARACTERIZATION, armed. Who can publish a workflow once operator
+/// binding is armed, with the ingest system agent registered and live-linked
+/// to the first human (the deploy order):
+///
+/// * the first human itself, over REST;
+/// * NOT an unlinked curator over REST: the ingest's caller check refuses an
+///   unbound caller (`OPL01`);
+/// * NOT a curator linked to the first human over REST: an operated agent
+///   holds no HTTP authority. Over stdio it publishes, into the first human's
+///   group;
+/// * NOT a curator linked to a SECOND human, on any transport: over stdio the
+///   caller check refuses it `OPL02` (it must belong to the system agent's
+///   human), and it writes nothing. This is the nearest shipped shape of "a
+///   curator re-linked to a second human": the re-link itself is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
+    let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
+    let (o2, _) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
+    let system = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
+            .await
+            .expect("the system agent")
+    };
+    assert!(fixture::register_system_agent(&pool, system).await);
+    let api = Api::prod_shaped(&pool).await;
+    // History first, as on a live instance: the system agent ingested (and so
+    // was provisioned its personal group) before it was linked.
+    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-unlinked").await;
+    api.ingest(
+        &token(unlinked, WRITE_SCOPES),
+        &small_extraction("acme-armed-history", 1),
+    )
+    .await;
+    link_as_maintenance(&pool, system, o1)
+        .await
+        .expect("live-link the system agent to the first human");
+    let first_server = mcp_server(&pool, 0xA1).await;
+    let first_curator = stdio_agent(&pool, &first_server, 0xA1).await;
+    link_as_maintenance(&pool, first_curator, o1)
+        .await
+        .expect("link a curator to the first human");
+    let second_server = mcp_server(&pool, 0xB2).await;
+    let second_curator = stdio_agent(&pool, &second_server, 0xB2).await;
+    link_as_maintenance(&pool, second_curator, o2)
+        .await
+        .expect("link a curator to the second human");
+    arm(&pool).await;
+
+    // The first human publishes over REST, into its own group.
+    api.ingest(
+        &token(o1, WRITE_SCOPES),
+        &small_extraction("acme-armed-human", 1),
+    )
+    .await;
+    assert_eq!(plan_owners(&pool, "acme-armed-human").await, vec![og1]);
+
+    // An unlinked curator over REST: OPL01, nothing written.
+    let (s, b) = api
+        .post(
+            "/api/v1/workflows/ingest",
+            &token(unlinked, WRITE_SCOPES),
+            &small_extraction("acme-armed-unlinked", 1),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    assert!(b.to_string().contains("OPL01"), "{b}");
+    assert_eq!(workflows_named(&pool, "acme-armed-unlinked").await, 0);
+
+    // The first human's curator: no HTTP authority; publishes over stdio.
+    let (s, b) = api
+        .post(
+            "/api/v1/workflows/ingest",
+            &token(first_curator, WRITE_SCOPES),
+            &small_extraction("acme-armed-curator-http", 1),
+        )
+        .await;
+    assert_operated_refusal(s, &b, "a linked curator over REST");
+    assert_eq!(workflows_named(&pool, "acme-armed-curator-http").await, 0);
+    stdio_ingest(&first_server, &small_extraction("acme-armed-curator", 1))
+        .await
+        .expect("the first human's curator publishes over stdio");
+    assert_eq!(plan_owners(&pool, "acme-armed-curator").await, vec![og1]);
+
+    // It cannot be re-linked to the second human.
+    assert_relink_refused(&pool, first_curator, o2).await;
+
+    // The second human's curator: OPL02 over stdio, nothing written.
+    let refused = stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
+        .await
+        .expect_err("a curator of another human must not publish through the system agent");
+    assert!(refused.contains("OPL02"), "{refused}");
+    assert_eq!(workflows_named(&pool, "acme-armed-second").await, 0);
 }
