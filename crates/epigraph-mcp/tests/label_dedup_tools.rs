@@ -247,6 +247,22 @@ fn unit_writes(plan: &Value) -> Vec<Value> {
     plan["write_units"].as_array().expect("write_units").clone()
 }
 
+/// The plan's per-unit prediction for `unit`.
+fn unit_check<'a>(plan: &'a Value, unit: &str) -> &'a Value {
+    plan["unit_check"]
+        .as_array()
+        .and_then(|a| a.iter().find(|u| u["unit"] == unit))
+        .unwrap_or_else(|| panic!("no unit_check for {unit}: {plan}"))
+}
+
+/// Whether `unit_check` names `id` as a member the write identity does not own.
+fn names_foreign_member(check: &Value, id: Uuid) -> bool {
+    check["members"].as_array().is_some_and(|ms| {
+        ms.iter()
+            .any(|m| m["claim_id"] == id.to_string() && m["owned"] == false)
+    })
+}
+
 fn result_for<'a>(apply: &'a Value, unit: &str) -> &'a Value {
     apply["results"]
         .as_array()
@@ -263,13 +279,35 @@ async fn app_role_server(
     pool: &PgPool,
     cfg: LabelDedupConfig,
 ) -> (EpiGraphMcpFull, Uuid, Uuid, Viewer) {
+    app_role_server_with_signer(pool, cfg, Signer::Declared).await
+}
+
+/// Which signer the stdio server runs under.
+#[derive(Debug, Clone, Copy)]
+enum Signer {
+    /// A fixed key: ownership is decided against the server's own agent.
+    Declared,
+    /// `main::select_signer`'s no-key rung: another agent's claim takes the
+    /// `UndeclaredSigner` arm of the ownership check.
+    Generated,
+}
+
+async fn app_role_server_with_signer(
+    pool: &PgPool,
+    cfg: LabelDedupConfig,
+    signer: Signer,
+) -> (EpiGraphMcpFull, Uuid, Uuid, Viewer) {
     let url = fixture::database_url_for(pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
-    let server = build_scoped_test_server(plain, scoped).with_label_dedup_config(cfg);
+    let server = match signer {
+        Signer::Declared => build_scoped_test_server(plain, scoped),
+        Signer::Generated => build_scoped_test_server_generated_signer(plain, scoped),
+    }
+    .with_label_dedup_config(cfg);
     let agent = server.server_agent_id().await.expect("server agent");
     let group = personal_group_of(pool, agent).await;
     let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
@@ -292,6 +330,12 @@ const FENCE: &str =
     "Yard fence replacement | Acme Parks Office | due: 2026-09-01 | ref ACME-555001";
 const GATE: &str = "Gate motor swap | Acme Parks Office | due: 2026-09-03 | ref ACME-555002";
 const ROOF: &str = "Library roof survey | Acme Library Board | due: 2026-12-20 | ref ACME-888001";
+const ROOF_B: &str =
+    "Library roof survey works | Acme Library Board | due: 2026-12-20 | ref ACME-888001";
+/// PUMP_A's item under a different strong id: it joins PUMP_A only through a
+/// revision label (the label overrides the strong-id veto).
+const PUMP_REVISED: &str =
+    "Pump station rehab | Acme Water Authority | due: 2026-11-20 | ref ACME-424242";
 
 // ── Profile loading ─────────────────────────────────────────────────────────
 
@@ -1361,14 +1405,16 @@ async fn probe_matches_a_live_member_and_refuses_a_truncated_index(pool: PgPool)
     assert_eq!(code(&err), "TRUNCATED", "{err:?}");
 }
 
-/// CHARACTERIZATION (an open decision, not an endorsement): the family read
-/// takes every claim the caller can read, so another author's PUBLIC claim
-/// carrying the family label is a member and can answer a probe `match`.
+/// Another author's PUBLIC claim carrying the family label is a member the
+/// caller can read, but it cannot answer `match` for the caller: a generator
+/// would skip filing its own item on a claim it neither owns nor can merge.
+/// The verdict is `review` and keeps `matched_id` for the human. Control: a
+/// candidate matching the caller's own member is still `match`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn characterization_a_foreign_public_family_claim_is_a_member(pool: PgPool) {
+async fn probe_answers_review_not_match_for_another_authors_member(pool: PgPool) {
     let bytes = profile_bytes();
     let root = profile_root(&bytes);
-    let (server, _agent, _group, viewer) =
+    let (server, agent, group, viewer) =
         app_role_server(&pool, config(Some(&root), None, 5000)).await;
     let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-public").await;
     let foreign = seed(
@@ -1381,6 +1427,16 @@ async fn characterization_a_foreign_public_family_claim_is_a_member(pool: PgPool
         "2026-10-01T00:00:00Z",
     )
     .await;
+    let mine = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
 
     let out = first_text(
         &probe_label_dedup(
@@ -1391,11 +1447,20 @@ async fn characterization_a_foreign_public_family_claim_is_a_member(pool: PgPool
                 profile_json: None,
                 profile_claim_id: None,
                 profile_hash: profile_hash(&bytes),
-                candidates: vec![LabelDedupCandidateParam {
-                    key: "k".into(),
-                    content: PUMP_C.into(),
-                    labels: s(&[FAMILY]),
-                }],
+                candidates: vec![
+                    LabelDedupCandidateParam {
+                        key: "foreign".into(),
+                        content: PUMP_C.into(),
+                        labels: s(&[FAMILY]),
+                    },
+                    LabelDedupCandidateParam {
+                        key: "mine".into(),
+                        content: "Library roof survey works | Acme Library Board | due: \
+                                  2026-12-20 | ref ACME-888001"
+                            .into(),
+                        labels: s(&[FAMILY]),
+                    },
+                ],
                 include_closed_signals: false,
                 max_claims: None,
             },
@@ -1404,12 +1469,27 @@ async fn characterization_a_foreign_public_family_claim_is_a_member(pool: PgPool
         .await
         .expect("probe"),
     );
-    assert_eq!(out["verdicts"][0]["verdict"], "match", "{out}");
+    let verdict = |key: &str| {
+        out["verdicts"]
+            .as_array()
+            .expect("verdicts")
+            .iter()
+            .find(|v| v["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("no verdict for {key}: {out}"))
+    };
     assert_eq!(
-        out["verdicts"][0]["matched_id"],
-        foreign.to_string(),
-        "{out}"
+        verdict("foreign")["verdict"],
+        "review",
+        "a foreign member never answers match: {out}"
     );
+    assert_eq!(
+        verdict("foreign")["matched_id"],
+        foreign.to_string(),
+        "the human still sees which claim it resembles: {out}"
+    );
+    assert_eq!(verdict("mine")["verdict"], "match", "control: {out}");
+    assert_eq!(verdict("mine")["matched_id"], mine.to_string(), "{out}");
 }
 
 /// The profile's own closed label is a retirement label: on stdio a free
@@ -1466,4 +1546,334 @@ async fn the_profiles_closed_label_takes_the_retirement_gate(pool: PgPool) {
     );
     assert!(labels_of(&pool, mine).await.contains(&"done".to_string()));
     assert!(!labels_of(&pool, theirs).await.contains(&"done".to_string()));
+}
+
+// ── Cluster ownership ───────────────────────────────────────────────────────
+//
+// A cluster unit retires its losers toward its survivor, so every member of
+// it, survivor included, must be the write identity's own (author, the
+// author's operator, or an admin over HTTP), whatever the transport and
+// whether or not the member itself is written. Row security alone does not
+// decide this: the foreign claims below sit in groups the write identity can
+// write, or are never written at all.
+
+/// How the foreign claim joins the caller's cluster.
+#[derive(Debug, Clone, Copy)]
+enum Join {
+    /// It shares the strong id.
+    SharedId,
+    /// A revision label naming the other claim, across a conflicting strong id.
+    RevisionLabel,
+}
+
+fn profile_for(join: Join) -> Value {
+    let mut v = profile_value();
+    if matches!(join, Join::RevisionLabel) {
+        v["revision_label_prefix"] = json!("revises:");
+    }
+    v
+}
+
+/// On an application-role server over stdio: the caller's survivor, a loser
+/// AUTHORED BY A STRANGER but owned by the server agent's own group (so row
+/// security admits the write and only an application check can refuse it),
+/// and, as the control, a second cluster whose members are all the agent's
+/// own. The foreign cluster is refused with nothing written and was predicted
+/// by `unit_check`; the self-authored cluster applies.
+async fn a_cross_author_cluster_is_refused_on_stdio(pool: PgPool, signer: Signer, join: Join) {
+    let bytes = serde_json::to_vec(&profile_for(join)).expect("profile");
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server_with_signer(&pool, config(Some(&root), None, 5000), signer).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "item-foreign-author").await;
+
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let mut cluster_ids = vec![survivor];
+    let foreign = match join {
+        Join::SharedId => {
+            cluster_ids.push(
+                seed(
+                    &pool,
+                    agent,
+                    group,
+                    "public",
+                    PUMP_B,
+                    &[FAMILY],
+                    "2026-09-01T00:00:00Z",
+                )
+                .await,
+            );
+            seed(
+                &pool,
+                stranger,
+                group,
+                "public",
+                PUMP_C,
+                &[FAMILY],
+                "2026-08-01T00:00:00Z",
+            )
+            .await
+        }
+        Join::RevisionLabel => {
+            let label = format!("revises:{survivor}");
+            seed(
+                &pool,
+                stranger,
+                group,
+                "public",
+                PUMP_REVISED,
+                &[FAMILY, &label],
+                "2026-08-01T00:00:00Z",
+            )
+            .await
+        }
+    };
+    cluster_ids.push(foreign);
+    let roof_old = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let roof_new = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF_B,
+        &[FAMILY],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &cluster_ids).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    // Precondition: the foreign claim is a loser of the caller's cluster.
+    let cluster = plan["clusters"]
+        .as_array()
+        .expect("clusters")
+        .iter()
+        .find(|c| c["survivor"] == survivor.to_string())
+        .unwrap_or_else(|| panic!("no cluster for the survivor: {plan}"));
+    let member = cluster["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|m| m["id"] == foreign.to_string())
+        .unwrap_or_else(|| panic!("the foreign claim is not in the cluster: {plan}"));
+    if matches!(join, Join::RevisionLabel) {
+        assert_eq!(member["tier"], "revision_label", "{plan}");
+    }
+
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let unit = format!("cluster:{survivor}");
+    let refused = result_for(&out, &unit);
+    assert_eq!(
+        refused["ok"], false,
+        "a cluster joining another author's claim must not apply ({signer:?}, {join:?}): {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &cluster_ids).await,
+        before,
+        "nothing of the unit lands, the foreign claim least of all"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("CROSS_OWNER_MEMBER")),
+        "{out}"
+    );
+    let check = unit_check(&plan, &unit);
+    assert_eq!(check["applies"], false, "predicted: {plan}");
+    assert!(names_foreign_member(check, foreign), "{plan}");
+
+    // Control: the self-authored cluster in the same apply commits.
+    let control = format!("cluster:{roof_new}");
+    assert_eq!(result_for(&out, &control)["ok"], true, "{out}");
+    assert!(
+        labels_of(&pool, roof_old)
+            .await
+            .contains(&format!("duplicate-of:{roof_new}")),
+        "the control cluster applied"
+    );
+    assert_eq!(unit_check(&plan, &control)["applies"], true, "{plan}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_author_cluster_joined_by_a_shared_id_is_refused_under_a_declared_signer(
+    pool: PgPool,
+) {
+    a_cross_author_cluster_is_refused_on_stdio(pool, Signer::Declared, Join::SharedId).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_author_cluster_joined_by_a_revision_label_is_refused_under_a_declared_signer(
+    pool: PgPool,
+) {
+    a_cross_author_cluster_is_refused_on_stdio(pool, Signer::Declared, Join::RevisionLabel).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_author_cluster_joined_by_a_shared_id_is_refused_under_a_generated_signer(
+    pool: PgPool,
+) {
+    a_cross_author_cluster_is_refused_on_stdio(pool, Signer::Generated, Join::SharedId).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_author_cluster_joined_by_a_revision_label_is_refused_under_a_generated_signer(
+    pool: PgPool,
+) {
+    a_cross_author_cluster_is_refused_on_stdio(pool, Signer::Generated, Join::RevisionLabel).await;
+}
+
+/// Over HTTP: a stranger files a NEWER public claim that joins the caller's
+/// family, so it ranks survivor. With `merge.survivor_add` empty and nothing
+/// to carry, the survivor has no write of its own: every write of the unit
+/// targets the caller's claims, which the caller owns, so no per-write gate
+/// sees the stranger. The unit must still refuse, because its survivor is
+/// not the caller's, and leave the caller's labels byte-identical.
+async fn a_foreign_survivor_never_absorbs_the_callers_claims(pool: PgPool, join: Join) {
+    let mut v = profile_for(join);
+    v["merge"]["survivor_add"] = json!([]);
+    if matches!(join, Join::RevisionLabel) {
+        // The stranger's claim carries none of the caller's ids, so nothing
+        // may be carried onto it either.
+        v["merge"]["carry_ids"] = json!(false);
+        v["merge"]["carry_later_dates"] = json!([]);
+    }
+    let bytes = serde_json::to_vec(&v).expect("profile");
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-newer").await;
+
+    let a = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let mut mine = vec![a];
+    let theirs = match join {
+        // Every id and the latest date already on the stranger's claim.
+        Join::SharedId => {
+            mine.push(
+                seed(
+                    &pool,
+                    caller,
+                    caller_group,
+                    "public",
+                    PUMP_C,
+                    &[FAMILY],
+                    "2026-08-01T00:00:00Z",
+                )
+                .await,
+            );
+            seed(
+                &pool,
+                stranger,
+                stranger_group,
+                "public",
+                PUMP_B,
+                &[FAMILY],
+                "2026-10-01T00:00:00Z",
+            )
+            .await
+        }
+        // A one-sided revision label on the stranger's own claim, across a
+        // conflicting strong id.
+        Join::RevisionLabel => {
+            let label = format!("revises:{a}");
+            seed(
+                &pool,
+                stranger,
+                stranger_group,
+                "public",
+                PUMP_REVISED,
+                &[FAMILY, &label],
+                "2026-10-01T00:00:00Z",
+            )
+            .await
+        }
+    };
+    let before = snapshot(&pool, &mine).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    // Preconditions: the stranger's claim is the survivor, and the unit writes
+    // only the caller's claims.
+    assert_eq!(
+        plan["clusters"][0]["survivor"],
+        theirs.to_string(),
+        "{plan}"
+    );
+    let unit = format!("cluster:{theirs}");
+    let writes = unit_writes(&plan)
+        .into_iter()
+        .find(|u| u["unit"] == unit)
+        .unwrap_or_else(|| panic!("no write unit {unit}: {plan}"));
+    let targets: Vec<String> = writes["writes"]
+        .as_array()
+        .expect("writes")
+        .iter()
+        .map(|w| w["claim_id"].as_str().expect("claim_id").to_string())
+        .collect();
+    assert!(!targets.contains(&theirs.to_string()), "{plan}");
+    assert!(targets.contains(&a.to_string()), "{plan}");
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    let refused = result_for(&out, &unit);
+    assert_eq!(
+        refused["ok"], false,
+        "the caller's claims are never retired toward a stranger's ({join:?}): {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &mine).await,
+        before,
+        "the caller's labels are byte-identical"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("CROSS_OWNER_MEMBER")),
+        "{out}"
+    );
+    let check = unit_check(&plan, &unit);
+    assert_eq!(check["applies"], false, "predicted: {plan}");
+    assert!(names_foreign_member(check, theirs), "{plan}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_foreign_survivor_with_no_write_of_its_own_is_refused_over_http(pool: PgPool) {
+    a_foreign_survivor_never_absorbs_the_callers_claims(pool, Join::SharedId).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_one_sided_revision_label_cannot_make_a_stranger_the_survivor(pool: PgPool) {
+    a_foreign_survivor_never_absorbs_the_callers_claims(pool, Join::RevisionLabel).await;
 }
