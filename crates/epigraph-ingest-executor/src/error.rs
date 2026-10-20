@@ -33,6 +33,35 @@ pub enum IngestExecutorError {
     )]
     SystemAgentUnregistered { role: &'static str },
 
+    /// A declared-tenancy ingest names a group the CALLING agent itself does
+    /// not write: it holds no live `writer` / `admin` membership of it. The
+    /// caller's human writing the group does not count (an agent writes only
+    /// where it is itself a member). Raised before anything is written.
+    #[error(
+        "the calling agent {caller} holds no live writer or admin membership of group {group}, \
+         so it may not declare that group as the tenancy of a workflow ingest (its own \
+         membership is required; its operator's does not count). Nothing was written"
+    )]
+    CallerNotGroupWriter {
+        caller: uuid::Uuid,
+        group: uuid::Uuid,
+    },
+
+    /// A declared-tenancy ingest names a group the workflow-ingest system
+    /// agent does not write, so its stamp could not satisfy the row-security
+    /// `WITH CHECK` on the claims and edges it would create. Raised on the
+    /// stamped transaction before anything is written.
+    #[error(
+        "the workflow-ingest system agent {system_agent} holds no live writer or admin \
+         membership of group {group}, so no claim of this ingest could be owned by it: a \
+         maintenance session must grant that agent a writer row in the group first. Nothing \
+         was written"
+    )]
+    DeclaredGroupNotWritable {
+        group: uuid::Uuid,
+        system_agent: uuid::Uuid,
+    },
+
     /// Failed to insert the workflow row.
     #[error("workflow row insert failed: {0}")]
     WorkflowInsert(String),
@@ -66,4 +95,17 @@ pub enum IngestExecutorError {
         level2: usize,
         claims: usize,
     },
+}
+
+impl IngestExecutorError {
+    /// Whether this is one of the two declared-tenancy refusals
+    /// ([`Self::CallerNotGroupWriter`], [`Self::DeclaredGroupNotWritable`]):
+    /// a denial the caller can act on (403 / `INVALID_REQUEST`), not a fault.
+    #[must_use]
+    pub const fn is_declared_tenancy_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::CallerNotGroupWriter { .. } | Self::DeclaredGroupNotWritable { .. }
+        )
+    }
 }

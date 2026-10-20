@@ -159,6 +159,98 @@ pub struct WorkflowIngestExecutionResult {
     /// `auto_wire_edge_if_epistemic` as the BBA's `source_agent_id`. `None`
     /// on idempotent re-ingest (no agent created, no edges to wire).
     pub system_agent_id: Option<Uuid>,
+    /// Declared-tenancy ingests only ([`execute_workflow_ingest_plan_in_group`]
+    /// with a group): every planned claim this call did NOT create whose
+    /// tenancy is not `('group', <the declared group>)`, in plan order. On an
+    /// idempotent re-ingest that is every planned claim of another tenancy.
+    /// Always empty when no group was declared.
+    pub reused_items: Vec<ReusedClaim>,
+}
+
+/// What a declared-tenancy ingest declares: the owner group of every claim it
+/// creates, and the CALLER's viewer, through which the tenancy of every claim
+/// it reuses is read (so a caller is never told the tenancy of a claim it
+/// cannot read).
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredGroup<'a> {
+    pub group: Uuid,
+    pub caller: &'a epigraph_db::visibility::Viewer,
+}
+
+/// A planned claim a declared-tenancy ingest reused rather than created, whose
+/// tenancy differs from the declared one. Nothing re-tenants it: the plan then
+/// executes a claim outside the declared group, and the caller decides whether
+/// that is acceptable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusedClaim {
+    pub claim_id: Uuid,
+    /// `public` or `group`; `None` when the caller (or the ingest's own
+    /// system-agent stamp) cannot read the claim.
+    pub visibility: Option<String>,
+    /// The claim's owner group; `None` exactly when `visibility` is.
+    pub owner_group_id: Option<Uuid>,
+}
+
+/// The app-side half of a declared-tenancy ingest's authority: the CALLING
+/// agent itself must hold a live `writer` / `admin` membership of `group`.
+///
+/// Asked of the caller's OWN viewer, never its human's: an operated agent's
+/// writer authority through its operator (`AgentRepository::require_writer_authority`)
+/// would admit every agent the group's writer operates. `viewer` must be the
+/// caller's (its principal is compared); a bypass viewer has no writable set
+/// and is refused. Call it before any transaction is opened, so a refusal
+/// writes nothing (not even the system agent's first-use provisioning).
+///
+/// # Errors
+/// [`IngestExecutorError::CallerNotGroupWriter`].
+pub fn require_caller_writes_group(
+    viewer: &epigraph_db::visibility::Viewer,
+    caller: Uuid,
+    group: Uuid,
+) -> Result<(), IngestExecutorError> {
+    if viewer.principal() == Some(caller) && viewer.writable_groups().contains(&group) {
+        Ok(())
+    } else {
+        Err(IngestExecutorError::CallerNotGroupWriter { caller, group })
+    }
+}
+
+/// The reused claims among `planned` whose tenancy is not `('group', group)`,
+/// first occurrence first.
+async fn reused_with_another_tenancy(
+    conn: &mut sqlx::PgConnection,
+    planned: impl IntoIterator<Item = Uuid>,
+    declared: DeclaredGroup<'_>,
+) -> Result<Vec<ReusedClaim>, IngestExecutorError> {
+    let group = declared.group;
+    let mut ids: Vec<Uuid> = Vec::new();
+    for id in planned {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let readable: HashMap<Uuid, (String, Uuid)> =
+        ClaimRepository::tenancy_of_conn(conn, declared.caller, &ids)
+            .await?
+            .into_iter()
+            .map(|(id, v, o)| (id, (v, o)))
+            .collect();
+    Ok(ids
+        .into_iter()
+        .filter_map(|claim_id| match readable.get(&claim_id) {
+            Some((v, o)) if v == "group" && *o == group => None,
+            Some((v, o)) => Some(ReusedClaim {
+                claim_id,
+                visibility: Some(v.clone()),
+                owner_group_id: Some(*o),
+            }),
+            None => Some(ReusedClaim {
+                claim_id,
+                visibility: None,
+                owner_group_id: None,
+            }),
+        })
+        .collect())
 }
 
 /// Execute a workflow ingest plan against the database.
@@ -198,6 +290,38 @@ pub async fn execute_workflow_ingest_plan(
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
+    execute_workflow_ingest_plan_in_group(conn, plan, extraction, None).await
+}
+
+/// [`execute_workflow_ingest_plan`], with an optional DECLARED owner group.
+///
+/// `None` is exactly [`execute_workflow_ingest_plan`]: every claim the walk
+/// creates is public, owned by the system agent's default group.
+///
+/// `Some(DeclaredGroup { group, caller })` declares `('group', group)` for every claim the walk CREATES
+/// (`TenancyDecl::group`); the `executes` and plan edges then derive the same
+/// tenancy from their endpoints. Before anything is written (and before the
+/// idempotency gate, so a re-ingest is refused the same way) it asks the
+/// stamped connection whether its stamp writes `group`
+/// (`GroupMembershipRepository::session_can_write_group_conn`, the question
+/// the row-security `WITH CHECK` asks of every row): the stamp is the system
+/// agent's, so this refuses with
+/// [`IngestExecutorError::DeclaredGroupNotWritable`] unless that agent holds a
+/// live writer membership of the group. It does NOT check the caller: that is
+/// [`require_caller_writes_group`], which every caller runs first. Claims the
+/// walk reuses keep their tenancy and are reported in
+/// [`WorkflowIngestExecutionResult::reused_items`].
+///
+/// # Errors
+/// As [`execute_workflow_ingest_plan`], plus
+/// [`IngestExecutorError::DeclaredGroupNotWritable`].
+pub async fn execute_workflow_ingest_plan_in_group(
+    conn: &mut sqlx::PgConnection,
+    plan: &IngestPlan,
+    extraction: &WorkflowExtraction,
+    declared: Option<DeclaredGroup<'_>>,
+) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
+    let declared_group = declared.map(|d| d.group);
     let canonical_name = &extraction.source.canonical_name;
     let generation = extraction.source.generation as i32;
     let goal = &extraction.source.goal;
@@ -251,6 +375,19 @@ pub async fn execute_workflow_ingest_plan(
         }
     }
 
+    // ── 0c. Declared tenancy: the stamp must write the declared group ────
+    if let Some(group) = declared_group {
+        if !epigraph_db::GroupMembershipRepository::session_can_write_group_conn(&mut *conn, group)
+            .await?
+        {
+            let system_agent = get_or_create_system_agent(&mut *conn).await?;
+            return Err(IngestExecutorError::DeclaredGroupNotWritable {
+                group,
+                system_agent,
+            });
+        }
+    }
+
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
     if let Some(existing_id) =
         WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation).await?
@@ -264,6 +401,13 @@ pub async fn execute_workflow_ingest_plan(
         .await?;
 
         if edge_count > 0 {
+            let reused_items = match declared {
+                Some(d) => {
+                    reused_with_another_tenancy(&mut *conn, plan.claims.iter().map(|c| c.id), d)
+                        .await?
+                }
+                None => Vec::new(),
+            };
             return Ok(WorkflowIngestExecutionResult {
                 workflow_id: existing_id,
                 canonical_name: canonical_name.clone(),
@@ -277,6 +421,7 @@ pub async fn execute_workflow_ingest_plan(
                 inserted: Vec::new(),
                 inserted_edges: Vec::new(),
                 system_agent_id: None,
+                reused_items,
             });
         }
     }
@@ -404,7 +549,15 @@ pub async fn execute_workflow_ingest_plan(
     // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
     // instance-wide workflow content -- so the system agent's own group is the
     // declaration, publicly visible.
-    let decl = ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?;
+    //
+    // A DECLARED group (`execute_workflow_ingest_plan_in_group`) replaces that
+    // default for the claims this walk creates; step 0c proved the stamp writes
+    // it.
+    let decl = match declared_group {
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        None => ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?,
+    };
+    let mut reused_ids: Vec<Uuid> = Vec::new();
 
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
@@ -469,6 +622,7 @@ pub async fn execute_workflow_ingest_plan(
             inserted.push((planned.id, planned.content.clone()));
         } else {
             claims_skipped_dedup += 1;
+            reused_ids.push(planned.id);
         }
 
         id_map.insert(planned.id, planned.id);
@@ -582,6 +736,11 @@ pub async fn execute_workflow_ingest_plan(
         }
     }
 
+    let reused_items = match declared {
+        Some(d) => reused_with_another_tenancy(&mut *conn, reused_ids, d).await?,
+        None => Vec::new(),
+    };
+
     Ok(WorkflowIngestExecutionResult {
         workflow_id,
         canonical_name: canonical_name.clone(),
@@ -595,5 +754,6 @@ pub async fn execute_workflow_ingest_plan(
         inserted,
         inserted_edges,
         system_agent_id: Some(system_agent_id),
+        reused_items,
     })
 }
