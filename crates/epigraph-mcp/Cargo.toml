@@ -31,6 +31,11 @@ epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
 epigraph-ingest-executor = { workspace = true }
 
+# `O_NOFOLLOW | O_NONBLOCK` for the label-dedup profile file open (a symlink
+# or a FIFO at the profile path must be refused, never followed or waited on).
+# Already in the lock through tokio; no new crate.
+libc = "0.2"
+
 # MCP protocol (no sqlx dep — coexists with workspace sqlx 0.7)
 rmcp = { workspace = true }
 schemars = { workspace = true }
