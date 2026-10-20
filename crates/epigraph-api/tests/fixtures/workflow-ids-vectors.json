@@ -1,6 +1,6 @@
 {
   "schema": "workflow-ids-vectors/v1",
-  "about": "Frozen expected values for epigraph-ingest/src/common/ids.rs and the workflow ingest plan order. Computed by an implementation independent of the Rust crate; the Rust test compares, it never regenerates. A change here is a change to every stored workflow id.",
+  "about": "Frozen expected values for epigraph-ingest/src/common/ids.rs and the workflow ingest plan order. Computed by an implementation independent of the Rust crate (gen_workflow_ids_vectors.py, beside this file, run by hand); the Rust test compares, it never regenerates. A change here is a change to every stored workflow id.",
   "namespaces": {
     "workflow": "f10e55a5-3742-4bc0-9d21-8ea6f3126c88",
     "compound": "c04d90d1-e2f3-4456-789a-bcdef01234a5",
