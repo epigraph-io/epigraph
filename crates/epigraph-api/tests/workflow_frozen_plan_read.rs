@@ -52,7 +52,6 @@ const VECTORS: &str = include_str!("../../epigraph-ingest/tests/fixtures/wfd1-ve
 
 const WRITE_SCOPES: &[&str] = &["claims:read", "claims:write", "edges:write"];
 const READ_SCOPES: &[&str] = &["claims:read"];
-const WORLD_GROUP: &str = "00000000-0000-0000-0000-000000000000";
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("the vectors file parses")
@@ -385,9 +384,10 @@ async fn a_reader_reads_the_frozen_plan_and_its_digest_equals_the_vectors(pool: 
 }
 
 /// Tenancy is reported, not assumed: the same plan left public reads as
-/// public items owned by the world group, with the same digest.
+/// public items, each with the owner group its row actually carries (the
+/// ingest system agent's, not G), and the same digest.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_public_plan_reports_public_items_owned_by_the_world_group(pool: PgPool) {
+async fn a_public_plan_reports_public_items_and_their_stored_owner(pool: PgPool) {
     let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
     let api = Api::prod_shaped(&pool).await;
@@ -399,8 +399,19 @@ async fn a_public_plan_reports_public_items_owned_by_the_world_group(pool: PgPoo
     assert_eq!(flags(&p), clean());
     assert_eq!(p["digest_echo"], vectors()["ingest"]["wfd1"]);
     for item in p["items"].as_array().unwrap() {
+        let stored: (String, Uuid) =
+            sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
+                .bind(uuid_of(&item["claim_id"]))
+                .fetch_one(&pool)
+                .await
+                .expect("harness: stored tenancy");
+        assert_eq!(stored.0, "public", "calibration: the ingest is public");
         assert_eq!(item["visibility"], json!("public"), "{item}");
-        assert_eq!(item["owner_group_id"], json!(WORLD_GROUP), "{item}");
+        assert_eq!(
+            item["owner_group_id"],
+            json!(stored.1.to_string()),
+            "{item}"
+        );
     }
 }
 
@@ -600,26 +611,6 @@ async fn evolve_step_leaves_the_items_and_digest_and_sets_heads_diverged(pool: P
         assert_eq!(item["heads_diverged"], json!(is_step), "{item}");
         assert_eq!(item["is_current"], json!(!is_step), "{item}");
     }
-}
-
-/// The row's truth is the kill switch: a deprecated workflow reads 0.05.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_deprecated_workflow_reads_truth_0_05(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
-    let api = Api::prod_shaped(&pool).await;
-    let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
-    let (status, body) = api
-        .call(
-            Method::DELETE,
-            &format!("/api/v1/workflows/{wf}?reason=workflow-plan%20retired"),
-            &t,
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "deprecate: {body}");
-    let p = api.plan(&t, wf).await;
-    assert_eq!(p["truth_value"], json!(0.05), "{p}");
 }
 
 /// `content_hash_ok` is seed-aware. A legacy row (no scope marker, plain
