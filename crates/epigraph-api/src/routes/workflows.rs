@@ -738,6 +738,82 @@ pub async fn get_workflow(
     })))
 }
 
+/// GET /api/v1/workflows/:id/plan - The frozen plan of one workflow
+/// generation, read as the caller (`claims:read`).
+///
+/// Every `executes` target of THIS `workflow_id`, at every level, in the order
+/// the edges' `plan_index` values give, with content, stored hash, the
+/// seed-aware `content_hash_ok`, tenancy, truth, `is_current` and
+/// `heads_diverged`; the `workflows` row's name, generation, goal, parent,
+/// truth and recorded submitter; integrity counts (`hidden_count`,
+/// `unindexed_edges`, `plan_index_gaps`, `duplicate_plan_indices`,
+/// `retracted_edges`); and a `wfd1` `digest_echo` only when every count is
+/// zero. Lineage heads are never read as content: an `evolve_step` shows as
+/// `heads_diverged`, not as a different plan.
+///
+/// `plan_index` is a mutable edge property (a writer of the plan's group can
+/// rewrite or retract an `executes` edge), so the read reports the order as
+/// stored and never repairs it. A caller that pins a plan compares its own
+/// digest; the echo is informational.
+///
+/// 404 when the row does not exist and when the caller can see none of its
+/// `executes` edges (a non-member of a group-private plan); see
+/// `epigraph_ingest_executor::workflow_plan::frozen_plan` for why that is not a
+/// 200 with a count.
+///
+/// The `workflows` row and every edge and claim are read on ONE connection
+/// stamped with the caller's viewer, so the in-query predicates and the
+/// session's tenancy GUCs agree under forced RLS.
+#[cfg(feature = "db")]
+pub async fn get_workflow_plan(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<epigraph_ingest::workflow::frozen_plan::FrozenPlan>, ApiError> {
+    // `else return Unauthorized`, not `if let Some(..)`: the conditional form
+    // is a fail-open scope site (see `routes/crud.rs::list_evidence`).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_workflow_plan",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let plan =
+        epigraph_ingest_executor::workflow_plan::frozen_plan(&mut *read, &viewer, workflow_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "get_workflow_plan",
+                    "frozen plan read failed on the viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to read the workflow plan".to_string(),
+                }
+            })?;
+    read.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to close the scoped read: {e}"),
+    })?;
+    plan.map(Json).ok_or(ApiError::NotFound {
+        entity: "workflow plan".to_string(),
+        id: workflow_id.to_string(),
+    })
+}
+
 /// POST /api/v1/workflows/:id/outcome - Report execution outcome.
 ///
 /// The truth update, the usage counters and the behavioral-execution row are
