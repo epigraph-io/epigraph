@@ -2030,7 +2030,14 @@ mod tests {
     /// accepting any non-empty value.
     #[test]
     fn only_on_switches_run_tokens_on() {
-        for off in [None, Some(""), Some("true"), Some("1"), Some("yes"), Some("onn")] {
+        for off in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("1"),
+            Some("yes"),
+            Some("onn"),
+        ] {
             assert_eq!(RunTokens::parse(off), RunTokens::Off, "{off:?}");
         }
         for on in [Some("on"), Some(" ON "), Some("On")] {
