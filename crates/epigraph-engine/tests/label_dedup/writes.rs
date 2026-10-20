@@ -200,6 +200,13 @@ fn every_added_label_passes_the_write_path_validator() {
     for u in &units {
         for w in &u.writes {
             epigraph_db::reject_unexpanded_labels(&w.add).unwrap_or_else(|e| panic!("{u:?}: {e}"));
+            // A label in both lists would make the result depend on whether
+            // the write path removes or adds first; the replan-empty tests
+            // assume it never does.
+            assert!(
+                w.add.iter().all(|l| !w.remove.contains(l)),
+                "add and remove overlap: {w:?}"
+            );
             for l in &w.add {
                 assert!(
                     !l.contains('{') && !l.contains('}'),

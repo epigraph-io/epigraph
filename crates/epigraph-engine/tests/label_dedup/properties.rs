@@ -257,12 +257,22 @@ fn plan_with(
     sections: &[Section],
     graph: &[DedupClaim],
 ) -> epigraph_engine::label_dedup::Plan {
+    plan_at(profile_hash, run_tag, sections, graph, "2026-10-05")
+}
+
+fn plan_at(
+    profile_hash: &str,
+    run_tag: &str,
+    sections: &[Section],
+    graph: &[DedupClaim],
+    as_of: &str,
+) -> epigraph_engine::label_dedup::Plan {
     let prof = profile();
     let req = PlanRequest {
         profile: &prof,
         profile_hash,
         run_tag,
-        as_of: Some(date("2026-10-05")),
+        as_of: Some(date(as_of)),
         sections,
     };
     let inputs = PlanInputs {
@@ -359,5 +369,38 @@ fn the_plan_hash_covers_the_writes_and_the_inputs_that_define_them() {
             &base.write_units()
         ),
         base.plan_hash
+    );
+}
+
+#[test]
+fn the_plan_hash_covers_as_of_and_the_section_set_even_with_equal_writes() {
+    let h = "a".repeat(64);
+    let dedup = [Section::Hygiene, Section::Dedup];
+    // Two dates, dedup only: the writes cannot differ, the hash must.
+    let a = plan_at(&h, RUN_TAG, &dedup, &corpus(), "2026-10-05");
+    let b = plan_at(&h, RUN_TAG, &dedup, &corpus(), "2026-10-06");
+    assert!(!a.write_units().is_empty(), "precondition: real writes");
+    assert_eq!(a.write_units(), b.write_units(), "precondition");
+    assert_ne!(a.plan_hash, b.plan_hash, "as_of is covered");
+    // Adding close-out at a date before every deadline adds no write, but
+    // a plan for a different section set must not verify as this one.
+    let early = "2026-01-01";
+    let without = plan_at(&h, RUN_TAG, &dedup, &corpus(), early);
+    let with = plan_at(
+        &h,
+        RUN_TAG,
+        &[Section::Hygiene, Section::Dedup, Section::Closeout],
+        &corpus(),
+        early,
+    );
+    assert!(
+        with.past_due.is_empty(),
+        "precondition: {:?}",
+        with.past_due
+    );
+    assert_eq!(with.write_units(), without.write_units(), "precondition");
+    assert_ne!(
+        with.plan_hash, without.plan_hash,
+        "the section set is covered"
     );
 }
