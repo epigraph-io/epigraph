@@ -14,8 +14,9 @@ use super::classify::{is_non_member, is_partially_retired};
 use super::ids::{carried_id, is_iso_date, is_us_date};
 use super::profile::{
     expand, label_problem, AgeKey, AgeKeyName, Bindings, CloseoutSpec, LabelDedupProfile,
-    LifecycleSpec, PassProfile, ReadPurpose, SupersedeMatch, TieBreak, Tier,
+    LifecycleSpec, PassProfile, ReadPurpose, SupersedeMatch, SupersedeSpec, TieBreak, Tier,
 };
+use super::record::entities_match;
 use super::record::{parse_record, unknown_count, ParsedRecord};
 use super::{iso_prefix_date, normalize_text, DedupClaim, LabelDedupError, Section, Snapshot};
 
@@ -366,6 +367,19 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
         None
     };
 
+    let signal_input = if has(Section::SignalDedup) {
+        Some(
+            inputs
+                .signal_members
+                .as_ref()
+                .ok_or(LabelDedupError::InputMissing {
+                    purpose: ReadPurpose::SignalMembers,
+                })?,
+        )
+    } else {
+        None
+    };
+
     let main = run_pass(
         &profile.pass,
         &inputs.members.claims,
@@ -430,6 +444,20 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
             as_of,
             req.run_tag,
         )?;
+    }
+    if let (Some(sp), Some(snap)) = (profile.signal_dedup.as_ref(), signal_input) {
+        let sig = run_pass(sp, &snap.claims, req.run_tag, true, true, "deadline")?;
+        if let Some(ss) = profile.signal_superseded_by_member.as_ref() {
+            plan.signal_superseded =
+                plan_superseded(&profile.pass, sp, ss, &sig, &main, req.run_tag)?;
+        }
+        plan.signal_dedup = Some(SignalDedupPlan {
+            family_label: sp.family_label.clone(),
+            hygiene: sig.hygiene,
+            clusters: sig.clusters,
+            review_pairs: sig.review_pairs,
+            vetoed_chains: sig.vetoed_chains,
+        });
     }
     plan.plan_hash = compute_plan_hash(
         req.profile_hash,
@@ -1205,4 +1233,79 @@ fn parse_signal_date(token: &str) -> Option<NaiveDate> {
     );
     let year = if y < 100 { 2000 + y } else { y };
     NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, m, d)
+}
+
+// ── Signal supersession ─────────────────────────────────────────────────────
+
+/// A live signal (not hygiene, not a signal-cluster loser) that names a live
+/// member's strong id, or matches its entity and exact title, leaves the
+/// signal family. Pairs the main pass would keep apart (a strong-id veto, a
+/// distinct-from ruling, a partition) never match. A strong-id match beats
+/// a title match, then the smallest member id wins.
+fn plan_superseded(
+    main_pass: &PassProfile,
+    signal_pass: &PassProfile,
+    spec: &SupersedeSpec,
+    signals: &PassResult,
+    main: &PassResult,
+    run_tag: &str,
+) -> Result<Vec<SignalSuperseded>, LabelDedupError> {
+    let targets: Vec<&ParsedRecord> = main
+        .records
+        .iter()
+        .filter(|r| !main.loser_of.contains_key(&rid(r)))
+        .collect();
+    let mut out = Vec::new();
+    for s in &signals.records {
+        let sid = rid(s);
+        if signals.loser_of.contains_key(&sid) {
+            continue;
+        }
+        let mut best: Option<(u8, Uuid, SupersedeMatch)> = None;
+        for t in &targets {
+            if cluster_conflict(main_pass, s, t).is_some() {
+                continue;
+            }
+            let strong = spec.require.contains(&SupersedeMatch::StrongId)
+                && !s.keys.strong_ids.is_disjoint(&t.keys.strong_ids);
+            let titled = spec.require.contains(&SupersedeMatch::ExactEntityTitle)
+                && !s.keys.title_key.is_empty()
+                && s.keys.title_key == t.keys.title_key
+                && entities_match(
+                    main_pass,
+                    s.keys.entity_tokens.as_ref(),
+                    t.keys.entity_tokens.as_ref(),
+                );
+            let found = if strong {
+                Some((0, SupersedeMatch::StrongId))
+            } else if titled {
+                Some((1, SupersedeMatch::ExactEntityTitle))
+            } else {
+                None
+            };
+            if let Some((rank, how)) = found {
+                let cand = (rank, rid(t), how);
+                if best.as_ref().is_none_or(|b| (cand.0, cand.1) < (b.0, b.1)) {
+                    best = Some(cand);
+                }
+            }
+        }
+        if let Some((_, target, matched_by)) = best {
+            let t = target.to_string();
+            let bind = Bindings {
+                run_tag,
+                family: &signal_pass.family_label,
+                survivor: None,
+                target: Some(&t),
+            };
+            out.push(SignalSuperseded {
+                id: sid,
+                target,
+                matched_by,
+                add: expand_all(&spec.add, &bind)?,
+                remove: expand_all(&spec.remove, &bind)?,
+            });
+        }
+    }
+    Ok(out)
 }
