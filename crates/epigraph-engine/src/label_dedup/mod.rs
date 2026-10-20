@@ -179,8 +179,20 @@ impl LabelDedupError {
 /// Lowercase, collapse every non-alphanumeric run to one space, trim.
 #[must_use]
 pub fn normalize_text(s: &str) -> String {
-    let _ = s;
-    String::new()
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    out
 }
 
 /// `|A ∩ B| / min(|A|, |B|)`, or 0 when either set is empty.
@@ -192,14 +204,22 @@ pub fn overlap_coefficient(
     a: &std::collections::BTreeSet<String>,
     b: &std::collections::BTreeSet<String>,
 ) -> f64 {
-    let _ = (a, b);
-    0.0
+    let smaller = a.len().min(b.len());
+    if smaller == 0 {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        inter as f64 / smaller as f64
+    }
 }
 
 /// The ISO date a field value BEGINS with, if any. `unknown`, `TBD` and prose
-/// dates yield `None`: nothing in this engine infers a date.
+/// dates yield `None`: nothing in this engine infers a date. `get(..10)`, not
+/// `[..10]`: a prose value can put a multi-byte character across byte 10.
 #[must_use]
 pub fn iso_prefix_date(value: &str) -> Option<NaiveDate> {
-    let _ = value;
-    None
+    let head = value.trim().get(..10)?;
+    NaiveDate::parse_from_str(head, "%Y-%m-%d").ok()
 }
