@@ -4,7 +4,8 @@ use epigraph_engine::label_dedup::{plan, DedupClaim, PlanInputs, PlanRequest, Se
 use proptest::prelude::*;
 
 use crate::fixtures::{
-    self as f, all_sections, apply_units, claim, corpus, date, profile, RUN_TAG,
+    self as f, all_sections, apply_units, claim, corpus, date, plan_graph_as_given, profile,
+    RUN_TAG,
 };
 
 /// The corpus, plus a transitive veto chain, a carry, signals and a closed
@@ -62,8 +63,68 @@ fn rich_graph() -> Vec<DedupClaim> {
     g
 }
 
+/// The rich graph plus claims whose LABEL order is read somewhere: two
+/// carried dates on one survivor, two carried values on one loser, two
+/// retirement labels, labels from two rank groups, and several ruling labels.
+fn label_rich_graph() -> Vec<DedupClaim> {
+    let mut g = rich_graph();
+    let spill = |due: &str| {
+        format!("Tender: GWX KX-5520 Granite Weir Spillway Refit — Acme County PUA, due {due}, est. TBD.")
+    };
+    g.push(claim(
+        0x3200_0001,
+        &spill("2026-07-10"),
+        &[
+            "notice",
+            "src-direct-a",
+            "due-carried:2026-07-15",
+            "due-carried:2026-07-01",
+        ],
+        "2026-04-27T00:00:00Z",
+    ));
+    g.push(claim(
+        0x3200_0002,
+        &spill("2026-08-30"),
+        &["notice"],
+        "2026-07-20T00:00:00Z",
+    ));
+    let crane = "[OPEN] Harbor Crane Rail Survey | Acme Port Board | ref HX-77310 | sector:city | due unknown | est. unknown | rail survey";
+    g.push(claim(
+        0x3300_0001,
+        crane,
+        &["notice", "src-direct-a"],
+        "2026-05-01T00:00:00Z",
+    ));
+    g.push(claim(
+        0x3300_0002,
+        crane,
+        &[
+            "notice",
+            "value-carried:900K",
+            "value-carried:1.2M",
+            "src-feed",
+        ],
+        "2026-05-02T00:00:00Z",
+    ));
+    g.push(claim(
+        0x3400_0001,
+        "[OPEN] Ferry Ramp Lighting Swap | Acme Port Board | ref HX-80021 | sector:city | due unknown | est. unknown | ramp lights",
+        &["notice", "listed-final", "notice-dropped", "src-feed"],
+        "2026-05-03T00:00:00Z",
+    ));
+    let ruled = format!("distinct-from:{}", f::prefix(0x3000_0003));
+    let revises = format!("revision-of-{}", f::prefix(0x3000_0001));
+    g.push(claim(
+        0x3000_0004,
+        "[OPEN] Riverside Pump Station Upgrade | Acme Water Board | ref TND 55501A | sector:city | due 2026-09-03 | est. unknown | pump design",
+        &["notice", &ruled, &revises, "class:open", "src-feed", "src-direct-c"],
+        "2026-07-02T00:00:00Z",
+    ));
+    g
+}
+
 fn plan_json(graph: &[DedupClaim], sections: &[Section]) -> (String, String) {
-    let p = f::plan_graph(&profile(), graph, sections, Some(date("2026-10-05")));
+    let p = plan_graph_as_given(&profile(), graph, sections, Some(date("2026-10-05")));
     // Guard: identical EMPTY plans would make the comparison vacuous.
     assert!(
         p.clusters.len() >= 7 && !p.vetoed_chains.is_empty(),
@@ -80,9 +141,28 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     #[test]
-    fn the_plan_is_input_order_independent(order in Just((0..rich_graph().len()).collect::<Vec<usize>>()).prop_shuffle()) {
-        let base = rich_graph();
-        let shuffled: Vec<DedupClaim> = order.iter().map(|i| base[*i].clone()).collect();
+    fn the_plan_is_input_order_independent(
+        order in Just((0..label_rich_graph().len()).collect::<Vec<usize>>()).prop_shuffle(),
+        label_keys in proptest::collection::vec(proptest::collection::vec(any::<u32>(), 12), label_rich_graph().len()),
+    ) {
+        // Rows AND each claim's labels arrive in a random order; nothing on
+        // the way in sorts them (plan_graph_as_given), so this pins the
+        // engine's own normalization.
+        let base = label_rich_graph();
+        let shuffled: Vec<DedupClaim> = order
+            .iter()
+            .map(|i| {
+                let mut c = base[*i].clone();
+                let mut keyed: Vec<(u32, String)> = label_keys[*i]
+                    .iter()
+                    .copied()
+                    .zip(c.labels.drain(..))
+                    .collect();
+                keyed.sort();
+                c.labels = keyed.into_iter().map(|(_, l)| l).collect();
+                c
+            })
+            .collect();
         let (h0, j0) = plan_json(&base, &all_sections());
         let (h1, j1) = plan_json(&shuffled, &all_sections());
         prop_assert_eq!(h0, h1);
@@ -106,6 +186,50 @@ proptest! {
         let second = f::plan_graph(&profile(), &applied, &all_sections(), Some(date("2026-10-05")));
         prop_assert!(second.is_empty(), "{:?}", second.write_units());
     }
+}
+
+#[test]
+fn the_label_rich_claims_reach_their_label_order_paths() {
+    // Guard on the permutation fixture: each added claim must hit a rule that
+    // takes the first matching label, or shuffling its labels proves nothing.
+    let p = plan_graph_as_given(
+        &profile(),
+        &label_rich_graph(),
+        &all_sections(),
+        Some(date("2026-10-05")),
+    );
+    let by_survivor = |tag: u32| {
+        p.clusters
+            .iter()
+            .find(|c| c.survivor == f::id(tag))
+            .unwrap_or_else(|| panic!("no cluster survived by {tag:x}: {:?}", p.clusters))
+    };
+    // Two carried dates on one survivor: both are replaced.
+    assert_eq!(by_survivor(0x3200_0001).survivor_remove.len(), 2);
+    // Two carried values on one loser: exactly one is carried.
+    let crane = by_survivor(0x3300_0001);
+    assert_eq!(
+        crane
+            .carry_add
+            .iter()
+            .filter(|l| l.starts_with("value-carried:"))
+            .count(),
+        1,
+        "{:?}",
+        crane.carry_add
+    );
+    // Two retirement labels: both are named.
+    let h = p
+        .hygiene
+        .iter()
+        .find(|h| h.id == f::id(0x3400_0001))
+        .expect("hygiene item");
+    assert_eq!(
+        h.reason.matches("retired_label:").count(),
+        2,
+        "{}",
+        h.reason
+    );
 }
 
 #[test]

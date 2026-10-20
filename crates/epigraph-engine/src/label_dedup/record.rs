@@ -137,6 +137,13 @@ fn parse_parts(
     labels: &[String],
     created_at: Option<DateTime<Utc>>,
 ) -> ParsedRecord {
+    // Label order is not part of a claim's meaning (a store may return it in
+    // any order), but several rules take the FIRST matching label. Sort and
+    // dedup once here so every rule, and so the plan, is label-order free.
+    let mut sorted_labels = labels.to_vec();
+    sorted_labels.sort();
+    sorted_labels.dedup();
+    let labels = sorted_labels.as_slice();
     let mut facts = parse_content(pass, content);
     let f = &pass.fields;
     merge_label(&mut facts.entity, &f.entity, labels, None);

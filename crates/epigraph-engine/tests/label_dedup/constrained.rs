@@ -6,7 +6,8 @@ use epigraph_engine::label_dedup::profile::Tier;
 use epigraph_engine::label_dedup::DedupClaim;
 
 use crate::fixtures::{
-    self as f, claim, cluster_shape, dedup_sections, id, plan_graph, prefix, profile,
+    self as f, claim, cluster_shape, dedup_sections, id, plan_graph, plan_graph_as_given, prefix,
+    profile,
 };
 
 const TITLE: &str = "Riverside Pump Station Upgrade";
@@ -63,11 +64,13 @@ fn a_stronger_edge_is_joined_first() {
     let a = item(1, "TND 55501A", &[]);
     let b = item(2, "ref Q31", &[]);
     let c = item(3, "TND 55502C ref Q31", &[]);
+    // Rows are handed over as given (no sort on the way in), so the reversed
+    // order really reaches the engine.
     for graph in [
         vec![a.clone(), b.clone(), c.clone()],
         vec![c.clone(), b.clone(), a.clone()],
     ] {
-        let p = plan_graph(&profile(), &graph, &dedup_sections(), None);
+        let p = plan_graph_as_given(&profile(), &graph, &dedup_sections(), None);
         let shape = cluster_shape(&p);
         assert_eq!(shape.len(), 1, "{shape:?}");
         let mut members = vec![shape[0].0];

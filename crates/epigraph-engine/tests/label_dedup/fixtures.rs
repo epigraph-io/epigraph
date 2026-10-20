@@ -232,6 +232,43 @@ pub fn try_plan_graph(
     plan(&req, &inputs)
 }
 
+/// Like [`plan_graph`], but every read keeps `graph`'s row order and each
+/// claim's label order: nothing is sorted on the way in, so the engine alone
+/// is responsible for being order-independent.
+pub fn plan_graph_as_given(
+    profile: &LabelDedupProfile,
+    graph: &[DedupClaim],
+    sections: &[Section],
+    as_of: Option<NaiveDate>,
+) -> Plan {
+    let mut inputs = PlanInputs::default();
+    for read in profile.reads(sections).expect("reads") {
+        let snap = Snapshot {
+            claims: graph
+                .iter()
+                .filter(|c| read.matches(&c.labels))
+                .cloned()
+                .collect(),
+            truncated: false,
+        };
+        match read.purpose {
+            ReadPurpose::Members => inputs.members = snap,
+            ReadPurpose::LifecycleSignals => inputs.lifecycle_signals = Some(snap),
+            ReadPurpose::LifecycleTargets => inputs.lifecycle_targets = Some(snap),
+            ReadPurpose::SignalMembers => inputs.signal_members = Some(snap),
+            ReadPurpose::ClosedSignals => {}
+        }
+    }
+    let req = PlanRequest {
+        profile,
+        profile_hash: "0000000000000000000000000000000000000000000000000000000000000000",
+        run_tag: RUN_TAG,
+        as_of,
+        sections,
+    };
+    plan(&req, &inputs).expect("plan")
+}
+
 /// Apply write units to an in-memory graph exactly as the label-write path
 /// does: set union for `add`, set difference for `remove`, content untouched.
 pub fn apply_units(graph: &[DedupClaim], units: &[WriteUnit]) -> Vec<DedupClaim> {
