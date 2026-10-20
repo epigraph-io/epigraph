@@ -4851,10 +4851,40 @@ impl ClaimRepository {
         current_only: bool,
         cap: i64,
     ) -> Result<Vec<LabelFamilyRow>, DbError> {
-        let _ = (executor, viewer, include, exclude, current_only, cap);
-        Err(DbError::InvalidData {
-            reason: "NOT_IMPLEMENTED: list_all_by_labels_ordered_by_id".to_string(),
-        })
+        if include.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: "a label-family read needs at least one include label; an empty set \
+                         would read every claim"
+                    .to_string(),
+            });
+        }
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("a label-family read needs a non-negative cap, got {cap}"),
+            });
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at
+            FROM claims c
+            WHERE c.labels @> $1
+              AND ($2::text[] = '{}'::text[] OR NOT (c.labels && $2))
+              AND ($3 = false OR COALESCE(c.is_current, true) = true)
+              /* {VISIBILITY:c} */
+            ORDER BY c.id
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, LabelFamilyRow>(&sql)
+            .bind(include)
+            .bind(exclude)
+            .bind(current_only)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// List claims that have NEVER been touched by decomposition: claims that
