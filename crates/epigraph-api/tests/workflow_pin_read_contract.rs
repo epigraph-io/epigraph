@@ -14,8 +14,8 @@
 //!
 //! * CONTRACT tests ((a1), (a2), (b), (c), (d)) pin behaviour the resolver is
 //!   built on. A change that fails one of them breaks every resolver.
-//! * CHARACTERIZATION tests ((e), (f)) record what the code does TODAY,
-//!   including behaviour nobody would design. They are evidence for a
+//! * CHARACTERIZATION tests ((e), (f), (g), (h)) record what the code does
+//!   TODAY, including behaviour nobody would design. They are evidence for a
 //!   decision, not an endorsement, and they say so where they pin a gap.
 //!
 //! # The cases
@@ -53,6 +53,13 @@
 //!   (`OPL01`); and a curator of a SECOND human nowhere (`OPL02` over stdio,
 //!   nothing written). A curator re-linked to the second human cannot be
 //!   constructed, as in (e).
+//! * (g) An `epigraph_app` session that sets `epigraph.group_ids` itself reads
+//!   a G-private claim and its `executes` edge: the GUCs are session
+//!   settings, not credentials, so a session on the application role reads
+//!   whichever group it names.
+//! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
+//!   `workflows` has no row security. A rewritten submitter is then honoured by
+//!   the workflow authority gate.
 //!
 //! # How a workflow becomes group-private here
 //!
@@ -443,6 +450,7 @@ struct PrivateWorkflow {
     workflow_id: Uuid,
     canonical_name: String,
     claims: Vec<Uuid>,
+    g: Uuid,
     curator: Uuid,
     reader: Uuid,
     stranger: Uuid,
@@ -467,6 +475,7 @@ async fn private_workflow(pool: &PgPool, extraction: Value) -> PrivateWorkflow {
         workflow_id,
         canonical_name,
         claims,
+        g,
         curator,
         reader,
         stranger,
@@ -1147,4 +1156,131 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
         .expect_err("a curator of another human must not publish through the system agent");
     assert!(refused.contains("OPL02"), "{refused}");
     assert_eq!(workflows_named(&pool, "acme-armed-second").await, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (g) / (h): what an application-role DSN can do by itself
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// (g) CHARACTERIZATION. The tenancy GUCs are not authenticated: an
+/// `epigraph_app` session that names G in `epigraph.group_ids` itself reads a
+/// G-private claim and its `executes` edge. Calibrated by the same session
+/// reading nothing before it sets them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool: PgPool) {
+    let w = private_workflow(&pool, small_extraction("acme-guc-plan", 1)).await;
+    let claim = w.claims[0];
+    let (g, wf) = (w.g, w.workflow_id);
+    async fn read(c: &mut sqlx::PgConnection, claim: Uuid, wf: Uuid) -> (i64, i64) {
+        let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&mut *c)
+            .await
+            .expect("read the claim");
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'executes'",
+        )
+        .bind(wf)
+        .fetch_one(&mut *c)
+        .await
+        .expect("read the edges");
+        (claims, edges)
+    }
+    let (before, after) = fixture::as_role(&pool, "epigraph_app", move |mut conn| async move {
+        let before = read(&mut conn, claim, wf).await;
+        sqlx::query("SELECT set_config('epigraph.group_ids', $1, false)")
+            .bind(g.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("self-set the group GUC");
+        let after = read(&mut conn, claim, wf).await;
+        sqlx::query("SELECT set_config('epigraph.group_ids', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("clear the GUC");
+        (conn, (before, after))
+    })
+    .await;
+    assert_eq!(
+        before,
+        (0, 0),
+        "unstamped, the app role reads nothing of the plan"
+    );
+    assert_eq!(
+        after,
+        (1, i64::try_from(w.claims.len()).unwrap()),
+        "self-stamped, the app role reads the claim and every executes edge"
+    );
+}
+
+/// (h) CHARACTERIZATION. `workflows` has no row security: the application
+/// role rewrites a workflow's truth and its recorded submitter, and the
+/// workflow authority gate then honours the forged submitter (it reads the
+/// row) and refuses the real one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (forger, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-forger").await;
+    let api = Api::prod_shaped(&pool).await;
+    let name = "acme-forged-plan";
+    let wf = uuid_of(
+        &api.ingest(&token(curator, WRITE_SCOPES), &small_extraction(name, 1))
+            .await["workflow_id"],
+    );
+    let (s, b) = api
+        .add_step(&token(forger, WRITE_SCOPES), name, "forger, before")
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "calibration: {b}");
+
+    let (truth_rows, submitter_rows) =
+        fixture::as_role(&pool, "epigraph_app", move |mut conn| async move {
+            let t = sqlx::query("UPDATE workflows SET truth_value = 0.05 WHERE id = $1")
+                .bind(wf)
+                .execute(&mut *conn)
+                .await
+                .expect("the app role updates workflows.truth_value")
+                .rows_affected();
+            let s = sqlx::query(
+                "UPDATE workflows SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', \
+                 to_jsonb($2::text)) WHERE id = $1",
+            )
+            .bind(wf)
+            .bind(forger.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("the app role rewrites the submitter")
+            .rows_affected();
+            (conn, (t, s))
+        })
+        .await;
+    assert_eq!((truth_rows, submitter_rows), (1, 1));
+
+    let (status, body) = api
+        .get(
+            &format!("/api/v1/workflows/{wf}"),
+            &token(curator, READ_SCOPES),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["truth_value"].as_f64(), Some(0.05));
+    assert_eq!(
+        body["properties"]["epigraph_submitted_by"],
+        json!(forger.to_string())
+    );
+    let (s, b) = api
+        .add_step(&token(forger, WRITE_SCOPES), name, "forger, after")
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the forged submitter passes the gate: {b}"
+    );
+    let (s, b) = api
+        .add_step(&token(curator, WRITE_SCOPES), name, "curator, after")
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "the real submitter is refused: {b}"
+    );
 }
