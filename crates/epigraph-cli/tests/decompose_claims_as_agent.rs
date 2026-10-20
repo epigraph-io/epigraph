@@ -172,7 +172,7 @@ async fn seed_decomposes_to(pool: &PgPool, parent: Uuid, atom: Uuid) {
 async fn a_fleet_login_selects_what_rls_shows_and_is_not_refused(pool: PgPool) {
     let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
     let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
-    let (acting, _acting_group) =
+    let (acting, acting_group) =
         viewer_fixture::seed_agent_with_group(&pool, "decomp-acting").await;
     let (author, author_group) =
         viewer_fixture::seed_agent_with_group(&pool, "decomp-author").await;
@@ -207,6 +207,18 @@ async fn a_fleet_login_selects_what_rls_shows_and_is_not_refused(pool: PgPool) {
     let m_atom =
         viewer_fixture::seed_group_claim(&pool, author, author_group, "M private atom.").await;
     seed_decomposes_to(&pool, m, m_atom).await;
+    // Q: a public parent whose only decomposes_to edge is private to the
+    // ACTING agent's own group. A session stamped as the agent sees the edge,
+    // so Q is decomposed for it; an unstamped read would not see it.
+    let q = viewer_fixture::seed_public_claim(
+        &pool,
+        author,
+        "Own-group parent Q has a first part. Own-group parent Q has a second part.",
+    )
+    .await;
+    let q_atom =
+        viewer_fixture::seed_group_claim(&pool, acting, acting_group, "Q private atom.").await;
+    seed_decomposes_to(&pool, q, q_atom).await;
     let m_edge_visibility: String = sqlx::query_scalar(
         "SELECT visibility FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
     )
@@ -283,6 +295,14 @@ async fn a_fleet_login_selects_what_rls_shows_and_is_not_refused(pool: PgPool) {
         "the fleet session cannot see M's private decomposes_to edge, so M reads as \
          undecomposed; if this changed, the coverage note in decompose_claims' module doc \
          is stale:\n{}",
+        fleet.stderr
+    );
+
+    assert!(
+        !fl.contains(&q) && !ml.contains(&q),
+        "Q's decomposes_to edge is in the acting agent's own group: a read stamped as the \
+         agent sees it, so Q is not undecomposed. Selected here means the read was not \
+         stamped for the agent:\n{}",
         fleet.stderr
     );
 
