@@ -1204,6 +1204,21 @@ pub async fn find_workflow_hierarchical(
 /// with no `AuthContext` is 401, never a skipped check. The route used to take
 /// no `AuthContext` at all, so any authenticated bearer, a read-only client
 /// included, could move a workflow's counters.
+///
+/// # Step attribution runs through the CALLER's viewer
+///
+/// The whole report runs on one transaction stamped with the caller's viewer
+/// ([`AppState::write_as`]). `workflows` and `behavioral_executions` have no
+/// row security, so that changes nothing about the two writes; it changes the
+/// step LOOKUP, which reads `claims` and `edges`. On the plain transaction this
+/// used to run on, row security admitted only public rows, so a group's own
+/// member got every row of a group-private workflow written with a NULL
+/// `step_claim_id`, silently. Now a member resolves its group's steps, and any
+/// `step_index` that matches no step the caller can read is listed in
+/// `unresolved_step_indices` with a `warning` (out of range and not visible are
+/// deliberately not told apart). Shared with MCP:
+/// `WorkflowRepository::plan_step_claim_ids` and
+/// `epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning`.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1223,6 +1238,7 @@ pub async fn find_workflow_hierarchical(
 )]
 pub async fn report_hierarchical_outcome(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
@@ -1276,16 +1292,12 @@ pub async fn report_hierarchical_outcome(
     };
 
     // ONE transaction for the counters and every step row (U033): a refused row
-    // fails the report and rolls the counters back. A plain transaction, not an
-    // author-stamped one: neither `workflows` nor `behavioral_executions` has
-    // row security, so there is no `WITH CHECK` for a stamp to satisfy.
+    // fails the report and rolls the counters back. Stamped with the caller's
+    // viewer so the step lookup (step 4) reads what the CALLER may read; the
+    // two writes are to tables with no row security.
     let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("transaction begin failed: {e}"),
-        })?;
+        .write_as(&viewer, "report_hierarchical_outcome")
+        .await?;
 
     // 1. Confirm this is a hierarchical workflow root, and lock its row so two
     //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
@@ -1359,48 +1371,29 @@ pub async fn report_hierarchical_outcome(
         })?;
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
-    //    restricted to level=2 (steps), in PLAN order: the `plan_index` ordinal
-    //    the ingest executor records on each edge, with `e.created_at` only as
-    //    the fallback for edges that predate it. `created_at` alone stopped
-    //    being a usable proxy when the executor began writing a plan in ONE
-    //    transaction — `NOW()` is transaction-start time, every edge ties, and
-    //    the tiebreak `c.id` is a content-derived UUID. Same key as
-    //    `epigraph_mcp::tools::workflow_hierarchical` and
-    //    `WorkflowRepository::resolve_steps_to_heads`, so step N is one step on
-    //    both transports.
-    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT c.id \
-         FROM edges e \
-         JOIN claims c ON c.id = e.target_id \
-         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
-                       THEN (e.properties->>'plan_index')::int \
-                       ELSE 2147483647 END, \
-                  e.created_at ASC, c.id ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("step lookup failed: {e}"),
-    })?;
-    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
+    //    restricted to level=2 (steps), in PLAN order, through the caller's
+    //    viewer on this stamped transaction. The order key (the `plan_index`
+    //    ordinal; `e.created_at` only for edges that predate it) lives in the
+    //    repository, shared with the MCP tool, so step N is one step on both
+    //    transports.
+    let step_claim_ids =
+        epigraph_db::WorkflowRepository::plan_step_claim_ids(&mut tx, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("step lookup failed: {e}"),
+            })?;
 
     // 5. Write per-step behavioral_executions rows on the same transaction; a
     //    refused row returns 500 and rolls back everything above. Capture the
     //    timestamp once so rows from a single outcome report group cleanly
     //    downstream (and count as ONE report in `behavioral_affinity_hierarchical`).
     let report_ts = chrono::Utc::now();
+    let mut unresolved: Vec<usize> = Vec::new();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {
             let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
-            if step_claim_id.is_none() && !step_claim_ids.is_empty() {
-                tracing::warn!(
-                    workflow_id = %workflow_id,
-                    step_index = step_exec.step_index,
-                    known_steps = step_claim_ids.len(),
-                    "step_index out of range; behavioral_executions row will have NULL step_claim_id"
-                );
+            if step_claim_id.is_none() {
+                unresolved.push(step_exec.step_index);
             }
             let step_beliefs = serde_json::json!({
                 "deviated": step_exec.deviated,
@@ -1436,13 +1429,32 @@ pub async fn report_hierarchical_outcome(
         message: format!("outcome commit failed: {e}"),
     })?;
 
-    Ok(Json(serde_json::json!({
+    let warning = epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(&unresolved);
+    if warning.is_some() {
+        // Every unattributed row is logged, the all-invisible case included;
+        // the old guard (`!step_claim_ids.is_empty()`) kept that case silent.
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            principal = ?viewer.principal(),
+            unresolved_step_indices = ?unresolved,
+            "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
+             (step_index out of range, or the step is not visible to the reporter)"
+        );
+    }
+
+    let mut response = serde_json::json!({
         "workflow_id": workflow_id,
         "use_count": use_count,
         "success_count": success_count,
         "failure_count": failure_count,
         "variance": variance,
-    })))
+        // The rows written with a NULL step_claim_id, in request order.
+        "unresolved_step_indices": unresolved,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    Ok(Json(response))
 }
 
 /// POST /api/v1/workflows/steps/:id/evolve — atomically evolve a step claim.
@@ -3331,9 +3343,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Build a minimal axum app with just the outcome route.
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        // Build a minimal axum app with just the outcome route, on a state
+        // that can stamp the report's transaction (the route refuses to run
+        // unstamped).
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
@@ -3374,7 +3387,10 @@ mod tests {
     }
 
     /// The caller every outcome-route test reports as: an agent token holding
-    /// `claims:write`, the scope the route requires.
+    /// `claims:write`, the scope the route requires. Its principal belongs to
+    /// no group; the superuser test pool filters nothing, so these tests pin
+    /// the counters / atomicity / embedding contract, not visibility (that is
+    /// `tests/hierarchical_outcome_route_authority.rs`, on the app role).
     fn outcome_reporter() -> crate::middleware::bearer::AuthContext {
         let agent = uuid::Uuid::new_v4();
         crate::middleware::bearer::AuthContext {
@@ -3393,7 +3409,6 @@ mod tests {
 
     /// A bare hierarchical root plus the outcome route alone (U033 fixtures).
     async fn outcome_fixture(pool: &PgPool, canonical_name: &str) -> (axum::Router, uuid::Uuid) {
-        use crate::state::{ApiConfig, AppState};
         let workflow_id = uuid::Uuid::new_v4();
         epigraph_db::WorkflowRepository::insert_root(
             pool,
@@ -3406,7 +3421,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
@@ -3626,9 +3641,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let state = AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(
-            std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536))),
-        );
+        let state = scoped_test_state(pool)
+            .await
+            .with_embedding_service(std::sync::Arc::new(MockProvider::new(
+                EmbeddingConfig::openai(1536),
+            )));
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
@@ -3701,8 +3718,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",

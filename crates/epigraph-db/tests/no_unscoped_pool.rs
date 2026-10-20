@@ -651,7 +651,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 ///
 /// Nightly staging 2026-10-14 merged both: 256 - 3 (U033) - 1 (X12) = 252, disjoint
 /// files, re-measured by `the_unconverted_register_is_exactly_what_was_measured`.
-const HIGH_WATER: usize = 252;
+///
+/// 252 -> 251: `report_hierarchical_outcome`'s transaction moved from
+/// `state.db_pool.begin()` to `AppState::write_as` with the caller's viewer, so
+/// its step lookup reads what the caller may read (`routes/workflows.rs` 9 -> 8,
+/// keeping sites), read off `the_scanner_is_not_vacuous`'s own failure
+/// (`left: 251, right: 252`).
+const HIGH_WATER: usize = 251;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1034,7 +1040,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // a refused step row rolls the counters back. A plain transaction: neither
     // `workflows` nor `behavioral_executions` has row security. Read off this
     // test's failure output (`recorded 12, measured 9`).
-    ("routes/workflows.rs", 9),
+    //
+    // 9 -> 8: that `state.db_pool.begin()` became `AppState::write_as` with
+    // the caller's viewer. The two writes still need no stamp; the step lookup
+    // does, or row security hides every group-private step from the group's
+    // own members. Read off this test's failure output (`recorded 9, measured
+    // 8`).
+    ("routes/workflows.rs", 8),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

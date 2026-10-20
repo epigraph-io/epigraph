@@ -287,7 +287,11 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
     // claims` for the goal fallback became a `get_by_id_with_labels` read
     // through the caller's viewer.
-    ("workflows.rs", 3),
+    // 3 -> 2: `report_hierarchical_outcome`'s `edges ⨝ claims` step lookup
+    // (it projected `claims.properties`) moved to
+    // `WorkflowRepository::plan_step_claim_ids`, with its viewer predicates,
+    // run on a transaction stamped with the caller's viewer.
+    ("workflows.rs", 2),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
