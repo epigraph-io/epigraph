@@ -1059,9 +1059,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "lock_content_hash_agent",
         "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
          (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
-         no row for a viewer to filter. Both callers (create_or_get_signed and POST /claims' \
-         if_not_exists=false branch) follow it with find_by_content_hash_and_agent, which takes \
-         the caller's viewer.",
+         no row for a viewer to filter. Its callers follow it with their own find: \
+         create_or_get_signed and POST /claims' if_not_exists=false branch with \
+         find_by_content_hash_and_agent, which takes the caller's viewer; create_conn_serialized \
+         with its existing VISIBILITY-EXEMPT write-path probe.",
     ),
     (
         "claim.rs",
@@ -1840,6 +1841,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `content_hash` dedup probe is the existing VISIBILITY-EXEMPT write-path read; the \
          INSERT is authorised by claims_tenancy's WITH CHECK, and the `claim.created` event rides \
          `publish_or_log_conn`'s SAVEPOINT.",
+    ),
+    (
+        "claim.rs",
+        "create_conn_serialized",
+        "WRITE. `create_conn`'s body, run inside the scope `create_conn` opens so the \
+         (content_hash, agent_id) dedup lock outlives its own statement (backlog 00f1a517). Same \
+         argument as create_conn: the lock reads no row, the `content_hash` dedup probe is the \
+         existing VISIBILITY-EXEMPT write-path read, and the INSERT is authorised by \
+         claims_tenancy's WITH CHECK.",
     ),
     (
         "claim.rs",
