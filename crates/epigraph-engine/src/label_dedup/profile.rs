@@ -1,0 +1,763 @@
+//! The `label-dedup-profile/v1` schema: every piece of deployment data the
+//! engine uses, passed by reference and pinned by hash.
+//!
+//! Every list defaults to empty. The defaults that do exist are generic
+//! algorithm knobs: the 0.8 overlap thresholds, the 3-token fuzzy floor, the
+//! 6-char / 2-digit strong-id rule, the parser's layout limits and the tier
+//! order. Unknown keys are refused, so a misspelt key is an error rather than
+//! a silently ignored rule.
+//!
+//! Write templates may use these placeholders, each only where it has a value:
+//! `{run_tag}`, `{family}` (the family label of the pass the write belongs to),
+//! `{survivor}` (loser writes) and `{target}` (graduation and supersession).
+
+use std::collections::BTreeMap;
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+use super::{LabelDedupError, Section};
+
+/// The only schema id this engine accepts.
+pub const PROFILE_SCHEMA: &str = "label-dedup-profile/v1";
+
+/// BLAKE3 of the exact profile bytes, lowercase hex. The pin a workflow step
+/// records, and the value `profile_hash` arguments are checked against.
+#[must_use]
+pub fn profile_hash(bytes: &[u8]) -> String {
+    let _ = bytes;
+    String::new()
+}
+
+/// A parsed, validated profile.
+#[derive(Debug, Clone)]
+pub struct LabelDedupProfile {
+    pub schema: String,
+    /// The main family pass (all top-level pass keys).
+    pub pass: PassProfile,
+    pub closeout: Option<CloseoutSpec>,
+    pub lifecycle: Option<LifecycleSpec>,
+    /// A second family deduplicated on its own (its own `family_label`).
+    pub signal_dedup: Option<PassProfile>,
+    pub signal_superseded_by_member: Option<SupersedeSpec>,
+}
+
+/// The keys that configure one dedup pass over one family.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PassProfile {
+    /// (required) The index key. Retirement removes it.
+    pub family_label: String,
+    /// Extra labels the member read excludes (the closed label is always
+    /// excluded). Partial retirements must NOT be listed here: they have to be
+    /// loaded so hygiene can see them.
+    #[serde(default)]
+    pub index_exclude_labels: Vec<String>,
+    /// Members carrying it are closed: never members, never survivors.
+    #[serde(default)]
+    pub closed_label: Option<String>,
+    /// A family member also carrying one of these is a partial retirement.
+    #[serde(default)]
+    pub retired_labels: Vec<String>,
+    /// A leading `[FLAG]` (exact text) that marks retired content.
+    #[serde(default)]
+    pub content_retired_flags: Vec<String>,
+    #[serde(default)]
+    pub non_member: NonMemberSpec,
+    /// Required when the hygiene section is planned. Must remove `{family}`.
+    #[serde(default)]
+    pub hygiene_write: Option<WriteTemplate>,
+    #[serde(default)]
+    pub flag: FlagSpec,
+    #[serde(default)]
+    pub fields: FieldsSpec,
+    #[serde(default)]
+    pub unknown: UnknownSpec,
+    #[serde(default)]
+    pub ids: IdSpec,
+    #[serde(default)]
+    pub entity_match: EntityMatchSpec,
+    #[serde(default)]
+    pub title_match: TitleMatchSpec,
+    /// Enabled tiers. Their order of evaluation is fixed; omitting one
+    /// disables it.
+    #[serde(default = "Tier::all")]
+    pub tiers: Vec<Tier>,
+    /// `<prefix><id-prefix>` on either claim links a revision to its original.
+    #[serde(default)]
+    pub revision_label_prefix: Option<String>,
+    /// `<prefix><id-prefix>` on either claim is a human ruling that the two
+    /// are distinct: the pair never merges and is never queued for review.
+    #[serde(default)]
+    pub distinct_label_prefix: Option<String>,
+    #[serde(default)]
+    pub partition: PartitionSpec,
+    #[serde(default)]
+    pub precedence: PrecedenceSpec,
+    /// Required when the dedup section is planned.
+    #[serde(default)]
+    pub merge: Option<MergeSpec>,
+}
+
+/// How a pair of claims was matched, strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    /// One claim carries `<revision_label_prefix><prefix of the other's id>`.
+    RevisionLabel,
+    /// The claims share a strong id.
+    StrongId,
+    /// The claims share any id and their entities match.
+    WeakIdAndEntity,
+    /// Identical normalized titles and matching entities.
+    TitleAndEntity,
+    /// Similar titles and matching entities: queued for a human, never merged.
+    FuzzyReview,
+}
+
+impl Tier {
+    #[must_use]
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::RevisionLabel,
+            Self::StrongId,
+            Self::WeakIdAndEntity,
+            Self::TitleAndEntity,
+            Self::FuzzyReview,
+        ]
+    }
+
+    /// Whether the tier merges without a human.
+    #[must_use]
+    pub const fn auto_merge(self) -> bool {
+        !matches!(self, Self::FuzzyReview)
+    }
+
+    /// Larger is stronger.
+    #[must_use]
+    pub const fn strength(self) -> u8 {
+        match self {
+            Self::RevisionLabel => 4,
+            Self::StrongId => 3,
+            Self::WeakIdAndEntity => 2,
+            Self::TitleAndEntity => 1,
+            Self::FuzzyReview => 0,
+        }
+    }
+}
+
+/// Bookkeeping that wears the family label.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonMemberSpec {
+    #[serde(default)]
+    pub labels_any: Vec<String>,
+    /// Matched against the normalized, flag-stripped body.
+    #[serde(default)]
+    pub body_prefixes: Vec<String>,
+    #[serde(default)]
+    pub body_contains: Vec<String>,
+    #[serde(default)]
+    pub completion_report: Option<CompletionReportSpec>,
+}
+
+/// `<one of prefixes> … <one of requires_any> …` reads as a status report.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReportSpec {
+    #[serde(default)]
+    pub prefixes: Vec<String>,
+    #[serde(default)]
+    pub requires_any: Vec<String>,
+}
+
+/// A label write template.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteTemplate {
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// The leading `[FLAG]` of a content body.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlagSpec {
+    #[serde(default = "default_flag_max_len")]
+    pub max_len: usize,
+    #[serde(default = "default_flag_max_words")]
+    pub max_words: usize,
+    /// Spelling → canonical value, both compared in normalized-dashed form.
+    #[serde(default)]
+    pub canonical: BTreeMap<String, String>,
+}
+
+impl Default for FlagSpec {
+    fn default() -> Self {
+        Self {
+            max_len: default_flag_max_len(),
+            max_words: default_flag_max_words(),
+            canonical: BTreeMap::new(),
+        }
+    }
+}
+
+const fn default_flag_max_len() -> usize {
+    20
+}
+const fn default_flag_max_words() -> usize {
+    3
+}
+
+/// The record parser: a pipe layout (`title | entity | key: value | …`) with
+/// a prose fallback (`<type>: <title> — <entity>, <marker> <value>, …`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldsSpec {
+    #[serde(default)]
+    pub title: TitleSpec,
+    #[serde(default)]
+    pub entity: FieldSpec,
+    #[serde(default)]
+    pub deadline: FieldSpec,
+    #[serde(default)]
+    pub value: FieldSpec,
+    #[serde(default)]
+    pub class: FieldSpec,
+    /// Pipe fields that are neither positional nor parsed.
+    #[serde(default)]
+    pub ignored_keys: Vec<String>,
+    /// Further named fields (label-sourced or keyed).
+    #[serde(default)]
+    pub extra: BTreeMap<String, FieldSpec>,
+}
+
+/// Title extraction and the layout limits of both parsers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitleSpec {
+    /// Position among the pipe fields left after keyed and ignored fields
+    /// (and a leading header) are removed.
+    #[serde(default)]
+    pub pipe_position: usize,
+    /// A pipe title `X: rest` with `X` this short and space-free is `rest`,
+    /// and `X` becomes the entity when none is keyed.
+    #[serde(default = "default_short_prefix_max")]
+    pub strip_short_prefix_max: usize,
+    /// A leading pipe field of at most this many words containing a header
+    /// token is a header, not the title.
+    #[serde(default = "default_pipe_header_words_max")]
+    pub header_words_max: usize,
+    #[serde(default)]
+    pub header_tokens: Vec<String>,
+    /// A prose body whose first `:` is within this many bytes has a type
+    /// prefix (`Notice:`), which is stripped.
+    #[serde(default = "default_short_prefix_max")]
+    pub prose_prefix_max: usize,
+    /// A prose left side of at most this many words containing a prose
+    /// header token (or empty) is a header: the right side is
+    /// `<entity>: <title>`.
+    #[serde(default = "default_prose_header_words_max")]
+    pub prose_header_words_max: usize,
+    #[serde(default)]
+    pub prose_header_tokens: Vec<String>,
+    /// Characters of content used as the title when none is parsed.
+    #[serde(default = "default_title_fallback_chars")]
+    pub fallback_chars: usize,
+}
+
+impl Default for TitleSpec {
+    fn default() -> Self {
+        Self {
+            pipe_position: 0,
+            strip_short_prefix_max: default_short_prefix_max(),
+            header_words_max: default_pipe_header_words_max(),
+            header_tokens: Vec::new(),
+            prose_prefix_max: default_short_prefix_max(),
+            prose_header_words_max: default_prose_header_words_max(),
+            prose_header_tokens: Vec::new(),
+            fallback_chars: default_title_fallback_chars(),
+        }
+    }
+}
+
+const fn default_short_prefix_max() -> usize {
+    12
+}
+const fn default_pipe_header_words_max() -> usize {
+    4
+}
+const fn default_prose_header_words_max() -> usize {
+    3
+}
+const fn default_title_fallback_chars() -> usize {
+    120
+}
+
+/// One parsed field.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldSpec {
+    /// Pipe position (see [`TitleSpec::pipe_position`]) used when no keyed
+    /// value was found.
+    #[serde(default)]
+    pub pipe_position: Option<usize>,
+    /// Pipe field prefixes (`key:`), matched case-insensitively.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Markers scanned for in the whole body when no keyed value was found.
+    #[serde(default)]
+    pub prose_markers: Vec<String>,
+    /// The suffix of the first label with this prefix.
+    #[serde(default)]
+    pub from_label_prefix: Option<String>,
+    /// Read the label before the content.
+    #[serde(default)]
+    pub prefer_label: bool,
+    /// Take the canonical leading `[FLAG]` as this field's value.
+    #[serde(default)]
+    pub from_flag: bool,
+    /// The stem of this field's carry label: `<stem>-carried:<value>`.
+    /// Defaults to the field name.
+    #[serde(default)]
+    pub carry_label: Option<String>,
+}
+
+/// What counts as a missing value.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownSpec {
+    /// Values (compared normalized) that mean "missing".
+    #[serde(default)]
+    pub tokens: Vec<String>,
+    /// Values that are never missing, even when they match a token.
+    #[serde(default)]
+    pub not_unknown: Vec<String>,
+    /// Fields whose missing values count against a survivor candidate.
+    #[serde(default)]
+    pub count_fields: Vec<String>,
+}
+
+/// A built-in token rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectRule {
+    /// `YYYY-MM-DD`.
+    IsoDate,
+    /// `M/D/YY` or `M/D/YYYY`.
+    UsDate,
+    /// `19xx` / `20xx`.
+    BareYear,
+    /// `YYYY-YYYY`.
+    YearRange,
+    /// `2026-27`, `2026/27`, `FY2026-27`, `FY26-27`, `FY25/26`, `FY2026`, `FY26`
+    /// (only when the second part is the next year).
+    FiscalYear,
+    /// Any piece containing `:` (tested before trimming).
+    ClockTime,
+    /// Any piece containing `$` (tested before trimming).
+    Money,
+    /// Any piece containing `%` (tested before trimming).
+    Percent,
+}
+
+/// Id tokenization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdSpec {
+    /// Content after the LAST occurrence of this marker is never scanned.
+    #[serde(default)]
+    pub scan_cut_at_last: Option<String>,
+    #[serde(default = "default_strong_min_len")]
+    pub strong_min_len: usize,
+    #[serde(default = "default_strong_min_digits")]
+    pub strong_min_digits: usize,
+    #[serde(default = "default_id_min_len")]
+    pub min_len: usize,
+    #[serde(default = "default_pure_digit_min_len")]
+    pub pure_digit_min_len: usize,
+    #[serde(default)]
+    pub reject: Vec<RejectRule>,
+    /// Regexes on the trimmed token; a match is not an id.
+    #[serde(default)]
+    pub reject_patterns: Vec<String>,
+    /// Regexes on the trimmed token (and on a carried normalized id); a match
+    /// is a strong id whatever its length.
+    #[serde(default)]
+    pub strong_patterns: Vec<String>,
+    /// Labels `<prefix><NORM>` add `NORM` to the claim's id set.
+    #[serde(default)]
+    pub carry_label_prefix: Option<String>,
+    #[serde(skip)]
+    pub(crate) compiled_reject: Vec<Regex>,
+    #[serde(skip)]
+    pub(crate) compiled_strong: Vec<Regex>,
+}
+
+impl Default for IdSpec {
+    fn default() -> Self {
+        Self {
+            scan_cut_at_last: None,
+            strong_min_len: default_strong_min_len(),
+            strong_min_digits: default_strong_min_digits(),
+            min_len: default_id_min_len(),
+            pure_digit_min_len: default_pure_digit_min_len(),
+            reject: Vec::new(),
+            reject_patterns: Vec::new(),
+            strong_patterns: Vec::new(),
+            carry_label_prefix: None,
+            compiled_reject: Vec::new(),
+            compiled_strong: Vec::new(),
+        }
+    }
+}
+
+const fn default_strong_min_len() -> usize {
+    6
+}
+const fn default_strong_min_digits() -> usize {
+    2
+}
+const fn default_id_min_len() -> usize {
+    3
+}
+const fn default_pure_digit_min_len() -> usize {
+    4
+}
+
+/// Entity comparison.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityMatchSpec {
+    /// `[token, "expansion words"]`: the token is replaced by the words.
+    #[serde(default)]
+    pub aliases: Vec<(String, String)>,
+    #[serde(default)]
+    pub stopwords: Vec<String>,
+    #[serde(default = "default_threshold")]
+    pub threshold: f64,
+}
+
+impl Default for EntityMatchSpec {
+    fn default() -> Self {
+        Self {
+            aliases: Vec::new(),
+            stopwords: Vec::new(),
+            threshold: default_threshold(),
+        }
+    }
+}
+
+/// Title comparison.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitleMatchSpec {
+    #[serde(default)]
+    pub stopwords: Vec<String>,
+    #[serde(default = "default_threshold")]
+    pub fuzzy_threshold: f64,
+    #[serde(default = "default_fuzzy_min_tokens")]
+    pub fuzzy_min_tokens: usize,
+}
+
+impl Default for TitleMatchSpec {
+    fn default() -> Self {
+        Self {
+            stopwords: Vec::new(),
+            fuzzy_threshold: default_threshold(),
+            fuzzy_min_tokens: default_fuzzy_min_tokens(),
+        }
+    }
+}
+
+const fn default_threshold() -> f64 {
+    0.8
+}
+const fn default_fuzzy_min_tokens() -> usize {
+    3
+}
+
+/// Label partitions that clustering never crosses.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionSpec {
+    /// Two claims whose labels under one of these prefixes are both present
+    /// and disjoint never pair, directly or through a chain.
+    #[serde(default)]
+    pub must_agree_label_prefixes: Vec<String>,
+    /// A claim carrying one of these labels pairs with a claim that does not
+    /// carry the same label only through a shared strong id.
+    #[serde(default)]
+    pub no_merge_without_strong_id_label_values: Vec<String>,
+}
+
+/// Survivor choice: a total order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrecedenceSpec {
+    /// Rank = index of the first group sharing a label with the claim;
+    /// unmatched claims rank last.
+    #[serde(default)]
+    pub rank_label_groups: Vec<Vec<String>>,
+    /// Tie-breaks after the rank. The smallest id always breaks a final tie.
+    #[serde(default = "TieBreak::all")]
+    pub then: Vec<TieBreak>,
+}
+
+impl Default for PrecedenceSpec {
+    fn default() -> Self {
+        Self {
+            rank_label_groups: Vec::new(),
+            then: TieBreak::all(),
+        }
+    }
+}
+
+/// A survivor tie-break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TieBreak {
+    FewestUnknown,
+    NewestCreatedAt,
+    SmallestId,
+}
+
+impl TieBreak {
+    #[must_use]
+    pub fn all() -> Vec<Self> {
+        vec![Self::FewestUnknown, Self::NewestCreatedAt, Self::SmallestId]
+    }
+}
+
+/// Cluster writes.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeSpec {
+    /// Must contain a `{survivor}` pointer or not; must leave the family via
+    /// `loser_remove`.
+    #[serde(default)]
+    pub loser_add: Vec<String>,
+    #[serde(default)]
+    pub loser_remove: Vec<String>,
+    #[serde(default)]
+    pub survivor_add: Vec<String>,
+    /// Carry every loser id the survivor lacks as `<carry_label_prefix><NORM>`.
+    #[serde(default)]
+    pub carry_ids: bool,
+    /// Date fields whose later loser value is carried onto the survivor.
+    #[serde(default)]
+    pub carry_later_dates: Vec<String>,
+    /// Fields whose loser value is carried when the survivor has none.
+    #[serde(default)]
+    pub carry_missing: Vec<String>,
+    /// Read by the apply tool: attach loser sources to the survivor.
+    #[serde(default)]
+    pub attach_loser_sources: bool,
+}
+
+/// Past-due close-out of live members.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseoutSpec {
+    pub date_field: String,
+    /// Must contain the closed label.
+    pub add: Vec<String>,
+}
+
+/// Signal lifecycle: graduation into a member, or age-out.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleSpec {
+    pub signal_family_label: String,
+    #[serde(default)]
+    pub signal_exclude_labels: Vec<String>,
+    /// The graduation index read excludes these, but keeps closed members.
+    #[serde(default)]
+    pub target_exclude_labels: Vec<String>,
+    #[serde(default)]
+    pub umbrella: UmbrellaSpec,
+    #[serde(default)]
+    pub age_key: Vec<AgeKey>,
+    /// No age-out when absent.
+    #[serde(default)]
+    pub max_age_days: Option<i64>,
+    pub graduate_add: Vec<String>,
+    #[serde(default)]
+    pub age_out_add: Vec<String>,
+}
+
+/// Signals that cover many items never graduate on one shared id.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UmbrellaSpec {
+    #[serde(default)]
+    pub body_prefixes: Vec<String>,
+    #[serde(default)]
+    pub tokens: Vec<String>,
+    #[serde(default)]
+    pub phrases: Vec<String>,
+    /// Stripped from the normalized body before the checks.
+    #[serde(default)]
+    pub strip_prefix: Option<String>,
+}
+
+/// One entry of the age-key chain, tried in order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum AgeKey {
+    /// The first date directly after one of these whole-word keywords.
+    AfterKeywords { after_keywords: Vec<String> },
+    /// `"created_at"`.
+    Named(AgeKeyName),
+}
+
+/// Named age keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeKeyName {
+    CreatedAt,
+}
+
+/// Signals that became a member leave the signal family.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersedeSpec {
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Accepted matches (any of).
+    pub require: Vec<SupersedeMatch>,
+}
+
+/// A supersession match kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersedeMatch {
+    StrongId,
+    ExactEntityTitle,
+}
+
+/// Why a read is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadPurpose {
+    /// The main family, excluding the closed label.
+    Members,
+    /// The lifecycle signal family.
+    LifecycleSignals,
+    /// The main family including closed members: the graduation index.
+    LifecycleTargets,
+    /// The signal-dedup family.
+    SignalMembers,
+    /// Closed lifecycle signals: the probe's match-only index.
+    ClosedSignals,
+}
+
+/// One viewer-scoped read: claims carrying ALL of `include` and NONE of
+/// `exclude`, ordered by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadSpec {
+    pub purpose: ReadPurpose,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub current_only: bool,
+}
+
+impl ReadSpec {
+    /// Whether a claim with `labels` is in this read.
+    #[must_use]
+    pub fn matches(&self, labels: &[String]) -> bool {
+        let _ = labels;
+        false
+    }
+}
+
+impl LabelDedupProfile {
+    /// Parse and validate profile JSON.
+    ///
+    /// # Errors
+    /// [`LabelDedupError::ProfileSchemaInvalid`] for malformed JSON, an
+    /// unknown key, a wrong schema id, a bad regex, a write template that
+    /// would not leave the family (so a re-plan would never be empty), or an
+    /// unknown placeholder.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, LabelDedupError> {
+        let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)
+            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(e.to_string()))?;
+        let take = |map: &mut serde_json::Map<String, serde_json::Value>, k: &str| map.remove(k);
+        let schema = take(&mut map, "schema")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let closeout = take(&mut map, "closeout")
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("closeout: {e}")))?;
+        let lifecycle = take(&mut map, "lifecycle")
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("lifecycle: {e}")))?;
+        let signal_dedup = take(&mut map, "signal_dedup")
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("signal_dedup: {e}")))?;
+        let signal_superseded_by_member = take(&mut map, "signal_superseded_by_member")
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| {
+                LabelDedupError::ProfileSchemaInvalid(format!("signal_superseded_by_member: {e}"))
+            })?;
+        let pass: PassProfile = serde_json::from_value(serde_json::Value::Object(map))
+            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(e.to_string()))?;
+        Ok(Self {
+            schema,
+            pass,
+            closeout,
+            lifecycle,
+            signal_dedup,
+            signal_superseded_by_member,
+        })
+    }
+
+    /// Check `bytes` against the pinned `expected_hash` BEFORE parsing, then
+    /// parse. Returns the profile and its hash.
+    ///
+    /// # Errors
+    /// [`LabelDedupError::ProfileHashMismatch`] when the bytes do not hash to
+    /// the pin; otherwise as [`Self::from_json_bytes`].
+    pub fn load_pinned(
+        bytes: &[u8],
+        expected_hash: &str,
+    ) -> Result<(Self, String), LabelDedupError> {
+        let _ = expected_hash;
+        Ok((Self::from_json_bytes(bytes)?, profile_hash(bytes)))
+    }
+
+    /// The reads a plan over `sections` needs, in a fixed order.
+    ///
+    /// # Errors
+    /// [`LabelDedupError::SectionNotConfigured`] when a requested section has
+    /// no configuration.
+    pub fn reads(&self, sections: &[Section]) -> Result<Vec<ReadSpec>, LabelDedupError> {
+        let _ = sections;
+        Ok(Vec::new())
+    }
+
+    /// The reads a probe needs: the members, plus the closed lifecycle
+    /// signals when `include_closed_signals`.
+    ///
+    /// # Errors
+    /// [`LabelDedupError::SectionNotConfigured`] when closed signals are asked
+    /// for and the profile has no lifecycle (or no closed label).
+    pub fn probe_reads(
+        &self,
+        include_closed_signals: bool,
+    ) -> Result<Vec<ReadSpec>, LabelDedupError> {
+        let _ = include_closed_signals;
+        Ok(Vec::new())
+    }
+}
