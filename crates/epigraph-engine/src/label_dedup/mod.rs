@@ -91,7 +91,7 @@ impl Snapshot {
     /// than `cap` rows were supplied.
     #[must_use]
     pub fn from_capped(mut rows: Vec<DedupClaim>, cap: usize) -> Self {
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows.sort_by_key(|c| c.id);
         rows.dedup_by(|a, b| a.id == b.id);
         let truncated = rows.len() > cap;
         rows.truncate(cap);
