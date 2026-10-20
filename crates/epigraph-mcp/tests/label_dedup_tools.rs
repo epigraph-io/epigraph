@@ -2008,3 +2008,59 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
     assert_eq!(out["counts"]["failed"], 1, "{out}");
 }
 
+// ── The engine's member bound ───────────────────────────────────────────────
+
+/// A family larger than the engine's pairwise bound but within `max_claims`
+/// reads untruncated, then cannot be planned. Apply reports that as a
+/// `refused` status (code RESOURCE_CAP, nothing written), like TRUNCATED and
+/// PLAN_DRIFT, so a barrier that reads `status` sees a refusal and not a tool
+/// failure. Plan itself still answers with the refusal code.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_family_over_the_engine_bound_is_a_refused_apply_not_a_tool_error(pool: PgPool) {
+    let bytes = profile_bytes();
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let group = personal_group_of(&pool, caller).await;
+    let members = epigraph_engine::label_dedup::MAX_DEDUP_FAMILY_MEMBERS + 1;
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             labels, visibility, owner_group_id, created_at) \
+         SELECT gen_random_uuid(), \
+                format('Item %s | Acme Unit %s | due: 2026-12-01 | ref ACME-%s', g, g, 100000 + g), \
+                sha256(convert_to(gen_random_uuid()::text, 'UTF8')), 0.6, $1, true, \
+                ARRAY[$2]::text[], 'public', $3, now() - g * interval '1 minute' \
+           FROM generate_series(1, $4::int) AS g",
+    )
+    .bind(caller)
+    .bind(FAMILY)
+    .bind(group)
+    .bind(i32::try_from(members).expect("bound fits i32"))
+    .execute(&pool)
+    .await
+    .expect("seed a large family");
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let err = plan_label_dedup(&server, &viewer, p.clone(), Some(&auth))
+        .await
+        .expect_err("the planner refuses the family");
+    assert_eq!(code(&err), "RESOURCE_CAP", "{err:?}");
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &"0".repeat(64)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(out["status"], "refused", "{out}");
+    assert_eq!(out["refusal"]["code"], "RESOURCE_CAP", "{out}");
+    let written: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE agent_id = $1 AND NOT ($2 = ANY(labels))",
+    )
+    .bind(caller)
+    .bind(FAMILY)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(written, 0, "nothing written");
+}
