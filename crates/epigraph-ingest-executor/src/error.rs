@@ -62,6 +62,21 @@ pub enum IngestExecutorError {
         system_agent: uuid::Uuid,
     },
 
+    /// A declared-tenancy ingest's plan names a claim that already exists and
+    /// that is private to a group the CALLING agent does not write (or that the
+    /// ingest's own stamp cannot read at all). The ingest would write
+    /// `executes` / `decomposes_to` edges to it, which row security assigns to
+    /// that group, on the system agent's stamp: a write into a group the caller
+    /// holds no membership of. Raised on the stamped transaction before any
+    /// edge is written, so the whole ingest rolls back. The message names the
+    /// claim (its id is derived from the plan's own text) and never its group.
+    #[error(
+        "the plan reuses claim {claim_id}, which already exists and is private to a group the \
+         calling agent does not write, so a declared-tenancy ingest may not link it. Nothing \
+         was written"
+    )]
+    ReusedClaimOutsideCallerGroups { claim_id: uuid::Uuid },
+
     /// Failed to insert the workflow row.
     #[error("workflow row insert failed: {0}")]
     WorkflowInsert(String),
@@ -98,14 +113,17 @@ pub enum IngestExecutorError {
 }
 
 impl IngestExecutorError {
-    /// Whether this is one of the two declared-tenancy refusals
-    /// ([`Self::CallerNotGroupWriter`], [`Self::DeclaredGroupNotWritable`]):
-    /// a denial the caller can act on (403 / `INVALID_REQUEST`), not a fault.
+    /// Whether this is one of the declared-tenancy refusals
+    /// ([`Self::CallerNotGroupWriter`], [`Self::DeclaredGroupNotWritable`],
+    /// [`Self::ReusedClaimOutsideCallerGroups`]): a denial the caller can act
+    /// on (403 / `INVALID_REQUEST`), not a fault.
     #[must_use]
     pub const fn is_declared_tenancy_refusal(&self) -> bool {
         matches!(
             self,
-            Self::CallerNotGroupWriter { .. } | Self::DeclaredGroupNotWritable { .. }
+            Self::CallerNotGroupWriter { .. }
+                | Self::DeclaredGroupNotWritable { .. }
+                | Self::ReusedClaimOutsideCallerGroups { .. }
         )
     }
 }

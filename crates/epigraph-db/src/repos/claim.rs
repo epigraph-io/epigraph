@@ -1026,6 +1026,36 @@ impl ClaimRepository {
         Ok(q.fetch_all(&mut *conn).await?)
     }
 
+    /// The `(id, visibility, owner_group_id)` of each of `ids` that `conn`'s own
+    /// session may read, in no particular order.
+    ///
+    /// Row security on `conn`'s stamp is the ONLY filter: there is no viewer
+    /// predicate, so this answers "what can the principal this connection is
+    /// stamped as see", never a caller's question. A declared-tenancy workflow
+    /// ingest asks it on its system-agent stamped transaction about the claims
+    /// it REUSED, before it writes an edge to any of them: an id missing from
+    /// the answer is a claim that exists (the ingest's `ON CONFLICT` saw it)
+    /// but that the stamp cannot read. Never return this answer to a caller; it
+    /// is the stamp's view, not theirs ([`Self::tenancy_of_conn`] is the
+    /// caller-filtered read).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn tenancy_on_session_conn(
+        conn: &mut sqlx::PgConnection,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String, Uuid)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, (Uuid, String, Uuid)>(
+            "SELECT id, visibility::text, owner_group_id FROM claims WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
     /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`
     /// function alone: **no read on the caller's connection first.**
     ///

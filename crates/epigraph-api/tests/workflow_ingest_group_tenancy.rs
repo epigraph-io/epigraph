@@ -27,6 +27,9 @@
 //!   not `('group', G)` is listed in `reused_items`, with its tenancy. Nothing
 //!   re-tenants it.
 //! * `embed: false` writes no claim embedding and no goal embedding.
+//! * A plan that reuses a claim private to a group the caller does not write
+//!   is refused before any edge is written: those edges would be owned by that
+//!   group and written on the system agent's stamp.
 //! * Without `tenancy` nothing changes: public, and no `reused_items` key.
 //!
 //! # The ownership the tests use: the operator group, and a team group
@@ -256,6 +259,19 @@ async fn claims_mentioning(pool: &PgPool, name: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count claims")
+}
+
+/// `(claims, edges, workflows, mass_functions)` row counts: a refusal that
+/// "writes nothing" leaves every one of them unchanged, whatever text or ids
+/// the payload carried (operation atoms, AUTHORED edges, BBAs included).
+async fn row_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM claims), (SELECT count(*) FROM edges), \
+                (SELECT count(*) FROM workflows), (SELECT count(*) FROM mass_functions)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("row counts")
 }
 
 /// Every `(claim id, visibility, owner group)` the workflow executes.
@@ -966,25 +982,29 @@ async fn reused_items_omits_reused_claims_already_in_the_declared_group(pool: Pg
     assert_eq!(reused(&again).len(), 0, "{again}");
 }
 
-/// A reused claim the CALLER cannot read is listed with a null tenancy, even
-/// when the ingest's own system-agent stamp can read it: the response never
-/// tells a caller the owner group of a claim it cannot see. Here the fleet
-/// agent `f` (not a member of the team group `g`) declares `og`, and its plan
-/// names an operation atom that is private to `g`, which the system agent
-/// writes. Calibrated by the curator `c`, a member of `g`, which is told the
-/// atom's real tenancy for the same plan text.
+/// A fresh declared ingest whose plan reuses a claim private to a group the
+/// CALLER does not write is refused before any edge is written, even when the
+/// ingest's own system-agent stamp writes that group: the `executes` and
+/// `decomposes_to` edges to it would be owned by that group, written on the
+/// system agent's stamp on behalf of a caller with no membership of it. The
+/// refusal never names the group. Here the fleet agent `f` (not a member of
+/// the team group `g`) declares `og`, and its plan names an operation atom
+/// private to `g`, which the system agent writes. Calibrated by the curator
+/// `c`, a member of `g`, which may link the same atom and is told its tenancy.
+///
+/// A re-ingest writes nothing, so it is not refused: there a reused claim the
+/// caller cannot read is listed with a null tenancy, and again the response
+/// never names its group.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_reused_claim_the_caller_cannot_read_is_listed_without_its_tenancy(pool: PgPool) {
+async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the_ingest(
+    pool: PgPool,
+) {
     let w = world(&pool).await;
-    let seeded = stdio_ingest(
-        &w.c_server,
-        mcp_params(
-            extraction("acme-hidden-atom-owner", 0, &[&["acme hidden operation"]]),
-            Some(w.g),
-        ),
-    )
-    .await
-    .expect("the curator seeds a g-private atom");
+    let owner = extraction("acme-hidden-atom-owner", 0, &[&["acme hidden operation"]]);
+    let seeded = stdio_ingest(&w.c_server, mcp_params(owner.clone(), Some(w.g)))
+        .await
+        .expect("the curator seeds a g-private atom");
+    let seeded_plan = plan_tenancy(&pool, uuid_of(&seeded["workflow_id"])).await;
     let atom: Uuid = sqlx::query_scalar(
         "SELECT c.id FROM edges e JOIN claims c ON c.id = e.target_id \
           WHERE e.source_id = $1 AND e.relationship = 'executes' \
@@ -995,26 +1015,60 @@ async fn a_reused_claim_the_caller_cannot_read_is_listed_without_its_tenancy(poo
     .await
     .expect("the atom");
 
-    let out = stdio_ingest(
+    let name = "acme-hidden-atom-user";
+    let before = row_counts(&pool).await;
+    let refused = stdio_ingest(
         &w.f_server,
         mcp_params(
-            extraction("acme-hidden-atom-user", 0, &[&["acme hidden operation"]]),
+            extraction(name, 0, &[&["acme hidden operation"]]),
             Some(w.og),
         ),
     )
     .await
-    .expect("f declares og; the hidden atom is reused");
-    let listed = reused(&out);
-    assert_eq!(
-        listed.get(&atom),
-        Some(&(Value::Null, Value::Null)),
-        "the atom is listed, without the tenancy f cannot read: {out}"
+    .expect_err("f may not link an atom private to a group it does not write");
+    assert!(
+        refused.contains(&atom.to_string())
+            && refused.contains("private to a group the calling agent does not write"),
+        "refused by the reused-claim check, naming the claim: {refused}"
     );
     assert!(
-        !out.to_string().contains(&w.g.to_string()),
-        "the response never names g to a non-member: {out}"
+        !refused.contains(&w.g.to_string()),
+        "the refusal never names g to a non-member: {refused}"
+    );
+    assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "the refusal wrote no claim, edge, workflow or BBA"
     );
 
+    // A re-ingest of the owner's generation by f: nothing is written, so it
+    // is answered, and every g-private claim is listed without its tenancy.
+    let again = stdio_ingest(&w.f_server, mcp_params(owner, Some(w.og)))
+        .await
+        .expect("a re-ingest writes nothing, so it is not refused");
+    assert_eq!(again["already_ingested"], json!(true), "{again}");
+    let listed = reused(&again);
+    assert_eq!(
+        listed.keys().copied().collect::<BTreeSet<_>>(),
+        seeded_plan.iter().map(|p| p.0).collect::<BTreeSet<_>>(),
+        "every planned claim is listed: {again}"
+    );
+    assert!(
+        listed.values().all(|t| t == &(Value::Null, Value::Null)),
+        "listed without the tenancy f cannot read: {again}"
+    );
+    assert!(
+        !again.to_string().contains(&w.g.to_string()),
+        "the response never names g to a non-member: {again}"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "the re-ingest wrote nothing"
+    );
+
+    // Calibration: c writes g, so it may link the same atom from og.
     let out = stdio_ingest(
         &w.c_server,
         mcp_params(
@@ -1193,13 +1247,14 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
 // Characterization: an operation atom already private to another group
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// CHARACTERIZATION. Operation atoms are keyed by their text alone, across
-/// every workflow and document. When the atom a plan names already exists as
-/// a claim private to a group the ingest system agent does not write, the
-/// `executes` edge to it inherits that group and its `WITH CHECK` fails: the
-/// whole declared ingest is refused and writes nothing. (Availability: a
-/// publisher cannot use that operation text until the atom is public or in its
-/// own group.)
+/// Operation atoms are keyed by their text alone, across every workflow and
+/// document. When the atom a plan names already exists as a claim private to
+/// a group neither the caller nor the ingest system agent writes, the whole
+/// declared ingest is refused with a 403 (the reused-claim check; the stamp
+/// cannot even read the atom) and writes nothing, rather than failing on the
+/// `executes` edge's `WITH CHECK`. The refusal does not name that group.
+/// (Availability: a publisher cannot use that operation text until the atom is
+/// public or in a group it writes.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_atom_private_to_another_group_refuses_the_whole_ingest(pool: PgPool) {
     let w = world(&pool).await;
@@ -1227,6 +1282,7 @@ async fn an_atom_private_to_another_group_refuses_the_whole_ingest(pool: PgPool)
     drop(conn);
 
     let name = "acme-atom-contender";
+    let before = row_counts(&pool).await;
     let (s, b) = w
         .api
         .ingest(
@@ -1238,8 +1294,19 @@ async fn an_atom_private_to_another_group_refuses_the_whole_ingest(pool: PgPool)
             ),
         )
         .await;
-    assert!(!s.is_success(), "refused: {s} {b}");
+    assert_eq!(s, StatusCode::FORBIDDEN, "refused as a denial: {b}");
+    assert!(
+        b.to_string().contains(&atom.to_string())
+            && b.to_string()
+                .contains("private to a group the calling agent does not write"),
+        "refused by the reused-claim check: {b}"
+    );
+    assert!(
+        !b.to_string().contains(&w.og2.to_string()),
+        "the refusal never names the other group: {b}"
+    );
     assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
     assert_eq!(claims_mentioning(&pool, name).await, 0, "no claim");
     assert!(workflow_id_named(&pool, name, 0).await.is_none());
+    assert_eq!(row_counts(&pool).await, before, "nothing written");
 }

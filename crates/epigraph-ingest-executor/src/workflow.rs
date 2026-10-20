@@ -185,7 +185,9 @@ pub struct DeclaredGroup<'a> {
 pub struct ReusedClaim {
     pub claim_id: Uuid,
     /// `public` or `group`; `None` when the caller (or the ingest's own
-    /// system-agent stamp) cannot read the claim.
+    /// system-agent stamp) cannot read the claim. Only an idempotent re-ingest
+    /// (which writes nothing) can report `None`: a fresh walk refuses such a
+    /// claim ([`IngestExecutorError::ReusedClaimOutsideCallerGroups`]).
     pub visibility: Option<String>,
     /// The claim's owner group; `None` exactly when `visibility` is.
     pub owner_group_id: Option<Uuid>,
@@ -310,11 +312,16 @@ pub async fn execute_workflow_ingest_plan(
 /// live writer membership of the group. It does NOT check the caller: that is
 /// [`require_caller_writes_group`], which every caller runs first. Claims the
 /// walk reuses keep their tenancy and are reported in
-/// [`WorkflowIngestExecutionResult::reused_items`].
+/// [`WorkflowIngestExecutionResult::reused_items`]. A reused claim private to a
+/// group outside the CALLER's writable set (or unreadable to the stamp) refuses
+/// the ingest before any edge is written
+/// ([`IngestExecutorError::ReusedClaimOutsideCallerGroups`]): its edges would be
+/// owned by that group and written on the system agent's stamp.
 ///
 /// # Errors
 /// As [`execute_workflow_ingest_plan`], plus
-/// [`IngestExecutorError::DeclaredGroupNotWritable`].
+/// [`IngestExecutorError::DeclaredGroupNotWritable`] and
+/// [`IngestExecutorError::ReusedClaimOutsideCallerGroups`].
 pub async fn execute_workflow_ingest_plan_in_group(
     conn: &mut sqlx::PgConnection,
     plan: &IngestPlan,
@@ -626,6 +633,42 @@ pub async fn execute_workflow_ingest_plan_in_group(
         }
 
         id_map.insert(planned.id, planned.id);
+    }
+
+    // ── 5b. Declared tenancy: every reused claim must be the caller's to link ──
+    //
+    // A reused claim keeps its tenancy, and the edge trigger derives the
+    // `executes` / `decomposes_to` edges' owner from their endpoints: an edge to
+    // a claim private to G is owned by G. Those edges are written on the SYSTEM
+    // agent's stamp, which (provisioned as a writer of every target group)
+    // passes `WITH CHECK` for G even when the caller holds no membership of G.
+    // So before any edge is written, read every reused claim on the stamp and
+    // refuse one the stamp cannot read, or one private to a group outside the
+    // caller's own writable set. A refusal rolls the whole ingest back.
+    if let Some(d) = declared {
+        let mut ids: Vec<Uuid> = Vec::new();
+        for id in &reused_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        let on_stamp: HashMap<Uuid, (String, Uuid)> =
+            ClaimRepository::tenancy_on_session_conn(&mut *conn, &ids)
+                .await?
+                .into_iter()
+                .map(|(id, v, o)| (id, (v, o)))
+                .collect();
+        let writable = d.caller.writable_groups();
+        for claim_id in ids {
+            let linkable = match on_stamp.get(&claim_id) {
+                Some((v, _)) if v == "public" => true,
+                Some((_, owner)) => *owner == d.group || writable.contains(owner),
+                None => false,
+            };
+            if !linkable {
+                return Err(IngestExecutorError::ReusedClaimOutsideCallerGroups { claim_id });
+            }
+        }
     }
 
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
