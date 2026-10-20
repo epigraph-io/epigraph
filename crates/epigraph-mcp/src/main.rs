@@ -728,8 +728,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
-        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::StreamableHttpService;
 
         // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
         // was already refused above; this catches a link recorded earlier by a
@@ -830,27 +828,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
-        // The TCP listener's Host/Origin allowlist (`None` on a unix socket).
-        // Built once: the rmcp service config and the outer guard layer below
-        // must agree on it.
-        let tcp_allowlist = (!epigraph_mcp::is_unix_listener(addr)).then(|| {
-            epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host)
+        // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and the
+        // factory closure runs once PER SESSION. Every session is a clone of
+        // the one template above: it carries the template's `ScopedPool` (an
+        // attachment on the stdio path alone would leave every real caller on
+        // a server whose `scoped` is `None`, turning the 42501 into a total
+        // `submit_claim` / `memorize` refusal) and SHARES its `agent_db_id`
+        // cell, so the server agent is resolved — and its personal group
+        // provisioned — once per process, not once per session. See
+        // `SessionFactory` for the measurement.
+        //
+        // `mcp_http_listener` also picks the rmcp config and the session
+        // manager, and returns the TCP Host/Origin allowlist (`None` on a unix
+        // socket) that the outer guard layer below installs: the rmcp config
+        // and that layer are built from one value. The HTTP test suites build
+        // their listeners through the same function.
+        let epigraph_mcp::http_listener::McpHttpListener {
+            service,
+            tcp_allowlist,
+            ..
+        } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
+            Ok(sessions.session())
         });
-
-        let service = StreamableHttpService::new(
-            // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
-            // this closure runs once PER SESSION. Every session is a clone of
-            // the one template above: it carries the template's `ScopedPool`
-            // (an attachment on the stdio path alone would leave every real
-            // caller on a server whose `scoped` is `None`, turning the 42501
-            // into a total `submit_claim` / `memorize` refusal) and SHARES its
-            // `agent_db_id` cell, so the server agent is resolved — and its
-            // personal group provisioned — once per process, not once per
-            // session. See `SessionFactory` for the measurement.
-            move || Ok(sessions.session()),
-            Arc::new(LocalSessionManager::default()),
-            epigraph_mcp::host_guard::streamable_http_server_config(tcp_allowlist.as_ref()),
-        );
 
         // Innermost layer: rewrite rmcp's remaining session-error statuses to the MCP
         // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize

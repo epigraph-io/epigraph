@@ -188,8 +188,9 @@ impl HostAllowlist {
 ///
 /// `tcp_allowlist` is the TCP listener's [`HostAllowlist`] (the one
 /// [`host_guard_middleware`] enforces), or `None` for a unix-socket listener.
-/// `main.rs` and the HTTP tests both build the rmcp service through this
-/// function, so the tests exercise the production configuration.
+/// Callers reach it through [`crate::http_listener::mcp_http_listener`], which
+/// `main.rs` and the HTTP Host tests both call, so those tests serve the config
+/// `main.rs` builds for the same `--listen` / `--allowed-host` values.
 ///
 /// rmcp (>= 1.4) validates `Host` inside the service too, and its default
 /// `allowed_hosts` is loopback only. Left at that default, a reverse-proxied

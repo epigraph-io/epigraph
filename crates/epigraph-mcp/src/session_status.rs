@@ -165,7 +165,10 @@ pub async fn rewrite_rmcp_session_status(req: Request, next: Next) -> Response {
 ///
 /// The service is taken already built (not its session manager) so a test can
 /// keep its own handle on the `LocalSessionManager` it passed in.
-pub fn nest_mcp_service(service: McpHttpService) -> axum::Router {
+pub fn nest_mcp_service<S>(service: StreamableHttpService<S, LocalSessionManager>) -> axum::Router
+where
+    S: rmcp::Service<rmcp::RoleServer> + Send + 'static,
+{
     axum::Router::new()
         .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn(rewrite_rmcp_session_status))
