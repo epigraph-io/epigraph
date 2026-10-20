@@ -1682,6 +1682,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "claim.rs",
+        "tenancy_on_session_conn",
+        "READ of `claims` (`id, visibility, owner_group_id` only) for ids the caller already \
+         holds, with row security on the CONNECTION as the only filter, deliberately: the \
+         question is what the connection's own stamp can see, not what a viewer can. Its one \
+         caller is a declared-tenancy workflow ingest, on its system-agent stamped transaction, \
+         asking about the claims it reused before it writes an edge to any of them; an id \
+         missing from the answer exists but is invisible to the stamp and refuses the ingest. \
+         The answer is never returned to a caller (the caller-filtered read is \
+         `tenancy_of_conn`, which takes a viewer).",
+    ),
+    (
         "security_event.rs",
         "workflow_caller_write",
         "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
