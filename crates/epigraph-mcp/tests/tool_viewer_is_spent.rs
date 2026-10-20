@@ -60,6 +60,16 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str)] = &[
     // at the site. The `claim_themes` one explicitly records that §2.4's stated
     // control — viewer-scoped clustering — is NOT delivered by PR-09.
     ("recall.rs", "compute_corpus_scope"),
+    // The hierarchical outcome report's own SQL is the `workflows` counter
+    // read-modify-write (no tenancy columns, same reason as the next entry).
+    // It takes a viewer to STAMP its transaction and spends it in the
+    // repository step lookup (`WorkflowRepository::plan_step_claim_ids`, which
+    // splices), so the claim read it performs is filtered; this scan sees only
+    // the inline SQL.
+    (
+        "workflow_hierarchical.rs",
+        "do_report_hierarchical_outcome_as",
+    ),
     // `workflows` carries neither `visibility` nor `owner_group_id` (it is not
     // in migration 062's `tier_a`), so the routing probe
     // `SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)` has nothing to

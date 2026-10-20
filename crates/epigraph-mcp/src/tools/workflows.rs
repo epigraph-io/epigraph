@@ -965,8 +965,11 @@ pub async fn report_workflow_outcome(
                 deviation_reason: s.deviation_reason.clone(),
             })
             .collect();
+        // Resolved through the caller's viewer on a stamped transaction, so a
+        // member reads its group's private steps (see the callee).
         return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_with_embedder(
-            &server.pool,
+            server.scoped.as_ref(),
+            viewer,
             server.embedder.as_ref(),
             workflow_id,
             params.success,

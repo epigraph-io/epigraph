@@ -122,7 +122,9 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // the request's principal, read off the viewer) and
     // `set_source_reliability` (read, owned and written as that principal).
     "create_frame",
-    "report_hierarchical_outcome",
+    // `report_hierarchical_outcome` left this list when its step lookup moved
+    // onto a transaction stamped with the caller's viewer: an unstamped
+    // lookup resolved no group-private step for anyone, members included.
     "structure_source",
     // no corpus read
     "list_mcp_tools",
