@@ -474,13 +474,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          RFC 7009 denylist lookup both middlewares and /oauth/introspect run after verifying a \
          token's signature and BEFORE any principal exists (a revoked token gets none), keyed by \
          that signature-verified jti, on a non-tenant credential table read by primary key. The \
-         fourth, run concurrently with the first two and only for a token carrying a `dlg` \
-         claim, is AgentRepository::delegated_principal_pool: the per-request liveness check of \
-         a delegated run token, which like the second decides whether the principal gets a \
-         viewer at all (so it must answer BEFORE there is one), reads only through app-executable \
-         SECURITY DEFINER functions (migrations 077, 107, 122, 149) that do not depend on the \
-         session's stamp, and returns only the named delegator's and principal's own binding, \
-         link and membership answers.",
+         fourth is admit_delegated's AgentRepository::delegated_principal_pool: the per-request \
+         liveness check of a delegated run token, which both middlewares run (only for a token \
+         carrying a `dlg` claim) right after the revocation lookup and for the same reason: it \
+         decides whether the verified token yields a principal at all, BEFORE any viewer exists. \
+         It reads only through app-executable SECURITY DEFINER functions (migrations 077, 107, \
+         122, 149) that do not depend on the session's stamp, and returns only the named \
+         delegator's and principal's own binding, link and membership answers. extract_viewer \
+         reuses its answer from the request's extensions and reads nothing for it.",
     ),
     (
         "middleware/rate_limit.rs",

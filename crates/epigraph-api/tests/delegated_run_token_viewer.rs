@@ -58,11 +58,22 @@ fn state(pool: &PgPool, run_tokens: RunTokens) -> AppState {
 /// An `agent`-type access token for `principal`, `sub` = `client`, carrying
 /// `dlg = delegated_by` when `Some`. 15 minutes, `claims:read`.
 fn token(state: &AppState, client: Uuid, principal: Uuid, delegated_by: Option<Uuid>) -> String {
+    token_with(state, client, principal, delegated_by, &["claims:read"])
+}
+
+/// [`token`] with the given scopes.
+fn token_with(
+    state: &AppState,
+    client: Uuid,
+    principal: Uuid,
+    delegated_by: Option<Uuid>,
+    scopes: &[&str],
+) -> String {
     state
         .jwt_config
         .issue_access_token(
             client,
-            vec!["claims:read".to_string()],
+            scopes.iter().map(|s| (*s).to_string()).collect(),
             "agent",
             None,
             Some(principal),
@@ -108,11 +119,78 @@ fn assert_admitted(what: &str, (status, body): (StatusCode, String)) {
     );
 }
 
+/// A delegated token refused AS A DELEGATION: 403 with the delegation's own
+/// reason, never the operated-principal refusal a token without `dlg` gets
+/// (which a skipped delegation check would fall through to).
 fn assert_refused(what: &str, (status, body): (StatusCode, String)) {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "{what}: the token must get no viewer: {body}"
+        "{what}: the token must be refused: {body}"
+    );
+    assert!(
+        body.contains("delegation is not live") && !body.contains("stdio-only"),
+        "{what}: refused as a delegation that is not live: {body}"
+    );
+}
+
+/// `POST /api/v1/evidence` with `access` and a body the handler itself refuses
+/// (an `evidence_type` no variant matches): a route that resolves NO viewer,
+/// where reaching the handler shows as its own 400 and nothing is written.
+async fn submit_evidence(state: &AppState, access: &str) -> (StatusCode, String) {
+    let body = serde_json::json!({
+        "agent_id": Uuid::new_v4(),
+        "claim_id": Uuid::new_v4(),
+        "raw_content": "delegated evidence probe",
+        "evidence_type": {"no_such_variant": {}},
+    });
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/evidence")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// The delegation is checked on EVERY request that carries `dlg`, in the
+/// bearer middleware, not only where a viewer is resolved. `POST
+/// /api/v1/evidence` resolves none: a live delegation reaches its handler
+/// (which refuses the body itself, 400), and the same token is refused there
+/// with the switch off and on the next request after the link retires.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dead_delegation_is_refused_at_a_route_that_resolves_no_viewer(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "viewerless").await;
+    let st = state(&pool, RunTokens::On);
+    let access = token_with(
+        &st,
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read", "evidence:submit"],
+    );
+    let (status, body) = submit_evidence(&st, &access).await;
+    assert!(
+        status == StatusCode::BAD_REQUEST && body.contains("evidence_type"),
+        "CALIBRATION: a live delegation reaches the handler, which refuses the body: \
+         {status} {body}"
+    );
+    assert_refused(
+        "switch off",
+        submit_evidence(&AppState::with_db(pool.clone(), config()), &access).await,
+    );
+    delegation::retire_link(&pool, d.principal).await;
+    assert_refused(
+        "after the link was retired",
+        submit_evidence(&st, &access).await,
     );
 }
 

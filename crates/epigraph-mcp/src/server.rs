@@ -2648,6 +2648,23 @@ impl ServerHandler for EpiGraphMcpFull {
                 .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
                 .map(|t| t.0.clone());
         }
+        // A DELEGATED run token (`dlg`) is checked FIRST, on every call, before
+        // any other gate, the lineage write or the tool
+        // (`tools::viewer::admit_delegated_call`: one read, none for any other
+        // token). A tool that resolves no viewer is covered like one that
+        // does; the live answer is handed to the tool's own viewer and
+        // ownership checks below (`with_admitted_delegation`).
+        let admitted_delegation =
+            match tools::viewer::admit_delegated_call(self, auth_owned.as_ref(), &request.name)
+                .await
+            {
+                Ok(admitted) => admitted,
+                Err(err) => {
+                    self.emit_tool_invoked(&format!("denied:{}", request.name))
+                        .await;
+                    return Err(err);
+                }
+            };
         // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
         // caller's admin-only scopes count (`AuthContext::has_scope`). Read
         // before any scope gate, the federated one included, for a token it
@@ -2851,7 +2868,11 @@ impl ServerHandler for EpiGraphMcpFull {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = tools::viewer::with_admitted_delegation(
+            admitted_delegation,
+            self.tool_router.call(tcc),
+        )
+        .await;
         match (elevated, recording) {
             (Some(viewer), Some((tool, arguments, jti))) => {
                 crate::elevated_access::record_elevated_call(

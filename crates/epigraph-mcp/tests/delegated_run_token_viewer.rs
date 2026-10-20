@@ -321,12 +321,23 @@ async fn listener(pool: &PgPool, run_tokens: RunTokens) -> String {
     format!("http://{addr}/mcp")
 }
 
-/// A signed `agent` token for `principal`, `sub` = `client`, `dlg` as given.
+/// A signed `agent` token for `principal`, `sub` = `client`, `dlg` as given,
+/// carrying `claims:read`.
 fn signed(client: Uuid, principal: Uuid, delegated_by: Option<Uuid>) -> String {
+    signed_with(client, principal, delegated_by, &["claims:read"])
+}
+
+/// [`signed`] with the given scopes.
+fn signed_with(
+    client: Uuid,
+    principal: Uuid,
+    delegated_by: Option<Uuid>,
+    scopes: &[&str],
+) -> String {
     epigraph_auth::JwtConfig::from_secret(CHAIN_SECRET)
         .issue_access_token(
             client,
-            vec!["claims:read".to_string()],
+            scopes.iter().map(|s| (*s).to_string()).collect(),
             "agent",
             None,
             Some(principal),
@@ -375,47 +386,97 @@ async fn data(mut resp: reqwest::Response) -> serde_json::Value {
     panic!("no SSE data: {acc}");
 }
 
+/// One streamable-HTTP MCP session (one `Mcp-Session-Id`) under one bearer,
+/// kept open across calls the way a long-running client keeps it.
+struct McpSession {
+    url: String,
+    token: String,
+    id: String,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl McpSession {
+    /// `initialize` + `notifications/initialized`.
+    async fn open(url: &str, token: &str) -> Self {
+        let init = post(
+            url,
+            token,
+            None,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                           "clientInfo": {"name": "delegated-chain-test", "version": "0"}}
+            }),
+        )
+        .await;
+        assert_eq!(init.status().as_u16(), 200, "initialize");
+        let id = init
+            .headers()
+            .get("Mcp-Session-Id")
+            .expect("session header")
+            .to_str()
+            .expect("ascii")
+            .to_owned();
+        let _ = data(init).await;
+        let notif = post(
+            url,
+            token,
+            Some(&id),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+        Self {
+            url: url.to_owned(),
+            token: token.to_owned(),
+            id,
+            next: std::sync::atomic::AtomicU64::new(2),
+        }
+    }
+
+    /// `tools/call {tool} {arguments}` on this session; the JSON-RPC answer.
+    async fn call(&self, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resp = post(
+            &self.url,
+            &self.token,
+            Some(&self.id),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": n, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments}
+            }),
+        )
+        .await;
+        data(resp).await
+    }
+}
+
 /// `tools/call get_claim {claim}` on a fresh session; the JSON-RPC answer.
 async fn get_claim(url: &str, token: &str, claim: Uuid) -> serde_json::Value {
-    let init = post(
-        url,
-        token,
-        None,
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "delegated-chain-test", "version": "0"}}
-        }),
-    )
-    .await;
-    assert_eq!(init.status().as_u16(), 200, "initialize");
-    let session = init
-        .headers()
-        .get("Mcp-Session-Id")
-        .expect("session header")
-        .to_str()
-        .expect("ascii")
-        .to_owned();
-    let _ = data(init).await;
-    let notif = post(
-        url,
-        token,
-        Some(&session),
-        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-    )
-    .await;
-    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
-    let resp = post(
-        url,
-        token,
-        Some(&session),
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "get_claim", "arguments": {"claim_id": claim.to_string()}}
-        }),
-    )
-    .await;
-    data(resp).await
+    McpSession::open(url, token)
+        .await
+        .call(
+            "get_claim",
+            serde_json::json!({"claim_id": claim.to_string()}),
+        )
+        .await
+}
+
+/// The call succeeded (no JSON-RPC error, no tool error).
+fn succeeded(answer: &serde_json::Value) -> bool {
+    answer.get("error").is_none() && answer["result"]["isError"] != serde_json::json!(true)
+}
+
+/// The call was refused AS A DELEGATION that is not live, not by any other
+/// gate (the operated-principal refusal a skipped check would fall to).
+fn assert_dead(what: &str, answer: &serde_json::Value) {
+    let text = answer.to_string();
+    assert!(
+        !succeeded(answer)
+            && text.contains("delegation is not live")
+            && !text.contains("stdio-only"),
+        "{what}: refused as a delegation that is not live: {answer}"
+    );
 }
 
 /// A signed delegated token reaches a tool on a listener built ON, and is
@@ -449,4 +510,142 @@ async fn a_signed_dlg_token_reaches_a_tool_through_the_real_http_listener(pool: 
         plain.to_string().contains("stdio-only"),
         "CALIBRATION: without `dlg` the operated principal is refused: {plain}"
     );
+}
+
+/// `frames` rows named `name`.
+async fn frames_named(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM frames WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("count frames")
+}
+
+/// The delegation is checked at DISPATCH, on every tool call, not only where
+/// a tool resolves a viewer. `create_frame` resolves none and writes: a live
+/// delegation writes its frame; after the principal's link retires, the NEXT
+/// call on the same session is refused and writes nothing; a listener built
+/// OFF refuses it outright.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dead_delegation_is_refused_at_a_tool_that_resolves_no_viewer(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-viewerless").await;
+    let on = listener(&pool, RunTokens::On).await;
+    let off = listener(&pool, RunTokens::Off).await;
+    let token = signed_with(
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read", "claims:write"],
+    );
+    let frame = |name: &str| serde_json::json!({"name": name, "hypotheses": ["held", "not_held"]});
+    let live_name = format!("delegated-frame-live-{}", Uuid::new_v4());
+    let dead_name = format!("delegated-frame-dead-{}", Uuid::new_v4());
+
+    let session = McpSession::open(&on, &token).await;
+    let admitted = session.call("create_frame", frame(&live_name)).await;
+    assert!(
+        succeeded(&admitted) && frames_named(&pool, &live_name).await == 1,
+        "CALIBRATION: a live delegation writes its frame: {admitted}"
+    );
+
+    delegation::retire_link(&pool, d.principal).await;
+    assert_dead(
+        "the link retired: the next call on the same session",
+        &session.call("create_frame", frame(&dead_name)).await,
+    );
+    assert_dead(
+        "a listener built OFF",
+        &McpSession::open(&off, &token)
+            .await
+            .call("create_frame", frame(&dead_name))
+            .await,
+    );
+    assert_eq!(
+        frames_named(&pool, &dead_name).await,
+        0,
+        "a refused call wrote a frame"
+    );
+}
+
+/// One long-lived session, one token: each way of ending the delegation
+/// refuses the NEXT `tools/call` on that same session, at a tool that resolves
+/// a viewer (`get_claim`) and at one that resolves none (`create_frame`), and
+/// restoring it admits the call after. So no layer between the bearer and the
+/// tool (the session manager, the middleware, the dispatch) caches the answer
+/// per session. The allowance revoke is final, so it is last.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_long_lived_session_refuses_the_next_call_after_each_revocation(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-long-lived").await;
+    let claim = fixture::seed_public_claim(&pool, d.operator, "long-lived session claim").await;
+    let on = listener(&pool, RunTokens::On).await;
+    let session = McpSession::open(
+        &on,
+        &signed_with(
+            d.delegator_client,
+            d.principal,
+            Some(d.delegator),
+            &["claims:read", "claims:write"],
+        ),
+    )
+    .await;
+    let read = || {
+        session.call(
+            "get_claim",
+            serde_json::json!({"claim_id": claim.to_string()}),
+        )
+    };
+    let admitted = |what: &str, answer: serde_json::Value| {
+        assert!(
+            succeeded(&answer) && answer.to_string().contains(&claim.to_string()),
+            "{what}: the call must read the claim: {answer}"
+        );
+    };
+    let refused = |what: &'static str| {
+        let session = &session;
+        let pool = &pool;
+        async move {
+            assert_dead(what, &read().await);
+            let name = format!("long-lived-dead-{}", Uuid::new_v4());
+            assert_dead(
+                what,
+                &session
+                    .call(
+                        "create_frame",
+                        serde_json::json!({"name": name, "hypotheses": ["held", "not_held"]}),
+                    )
+                    .await,
+            );
+            assert_eq!(
+                frames_named(pool, &name).await,
+                0,
+                "{what}: a refused call wrote"
+            );
+        }
+    };
+    admitted("CALIBRATION: before any revocation", read().await);
+
+    delegation::revoke_membership(&pool, d.delegator, d.operator_group).await;
+    refused("the delegator's writer row revoked").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 1, 'writer')",
+    )
+    .bind(d.operator_group)
+    .bind(d.delegator)
+    .execute(&pool)
+    .await
+    .expect("restore the delegator's writer row");
+    admitted("the delegator's writer row restored", read().await);
+
+    delegation::retire_link(&pool, d.principal).await;
+    refused("the principal's link retired").await;
+    sqlx::query("UPDATE operator_links SET retired = false WHERE agent_id = $1")
+        .bind(d.principal)
+        .execute(&pool)
+        .await
+        .expect("un-retire the link");
+    admitted("the link restored", read().await);
+
+    delegation::revoke_allowance(&pool, d.delegator_client).await;
+    refused("the allowance revoked").await;
 }
