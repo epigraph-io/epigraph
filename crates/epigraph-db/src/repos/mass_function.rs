@@ -1267,6 +1267,141 @@ impl MassFunctionRepository {
     }
 }
 
+/// One legacy BBA with no `evidence_type`, and the stored provenance the
+/// evidence-type backfill decides from (backlog bc06ec6f).
+///
+/// Every field is read from a stored column; nothing here is inferred. The
+/// decision itself lives with the caller (`epigraph_cli::evidence_type_backfill`),
+/// which holds the calibration this crate does not depend on.
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct UntypedBbaProvenance {
+    pub id: Uuid,
+    pub combination_method: Option<String>,
+    /// TRUE for a cached combination row, by [`cached_combination_predicate`].
+    pub cached_combination: bool,
+    /// TRUE for an UNLABELLED (`combination_method` NULL) row with no agent and
+    /// no perspective that shares its (claim, frame) with another BBA: the
+    /// shape of the single-input cache copy writers stored before b5cb3efb,
+    /// which the predicate above cannot tell from a lone legacy input.
+    pub unlabelled_slot_shared: bool,
+    /// `evidence.evidence_type` of the linked evidence row (`evidence_id`).
+    pub linked_evidence_type: Option<String>,
+    /// `claims.properties->>'evidence_type'`.
+    pub claim_evidence_type: Option<String>,
+    /// `claims.properties->>'methodology'`.
+    pub claim_methodology: Option<String>,
+    /// `claims.properties->>'source_doi'`.
+    pub claim_source_doi: Option<String>,
+    /// `claims.properties->>'source_type'`.
+    pub claim_source_type: Option<String>,
+    /// `claims.labels` (empty when the claim row is missing).
+    pub claim_labels: Vec<String>,
+    /// `perspectives.name` when `perspective_id` names a perspective.
+    pub perspective_name: Option<String>,
+    /// The BBA's source agent's display name, else its claim's agent's.
+    pub agent_name: Option<String>,
+}
+
+impl MassFunctionRepository {
+    /// One keyset page of BBAs whose `evidence_type` is NULL or empty, in `id`
+    /// order, strictly after `after` (from the start when `None`), at most
+    /// `limit` rows, each with the provenance the backfill decides from.
+    ///
+    /// MAINTENANCE ONLY: it reads every tenant's rows and must run on the
+    /// maintenance connection; on an application session RLS hides most of
+    /// the corpus and the backfill would silently cover a fraction of it.
+    ///
+    /// # Errors
+    /// `DbError` on a query failure.
+    pub async fn untyped_provenance_page<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<UntypedBbaProvenance>, DbError> {
+        let sql = format!(
+            r#"
+            SELECT m.id,
+                   m.combination_method,
+                   {cached} AS cached_combination,
+                   (m.combination_method IS NULL
+                    AND m.source_agent_id IS NULL AND m.perspective_id IS NULL
+                    AND EXISTS (SELECT 1 FROM mass_functions s
+                                 WHERE s.claim_id = m.claim_id AND s.frame_id = m.frame_id
+                                   AND s.id <> m.id)) AS unlabelled_slot_shared,
+                   e.evidence_type::text              AS linked_evidence_type,
+                   c.properties->>'evidence_type'     AS claim_evidence_type,
+                   c.properties->>'methodology'       AS claim_methodology,
+                   c.properties->>'source_doi'        AS claim_source_doi,
+                   c.properties->>'source_type'       AS claim_source_type,
+                   COALESCE(c.labels, ARRAY[]::text[]) AS claim_labels,
+                   p.name::text                       AS perspective_name,
+                   COALESCE(sa.display_name, ca.display_name)::text AS agent_name
+              FROM mass_functions m
+              LEFT JOIN claims c        ON c.id = m.claim_id
+              LEFT JOIN evidence e      ON e.id = m.evidence_id
+              LEFT JOIN perspectives p  ON p.id = m.perspective_id
+              LEFT JOIN agents sa       ON sa.id = m.source_agent_id
+              LEFT JOIN agents ca       ON ca.id = c.agent_id
+             WHERE (m.evidence_type IS NULL OR m.evidence_type = '')
+               AND ($1::uuid IS NULL OR m.id > $1)
+             ORDER BY m.id
+             LIMIT $2
+            "#,
+            cached = cached_combination_predicate("m.")
+        );
+        let rows = sqlx::query_as::<_, UntypedBbaProvenance>(&sql)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(executor)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Set `evidence_type` on each `ids[i]` to `types[i]`, ONLY where the row
+    /// is still untyped (NULL or empty). Returns the number of rows written.
+    ///
+    /// The untyped guard makes the backfill idempotent and safe beside a live
+    /// writer: a row a writer typed after the page was read is left as the
+    /// writer stored it. No other column is touched.
+    ///
+    /// MAINTENANCE ONLY (see [`Self::untyped_provenance_page`]).
+    ///
+    /// # Errors
+    /// `DbError` on a query failure, or if the two slices differ in length.
+    pub async fn backfill_evidence_type_where_untyped<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+        types: &[String],
+    ) -> Result<u64, DbError> {
+        if ids.len() != types.len() {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "backfill_evidence_type_where_untyped: {} ids but {} types",
+                    ids.len(),
+                    types.len()
+                ),
+            });
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let done = sqlx::query(
+            r#"
+            UPDATE mass_functions m
+               SET evidence_type = v.t
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, t)
+             WHERE m.id = v.id
+               AND (m.evidence_type IS NULL OR m.evidence_type = '')
+            "#,
+        )
+        .bind(ids)
+        .bind(types)
+        .execute(executor)
+        .await?;
+        Ok(done.rows_affected())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
