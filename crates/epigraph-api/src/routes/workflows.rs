@@ -1197,6 +1197,13 @@ pub async fn find_workflow_hierarchical(
 ///
 /// Returns 404 if the id does not correspond to a `workflows` row. Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
+///
+/// # Authority
+///
+/// Requires `claims:write`, as the MCP twin does (`scope_map.rs`); a request
+/// with no `AuthContext` is 401, never a skipped check. The route used to take
+/// no `AuthContext` at all, so any authenticated bearer, a read-only client
+/// included, could move a workflow's counters.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1206,6 +1213,8 @@ pub async fn find_workflow_hierarchical(
     responses(
         (status = 200, body = serde_json::Value),
         (status = 400, description = "quality outside [0, 1]"),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write"),
         (status = 404),
         (status = 500),
     ),
@@ -1213,10 +1222,18 @@ pub async fn find_workflow_hierarchical(
     tag = "workflows"
 )]
 pub async fn report_hierarchical_outcome(
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "report_hierarchical_outcome requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // 0. Validate before touching the database (U033). `behavioral_executions`
     //    carries CHECK (quality BETWEEN 0 AND 1); an out-of-range value used to
     //    move the counters and then have every step row silently refused.
@@ -3338,6 +3355,7 @@ mod tests {
                     ))
                     .method("POST")
                     .header("content-type", "application/json")
+                    .extension(outcome_reporter())
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -3353,6 +3371,24 @@ mod tests {
                 .unwrap();
         assert_eq!(metadata["use_count"], 1);
         assert_eq!(metadata["success_count"], 1);
+    }
+
+    /// The caller every outcome-route test reports as: an agent token holding
+    /// `claims:write`, the scope the route requires.
+    fn outcome_reporter() -> crate::middleware::bearer::AuthContext {
+        let agent = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: uuid::Uuid::new_v4(),
+            agent_id: Some(agent),
+            owner_id: Some(agent),
+            client_type: crate::middleware::ClientType::Agent,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        }
     }
 
     /// A bare hierarchical root plus the outcome route alone (U033 fixtures).
@@ -3392,6 +3428,7 @@ mod tests {
                 ))
                 .method("POST")
                 .header("content-type", "application/json")
+                .extension(outcome_reporter())
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -3463,6 +3500,7 @@ mod tests {
                     ))
                     .method("POST")
                     .header("content-type", "application/json")
+                    .extension(outcome_reporter())
                     .body(Body::from(two_step_body(None).to_string()))
                     .unwrap(),
             )
@@ -3681,6 +3719,7 @@ mod tests {
                     .uri(format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
                     .method("POST")
                     .header("content-type", "application/json")
+                    .extension(outcome_reporter())
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
