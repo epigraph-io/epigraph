@@ -323,8 +323,8 @@ pub const RUN_STATUS: &str =
 pub const REVIEW_STATUS: &str =
     "Review src-direct-a for notice-2026-08-02 complete. Flagged: 1 item. Kept: 6 items.";
 
-pub const STEAM_A: &str = "[OPEN] Quad Steam Line Swap TND 90001A | Acme Polytechnic | sector:univ | trade:eng | due 2026-09-01 | est. unknown | scope";
-pub const STEAM_B: &str = "[OPEN] Quad Steam Line Swap TND 90002B | Acme Polytechnic | sector:univ | trade:eng | due 2026-09-01 | est. unknown | scope";
+pub const STEAM_A: &str = "[OPEN] Quad Steam Line Swap | Acme Polytechnic | ref TND 90001A | sector:univ | trade:eng | due 2026-09-01 | est. unknown | scope";
+pub const STEAM_B: &str = "[OPEN] Quad Steam Line Swap | Acme Polytechnic | ref TND 90002B | sector:univ | trade:eng | due 2026-09-01 | est. unknown | scope";
 
 pub const WIDGET_SPARSE: &str = "[OPEN] Footpath Lighting Study | City of Acmeton | sector:city | trade:planning | due unknown | est. unknown | scope";
 pub const WIDGET_FULL: &str = "[OPEN] Footpath Lighting Study | City of Acmeton | sector:city | trade:planning | due 2026-09-01 | est. $180,000 | scope";
