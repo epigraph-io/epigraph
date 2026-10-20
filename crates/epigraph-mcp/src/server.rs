@@ -120,6 +120,12 @@ pub struct EpiGraphMcpFull {
     /// is. Off, a token without `elv` resolves the plain scoped viewer with no
     /// liveness round trip at all.
     pub(crate) connector_elevation: bool,
+    /// Whether an HTTP request may carry a DELEGATED run token (a token with
+    /// `dlg`): admitted by `tools::viewer::request_viewer` and the ownership
+    /// gate only while its delegation is live, refused by every federated
+    /// tool whatever this says. OFF in every constructor; `main` sets it from
+    /// `EPIGRAPH_RUN_TOKENS` at boot ([`Self::with_run_tokens`]).
+    pub(crate) run_tokens: epigraph_db::RunTokens,
     /// The admin-scope switch (migration 128) as this process reads it,
     /// behind a short cache (elevation plan EL-10); shared by every session
     /// the factory clones. [`Self::admin_scope_posture`].
@@ -1065,6 +1071,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
         }
@@ -1103,6 +1110,14 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_connector_elevation(mut self, enabled: bool) -> Self {
         self.connector_elevation = enabled;
+        self
+    }
+
+    /// Set the delegated run-token switch (see the field's doc; OFF is the
+    /// default).
+    #[must_use]
+    pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
+        self.run_tokens = run_tokens;
         self
     }
 
@@ -1182,6 +1197,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
         }

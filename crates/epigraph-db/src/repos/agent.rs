@@ -22,6 +22,45 @@ pub const LIVE_LINK_BINDING: &str = "live_link";
 /// keeps its HTTP token and viewer.
 pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
 
+/// The environment variable that switches delegated run tokens on for a
+/// request-serving process ([`RunTokens`]). Read ONCE, at boot.
+pub const RUN_TOKENS_ENV: &str = "EPIGRAPH_RUN_TOKENS";
+
+/// Whether this process admits a delegated run token: an access token whose
+/// `dlg` claim names a delegator that asked for it on an operated agent's
+/// behalf. OFF by default in every constructor; ON only when the binary read
+/// `EPIGRAPH_RUN_TOKENS=on` at boot ([`Self::from_env`]). While OFF, every
+/// site that would admit such a token refuses it without a database read, so
+/// the feature is dormant until an operator arms it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunTokens {
+    /// Delegated run tokens are refused everywhere.
+    #[default]
+    Off,
+    /// A delegated run token is admitted where its delegation is live.
+    On,
+}
+
+impl RunTokens {
+    /// The switch's parse, apart from the environment: ONLY the exact value
+    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
+    /// `1` or a typo leave it OFF.
+    #[must_use]
+    pub fn parse(raw: Option<&str>) -> Self {
+        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+
+    /// [`Self::parse`] of [`RUN_TOKENS_ENV`]. For a binary's boot only.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(RUN_TOKENS_ENV).ok().as_deref())
+    }
+}
+
 /// One ACTING operator link: the operator's agent id and the id of the
 /// operator's personal group, which owns the operated agent's new claims.
 ///
@@ -1984,6 +2023,22 @@ impl AgentRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::RunTokens;
+
+    /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
+    /// and a typo all leave delegated run tokens refused. Mutation caught:
+    /// accepting any non-empty value.
+    #[test]
+    fn only_on_switches_run_tokens_on() {
+        for off in [None, Some(""), Some("true"), Some("1"), Some("yes"), Some("onn")] {
+            assert_eq!(RunTokens::parse(off), RunTokens::Off, "{off:?}");
+        }
+        for on in [Some("on"), Some(" ON "), Some("On")] {
+            assert_eq!(RunTokens::parse(on), RunTokens::On, "{on:?}");
+        }
+        assert_eq!(RunTokens::default(), RunTokens::Off);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_agent_crud(_pool: sqlx::PgPool) {
         // Placeholder: full CRUD coverage is in tests/agent_tests.rs

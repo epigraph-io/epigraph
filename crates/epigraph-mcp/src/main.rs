@@ -759,6 +759,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_scoped_pool(scoped.clone())
         .with_connector_elevation(connector_elevation_from_env())
+        .with_run_tokens(run_tokens_from_env())
         // The ceremony page's public origin, for the URL `sudo` returns
         // (elevation plan EL-11): the API's own variable. Unset, `sudo`
         // refuses.
@@ -1358,6 +1359,20 @@ fn connector_elevation_from_env() -> bool {
         );
     }
     on
+}
+
+/// `EPIGRAPH_RUN_TOKENS`: whether this listener admits a delegated run token
+/// (`epigraph_db::RunTokens`; only the exact value `on` enables it). Logged
+/// when ON.
+fn run_tokens_from_env() -> epigraph_db::RunTokens {
+    let switch = epigraph_db::RunTokens::from_env();
+    if switch == epigraph_db::RunTokens::On {
+        tracing::warn!(
+            "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \
+             is live"
+        );
+    }
+    switch
 }
 
 /// The switch's parse, apart from the environment: only `on`.
