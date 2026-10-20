@@ -356,6 +356,15 @@ pub async fn run(
             tx.commit().await?;
         }
         report.last_id = after;
+        // One line per batch, so a run that fails later still leaves the
+        // operator a resume point (`--after`) in its log.
+        tracing::info!(
+            batch = report.batches,
+            last_id = ?after,
+            scanned = report.scanned,
+            written = report.written,
+            "backfill_evidence_type batch done"
+        );
         if i64::try_from(page.len()).unwrap_or(i64::MAX) < batch {
             report.complete = true;
             return Ok(report);
