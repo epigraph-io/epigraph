@@ -158,6 +158,13 @@ pub fn executor_caller_error(
         e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
             invalid_params(format!("{context}: {e}"))
         }
+        // A declared-tenancy refusal (the caller, or the system agent, does not
+        // write the declared group): a denial, as OPL02 is.
+        e if e.is_declared_tenancy_refusal() => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(format!("{context}: {e}")),
+            data: None,
+        },
         other => internal_error(format!("{context}: {other}")),
     }
 }

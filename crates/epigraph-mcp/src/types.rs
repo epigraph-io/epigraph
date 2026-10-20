@@ -886,6 +886,18 @@ pub struct IngestWorkflowParams {
     )]
     #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+
+    #[schemars(
+        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items. Omit for the default: public."
+    )]
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Whether to embed the created claims and the workflow goal (default true). false sends no text to the embedding provider and stores no vector, so the claims stay out of semantic recall and semantic dedup."
+    )]
+    #[serde(default)]
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

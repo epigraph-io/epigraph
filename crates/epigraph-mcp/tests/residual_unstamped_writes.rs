@@ -266,7 +266,16 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
      `epigraph_live_memberships` (SECURITY DEFINER) before the stamp exists. The WRITE inside that \
      helper runs on `ScopedPool::begin_as`, which is the whole point of it.",
-)];
+),
+    (
+        "tools/workflow_ingest.rs",
+        "claim_helper::store_embedding_author_stamped",
+        "`store_ingest_embedding`, the post-commit embed of a declared-tenancy ingest's claims. \
+         The same helper as the `claim_helper.rs` entry above, for the same reason: \
+         `&server.pool` is its READ pool for resolving the author's viewer, and the UPDATE runs \
+         on `ScopedPool::begin_as` from that author.",
+    ),
+];
 
 /// Tokens that make a callee name write-shaped. Deliberately broad: a name this
 /// misses is a site this lint cannot see, and the inherited inventory's own
@@ -872,6 +881,9 @@ fn the_production_embedder_scan_sees_the_two_known_sites() {
 /// deliberate addition here, not silently uncovered.
 const EXECUTOR_ENTRY_POINTS: &[&str] = &[
     "execute_workflow_ingest_plan(",
+    // The declared-tenancy form; `execute_workflow_ingest_plan` delegates to
+    // it inside the executor crate, which this scan does not read.
+    "execute_workflow_ingest_plan_in_group(",
     "epigraph_ingest_executor::add_step(",
     "epigraph_ingest_executor::delete_step(",
 ];
@@ -892,7 +904,7 @@ const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
         4,
         4,
         "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
-         `execute_workflow_ingest_plan` each) plus `POST /workflows/steps` and \
+         `execute_workflow_ingest_plan` / `execute_workflow_ingest_plan_in_group` each) plus `POST /workflows/steps` and \
          `/workflows/steps/delete`. All four stamp through this module's own \
          `begin_system_ingest_stamped_tx`; none is exempt.",
     ),
