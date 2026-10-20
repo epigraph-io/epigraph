@@ -1886,7 +1886,13 @@ pub struct IngestWorkflowRequest {
 /// executor on the stamped transaction). Both refusals are 403. The response
 /// then carries `reused_items`: every planned claim the call did not create
 /// whose tenancy is not `('group', G)`, with its tenancy (`null` when the
-/// caller cannot read it). Nothing re-tenants a reused claim.
+/// caller cannot read it, which only a re-ingest can report). Nothing
+/// re-tenants a reused claim, and a plan that reuses a claim private to a group
+/// the caller does not write is refused (403) before any edge is written.
+///
+/// The `workflows` row itself has no row security: its `canonical_name`,
+/// `goal`, `metadata` and (unless `embed` is `false`) `goal_embedding` stay
+/// instance-readable whatever the tenancy, so a caller must keep them neutral.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
