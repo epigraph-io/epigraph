@@ -203,6 +203,14 @@ pub struct QueryUndecomposedClaimsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowPlanParams {
+    #[schemars(
+        description = "The hierarchical workflow's id: the `workflows`-table id that ingest_workflow returns (deterministic from canonical_name and generation)."
+    )]
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,

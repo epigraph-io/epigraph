@@ -1282,6 +1282,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Read the FROZEN plan of one hierarchical workflow generation by its workflows-table id, as the caller. Returns the row (canonical_name, generation, goal, parent_id, truth_value, submitter) and every executes target of THIS generation at every level, in the order its edge's plan_index gives: plan_index, level, claim_id, content, phase, content_hash (hex), content_hash_ok (seed-aware: the stored hash must match the content under this workflow's name, or the plain hash on rows without the scope marker), visibility, owner_group_id, truth_value, is_current and heads_diverged (an evolve_step happened; the frozen step is still what this generation executes). Integrity counts: hidden_count (edges you can see whose target you cannot read: a count, never ids), unindexed_edges (no integer plan_index or level, e.g. an add_step edge; not items), plan_index_gaps, duplicate_plan_indices and retracted_edges (not items). digest_echo is the wfd1 digest of the items, present only when every count is zero; it is informational, because plan_index is a mutable edge property and the order is reported as stored, never repaired. Not found when no such workflow exists or when you can see none of its executes edges (for example, a group-private plan of a group you are not in)."
+    )]
+    async fn get_workflow_plan(
+        &self,
+        Parameters(params): Parameters<crate::types::GetWorkflowPlanParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflow_plan::get_workflow_plan(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false."
     )]
     async fn verify_claim(
