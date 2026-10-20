@@ -47,6 +47,7 @@ pub mod plan;
 pub mod probe;
 pub mod profile;
 pub mod record;
+pub mod revert;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ pub use plan::{
 pub use probe::{probe, ProbeCandidate, ProbeVerdict, ProbeVerdictKind, PROBE_MAX_CANDIDATES};
 pub use profile::{profile_hash, LabelDedupProfile, PassProfile, ReadPurpose, ReadSpec};
 pub use record::{parse_record, Facts, MatchKeys, ParsedRecord};
+pub use revert::{revert_writes, AppliedLabelChange};
 
 /// The claim view the engine needs, and nothing else: no truth value, no
 /// evidence, no owner. Built by the caller from a viewer-scoped read.

@@ -19,6 +19,7 @@ mod precedence;
 mod probe;
 mod profile;
 mod properties;
+mod revert;
 mod signal;
 mod snapshot;
 mod writes;
