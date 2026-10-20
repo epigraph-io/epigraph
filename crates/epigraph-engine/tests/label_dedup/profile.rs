@@ -195,3 +195,123 @@ fn sections_normalize_before_hashing() {
     );
     assert_eq!(Section::normalize(&[]), Section::default_set());
 }
+
+// ── Knobs: each one changes an outcome, and the default is the control ─────
+
+fn survivor_of(
+    prof: &LabelDedupProfile,
+    graph: &[epigraph_engine::label_dedup::DedupClaim],
+) -> uuid::Uuid {
+    let p = f::plan_graph(prof, graph, &f::dedup_sections(), None);
+    assert_eq!(
+        p.clusters.len(),
+        1,
+        "the pair must cluster: {:?}",
+        p.clusters
+    );
+    p.clusters[0].survivor
+}
+
+/// A sparse claim (newer) and a complete one (older), same item.
+fn sparse_and_full() -> Vec<epigraph_engine::label_dedup::DedupClaim> {
+    vec![
+        f::claim(
+            1,
+            f::WIDGET_SPARSE,
+            &["notice", "src-direct-a"],
+            "2026-07-20T00:00:00Z",
+        ),
+        f::claim(
+            2,
+            f::WIDGET_FULL,
+            &["notice", "src-direct-a"],
+            "2026-07-01T00:00:00Z",
+        ),
+    ]
+}
+
+#[test]
+fn a_not_unknown_value_stops_counting_against_completeness() {
+    // Control: `unknown` is missing, so the complete claim survives.
+    assert_eq!(survivor_of(&f::profile(), &sparse_and_full()), f::id(2));
+    // Listed in `not_unknown` too, it is a value: completeness ties and the
+    // newer claim survives.
+    let mut v = profile_value();
+    v["unknown"]["not_unknown"] = serde_json::json!(["Unknown"]);
+    assert_eq!(survivor_of(&f::load(&v), &sparse_and_full()), f::id(1));
+}
+
+#[test]
+fn the_tie_break_order_comes_from_the_profile() {
+    // Default order: fewest unknown, then newest.
+    assert_eq!(survivor_of(&f::profile(), &sparse_and_full()), f::id(2));
+    let mut v = profile_value();
+    v["precedence"]["then"] =
+        serde_json::json!(["newest_created_at", "fewest_unknown", "smallest_id"]);
+    assert_eq!(survivor_of(&f::load(&v), &sparse_and_full()), f::id(1));
+}
+
+#[test]
+fn index_exclude_labels_keep_claims_out_of_the_member_read() {
+    let graph = vec![
+        f::claim(
+            1,
+            f::WING_FEED,
+            &["notice", "src-feed", "on-hold"],
+            "2026-06-28T00:00:00Z",
+        ),
+        f::claim(
+            2,
+            f::WING_DIRECT,
+            &["notice", "src-direct-c"],
+            "2026-06-29T00:00:00Z",
+        ),
+    ];
+    // Control: without the knob the pair clusters.
+    let p = f::plan_graph(&f::profile(), &graph, &f::dedup_sections(), None);
+    assert_eq!(p.clusters.len(), 1);
+    let mut v = profile_value();
+    v["index_exclude_labels"] = serde_json::json!(["on-hold"]);
+    let prof = f::load(&v);
+    let reads = prof.reads(&[Section::Dedup]).expect("reads");
+    assert_eq!(
+        reads[0].exclude,
+        vec!["resolved".to_string(), "on-hold".to_string()]
+    );
+    let p = f::plan_graph(&prof, &graph, &f::dedup_sections(), None);
+    assert!(p.clusters.is_empty() && p.hygiene.is_empty(), "{p:?}");
+    assert_eq!(p.coverage.members, 1);
+}
+
+#[test]
+fn match_thresholds_come_from_the_profile() {
+    // Entity overlap 4/5 = 0.8: a match at the default threshold only.
+    let pier = |tag: u32, side: &str| {
+        f::claim(
+            tag,
+            &format!("[OPEN] Pier Lamp Swap | Acme Harbor Port Board {side} | sector:city | due unknown | est. unknown | lamps"),
+            &["notice"],
+            "2026-06-28T00:00:00Z",
+        )
+    };
+    let piers = [pier(1, "North"), pier(2, "South")];
+    let p = f::plan_graph(&f::profile(), &piers, &f::dedup_sections(), None);
+    assert_eq!(p.clusters.len(), 1, "control: {:?}", p.review_pairs);
+    let mut v = profile_value();
+    v["entity_match"]["threshold"] = serde_json::json!(0.9);
+    let p = f::plan_graph(&f::load(&v), &piers, &f::dedup_sections(), None);
+    assert!(p.clusters.is_empty(), "{:?}", p.clusters);
+
+    // A preference-track variant is queued for review by default...
+    let murals = [
+        f::claim(1, f::MURAL_STD, &["notice"], "2026-06-22T00:00:00Z"),
+        f::claim(2, f::MURAL_MSB, &["notice"], "2026-06-22T00:00:00Z"),
+    ];
+    let p = f::plan_graph(&f::profile(), &murals, &f::dedup_sections(), None);
+    assert_eq!(p.review_pairs.len(), 1, "control");
+    // ...but not when its titles are shorter than the fuzzy minimum.
+    let mut v = profile_value();
+    v["title_match"]["fuzzy_min_tokens"] = serde_json::json!(12);
+    let p = f::plan_graph(&f::load(&v), &murals, &f::dedup_sections(), None);
+    assert!(p.review_pairs.is_empty(), "{:?}", p.review_pairs);
+}
