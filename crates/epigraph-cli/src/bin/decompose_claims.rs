@@ -203,6 +203,10 @@ struct Cli {
     /// Stop reading the undecomposed population after this many rows.
     #[arg(long, default_value_t = 20_000)]
     max_scan: usize,
+    /// Run as this agent on the ordinary application login (DATABASE_URL),
+    /// through row-level security, with no maintenance DSN.
+    #[arg(long)]
+    as_agent: Option<uuid::Uuid>,
     /// Call the LLM, print the proposed atoms, write this JSONL plan, and
     /// write NOTHING to the graph.
     #[arg(long)]
