@@ -166,6 +166,18 @@ fn engine_refusal(e: &LabelDedupError) -> McpError {
     }
 }
 
+/// The engine's code for a pass over its pairwise bound
+/// (`LabelDedupError::ResourceCap`).
+const RESOURCE_CAP: &str = "RESOURCE_CAP";
+
+/// The `data.code` a refusal carries, if any.
+fn refusal_code(e: &McpError) -> Option<&str> {
+    e.data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(Value::as_str)
+}
+
 fn success_json(value: &Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -803,8 +815,9 @@ pub async fn plan_label_dedup(
 ///
 /// # Errors
 /// As [`plan_label_dedup`], plus the read-only refusal and a missing write
-/// identity. A truncated read and a drifted plan are NOT errors: they are a
-/// `refused` status with nothing written.
+/// identity. A truncated read, a family over the engine's pairwise bound
+/// (`RESOURCE_CAP`) and a drifted plan are NOT errors: they are a `refused`
+/// status with nothing written.
 pub async fn apply_label_dedup(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -826,7 +839,24 @@ pub async fn apply_label_dedup(
         &params.sections,
         params.max_claims,
     )?;
-    let (plan, at) = compute_plan(server, viewer, &prepared).await?;
+    let (plan, at) = match compute_plan(server, viewer, &prepared).await {
+        Ok(planned) => planned,
+        // The family read fit `max_claims` but not the engine's pairwise
+        // bound: a refusal of the pass, like TRUNCATED, with no plan to show.
+        Err(e) if refusal_code(&e) == Some(RESOURCE_CAP) => {
+            return success_json(&json!({
+                "applied_plan_hash": Value::Null,
+                "status": "refused",
+                "refusal": {"code": RESOURCE_CAP, "message": e.message},
+                "plan": Value::Null,
+                "results": [],
+                "counts": {"units": 0, "ok": 0, "failed": 0, "labels_added": 0, "labels_removed": 0},
+                "applied_units": [],
+                "max_claims": prepared.max.json(),
+            }));
+        }
+        Err(e) => return Err(e),
+    };
     let refused = |code: &str, message: String| -> Result<CallToolResult, McpError> {
         success_json(&json!({
             "applied_plan_hash": Value::Null,
@@ -876,10 +906,9 @@ pub async fn apply_label_dedup(
             }
             Err(e) => {
                 failed += 1;
-                let code = e.data.as_ref().and_then(|d| d.get("code")).cloned();
                 results.push(json!({
                     "unit": unit.unit, "ok": false, "admin_path": false,
-                    "code": code, "error": e.message,
+                    "code": refusal_code(&e), "error": e.message,
                 }));
             }
         }
