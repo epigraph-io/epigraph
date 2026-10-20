@@ -63,10 +63,33 @@ is clamped, and the response reports `max_claims: {requested, effective,
 clamped}`. A read that hits the cap sets `coverage.truncated`.
 
 Every claim the caller can read that carries the family label is a member.
-That includes another author's public claim. Whether a family read should be
-restricted further (for example, to owner groups the caller writes) is an open
-operator decision. `tests/label_dedup_tools.rs` characterizes today's
-behaviour.
+That includes another author's public claim, so membership is not ownership.
+Apply and probe therefore check ownership themselves (next section).
+
+## Ownership of a cluster
+
+The engine has no owner field, and a revision label on either claim of a pair
+links them, so another author can make a claim of theirs a member of the
+caller's cluster, and, if it is newer, its survivor. A cluster unit retires its
+losers toward its survivor, so:
+
+- every member of a cluster unit, the survivor included and whether or not
+  that member is itself written, must be the write identity's own: its
+  author, an agent of the author's operator, or, over HTTP, a `claims:admin`
+  caller (the same decided grants as `require_owner_or_admin`);
+- a stdio server with no declared signer cannot decide this for another
+  agent's claim, and undecided is not owned;
+- a cluster with any other member fails as a unit with `CROSS_OWNER_MEMBER`
+  and writes nothing. Membership comes from the plan's cluster records, not
+  from the unit's writes: a survivor with nothing to write is still checked.
+
+Probe applies the same check: a `match` or `match_only` on a claim the caller
+does not own becomes `review`, with `matched_id` kept for the human.
+
+Hygiene, close-out and lifecycle units involve one claim each and keep
+`update_labels`' per-claim gates (below). A lifecycle `graduated` close and a
+signal supersession name a target member as the reason; that target is not
+ownership-checked today.
 
 ## `plan_label_dedup` (claims:read)
 
@@ -78,7 +101,9 @@ It returns:
   `lifecycle` and the signal sections;
 - `write_units`: exactly the writes apply would make, one transaction each, in
   apply order;
-- `write_check`.
+- `write_check`, per write target;
+- `unit_check`, per unit: `{unit, applies, members}`, where `members` lists
+  every member of a cluster unit with `owned` and a `reason` when not.
 
 `plan_hash` covers `profile_hash`, `run_tag`, `as_of`, the normalized sections
 and the write units, and nothing else. A new review pair therefore never causes
@@ -89,12 +114,17 @@ write target. It uses the same non-writing gates `update_labels` runs:
 ownership over HTTP, the retirement-label gate, and whether the owner group is
 writable (or reachable through the admin path). It never writes. Row-security
 refusals that only the database decides are reported by apply, per unit.
+`unit_check.applies` is false when any write target is predicted unwritable or
+any cluster member is not the write identity's own; apply's
+`CROSS_OWNER_MEMBER` comes from the same check.
 
 ## `apply_label_dedup` (claims:write; refused on a read-only server)
 
 1. Re-plan from live state with the same arguments.
 2. If any read was truncated, return `status: refused`, `refusal.code:
-   TRUNCATED`, and write nothing.
+   TRUNCATED`, and write nothing. A family over the engine's pairwise bound
+   (see `RESOURCE_CAP` below) is likewise `status: refused`,
+   `refusal.code: RESOURCE_CAP`, with `plan: null`.
 3. If the fresh `plan_hash` differs from the argument, return `status:
    refused`, `refusal.code: PLAN_DRIFT`, with the fresh `plan`, and write
    nothing. Review the fresh plan, then apply its hash.
@@ -104,6 +134,8 @@ refusals that only the database decides are reported by apply, per unit.
    identity:
    - a unit is a cluster (survivor carry labels plus every loser's retirement),
      one hygiene claim, one close-out claim, or one lifecycle signal;
+   - a cluster unit first checks that every member is the write identity's
+     own (`CROSS_OWNER_MEMBER` otherwise, nothing written);
    - each claim goes through `update_labels`' own per-claim path
      (`tools::claims::relabel_claim`): over HTTP, ownership or `claims:admin`
      (the audited admin path for a group the caller cannot write); on every
@@ -116,7 +148,7 @@ The response contains:
 
 - `status`: `applied`, even when some units failed (see `results` and
   `counts.failed`);
-- `results`: one `{unit, ok, error?, admin_path}` per unit;
+- `results`: one `{unit, ok, code?, error?, admin_path}` per unit;
 - `counts`;
 - `applied_units`.
 
@@ -173,7 +205,8 @@ the rules a plan uses. Each verdict is one of:
 
 - `new`: file it;
 - `match`: an auto-merge rule matched a live member (`matched_id`, `tier`);
-- `review`: a human decides;
+- `review`: a human decides (also a match on a claim the caller does not
+  own);
 - `match_only`: it matched only a closed signal (with
   `include_closed_signals`).
 
@@ -203,4 +236,6 @@ Tool errors carry `data.code`:
   refused here)
 - `TRUNCATED` (probe)
 
-Apply's `TRUNCATED` and `PLAN_DRIFT` are a `refused` status, not an error.
+Apply's `TRUNCATED`, `RESOURCE_CAP` and `PLAN_DRIFT` are a `refused` status, not
+an error. A failed unit carries its code in `results[].code`, for example
+`CROSS_OWNER_MEMBER`.
