@@ -68,6 +68,18 @@ async fn seed_frame(pool: &PgPool) -> Uuid {
     .expect("seed frame")
 }
 
+/// A frame with a given name (get-or-create: `frames.name` is UNIQUE).
+async fn seed_frame_named(pool: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['supported','unsupported']) \
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("seed named frame")
+}
+
 async fn seed_claim(pool: &PgPool, agent: Uuid, props: serde_json::Value, labels: &[&str]) -> Uuid {
     let labels: Vec<String> = labels.iter().map(ToString::to_string).collect();
     sqlx::query_scalar(
@@ -155,6 +167,7 @@ struct Fixture {
     expected: Vec<(Uuid, &'static str, Decision)>,
     already_typed: Uuid,
     intra_typed: Uuid,
+    truth_value_seed: Uuid,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -386,7 +399,9 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .await;
 
     // ── Dempster: agent-less = a cached combination; with an agent = a
-    // submit_ds_evidence input.
+    // submit_ds_evidence input stored without a caller type, whose masses that
+    // writer pre-discounted by the caller's reliability (#573 stores RAW masses
+    // only when it is given a type): typing it would weigh it twice.
     let (c, f) = slot!(json!({"evidence_type": "empirical"}), &[]);
     let e = seed_evidence(pool, c, "reference").await;
     let id = seed_bba(
@@ -415,7 +430,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         },
     )
     .await;
-    expected.push((id, "Dempster", typed("logical", Rule::LinkedReference)));
+    expected.push((id, "Dempster", null(LeaveNull::CombinationLabelledInput)));
 
     // ── the rest of the cached-combination family.
     for label in ["cautious+Dempster", "cached_unfolded", "YagerOpen"] {
@@ -491,7 +506,9 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         typed("testimonial", Rule::InterviewExtraction),
     ));
 
-    // ── dempster (lower case, praxis): an input with an agent; declared type.
+    // ── dempster (lower case, an out-of-repo writer): a combination label on an
+    // input with an agent. No #573 writer types such a row; left NULL even
+    // though its claim declares a type.
     let (c, f) = slot!(json!({"evidence_type": "testimonial"}), &[]);
     let id = seed_bba(
         pool,
@@ -504,7 +521,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         },
     )
     .await;
-    expected.push((id, "dempster", typed("testimonial", Rule::DeclaredType)));
+    expected.push((id, "dempster", null(LeaveNull::CombinationLabelledInput)));
 
     // ── test: a fixture, not evidence.
     let (c, f) = slot!(json!({"evidence_type": "empirical"}), &[]);
@@ -540,25 +557,106 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         expected.push((id, m, null(LeaveNull::LinkedTagUnreliable)));
     }
 
-    // ── truth_value_seed / memory_reinforcement: nothing that decides.
-    for (m, labels) in [
-        ("truth_value_seed", &[][..]),
-        ("memory_reinforcement", &["claude-memory"][..]),
+    // ── memory_reinforcement: nothing that decides.
+    let (c, f) = slot!(json!({}), &["claude-memory"]);
+    let id = seed_bba(
+        pool,
+        c,
+        f,
+        Bba {
+            method: Some("memory_reinforcement"),
+            agent: Some(ext),
+            ..Bba::default()
+        },
+    )
+    .await;
+    expected.push((
+        id,
+        "memory_reinforcement",
+        null(LeaveNull::NoDeterminingField),
+    ));
+
+    // ── truth_value_seed, as `ds_auto.rs::auto_wire_ds_update` writes it: the
+    // author's agent, source_strength 1.0, evidence_type NULL ON PURPOSE (the
+    // exempt arm keys on its absence, so the seed's BetP stays the claim's
+    // truth_value). A declared type on its claim must not type it.
+    let (c, f) = slot!(json!({"evidence_type": "testimonial"}), &[]);
+    let seed = seed_bba(
+        pool,
+        c,
+        f,
+        Bba {
+            method: Some("truth_value_seed"),
+            agent: Some(ext),
+            source_strength: Some(1.0),
+            ..Bba::default()
+        },
+    )
+    .await;
+    expected.push((seed, "truth_value_seed", null(LeaveNull::UntypedByDesign)));
+
+    // ── prior: a vacuous hypothesis prior, not evidence; untyped by design.
+    let (c, f) = slot!(json!({"evidence_type": "empirical"}), &[]);
+    let id = seed_bba(
+        pool,
+        c,
+        f,
+        Bba {
+            method: Some("prior"),
+            agent: Some(ext),
+            ..Bba::default()
+        },
+    )
+    .await;
+    expected.push((id, "prior", null(LeaveNull::UntypedByDesign)));
+
+    // ── the assess shape: `routes/assess.rs::assess_claim` stores an agent-less,
+    // perspective-less `discount` input whose masses `build_bba_directed`
+    // already sized with the type weight. Anonymous REST inputs share the
+    // shape. Typing it would apply the type weight a second time.
+    let (c, f) = slot!(json!({"evidence_type": "empirical"}), &[]);
+    let id = seed_bba(
+        pool,
+        c,
+        f,
+        Bba {
+            method: Some("discount"),
+            ..Bba::default()
+        },
+    )
+    .await;
+    expected.push((id, "discount", null(LeaveNull::MassesAlreadyWeighted)));
+
+    // ── a lone agent-less `<null>` row on an assess auto-frame: the single-input
+    // fold that replaced its (already type-weighted) assess input in the
+    // shared slot. Left NULL whatever its claim declares.
+    for frame_name in [
+        "research_validity".to_string(),
+        format!("paper_validity_bc06_{}", Uuid::new_v4().simple()),
     ] {
-        let (c, f) = slot!(json!({}), labels);
-        let id = seed_bba(
-            pool,
-            c,
-            f,
-            Bba {
-                method: Some(m),
-                agent: Some(ext),
-                ..Bba::default()
-            },
-        )
-        .await;
-        expected.push((id, m, null(LeaveNull::NoDeterminingField)));
+        let c = seed_claim(pool, ext, json!({"evidence_type": "logical"}), &[]).await;
+        let f = seed_frame_named(pool, &frame_name).await;
+        let id = seed_bba(pool, c, f, Bba::default()).await;
+        expected.push((id, "<null>", null(LeaveNull::MassesAlreadyWeighted)));
     }
+
+    // ── a declared type beside a linked `observation` tag: the claim's own
+    // declared type wins (it is checked first), the tag is not consulted.
+    let (c, f) = slot!(json!({"evidence_type": "empirical"}), &[]);
+    let e = seed_evidence(pool, c, "observation").await;
+    let id = seed_bba(
+        pool,
+        c,
+        f,
+        Bba {
+            method: Some("auto_wire"),
+            agent: Some(ext),
+            evidence: Some(e),
+            ..Bba::default()
+        },
+    )
+    .await;
+    expected.push((id, "auto_wire", typed("empirical", Rule::DeclaredType)));
 
     // ── error_derived: #573 keeps it untyped on purpose; a declared type on
     // the claim must not lift it.
@@ -582,6 +680,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         expected,
         already_typed,
         intra_typed,
+        truth_value_seed: seed,
     }
 }
 
@@ -836,6 +935,14 @@ async fn typing_changes_only_the_documented_lens_weight(pool: PgPool) {
     assert!(
         (w - cal.evidence_type_weights["logical"] * intra).abs() < 1e-12,
         "the intra locality discount must compose with the typed weight"
+    );
+    // The truth_value seed keeps its exempt (undiscounted) reliability, so its
+    // BetP stays the claim's truth_value.
+    let row = mf_row(&pool, fx.truth_value_seed).await;
+    let w = epigraph_engine::edge_factor::effective_source_strength(&row, None, None, &cal);
+    assert!(
+        (w - 1.0).abs() < 1e-12,
+        "the truth_value seed's reliability moved to {w}; it must stay 1.0"
     );
 }
 

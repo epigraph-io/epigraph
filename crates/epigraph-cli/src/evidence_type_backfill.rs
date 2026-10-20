@@ -92,6 +92,8 @@ pub enum LeaveNull {
     CachedCombination,
     UnlabelledSharedSlot,
     UntypedByDesign,
+    MassesAlreadyWeighted,
+    CombinationLabelledInput,
     NotEvidence,
     RelationshipNotStored,
     RegulatoryProvisional,
