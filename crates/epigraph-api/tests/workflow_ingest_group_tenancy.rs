@@ -510,6 +510,22 @@ async fn stdio_ingest(
     Ok(tool_json(&out))
 }
 
+/// MCP `ingest_workflow` on the stdio transport, expected to be refused: the
+/// error itself, so a test can pin its code and not only its message.
+async fn stdio_ingest_refused(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    params: epigraph_mcp::types::IngestWorkflowParams,
+) -> rmcp::model::ErrorData {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("the stdio viewer");
+    match epigraph_mcp::tools::workflow_ingest::ingest_workflow(server, &viewer, params, None).await
+    {
+        Ok(out) => panic!("expected a refusal, got {out:?}"),
+        Err(e) => e,
+    }
+}
+
 /// MCP `ingest_workflow` on the authenticated transport, as `agent`.
 async fn http_mcp_ingest(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
@@ -780,6 +796,7 @@ async fn a_curator_that_writes_the_team_group_publishes_into_it_over_stdio(pool:
 async fn a_fleet_agent_operated_by_a_group_writer_is_refused_unless_it_is_a_member(pool: PgPool) {
     let w = world(&pool).await;
     let name = "acme-tenancy-fleet";
+    let before = row_counts(&pool).await;
     let refused = stdio_ingest(
         &w.f_server,
         mcp_params(extraction(name, 0, &[&[]]), Some(w.g)),
@@ -818,6 +835,11 @@ async fn a_fleet_agent_operated_by_a_group_writer_is_refused_unless_it_is_a_memb
         "{refused}"
     );
     assert_eq!(workflows_named(&pool, name).await, 0);
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "the three refusals wrote no claim, edge, workflow or BBA"
+    );
 
     // The fallback residual: the operator group admits every agent of `h`.
     let fallback = "acme-tenancy-fleet-fallback";
@@ -849,6 +871,7 @@ async fn a_caller_is_refused_for_a_group_it_does_not_write(pool: PgPool) {
         ("acme-tenancy-foreign", w.og2),
         ("acme-tenancy-reader", read_only),
     ] {
+        let before = row_counts(&pool).await;
         let (s, b) = w
             .api
             .ingest(
@@ -890,17 +913,26 @@ async fn a_caller_is_refused_for_a_group_it_does_not_write(pool: PgPool) {
             0,
             "{name}: no workflow row"
         );
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "{name}: neither refusal wrote a claim (the operation atom included), an edge, a \
+             workflow or a BBA"
+        );
     }
 }
 
 /// A group the caller writes but the ingest system agent does not: refused
 /// before any row is written, naming the system agent, rather than failing on
-/// the first INSERT.
+/// the first INSERT. On REST (the human) and on stdio (the curator, a writer
+/// of the group, which the MCP transport maps to its own refusal arm).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_ingest_system_agent_must_write_the_declared_group(pool: PgPool) {
     let w = world(&pool).await;
     let unprovisioned = team_group(&pool, w.h).await;
+    add_member(&pool, unprovisioned, w.c, "writer").await;
     let name = "acme-tenancy-unprovisioned";
+    let before = row_counts(&pool).await;
     let (s, b) = w
         .api
         .ingest(
@@ -915,6 +947,34 @@ async fn the_ingest_system_agent_must_write_the_declared_group(pool: PgPool) {
     );
     assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
     assert_eq!(claims_mentioning(&pool, name).await, 0, "no claim");
+
+    let refused = stdio_ingest_refused(
+        &w.c_server,
+        mcp_params(
+            extraction(name, 0, &[&["acme unprovisioned operation"]]),
+            Some(unprovisioned),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "a denial, not an internal error: {refused:?}"
+    );
+    let refused = refused.message.to_string();
+    assert!(
+        refused.contains(&w.system.to_string()) && refused.contains(&unprovisioned.to_string()),
+        "the stdio refusal names the system agent and the group: {refused}"
+    );
+    assert!(
+        !refused.contains(&w.c.to_string()),
+        "refused by the system-agent check, not as the caller: {refused}"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "neither refusal wrote a claim, an edge, a workflow or a BBA"
+    );
 }
 
 /// Only `visibility: "group"` is a declaration; anything else is refused and
@@ -925,12 +985,14 @@ async fn a_tenancy_other_than_group_is_refused(pool: PgPool) {
     let name = "acme-tenancy-public-declared";
     let mut body = extraction(name, 0, &[&[]]);
     body["tenancy"] = json!({"visibility": "public", "owner_group_id": w.og});
+    let before = row_counts(&pool).await;
     let (s, b) = w.api.ingest(&token(w.h, WRITE_SCOPES), &body).await;
     assert!(
         s.is_client_error(),
         "refused as the caller's error: {s} {b}"
     );
     assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
+    assert_eq!(row_counts(&pool).await, before, "nothing written");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1356,6 +1418,42 @@ async fn stdio_ingest_embeds_every_created_claim_unless_embed_is_false(pool: PgP
             "{label}: embed:false sends no text to the provider"
         );
     }
+}
+
+/// MCP over HTTP: the human (not an operated agent, so it has HTTP authority)
+/// declares its operator group through the authenticated transport. The plan
+/// lands `('group', og)`, and the response carries `reused_items`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_declares_its_operator_group_over_mcp_http(pool: PgPool) {
+    let w = world(&pool).await;
+    let out = http_mcp_ingest(
+        &w.c_server,
+        w.h,
+        mcp_params(
+            extraction("acme-tenancy-mcp-http", 0, &[&["acme mcp http operation"]]),
+            Some(w.og),
+        ),
+    )
+    .await
+    .expect("the human declares og over MCP-HTTP");
+    let plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
+    assert_eq!(plan.len(), 3, "the phase, the step and the atom: {plan:?}");
+    assert!(
+        plan.iter().all(|(_, v, o)| v == "group" && *o == w.og),
+        "every planned claim is ('group', og): {plan:?}"
+    );
+    assert!(
+        executes_tenancy(&pool, uuid_of(&out["workflow_id"]))
+            .await
+            .iter()
+            .all(|(v, o)| v == "group" && *o == w.og),
+        "every executes edge is ('group', og)"
+    );
+    assert_eq!(
+        reused(&out).len(),
+        0,
+        "present, and empty for a fresh plan: {out}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
