@@ -226,3 +226,55 @@ fn an_id_a_kept_apart_claim_carries_is_never_carried() {
         alone.clusters[0].carry_add
     );
 }
+
+#[test]
+fn a_carried_value_is_made_writable_and_bounded() {
+    let survivor = || {
+        claim(
+            1,
+            f::FENDER_DIRECT_NO_DUE,
+            &["notice", "src-direct-a"],
+            "2026-05-01T00:00:00Z",
+        )
+    };
+    let carried = |loser_content: &str| -> Vec<String> {
+        let graph = vec![
+            survivor(),
+            claim(2, loser_content, &["notice"], "2026-05-10T00:00:00Z"),
+        ];
+        // One odd loser value must never fail the whole plan.
+        let p = f::try_plan_graph(&profile(), &graph, &dedup_sections(), None, 5000)
+            .expect("a loser's value never fails the plan");
+        assert_eq!(cluster_shape(&p), vec![(id(1), vec![id(2)])]);
+        p.clusters[0]
+            .carry_add
+            .iter()
+            .filter(|l| l.starts_with("value-carried:"))
+            .cloned()
+            .collect()
+    };
+    let pipe = |est: &str| {
+        format!(
+            "[OPEN] Dock 4 Fender Rebuild TND 0000029912 | Acme Port Authority | sector:city | due unknown | est. {est} | Fender rebuild"
+        )
+    };
+    // A control character inside the value is dropped, not fatal.
+    let bell = carried(&pipe("2.4M\u{7}approx"));
+    assert_eq!(bell, vec!["value-carried:2.4Mapprox".to_string()]);
+    // A run-on value is cut to a bounded label on a character boundary.
+    let long_tail = "ca ".repeat(80) + "é".repeat(80).as_str();
+    let long = carried(&pipe(&long_tail));
+    assert_eq!(long.len(), 1, "{long:?}");
+    let value = long[0].strip_prefix("value-carried:").expect("prefix");
+    assert!(
+        value.chars().count() <= epigraph_engine::label_dedup::plan::MAX_CARRIED_VALUE_CHARS,
+        "{} chars: {value}",
+        value.chars().count()
+    );
+    assert!(value.starts_with("ca-ca-"), "{value}");
+    assert!(!value.ends_with('-'), "{value}");
+    epigraph_db::reject_unexpanded_labels(&long).expect("valid label");
+    // Control: a clean value is carried whole.
+    let clean = carried(f::FENDER_FEED);
+    assert_eq!(clean, vec!["value-carried:1,600,000".to_string()]);
+}

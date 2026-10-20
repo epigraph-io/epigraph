@@ -806,14 +806,22 @@ fn effective_date(
     (own, own.max(carried))
 }
 
+/// The most characters of a loser's value a carry label keeps.
+pub const MAX_CARRIED_VALUE_CHARS: usize = 96;
+
 /// A value made safe to carry in a label: `$` dropped (the write path
-/// refuses it), braces dropped, whitespace runs collapsed to `-`.
+/// refuses it), braces and control characters dropped, whitespace runs
+/// collapsed to `-`, and the result cut to [`MAX_CARRIED_VALUE_CHARS`] on a
+/// character boundary. The value is claim data, so one odd row must yield a
+/// writable label (or none), never an error that fails the whole plan.
 fn label_safe_value(v: &str) -> String {
     let cleaned: String = v
         .chars()
-        .filter(|c| !matches!(c, '$' | '{' | '}'))
+        .filter(|c| !matches!(c, '$' | '{' | '}') && !c.is_control())
         .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join("-")
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join("-");
+    let cut: String = joined.chars().take(MAX_CARRIED_VALUE_CHARS).collect();
+    cut.trim_end_matches('-').to_string()
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
