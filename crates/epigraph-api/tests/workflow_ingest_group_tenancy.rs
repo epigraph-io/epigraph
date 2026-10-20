@@ -1523,3 +1523,145 @@ async fn an_atom_private_to_another_group_refuses_the_whole_ingest(pool: PgPool)
     assert!(workflow_id_named(&pool, name, 0).await.is_none());
     assert_eq!(row_counts(&pool).await, before, "nothing written");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What a re-ingest reports
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `executes` edges of `workflow_id` the harness (superuser) counts: the
+/// true size of the plan.
+async fn executes_count(pool: &PgPool, workflow_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'workflow' \
+            AND relationship = 'executes'",
+    )
+    .bind(workflow_id)
+    .fetch_one(pool)
+    .await
+    .expect("count executes edges")
+}
+
+/// `out` without the keys that name the request itself (`workflow_id`,
+/// `canonical_name`) or list the caller's own planned ids (`reused_items`):
+/// what is left is the part of the answer that could describe the plan.
+fn plan_answer(out: &Value) -> Value {
+    let mut out = out.clone();
+    let obj = out.as_object_mut().expect("a JSON object");
+    for key in ["workflow_id", "canonical_name", "reused_items"] {
+        obj.remove(key);
+    }
+    out
+}
+
+/// A re-ingest of an existing `(canonical_name, generation)` is answered with
+/// `already_ingested: true` and the existing plan's `executes` count. That
+/// count is the CALLER's view of the plan, never the ingest stamp's: the
+/// system agent writes (and so reads) every group it serves, so a count read
+/// on its stamp would tell a non-member how many private steps a group's
+/// workflow has. A non-member re-ingesting two group-private workflows of
+/// different sizes, declared or not, gets the same answer for both; a member
+/// gets each plan's true size; a public plan's size is everyone's. Runs on the
+/// application role with FORCE row security on `claims` and `edges`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
+    let w = world(&pool).await;
+    for table in ["claims", "edges"] {
+        let (enabled, forced): (bool, bool) = sqlx::query_as(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+              WHERE oid = ('public.' || $1)::regclass",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("read row-security flags");
+        assert!(
+            enabled && forced,
+            "{table}: row security must be enabled and FORCEd, or every arm here is vacuous"
+        );
+    }
+
+    let small = extraction("acme-plan-size-small", 0, &[&[], &[]]);
+    let large = extraction("acme-plan-size-large", 0, &[&[], &[], &[], &[], &[]]);
+    let mut true_sizes = Vec::new();
+    for body in [&small, &large] {
+        let out = stdio_ingest(&w.c_server, mcp_params(body.clone(), Some(w.g)))
+            .await
+            .expect("the curator publishes a g-private workflow");
+        let wf = uuid_of(&out["workflow_id"]);
+        assert!(
+            plan_tenancy(&pool, wf)
+                .await
+                .iter()
+                .all(|(_, v, o)| v == "group" && *o == w.g),
+            "the seeded plan is g-private"
+        );
+        true_sizes.push(executes_count(&pool, wf).await);
+    }
+    assert_ne!(
+        true_sizes[0], true_sizes[1],
+        "premise: the two private plans differ in size"
+    );
+
+    let before = row_counts(&pool).await;
+
+    // f writes og but is not a member of g: undeclared, and declared into og.
+    for declared_group in [None, Some(w.og)] {
+        let mut answers = Vec::new();
+        for body in [&small, &large] {
+            let out = stdio_ingest(&w.f_server, mcp_params(body.clone(), declared_group))
+                .await
+                .expect("a re-ingest writes nothing, so it is answered");
+            assert_eq!(out["already_ingested"], json!(true), "{out}");
+            answers.push(plan_answer(&out));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "a non-member's answer must not depend on the private plan's size \
+             (declared {declared_group:?}): {answers:?}"
+        );
+        assert_eq!(
+            answers[0]["executes_edges"],
+            json!(0),
+            "a non-member reads none of the private plan's executes edges: {answers:?}"
+        );
+    }
+
+    // c is a member of g: each plan's true size.
+    for (body, size) in [&small, &large].into_iter().zip(&true_sizes) {
+        let out = stdio_ingest(&w.c_server, mcp_params(body.clone(), Some(w.g)))
+            .await
+            .expect("the member's re-ingest");
+        assert_eq!(out["already_ingested"], json!(true), "{out}");
+        assert_eq!(
+            out["executes_edges"],
+            json!(size),
+            "a member is told the plan's true size: {out}"
+        );
+    }
+
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "no re-ingest wrote anything"
+    );
+
+    // Calibration: a public plan's size is everyone's, f's included.
+    let public = extraction("acme-plan-size-public", 0, &[&[], &[], &[]]);
+    let seeded = w.api.ingest_ok(&token(w.h, WRITE_SCOPES), &public).await;
+    let public_size = executes_count(&pool, uuid_of(&seeded["workflow_id"])).await;
+    let before_public = row_counts(&pool).await;
+    let out = stdio_ingest(&w.f_server, mcp_params(public, None))
+        .await
+        .expect("f re-ingests the public plan");
+    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    assert_eq!(
+        out["executes_edges"],
+        json!(public_size),
+        "a public plan's size is unchanged for any caller: {out}"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        before_public,
+        "the public re-ingest wrote nothing"
+    );
+}
