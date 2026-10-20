@@ -858,6 +858,28 @@ async fn allowlisted_hosts_with_a_valid_token_get_a_session() {
              got {status} (session header: {has_session}) body: {body}"
         );
     }
+
+    // A browser client behind the proxy also sends an allowlisted `Origin`. It
+    // must reach rmcp and get a session: rmcp's own `allowed_origins` is left
+    // empty ("not checked"), and filling it with this allowlist's bare names
+    // would refuse every scheme-qualified Origin inside the service.
+    for (host, origin) in [
+        (PROXY_HOST, "https://mcp.example.com"),
+        ("127.0.0.1:3100", "http://localhost:5173"),
+    ] {
+        let resp = boot_guarded_router()
+            .await
+            .oneshot(init_request(host, Some(origin), Some(&token)))
+            .await
+            .expect("router is infallible");
+        let status = resp.status().as_u16();
+        let has_session = resp.headers().contains_key(SESSION_HEADER);
+        assert!(
+            status == 200 && has_session,
+            "Host {host:?} + Origin {origin:?} with a valid token must get an MCP session; \
+             got {status} (session header: {has_session})"
+        );
+    }
 }
 
 /// A unix-socket listener applies no Host allowlist at any layer: whatever
@@ -881,6 +903,70 @@ async fn unix_shaped_listener_serves_any_host() {
              (session header: {has_session})"
         );
     }
+}
+
+/// rmcp's in-service Host check, with the outer guard taken away: on a TCP
+/// listener it must refuse a rebound `Host` by itself. Every other negative Host
+/// test goes through the outer guard, which answers 403 before rmcp sees the
+/// request, so without this test the inner check could be disabled (or fed an
+/// empty list, which rmcp reads as "allow every host") and the suite would stay
+/// green. The unix-shaped control serves the same request, proving the 403 is
+/// the TCP config's doing.
+#[tokio::test]
+async fn rmcps_own_host_check_refuses_a_rebound_host_on_a_tcp_listener() {
+    let token = mint_token(SECRET, &["claims:read"]);
+    for host in ["evil.example", "evil.example:3100"] {
+        let (router, _) = listener_router(TCP_LISTEN);
+        let resp = router
+            .oneshot(init_request(host, None, Some(&token)))
+            .await
+            .expect("router is infallible");
+        let status = resp.status().as_u16();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            (status, body.as_str()),
+            (403, "Forbidden: Host header is not allowed"),
+            "rmcp must refuse Host {host:?} on a TCP listener without the outer guard"
+        );
+    }
+
+    let resp = boot_unix_shaped_router()
+        .await
+        .oneshot(init_request("evil.example", None, Some(&token)))
+        .await
+        .expect("router is infallible");
+    assert!(
+        resp.status().as_u16() == 200 && resp.headers().contains_key(SESSION_HEADER),
+        "control: the unix-shaped listener serves the same request; got {}",
+        resp.status()
+    );
+}
+
+/// The exact list rmcp's Host check is given for a TCP listener: every
+/// allowlisted name plus its fully-qualified spelling, no dotted twin for the
+/// IPv6 literal, and never empty (an empty list is rmcp's allow-all).
+#[test]
+fn rmcp_allowed_hosts_carries_every_name_and_its_dotted_twin() {
+    let allowlist = epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(
+        TCP_LISTEN,
+        &[PROXY_HOST.to_string()],
+    );
+    let mut got = allowlist.rmcp_allowed_hosts();
+    got.sort();
+    let mut want = vec![
+        "127.0.0.1",
+        "127.0.0.1.",
+        "::1",
+        "localhost",
+        "localhost.",
+        "mcp.example.com",
+        "mcp.example.com.",
+    ];
+    want.sort_unstable();
+    assert_eq!(got, want);
 }
 
 /// A hostile page reaching the listener carries its own `Origin` even when the
