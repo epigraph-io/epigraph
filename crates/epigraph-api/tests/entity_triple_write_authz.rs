@@ -2,14 +2,12 @@
 //! CLAIM each item attaches to, not only against the `claims:write` scope
 //! (backlog 850dcc61).
 //!
-//! `POST /api/v1/entity-mentions/batch` and `POST /api/v1/triples/batch` used
-//! to check the scope and then insert on the raw pool, so any `claims:write`
-//! principal could attach rows to any claim id it named, including one in a
-//! group it does not belong to. The rule these tests pin, item by item over the
-//! whole batch BEFORE anything is written:
+//! `POST /api/v1/entity-mentions/batch` and `POST /api/v1/triples/batch`
+//! authorize each item against its target claim through the caller's viewer.
+//! The rule these tests pin, item by item over the whole batch:
 //!
-//! * a claim the caller cannot read is `404`, exactly like a claim that does
-//!   not exist (no existence oracle);
+//! * a claim the caller cannot read is `404`, answered exactly like a claim
+//!   that does not exist;
 //! * a claim the caller can read but whose owning group it cannot write
 //!   (`admin` / `writer` membership) is `403 not_owner`, rule
 //!   `not_claim_writer`;
@@ -201,9 +199,9 @@ async fn a_stranger_cannot_attach_to_another_groups_private_claim(pool: PgPool) 
     );
 }
 
-/// The refusal for a claim the caller cannot read is the refusal for a claim
-/// that does not exist, byte for byte once the id is masked, so the batch
-/// endpoints are not an existence oracle for other groups' claims.
+/// A hidden claim is answered exactly like a missing one: the refusal for a
+/// claim the caller cannot read is the refusal for a claim that does not
+/// exist, byte for byte once the id is masked, on both batch endpoints.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_hidden_claim_is_answered_like_a_missing_one(pool: PgPool) {
     let (owner, og) = seed_agent_with_group(&pool, "850-owner").await;
@@ -217,8 +215,15 @@ async fn a_hidden_claim_is_answered_like_a_missing_one(pool: PgPool) {
     let (ms, mb) = post_triples(&app, stranger, vec![triple(missing, e)]).await;
     let h = hb.to_string().replace(&private.to_string(), "<id>");
     let m = mb.to_string().replace(&missing.to_string(), "<id>");
-    assert_eq!((hs, &h), (ms, &m));
-    assert_eq!(hs, 404, "{h}");
+    assert_eq!((hs, &h), (ms, &m), "triples");
+    assert_eq!(hs, 404, "triples: {h}");
+
+    let (hs, hb) = post_mentions(&app, stranger, vec![mention(private, e)]).await;
+    let (ms, mb) = post_mentions(&app, stranger, vec![mention(missing, e)]).await;
+    let h = hb.to_string().replace(&private.to_string(), "<id>");
+    let m = mb.to_string().replace(&missing.to_string(), "<id>");
+    assert_eq!((hs, &h), (ms, &m), "mentions");
+    assert_eq!(hs, 404, "mentions: {h}");
 }
 
 /// A PUBLIC claim the caller can read but whose owning group it cannot write
@@ -241,8 +246,9 @@ async fn a_readable_claim_the_caller_cannot_write_is_refused_by_name(pool: PgPoo
 }
 
 /// One refused item refuses the whole batch. The refused item is LAST, after
-/// items on the caller's own claim, so a check made inside the insert loop
-/// (which would already have written the earlier items) fails here.
+/// items on the caller's own claims, so this catches a non-atomic batch that
+/// commits earlier items before refusing a later one: no row from the batch
+/// may remain.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_batch_whose_last_item_is_refused_writes_nothing(pool: PgPool) {
     let (owner, og) = seed_agent_with_group(&pool, "850-owner").await;
