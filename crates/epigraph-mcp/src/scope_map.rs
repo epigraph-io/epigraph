@@ -291,6 +291,17 @@ mod tests {
     fn claim_acts_are_write_scoped() {
         assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
         assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
+    }
+
+    /// Plan and probe only read, so a `claims:read` bearer reaches them; apply
+    /// writes (above). Asserted by name: the label-dedup tool tests call the
+    /// tool functions directly and never pass through the router's scope
+    /// check, and the coverage test passes for any mapping.
+    #[test]
+    fn label_dedup_reads_are_read_scoped() {
+        assert_eq!(required_scope("plan_label_dedup"), Some("claims:read"));
+        assert_eq!(required_scope("probe_label_dedup"), Some("claims:read"));
     }
 
     /// The three maintenance tools act across every tenant on a bypass viewer,
