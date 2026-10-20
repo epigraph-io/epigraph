@@ -188,6 +188,16 @@ impl Default for LabelQuery<'_> {
     }
 }
 
+/// One row of [`ClaimRepository::list_all_by_labels_ordered_by_id`]: the
+/// fields a label-family planner reads, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LabelFamilyRow {
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -4812,6 +4822,39 @@ impl ClaimRepository {
             out.push((claim, row.labels));
         }
         Ok(out)
+    }
+
+    /// Every claim carrying ALL of `include` and NONE of `exclude`, in id
+    /// order, with no offset: a whole label family in one deterministic read.
+    ///
+    /// Returns at most `cap + 1` rows. A caller that receives more than `cap`
+    /// knows the family is larger than its cap and must treat the read as
+    /// truncated (the planner refuses to act on a prefix), which offset paging
+    /// over `created_at` could never tell it: a page boundary drifts under
+    /// concurrent writes.
+    ///
+    /// Viewer-scoped: rows the viewer cannot read are absent. Under forced
+    /// row security a group-private row is visible only on a connection
+    /// stamped from a viewer that reads its group, so call it on
+    /// `ScopedPool::read_as`.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` when `include` is empty (that would read every
+    /// claim) or `cap` is negative; `DbError::QueryFailed` on a database
+    /// failure.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_all_by_labels_ordered_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        include: &[String],
+        exclude: &[String],
+        current_only: bool,
+        cap: i64,
+    ) -> Result<Vec<LabelFamilyRow>, DbError> {
+        let _ = (executor, viewer, include, exclude, current_only, cap);
+        Err(DbError::InvalidData {
+            reason: "NOT_IMPLEMENTED: list_all_by_labels_ordered_by_id".to_string(),
+        })
     }
 
     /// List claims that have NEVER been touched by decomposition: claims that
