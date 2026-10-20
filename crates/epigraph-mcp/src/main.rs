@@ -1365,7 +1365,15 @@ fn connector_elevation_from_env() -> bool {
 /// (`epigraph_db::RunTokens`; only the exact value `on` enables it). Logged
 /// when ON.
 fn run_tokens_from_env() -> epigraph_db::RunTokens {
-    let switch = epigraph_db::RunTokens::from_env();
+    let raw = std::env::var(epigraph_db::RUN_TOKENS_ENV).ok();
+    if epigraph_db::RunTokens::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_RUN_TOKENS is set to a value that is neither `on` nor `off`: delegated \
+             run tokens stay OFF on this listener (only `on` admits them)"
+        );
+    }
+    let switch = epigraph_db::RunTokens::parse(raw.as_deref());
     if switch == epigraph_db::RunTokens::On {
         tracing::warn!(
             "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \

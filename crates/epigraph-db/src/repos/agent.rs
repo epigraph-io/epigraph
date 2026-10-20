@@ -54,6 +54,18 @@ impl RunTokens {
         }
     }
 
+    /// Whether `raw` is SET to a value that is neither `on` nor `off`
+    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
+    /// OFF, which a binary warns about at boot so an operator who typed `true`
+    /// or `1` learns why every delegated token is refused. Unset or blank is
+    /// the plain default and is not flagged.
+    #[must_use]
+    pub fn is_unrecognised(raw: Option<&str>) -> bool {
+        raw.map(str::trim).is_some_and(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
+        })
+    }
+
     /// [`Self::parse`] of [`RUN_TOKENS_ENV`]. For a binary's boot only.
     #[must_use]
     pub fn from_env() -> Self {
@@ -2114,6 +2126,28 @@ mod tests {
             assert_eq!(RunTokens::parse(on), RunTokens::On, "{on:?}");
         }
         assert_eq!(RunTokens::default(), RunTokens::Off);
+    }
+
+    /// A value that is SET but neither `on` nor `off` is flagged (it reads as
+    /// OFF silently otherwise); unset, blank, `on` and `off` in any case are
+    /// not. Mutation caught: flagging nothing (an operator who typed `true`
+    /// sees no warning) or flagging `off`.
+    #[test]
+    fn an_unrecognised_run_tokens_value_is_flagged() {
+        for flagged in ["true", "1", "yes", "onn", "enabled"] {
+            assert!(RunTokens::is_unrecognised(Some(flagged)), "{flagged:?}");
+        }
+        for quiet in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("on"),
+            Some(" ON "),
+            Some("off"),
+            Some("OFF"),
+        ] {
+            assert!(!RunTokens::is_unrecognised(quiet), "{quiet:?}");
+        }
     }
 
     #[sqlx::test(migrations = "../../migrations")]
