@@ -22,6 +22,19 @@ fn rich_graph() -> Vec<DedupClaim> {
     g.push(chain(0x3000_0001, "TND 55501A"));
     g.push(chain(0x3000_0002, ""));
     g.push(chain(0x3000_0003, "TND 55502C"));
+    // A pair whose survivor gains a carried value.
+    g.push(claim(
+        0x3100_0001,
+        f::FENDER_DIRECT_NO_DUE,
+        &["notice", "src-direct-a"],
+        "2026-05-01T00:00:00Z",
+    ));
+    g.push(claim(
+        0x3100_0002,
+        f::FENDER_FEED,
+        &["notice"],
+        "2026-05-10T00:00:00Z",
+    ));
     g.push(claim(
         0x7000_0001,
         f::LEAD_CHILLER,
@@ -53,7 +66,7 @@ fn plan_json(graph: &[DedupClaim], sections: &[Section]) -> (String, String) {
     let p = f::plan_graph(&profile(), graph, sections, Some(date("2026-10-05")));
     // Guard: identical EMPTY plans would make the comparison vacuous.
     assert!(
-        p.clusters.len() >= 6 && !p.vetoed_chains.is_empty(),
+        p.clusters.len() >= 7 && !p.vetoed_chains.is_empty(),
         "{:?}",
         p.clusters
     );
@@ -77,7 +90,7 @@ proptest! {
     }
 
     #[test]
-    fn any_subset_replans_empty_after_apply(mask in proptest::collection::vec(any::<bool>(), 31)) {
+    fn any_subset_replans_empty_after_apply(mask in proptest::collection::vec(any::<bool>(), 33)) {
         let base = rich_graph();
         // The wing pair is always kept, so every case has at least one write.
         let pinned = [f::id(f::t::WING_FEED), f::id(f::t::WING_DIRECT)];
@@ -106,7 +119,7 @@ fn the_rich_graph_exercises_every_stage() {
         Some(date("2026-10-05")),
     );
     assert!(!p.hygiene.is_empty());
-    assert!(p.clusters.len() >= 6, "{:?}", p.clusters.len());
+    assert!(p.clusters.len() >= 7, "{:?}", p.clusters.len());
     assert!(!p.vetoed_chains.is_empty());
     assert!(p.clusters.iter().any(|c| !c.carry_add.is_empty()));
     assert!(!p.past_due.is_empty());
