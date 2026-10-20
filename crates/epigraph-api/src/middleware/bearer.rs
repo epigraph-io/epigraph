@@ -697,6 +697,7 @@ mod require_scope_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         });
         parts
     }
@@ -787,6 +788,7 @@ mod viewer_extractor_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

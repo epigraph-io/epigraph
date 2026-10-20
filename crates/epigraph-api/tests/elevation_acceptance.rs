@@ -228,6 +228,7 @@ impl Server {
                 AccessTokenBinding {
                     family_id: Some(p.family),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -1408,6 +1409,7 @@ async fn ps_agent_cannot_elevate(pool: PgPool) {
                 AccessTokenBinding {
                     family_id: Some(fam),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")

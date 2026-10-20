@@ -473,6 +473,7 @@ async fn batch_create_claims_401s_without_an_agent_id_and_writes_nothing() {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
     let a = uniq("handler-no-agent");
     let req: epigraph_api::routes::batch::BatchClaimRequest =

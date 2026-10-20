@@ -1408,6 +1408,7 @@ async fn handle_elevate_grant(
     let binding = epigraph_auth::AccessTokenBinding {
         family_id: Some(family),
         elevation_id: Some(session),
+        delegated_by: None,
     };
     let (access_token, _jti) = state
         .jwt_config
