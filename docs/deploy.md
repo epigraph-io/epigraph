@@ -2644,3 +2644,34 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
 - **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
   reverse.
+
+## `backfill_evidence_type` — legacy BBA typing (no migration, operator-gated)
+
+Backlog bc06ec6f. #573 made every BBA write path store the canonical
+`mass_functions.evidence_type`; rows written before it stay NULL, so
+`effective_source_strength` uses their stored `source_strength` (or 0.5) instead
+of `[evidence_type_weights]`, and the perspective lens never sees them. This
+binary types the rows whose stored provenance determines their type and leaves
+every other row NULL, counted per writer (`combination_method`) and reason.
+Rules and reasons: `crates/epigraph-cli/src/evidence_type_backfill.rs`.
+
+- **Authority**: `MAINTENANCE_DATABASE_URL` must be set (the fallback to
+  `DATABASE_URL` is refused) and its login must bypass row security.
+- **`--calibration <path>` is required** and must be the `calibration.toml` the
+  API and MCP servers load; the report echoes it. A file that does not load, or
+  has no `[evidence_type_weights]`, is refused.
+- **Dry run by default.** `--apply` writes `evidence_type` only, only on rows
+  still untyped, one transaction per `--batch` (default 1000). A re-run is a
+  no-op on rows already typed. `--max-batches N` bounds a run; pass the
+  report's `last_id` as `--after` to continue.
+- **Never typed**: cached combination rows (the predicate the combine-input
+  readers exclude), unlabelled agent-less rows sharing their (claim, frame)
+  with another BBA, `error_derived` / `prior`, test and backlog rows,
+  propagated BBAs, linked `observation` / `testimony` / `computation` /
+  `document` tags, declared aliases, rows with a deciding methodology.
+- **Counted, not applied: `openstax_agent_name_only`.** OpenStax extractor rows
+  have only their agent's name to go on. Typing them `logical` would move about
+  120k rows from 0.3 to 0.85; that needs its own operator decision.
+- **Beliefs**: typing changes the weight each typed row contributes (the
+  calibrated weight of its type, times the locality factor) and nothing else.
+  Cached beliefs are NOT recomputed: run the belief recompute after an apply.
