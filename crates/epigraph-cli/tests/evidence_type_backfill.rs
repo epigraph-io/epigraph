@@ -2,22 +2,28 @@
 //! or more rows from every writer class measured on production
 //! (`combination_method` NULL, discount, auto_wire, Dempster, auto_cdst,
 //! propagated_from_parent / _neighbor, interview_extraction, dempster, test,
-//! adaptive, truth_value_seed, error_derived, memory_reinforcement, none) plus
-//! the cached-combination labels the X01 predicate names (`cautious+…`,
-//! `cached_unfolded`).
+//! adaptive, truth_value_seed, error_derived, memory_reinforcement, none, and
+//! prior) plus the cached-combination labels the full cached-combination
+//! predicate names (`cautious+…`, `cached_unfolded`) and the writer shapes
+//! whose masses already carry their weight (the assess input and its fold,
+//! agent-bearing combination-labelled inputs, the truth_value seed).
 //!
 //! What is pinned:
 //! * each row is typed, or left NULL for its stated reason (a decision table,
 //!   so a rule that types an ambiguous row fails on THAT row);
+//! * a type the calibration cannot weigh is left NULL;
 //! * a dry run writes nothing; an apply writes exactly the decided rows and
-//!   only their `evidence_type`;
+//!   only their `evidence_type`, and touches no claim or cached belief;
 //! * cached combination rows and ambiguous rows are untouched;
-//! * a second run writes nothing; a bounded run resumes from its `last_id`;
+//! * a second run writes nothing; a bounded run resumes after its `last_id`;
 //! * the only belief effect is the documented lens effect: a typed row's
 //!   `effective_source_strength` becomes its type's calibrated weight times the
-//!   locality factor, and every other row's is unchanged;
-//! * the binary refuses the application DSN, and on a real
-//!   `epigraph_maintenance` login it writes.
+//!   locality factor, a perspective's reliability for its type now applies to
+//!   it, and every other row's weight (global and through the lens) is
+//!   unchanged;
+//! * the binary refuses an unset maintenance DSN, an application login as the
+//!   maintenance DSN, and a calibration that does not load or weighs no type;
+//!   on a real `epigraph_maintenance` login it writes.
 
 #[path = "viewer_fixture.rs"]
 mod viewer_fixture;
@@ -44,6 +50,44 @@ fn calibration_path() -> PathBuf {
 
 fn calibration() -> CalibrationConfig {
     CalibrationConfig::load(&calibration_path()).expect("load calibration.toml")
+}
+
+/// A copy of the workspace calibration.toml with every `[evidence_type_weights]`
+/// line for which `keep` is false removed, written to a fresh temp file.
+fn calibration_variant(keep: impl Fn(&str) -> bool) -> PathBuf {
+    let src = std::fs::read_to_string(calibration_path()).expect("read calibration.toml");
+    let mut in_weights = false;
+    let mut out = String::new();
+    for line in src.lines() {
+        if line.trim_start().starts_with('[') {
+            in_weights = line.trim() == "[evidence_type_weights]";
+        } else if in_weights && !keep(line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let path = std::env::temp_dir().join(format!("bc06-calibration-{}.toml", Uuid::new_v4()));
+    std::fs::write(&path, out).expect("write the calibration variant");
+    path
+}
+
+/// Every claim and every cached combined belief, whole: the backfill must not
+/// touch either (it writes `mass_functions.evidence_type` only and recomputes
+/// nothing).
+async fn belief_snapshot(pool: &PgPool) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let claims: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT to_jsonb(c) FROM claims c ORDER BY c.id")
+            .fetch_all(pool)
+            .await
+            .expect("claims snapshot");
+    let combined: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(b) FROM ds_combined_beliefs b ORDER BY to_jsonb(b)::text",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("combined-belief snapshot");
+    (claims, combined)
 }
 
 async fn seed_agent(pool: &PgPool, name: &str) -> Uuid {
@@ -796,10 +840,20 @@ async fn apply_types_exactly_the_decided_rows_and_a_second_run_is_a_no_op(pool: 
     let cal = calibration();
     let fx = seed_fixture(&pool).await;
     let before = snapshot(&pool).await;
+    let beliefs_before = belief_snapshot(&pool).await;
+    assert!(
+        !beliefs_before.0.is_empty(),
+        "CALIBRATION: the fixture has claims"
+    );
 
     let mut conn = pool.acquire().await.expect("conn");
     let first = run(&mut conn, &cal, &opts(true, 4)).await.expect("apply");
     let after = snapshot(&pool).await;
+    assert_eq!(
+        belief_snapshot(&pool).await,
+        beliefs_before,
+        "the apply changed a claim or a cached combined belief"
+    );
 
     let want_typed: BTreeMap<Uuid, String> = fx
         .expected
@@ -842,11 +896,13 @@ async fn a_bounded_run_resumes_from_its_last_id(pool: PgPool) {
     let fx = seed_fixture(&pool).await;
     let mut conn = pool.acquire().await.expect("conn");
 
+    // Dry runs: nothing leaves the untyped set, so a resume that ignored
+    // `--after` would rescan the first batch and over-count.
     let part = run(
         &mut conn,
         &cal,
         &Options {
-            apply: true,
+            apply: false,
             batch: 5,
             after: None,
             max_batches: Some(1),
@@ -856,11 +912,12 @@ async fn a_bounded_run_resumes_from_its_last_id(pool: PgPool) {
     .expect("first batch");
     assert!(!part.complete);
     assert_eq!(part.scanned, 5);
+    let last = part.last_id.expect("a bounded run reports its last id");
     let rest = run(
         &mut conn,
         &cal,
         &Options {
-            apply: true,
+            apply: false,
             batch: 5,
             after: part.last_id,
             max_batches: None,
@@ -875,7 +932,42 @@ async fn a_bounded_run_resumes_from_its_last_id(pool: PgPool) {
         .iter()
         .filter(|(_, _, d)| matches!(d, Decision::Type { .. }))
         .count() as u64;
-    assert_eq!(part.written + rest.written, typed);
+    assert_eq!(part.decided_typed + rest.decided_typed, typed);
+    let resumed = MassFunctionRepository::untyped_provenance_page(&mut *conn, Some(last), 10_000)
+        .await
+        .expect("resumed page");
+    assert_eq!(resumed.len() as u64, rest.scanned);
+    assert!(
+        resumed.iter().all(|r| r.id > last),
+        "the resumed page starts at or before the cursor"
+    );
+
+    // Applied in the same two parts, every decided row is written once.
+    let a = run(
+        &mut conn,
+        &cal,
+        &Options {
+            apply: true,
+            batch: 5,
+            after: None,
+            max_batches: Some(1),
+        },
+    )
+    .await
+    .expect("first applied batch");
+    let b = run(
+        &mut conn,
+        &cal,
+        &Options {
+            apply: true,
+            batch: 5,
+            after: a.last_id,
+            max_batches: None,
+        },
+    )
+    .await
+    .expect("the applied rest");
+    assert_eq!(a.written + b.written, typed);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -883,13 +975,41 @@ async fn typing_changes_only_the_documented_lens_weight(pool: PgPool) {
     let cal = calibration();
     let fx = seed_fixture(&pool).await;
     let ids: Vec<Uuid> = fx.expected.iter().map(|(id, _, _)| *id).collect();
+    // A perspective whose reliability for every canonical type the fixture
+    // can be typed with differs from calibration: the lens bc06ec6f is about.
+    const LENS: f64 = 0.42;
+    let mut lens = epigraph_engine::edge_factor::PerspectiveReliability::default();
+    for t in [
+        "empirical",
+        "statistical",
+        "logical",
+        "testimonial",
+        "circumstantial",
+    ] {
+        assert!(
+            (cal.evidence_type_weights[t] - LENS).abs() > 1e-6,
+            "CALIBRATION: {t}'s calibrated weight equals the lens value"
+        );
+        lens.source_reliability.insert(t.to_string(), LENS);
+    }
+    let with_lens = |row: &MassFunctionRow| {
+        epigraph_engine::edge_factor::effective_source_strength_with_perspective(
+            row, None, None, &cal, &lens,
+        )
+    };
     let mut weight_before = BTreeMap::new();
+    let mut lens_before = BTreeMap::new();
     for id in &ids {
         let row = mf_row(&pool, *id).await;
-        weight_before.insert(
-            *id,
-            epigraph_engine::edge_factor::effective_source_strength(&row, None, None, &cal),
+        let global =
+            epigraph_engine::edge_factor::effective_source_strength(&row, None, None, &cal);
+        // Untyped, the row is invisible to the lens: it reads the global value.
+        assert!(
+            (with_lens(&row) - global).abs() < 1e-12,
+            "row {id}: the lens saw an untyped row"
         );
+        weight_before.insert(*id, global);
+        lens_before.insert(*id, with_lens(&row));
     }
 
     let mut conn = pool.acquire().await.expect("conn");
@@ -902,14 +1022,15 @@ async fn typing_changes_only_the_documented_lens_weight(pool: PgPool) {
     for (id, _, d) in &fx.expected {
         let row = mf_row(&pool, *id).await;
         let w = epigraph_engine::edge_factor::effective_source_strength(&row, None, None, &cal);
+        let lw = with_lens(&row);
+        let locality = if row.locality_tag.starts_with("intra") {
+            intra
+        } else {
+            1.0
+        };
         match d {
             Decision::Type { evidence_type, .. } => {
-                let base = cal.evidence_type_weights[evidence_type.as_str()];
-                let want = if row.locality_tag.starts_with("intra") {
-                    base * intra
-                } else {
-                    base
-                };
+                let want = cal.evidence_type_weights[evidence_type.as_str()] * locality;
                 assert!(
                     (w - want).abs() < 1e-12,
                     "row {id}: weight {w}, documented {want}"
@@ -917,11 +1038,27 @@ async fn typing_changes_only_the_documented_lens_weight(pool: PgPool) {
                 if (w - weight_before[id]).abs() > 1e-9 {
                     moved += 1;
                 }
+                // Typed, the row is visible to the lens: it reads the
+                // perspective's reliability for its type, which it did not
+                // before.
+                assert!(
+                    (lw - LENS * locality).abs() < 1e-12,
+                    "row {id}: lens weight {lw}, want {}",
+                    LENS * locality
+                );
+                assert!(
+                    (lens_before[id] - LENS * locality).abs() > 1e-9,
+                    "CALIBRATION: row {id} already read the lens value before the apply"
+                );
             }
             Decision::LeaveNull(_) => {
                 assert!(
                     (w - weight_before[id]).abs() < 1e-12,
                     "row {id} was left NULL but its weight moved"
+                );
+                assert!(
+                    (lw - lens_before[id]).abs() < 1e-12,
+                    "row {id} was left NULL but its lens weight moved"
                 );
             }
         }
@@ -970,6 +1107,37 @@ async fn a_type_a_writer_stored_after_the_read_is_kept(pool: PgPool) {
             .await
             .expect("read");
     assert_eq!(t.as_deref(), Some("statistical"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_type_the_calibration_cannot_weigh_is_left_null(pool: PgPool) {
+    let fx = seed_fixture(&pool).await;
+    let path = calibration_variant(|line| !line.trim_start().starts_with("logical"));
+    let cal = CalibrationConfig::load(&path).expect("load the variant");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !cal.evidence_type_weight_present("logical"),
+        "CALIBRATION: the variant still weighs logical"
+    );
+    let page = MassFunctionRepository::untyped_provenance_page(&pool, None, 10_000)
+        .await
+        .expect("page");
+    let decided: BTreeMap<Uuid, Decision> = page.iter().map(|r| (r.id, decide(r, &cal))).collect();
+    let mut uncalibrated = 0;
+    for (id, writer, want) in &fx.expected {
+        let want = match want {
+            Decision::Type { evidence_type, .. } if evidence_type == "logical" => {
+                uncalibrated += 1;
+                null(LeaveNull::Uncalibrated)
+            }
+            other => other.clone(),
+        };
+        assert_eq!(decided.get(id), Some(&want), "{writer} {id}");
+    }
+    assert!(
+        uncalibrated > 0,
+        "CALIBRATION: no fixture row is typed logical"
+    );
 }
 
 // ── the binary, as a real process on real LOGIN roles ──────────────────────
@@ -1047,6 +1215,29 @@ async fn the_binary_refuses_the_application_dsn_and_writes_on_the_maintenance_lo
     );
     assert_ne!(r.code, Some(0), "{}", r.stderr);
     assert!(r.stderr.contains("--calibration"), "{}", r.stderr);
+    // A calibration that loads but weighs no type: refused.
+    let empty = calibration_variant(|_| false);
+    let r = run_bin(
+        &["--calibration", empty.to_str().expect("utf-8"), "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    let _ = std::fs::remove_file(&empty);
+    assert_ne!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("has no [evidence_type_weights]"),
+        "{}",
+        r.stderr
+    );
+    // An application login configured AS the maintenance DSN: it cannot
+    // bypass row security, so the maintenance pool refuses it at connect.
+    let r = run_bin(&["--calibration", cal, "--apply"], &app_url, Some(&app_url));
+    assert_ne!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("does not satisfy epigraph_bypass()"),
+        "{}",
+        r.stderr
+    );
     assert_eq!(snapshot(&pool).await, before, "a refused run wrote");
 
     // Dry run (the default): the report, and nothing written.
