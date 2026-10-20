@@ -197,12 +197,36 @@ pub async fn request_viewer(
     // while the agent's writer row in the operator's group is live. Checked
     // concurrently with the resolve, so it adds a round trip of work but no
     // latency.
-    let (viewer, actor) = tokio::join!(
+    //
+    // A DELEGATED run token (`dlg`) is the one carve-out, and only while its
+    // delegation is live NOW ([`live_delegation`]). A token carrying `dlg`
+    // whose delegation is not live is refused whatever the principal's link
+    // state: an unlinked principal is never delegated to.
+    let (viewer, actor, delegation) = tokio::join!(
         resolve_http(server, auth, principal),
         epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, principal),
+        live_delegation(server, auth, principal),
     );
+    let delegated = match (auth.and_then(|a| a.delegated_by), delegation?) {
+        (None, _) => false,
+        (Some(_), Some(_)) => true,
+        (Some(delegator), None) => {
+            return Err(McpError::invalid_request(
+                format!(
+                    "this token was delegated to agent {principal} by agent {delegator}, and \
+                     that delegation is not live: delegated run tokens are refused, or the \
+                     delegator's allowance, client, or writer membership, or the agent's \
+                     operator link, has ended"
+                ),
+                None,
+            ))
+        }
+    };
     match actor {
         Ok(None) => {}
+        // A live delegation names this operated principal's own operator, so
+        // its viewer carries only authority the delegator already holds.
+        Ok(Some(_)) if delegated => {}
         Ok(Some(link)) => {
             return Err(McpError::invalid_request(
                 format!(
@@ -221,4 +245,38 @@ pub async fn request_viewer(
         }
     }
     viewer.map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+}
+
+/// The live delegation of `auth`'s `dlg` claim to `principal`, through THE
+/// shared per-request check (`AgentRepository::delegated_principal_pool`, with
+/// this listener's `EPIGRAPH_RUN_TOKENS` switch: `None` without a read while
+/// it is off). `None` too when the token carries no `dlg`.
+///
+/// Read by [`request_viewer`] and by the ownership gate's actor arm
+/// (`tools::claims::require_owner_or_admin`), so both sites admit a delegated
+/// token on the same answer.
+///
+/// # Errors
+/// An MCP internal error when the check cannot answer; callers refuse.
+pub(crate) async fn live_delegation(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    principal: uuid::Uuid,
+) -> Result<Option<epigraph_db::DelegationLive>, McpError> {
+    let Some(delegator) = auth.and_then(|a| a.delegated_by) else {
+        return Ok(None);
+    };
+    epigraph_db::AgentRepository::delegated_principal_pool(
+        &server.pool,
+        server.run_tokens,
+        delegator,
+        principal,
+    )
+    .await
+    .map_err(|e| {
+        McpError::internal_error(
+            format!("could not check whether the token's delegation to {principal} is live: {e}"),
+            None,
+        )
+    })
 }

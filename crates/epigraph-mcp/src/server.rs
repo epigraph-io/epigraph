@@ -762,6 +762,19 @@ impl EpiGraphMcpFull {
                 data: None,
             });
         };
+        // A DELEGATED run token never reaches a federated tool, whatever its
+        // scopes: the call would forward its bearer to the extension, which
+        // runs no delegation check of its own.
+        if auth.delegated_by.is_some() {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: federated tool '{tool_name}' is unavailable to a delegated run \
+                     token (its bearer is never forwarded to an extension)"
+                )),
+                data: None,
+            });
+        }
         if !auth.has_scope(required) {
             return Err(McpError {
                 code: rmcp::model::ErrorCode::INVALID_REQUEST,

@@ -73,6 +73,16 @@ pub struct OperatorLink {
     pub operator_group_id: Uuid,
 }
 
+/// A LIVE delegation of an operated agent (a delegated run token's `dlg`):
+/// the operator both sides answer to, and the operator's group the delegated
+/// principal writes. Produced only by
+/// [`AgentRepository::delegated_principal_pool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationLive {
+    pub operator_id: Uuid,
+    pub operator_group_id: Uuid,
+}
+
 /// The operator an AUTHOR's claims belong to, from the link record alone.
 ///
 /// Produced only by [`AgentRepository::operator_of_author`] (migration 107's
@@ -1528,6 +1538,66 @@ impl AgentRepository {
     ) -> Result<Option<OperatorLink>, DbError> {
         let mut conn = pool.acquire().await?;
         Self::operator_actor(&mut conn, agent_id).await
+    }
+
+    /// "May a token that `delegator_agent` asked for act as `principal`?" —
+    /// THE per-request liveness check of a delegated run token (a token whose
+    /// `dlg` claim names `delegator_agent`), shared by every site that admits
+    /// one. `Some` iff ALL of these hold at the moment of the read:
+    ///
+    /// * `run_tokens` is [`RunTokens::On`] (else `None` with no read at all);
+    /// * `delegator_agent` is bound to a human through migration 149's
+    ///   allowlist ([`CLIENT_ALLOWLIST_BINDING`]): its allowance is not
+    ///   revoked, its client is `active` and `service`/`agent`, it holds no
+    ///   operator link and operates no agent, and its operator is a registered
+    ///   human (149's arm (c), `epigraph_author_binding`);
+    /// * that human (`epigraph_human_of(delegator, true)`) is the operator of
+    ///   `principal`'s ACTING link ([`Self::operator_actor`]: a not-retired
+    ///   record and a live writer membership of the operator's group);
+    /// * `delegator_agent` ITSELF holds a live `writer`/`admin` membership of
+    ///   that operator's group (`epigraph_live_memberships`, the read the
+    ///   viewer resolves on). This is the no-escalation conjunct: a delegated
+    ///   token hands out only write authority its delegator already holds.
+    ///
+    /// An unlinked `principal` is never delegated to: it has no acting link.
+    ///
+    /// ONE statement on one connection, every read through an app-executable
+    /// `SECURITY DEFINER` function, so it answers the same on an unstamped
+    /// `epigraph_app` session as on a privileged one, and from one snapshot.
+    /// No cache: a revoke, a retire or a suspension takes effect on the next
+    /// request.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a function is absent or the read fails.
+    /// Never mapped to "not live" by this function; every caller refuses on an
+    /// error (fails closed).
+    pub async fn delegated_principal_pool(
+        pool: &PgPool,
+        run_tokens: RunTokens,
+        delegator_agent: Uuid,
+        principal: Uuid,
+    ) -> Result<Option<DelegationLive>, DbError> {
+        if run_tokens != RunTokens::On {
+            return Ok(None);
+        }
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT a.operator_id, a.operator_group_id \
+               FROM public.epigraph_operator_actor($2) a \
+              WHERE public.epigraph_author_binding($1) = $3 \
+                AND public.epigraph_human_of($1, true) = a.operator_id \
+                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) m \
+                             WHERE m.group_id = a.operator_group_id \
+                               AND m.role IN ('writer', 'admin'))",
+        )
+        .bind(delegator_agent)
+        .bind(principal)
+        .bind(CLIENT_ALLOWLIST_BINDING)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(operator_id, operator_group_id)| DelegationLive {
+            operator_id,
+            operator_group_id,
+        }))
     }
 
     /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that

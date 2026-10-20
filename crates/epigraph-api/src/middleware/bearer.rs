@@ -504,12 +504,69 @@ async fn extract_viewer(
                 _ => epigraph_db::Viewer::resolve(&state.db_pool, principal).await,
             }
         };
-        let (viewer, actor) = tokio::join!(
+        // A DELEGATED run token (`dlg`) is admitted only through a delegation
+        // that is live NOW (`AgentRepository::delegated_principal_pool`, the
+        // one check every admitting site shares; it reads nothing while the
+        // process's `EPIGRAPH_RUN_TOKENS` switch is off). A token carrying
+        // `dlg` whose delegation is not live is refused WHATEVER the
+        // principal's link state: an unlinked principal is never delegated
+        // to. Read concurrently with the other two.
+        let delegation = async {
+            match auth.delegated_by {
+                None => Ok(None),
+                Some(delegator) => epigraph_db::AgentRepository::delegated_principal_pool(
+                    &state.db_pool,
+                    state.run_tokens,
+                    delegator,
+                    principal,
+                )
+                .await
+                .map(|live| Some((delegator, live))),
+            }
+        };
+        let (viewer, actor, delegation) = tokio::join!(
             resolve,
             epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, principal),
+            delegation,
         );
+        let delegated = match delegation {
+            Ok(None) => false,
+            Ok(Some((_, Some(_)))) => true,
+            Ok(Some((delegator, None))) => {
+                tracing::warn!(
+                    target: "visibility.viewer.rejected",
+                    reason = "delegation_not_live",
+                    route = %route,
+                    principal = %principal,
+                    delegator = %delegator,
+                    "viewer rejected: the token is a delegated run token whose delegation is \
+                     not live"
+                );
+                return Err(ApiError::Forbidden {
+                    reason: format!(
+                        "this token was delegated to agent {principal} by agent {delegator}, \
+                         and that delegation is not live: delegated run tokens are refused, or \
+                         the delegator's allowance, client, or writer membership, or the \
+                         agent's operator link, has ended"
+                    ),
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    route = %route,
+                    principal = %principal,
+                    error = %e,
+                    "failed to check whether the token's delegation is live"
+                );
+                return Err(ApiError::from(e));
+            }
+        };
         match actor {
             Ok(None) => {}
+            // The carve-out of the refusal below: a live delegation names this
+            // operated principal's own operator, so its viewer carries only
+            // authority the delegator already holds.
+            Ok(Some(_)) if delegated => {}
             Ok(Some(link)) => {
                 tracing::warn!(
                     target: "visibility.viewer.rejected",
