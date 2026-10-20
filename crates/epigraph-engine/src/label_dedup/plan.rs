@@ -49,6 +49,13 @@ pub struct PlanInputs {
 /// bound the plan is refused with RESOURCE_CAP instead of running unbounded.
 pub const MAX_DEDUP_FAMILY_MEMBERS: usize = 2_000;
 
+/// The most auto-merge edges one dedup pass may hold. The union step scans the
+/// members of both sides of every edge for a veto, so edges are bounded too.
+pub const MAX_DEDUP_MERGE_EDGES: usize = 20_000;
+
+/// The most review pairs one dedup pass may return.
+pub const MAX_DEDUP_REVIEW_PAIRS: usize = 5_000;
+
 /// How much was read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Coverage {
@@ -598,17 +605,40 @@ pub(crate) fn run_pass(
 
     let recs = &out.records;
     let n = recs.len();
+    if n > MAX_DEDUP_FAMILY_MEMBERS {
+        return Err(LabelDedupError::ResourceCap {
+            what: "dedup family members",
+            got: n,
+            max: MAX_DEDUP_FAMILY_MEMBERS,
+        });
+    }
     let mut edges: Vec<Edge> = Vec::new();
     let mut review_pairs = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
             match classify_pair(pass, &recs[i], &recs[j]) {
-                PairVerdict::Merge { tier, reason } => edges.push(Edge {
-                    a: i,
-                    b: j,
-                    tier,
-                    reason,
-                }),
+                PairVerdict::Merge { tier, reason } => {
+                    if edges.len() >= MAX_DEDUP_MERGE_EDGES {
+                        return Err(LabelDedupError::ResourceCap {
+                            what: "dedup merge edges",
+                            got: edges.len() + 1,
+                            max: MAX_DEDUP_MERGE_EDGES,
+                        });
+                    }
+                    edges.push(Edge {
+                        a: i,
+                        b: j,
+                        tier,
+                        reason,
+                    });
+                }
+                PairVerdict::Review { .. } if review_pairs.len() >= MAX_DEDUP_REVIEW_PAIRS => {
+                    return Err(LabelDedupError::ResourceCap {
+                        what: "dedup review pairs",
+                        got: review_pairs.len() + 1,
+                        max: MAX_DEDUP_REVIEW_PAIRS,
+                    });
+                }
                 PairVerdict::Review { overlap, reason } => review_pairs.push(ReviewPair {
                     left: rid(&recs[i]),
                     right: rid(&recs[j]),

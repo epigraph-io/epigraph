@@ -234,10 +234,16 @@ fn names_by_prefix(
         })
 }
 
+/// The shortest id prefix a revision label may use. A revision link
+/// auto-merges and overrides the strong-id veto, so it must name its claim as
+/// precisely as a `distinct-from` ruling: a one-digit prefix would link the
+/// labelled claim to one claim in sixteen.
+pub const MIN_REVISION_ID_PREFIX: usize = MIN_DISTINCT_ID_PREFIX;
+
 fn revision_linked(pass: &PassProfile, a: &ParsedRecord, b: &ParsedRecord) -> bool {
-    // Any non-empty prefix links, as in the planner this one replaces.
     let p = pass.revision_label_prefix.as_deref();
-    names_by_prefix(p, a, b, 1) || names_by_prefix(p, b, a, 1)
+    names_by_prefix(p, a, b, MIN_REVISION_ID_PREFIX)
+        || names_by_prefix(p, b, a, MIN_REVISION_ID_PREFIX)
 }
 
 fn label_values<'a>(

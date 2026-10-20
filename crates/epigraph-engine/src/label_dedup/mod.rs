@@ -156,6 +156,12 @@ pub enum LabelDedupError {
     Truncated,
     #[error("TOO_MANY_CANDIDATES: {got} candidates, at most {max} per call")]
     TooManyCandidates { got: usize, max: usize },
+    #[error("RESOURCE_CAP: {got} {what}, at most {max}; narrow the pass")]
+    ResourceCap {
+        what: &'static str,
+        got: usize,
+        max: usize,
+    },
 }
 
 impl LabelDedupError {
@@ -172,6 +178,7 @@ impl LabelDedupError {
             Self::InvalidLabel { .. } => "INVALID_LABEL",
             Self::Truncated => "TRUNCATED",
             Self::TooManyCandidates { .. } => "TOO_MANY_CANDIDATES",
+            Self::ResourceCap { .. } => "RESOURCE_CAP",
         }
     }
 }
