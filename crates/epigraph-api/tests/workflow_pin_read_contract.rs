@@ -14,10 +14,10 @@
 //!
 //! * CONTRACT tests ((a1), (a2), (b), (c), (d)) pin behaviour the resolver is
 //!   built on. A change that fails one of them breaks every resolver.
-//! * CHARACTERIZATION tests ((e), (f), (g), (h), the outcome report) record
-//!   what the code does TODAY, including behaviour nobody would design. They
-//!   are evidence for a decision, not an endorsement, and they say so where
-//!   they pin a gap.
+//! * CHARACTERIZATION tests ((e), (f), (g), (h), the outcome report, the
+//!   `executes` edge mutation) record what the code does TODAY, including
+//!   behaviour nobody would design. They are evidence for a decision, not an
+//!   endorsement, and they say so where they pin a gap.
 //!
 //! # The cases
 //!
@@ -65,6 +65,9 @@
 //!   succeeds for a caller that cannot read the steps (and for one holding
 //!   only `claims:read`), moves the counters, and records every step of a
 //!   group-private plan with a NULL `step_claim_id`, for members too.
+//! * `executes` edge mutation: a WRITER of G can rewrite `plan_index` and
+//!   retract an `executes` edge of a G-private workflow; a reader and a
+//!   non-member cannot.
 //!
 //! # How a workflow becomes group-private here
 //!
@@ -457,6 +460,7 @@ struct PrivateWorkflow {
     claims: Vec<Uuid>,
     g: Uuid,
     curator: Uuid,
+    writer: Uuid,
     reader: Uuid,
     stranger: Uuid,
 }
@@ -482,6 +486,7 @@ async fn private_workflow(pool: &PgPool, extraction: Value) -> PrivateWorkflow {
         claims,
         g,
         curator,
+        writer,
         reader,
         stranger,
     }
@@ -1408,4 +1413,116 @@ async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_s
         vec![None, None],
         "the MCP twin loses the steps too"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// executes edge mutation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// CHARACTERIZATION. Nothing in the edge mutation routes looks at
+/// `relationship`: a WRITER of G rewrites an `executes` edge's `plan_index`
+/// and retracts another, on the authenticated REST surface; a reader of G and
+/// a non-member are refused. A retracted edge stays in the edge listing with
+/// `valid_to` set, so a reader that does not filter on `valid_to` still
+/// counts it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: PgPool) {
+    let w = private_workflow(&pool, small_extraction("acme-mutable-plan", 2)).await;
+    let reader_t = token(w.reader, WRITE_SCOPES);
+    let edges = w.api.executes_edges(&reader_t, w.workflow_id).await;
+    let id_at = |i: u64| {
+        edges
+            .iter()
+            .find(|e| e["properties"]["plan_index"].as_u64() == Some(i))
+            .map(|e| uuid_of(&e["id"]))
+            .unwrap_or_else(|| panic!("no edge at plan_index {i}"))
+    };
+    let (first, second) = (id_at(0), id_at(1));
+    let patch = json!({"properties": {"plan_index": 7}});
+
+    // A reader can see the edge but does not write G: 403. A non-member cannot
+    // see it at all: 404.
+    for (who, label, refused) in [
+        (w.reader, "reader", StatusCode::FORBIDDEN),
+        (w.stranger, "non-member", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = w
+            .api
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/edges/{first}"),
+                &token(who, WRITE_SCOPES),
+                Some(&patch),
+            )
+            .await;
+        assert_eq!(
+            status, refused,
+            "{label} must not patch the executes edge: {body}"
+        );
+        let (status, body) = w
+            .api
+            .call(
+                Method::DELETE,
+                &format!("/api/v1/edges/{second}"),
+                &token(who, WRITE_SCOPES),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, refused,
+            "{label} must not retract the executes edge: {body}"
+        );
+    }
+
+    let writer_t = token(w.writer, WRITE_SCOPES);
+    let (status, body) = w
+        .api
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/edges/{first}"),
+            &writer_t,
+            Some(&patch),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the writer patches plan_index: {body}"
+    );
+    assert_eq!(body["properties"]["plan_index"], json!(7));
+    let (status, body) = w
+        .api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/edges/{second}"),
+            &writer_t,
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the writer retracts it: {body}"
+    );
+
+    let after = w.api.executes_edges(&reader_t, w.workflow_id).await;
+    let indices: Vec<Option<u64>> = {
+        let mut v: Vec<Option<u64>> = after
+            .iter()
+            .filter(|e| e["valid_to"].is_null())
+            .map(|e| e["properties"]["plan_index"].as_u64())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert!(
+        indices.contains(&Some(7)) && !indices.contains(&Some(0)),
+        "the in-force plan now has an index 7 and no index 0: {indices:?}"
+    );
+    let retracted = after
+        .iter()
+        .find(|e| uuid_of(&e["id"]) == second)
+        .expect("the retracted edge is still listed");
+    assert!(!retracted["valid_to"].is_null(), "and carries valid_to");
+    let _ = (w.curator, w.canonical_name);
 }
