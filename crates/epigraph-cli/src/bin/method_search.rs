@@ -443,7 +443,7 @@ async fn insert_unless_hash_exists(
 /// blocked on a two-key advisory lock, and panics if neither happens.
 #[cfg(test)]
 mod dedup_race_tests {
-    use super::{insert_unless_hash_exists, WebSearchClaim};
+    use super::{content_hash_exists, insert_unless_hash_exists, WebSearchClaim};
     use epigraph_core::{AgentId, Claim, TenancyDecl, TruthValue};
     use epigraph_crypto::ContentHasher;
     use epigraph_db::ClaimRepository;
@@ -595,13 +595,18 @@ mod dedup_race_tests {
         );
     }
 
-    /// A run over content that is already in the graph skips it. The probe
-    /// is `SELECT 1`, an INT4: decoding it as anything wider failed every
-    /// time a match existed, so a known result aborted the run instead.
+    /// A run over content that is already in the graph skips it, at BOTH
+    /// places a run checks: the run loop's unlocked pre-check
+    /// (`content_hash_exists` on the pool, before the embedding call) and
+    /// `insert_unless_hash_exists`. Both go through the one probe,
+    /// `content_hash_exists`, whose `SELECT 1` is an INT4: decoding it as
+    /// anything wider failed every time a match existed, so a known result
+    /// aborted the run instead of being skipped.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_second_run_over_known_content_skips_it(pool: PgPool) {
         let (agent_id, decl) = seed_author(&pool).await;
         let content = format!("method_search sequential {}", Uuid::new_v4());
+        let hash = ContentHasher::hash(content.as_bytes());
         let embedding = embedding_literal();
         let claim = WebSearchClaim {
             content: &content,
@@ -609,11 +614,23 @@ mod dedup_race_tests {
             properties: serde_json::json!({ "source": "web_search" }),
             embedding: &embedding,
         };
+        assert!(
+            !content_hash_exists(&pool, hash.as_slice())
+                .await
+                .expect("the run loop's pre-check over new content"),
+            "new content is not reported as known"
+        );
         let mut conn = pool.acquire().await.expect("acquire");
         let first = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
             .await
             .expect("first run");
         assert!(first.is_some(), "the first run inserts the new content");
+        assert!(
+            content_hash_exists(&pool, hash.as_slice())
+                .await
+                .expect("the run loop's pre-check over known content must not error"),
+            "the run loop's pre-check reports the committed content as known"
+        );
         let second = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
             .await
             .expect("a second run over known content must not error");
