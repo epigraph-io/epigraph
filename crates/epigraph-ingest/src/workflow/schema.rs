@@ -90,8 +90,12 @@ pub struct Step {
 /// Only `visibility: "group"` is a declaration: absent, an ingest keeps its
 /// default (public, owned by the ingest system agent's default group), so
 /// there is nothing to declare for "public". Any other value is refused at
-/// deserialization. `deny_unknown_fields`, so a misspelt key cannot be read
-/// as an absent one and silently publish the plan.
+/// deserialization. `deny_unknown_fields`, so a misspelt key INSIDE the
+/// declaration is refused. A misspelt or unsupported `tenancy` key itself is
+/// not: the request bodies ignore unknown keys, so it parses as an absent
+/// declaration and the plan is published public. A caller must therefore treat
+/// a response without `reused_items` (present exactly when a declaration was
+/// honoured) as "not declared" and fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
