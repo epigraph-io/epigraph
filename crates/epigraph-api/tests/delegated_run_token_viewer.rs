@@ -365,6 +365,40 @@ async fn a_dlg_token_whose_delegator_is_not_allowlisted_is_refused(pool: PgPool)
     );
 }
 
+/// The allowlist conjunct, pinned where it alone decides. An agent
+/// LIVE-LINKED to the same operator passes every other conjunct (its human is
+/// that operator; its link gives it a writer row of the operator's group), and
+/// so does the human operator ITSELF (its own human; admin of its personal
+/// group). Neither is on migration 149's allowlist, so neither delegates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_linked_agent_or_the_operator_itself_cannot_be_a_delegator(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "allowlist-conjunct").await;
+    let sibling = delegation::linked_principal(&pool, d.operator, "allowlist-sibling").await;
+    let st = state(&pool, RunTokens::On);
+    assert_admitted(
+        "CALIBRATION: the allowlisted delegator",
+        read(&st, &dlg_token(&st, &d)).await,
+    );
+    // Both requests run before either is asserted, so a failure shows both.
+    let as_sibling = read(
+        &st,
+        &token(&st, d.delegator_client, d.principal, Some(sibling)),
+    )
+    .await;
+    let as_operator = read(
+        &st,
+        &token(&st, d.delegator_client, d.principal, Some(d.operator)),
+    )
+    .await;
+    assert!(
+        as_sibling.0 == StatusCode::FORBIDDEN && as_operator.0 == StatusCode::FORBIDDEN,
+        "a linked agent of the same operator {as_sibling:?} and the operator itself \
+         {as_operator:?} must both be refused as delegators"
+    );
+    assert_refused("a delegator live-linked to the same operator", as_sibling);
+    assert_refused("the operator itself as the delegator", as_operator);
+}
+
 /// A delegator allowlisted for one operator cannot delegate to an agent linked
 /// to ANOTHER operator, even when it is also a writer of that operator's group.
 #[sqlx::test(migrations = "../../migrations")]

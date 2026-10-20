@@ -65,3 +65,32 @@ async fn the_check_answers_on_the_application_role(pool: PgPool) {
     );
     assert_eq!(check(&app, RunTokens::On, reader, d.principal).await, None);
 }
+
+/// The allowlist conjunct (`epigraph_author_binding(delegator) =
+/// 'client_allowlist'`) on the application role. The other conjuncts admit
+/// two delegators it alone refuses: an agent LIVE-LINKED to the same operator
+/// (its human is that operator, and its link gives it a writer row of the
+/// operator's group) and the human operator ITSELF (its own human, admin of
+/// its personal group). Neither is a delegator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_linked_agent_or_the_operator_itself_is_no_delegator_on_the_application_role(
+    pool: PgPool,
+) {
+    let d = delegation::live_delegation(&pool, "app-role-allowlist").await;
+    let sibling = delegation::linked_principal(&pool, d.operator, "app-role-sibling").await;
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    assert!(
+        check(&app, RunTokens::On, d.delegator, d.principal)
+            .await
+            .is_some(),
+        "CALIBRATION: the allowlisted delegator"
+    );
+    // Both read before either is asserted, so a failure shows both answers.
+    let as_sibling = check(&app, RunTokens::On, sibling, d.principal).await;
+    let as_operator = check(&app, RunTokens::On, d.operator, d.principal).await;
+    assert_eq!(
+        (as_sibling, as_operator),
+        (None, None),
+        "(a linked agent of the same operator, the operator itself) as the delegator"
+    );
+}
