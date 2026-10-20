@@ -1226,6 +1226,7 @@ async fn race_held_open(pool: &PgPool, first: PairWriter, second: PairWriter) {
     let caller_2 = {
         let pool = pool.clone();
         let content = content.clone();
+        let sources_2 = sources_2.clone();
         tokio::spawn(async move {
             let mut tx = pool.begin().await.expect("begin caller 2's transaction");
             let claim = make_claim(&content, agent_id);
@@ -1261,6 +1262,59 @@ async fn race_held_open(pool: &PgPool, first: PairWriter, second: PairWriter) {
         "caller 2 ran after caller 1 committed, so it must report the existing row: {r2:?}"
     );
     assert_eq!(r2.0, r1.0, "caller 2 must answer with caller 1's row");
+
+    // A consolidation's sources: the merge that inserted retires its own
+    // sources into the merged row; a merge that answered with an existing row
+    // retires nothing, so its sources stay current and unsuperseded (the
+    // semantics a sequential retry already had).
+    if matches!(first, PairWriter::Consolidate) {
+        assert_sources(
+            pool,
+            &sources_1,
+            Some(r1.0),
+            "caller 1 (the merge that inserted)",
+        )
+        .await;
+    }
+    if matches!(second, PairWriter::Consolidate) {
+        assert_sources(
+            pool,
+            &sources_2,
+            None,
+            "caller 2 (the merge that found the row)",
+        )
+        .await;
+    }
+}
+
+/// Assert every claim in `sources` is retired into `merged` (`Some`), or is
+/// still current and supersedes nothing (`None`).
+async fn assert_sources(pool: &PgPool, sources: &[Uuid], merged: Option<Uuid>, who: &str) {
+    for id in sources {
+        let (is_current, supersedes): (bool, Option<Uuid>) =
+            sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read a consolidation source");
+        match merged {
+            Some(m) => {
+                assert!(!is_current, "{who}: source {id} must be retired");
+                assert_eq!(
+                    supersedes,
+                    Some(m),
+                    "{who}: source {id} must point at the merged row"
+                );
+            }
+            None => {
+                assert!(is_current, "{who}: source {id} must stay current");
+                assert_eq!(
+                    supersedes, None,
+                    "{who}: source {id} must supersede nothing"
+                );
+            }
+        }
+    }
 }
 
 /// Two legacy content-hash creates of one pair (`ingest_document` atoms, the
