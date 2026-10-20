@@ -24,7 +24,8 @@ use super::{iso_prefix_date, normalize_text, DedupClaim, LabelDedupError, Sectio
 #[derive(Debug, Clone, Copy)]
 pub struct PlanRequest<'a> {
     pub profile: &'a LabelDedupProfile,
-    /// The pinned hash the profile was loaded under; covered by the plan hash.
+    /// The pinned hash the profile was loaded under; covered by the plan
+    /// hash. Trimmed and lowercased before use, as the pin check accepts it.
     pub profile_hash: &'a str,
     /// Substituted into `{run_tag}`; must be a valid label.
     pub run_tag: &'a str,
@@ -315,9 +316,10 @@ pub fn compute_plan_hash(
         sections: Vec<Section>,
         units: &'a [WriteUnit],
     }
+    let profile_hash = canonical_profile_hash(profile_hash);
     let doc = HashDoc {
         schema: "label-dedup-plan-hash/v1",
-        profile_hash,
+        profile_hash: &profile_hash,
         run_tag,
         as_of: as_of.map(|d| d.format("%Y-%m-%d").to_string()),
         sections: Section::normalize(sections),
@@ -326,6 +328,12 @@ pub fn compute_plan_hash(
     // Serializing a struct of strings, dates and vectors cannot fail.
     let bytes = serde_json::to_vec(&doc).unwrap_or_default();
     epigraph_crypto::ContentHasher::to_hex(&epigraph_crypto::ContentHasher::hash(&bytes))
+}
+
+/// A profile hash as [`LabelDedupProfile::load_pinned`] compares it: trimmed,
+/// ASCII-lowercased. Plan and apply may receive either spelling of one pin.
+fn canonical_profile_hash(h: &str) -> String {
+    h.trim().to_ascii_lowercase()
 }
 
 /// Build the plan.
@@ -410,7 +418,7 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
 
     let mut plan = Plan {
         plan_hash: String::new(),
-        profile_hash: req.profile_hash.to_string(),
+        profile_hash: canonical_profile_hash(req.profile_hash),
         run_tag: req.run_tag.to_string(),
         as_of: req.as_of,
         sections: sections.clone(),

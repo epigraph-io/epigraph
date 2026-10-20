@@ -404,3 +404,33 @@ fn the_plan_hash_covers_as_of_and_the_section_set_even_with_equal_writes() {
         "the section set is covered"
     );
 }
+
+#[test]
+fn the_plan_hash_does_not_depend_on_how_the_profile_hash_is_spelled() {
+    // The pin is accepted case-insensitively and trimmed, so a caller may
+    // forward either spelling; plan and apply must still agree.
+    let canonical = "ab".repeat(32);
+    let spelled = format!("  {}\n", canonical.to_ascii_uppercase());
+    let dedup = [Section::Hygiene, Section::Dedup];
+    let a = plan_with(&canonical, RUN_TAG, &dedup, &corpus());
+    let b = plan_with(&spelled, RUN_TAG, &dedup, &corpus());
+    assert_eq!(
+        b.profile_hash, canonical,
+        "the plan echoes the canonical hash"
+    );
+    assert_eq!(a.plan_hash, b.plan_hash);
+    assert_eq!(
+        epigraph_engine::label_dedup::compute_plan_hash(
+            &spelled,
+            RUN_TAG,
+            Some(date("2026-10-05")),
+            &dedup,
+            &a.write_units()
+        ),
+        a.plan_hash,
+        "the apply-side recomputation agrees"
+    );
+    // Control: a different hash is still a different plan.
+    let other = plan_with(&"cd".repeat(32), RUN_TAG, &dedup, &corpus());
+    assert_ne!(other.plan_hash, a.plan_hash);
+}
