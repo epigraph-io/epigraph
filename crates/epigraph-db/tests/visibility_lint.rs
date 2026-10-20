@@ -2821,6 +2821,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
+        "backfill_evidence_type_where_untyped",
+        "WRITE: `UPDATE mass_functions SET evidence_type` for the legacy evidence-type backfill \
+         (backlog bc06ec6f), only on rows still untyped. Maintenance connection only (the binary \
+         refuses an unset MAINTENANCE_DATABASE_URL); the backfill is corpus-wide by definition, \
+         so there is no viewer to filter by.",
+    ),
+    (
+        "mass_function.rs",
         "clear_claim_belief",
         "WRITE: `UPDATE claims` clearing the cached belief columns. Authorised by claims_tenancy's \
          WITH CHECK on the caller's stamped connection, like `update_claim_belief`.",
@@ -2842,6 +2850,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
          authorised by migration 115's cascade definer on the caller's connection, not by a \
          viewer.",
+    ),
+    (
+        "mass_function.rs",
+        "untyped_provenance_page",
+        "READ of every tenant's untyped `mass_functions` rows with their stored provenance, for \
+         the legacy evidence-type backfill (backlog bc06ec6f). Maintenance connection only: a \
+         per-viewer page would leave every other tenant's rows untyped while reporting the run \
+         complete.",
     ),
     (
         "mass_function.rs",
