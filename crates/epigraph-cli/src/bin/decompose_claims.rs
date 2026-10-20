@@ -161,8 +161,8 @@ use clap::Parser;
 use epigraph_cli::decompose::{
     atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
     run_decomposition_batches, select_candidates, verify_plan, visible_claim_count,
-    write_plan_jsonl, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters, PlanGaps, Priority,
-    SingletonLedger,
+    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
+    PlanGaps, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -413,8 +413,12 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
 /// [`epigraph_db::ScopedPool`], and the acting agent's viewer resolved on it.
 ///
 /// No maintenance DSN is read and no privilege is asserted: this path is
-/// unprivileged on purpose. A mode that writes refuses an agent with no
-/// writable group, because its edges would carry no owner.
+/// unprivileged on purpose. A mode that writes asks the database which group
+/// its `decomposes_to` edges would record as their writer
+/// ([`epigraph_cli::decompose::writer_group`], the very function the edge
+/// trigger uses) and refuses when the answer is none, because those edges
+/// would carry no owner. A read-only mode proceeds as whatever the agent can
+/// see (for an agent with no group, public rows only).
 async fn connect_as_agent(
     agent: uuid::Uuid,
     writes: bool,
@@ -434,15 +438,28 @@ async fn connect_as_agent(
     let viewer = epigraph_db::visibility::Viewer::resolve(scoped.inner(), agent).await?;
     let groups = viewer.group_bind().map_or(0, <[uuid::Uuid]>::len);
     let writable = viewer.writable_groups().len();
+    // Only a writing mode asks: the question opens a write transaction.
+    let writer = if writes {
+        Some(writer_group(&scoped, &viewer).await?)
+    } else {
+        None
+    };
+    let shown = match writer {
+        None => "n/a (read-only mode)".to_string(),
+        Some(None) => "none".to_string(),
+        Some(Some(g)) => g.to_string(),
+    };
     eprintln!(
         "connection: --as-agent {agent} on the application login (DATABASE_URL), through \
-         row-level security; no maintenance DSN; groups={groups} writable={writable}"
+         row-level security; no maintenance DSN; groups={groups} writable={writable} \
+         writer_group={shown}"
     );
-    if writable == 0 && writes {
+    if writer == Some(None) {
         return Err(format!(
-            "--as-agent {agent}: the agent holds no writable group, so the decomposes_to edges \
-             this run writes would carry no owner. Pass the agent the API token acts as \
-             (the service client's agent), which holds its personal group."
+            "--as-agent {agent}: the agent has no writer group (epigraph_writer_group() is \
+             NULL for it), so the decomposes_to edges this run writes would carry no owner. \
+             Pass the agent the API token acts as (the service client's agent); it needs a \
+             writable personal group of its own or of its operator."
         )
         .into());
     }

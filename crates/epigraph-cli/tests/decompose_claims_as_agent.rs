@@ -514,6 +514,153 @@ async fn an_empty_conflict_queue_is_not_a_zero_visible_fault(pool: PgPool) {
     drop_login(&pool, &app_role).await;
 }
 
+/// An agent row with no group membership at all.
+async fn seed_bare_agent(pool: &PgPool) -> Uuid {
+    let agent = Uuid::new_v4();
+    let pk: Vec<u8> = agent.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(&pk)
+        .execute(pool)
+        .await
+        .expect("seed agent");
+    agent
+}
+
+/// The `--as-agent` write refusal asks the database the question the edge
+/// trigger asks (`epigraph_writer_group()`, migrations 114/120), not a proxy
+/// for it:
+///
+/// * agent Y is a `writer` of a COMMUNITY group and has no personal group.
+///   It holds a writable group (so a "writable >= 1" check passes it), yet
+///   `epigraph_writer_group()` is NULL for it, so its edges would land with
+///   no writer group. A writing run must refuse before any LLM or API call;
+/// * agent N has no membership at all: a writing run is refused the same
+///   way, and a `--dry-run` proceeds as a public-only viewer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_run_refuses_an_agent_whose_edges_would_have_no_writer_group(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "decomp-nowriter-a").await;
+
+    let y = seed_bare_agent(&pool).await;
+    let community: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('decomp community', 'did:epigraph:test:community:' || $1::text, ''::bytea, \
+                 'community', $1) RETURNING id",
+    )
+    .bind(y)
+    .fetch_one(&pool)
+    .await
+    .expect("seed community group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(community)
+    .bind(y)
+    .execute(&pool)
+    .await
+    .expect("seed community membership");
+    let n = seed_bare_agent(&pool).await;
+
+    let parent_text =
+        "Ownerless parent O turns freely. Ownerless parent O has a friction coefficient of 4e-22.";
+    let atom1_text = "Ownerless parent O turns freely.";
+    let atom2_text = "Ownerless parent O has a friction coefficient of 4e-22.";
+    let o = viewer_fixture::seed_public_claim(&pool, author, parent_text).await;
+    let a1 = viewer_fixture::seed_public_claim(&pool, author, atom1_text).await;
+    let a2 = viewer_fixture::seed_public_claim(&pool, author, atom2_text).await;
+
+    // An API that would answer, so a run that gets past startup really
+    // writes; `expect(0)`: a refused run must never reach it.
+    let api = MockServer::start().await;
+    for (text, id) in [(atom1_text, a1), (atom2_text, a2)] {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/claims"))
+            .and(body_string_contains(text))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": id})))
+            .expect(0)
+            .mount(&api)
+            .await;
+    }
+    let fixture = temp_path("fixture", "json");
+    std::fs::write(
+        &fixture,
+        serde_json::json!({ parent_text: {"atoms": [atom1_text, atom2_text], "generality": [0, 1]} })
+            .to_string(),
+    )
+    .unwrap();
+    let ids = temp_path("ids", "txt");
+    std::fs::write(&ids, format!("{o}\n")).unwrap();
+    let api_uri = api.uri();
+    let env = [
+        ("EPIGRAPH_API", api_uri.as_str()),
+        ("EPIGRAPH_TOKEN", "decomp-test-token"),
+        ("DECOMPOSE_FIXTURE_PATH", s(&fixture)),
+    ];
+
+    for (who, agent, writable) in [("Y", y, 1), ("N", n, 0)] {
+        let agent_s = agent.to_string();
+        let w = run(
+            &app_url,
+            &[
+                "--as-agent",
+                agent_s.as_str(),
+                "--provider",
+                "fixture",
+                "--ids-file",
+                s(&ids),
+            ],
+            &env,
+        );
+        assert!(
+            w.stderr.contains(&format!("writable={writable}")),
+            "CALIBRATION ({who}): the connection line must report writable={writable}:\n{}",
+            w.stderr
+        );
+        assert_ne!(
+            w.code,
+            Some(0),
+            "{who}: a writing run whose edges would have no writer group exited 0:\n{}",
+            w.stderr
+        );
+        assert!(
+            w.stderr.contains("has no writer group"),
+            "{who}: not refused for the writer group:\n{}",
+            w.stderr
+        );
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
+        )
+        .bind(o)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edges, 0, "{who}: a refused run wrote edges");
+    }
+
+    // Read-only: N proceeds as a public-only viewer.
+    let n_s = n.to_string();
+    let dry = run(
+        &app_url,
+        &[
+            "--as-agent",
+            n_s.as_str(),
+            "--dry-run",
+            "--ids-file",
+            s(&ids),
+        ],
+        &[],
+    )
+    .ok();
+    assert!(dry.listed().contains(&o), "{}", dry.stderr);
+
+    for p in [&fixture, &ids] {
+        std::fs::remove_file(p).ok();
+    }
+    drop_login(&pool, &app_role).await;
+}
+
 /// A decomposing `--as-agent` run on the fleet login writes its
 /// `decomposes_to` edges AS THE ACTING AGENT: the edge records the agent's
 /// writable group (`writer_group_id`, migration 120). An unstamped write on
@@ -584,6 +731,11 @@ async fn a_fleet_run_writes_decomposes_to_edges_as_the_acting_agent(pool: PgPool
         r.stderr
             .contains("decompose complete: 2 atoms, 2 decomposes_to edges"),
         "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains(&format!("writer_group={acting_group}")),
+        "the startup check must name the group the edges will record:\n{}",
         r.stderr
     );
 

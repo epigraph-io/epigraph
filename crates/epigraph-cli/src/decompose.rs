@@ -648,8 +648,8 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, visible_claim_count, BatchClaim, BatchTotals, DecomposeDb, DecomposeRead,
-    DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
+    verify_plan, visible_claim_count, writer_group, BatchClaim, BatchTotals, DecomposeDb,
+    DecomposeRead, DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -785,6 +785,30 @@ mod db_writes {
         viewer: &Viewer,
     ) -> Result<i64, DbError> {
         ClaimRepository::count_conn(&mut *db.read(viewer).await?, viewer, None).await
+    }
+
+    /// The group a `decomposes_to` edge written as `viewer` on `db` records
+    /// as its writer ([`EdgeRepository::session_writer_group`], the function
+    /// migration 120's edge trigger stamps `writer_group_id` from), evaluated
+    /// in a write transaction stamped exactly like the edge transaction and
+    /// rolled back: nothing is written.
+    ///
+    /// `None` means such an edge would land with no writer group. That is the
+    /// case for an agent with no writable group, and ALSO for one whose
+    /// writable groups include neither its operator's personal group nor its
+    /// own: a count of writable groups answers a different question.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn writer_group(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+    ) -> Result<Option<Uuid>, DbError> {
+        let mut tx = db.write(viewer).await?;
+        let group = EdgeRepository::session_writer_group(tx.conn()).await?;
+        // Dropped without commit: rolled back.
+        drop(tx);
+        Ok(group)
     }
 
     /// What `persist_decomposition` did, for reporting/tests.
