@@ -380,17 +380,24 @@ async fn private_plan(pool: &PgPool, name: &str) -> Plan {
     }
 }
 
-/// The shape of every gate refusal: 403 with the workflow gate's own text
-/// naming `workflow`, and nothing written (no claim with `content`, the parent
-/// still current, no provenance row).
+/// Send `POST .../steps/:parent/evolve` as `token` and assert the shape of
+/// every gate refusal: 403 with the workflow gate's own text naming
+/// `workflow`, and nothing written (no claim with `content`, the parent still
+/// current, no `workflows.caller_write` or `workflows.admin_write` row).
+#[allow(clippy::too_many_arguments)]
 async fn assert_gate_refused(
     pool: &PgPool,
-    (status, body): (StatusCode, Value),
+    api: &Api,
+    token: &str,
     parent: Uuid,
     content: &str,
+    edge_type: &str,
     workflow: Uuid,
     expect_text: &str,
 ) {
+    let callers_before = evolve_rows(pool, CALLER_WRITE).await.len();
+    let admins_before = evolve_rows(pool, ADMIN_WRITE).await.len();
+    let (status, body) = api.evolve(token, parent, content, edge_type).await;
     let text = body.to_string();
     assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
     assert!(
@@ -403,6 +410,16 @@ async fn assert_gate_refused(
     );
     assert_eq!(claims_with_content(pool, content).await, 0, "no claim");
     assert!(is_current(pool, parent).await, "the parent is not retired");
+    assert_eq!(
+        evolve_rows(pool, CALLER_WRITE).await.len(),
+        callers_before,
+        "no caller_write row"
+    );
+    assert_eq!(
+        evolve_rows(pool, ADMIN_WRITE).await.len(),
+        admins_before,
+        "no admin_write row"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,11 +434,17 @@ async fn a_group_writer_who_is_not_the_submitter_cannot_evolve_an_executed_step(
 
     for edge_type in ["supersedes", "revises"] {
         let content = format!("the writer's {edge_type} of the step");
-        let r = p
-            .api
-            .evolve(&token(p.writer), p.step, &content, edge_type)
-            .await;
-        assert_gate_refused(&pool, r, p.step, &content, p.workflow_id, GATE_TEXT).await;
+        assert_gate_refused(
+            &pool,
+            &p.api,
+            &token(p.writer),
+            p.step,
+            &content,
+            edge_type,
+            p.workflow_id,
+            GATE_TEXT,
+        )
+        .await;
     }
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
 
@@ -503,17 +526,17 @@ async fn the_submitters_operator_may_evolve_and_a_bound_agent_may_not(pool: PgPo
         "calibration: the agent is bound to H"
     );
 
-    let content = "the bound agent's revision";
-    let r = p
-        .api
-        .evolve(
-            &token_for_client(client, bound, WRITE_SCOPES),
-            p.step,
-            content,
-            "revises",
-        )
-        .await;
-    assert_gate_refused(&pool, r, p.step, content, p.workflow_id, GATE_TEXT).await;
+    assert_gate_refused(
+        &pool,
+        &p.api,
+        &token_for_client(client, bound, WRITE_SCOPES),
+        p.step,
+        "the bound agent's revision",
+        "revises",
+        p.workflow_id,
+        GATE_TEXT,
+    )
+    .await;
 
     let (status, body) = p
         .api
@@ -530,7 +553,9 @@ async fn the_submitters_operator_may_evolve_and_a_bound_agent_may_not(pool: PgPo
 
 /// `executes` stays on the frozen step when the submitter evolves it, so the
 /// new head is executed by nothing directly. Evolving THAT head is still
-/// gated: the gate reads the whole lineage.
+/// gated: the gate reads the whole lineage. The submitter still evolves it,
+/// recorded against the workflow, so the gate admits through the lineage
+/// rather than freezing executed heads.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_second_evolve_of_an_unexecuted_head_is_still_gated(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-second").await;
@@ -556,12 +581,48 @@ async fn a_second_evolve_of_an_unexecuted_head_is_still_gated(pool: PgPool) {
 
     for edge_type in ["supersedes", "revises"] {
         let content = format!("the writer's {edge_type} of the head");
-        let r = p
-            .api
-            .evolve(&token(p.writer), head, &content, edge_type)
-            .await;
-        assert_gate_refused(&pool, r, head, &content, p.workflow_id, GATE_TEXT).await;
+        assert_gate_refused(
+            &pool,
+            &p.api,
+            &token(p.writer),
+            head,
+            &content,
+            edge_type,
+            p.workflow_id,
+            GATE_TEXT,
+        )
+        .await;
     }
+
+    // CALIBRATION: the gate admits the submitter through the lineage; it does
+    // not freeze an executed lineage's head.
+    let before = evolve_rows(&pool, CALLER_WRITE).await.len();
+    let (status, body) = p
+        .api
+        .evolve(
+            &token(p.curator),
+            head,
+            "the curator's revision of the head",
+            "revises",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the submitter evolves the head: {body}"
+    );
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), before + 1, "exactly one new row: {rows:?}");
+    let (agent, d) = &rows[before];
+    assert_eq!(*agent, Some(p.curator), "{d}");
+    assert_eq!(d["workflow_id"], p.workflow_id.to_string(), "{d}");
+    assert_eq!(d["arm"], "submitter", "{d}");
+    assert_eq!(d["write"]["parent_claim_id"], head.to_string(), "{d}");
+    assert_eq!(
+        d["write"]["claim_id"],
+        uuid_of(&body["claim_id"]).to_string(),
+        "{d}"
+    );
 }
 
 /// A step two workflows execute: the submitter of only one of them is
@@ -586,18 +647,28 @@ async fn a_step_two_workflows_execute_needs_authority_over_both(pool: PgPool) {
     .await
     .expect("the second workflow executes the step");
 
-    let content = "the first curator's revision";
-    let r = p
-        .api
-        .evolve(&token(p.curator), p.step, content, "revises")
-        .await;
-    assert_gate_refused(&pool, r, p.step, content, second, GATE_TEXT).await;
-    let content = "the second curator's revision";
-    let r = p
-        .api
-        .evolve(&token(other), p.step, content, "revises")
-        .await;
-    assert_gate_refused(&pool, r, p.step, content, p.workflow_id, GATE_TEXT).await;
+    assert_gate_refused(
+        &pool,
+        &p.api,
+        &token(p.curator),
+        p.step,
+        "the first curator's revision",
+        "revises",
+        second,
+        GATE_TEXT,
+    )
+    .await;
+    assert_gate_refused(
+        &pool,
+        &p.api,
+        &token(other),
+        p.step,
+        "the second curator's revision",
+        "revises",
+        p.workflow_id,
+        GATE_TEXT,
+    )
+    .await;
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
 
     // CALIBRATION: authority over both.
@@ -624,7 +695,8 @@ async fn a_step_two_workflows_execute_needs_authority_over_both(pool: PgPool) {
 }
 
 /// Any writer of G can retract an `executes` edge of a G-private plan
-/// (`DELETE /api/v1/edges/:id`). Retracting it does not lift the gate.
+/// (`DELETE /api/v1/edges/:id`). Retracting it does not lift the gate, and
+/// does not lock the submitter out either.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retracting_the_executes_edge_does_not_lift_the_gate(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-retracted").await;
@@ -649,12 +721,36 @@ async fn retracting_the_executes_edge_does_not_lift_the_gate(pool: PgPool) {
         .expect("edge");
     assert!(!live, "calibration: the executes edge is retracted");
 
-    let content = "the writer's revision after the retraction";
-    let r = p
+    assert_gate_refused(
+        &pool,
+        &p.api,
+        &token(p.writer),
+        p.step,
+        "the writer's revision after the retraction",
+        "supersedes",
+        p.workflow_id,
+        GATE_TEXT,
+    )
+    .await;
+
+    // CALIBRATION: the retraction did not make the step unevolvable; the
+    // submitter is still admitted, and the write is recorded against the
+    // workflow whose edge was retracted.
+    let (status, body) = p
         .api
-        .evolve(&token(p.writer), p.step, content, "supersedes")
+        .evolve(
+            &token(p.curator),
+            p.step,
+            "the curator's revision after the retraction",
+            "supersedes",
+        )
         .await;
-    assert_gate_refused(&pool, r, p.step, content, p.workflow_id, GATE_TEXT).await;
+    assert_eq!(status, StatusCode::OK, "the submitter evolves: {body}");
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0].1;
+    assert_eq!(d["workflow_id"], p.workflow_id.to_string(), "{d}");
+    assert_eq!(d["write"]["parent_claim_id"], p.step.to_string(), "{d}");
 }
 
 /// A workflow with no recorded submitter is platform corpus: a writer of G,
@@ -667,16 +763,13 @@ async fn an_executed_step_of_a_legacy_workflow_is_admin_only(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-legacy").await;
     set_submitter(&pool, p.workflow_id, None).await;
 
-    let content = "the ingester's revision of a legacy step";
-    let r = p
-        .api
-        .evolve(&token(p.curator), p.step, content, "revises")
-        .await;
     assert_gate_refused(
         &pool,
-        r,
+        &p.api,
+        &token(p.curator),
         p.step,
-        content,
+        "the ingester's revision of a legacy step",
+        "revises",
         p.workflow_id,
         "has no recorded submitter",
     )
@@ -686,9 +779,17 @@ async fn an_executed_step_of_a_legacy_workflow_is_admin_only(pool: PgPool) {
     add_writer(&pool, p.g, admin).await;
     let admin_scopes = &["claims:read", "claims:write", "claims:admin"];
     let grantless = token_for_client(Uuid::new_v4(), admin, admin_scopes);
-    let content = "a grantless admin's revision";
-    let r = p.api.evolve(&grantless, p.step, content, "revises").await;
-    assert_gate_refused(&pool, r, p.step, content, p.workflow_id, "ADM02").await;
+    assert_gate_refused(
+        &pool,
+        &p.api,
+        &grantless,
+        p.step,
+        "a grantless admin's revision",
+        "revises",
+        p.workflow_id,
+        "ADM02",
+    )
+    .await;
 
     let client = Uuid::new_v4();
     sqlx::query(
