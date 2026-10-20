@@ -152,18 +152,31 @@ fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
         sql.contains(NOT_CACHED_COMBINATION_MARKER),
         "combine-input query has no {NOT_CACHED_COMBINATION_MARKER} marker:\n{sql}"
     );
+    let predicate = format!("AND NOT {}", cached_combination_predicate(qualifier));
+    sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
+}
+
+/// A boolean SQL expression, TRUE exactly for a cached combination row (see
+/// `with_cached_combination_excluded` for what that is), with every column
+/// qualified by `qualifier` (`""` or `"mf."`). Never NULL: a row whose label
+/// is NULL is not a cached combination by this test.
+///
+/// Public so a maintenance job that must leave cached rows alone (the
+/// legacy evidence-type backfill, backlog bc06ec6f) uses the SAME predicate
+/// the combine-input readers exclude, rather than a copy that could drift.
+#[must_use]
+pub fn cached_combination_predicate(qualifier: &str) -> String {
     let labels = CACHED_COMBINATION_LABELS
         .iter()
         .map(|l| format!("'{l}'"))
         .collect::<Vec<_>>()
         .join(", ");
     let q = qualifier;
-    let predicate = format!(
-        "AND NOT COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
+    format!(
+        "COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
          AND ({q}combination_method IN ({labels}) \
               OR {q}combination_method LIKE '{CACHED_COMBINATION_CAUTIOUS_PREFIX}%'), false)"
-    );
-    sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
+    )
 }
 
 /// Whether a writer must NOT store its cached combination row for this pair,
