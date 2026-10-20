@@ -992,6 +992,40 @@ impl ClaimRepository {
         Ok(TenancyDecl::public(group))
     }
 
+    /// The `(id, visibility, owner_group_id)` of each of `ids` that `viewer`
+    /// may read, in no particular order.
+    ///
+    /// Filtered twice: by `viewer`'s predicate in the SQL, and by row security
+    /// on `conn`'s own stamp, which may be a different principal's. An id
+    /// missing from the answer is a claim that does not exist or that one of
+    /// the two may not read. It is the question a declared-tenancy workflow
+    /// ingest asks about the claims it REUSED rather than created
+    /// (`epigraph_ingest_executor`'s `reused_items`): on the system-agent
+    /// stamped transaction, through the CALLER's viewer, so the answer never
+    /// tells a caller the tenancy of a claim it cannot read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn tenancy_of_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String, Uuid)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, visibility::text, owner_group_id FROM claims \
+              WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String, Uuid)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
     /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`
     /// function alone: **no read on the caller's connection first.**
     ///
