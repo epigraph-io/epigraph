@@ -225,7 +225,10 @@ Return 3-8 claims."#,
             // Compute content_hash via BLAKE3 (matches all other claims in the DB)
             let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
-            // Check for duplicates
+            // Cheap pre-check, before the embedding call: content that is
+            // already in the graph is skipped without paying for an embedding.
+            // `insert_unless_hash_exists` repeats the find, so this check is an
+            // optimization, not the dedup.
             let exists: Option<(i64,)> =
                 sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
                     .bind(content_hash.as_slice())
@@ -274,29 +277,29 @@ Return 3-8 claims."#,
             );
 
             // Insert claim
-            let claim_id: (Uuid,) = sqlx::query_as(
-                r#"
-                INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
-                VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
-                RETURNING id
-                "#,
-            )
-            .bind(content)
-            .bind(content_hash.as_slice())
-            .bind(tv)
-            .bind(args.agent_id)
-            .bind(serde_json::json!({
-                "source": "web_search",
-                "doi": doi,
-                "journal": journal,
-                "year": year,
-                "protocol_parameters": claim.get("protocol_parameters"),
-            }))
-            .bind(&embedding_str)
-            .bind(decl.visibility_bind())
-            .bind(decl.owner_group_bind())
-            .fetch_one(&pool)
-            .await?;
+            let new_claim = WebSearchClaim {
+                content,
+                truth_value: tv,
+                properties: serde_json::json!({
+                    "source": "web_search",
+                    "doi": doi,
+                    "journal": journal,
+                    "year": year,
+                    "protocol_parameters": claim.get("protocol_parameters"),
+                }),
+                embedding: &embedding_str,
+            };
+            let claim_id = {
+                let mut conn = pool.acquire().await?;
+                insert_unless_hash_exists(&mut conn, args.agent_id, decl, &new_claim).await?
+            };
+            let Some(claim_id) = claim_id else {
+                tracing::info!(
+                    "Duplicate claim skipped: {}",
+                    &content[..content.len().min(60)]
+                );
+                continue;
+            };
 
             // Create SUPPORTS edge from claim to hypothesis
             sqlx::query(
@@ -306,7 +309,7 @@ Return 3-8 claims."#,
                 ON CONFLICT DO NOTHING
                 "#,
             )
-            .bind(claim_id.0)
+            .bind(claim_id)
             .bind(args.hypothesis_id)
             .execute(&pool)
             .await
@@ -316,7 +319,7 @@ Return 3-8 claims."#,
             sqlx::query(
                 "UPDATE methods SET source_claim_ids = source_claim_ids || ARRAY[$1] WHERE id = $2",
             )
-            .bind(claim_id.0)
+            .bind(claim_id)
             .bind(method_id)
             .execute(&pool)
             .await
@@ -344,4 +347,52 @@ Return 3-8 claims."#,
     }
 
     Ok(all_filled)
+}
+
+/// One web-search result to persist as a claim.
+struct WebSearchClaim<'a> {
+    content: &'a str,
+    truth_value: f64,
+    properties: serde_json::Value,
+    /// pgvector text literal, `[x,y,...]`.
+    embedding: &'a str,
+}
+
+/// Insert `claim` authored by `agent_id`, unless a claim with its
+/// `content_hash` already exists. Returns the new row's id, or `None` when the
+/// content was already present.
+async fn insert_unless_hash_exists(
+    conn: &mut sqlx::PgConnection,
+    agent_id: Uuid,
+    decl: epigraph_core::TenancyDecl,
+    claim: &WebSearchClaim<'_>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
+        .bind(content_hash.as_slice())
+        .fetch_optional(&mut *conn)
+        .await?;
+    if exists.is_some() {
+        return Ok(None);
+    }
+
+    let (id,): (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
+        VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
+        RETURNING id
+        "#,
+    )
+    .bind(claim.content)
+    .bind(content_hash.as_slice())
+    .bind(claim.truth_value)
+    .bind(agent_id)
+    .bind(&claim.properties)
+    .bind(claim.embedding)
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(Some(id))
 }
