@@ -133,6 +133,11 @@ pub struct WorkflowIngestExecutionResult {
     pub generation: i32,
     pub claims_ingested: usize,
     pub claims_skipped_dedup: usize,
+    /// The `executes` edges this call wrote. On an idempotent re-ingest
+    /// (`already_ingested`) it is instead the existing plan's `executes` edges
+    /// that the CALLER can read: never the count on the ingest's own stamp,
+    /// which reads every group the system agent serves. Zero on a re-ingest
+    /// through [`execute_workflow_ingest_plan`], which has no caller viewer.
     pub executes_edges_created: usize,
     /// `true` when this ingest inserted (or upserted) a `workflow → variant_of
     /// → workflow` edge, i.e. when a parent was resolved (the named
@@ -143,7 +148,8 @@ pub struct WorkflowIngestExecutionResult {
     pub variant_of_edge_created: bool,
     pub relationship_edges_created: usize,
     /// `true` when the idempotency gate short-circuited (workflow already
-    /// has `executes` edges). The other counters are zero in that case.
+    /// has `executes` edges). The other counters are zero in that case, except
+    /// `executes_edges_created` (the caller's view of the existing plan).
     pub already_ingested: bool,
     /// (claim_id, content) for every newly inserted claim in this run.
     /// Empty on idempotent re-ingest. Callers embed these to satisfy the
@@ -165,16 +171,6 @@ pub struct WorkflowIngestExecutionResult {
     /// idempotent re-ingest that is every planned claim of another tenancy.
     /// Always empty when no group was declared.
     pub reused_items: Vec<ReusedClaim>,
-}
-
-/// What a declared-tenancy ingest declares: the owner group of every claim it
-/// creates, and the CALLER's viewer, through which the tenancy of every claim
-/// it reuses is read (so a caller is never told the tenancy of a claim it
-/// cannot read).
-#[derive(Debug, Clone, Copy)]
-pub struct DeclaredGroup<'a> {
-    pub group: Uuid,
-    pub caller: &'a epigraph_db::visibility::Viewer,
 }
 
 /// A planned claim a declared-tenancy ingest reused rather than created, whose
@@ -222,9 +218,9 @@ pub fn require_caller_writes_group(
 async fn reused_with_another_tenancy(
     conn: &mut sqlx::PgConnection,
     planned: impl IntoIterator<Item = Uuid>,
-    declared: DeclaredGroup<'_>,
+    caller: &epigraph_db::visibility::Viewer,
+    group: Uuid,
 ) -> Result<Vec<ReusedClaim>, IngestExecutorError> {
-    let group = declared.group;
     let mut ids: Vec<Uuid> = Vec::new();
     for id in planned {
         if !ids.contains(&id) {
@@ -232,7 +228,7 @@ async fn reused_with_another_tenancy(
         }
     }
     let readable: HashMap<Uuid, (String, Uuid)> =
-        ClaimRepository::tenancy_of_conn(conn, declared.caller, &ids)
+        ClaimRepository::tenancy_of_conn(conn, caller, &ids)
             .await?
             .into_iter()
             .map(|(id, v, o)| (id, (v, o)))
@@ -287,20 +283,36 @@ async fn reused_with_another_tenancy(
 /// `(canonical_name, generation)`, `create_with_id_if_absent` on `(id)`,
 /// `create_if_not_exists` on the edge triple — so a re-run after a rollback
 /// converges rather than accumulating rows.
+///
+/// # It has no caller viewer
+///
+/// So an idempotent re-ingest reports `executes_edges_created: 0`: the only
+/// count it could read is the stamp's, and the stamp is not the caller. A
+/// caller-facing entry point uses [`execute_workflow_ingest_plan_in_group`].
 pub async fn execute_workflow_ingest_plan(
     conn: &mut sqlx::PgConnection,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    execute_workflow_ingest_plan_in_group(conn, plan, extraction, None).await
+    execute_plan(conn, plan, extraction, None, None).await
 }
 
-/// [`execute_workflow_ingest_plan`], with an optional DECLARED owner group.
+/// [`execute_workflow_ingest_plan`] for a CALLER, with an optional DECLARED
+/// owner group.
 ///
-/// `None` is exactly [`execute_workflow_ingest_plan`]: every claim the walk
-/// creates is public, owned by the system agent's default group.
+/// `caller` is the viewer of the principal the answer goes back to. Every
+/// tenancy-bearing fact the result reports about rows this call did not write
+/// is read through it, on top of the stamp's own row security: the existing
+/// plan's `executes` count on an idempotent re-ingest, and `reused_items`. The
+/// stamp is the system agent's, which reads every group it serves, so an
+/// answer read on the stamp alone would describe another group's plan to a
+/// non-member.
 ///
-/// `Some(DeclaredGroup { group, caller })` declares `('group', group)` for every claim the walk CREATES
+/// `declared_group: None` writes what [`execute_workflow_ingest_plan`] writes:
+/// every claim the walk creates is public, owned by the system agent's default
+/// group.
+///
+/// `Some(group)` declares `('group', group)` for every claim the walk CREATES
 /// (`TenancyDecl::group`); the `executes` and plan edges then derive the same
 /// tenancy from their endpoints. Before anything is written (and before the
 /// idempotency gate, so a re-ingest is refused the same way) it asks the
@@ -310,7 +322,8 @@ pub async fn execute_workflow_ingest_plan(
 /// agent's, so this refuses with
 /// [`IngestExecutorError::DeclaredGroupNotWritable`] unless that agent holds a
 /// live writer membership of the group. It does NOT check the caller: that is
-/// [`require_caller_writes_group`], which every caller runs first. Claims the
+/// [`require_caller_writes_group`], which every caller runs first, on the same
+/// `caller` viewer. Claims the
 /// walk reuses keep their tenancy and are reported in
 /// [`WorkflowIngestExecutionResult::reused_items`]. A reused claim private to a
 /// group outside the CALLER's writable set (or unreadable to the stamp) refuses
@@ -326,9 +339,33 @@ pub async fn execute_workflow_ingest_plan_in_group(
     conn: &mut sqlx::PgConnection,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
-    declared: Option<DeclaredGroup<'_>>,
+    caller: &epigraph_db::visibility::Viewer,
+    declared_group: Option<Uuid>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    let declared_group = declared.map(|d| d.group);
+    execute_plan(conn, plan, extraction, Some(caller), declared_group).await
+}
+
+/// The walk both entry points share. `caller` is `None` only for
+/// [`execute_workflow_ingest_plan`], which never declares a group.
+#[allow(clippy::too_many_lines)]
+async fn execute_plan(
+    conn: &mut sqlx::PgConnection,
+    plan: &IngestPlan,
+    extraction: &WorkflowExtraction,
+    caller: Option<&epigraph_db::visibility::Viewer>,
+    declared_group: Option<Uuid>,
+) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
+    // A declared group always comes with the caller it is declared for.
+    let declared = match (declared_group, caller) {
+        (Some(group), Some(caller)) => Some((group, caller)),
+        (None, _) => None,
+        (Some(group), None) => {
+            return Err(IngestExecutorError::CallerNotGroupWriter {
+                caller: Uuid::nil(),
+                group,
+            })
+        }
+    };
     let canonical_name = &extraction.source.canonical_name;
     let generation = extraction.source.generation as i32;
     let goal = &extraction.source.goal;
@@ -399,19 +436,47 @@ pub async fn execute_workflow_ingest_plan_in_group(
     if let Some(existing_id) =
         WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation).await?
     {
-        let edge_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM edges \
+        // The gate DECIDES on the stamp's view (every `executes` edge the
+        // system agent can read): a workflow whose plan the caller cannot see
+        // is still processed, and falling through would write the caller's
+        // claims under another group's workflow row. It REPORTS the caller's
+        // view only; see `executes_edges_created`.
+        let targets: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT target_id FROM edges \
              WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
         )
         .bind(existing_id)
-        .fetch_one(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
 
-        if edge_count > 0 {
+        if !targets.is_empty() {
+            let visible_to_caller = match caller {
+                Some(caller) => {
+                    let mut ids: Vec<Uuid> = Vec::new();
+                    for id in &targets {
+                        if !ids.contains(id) {
+                            ids.push(*id);
+                        }
+                    }
+                    let readable: std::collections::HashSet<Uuid> =
+                        ClaimRepository::tenancy_of_conn(&mut *conn, caller, &ids)
+                            .await?
+                            .into_iter()
+                            .map(|(id, _, _)| id)
+                            .collect();
+                    targets.iter().filter(|t| readable.contains(t)).count()
+                }
+                None => 0,
+            };
             let reused_items = match declared {
-                Some(d) => {
-                    reused_with_another_tenancy(&mut *conn, plan.claims.iter().map(|c| c.id), d)
-                        .await?
+                Some((group, caller)) => {
+                    reused_with_another_tenancy(
+                        &mut *conn,
+                        plan.claims.iter().map(|c| c.id),
+                        caller,
+                        group,
+                    )
+                    .await?
                 }
                 None => Vec::new(),
             };
@@ -421,7 +486,7 @@ pub async fn execute_workflow_ingest_plan_in_group(
                 generation,
                 claims_ingested: 0,
                 claims_skipped_dedup: 0,
-                executes_edges_created: edge_count as usize,
+                executes_edges_created: visible_to_caller,
                 variant_of_edge_created: false,
                 relationship_edges_created: 0,
                 already_ingested: true,
@@ -645,7 +710,7 @@ pub async fn execute_workflow_ingest_plan_in_group(
     // So before any edge is written, read every reused claim on the stamp and
     // refuse one the stamp cannot read, or one private to a group outside the
     // caller's own writable set. A refusal rolls the whole ingest back.
-    if let Some(d) = declared {
+    if let Some((group, caller)) = declared {
         let mut ids: Vec<Uuid> = Vec::new();
         for id in &reused_ids {
             if !ids.contains(id) {
@@ -658,11 +723,11 @@ pub async fn execute_workflow_ingest_plan_in_group(
                 .into_iter()
                 .map(|(id, v, o)| (id, (v, o)))
                 .collect();
-        let writable = d.caller.writable_groups();
+        let writable = caller.writable_groups();
         for claim_id in ids {
             let linkable = match on_stamp.get(&claim_id) {
                 Some((v, _)) if v == "public" => true,
-                Some((_, owner)) => *owner == d.group || writable.contains(owner),
+                Some((_, owner)) => *owner == group || writable.contains(owner),
                 None => false,
             };
             if !linkable {
@@ -780,7 +845,9 @@ pub async fn execute_workflow_ingest_plan_in_group(
     }
 
     let reused_items = match declared {
-        Some(d) => reused_with_another_tenancy(&mut *conn, reused_ids, d).await?,
+        Some((group, caller)) => {
+            reused_with_another_tenancy(&mut *conn, reused_ids, caller, group).await?
+        }
         None => Vec::new(),
     };
 

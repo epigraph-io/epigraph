@@ -190,10 +190,8 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         &mut tx,
         &plan,
         extraction,
-        declared_group.map(|group| epigraph_ingest_executor::DeclaredGroup {
-            group,
-            caller: viewer,
-        }),
+        viewer,
+        declared_group,
     )
     .await
     .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;

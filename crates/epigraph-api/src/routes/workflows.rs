@@ -1874,7 +1874,8 @@ pub struct IngestWorkflowRequest {
 /// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
 /// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
 /// if the workflow row already has `executes` edges, returns `already_ingested: true`
-/// without touching the DB further.
+/// without touching the DB further. `executes_edges` then counts only the
+/// existing plan's edges the caller can read.
 ///
 /// # A declared tenancy
 ///
@@ -1943,10 +1944,8 @@ pub async fn ingest_workflow(
         &mut tx,
         &plan,
         &extraction,
-        declared_group.map(|group| epigraph_ingest_executor::DeclaredGroup {
-            group,
-            caller: &viewer,
-        }),
+        &viewer,
+        declared_group,
     )
     .await
     .map_err(workflow_ingest_error)?;
