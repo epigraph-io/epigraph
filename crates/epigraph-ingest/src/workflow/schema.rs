@@ -82,3 +82,61 @@ pub struct Step {
     #[serde(default)]
     pub evidence_type: Option<String>,
 }
+
+/// The tenancy an ingest DECLARES for the claims it creates, beside the
+/// extraction (`ingest_workflow`'s `tenancy` parameter, and the same key in
+/// `POST /api/v1/workflows/ingest`'s body).
+///
+/// Only `visibility: "group"` is a declaration: absent, an ingest keeps its
+/// default (public, owned by the ingest system agent's default group), so
+/// there is nothing to declare for "public". Any other value is refused at
+/// deserialization. `deny_unknown_fields`, so a misspelt key cannot be read
+/// as an absent one and silently publish the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTenancy {
+    /// Always `"group"`: readable only by live members of `owner_group_id`.
+    pub visibility: DeclaredVisibility,
+    /// The group that owns every claim the ingest creates. The calling agent
+    /// itself, and the ingest system agent, must each hold a live writer or
+    /// admin membership of it.
+    #[schemars(with = "String")]
+    pub owner_group_id: uuid::Uuid,
+}
+
+/// The one visibility a [`WorkflowTenancy`] may declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum DeclaredVisibility {
+    /// `visibility = 'group'`.
+    Group,
+}
+
+#[cfg(test)]
+mod tenancy_tests {
+    use super::{DeclaredVisibility, WorkflowTenancy};
+
+    #[test]
+    fn only_a_group_declaration_parses() {
+        let g = uuid::Uuid::from_u128(7);
+        let ok: WorkflowTenancy =
+            serde_json::from_value(serde_json::json!({"visibility": "group", "owner_group_id": g}))
+                .expect("a group declaration");
+        assert_eq!(ok.visibility, DeclaredVisibility::Group);
+        assert_eq!(ok.owner_group_id, g);
+        for refused in [
+            serde_json::json!({"visibility": "public", "owner_group_id": g}),
+            serde_json::json!({"visibility": "Group", "owner_group_id": g}),
+            serde_json::json!({"owner_group_id": g}),
+            serde_json::json!({"visibility": "group"}),
+            serde_json::json!({"visibility": "group", "owner_group_id": g, "group": g}),
+        ] {
+            assert!(
+                serde_json::from_value::<WorkflowTenancy>(refused.clone()).is_err(),
+                "{refused} must not parse"
+            );
+        }
+    }
+}
