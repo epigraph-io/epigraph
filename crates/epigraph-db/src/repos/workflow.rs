@@ -820,6 +820,61 @@ impl WorkflowRepository {
         Ok(resolved)
     }
 
+    /// The workflow's level-2 step claims `viewer` can read, in PLAN order: the
+    /// lookup an outcome report maps each `step_index` through, shared by the
+    /// MCP tool and the HTTP route so step N is one step on both transports.
+    ///
+    /// Same order key as [`Self::resolve_steps_to_heads`] (`plan_index` first,
+    /// `created_at` only for edges that predate it), and the same two
+    /// predicates, on the edge and on the claim.
+    ///
+    /// # Run it on the caller's STAMPED transaction
+    ///
+    /// `conn` must be stamped with `viewer`. On an unstamped application
+    /// session row security admits only public rows, so a group's own member
+    /// would get none of its group-private steps back, without an error.
+    ///
+    /// # What a caller can and cannot learn
+    ///
+    /// A step the viewer cannot read is simply absent, so the result lists only
+    /// what IS visible. A caller cannot tell an index that
+    /// is out of range from one whose step it may not read, and must not be
+    /// told: that difference is the existence of a step it cannot see. One
+    /// consequence: when only some steps of a plan are visible, a hidden step
+    /// shifts the indices of the visible ones that follow it. A plan's planned
+    /// steps are written by one ingest under one owner, so they share one
+    /// visibility; steps appended later by `add_step` sort after every planned
+    /// step. Mixed visibility within one plan therefore needs a later
+    /// differently owned `add_step` and is not detectable here without a
+    /// privileged read.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn plan_step_claim_ids(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(&mut *conn).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
