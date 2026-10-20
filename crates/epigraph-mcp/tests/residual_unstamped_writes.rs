@@ -127,17 +127,19 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/evolve_step.rs",
-        "ClaimRepository::evolve_step",
+        "server.pool.begin",
         1,
         "`evolve_step`'s FALLBACK for a server built without a ScopedPool (test fixtures). On \
-         a scoped server (every deployed one) the tool now writes on \
-         `begin_author_stamped_tx` + `ClaimRepository::evolve_step_conn` (operator-binding \
-         delta review: migration 122 refuses a claim written by an application session with no \
-         principal once armed). History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
+         a scoped server (every deployed one) the tool writes on `begin_author_stamped_tx` + \
+         `ClaimRepository::evolve_step_conn` (operator-binding delta review: migration 122 \
+         refuses a claim written by an application session with no principal once armed). The \
+         fallback runs the same `evolve_step_conn` on a `server.pool.begin()` transaction (it \
+         used to call `ClaimRepository::evolve_step`, which opened that transaction itself), so \
+         the lineage-wide workflow authority gate and its provenance rows run on the act's own \
+         transaction there too. History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
          review); MEASURED refused on a clean migrate (config A, 42501 on claims) unstamped. The \
          stamp is the step's AUTHOR (the caller), so a parent owned by a group the caller does \
-         not write is still refused by row security there: the H3 question (backlog 84b2a98d) \
-         about system-owned workflow rows remains.",
+         not write is still refused by row security there.",
     ),
     (
         "tools/ingestion.rs",
