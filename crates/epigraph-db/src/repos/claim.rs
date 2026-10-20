@@ -5719,11 +5719,16 @@ impl ClaimRepository {
     /// - [`Self::create_strict`] and the other unconditional INSERTs
     ///   (supersede, `evolve_step`, `batch_create`, hypothesis creation) have
     ///   no find, so there is no check-then-act to race.
-    /// - [`Self::create_with_id_if_absent`] dedups on its caller-supplied
-    ///   deterministic id (`ON CONFLICT (id)`), which the primary key already
-    ///   serializes among its own callers. It has no pair find, so taking this
-    ///   lock would close only one order of a race against a random-id
-    ///   [`Self::create_or_get`] of the same pair; that cross race stays open.
+    /// - [`Self::create_with_id_if_absent`] and the ingest-executor's
+    ///   workflow `add_step` dedup on a caller-derived deterministic id
+    ///   (`ON CONFLICT (id)`), which the primary key already serializes among
+    ///   their own callers; one id means one pair. They have NO pair dedup at
+    ///   all, so they do not dedup against a random-id row of the same pair:
+    ///   a [`Self::create_or_get`] of exact atom text by the same agent,
+    ///   committed earlier or running concurrently, followed by a
+    ///   deterministic-id create of that atom, leaves two rows of the pair.
+    ///   Taking this lock without adding a pair find would close neither
+    ///   case, so the gap stays open here and is tracked separately.
     /// - `policies.rs::create_challenge` finds on the pair PLUS the
     ///   `policy:challenge` label and serializes its own callers under
     ///   `'epigraph.policy_challenge'`. A non-challenge row of the same pair
