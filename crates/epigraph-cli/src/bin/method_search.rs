@@ -291,7 +291,9 @@ Return 3-8 claims."#,
             };
             let claim_id = {
                 let mut conn = pool.acquire().await?;
-                insert_unless_hash_exists(&mut conn, args.agent_id, decl, &new_claim).await?
+                insert_unless_hash_exists(&mut conn, args.agent_id, decl, &new_claim)
+                    .await
+                    .map_err(|e| e as Box<dyn std::error::Error>)?
             };
             let Some(claim_id) = claim_id else {
                 tracing::info!(
@@ -361,19 +363,44 @@ struct WebSearchClaim<'a> {
 /// Insert `claim` authored by `agent_id`, unless a claim with its
 /// `content_hash` already exists. Returns the new row's id, or `None` when the
 /// content was already present.
+///
+/// **Concurrency:** the find and the INSERT run in one scope (a real `BEGIN`
+/// on a bare connection, a SAVEPOINT in a caller's transaction) under
+/// `ClaimRepository::lock_content_hash_agent` for the pair the INSERT writes,
+/// the lock the repository's find-then-insert writers take (backlog
+/// 00f1a517). Two concurrent runs over the same content by one author, or a
+/// run racing a repository create of that pair, therefore yield one row. One
+/// lock per short transaction: nothing else is held while it waits. The find
+/// stays content-hash-only (any author), as before.
 async fn insert_unless_hash_exists(
     conn: &mut sqlx::PgConnection,
     agent_id: Uuid,
     decl: epigraph_core::TenancyDecl,
     claim: &WebSearchClaim<'_>,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+    use sqlx::Acquire;
+
     let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+
+    // Dropped without commit on any error path below, which rolls the scope
+    // (and the lock, when it is a real transaction) back.
+    let mut scope = conn.begin().await?;
+
+    // Taken before the find: without it, a concurrent writer's uncommitted
+    // row is invisible to the find and both insert.
+    epigraph_db::ClaimRepository::lock_content_hash_agent(
+        &mut scope,
+        content_hash.as_slice(),
+        agent_id,
+    )
+    .await?;
 
     let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
         .bind(content_hash.as_slice())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&mut *scope)
         .await?;
     if exists.is_some() {
+        scope.commit().await?;
         return Ok(None);
     }
 
@@ -392,8 +419,9 @@ async fn insert_unless_hash_exists(
     .bind(claim.embedding)
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *scope)
     .await?;
+    scope.commit().await?;
     Ok(Some(id))
 }
 
@@ -590,6 +618,126 @@ mod dedup_race_tests {
             .await
             .expect("count rows");
         assert_eq!(rows, 1);
+    }
+
+    const RACE_BARRIER_KEY: i64 = 424_243;
+
+    /// Two runs of the binary, BOTH on bare connections (its real shape), with
+    /// caller 1 parked inside its INSERT by a `BEFORE INSERT` trigger that
+    /// takes a session advisory lock the test holds. A transaction-scoped lock
+    /// taken in autocommit is released at the end of its own statement, so an
+    /// implementation that locks without opening a scope passes the held-open
+    /// arms (caller 1 runs in a transaction there) and still mints a duplicate
+    /// here. No sleep decides the outcome: the handshakes are read from
+    /// `pg_locks`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn two_bare_connection_runs_serialize_across_the_insert(pool: PgPool) {
+        let (agent_id, decl) = seed_author(&pool).await;
+        let content = format!("method_search bare race {}", Uuid::new_v4());
+        let embedding = embedding_literal();
+
+        // Fires only for caller 1's row, which carries the marker property.
+        sqlx::query(
+            &"CREATE OR REPLACE FUNCTION zz_ms_race_barrier() RETURNS trigger
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                  PERFORM pg_advisory_lock(KEY);
+                  PERFORM pg_advisory_unlock(KEY);
+                  RETURN NEW;
+              END $$"
+                .replace("KEY", &RACE_BARRIER_KEY.to_string()),
+        )
+        .execute(&pool)
+        .await
+        .expect("create the barrier function");
+        sqlx::query(
+            "CREATE TRIGGER zz_ms_race_barrier BEFORE INSERT ON claims FOR EACH ROW \
+             WHEN (NEW.properties->>'race_barrier' = 'hold') \
+             EXECUTE FUNCTION zz_ms_race_barrier()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install the barrier trigger");
+
+        let mut holder = pool.acquire().await.expect("acquire the barrier holder");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(RACE_BARRIER_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("take the barrier");
+
+        let spawn_run = |marker: &'static str| {
+            let pool = pool.clone();
+            let content = content.clone();
+            let embedding = embedding.clone();
+            tokio::spawn(async move {
+                let mut conn = pool.acquire().await.expect("acquire a racer connection");
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "race_barrier": marker }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                    .await
+                    .expect("racer insert")
+            })
+        };
+
+        let caller_1 = spawn_run("hold");
+        // Caller 1 is parked inside its INSERT.
+        let mut parked = false;
+        for _ in 0..600 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks \
+                  WHERE locktype = 'advisory' AND objid = $1::bigint AND NOT granted \
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .bind(RACE_BARRIER_KEY)
+            .fetch_one(&pool)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            parked,
+            "caller 1 never reached the barrier trigger, so this arm would prove nothing"
+        );
+
+        let caller_2 = spawn_run("go");
+        let blocked = settle_on_the_dedup_lock(&pool, &caller_2).await;
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(RACE_BARRIER_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("release the barrier");
+        drop(holder);
+
+        let r1 = caller_1.await.expect("caller 1 must not panic");
+        let r2 = caller_2.await.expect("caller 2 must not panic");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2",
+        )
+        .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows for the pair");
+        assert_eq!(
+            rows, 1,
+            "two bare-connection runs of one (content_hash, agent_id) left {rows} rows: caller \
+             2's find ran while caller 1's INSERT was in flight. Outcomes: {r1:?}, {r2:?}"
+        );
+        assert!(
+            blocked,
+            "caller 2 finished while caller 1 was parked in its INSERT"
+        );
+        assert!(r1.is_some() && r2.is_none(), "outcomes: {r1:?}, {r2:?}");
     }
 
     /// Two runs of the binary over the same search result.
