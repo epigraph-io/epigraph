@@ -44,6 +44,11 @@ pub struct PlanInputs {
     pub signal_members: Option<Snapshot>,
 }
 
+/// The most family members the pairwise dedup pass compares. Dedup classifies
+/// every pair, so its cost grows with the square of the family; past this
+/// bound the plan is refused with RESOURCE_CAP instead of running unbounded.
+pub const MAX_DEDUP_FAMILY_MEMBERS: usize = 2_000;
+
 /// How much was read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Coverage {

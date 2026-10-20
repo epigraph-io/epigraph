@@ -57,7 +57,7 @@ pub use ids::{extract_ids, IdToken};
 pub use plan::{
     compute_plan_hash, plan, Cluster, ClusterMember, Coverage, HygieneItem, LabelWrite,
     LifecycleAction, LifecycleKind, PastDue, Plan, PlanInputs, PlanRequest, ReviewPair,
-    SignalDedupPlan, SignalSuperseded, VetoedChain, WriteUnit,
+    SignalDedupPlan, SignalSuperseded, VetoedChain, WriteUnit, MAX_DEDUP_FAMILY_MEMBERS,
 };
 pub use probe::{probe, ProbeCandidate, ProbeVerdict, ProbeVerdictKind, PROBE_MAX_CANDIDATES};
 pub use profile::{profile_hash, LabelDedupProfile, PassProfile, ReadPurpose, ReadSpec};

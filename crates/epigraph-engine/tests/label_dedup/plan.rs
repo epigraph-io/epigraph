@@ -191,3 +191,27 @@ fn an_invalid_run_tag_is_refused() {
         "empty means the default set"
     );
 }
+
+/// Dedup compares every pair of members, so its cost grows with the square of
+/// the family. A family past the bound is refused with RESOURCE_CAP instead of
+/// running unbounded; the operator narrows the pass.
+#[test]
+fn a_family_past_the_pairwise_bound_is_refused() {
+    let cap = epigraph_engine::label_dedup::MAX_DEDUP_FAMILY_MEMBERS;
+    let graph: Vec<_> = (0..=cap as u32)
+        .map(|i| {
+            claim(
+                0x7000_0000 + i,
+                &format!("Synthetic notice number {i} for ACME-{i:06}"),
+                &["notice"],
+                "2026-07-01T00:00:00Z",
+            )
+        })
+        .collect();
+    let err = try_plan_graph(&profile(), &graph, &dedup_sections(), None, cap + 10)
+        .expect_err("a family larger than the pairwise bound must be refused");
+    assert_eq!(err.code(), "RESOURCE_CAP", "{err}");
+    // Control: at the bound it plans.
+    let ok = try_plan_graph(&profile(), &graph[..cap], &dedup_sections(), None, cap + 10);
+    assert!(ok.is_ok(), "{:?}", ok.err());
+}

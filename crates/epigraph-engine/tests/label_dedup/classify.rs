@@ -303,3 +303,36 @@ fn a_disabled_tier_never_fires() {
         }
     ));
 }
+
+/// A revision link auto-merges and overrides the strong-id veto, so it must
+/// name the other claim as precisely as a `distinct-from` ruling does: a
+/// label carrying only a short id prefix would link the labelled claim to
+/// every claim whose id starts with it (one in sixteen for one hex digit).
+#[test]
+fn a_short_revision_prefix_links_nothing_and_the_veto_still_applies() {
+    let orig = parsed(1, f::STEAM_A, &["notice"], "2026-07-01T00:00:00Z");
+    for len in 1..8 {
+        let short: String = prefix(1).chars().take(len).collect();
+        let rev = parsed(
+            2,
+            f::STEAM_B,
+            &["notice", &format!("revision-of-{short}")],
+            "2026-07-02T00:00:00Z",
+        );
+        assert_eq!(
+            merge_tier(&orig, &rev),
+            None,
+            "a {len}-char revision prefix must not link"
+        );
+        assert!(
+            matches!(
+                verdict(&orig, &rev),
+                PairVerdict::Conflict {
+                    conflict: ConflictKind::StrongIdVeto,
+                    ..
+                }
+            ),
+            "a {len}-char revision prefix must not override the strong-id veto"
+        );
+    }
+}
