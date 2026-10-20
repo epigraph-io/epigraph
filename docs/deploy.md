@@ -2662,8 +2662,11 @@ Rules and reasons: `crates/epigraph-cli/src/evidence_type_backfill.rs`.
   has no `[evidence_type_weights]`, is refused.
 - **Dry run by default.** `--apply` writes `evidence_type` only, only on rows
   still untyped, one transaction per `--batch` (default 1000). A re-run writes
-  nothing on rows already typed; on a live database it also scans rows written
-  untyped since, which the same rules leave NULL. `--max-batches N` bounds a
+  nothing on rows already typed. On a live database it also decides the rows
+  written untyped since by the same rules, so it can type some (e.g. a REST
+  input sent without a type on a claim that declares one): run the re-apply
+  right after the apply and expect `written` near 0, any rows it does write
+  being ones created after the first apply started. `--max-batches N` bounds a
   run; pass the report's `last_id` as `--after` to continue.
 - **Never typed**: cached combination rows (the predicate the combine-input
   readers exclude), unlabelled agent-less rows sharing their (claim, frame)

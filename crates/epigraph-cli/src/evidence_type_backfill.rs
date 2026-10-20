@@ -69,9 +69,12 @@
 //! column changes, and no cached belief is recomputed: run the belief
 //! recompute afterwards.
 //!
-//! A re-run writes nothing on rows it typed. On a live database it also scans
-//! the rows written untyped since (writers that store NULL on purpose); the
-//! same rules leave those NULL, so it is a no-op on them too.
+//! A re-run writes nothing on rows already typed. On a live database it also
+//! scans the rows written untyped since and decides them by the same rules:
+//! the writers that store NULL on purpose stay NULL, but, for example, a REST
+//! input sent without a type on a claim that declares one IS typed. So a
+//! re-apply right after an apply writes about 0, and anything it does write is
+//! a row created untyped after the first apply started.
 
 use std::collections::BTreeMap;
 
