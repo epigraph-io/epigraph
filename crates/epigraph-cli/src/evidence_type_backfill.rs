@@ -12,10 +12,11 @@
 //! # How a type is derived: the way #573's writers do, never guessed
 //!
 //! Every type goes through [`CalibrationConfig::canonical_evidence_type`], the
-//! function #573's writers call, and must resolve to a calibrated key. The
-//! rules (first match wins) are the strict safe set of the 2026-10-12 typing
-//! study (precision 0.995 on its sample), each tied to the #573 writer it
-//! mirrors:
+//! function #573's writers call, and must resolve to a calibrated key. A row is
+//! typed only into the mass shape #573's writer for it would produce for that
+//! type. The rules (first match wins) are the ones a stratified sample of
+//! legacy rows, checked by hand, showed reliable, each tied to the #573 writer
+//! it mirrors:
 //!
 //! * the claim's own declared type (`properties.evidence_type`), only when it
 //!   is one of the five keys `submit_claim` accepts ([`DECLARABLE_TYPES`]), as
@@ -31,18 +32,31 @@
 //!   exclude, `epigraph_db::repos::mass_function::cached_combination_predicate`),
 //!   or an unlabelled agent-less row sharing its (claim, frame) with another BBA
 //!   (the pre-b5cb3efb single-input cache copy): an aggregate has no single type;
-//! * from a writer #573 keeps untyped on purpose (`error_derived`, `prior`):
-//!   their only type source is caller-declared and would RAISE the weight;
+//! * from a writer #573 keeps untyped on purpose: `error_derived` (its only
+//!   type source is caller-declared and would RAISE the weight), `prior` (not
+//!   evidence), `truth_value_seed` (its NULL type keeps it undiscounted, so its
+//!   BetP stays the claim's `truth_value`);
+//! * a row whose masses already carry their weight, which a type would apply a
+//!   second time: the agent-less, perspective-less `discount` input
+//!   (`routes/assess.rs::assess_claim` sized it with the type weight; an
+//!   anonymous REST input has the same stored shape), and a lone unlabelled
+//!   agent-less row on an assess auto-frame (`research_validity`,
+//!   `paper_validity_*`), the single-input fold that replaced that input;
+//! * any other row labelled with a combination-rule name, in any case: an
+//!   input `submit_ds_evidence` stored without a type, whose masses it
+//!   pre-discounted by the caller's reliability (#573 stores RAW masses only
+//!   when it is given a type), or an out-of-repo writer's `dempster`;
 //! * not evidence (`test`, `backlog*` / `content-draft` labels), or a
 //!   propagated BBA whose relationship was never stored;
-//! * typed by a rule the study measured as unsafe or provisional: a linked
-//!   `observation` / `testimony` / `computation` / `document` tag (right on 7
-//!   of 53 `observation` rows), a declared alias or a generic declared type, a
-//!   deciding methodology, a regulatory hint, a claim `source_type`;
-//! * an OpenStax extractor row with nothing but its agent's NAME to go on. The
-//!   study measured that rule at 524/524, but it is an inference from a name,
-//!   not a stored type, and it moves ~120k rows from 0.3 to 0.85: that is an
-//!   operator decision, so it is counted separately and never applied here;
+//! * typed only by a rule the sample showed unreliable or too thin: a linked
+//!   `observation` / `testimony` / `computation` / `document` tag (the stored
+//!   `observation` tag was wrong on most sampled rows), a declared alias or a
+//!   generic declared type, a deciding methodology, a regulatory hint, a claim
+//!   `source_type`;
+//! * an OpenStax extractor row with nothing but its agent's NAME to go on.
+//!   That is an inference from a name, not a stored type, and it would move
+//!   those rows from their stored 0.3 to `logical`'s 0.85: an operator
+//!   decision, so it is counted separately and never applied here;
 //! * anything else with no determining stored field.
 //!
 //! # What it changes
@@ -54,6 +68,10 @@
 //! locality factor). No calibration weight, mass, source_strength or other
 //! column changes, and no cached belief is recomputed: run the belief
 //! recompute afterwards.
+//!
+//! A re-run writes nothing on rows it typed. On a live database it also scans
+//! the rows written untyped since (writers that store NULL on purpose); the
+//! same rules leave those NULL, so it is a no-op on them too.
 
 use std::collections::BTreeMap;
 
@@ -137,8 +155,8 @@ fn is_assess_frame(frame: Option<&str>) -> bool {
     frame.is_some_and(|f| f == "research_validity" || f.starts_with("paper_validity_"))
 }
 
-/// Methodologies that decide nothing about the kind of support (the typing
-/// study's rules fall through them to the evidence row). Any other non-blank
+/// Methodologies that decide nothing about the kind of support (the rules fall
+/// through them to the evidence row). Any other non-blank
 /// methodology may contradict a declared or linked type, so it stops the rules.
 const NON_DECIDING_METHODOLOGIES: [&str; 5] = [
     "extraction",
@@ -148,8 +166,8 @@ const NON_DECIDING_METHODOLOGIES: [&str; 5] = [
     "inductive_generalization",
 ];
 
-/// The claim `source_type`s the study's provisional D10 rule would have typed
-/// `logical`. Measured on too few rows to apply; they stop the rules.
+/// The claim `source_type`s a provisional rule would have typed `logical`.
+/// Checked on too few sampled rows to apply; they stop the rules.
 const PROVISIONAL_SOURCE_TYPES: [&str; 3] = ["textbook", "paper", "internaldocument"];
 
 fn norm(v: Option<&str>) -> Option<String> {
