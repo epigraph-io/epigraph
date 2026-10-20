@@ -1630,6 +1630,130 @@ impl WorkflowRepository {
             .map(|(id, shared)| ExecutedClaim { id, shared })
             .collect())
     }
+
+    /// The `workflows` row and every `executes` edge of `workflow_id` that
+    /// `viewer` may see, each joined to its target claim when `viewer` may read
+    /// it. The raw input of the frozen-plan read
+    /// (`epigraph_ingest_executor::workflow_plan::frozen_plan`), which derives
+    /// the order, the integrity counts and the digest echo from these rows.
+    ///
+    /// `Ok(None)` when no `workflows` row has this id.
+    ///
+    /// # What is and is not filtered
+    ///
+    /// * The edges carry `{EDGE_VISIBILITY:e}` and the target claim
+    ///   `{VISIBILITY:c}`, so a target the viewer cannot read comes back as an
+    ///   edge with `readable = false` and no claim column: the caller counts it
+    ///   and never sees its id or content past this function. An edge the viewer
+    ///   cannot see does not come back at all. That is most hidden items: an
+    ///   `executes` edge takes its target's tenancy (migration 072's meet).
+    /// * RETRACTED edges (`valid_to` set) are returned, flagged, not dropped:
+    ///   a retraction changes the plan and the caller must be able to say so.
+    /// * `workflows` has no row security, so the row read needs no predicate.
+    /// * `heads_diverged` asks whether the target's step lineage has a head
+    ///   other than the target that the viewer may read (`{VISIBILITY:h}`). The
+    ///   `supersedes` exclusion inside it is unfiltered, as in
+    ///   [`ClaimRepository::latest_in_lineage`]: a supersedes edge the viewer
+    ///   cannot see must still retire a head.
+    ///
+    /// Takes the ONE viewer-stamped connection of the request, so the in-query
+    /// predicate and the session's tenancy GUCs agree under forced RLS.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a query fails.
+    pub async fn frozen_plan(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Option<FrozenPlanRead>, DbError> {
+        let row: Option<FrozenPlanRow> = sqlx::query_as(
+            "SELECT id, canonical_name, generation, goal, parent_id, truth_value, metadata \
+               FROM workflows WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let sql = viewer.splice(
+            r#"
+            SELECT e.properties AS edge_properties,
+                   (e.valid_to IS NOT NULL) AS retracted,
+                   e.target_id,
+                   (t.id IS NOT NULL) AS readable,
+                   t.content, t.content_hash, t.properties AS claim_properties,
+                   t.visibility, t.owner_group_id, t.truth_value, t.is_current,
+                   t.heads_diverged
+              FROM edges e
+              LEFT JOIN LATERAL (
+                  SELECT c.id, c.content, c.content_hash, c.properties,
+                         c.visibility::text AS visibility, c.owner_group_id,
+                         c.truth_value, c.is_current,
+                         (c.step_lineage_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM claims h
+                               WHERE h.step_lineage_id = c.step_lineage_id
+                                 AND h.id <> c.id
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM edges s
+                                      WHERE s.target_id = h.id
+                                        AND s.relationship = 'supersedes')
+                                 /* {VISIBILITY:h} */
+                         )) AS heads_diverged
+                    FROM claims c
+                   WHERE c.id = e.target_id AND e.target_type = 'claim'
+                     /* {VISIBILITY:c} */
+              ) t ON true
+             WHERE e.source_id = $1 AND e.relationship = 'executes'
+               /* {EDGE_VISIBILITY:e} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrozenPlanEdgeRow>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let edges = q.fetch_all(&mut *conn).await?;
+        Ok(Some(FrozenPlanRead { row, edges }))
+    }
+}
+
+/// The `workflows` row of [`WorkflowRepository::frozen_plan`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub truth_value: f64,
+    pub metadata: serde_json::Value,
+}
+
+/// One visible `executes` edge of [`WorkflowRepository::frozen_plan`]. Every
+/// claim column is `None` when `readable` is false.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanEdgeRow {
+    pub edge_properties: Option<serde_json::Value>,
+    pub retracted: bool,
+    pub target_id: Uuid,
+    pub readable: bool,
+    pub content: Option<String>,
+    pub content_hash: Option<Vec<u8>>,
+    pub claim_properties: Option<serde_json::Value>,
+    pub visibility: Option<String>,
+    pub owner_group_id: Option<Uuid>,
+    pub truth_value: Option<f64>,
+    pub is_current: Option<bool>,
+    pub heads_diverged: Option<bool>,
+}
+
+/// What [`WorkflowRepository::frozen_plan`] read.
+#[derive(Debug, Clone)]
+pub struct FrozenPlanRead {
+    pub row: FrozenPlanRow,
+    pub edges: Vec<FrozenPlanEdgeRow>,
 }
 
 /// One row of [`WorkflowRepository::executed_structural_claims`].
