@@ -1311,6 +1311,11 @@ impl MassFunctionRepository {
     /// maintenance connection; on an application session RLS hides most of
     /// the corpus and the backfill would silently cover a fraction of it.
     ///
+    /// The cursor is `m.id > COALESCE($1, nil uuid)`, never `$1 IS NULL OR
+    /// m.id > $1`: the statement is prepared once and re-executed per page, and
+    /// under a generic plan the OR form cannot be an index condition, so every
+    /// page would re-walk the key from the start.
+    ///
     /// # Errors
     /// `DbError` on a query failure.
     pub async fn untyped_provenance_page<'e, E: sqlx::PgExecutor<'e>>(
@@ -1343,7 +1348,7 @@ impl MassFunctionRepository {
               LEFT JOIN agents sa       ON sa.id = m.source_agent_id
               LEFT JOIN agents ca       ON ca.id = c.agent_id
              WHERE (m.evidence_type IS NULL OR m.evidence_type = '')
-               AND ($1::uuid IS NULL OR m.id > $1)
+               AND m.id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
              ORDER BY m.id
              LIMIT $2
             "#,
