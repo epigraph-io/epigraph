@@ -218,8 +218,9 @@ pub fn check_eligibility(
 /// The one eligibility rule no flag overrides: only a `visibility = 'public'`
 /// claim is decomposed.
 ///
-/// Selection runs under a maintenance BYPASS viewer and so sees group-private
-/// claims, but every atom is POSTed public (`if_not_exists` is public-tier
+/// Selection on the maintenance path runs under a BYPASS viewer and so sees
+/// group-private claims (on the `--as-agent` path only those of the acting
+/// agent's groups), but every atom is POSTed public (`if_not_exists` is public-tier
 /// only) and records the parent's text as its derivation evidence (U041). A
 /// group-private parent would be republished as public atoms, and the API
 /// refuses its `derived_from` — which would abort a normal run. So it is
@@ -647,16 +648,126 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
+    verify_plan, BatchClaim, BatchTotals, DecomposeDb, DecomposeRead, DecomposeTx, PersistOutcome,
+    PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
 mod db_writes {
     use super::{AtomParent, Decomposition};
-    use epigraph_db::{ClaimRepository, EdgeRepository};
-    use sqlx::PgPool;
+    use epigraph_db::visibility::Viewer;
+    use epigraph_db::{ClaimRepository, DbError, EdgeRepository};
+    use sqlx::{PgConnection, PgPool};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// Where a decomposition run's statements go, and as whom.
+    ///
+    /// Two implementations, one per way `decompose_claims` connects:
+    ///
+    /// * [`PgPool`] — the MAINTENANCE path. The pool is a privileged
+    ///   connection (`epigraph_cli::MaintenancePool`, checked at startup) and
+    ///   the viewer a bypass, so statements run on it as they are: row
+    ///   security does not filter them.
+    /// * [`epigraph_db::ScopedPool`] — the `--as-agent` path, on the ordinary
+    ///   application login with NO maintenance privilege (backlog 9a877b7c,
+    ///   operator ruling 2026-10-20). Every read runs on a connection stamped
+    ///   for the viewer ([`epigraph_db::ScopedPool::read_as`]) and every write
+    ///   in a transaction stamped for it ([`epigraph_db::ScopedPool::begin_as`]),
+    ///   so the in-query predicate and row security agree, and a
+    ///   `decomposes_to` edge records the acting agent's group as its writer
+    ///   (migration 120) instead of landing ownerless through the world arm an
+    ///   unstamped insert would take. Both refuse a bypass viewer.
+    ///
+    /// The library functions take `&dyn DecomposeDb`, so a caller holding a
+    /// `PgPool` passes `&pool` unchanged.
+    #[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
+    #[async_trait::async_trait]
+    pub trait DecomposeDb: Send + Sync {
+        /// A connection to read on, as `viewer`.
+        async fn read<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError>;
+        /// A transaction to write in, as `viewer`.
+        async fn write<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError>;
+    }
+
+    /// A read connection from a [`DecomposeDb`]; derefs to the connection.
+    pub enum DecomposeRead<'a> {
+        Pool(sqlx::pool::PoolConnection<sqlx::Postgres>),
+        Scoped(epigraph_db::ScopedRead<'a>),
+    }
+
+    impl std::ops::Deref for DecomposeRead<'_> {
+        type Target = PgConnection;
+        fn deref(&self) -> &PgConnection {
+            match self {
+                Self::Pool(c) => c,
+                Self::Scoped(c) => c,
+            }
+        }
+    }
+
+    impl std::ops::DerefMut for DecomposeRead<'_> {
+        fn deref_mut(&mut self) -> &mut PgConnection {
+            match self {
+                Self::Pool(c) => c,
+                Self::Scoped(c) => c,
+            }
+        }
+    }
+
+    /// A write transaction from a [`DecomposeDb`]. Dropped without
+    /// [`Self::commit`], it rolls back.
+    pub enum DecomposeTx<'a> {
+        Pool(sqlx::Transaction<'static, sqlx::Postgres>),
+        Scoped(epigraph_db::ScopedTx<'a>),
+    }
+
+    impl DecomposeTx<'_> {
+        /// The transaction's connection.
+        pub fn conn(&mut self) -> &mut PgConnection {
+            match self {
+                Self::Pool(t) => t,
+                Self::Scoped(t) => t,
+            }
+        }
+
+        /// Commit.
+        ///
+        /// # Errors
+        /// The commit failed.
+        pub async fn commit(self) -> Result<(), DbError> {
+            match self {
+                Self::Pool(t) => t.commit().await.map_err(DbError::from),
+                Self::Scoped(t) => t.commit().await,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DecomposeDb for PgPool {
+        async fn read<'a>(&'a self, _viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError> {
+            Ok(DecomposeRead::Pool(
+                self.acquire()
+                    .await
+                    .map_err(|source| DbError::ConnectionFailed { source })?,
+            ))
+        }
+
+        async fn write<'a>(&'a self, _viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError> {
+            Ok(DecomposeTx::Pool(self.begin().await?))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DecomposeDb for epigraph_db::ScopedPool {
+        async fn read<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError> {
+            Ok(DecomposeRead::Scoped(self.read_as(viewer).await?))
+        }
+
+        async fn write<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError> {
+            Ok(DecomposeTx::Scoped(self.begin_as(viewer).await?))
+        }
+    }
 
     /// What `persist_decomposition` did, for reporting/tests.
     pub struct PersistOutcome {
@@ -686,7 +797,7 @@ mod db_writes {
     /// exactly itself is already atomic — writing a self-equivalent child +
     /// edge would pollute the graph and is what `is_current`-atoms look like).
     pub async fn persist_decomposition<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         parent_id: Uuid,
         decomp: &Decomposition,
@@ -706,7 +817,9 @@ mod db_writes {
             });
         }
         // Guard: parent must still be current (never wire onto a retired claim).
-        if !ClaimRepository::are_all_current(pool, viewer, &[parent_id]).await? {
+        if !ClaimRepository::are_all_current(&mut *db.read(viewer).await?, viewer, &[parent_id])
+            .await?
+        {
             return Err(format!("parent claim {parent_id} is not current").into());
         }
         // Phase 1: submit EVERY atom before wiring ANY edge. The
@@ -742,12 +855,14 @@ mod db_writes {
             gens.push(gen);
         }
         // Phase 2: every edge in ONE transaction, so the parent goes from
-        // "no decomposition" to "all atoms" with nothing in between.
-        let mut tx = pool.begin().await?;
+        // "no decomposition" to "all atoms" with nothing in between. On the
+        // `--as-agent` path the transaction is stamped for the acting agent,
+        // so each edge records it as the writer (see [`DecomposeDb`]).
+        let mut tx = db.write(viewer).await?;
         let mut edges = 0usize;
         for (&atom_id, &gen) in atom_ids.iter().zip(gens.iter()) {
             let (_row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-                &mut tx,
+                tx.conn(),
                 parent_id,
                 "claim",
                 atom_id,
@@ -816,7 +931,7 @@ mod db_writes {
     /// answers with one atom is recorded (see [`persist_planned`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_decomposition_batches<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         claims: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
@@ -836,7 +951,7 @@ mod db_writes {
             // Verdicts are appended per chunk, so a run that aborts later
             // keeps the ones it already paid for.
             let chunk_totals = persist_planned(
-                pool,
+                db,
                 viewer,
                 &planned,
                 embedder.clone(),
@@ -1003,7 +1118,7 @@ mod db_writes {
     /// # Errors
     /// None today; the `Result` is kept for callers.
     pub async fn persist_planned<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         planned: &[super::PlannedDecomposition],
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
@@ -1021,7 +1136,7 @@ mod db_writes {
                 agent_id: plan.agent_id,
             };
             match persist_decomposition(
-                pool,
+                db,
                 viewer,
                 plan.claim_id,
                 &plan.decomposition(),
@@ -1086,7 +1201,7 @@ mod db_writes {
     /// # Errors
     /// Database failure.
     pub async fn verify_plan(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         planned: Vec<super::PlannedDecomposition>,
     ) -> Result<
@@ -1105,7 +1220,9 @@ mod db_writes {
         let ids: Vec<Uuid> = lines_per_parent.keys().copied().collect();
         let mut live = std::collections::HashMap::new();
         for chunk in ids.chunks(1000) {
-            for c in R::list_undecomposed_by_ids(pool, viewer, chunk).await? {
+            for c in
+                R::list_undecomposed_by_ids(&mut *db.read(viewer).await?, viewer, chunk).await?
+            {
                 live.insert(c.id, (c.content, c.agent_id));
             }
         }
@@ -1177,7 +1294,7 @@ mod db_writes {
     /// Database failure.
     #[allow(clippy::too_many_arguments)]
     pub async fn select_candidates(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         priority: Priority,
         ids: Option<&[Uuid]>,
@@ -1206,7 +1323,10 @@ mod db_writes {
         if let Some(ids) = ids {
             let mut rows = Vec::new();
             for chunk in ids.chunks(1000) {
-                rows.extend(R::list_undecomposed_by_ids(pool, viewer, chunk).await?);
+                rows.extend(
+                    R::list_undecomposed_by_ids(&mut *db.read(viewer).await?, viewer, chunk)
+                        .await?,
+                );
             }
             sel.scanned = rows.len();
             let present: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.id).collect();
@@ -1234,6 +1354,9 @@ mod db_writes {
 
         const PAGE: i64 = 500;
         let mut offset: i64 = 0;
+        // One stamped connection for the whole scan: every page is read as
+        // the same viewer.
+        let mut conn = db.read(viewer).await?;
         loop {
             if sel.chosen.len() >= limit {
                 break;
@@ -1244,11 +1367,11 @@ mod db_writes {
             }
             let page = match priority {
                 Priority::Conflict => {
-                    R::list_undecomposed_conflict_targets(pool, viewer, PAGE, offset).await?
+                    R::list_undecomposed_conflict_targets(&mut *conn, viewer, PAGE, offset).await?
                 }
                 Priority::Recent => {
                     R::list_undecomposed_ordered(
-                        pool,
+                        &mut *conn,
                         viewer,
                         UndecomposedOrder::Recent,
                         PAGE,
@@ -1258,7 +1381,7 @@ mod db_writes {
                 }
                 Priority::Oldest => {
                     R::list_undecomposed_ordered(
-                        pool,
+                        &mut *conn,
                         viewer,
                         UndecomposedOrder::Oldest,
                         PAGE,
