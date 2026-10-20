@@ -94,3 +94,45 @@ async fn a_linked_agent_or_the_operator_itself_is_no_delegator_on_the_applicatio
         "(a linked agent of the same operator, the operator itself) as the delegator"
     );
 }
+
+/// Every way of ending a delegation reads `None` on the APPLICATION role, each
+/// on its own fresh delegation that read `Some` there first: the principal's
+/// link retired, the delegator's client suspended, its allowance revoked, and
+/// its writer row in the operator's group revoked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_revocation_reads_none_on_the_application_role(pool: PgPool) {
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&app)
+        .await
+        .expect("current_user");
+    assert_eq!(role, "epigraph_app", "PREMISE: the downgraded pool");
+
+    for case in [
+        "retire",
+        "suspend",
+        "revoke-allowance",
+        "revoke-delegator-row",
+    ] {
+        let d = delegation::live_delegation(&pool, &format!("app-role-{case}")).await;
+        assert!(
+            check(&app, RunTokens::On, d.delegator, d.principal)
+                .await
+                .is_some(),
+            "CALIBRATION ({case}): live before"
+        );
+        match case {
+            "retire" => delegation::retire_link(&pool, d.principal).await,
+            "suspend" => {
+                delegation::set_client_status(&pool, d.delegator_client, "suspended").await;
+            }
+            "revoke-allowance" => delegation::revoke_allowance(&pool, d.delegator_client).await,
+            _ => delegation::revoke_membership(&pool, d.delegator, d.operator_group).await,
+        }
+        assert_eq!(
+            check(&app, RunTokens::On, d.delegator, d.principal).await,
+            None,
+            "{case}: the application role must read the delegation as ended"
+        );
+    }
+}

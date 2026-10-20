@@ -94,6 +94,46 @@ async fn a_dlg_token_for_a_live_linked_agent_resolves_a_viewer_with_the_operator
     assert!(err.message.contains("stdio-only"), "{}", err.message);
 }
 
+/// A delegated viewer is the PRINCIPAL's own membership set, nothing more: the
+/// delegator's memberships never ride along. The delegator here also writes a
+/// third group; the delegated viewer holds exactly the groups the principal's
+/// own viewer holds (its personal group and the operator's group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegated_viewer_never_gains_memberships_beyond_the_agents_own(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "mcp-memberships").await;
+    let (_, elsewhere) = delegation::agent_with_group(&pool, "mcp-memberships-elsewhere").await;
+    delegation::membership(&pool, elsewhere, d.delegator, "writer").await;
+    let server = session(&pool, 0x78, RunTokens::On).await;
+
+    let delegated = request_viewer(&server, Some(&dlg(&d, &["claims:read"])))
+        .await
+        .expect("a live delegation resolves a viewer");
+    let own = epigraph_db::Viewer::resolve(&pool, d.principal)
+        .await
+        .expect("the principal's own viewer");
+    let set = |groups: Option<&[Uuid]>| -> std::collections::BTreeSet<Uuid> {
+        groups.unwrap_or_default().iter().copied().collect()
+    };
+    assert_eq!(
+        set(delegated.group_bind()),
+        set(own.group_bind()),
+        "readable groups: exactly the principal's own"
+    );
+    assert_eq!(
+        set(Some(delegated.writable_groups())),
+        set(Some(own.writable_groups())),
+        "writable groups: exactly the principal's own"
+    );
+    assert!(
+        set(Some(delegated.writable_groups())).contains(&d.operator_group),
+        "PREMISE: the principal writes the operator's group"
+    );
+    assert!(
+        !set(delegated.group_bind()).contains(&elsewhere),
+        "the delegator's other group must not reach the delegated viewer"
+    );
+}
+
 /// The same context is refused by a session whose listener did not read the
 /// switch on (the default), and by one after the principal's link retired.
 #[sqlx::test(migrations = "../../migrations")]

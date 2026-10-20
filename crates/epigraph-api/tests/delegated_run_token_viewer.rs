@@ -399,6 +399,100 @@ async fn a_linked_agent_or_the_operator_itself_cannot_be_a_delegator(pool: PgPoo
     assert_refused("the operator itself as the delegator", as_operator);
 }
 
+/// Migration 149 binds an agent through its ONE non-revoked client. A second
+/// active client for the delegator's agent unbinds it, so the next request is
+/// refused. And the delegator cannot gain an operator link of its own: the
+/// link door refuses an allowlisted agent, and the delegation is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegator_that_gains_a_second_client_is_refused_and_cannot_gain_a_link(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "second-client").await;
+    let st = state(&pool, RunTokens::On);
+    let access = dlg_token(&st, &d);
+    assert_admitted("CALIBRATION: one client", read(&st, &access).await);
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let link =
+        epigraph_db::AgentRepository::link_operator(&mut conn, d.delegator, d.operator).await;
+    drop(conn);
+    assert!(
+        link.is_err(),
+        "the link door must refuse an allowlisted delegator: {link:?}"
+    );
+    assert_admitted("the refused link changed nothing", read(&st, &access).await);
+
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, \
+                                    legal_contact_email) \
+         VALUES ($1, 'second delegator client', 'service', ARRAY['claims:read'], 'active', $2, \
+                 'Delegation Fixture', 'ops@example.test')",
+    )
+    .bind(format!("delegation-fixture-second-{}", d.delegator))
+    .bind(d.delegator)
+    .execute(&pool)
+    .await
+    .expect("a second client for the delegator's agent");
+    assert_refused(
+        "the delegator's agent holds a second client",
+        read(&st, &access).await,
+    );
+}
+
+/// The single-token kill: revoking a delegated token by its `jti` (migration
+/// 141's denylist, what `/oauth/revoke` writes) refuses its next request,
+/// while its delegation stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_the_tokens_jti_refuses_its_next_request(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "jti").await;
+    let st = state(&pool, RunTokens::On);
+    let (access, jti) = st
+        .jwt_config
+        .issue_access_token(
+            d.delegator_client,
+            vec!["claims:read".to_string()],
+            "agent",
+            None,
+            Some(d.principal),
+            Duration::minutes(15),
+            AccessTokenBinding {
+                delegated_by: Some(d.delegator),
+                ..AccessTokenBinding::NONE
+            },
+        )
+        .expect("mint");
+    assert_admitted("CALIBRATION: before the revoke", read(&st, &access).await);
+    let revoked = epigraph_db::RevokedAccessTokenRepository::revoke(
+        &pool,
+        jti,
+        d.delegator_client,
+        chrono::Utc::now() + Duration::minutes(15),
+    )
+    .await
+    .expect("revoke the jti");
+    assert!(revoked, "PREMISE: the jti was recorded");
+    let (status, body) = read(&st, &access).await;
+    assert!(
+        status == StatusCode::UNAUTHORIZED && body.contains("revoked"),
+        "a revoked delegated token must be refused: {status} {body}"
+    );
+    assert!(
+        delegation_is_live(&pool, &d).await,
+        "PREMISE: the delegation itself is still live"
+    );
+}
+
+async fn delegation_is_live(pool: &PgPool, d: &Delegation) -> bool {
+    epigraph_db::AgentRepository::delegated_principal_pool(
+        pool,
+        RunTokens::On,
+        d.delegator,
+        d.principal,
+    )
+    .await
+    .expect("the check")
+    .is_some()
+}
+
 /// A delegator allowlisted for one operator cannot delegate to an agent linked
 /// to ANOTHER operator, even when it is also a writer of that operator's group.
 #[sqlx::test(migrations = "../../migrations")]
