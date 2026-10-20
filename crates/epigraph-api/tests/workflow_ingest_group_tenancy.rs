@@ -918,6 +918,110 @@ async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPoo
     }
 }
 
+/// A declared generation 1 that carries claims from a declared generation 0
+/// of the SAME group reuses them, and lists none: their tenancy is the
+/// declared one. A re-ingest of that generation lists none either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reused_items_omits_reused_claims_already_in_the_declared_group(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-tenancy-same-group";
+    let h = token(w.h, WRITE_SCOPES);
+    let gen0 = w
+        .api
+        .ingest_ok(
+            &h,
+            &declared(
+                extraction(name, 0, &[&["acme same-group operation"], &[]]),
+                w.og,
+                None,
+            ),
+        )
+        .await;
+    assert_eq!(reused(&gen0).len(), 0, "{gen0}");
+    let mut gen1_body = extraction(name, 1, &[&["acme same-group operation"], &[], &[]]);
+    gen1_body["source"]["parent_canonical_name"] = json!(name);
+    let gen1_body = declared(gen1_body, w.og, None);
+    let gen1 = w.api.ingest_ok(&h, &gen1_body).await;
+    assert_eq!(
+        gen1["claims_skipped_dedup"],
+        json!(4),
+        "the phase, two steps and the atom are reused: {gen1}"
+    );
+    assert_eq!(
+        reused(&gen1).len(),
+        0,
+        "all of them are already ('group', og): {gen1}"
+    );
+    let again = w.api.ingest_ok(&h, &gen1_body).await;
+    assert_eq!(again["already_ingested"], json!(true), "{again}");
+    assert_eq!(reused(&again).len(), 0, "{again}");
+}
+
+/// A reused claim the CALLER cannot read is listed with a null tenancy, even
+/// when the ingest's own system-agent stamp can read it: the response never
+/// tells a caller the owner group of a claim it cannot see. Here the fleet
+/// agent `f` (not a member of the team group `g`) declares `og`, and its plan
+/// names an operation atom that is private to `g`, which the system agent
+/// writes. Calibrated by the curator `c`, a member of `g`, which is told the
+/// atom's real tenancy for the same plan text.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reused_claim_the_caller_cannot_read_is_listed_without_its_tenancy(pool: PgPool) {
+    let w = world(&pool).await;
+    let seeded = stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction("acme-hidden-atom-owner", 0, &[&["acme hidden operation"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator seeds a g-private atom");
+    let atom: Uuid = sqlx::query_scalar(
+        "SELECT c.id FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND c.content = 'acme hidden operation'",
+    )
+    .bind(uuid_of(&seeded["workflow_id"]))
+    .fetch_one(&pool)
+    .await
+    .expect("the atom");
+
+    let out = stdio_ingest(
+        &w.f_server,
+        mcp_params(
+            extraction("acme-hidden-atom-user", 0, &[&["acme hidden operation"]]),
+            Some(w.og),
+        ),
+    )
+    .await
+    .expect("f declares og; the hidden atom is reused");
+    let listed = reused(&out);
+    assert_eq!(
+        listed.get(&atom),
+        Some(&(Value::Null, Value::Null)),
+        "the atom is listed, without the tenancy f cannot read: {out}"
+    );
+    assert!(
+        !out.to_string().contains(&w.g.to_string()),
+        "the response never names g to a non-member: {out}"
+    );
+
+    let out = stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction("acme-hidden-atom-member", 0, &[&["acme hidden operation"]]),
+            Some(w.og),
+        ),
+    )
+    .await
+    .expect("c declares og; the same atom is reused");
+    assert_eq!(
+        reused(&out).get(&atom),
+        Some(&(json!("group"), json!(w.g))),
+        "a member of g is told the atom's tenancy: {out}"
+    );
+}
+
 /// Re-ingesting an existing public `(name, generation)` with a declared
 /// tenancy changes nothing: `already_ingested`, every planned claim listed as
 /// public, no claim re-tenanted.
