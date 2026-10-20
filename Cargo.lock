@@ -1722,6 +1722,7 @@ dependencies = [
  "epigraph-ingest",
  "epigraph-ingest-executor",
  "epigraph-interfaces",
+ "futures",
  "hex",
  "http 1.4.0",
  "jsonwebtoken",

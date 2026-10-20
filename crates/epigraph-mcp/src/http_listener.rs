@@ -25,10 +25,33 @@ use rmcp::RoleServer;
 
 use crate::host_guard::{streamable_http_server_config, HostAllowlist};
 
-/// The session manager every MCP HTTP listener uses.
+/// How long an MCP HTTP session may go without a session event before rmcp
+/// ends it.
+///
+/// rmcp 2.x's default is 5 minutes (rmcp 0.15 had no timer at all). The timer
+/// is NOT an idle-client timer: rmcp's session worker re-arms it only on an
+/// inbound HTTP event or a message from the handler, and an in-flight tool
+/// call produces neither until it returns. Under the default, any single tool
+/// call that runs past 5 minutes without progress notifications ends its own
+/// session and the client never receives the result. This server has such
+/// calls (`backfill_embeddings` over thousands of claims,
+/// `sweep_semantic_duplicates`, `recompute_beliefs`, federated calls waiting
+/// on a downstream) and no tool-level timeout.
+///
+/// One hour outlasts those calls while keeping a bound on abandoned sessions
+/// (a client whose connection dropped without a `DELETE`). Sessions can only
+/// be created through the auth layer, so a longer bound does not let an
+/// unauthenticated caller grow the session table; the separate `init_timeout`
+/// (rmcp's default, 60 s) still bounds sessions that never initialize.
+pub const SESSION_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The session manager every MCP HTTP listener uses: rmcp's defaults, except
+/// `keep_alive` = [`SESSION_KEEP_ALIVE`].
 #[must_use]
 pub fn session_manager() -> LocalSessionManager {
-    LocalSessionManager::default()
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+    manager
 }
 
 /// What [`mcp_http_listener`] builds for one `--listen` address.
