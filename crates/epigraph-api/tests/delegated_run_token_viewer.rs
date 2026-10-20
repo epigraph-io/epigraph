@@ -639,6 +639,301 @@ async fn a_dlg_token_cannot_register_a_webhook(pool: PgPool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// A delegated token's `sub` is the DELEGATOR's client row (a `service` row),
+// while its `client_type` claim says `agent`. Nothing on the request path may
+// decide on that row's type: the static half finds every place that loads the
+// token's own client row or branches on a request's client type; the
+// behavioural half sends the same delegation under three different `sub` rows.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every `.rs` file under `root`, recursively.
+fn rust_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// `(file relative to crates/, byte offset)` of every occurrence of `needle`
+/// whose statement (up to the next `;`, at most 200 bytes) satisfies `hit`, in
+/// the API and MCP request-serving sources.
+fn sites(needle: &str, hit: impl Fn(&str) -> bool) -> Vec<(String, usize)> {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .to_path_buf();
+    let mut files = Vec::new();
+    for krate in ["epigraph-api", "epigraph-mcp"] {
+        rust_files(&crates.join(krate).join("src"), &mut files);
+    }
+    let mut found = Vec::new();
+    for file in files {
+        let src = std::fs::read_to_string(&file).expect("read source");
+        for (i, _) in src.match_indices(needle) {
+            let rest = &src[i..];
+            let end = rest.find(';').unwrap_or(rest.len()).min(200);
+            if hit(&rest[..end]) {
+                let rel = file
+                    .strip_prefix(&crates)
+                    .expect("under crates/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.push((rel, i));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// No request-path code decides on the type of a delegated token's `sub` row.
+///
+/// Static: the ONLY load of the token's own client row by its `sub`
+/// (`OAuthClientRepository::get_by_id*(.., auth.client_id)`) is the elevation
+/// ticket route, which first refuses a token without a refresh family (a
+/// delegated token carries none); and the ONLY branch on a request's
+/// `client_type` is the MCP elevation tools' human check, which refuses an
+/// `agent` token. Each scan is calibrated by the site it must find.
+///
+/// Behavioural: the same delegation, with `sub` set to the delegator's
+/// `service` row, to the operator's `human` row, and to an id with no row at
+/// all, gets the same answer on a viewer route and on a route without one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_code_path_branches_on_the_client_type_of_sub_for_a_dlg_token(pool: PgPool) {
+    let by_sub = |stmt: &str| {
+        [
+            "auth.client_id",
+            "ctx.client_id",
+            "auth_ctx.client_id",
+            "claims.sub",
+        ]
+        .iter()
+        .any(|arg| stmt.contains(arg))
+    };
+    let loads: Vec<String> = sites("OAuthClientRepository::get_by_id", by_sub)
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
+    assert_eq!(
+        loads,
+        vec!["epigraph-api/src/routes/elevation.rs".to_string()],
+        "the token's own client row is loaded only by the elevation ticket route (the \
+         scan is calibrated by finding it)"
+    );
+    let elevation = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/elevation.rs"),
+    )
+    .expect("elevation.rs");
+    let gate = elevation
+        .find("auth.family_id.ok_or_else")
+        .expect("the family gate");
+    let load = elevation
+        .find("OAuthClientRepository::get_by_id_conn(&mut tx, auth.client_id)")
+        .expect("the client load");
+    assert!(
+        gate < load,
+        "the elevation route refuses a token without a refresh family before it loads the \
+         client row"
+    );
+    let branches: Vec<String> = sites(".client_type ==", |stmt| {
+        stmt.starts_with(".client_type == ClientType::")
+    })
+    .into_iter()
+    .map(|(f, _)| f)
+    .collect();
+    assert_eq!(
+        branches,
+        vec!["epigraph-mcp/src/tools/elevation.rs".to_string()],
+        "a request's client type is branched on only by the MCP elevation tools (the scan \
+         is calibrated by finding them)"
+    );
+
+    let d = delegation::live_delegation(&pool, "sub-type").await;
+    let human_row: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(d.operator)
+    .fetch_one(&pool)
+    .await
+    .expect("the operator's human client row");
+    let st = state(&pool, RunTokens::On);
+    let mut answers = Vec::new();
+    for (row, sub) in [
+        ("the delegator's service row", d.delegator_client),
+        ("the operator's human row", human_row),
+        ("no row at all", Uuid::new_v4()),
+    ] {
+        let access = token_with(
+            &st,
+            sub,
+            d.principal,
+            Some(d.delegator),
+            &["claims:read", "evidence:submit"],
+        );
+        let viewer = read(&st, &access).await;
+        assert_admitted(&format!("sub = {row}: the viewer route"), viewer.clone());
+        let (status, body) = submit_evidence(&st, &access).await;
+        assert!(
+            status == StatusCode::BAD_REQUEST && body.contains("evidence_type"),
+            "sub = {row}: the route without a viewer reaches its handler: {status} {body}"
+        );
+        answers.push((row, viewer.0, status));
+    }
+    assert!(
+        answers
+            .windows(2)
+            .all(|w| (w[0].1, w[0].2) == (w[1].1, w[1].2)),
+        "the same answer whatever `sub` row the token names: {answers:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What a delegated token may WRITE is bounded by the database, not by the
+// delegator: migration 122's operator-scope rule (`OPL02`, armed) refuses a
+// claim its writing principal's operator does not write. Over HTTP, on the
+// application role, as in production.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An app-role `AppState` with a scoped pool, as `bin/server.rs` builds it,
+/// with the run-token switch as given.
+async fn app_role_state(pool: &PgPool, run_tokens: RunTokens) -> AppState {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "PREMISE: epigraph_app is subject to row security"
+    );
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let raw = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default()).with_run_tokens(run_tokens);
+    state.scoped = Some(scoped);
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    state
+}
+
+/// A claim packet authored by `author` (filed in the AUTHOR's operator group).
+fn packet(author: Uuid, content: &str) -> serde_json::Value {
+    let props = serde_json::json!({"probe": content});
+    let hash = epigraph_crypto::ContentHasher::to_hex(&epigraph_crypto::ContentHasher::hash(
+        &serde_json::to_vec(&props).expect("properties"),
+    ));
+    serde_json::json!({
+        "claim": {
+            "content": content, "initial_truth": 0.6, "agent_id": author,
+            "properties": props, "labels": ["delegated-probe"]
+        },
+        "evidence": [{
+            "content_hash": hash,
+            "evidence_type": {
+                "type": "observation", "observed_at": chrono::Utc::now().to_rfc3339(),
+                "method": "delegated_probe", "location": null
+            },
+            "raw_content": null, "signature": null
+        }],
+        "reasoning_trace": {
+            "methodology": "deductive", "explanation": "delegated probe", "confidence": 0.6,
+            "inputs": [{"type": "evidence", "index": 0}]
+        },
+        "signature": ""
+    })
+}
+
+async fn post_packet(
+    state: &AppState,
+    access: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, String) {
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/submit/packet")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+async fn owners_of(pool: &PgPool, content: &str) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_all(pool)
+        .await
+        .expect("read back")
+}
+
+/// A delegated token writes ONLY into its operator's groups. Armed, on the
+/// application role: a packet authored by the delegated principal lands in
+/// the operator's group (calibration); a packet authored by an agent of
+/// ANOTHER operator, which would be filed in that operator's group, is refused
+/// `OPL02` and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dlg_write_outside_the_operators_groups_is_refused_opl02(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "opl02").await;
+    let (other, _) = delegation::human_operator(&pool, "opl02-other-operator").await;
+    let foreign = delegation::linked_principal(&pool, other, "opl02-foreign").await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT armed_now FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm the operator binding");
+        (conn, ())
+    })
+    .await;
+    let st = app_role_state(&pool, RunTokens::On).await;
+    let access = token_with(
+        &st,
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read", "claims:write", "evidence:submit"],
+    );
+
+    let inside = format!("delegated packet inside {}", Uuid::new_v4());
+    let (status, body) = post_packet(&st, &access, &packet(d.principal, &inside)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "CALIBRATION: a delegated write into the operator's group: {body}"
+    );
+    assert_eq!(owners_of(&pool, &inside).await, vec![d.operator_group]);
+
+    let outside = format!("delegated packet outside {}", Uuid::new_v4());
+    let (status, body) = post_packet(&st, &access, &packet(foreign, &outside)).await;
+    assert!(
+        status == StatusCode::FORBIDDEN && body.contains("OPL02"),
+        "a delegated write outside the operator's groups must be refused OPL02: {status} {body}"
+    );
+    assert!(
+        owners_of(&pool, &outside).await.is_empty(),
+        "the refused write left a row"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Webhooks stay refused. A subscription is keyed on its PRINCIPAL, not on the
 // token that registered it, so a delegated identity must never receive
 // long-lived deliveries: `routes/webhooks.rs::agent_is_not_operated` keeps
