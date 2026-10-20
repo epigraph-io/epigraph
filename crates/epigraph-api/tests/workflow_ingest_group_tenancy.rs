@@ -26,7 +26,9 @@
 //!   generation, a shared operation atom, a whole re-ingest) whose tenancy is
 //!   not `('group', G)` is listed in `reused_items`, with its tenancy. Nothing
 //!   re-tenants it.
-//! * `embed: false` writes no claim embedding and no goal embedding.
+//! * `embed: false` makes no embedding call and writes no claim embedding and
+//!   no goal embedding, on REST and on stdio MCP (the stdio servers here embed
+//!   through a counting generator, `McpEmbedder::with_generator`).
 //! * A plan that reuses a claim private to a group the caller does not write
 //!   is refused before any edge is written: those edges would be owned by that
 //!   group and written on the system agent's stamp.
@@ -223,9 +225,21 @@ fn declared(mut body: Value, group: Uuid, embed: Option<bool>) -> Value {
 /// The MCP tool's parameters: the extraction under `extraction`, the tenancy
 /// beside it. Built from JSON, as a client sends them.
 fn mcp_params(extraction: Value, group: Option<Uuid>) -> epigraph_mcp::types::IngestWorkflowParams {
+    mcp_params_embed(extraction, group, None)
+}
+
+/// [`mcp_params`] with an explicit `embed`.
+fn mcp_params_embed(
+    extraction: Value,
+    group: Option<Uuid>,
+    embed: Option<bool>,
+) -> epigraph_mcp::types::IngestWorkflowParams {
     let mut params = json!({ "extraction": extraction });
     if let Some(g) = group {
         params["tenancy"] = json!({"visibility": "group", "owner_group_id": g});
+    }
+    if let Some(embed) = embed {
+        params["embed"] = json!(embed);
     }
     serde_json::from_value(params).expect("the tool's parameters")
 }
@@ -272,6 +286,28 @@ async fn row_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
     .fetch_one(pool)
     .await
     .expect("row counts")
+}
+
+/// `(planned claims, of them embedded, goal embedded)` for the workflow `out`
+/// names.
+async fn embedding_state(pool: &PgPool, out: &Value) -> (i64, i64, bool) {
+    let wf = uuid_of(&out["workflow_id"]);
+    let ids: Vec<Uuid> = plan_ids(pool, wf).await.into_iter().collect();
+    let (all, embedded): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE embedding IS NOT NULL) \
+           FROM claims WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_one(pool)
+    .await
+    .expect("embedding counts");
+    let goal: bool =
+        sqlx::query_scalar("SELECT goal_embedding IS NOT NULL FROM workflows WHERE id = $1")
+            .bind(wf)
+            .fetch_one(pool)
+            .await
+            .expect("goal embedding");
+    (all, embedded, goal)
 }
 
 /// Every `(claim id, visibility, owner group)` the workflow executes.
@@ -404,9 +440,23 @@ async fn add_member(pool: &PgPool, g: Uuid, agent: Uuid, role: &str) {
     .unwrap_or_else(|e| panic!("the {role} row: {e}"));
 }
 
+/// The number of texts a stdio server's embedder was asked to embed.
+type EmbedCalls = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+fn embed_calls(calls: &EmbedCalls) -> usize {
+    calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// An app-role stdio MCP server whose own agent is keyed by `seed`, as a
-/// container's `epigraph-mcp` is.
-async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMcpFull {
+/// container's `epigraph-mcp` is. Its embedder stores through the production
+/// author-stamped path, but its provider is a counting generator
+/// (`McpEmbedder::with_generator`): every text it is asked to embed is
+/// counted, and a fixed 1536-dimension vector is returned, so a test can tell
+/// "no text reached the provider" from "every claim was embedded".
+async fn mcp_server(
+    pool: &PgPool,
+    seed: u8,
+) -> (epigraph_mcp::server::EpiGraphMcpFull, EmbedCalls) {
     let url = fixture::database_url_for(pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
@@ -414,10 +464,17 @@ async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMc
             .expect("app-role ScopedPool");
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
     let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
-    let embedder =
-        epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
-    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
-        .with_scoped_pool(scoped)
+    let calls: EmbedCalls = std::sync::Arc::default();
+    let counter = calls.clone();
+    let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(move |_text: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.5_f32; 1536])
+        }));
+    let server = epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped);
+    (server, calls)
 }
 
 /// The stdio server's own agent, created by its first viewer resolution.
@@ -511,6 +568,8 @@ struct World {
     g: Uuid,
     c: Uuid,
     c_server: epigraph_mcp::server::EpiGraphMcpFull,
+    /// Texts `c_server`'s embedder was asked to embed.
+    c_embeds: EmbedCalls,
     f: Uuid,
     f_server: epigraph_mcp::server::EpiGraphMcpFull,
 }
@@ -535,10 +594,10 @@ async fn world(pool: &PgPool) -> World {
     )
     .await;
     link(pool, system, h).await;
-    let c_server = mcp_server(pool, 0xC1).await;
+    let (c_server, c_embeds) = mcp_server(pool, 0xC1).await;
     let c = stdio_agent(pool, &c_server, 0xC1).await;
     link(pool, c, h).await;
-    let f_server = mcp_server(pool, 0xF1).await;
+    let (f_server, _) = mcp_server(pool, 0xF1).await;
     let f = stdio_agent(pool, &f_server, 0xF1).await;
     link(pool, f, h).await;
     let g = team_group(pool, h).await;
@@ -555,6 +614,7 @@ async fn world(pool: &PgPool) -> World {
         g,
         c,
         c_server,
+        c_embeds,
         f,
         f_server,
     }
@@ -1157,26 +1217,6 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
 async fn embed_false_writes_no_embedding(pool: PgPool) {
     let w = world(&pool).await;
     let h = token(w.h, WRITE_SCOPES);
-    async fn embedding_state(pool: &PgPool, out: &Value) -> (i64, i64, bool) {
-        let wf = uuid_of(&out["workflow_id"]);
-        let ids: Vec<Uuid> = plan_ids(pool, wf).await.into_iter().collect();
-        let (all, embedded): (i64, i64) = sqlx::query_as(
-            "SELECT count(*), count(*) FILTER (WHERE embedding IS NOT NULL) \
-               FROM claims WHERE id = ANY($1)",
-        )
-        .bind(&ids)
-        .fetch_one(pool)
-        .await
-        .expect("embedding counts");
-        let goal: bool =
-            sqlx::query_scalar("SELECT goal_embedding IS NOT NULL FROM workflows WHERE id = $1")
-                .bind(wf)
-                .fetch_one(pool)
-                .await
-                .expect("goal embedding");
-        (all, embedded, goal)
-    }
-
     let provider_tokens = |api: &Api| api.embedder.token_usage().total_tokens;
     w.api.embedder.reset_token_usage();
     let calibration = w
@@ -1241,6 +1281,81 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
         0,
         "embed:false without tenancy calls no provider"
     );
+}
+
+/// The stdio MCP transport, which is the curator's (an operated agent has no
+/// HTTP authority): with `embed` absent every claim the call created and the
+/// workflow goal are embedded, ONE provider call each, and a DECLARED group's
+/// claims are stored too (through their known author: the embedder's
+/// public-reader store path cannot resolve a group-private claim's author).
+/// `embed: false` makes no provider call at all and stores no vector, with and
+/// without a declared tenancy. The call count is the counting generator's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_ingest_embeds_every_created_claim_unless_embed_is_false(pool: PgPool) {
+    let w = world(&pool).await;
+    for (name, group) in [
+        ("acme-stdio-embed-declared", Some(w.g)),
+        ("acme-stdio-embed-public", None),
+    ] {
+        let label = if group.is_some() {
+            "declared"
+        } else {
+            "public"
+        };
+        let start = embed_calls(&w.c_embeds);
+        let on = stdio_ingest(
+            &w.c_server,
+            mcp_params(extraction(name, 0, &[&[&format!("{name} op")]]), group),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{label}: embed absent: {e}"));
+        let (all, embedded, goal) = embedding_state(&pool, &on).await;
+        assert_eq!(all, 3, "{label}: the phase, the step and the atom");
+        assert_eq!(
+            (embedded, goal),
+            (3, true),
+            "{label}: embed absent stores every claim vector and the goal's"
+        );
+        assert_eq!(
+            embed_calls(&w.c_embeds) - start,
+            4,
+            "{label}: one provider call per created claim, and one for the goal"
+        );
+        if let Some(g) = group {
+            assert!(
+                plan_tenancy(&pool, uuid_of(&on["workflow_id"]))
+                    .await
+                    .iter()
+                    .all(|(_, v, o)| v == "group" && *o == g),
+                "the embedded claims are the group-private ones"
+            );
+        }
+
+        let off_name = format!("{name}-off");
+        let start = embed_calls(&w.c_embeds);
+        let off = stdio_ingest(
+            &w.c_server,
+            mcp_params_embed(
+                extraction(&off_name, 0, &[&[&format!("{off_name} op")]]),
+                group,
+                Some(false),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{label}: embed false: {e}"));
+        let (all, embedded, goal) = embedding_state(&pool, &off).await;
+        assert_eq!(all, 3, "{label}: embed:false still writes the plan");
+        assert_eq!(
+            (embedded, goal),
+            (0, false),
+            "{label}: embed:false stores no vector"
+        );
+        assert_eq!(
+            embed_calls(&w.c_embeds) - start,
+            0,
+            "{label}: embed:false sends no text to the provider"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
