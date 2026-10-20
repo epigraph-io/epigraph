@@ -666,11 +666,11 @@ async fn unauthenticated_writes_opt_in_passes_the_scope_gate() {
 
 // ─── Tests 6-10: Host/Origin allowlist (DNS-rebinding guard) ──────────────
 //
-// The workspace pins rmcp 0.15, whose StreamableHttpServerConfig has no
-// allowed_hosts/allowed_origins knob and which validates neither header (that
-// landed in rmcp 1.4.0, CVE-2026-42559 class). A browser on the listener's host
-// loading a hostile page whose DNS rebinds to 127.0.0.1:<port> could therefore
-// reach /mcp and drive every tool. `host_guard` closes that at the header level.
+// A browser on the listener's host loading a hostile page whose DNS rebinds to
+// 127.0.0.1:<port> could reach /mcp and drive every tool (CVE-2026-42559 class).
+// `host_guard` closes that at the header level, outside auth; rmcp (>= 1.4)
+// also checks Host inside the service, and `streamable_http_server_config`
+// feeds that check the same allowlist.
 //
 // Driven through `tower::ServiceExt::oneshot` rather than a live socket: reqwest
 // rewrites `Host` from the request URL, so a live-server test could not actually

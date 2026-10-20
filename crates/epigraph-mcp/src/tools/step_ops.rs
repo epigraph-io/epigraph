@@ -2,7 +2,7 @@
 //! [`epigraph_ingest_executor::workflow_steps`]; this module is a thin
 //! parameter/response shim for the MCP tool surface.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub struct DeleteStepResponse {
 }
 
 fn success_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }

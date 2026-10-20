@@ -12,7 +12,7 @@ mod fixture;
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::types::RecomputeBeliefsParams;
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -24,8 +24,8 @@ fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 
 fn result_json(out: rmcp::model::CallToolResult) -> serde_json::Value {
     let first = out.content.first().cloned().expect("first content");
-    let text = match first.raw {
-        RawContent::Text(t) => t.text,
+    let text = match first {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text content, got {other:?}"),
     };
     serde_json::from_str(&text).expect("result is JSON")

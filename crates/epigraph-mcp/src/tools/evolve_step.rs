@@ -6,7 +6,7 @@
 //! use `revises` for a concurrent branch sharing a common ancestor. The new
 //! claim shares the same `step_lineage_id` as the parent.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -198,7 +198,7 @@ pub async fn evolve_step(
 }
 
 fn success_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
