@@ -229,7 +229,7 @@ Return 3-8 claims."#,
             // already in the graph is skipped without paying for an embedding.
             // `insert_unless_hash_exists` repeats the find, so this check is an
             // optimization, not the dedup.
-            let exists: Option<(i64,)> =
+            let exists: Option<(i32,)> =
                 sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
                     .bind(content_hash.as_slice())
                     .fetch_optional(&pool)
@@ -369,7 +369,7 @@ async fn insert_unless_hash_exists(
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
 
-    let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
         .bind(content_hash.as_slice())
         .fetch_optional(&mut *conn)
         .await?;
@@ -559,6 +559,37 @@ mod dedup_race_tests {
             r2, None,
             "caller 2 ran after caller 1 committed, so it must skip the existing content"
         );
+    }
+
+    /// A run over content that is already in the graph skips it. The probe
+    /// is `SELECT 1`, an INT4: decoding it as anything wider failed every
+    /// time a match existed, so a known result aborted the run instead.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_second_run_over_known_content_skips_it(pool: PgPool) {
+        let (agent_id, decl) = seed_author(&pool).await;
+        let content = format!("method_search sequential {}", Uuid::new_v4());
+        let embedding = embedding_literal();
+        let claim = WebSearchClaim {
+            content: &content,
+            truth_value: 0.8,
+            properties: serde_json::json!({ "source": "web_search" }),
+            embedding: &embedding,
+        };
+        let mut conn = pool.acquire().await.expect("acquire");
+        let first = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+            .await
+            .expect("first run");
+        assert!(first.is_some(), "the first run inserts the new content");
+        let second = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+            .await
+            .expect("a second run over known content must not error");
+        assert_eq!(second, None, "the second run skips the known content");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+        assert_eq!(rows, 1);
     }
 
     /// Two runs of the binary over the same search result.
