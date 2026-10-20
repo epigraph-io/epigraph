@@ -90,6 +90,9 @@ fn uuid_of(v: &Value) -> Uuid {
 
 struct Api {
     router: axum::Router,
+    /// The router's embedding service, kept so a test can count its calls:
+    /// `MockProvider` adds every text it embeds to its token usage.
+    embedder: std::sync::Arc<MockProvider>,
 }
 
 impl Api {
@@ -110,16 +113,17 @@ impl Api {
             ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
                 .await
                 .expect("app-role ScopedPool");
-        let embedder: std::sync::Arc<dyn EmbeddingService> =
-            std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+        let embedder = std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+        let service: std::sync::Arc<dyn EmbeddingService> = embedder.clone();
         let state = AppState::with_scoped_pool(scoped, ApiConfig::default())
-            .with_embedding_service(embedder);
+            .with_embedding_service(service);
         state
             .load_entity_type_cache()
             .await
             .expect("load the entity-type cache");
         Self {
             router: epigraph_api::routes::create_router(state),
+            embedder,
         }
     }
 
@@ -1091,9 +1095,10 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
         .all(|(_, v, o)| v == "public" && *o == w.og));
 }
 
-/// `embed: false` writes no claim embedding and no goal embedding, with and
-/// without a declared tenancy. Calibrated by the default (`embed` absent),
-/// which embeds every claim on the same mock-embedder API.
+/// `embed: false` makes no embedding call and writes no claim or goal
+/// embedding, with and without a declared tenancy. Calibrated by the default
+/// (`embed` absent), which calls the provider and embeds every claim on the
+/// same mock-embedder API. The call count is the provider's token usage.
 #[sqlx::test(migrations = "../../migrations")]
 async fn embed_false_writes_no_embedding(pool: PgPool) {
     let w = world(&pool).await;
@@ -1118,6 +1123,8 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
         (all, embedded, goal)
     }
 
+    let provider_tokens = |api: &Api| api.embedder.token_usage().total_tokens;
+    w.api.embedder.reset_token_usage();
     let calibration = w
         .api
         .ingest_ok(
@@ -1134,7 +1141,12 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
         all == 3 && embedded == all && goal,
         "calibration embeds: {all} {embedded} {goal}"
     );
+    assert!(
+        provider_tokens(&w.api) > 0,
+        "the calibration called the provider"
+    );
 
+    w.api.embedder.reset_token_usage();
     let declared_off = w
         .api
         .ingest_ok(
@@ -1153,7 +1165,13 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
         (0, false),
         "embed:false with tenancy embeds nothing"
     );
+    assert_eq!(
+        provider_tokens(&w.api),
+        0,
+        "embed:false with tenancy calls no provider"
+    );
 
+    w.api.embedder.reset_token_usage();
     let mut public_off = extraction("acme-embed-off-public", 0, &[&["acme embed off public op"]]);
     public_off["embed"] = json!(false);
     let public_off = w.api.ingest_ok(&h, &public_off).await;
@@ -1163,6 +1181,11 @@ async fn embed_false_writes_no_embedding(pool: PgPool) {
         (embedded, goal),
         (0, false),
         "embed:false without tenancy embeds nothing"
+    );
+    assert_eq!(
+        provider_tokens(&w.api),
+        0,
+        "embed:false without tenancy calls no provider"
     );
 }
 
