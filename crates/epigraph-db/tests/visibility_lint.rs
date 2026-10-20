@@ -2103,6 +2103,28 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
          `IngestTx::owner_decl`, which refuses the ingest when it is false.",
     ),
+    // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
+    // the raw pool onto the route's stamped transaction.
+    (
+        "triple.rs",
+        "batch_create_mentions",
+        "WRITE of `entity_mentions` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_mentions` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `entity_mentions_tenancy`'s WITH CHECK applies on the \
+         stamped connection. An INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "triple.rs",
+        "batch_create_triples",
+        "WRITE of `triples` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_triples` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `triples_tenancy`'s WITH CHECK applies on the stamped \
+         connection. An INSERT has no read for a viewer marker to filter.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -2642,6 +2664,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          shard 7 widened the executor only. The SQL, its two binds and the projected row shape \
          are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
          in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
+    ),
+    (
+        "entity.rs",
+        "upsert",
+        "WRITE of one `entities` row (insert, or merge on the canonical `(lower(name), type_top)` \
+         pair). `entities` is the instance-wide RDF dictionary: no `visibility` / \
+         `owner_group_id` column and row security off, the posture `entity.rs::get` records above, \
+         so there is no predicate to splice and no policy to select. Widened from `&PgPool` so \
+         `routes/entities.rs::create_entity` writes on the caller's STAMPED transaction (backlog \
+         850dcc61), which refuses an elevated read-only token; the SQL is unchanged and the \
+         engine tests' `&PgPool` callers still satisfy the bound.",
     ),
     // ── FIVE MORE WRITES, from the conversion of the MCP tools PR #494 left
     // unconverted. Same argument as the three writes at the top of this
