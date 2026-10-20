@@ -13,11 +13,15 @@
 //! * an agent bound to the submitting human (allowlisted, through the real HTTP
 //!   viewer; live-linked, at the gate) is refused, while the human, the
 //!   submitter's operator, is admitted;
-//! * the new head, which no workflow executes directly, is still gated;
+//! * the new head, which no workflow executes directly, is still gated, and
+//!   the submitter still evolves it;
+//! * a step two workflows execute needs authority over both;
+//! * a retracted `executes` edge still counts;
 //! * a server built without a `ScopedPool` gates too;
 //! * the audited admin arm is admitted and recorded; a grantless admin is
 //!   refused ADM02;
-//! * stdio is unchanged (the batch H-b bar, as for the other workflow tools).
+//! * stdio is unchanged (the batch H-b bar, as for the other workflow tools),
+//!   and so is an authenticated evolve of a claim no workflow executes.
 //!
 //! The decision and the record are Rust-side and data-driven, so the superuser
 //! harness observes them faithfully. Whether row security lets the gate SEE
@@ -292,6 +296,211 @@ async fn an_authenticated_stranger_cannot_evolve_an_executed_step(pool: PgPool) 
         "was submitted by agent",
     )
     .await;
+
+    // CALIBRATION: the submitter still evolves the unexecuted head, recorded
+    // against the workflow; the gate admits through the lineage rather than
+    // freezing executed heads.
+    let res = tools::evolve_step::evolve_step(
+        &server,
+        &owner_viewer,
+        by_id(head, "the submitter's revision of the head", "revises"),
+        Some(&owner_token),
+    )
+    .await
+    .expect("the submitter evolves the unexecuted head");
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), 2, "exactly one new row: {rows:?}");
+    let d = &rows[1].1;
+    assert_eq!(d["workflow_id"], wf.to_string(), "{d}");
+    assert_eq!(d["arm"], "submitter", "{d}");
+    assert_eq!(d["write"]["parent_claim_id"], head.to_string(), "{d}");
+    assert_eq!(d["write"]["claim_id"], claim_id(&res).to_string(), "{d}");
+}
+
+/// Executes `step` from workflow `wf` as well (harness edge).
+async fn also_executes(pool: &PgPool, wf: Uuid, step: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'workflow', $2, 'claim', 'executes')",
+    )
+    .bind(wf)
+    .bind(step)
+    .execute(pool)
+    .await
+    .expect("the second workflow executes the step");
+}
+
+/// A step two workflows execute, over the authenticated transport: each
+/// submitter is refused naming the OTHER workflow (so a gate that stops after
+/// the first workflow it admits is caught whichever id sorts first). With
+/// authority over both the evolve is admitted and recorded once per workflow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_step_two_workflows_execute_needs_authority_over_both(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (a, a_token, a_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_b, b_token, b_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (wf_a, step) = ingest_as(
+        &server,
+        &pool,
+        "acme-mcp-evolve-shared",
+        &a_viewer,
+        &a_token,
+    )
+    .await;
+    let (wf_b, _) = ingest_as(
+        &server,
+        &pool,
+        "acme-mcp-evolve-shared-b",
+        &b_viewer,
+        &b_token,
+    )
+    .await;
+    also_executes(&pool, wf_b, step).await;
+
+    assert_refused(
+        &server,
+        &pool,
+        &a_viewer,
+        &a_token,
+        by_id(step, "the first submitter's revision", "revises"),
+        step,
+        wf_b,
+        "was submitted by agent",
+    )
+    .await;
+    assert_refused(
+        &server,
+        &pool,
+        &b_viewer,
+        &b_token,
+        by_id(step, "the second submitter's revision", "revises"),
+        step,
+        wf_a,
+        "was submitted by agent",
+    )
+    .await;
+    assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
+
+    // CALIBRATION: authority over both.
+    set_submitter(&pool, wf_b, a).await;
+    let res = tools::evolve_step::evolve_step(
+        &server,
+        &a_viewer,
+        by_id(step, "a revision both allow", "revises"),
+        Some(&a_token),
+    )
+    .await
+    .expect("authority over both workflows");
+    let new = claim_id(&res).to_string();
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    let mut recorded: Vec<String> = rows
+        .iter()
+        .map(|(_, d)| {
+            assert_eq!(d["write"]["parent_claim_id"], step.to_string(), "{d}");
+            assert_eq!(d["write"]["claim_id"], new, "{d}");
+            d["workflow_id"].as_str().expect("id").to_string()
+        })
+        .collect();
+    recorded.sort();
+    let mut want = vec![wf_a.to_string(), wf_b.to_string()];
+    want.sort();
+    assert_eq!(recorded, want, "one provenance row per workflow");
+}
+
+/// A retracted `executes` edge still counts over the authenticated transport:
+/// the stranger is refused naming the workflow, and the submitter is still
+/// admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_executes_edge_still_gates_the_evolve(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_o, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_s, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (wf, step) = ingest_as(
+        &server,
+        &pool,
+        "acme-mcp-evolve-retracted",
+        &owner_viewer,
+        &owner_token,
+    )
+    .await;
+    let retracted = sqlx::query(
+        "UPDATE edges SET valid_to = now() \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes' \
+            AND valid_to IS NULL",
+    )
+    .bind(wf)
+    .bind(step)
+    .execute(&pool)
+    .await
+    .expect("retract the executes edge")
+    .rows_affected();
+    assert_eq!(retracted, 1, "calibration: the executes edge is retracted");
+
+    assert_refused(
+        &server,
+        &pool,
+        &stranger_viewer,
+        &stranger_token,
+        by_id(
+            step,
+            "a stranger's revision after the retraction",
+            "revises",
+        ),
+        step,
+        wf,
+        "was submitted by agent",
+    )
+    .await;
+    tools::evolve_step::evolve_step(
+        &server,
+        &owner_viewer,
+        by_id(
+            step,
+            "the submitter's revision after the retraction",
+            "revises",
+        ),
+        Some(&owner_token),
+    )
+    .await
+    .expect("the submitter is still admitted");
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["workflow_id"], wf.to_string(), "{}", rows[0].1);
+}
+
+/// A claim no workflow executes is evolved over the authenticated transport
+/// exactly as before, twice (the second on the new head, so the lineage read
+/// runs over a real `step_lineage_id`), and nothing is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_authenticated_evolve_of_a_claim_no_workflow_executes_is_unaffected(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (caller, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let plain =
+        fixture::seed_public_claim(&pool, caller, "a plain claim no workflow executes").await;
+
+    let res = tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        by_id(plain, "the plain claim, revised", "revises"),
+        Some(&token),
+    )
+    .await
+    .expect("a claim no workflow executes is evolved");
+    let head = claim_id(&res);
+    tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        by_id(head, "the plain claim, superseded", "supersedes"),
+        Some(&token),
+    )
+    .await
+    .expect("and its new head too");
+    assert_eq!(
+        claims_with_content(&pool, "the plain claim, superseded").await,
+        1
+    );
+    assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
+    assert!(evolve_rows(&pool, ADMIN_WRITE).await.is_empty());
 }
 
 /// The operator ruling (2026-10-13) applies to `evolve_step`: on a workflow
