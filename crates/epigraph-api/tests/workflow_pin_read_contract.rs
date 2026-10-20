@@ -45,12 +45,13 @@
 //!   ended the documented way (its writer row in the operator group revoked),
 //!   `operator_of_author` still names the FIRST operator, who keeps the
 //!   operator arm over the curator's workflows on REST and on MCP, and the
-//!   second human never gains it. A linked curator itself holds no HTTP
-//!   authority (operated agents are stdio-only), before or after the
-//!   revocation.
+//!   second human never gains it. A linked curator cannot publish over REST:
+//!   the ingest route refuses its token, before and after the acting link
+//!   ends.
 //! * (f) Who can publish once operator binding is ARMED, with the ingest
 //!   system agent live-linked to the first human: that human over REST; its
-//!   linked curator over stdio only; an unlinked curator nowhere over REST
+//!   linked curator over stdio (the REST ingest refuses its token); an
+//!   unlinked curator nowhere over REST
 //!   (`OPL01`); and a curator of a SECOND human nowhere (`OPL02` over stdio,
 //!   nothing written). A curator re-linked to the second human cannot be
 //!   constructed, as in (e).
@@ -933,7 +934,7 @@ async fn mcp_add_step(
     .map_err(|e| e.message.to_string())
 }
 
-/// The REST refusal of an operated agent's token.
+/// The REST ingest's refusal of an operated agent's token.
 fn assert_operated_refusal(status: StatusCode, body: &Value, what: &str) {
     assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
     assert!(
@@ -946,13 +947,13 @@ fn assert_operated_refusal(status: StatusCode, body: &Value, what: &str) {
 /// because no shipped path can make one: both link definers refuse a second
 /// operator and neither application role can write `operator_links`.
 ///
-/// The curator ingests over REST while UNLINKED: a linked (operated) agent
-/// holds no HTTP authority at all, which the test also pins. Once linked, its
+/// The curator ingests over REST while UNLINKED, because once linked the
+/// REST ingest refuses its token (the test pins that too). Once linked, its
 /// first operator holds the operator arm over its workflow. Ending the
 /// curator's acting link the documented way (revoking its writer row in the
 /// operator group) leaves `operator_of_author` on the FIRST operator, so that
 /// human keeps the operator arm, on REST and on MCP, the second human never
-/// gets it, and the curator itself stays refused on HTTP.
+/// gets it, and the REST ingest still refuses the curator's token.
 #[sqlx::test(migrations = "../../migrations")]
 async fn workflow_authority_keeps_the_first_operator_because_a_relink_is_refused(pool: PgPool) {
     let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
@@ -1080,9 +1081,9 @@ async fn plan_owners(pool: &PgPool, name: &str) -> Vec<Uuid> {
 /// * the first human itself, over REST;
 /// * NOT an unlinked curator over REST: the ingest's caller check refuses an
 ///   unbound caller (`OPL01`);
-/// * NOT a curator linked to the first human over REST: an operated agent
-///   holds no HTTP authority. Over stdio it publishes, into the first human's
-///   group;
+/// * NOT a curator linked to the first human over REST: the REST ingest
+///   refuses an operated agent's token. Over stdio it publishes, into the
+///   first human's group;
 /// * NOT a curator linked to a SECOND human, on any transport: over stdio the
 ///   caller check refuses it `OPL02` (it must belong to the system agent's
 ///   human), and it writes nothing. This is the nearest shipped shape of "a
@@ -1142,7 +1143,8 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
     assert!(b.to_string().contains("OPL01"), "{b}");
     assert_eq!(workflows_named(&pool, "acme-armed-unlinked").await, 0);
 
-    // The first human's curator: no HTTP authority; publishes over stdio.
+    // The first human's curator: refused by the REST ingest; publishes over
+    // stdio.
     let (s, b) = api
         .post(
             "/api/v1/workflows/ingest",
