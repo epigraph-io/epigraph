@@ -1726,6 +1726,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          own transaction so the row authority-checked is the row linked.",
     ),
     (
+        "workflow.rs",
+        "workflows_executing_step_lineage",
+        "AUTHORITY READ of `edges` (`executes`), `claims` (the parent's `step_lineage_id` \
+         siblings) and `workflows` (no row security), for the `evolve_step` gate: it returns the \
+         workflows the caller must hold workflow authority over, so a spliced viewer predicate \
+         could only DROP workflows from that set, which makes the gate fail open, never safer. \
+         Both callers run it on the caller's own stamped write transaction (MCP \
+         `begin_author_stamped_tx`, REST `begin_claim_write`), before the act it gates, so row \
+         security on that connection still applies; the residual it leaves (lineage members \
+         split across tenancies out of band) is stated on the function. Returns workflow ids \
+         only, never content.",
+    ),
+    (
         "system_agent.rs",
         "lookup",
         "READ of migration 148's `system_agents` row for one role, with \
