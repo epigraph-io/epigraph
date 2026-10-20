@@ -520,6 +520,52 @@ pub struct SupersedeEdgeMigration {
 pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] =
     &["executes", "step_follows", "phase_follows", "revises"];
 
+/// Relationships every replacement of a NON-PUBLIC claim leaves on the retired
+/// claim, in either direction: a supersession ([`migrate_superseded_edges`]),
+/// a dedup ([`repair_marked_duplicate`]) and a merge
+/// ([`migrate_consolidated_edges`]), whether or not the pair shares a step
+/// lineage (OD-32).
+///
+/// `executes` names the steps of a FROZEN workflow generation, and a pinned
+/// group-private generation is verified against exactly those edges (their
+/// `plan_index`, and each target's id and content). A plain `supersede_claim`
+/// writes no `step_lineage_id`, so [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] never
+/// applies to it, and the dedup and merge paths have no lineage rule at all:
+/// without this set, each of them re-points (a merge of two executed steps also
+/// retracts) the edge and the generation no longer verifies. A non-public
+/// step's content changes only through a new generation.
+///
+/// The rule is read from the retired claim's row (`visibility <> 'public'`, a
+/// missing row counting as non-public), never from a caller flag, because the
+/// deferred replay of each cascade runs the same function knowing nothing of
+/// the original caller. A PUBLIC claim keeps the previous behaviour.
+pub(crate) const NON_PUBLIC_FROZEN_RELATIONSHIPS: &[&str] = &["executes"];
+
+/// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] when `claim` is not public (or has no
+/// row), else nothing: the relationships a replacement of `claim` must leave
+/// on it.
+async fn non_public_frozen_relationships(
+    conn: &mut sqlx::PgConnection,
+    claim: Uuid,
+) -> Result<Vec<String>, DbError> {
+    let non_public: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the retired claim for the edge migration that follows.
+        SELECT NOT EXISTS (
+            SELECT 1 FROM claims WHERE id = $1 AND visibility::text = 'public')"#,
+    )
+    .bind(claim)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(if non_public {
+        NON_PUBLIC_FROZEN_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    })
+}
+
 /// Relationships an AGENT holds on a step that a step-lineage supersession
 /// leaves on the retired step (incoming edges with `source_type = 'agent'`).
 ///
@@ -577,6 +623,10 @@ async fn require_privileged_session(
 /// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
 /// derived from the rows, not from a caller flag, because the deferred replay
 /// runs this same function knowing nothing of the original caller.
+///
+/// A supersession of a NON-PUBLIC claim also leaves
+/// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
+/// frozen group-private workflow generation keeps its plan (OD-32).
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -610,7 +660,12 @@ async fn migrate_superseded_edges(
             Vec::new()
         }
     };
-    let frozen = step_lineage_set(STEP_LINEAGE_FROZEN_RELATIONSHIPS);
+    let mut frozen = step_lineage_set(STEP_LINEAGE_FROZEN_RELATIONSHIPS);
+    for rel in non_public_frozen_relationships(&mut *conn, old_uuid).await? {
+        if !frozen.contains(&rel) {
+            frozen.push(rel);
+        }
+    }
     let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
@@ -5352,9 +5407,24 @@ impl ClaimRepository {
     /// (the lineage's branch history, like `supersedes`) and agents'
     /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
     /// caller, not by the agents that asserted the old content) on the retired
-    /// step. A supersession made here writes no `step_lineage_id`, so it moves
-    /// all of them as before. The rule is read from the rows, because the
-    /// deferred replay knows nothing of the original caller.
+    /// step. A supersession made here writes no `step_lineage_id`, so the
+    /// lineage rule does not apply to it. The rule is read from the rows,
+    /// because the deferred replay knows nothing of the original caller.
+    ///
+    /// ## Non-public steps keep their `executes` (OD-32)
+    ///
+    /// Whatever the lineage, a supersession of a claim whose `visibility` is
+    /// not `public` leaves `executes`
+    /// ([`NON_PUBLIC_FROZEN_RELATIONSHIPS`]) on the retired claim, in either
+    /// direction. That edge is how a frozen workflow generation names its
+    /// steps, and a pinned group-private generation is verified against it, so
+    /// a plain supersede (which writes no lineage) must not re-point it. The
+    /// dedup and merge cascades apply the same rule. The workflow keeps
+    /// executing the retired step until a new generation is published; the
+    /// chain edges `step_follows` / `phase_follows` still move as before
+    /// outside a step lineage. A public step's `executes` moves as before. The
+    /// rule is read from the old claim's row, so the deferred replay gives the
+    /// same result.
     ///
     /// ## Self-loop guards — deliberately unreachable
     ///
@@ -9681,17 +9751,36 @@ async fn migrate_consolidated_edges(
     // interior to the merge (both endpoints inside the source set) — those
     // would collapse to merged→merged self-loops. A retracted edge stays where
     // it is: it is history, and leaving it makes a second run a no-op.
+    //
+    // A NON-PUBLIC source keeps its `executes` edges
+    // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
+    // frozen workflow generation, so they are neither moved nor retracted as
+    // a redundant copy. The test is on the source endpoint's own row (a
+    // missing row counting as non-public), so the deferred replay gives the
+    // same result.
+    let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT id, source_id, target_id, source_type, target_type, relationship
-        FROM edges
-        WHERE relationship != 'supersedes'
-          AND valid_to IS NULL
-          AND ( (source_id = ANY($1) AND source_type = 'claim')
-             OR (target_id = ANY($1) AND target_type = 'claim') )
-        ORDER BY created_at, id"#,
+        SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
+        FROM edges e
+        WHERE e.relationship != 'supersedes'
+          AND e.valid_to IS NULL
+          AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
+             OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
+          AND NOT ( e.relationship = ANY($2) AND (
+                  (e.source_id = ANY($1) AND e.source_type = 'claim'
+                   AND NOT EXISTS (SELECT 1 FROM claims c
+                                    WHERE c.id = e.source_id AND c.visibility::text = 'public'))
+               OR (e.target_id = ANY($1) AND e.target_type = 'claim'
+                   AND NOT EXISTS (SELECT 1 FROM claims c
+                                    WHERE c.id = e.target_id AND c.visibility::text = 'public')) ) )
+        ORDER BY e.created_at, e.id"#,
     )
     .bind(source_ids)
+    .bind(&frozen)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -10085,6 +10174,13 @@ async fn repair_marked_duplicate(
     //      edges per triple).
     //
     // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+    //
+    // A NON-PUBLIC duplicate also keeps its `executes` edges
+    // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
+    // frozen workflow generation, so neither the collision guards nor the
+    // migration below touch them. Read from the duplicate's row, so the
+    // deferred replay gives the same result.
+    let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
 
     // Drop incoming dup-edges whose migrated triple already exists on canonical.
     // Alias the outer table as `e` so the correlated subquery references
@@ -10103,6 +10199,7 @@ async fn repair_marked_duplicate(
          UPDATE edges AS e SET valid_to = now()
          WHERE e.target_id = $2 AND e.target_type = 'claim'
          AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+         AND NOT (e.relationship = ANY($3))
          AND e.source_type = 'claim' AND e.source_id != $1
          AND e.valid_to IS NULL
          AND EXISTS (
@@ -10118,6 +10215,7 @@ async fn repair_marked_duplicate(
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -10130,6 +10228,7 @@ async fn repair_marked_duplicate(
              UPDATE edges AS e SET valid_to = now()
              WHERE e.source_id = $2 AND e.source_type = 'claim'
              AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND NOT (e.relationship = ANY($3))
              AND e.target_type = 'claim' AND e.target_id != $1
              AND e.valid_to IS NULL
              AND EXISTS (
@@ -10145,6 +10244,7 @@ async fn repair_marked_duplicate(
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
+        .bind(&frozen)
         .fetch_all(&mut *conn)
         .await?,
     );
@@ -10219,10 +10319,12 @@ async fn repair_marked_duplicate(
            -- rewrite history, and it would also leave two rows for the same
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = ANY($3)) \
          RETURNING id",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -10352,10 +10454,12 @@ async fn repair_marked_duplicate(
            -- rewrite history, and it would also leave two rows for the same
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = ANY($3)) \
          RETURNING id, target_id, relationship, target_type",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
