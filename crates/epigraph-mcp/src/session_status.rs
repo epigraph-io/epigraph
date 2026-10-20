@@ -60,13 +60,17 @@ pub type McpHttpService = StreamableHttpService<crate::EpiGraphMcpFull, LocalSes
 /// bodies are well under 200 bytes; anything larger is not one of them.
 pub const MAX_INSPECTED_BODY: u64 = 4096;
 
-/// rmcp 0.15.0's body for an unknown `Mcp-Session-Id` (`tower.rs`, POST and GET).
+/// rmcp 0.15.0's body for an unknown `Mcp-Session-Id` (`tower.rs`, POST and
+/// GET). rmcp 2.2.0 answers that case upstream with `404 Not Found: Session not
+/// found`, so this constant is kept only for a build that still produces the 401.
 pub const RMCP_SESSION_NOT_FOUND_BODY: &str = "Unauthorized: Session not found";
 
-/// Prefix of rmcp 0.15.0's `internal_error_response` bodies.
+/// Prefix of rmcp's `internal_error_response` bodies (`Encounter an error when
+/// {context}: {error}`), verified unchanged in rmcp 2.2.0.
 pub const RMCP_INTERNAL_ERROR_PREFIX: &str = "Encounter an error when";
 
-/// rmcp 0.15.0's body for a non-initialize POST that carries no session id.
+/// rmcp's body for a non-initialize POST that carries no session id
+/// (`unexpected_message_response`), verified unchanged in rmcp 2.2.0.
 pub const RMCP_EXPECT_INITIALIZE_BODY: &str = "Unexpected message, expect initialize request";
 
 /// Would `status` ever be rewritten? Decides whether the body is buffered at
