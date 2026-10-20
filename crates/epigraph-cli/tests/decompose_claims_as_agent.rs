@@ -113,6 +113,30 @@ impl Run {
             .parse()
             .unwrap_or_else(|e| panic!("`{key}=` is not a count ({e}): {line}"))
     }
+
+    /// `--count-eligible`'s `selection: eligible=N` line (a separate line,
+    /// not a field of `selection: priority=`): `(N, at_least)`, where
+    /// `at_least` is the `>=` prefix of a count that stopped at --max-scan.
+    #[track_caller]
+    fn eligible(&self) -> (usize, bool) {
+        let line = self
+            .stderr
+            .lines()
+            .find(|l| l.starts_with("selection: eligible="))
+            .unwrap_or_else(|| panic!("no selection: eligible= line:\n{}", self.stderr));
+        let rest = &line["selection: eligible=".len()..];
+        let (at_least, rest) = match rest.strip_prefix(">=") {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let n = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|e| panic!("eligible= is not a count ({e}): {line}"));
+        (n, at_least)
+    }
 }
 
 /// Run the binary with a clean environment: `DATABASE_URL` only, plus `env`.
@@ -781,6 +805,155 @@ async fn a_fleet_run_writes_decomposes_to_edges_as_the_acting_agent(pool: PgPool
     assert!(!next.listed().contains(&w), "{}", next.stderr);
 
     for p in [&fixture, &ids] {
+        std::fs::remove_file(p).ok();
+    }
+    drop_login(&pool, &app_role).await;
+}
+
+/// The command the decomposition-cycle schedule runs (operator ORDER 3),
+/// end to end on the fleet login: a WRITING population scan with
+/// `--priority recent --limit --singleton-ledger --count-eligible
+/// --max-scan` and no `--ids-file`, so the zero-visible guard, the ledger
+/// skip and the eligible count all run on the `--as-agent` path.
+///
+/// Seeded: J, a public compound parent the model already judged atomic (a
+/// ledger line for its exact text); W, a public compound parent to
+/// decompose; and W's two atoms (public, one sentence each, so they look
+/// atomic). The fixture LLM knows W's text only, so J reaching the model
+/// would fail the run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_scheduled_command_runs_on_the_fleet_login(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (acting, acting_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "decomp-schedule").await;
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "decomp-schedule-a").await;
+
+    let j_text = "Judged parent J has a first part. Judged parent J also has a second part.";
+    let parent_text =
+        "Scheduled parent W turns freely. Scheduled parent W has a friction coefficient of 4e-22.";
+    let atom1_text = "Scheduled parent W turns freely.";
+    let atom2_text = "Scheduled parent W has a friction coefficient of 4e-22.";
+    let j = viewer_fixture::seed_public_claim(&pool, author, j_text).await;
+    let w = viewer_fixture::seed_public_claim(&pool, author, parent_text).await;
+    let a1 = viewer_fixture::seed_public_claim(&pool, author, atom1_text).await;
+    let a2 = viewer_fixture::seed_public_claim(&pool, author, atom2_text).await;
+
+    let ledger = temp_path("ledger", "jsonl");
+    let j_line = serde_json::json!({
+        "kind": "judged_atomic",
+        "claim_id": j,
+        "content_blake3": blake3::hash(j_text.as_bytes()).to_hex().to_string(),
+        "model": "fixture",
+        "decided_at": "2026-10-19T00:00:00Z",
+    });
+    std::fs::write(&ledger, format!("{j_line}\n")).unwrap();
+    let recorded = std::fs::read(&ledger).unwrap();
+
+    let api = MockServer::start().await;
+    for (text, id) in [(atom1_text, a1), (atom2_text, a2)] {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/claims"))
+            .and(header("authorization", "Bearer decomp-test-token"))
+            .and(body_string_contains(text))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": id})))
+            .expect(1)
+            .mount(&api)
+            .await;
+    }
+    let fixture = temp_path("fixture", "json");
+    std::fs::write(
+        &fixture,
+        serde_json::json!({ parent_text: {"atoms": [atom1_text, atom2_text], "generality": [0, 1]} })
+            .to_string(),
+    )
+    .unwrap();
+
+    let acting_s = acting.to_string();
+    let api_uri = api.uri();
+    let r = run(
+        &app_url,
+        &[
+            "--as-agent",
+            acting_s.as_str(),
+            "--provider",
+            "fixture",
+            "--priority",
+            "recent",
+            "--limit",
+            "10",
+            "--singleton-ledger",
+            s(&ledger),
+            "--count-eligible",
+            "--max-scan",
+            "100",
+        ],
+        &[
+            ("EPIGRAPH_API", api_uri.as_str()),
+            ("EPIGRAPH_TOKEN", "decomp-test-token"),
+            ("DECOMPOSE_FIXTURE_PATH", s(&fixture)),
+        ],
+    );
+    assert!(!r.stderr.contains(BYPASS_REFUSAL), "{}", r.stderr);
+    let r = r.ok();
+
+    // Selection: all four rows read; W chosen; J skipped on the ledger; the
+    // two atoms skipped as looking atomic. Exactly one eligible, counted to
+    // the end of the population (not a `>=` lower bound).
+    assert_eq!(r.selection_count("scanned"), 4, "{}", r.stderr);
+    assert_eq!(r.selection_count("chosen"), 1, "{}", r.stderr);
+    assert_eq!(
+        r.selection_count("skipped_judged_atomic"),
+        1,
+        "{}",
+        r.stderr
+    );
+    assert_eq!(r.selection_count("skipped_looks_atomic"), 2, "{}", r.stderr);
+    assert_eq!(r.selection_count("skipped_not_public"), 0, "{}", r.stderr);
+    assert_eq!(r.eligible(), (1, false), "{}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("decompose complete: 2 atoms, 2 decomposes_to edges"),
+        "{}",
+        r.stderr
+    );
+
+    let edges: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT target_id, writer_group_id FROM edges \
+         WHERE source_id = $1 AND relationship = 'decomposes_to' ORDER BY target_id",
+    )
+    .bind(w)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut want = vec![a1, a2];
+    want.sort();
+    assert_eq!(
+        edges.iter().map(|e| e.0).collect::<Vec<_>>(),
+        want,
+        "{edges:?}"
+    );
+    for (target, writer) in &edges {
+        assert_eq!(
+            *writer,
+            Some(acting_group),
+            "the edge to {target} was not written as the acting agent"
+        );
+    }
+    let j_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
+    )
+    .bind(j)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(j_edges, 0, "the judged-atomic parent was decomposed");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        recorded,
+        "W decomposed into two atoms: no verdict to record"
+    );
+
+    for p in [&fixture, &ledger] {
         std::fs::remove_file(p).ok();
     }
     drop_login(&pool, &app_role).await;
