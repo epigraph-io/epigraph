@@ -2064,3 +2064,134 @@ async fn a_family_over_the_engine_bound_is_a_refused_apply_not_a_tool_error(pool
     .expect("count");
     assert_eq!(written, 0, "nothing written");
 }
+
+// ── A revision label never steers an admin apply across owners ─────────────
+
+/// ROOF's item under a different strong id: it joins ROOF only through a
+/// revision label.
+const ROOF_REVISED: &str =
+    "Library roof survey | Acme Library Board | due: 2026-12-20 | ref ACME-888999";
+
+/// Over HTTP with `claims:admin`, on an application-role server: the caller
+/// labels ITS OWN claim `revises:<another owner's claim>` across a
+/// conflicting strong id and applies. The admin grant makes every member
+/// "owned", so ownership alone admits the unit; but a revision label is one
+/// owner's assertion and cannot decide a merge into another owner's claim.
+/// The unit must fail with `CROSS_OWNER_MEMBER`, predicted by `unit_check`,
+/// and the other owner's claim must stay byte-identical, as the survivor
+/// (`a_newer = false`) or as the loser. Control: a revision-label cluster
+/// whose members are all the caller's own applies in the same call.
+async fn a_revision_label_never_steers_an_admin_apply_across_owners(pool: PgPool, a_newer: bool) {
+    let bytes = serde_json::to_vec(&profile_for(Join::RevisionLabel)).expect("profile");
+    let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    // A LIVE grant, so the audited admin path would write the other owner's
+    // group: only the revision-label rule can refuse the unit.
+    seed_admin_grant(&pool, &auth).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "item-other-owner").await;
+
+    let (a_at, b_at) = if a_newer {
+        ("2026-10-01T00:00:00Z", "2026-08-01T00:00:00Z")
+    } else {
+        ("2026-08-01T00:00:00Z", "2026-10-01T00:00:00Z")
+    };
+    let b = seed(&pool, other, other_group, "public", PUMP_A, &[FAMILY], b_at).await;
+    let a = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        PUMP_REVISED,
+        &[FAMILY, &format!("revises:{b}")],
+        a_at,
+    )
+    .await;
+    let roof = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let roof_revised = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF_REVISED,
+        &[FAMILY, &format!("revises:{roof}")],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[a, b]).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    // Preconditions: the revision label formed the cross-owner cluster, and
+    // the admin grant owns every member, so ownership alone would admit it.
+    let (survivor, loser) = if a_newer { (a, b) } else { (b, a) };
+    let unit = format!("cluster:{survivor}");
+    let cluster = plan["clusters"]
+        .as_array()
+        .expect("clusters")
+        .iter()
+        .find(|c| c["survivor"] == survivor.to_string())
+        .unwrap_or_else(|| panic!("no cluster for {survivor}: {plan}"));
+    let member = cluster["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|m| m["id"] == loser.to_string())
+        .unwrap_or_else(|| panic!("the loser is not in the cluster: {plan}"));
+    assert_eq!(member["tier"], "revision_label", "{plan}");
+    let check = unit_check(&plan, &unit);
+    assert!(
+        check["members"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().all(|m| m["owned"] == true)),
+        "the admin grant owns every member: {plan}"
+    );
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(
+        snapshot(&pool, &[a, b]).await,
+        before,
+        "another owner's claim is never merged on the strength of the caller's revision \
+         label (a_newer={a_newer}): {out}"
+    );
+    let refused = result_for(&out, &unit);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert_eq!(refused["code"], "CROSS_OWNER_MEMBER", "{out}");
+    assert_eq!(check["applies"], false, "predicted: {plan}");
+
+    // Control: the caller's own revision-label cluster commits.
+    let control = format!("cluster:{roof_revised}");
+    assert_eq!(result_for(&out, &control)["ok"], true, "{out}");
+    assert!(
+        labels_of(&pool, roof)
+            .await
+            .contains(&format!("duplicate-of:{roof_revised}")),
+        "the control cluster applied"
+    );
+    assert_eq!(unit_check(&plan, &control)["applies"], true, "{plan}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_apply_never_retires_another_owners_claim_through_a_revision_label(pool: PgPool) {
+    a_revision_label_never_steers_an_admin_apply_across_owners(pool, true).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_apply_never_makes_another_owners_claim_a_revision_survivor(pool: PgPool) {
+    a_revision_label_never_steers_an_admin_apply_across_owners(pool, false).await;
+}
