@@ -396,3 +396,180 @@ async fn insert_unless_hash_exists(
     .await?;
     Ok(Some(id))
 }
+
+/// Concurrency cover for [`insert_unless_hash_exists`] (backlog 00f1a517):
+/// two writers of one `(content_hash, agent_id)` must yield one row.
+///
+/// Held-open shape, as in `epigraph-db`'s `claim_repo_helpers` race arms:
+/// caller 1 writes inside a transaction it keeps OPEN, so its row exists but is
+/// invisible to every other snapshot. Caller 2 then writes the same content by
+/// the same author on its own connection (the binary's shape). No sleep decides
+/// the outcome: the arm waits until caller 2 either finished (nothing made it
+/// wait, so its find missed caller 1's row and it inserted a second one) or is
+/// blocked on a two-key advisory lock, and panics if neither happens.
+#[cfg(test)]
+mod dedup_race_tests {
+    use super::{insert_unless_hash_exists, WebSearchClaim};
+    use epigraph_core::{AgentId, Claim, TenancyDecl, TruthValue};
+    use epigraph_crypto::ContentHasher;
+    use epigraph_db::ClaimRepository;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Who holds the pair first, in the open transaction.
+    #[derive(Debug, Clone, Copy)]
+    enum First {
+        /// Another run of this binary.
+        MethodSearch,
+        /// The repository's legacy content-hash create (`ingest_document`
+        /// atoms, the conventions routes). Proves the binary takes the SAME
+        /// key as the repository writers, not merely some lock.
+        RepositoryCreateConn,
+    }
+
+    async fn seed_author(pool: &PgPool) -> (Uuid, TenancyDecl) {
+        // The production shape: no unique constraint on the pair (migration
+        // 150). Explicit, so the arm cannot pass on a constraint.
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
+            .execute(pool)
+            .await
+            .expect("drop the pair constraint");
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, created_at, updated_at) \
+             VALUES ($1, sha256($1::text::bytea), NOW(), NOW())",
+        )
+        .bind(agent_id)
+        .execute(pool)
+        .await
+        .expect("insert the author");
+        // Mint the author's personal group NOW, committed: left to the racers,
+        // caller 2 would wait on caller 1's uncommitted group upsert (a row
+        // lock, not the dedup lock).
+        let mut conn = pool.acquire().await.expect("acquire for the group mint");
+        let decl = ClaimRepository::default_decl_for_author(&mut conn, agent_id)
+            .await
+            .expect("mint the author's personal group");
+        (agent_id, decl)
+    }
+
+    fn embedding_literal() -> String {
+        format!("[{}]", vec!["0.1"; 1536].join(","))
+    }
+
+    async fn settle_on_the_dedup_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+        for _ in 0..600 {
+            if task.is_finished() {
+                return false;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks \
+                  WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "caller 2 neither finished nor blocked on a dedup lock while caller 1's transaction \
+             was open; it is waiting on something else, so the arm cannot tell serialized from not"
+        );
+    }
+
+    async fn race_held_open(pool: &PgPool, first: First) {
+        let (agent_id, decl) = seed_author(pool).await;
+        let content = format!("method_search held-open after {first:?} {}", Uuid::new_v4());
+        let embedding = embedding_literal();
+
+        let mut tx_1 = pool.begin().await.expect("begin caller 1's transaction");
+        let r1: Uuid = match first {
+            First::MethodSearch => {
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "source": "web_search" }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut tx_1, agent_id, decl, &claim)
+                    .await
+                    .expect("caller 1 insert")
+                    .expect("caller 1 is the first write of the pair")
+            }
+            First::RepositoryCreateConn => {
+                let claim = Claim::new(
+                    content.clone(),
+                    AgentId::from_uuid(agent_id),
+                    [0u8; 32],
+                    TruthValue::new(0.5).unwrap(),
+                );
+                ClaimRepository::create_conn(&mut tx_1, &claim, decl)
+                    .await
+                    .expect("caller 1 create_conn")
+                    .id
+                    .into()
+            }
+        };
+
+        let caller_2 = {
+            let pool = pool.clone();
+            let content = content.clone();
+            let embedding = embedding.clone();
+            tokio::spawn(async move {
+                let mut conn = pool.acquire().await.expect("acquire caller 2's connection");
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "source": "web_search" }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                    .await
+                    .expect("caller 2 insert")
+            })
+        };
+        let blocked = settle_on_the_dedup_lock(pool, &caller_2).await;
+
+        tx_1.commit().await.expect("commit caller 1's transaction");
+        let r2 = caller_2.await.expect("caller 2 must not panic");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2",
+        )
+        .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("count rows for the pair");
+        assert_eq!(
+            rows, 1,
+            "method_search racing an open {first:?} of one (content_hash, agent_id) left {rows} \
+             rows: its find could not see caller 1's uncommitted row and nothing made it wait. \
+             Caller 1 wrote {r1}, caller 2 answered {r2:?}"
+        );
+        assert!(
+            blocked,
+            "caller 2 finished while caller 1's transaction was open: nothing made it wait"
+        );
+        assert_eq!(
+            r2, None,
+            "caller 2 ran after caller 1 committed, so it must skip the existing content"
+        );
+    }
+
+    /// Two runs of the binary over the same search result.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn two_runs_of_one_content_by_one_author_insert_one_row(pool: PgPool) {
+        race_held_open(&pool, First::MethodSearch).await;
+    }
+
+    /// The binary waits on the lock the repository's writers hold.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn waits_on_the_repository_writers_dedup_lock(pool: PgPool) {
+        race_held_open(&pool, First::RepositoryCreateConn).await;
+    }
+}
