@@ -10,6 +10,7 @@ pub mod authorship;
 pub mod error;
 pub mod system_agent;
 pub mod workflow;
+pub mod workflow_plan;
 pub mod workflow_steps;
 
 pub use authorship::record_caller_authorship;
