@@ -134,9 +134,14 @@ impl LabelDedupConfig {
     /// unset.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] over any variable lookup: each value is trimmed,
+    /// and an empty or all-whitespace one is unset.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let var = |k: &str| {
-            std::env::var(k)
-                .ok()
+            lookup(k)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
@@ -899,7 +904,17 @@ pub async fn apply_label_dedup(
     let mut failed = 0usize;
     for unit in &units {
         let unit_members = members.get(&unit.unit).map_or(&[][..], Vec::as_slice);
-        match apply_unit(server, viewer, auth, caller, unit, unit_members, &retirement).await {
+        match apply_unit(
+            server,
+            viewer,
+            auth,
+            caller,
+            unit,
+            unit_members,
+            &retirement,
+        )
+        .await
+        {
             Ok((changes, admin_path)) => {
                 results.push(json!({"unit": unit.unit, "ok": true, "admin_path": admin_path}));
                 applied.extend(changes);
@@ -1105,4 +1120,56 @@ async fn review_foreign_matches(
     }
     read.commit().await.map_err(db_caller_error)?;
     Ok(verdicts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_from(vars: &[(&str, &str)]) -> LabelDedupConfig {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        LabelDedupConfig::from_lookup(|k| {
+            vars.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    /// The host forwards these exact names into the stdio server's
+    /// environment; a renamed variable would silently turn path mode off and
+    /// drop the pin.
+    #[test]
+    fn the_profile_root_and_pin_are_read_from_their_exact_names_and_trimmed() {
+        assert_eq!(PROFILE_ROOT_ENV, "EPIGRAPH_MCP_PROFILE_ROOT");
+        assert_eq!(PROFILE_PIN_ENV, "EPIGRAPH_MCP_PROFILE_PIN");
+        let cfg = config_from(&[
+            ("EPIGRAPH_MCP_PROFILE_ROOT", " /profiles "),
+            ("EPIGRAPH_MCP_PROFILE_PIN", "\tabc123\n"),
+        ]);
+        assert_eq!(cfg.profile_root, Some(PathBuf::from("/profiles")));
+        assert_eq!(cfg.profile_pin.as_deref(), Some("abc123"));
+        assert_eq!(cfg.max_claims_cap, DEFAULT_MAX_CLAIMS);
+    }
+
+    #[test]
+    fn an_empty_or_blank_profile_variable_is_unset() {
+        for blank in ["", "   ", "\t\n"] {
+            let cfg = config_from(&[
+                ("EPIGRAPH_MCP_PROFILE_ROOT", blank),
+                ("EPIGRAPH_MCP_PROFILE_PIN", blank),
+            ]);
+            assert_eq!(cfg.profile_root, None, "{blank:?}");
+            assert_eq!(cfg.profile_pin, None, "{blank:?}");
+        }
+        // Absent entirely, and set only under other names: unset too.
+        let cfg = config_from(&[
+            ("EPIGRAPH_PROFILE_ROOT", "/profiles"),
+            ("PROFILE_PIN", "abc123"),
+        ]);
+        assert_eq!(cfg.profile_root, None);
+        assert_eq!(cfg.profile_pin, None);
+    }
 }
