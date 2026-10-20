@@ -247,10 +247,13 @@ pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
 /// creates no membership, but a writer row that predates the retire, or one a
 /// concurrent roster write added, would otherwise ride the token onto HTTP.
 ///
-/// The author-binding allowlist (migration 149) is deliberately NOT consulted:
-/// an allowlisted client's agent is bound to a human, not operated, so it
-/// keeps minting; and an allowlisted agent that also holds a link record is
-/// refused here like any other.
+/// The author-binding allowlist (migration 149) is deliberately NOT consulted
+/// here: an allowlisted client's agent is bound to a human, not operated, so
+/// it keeps minting; and an allowlisted agent that also holds a link record is
+/// refused here like any other. The registry IS read on the request path, for
+/// one kind of token only: a delegated run token's `dlg` delegator, through
+/// `AgentRepository::delegated_principal_pool` (the bearer and MCP viewers and
+/// the MCP ownership gate). No grant here mints such a token yet.
 ///
 /// # Errors
 /// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the

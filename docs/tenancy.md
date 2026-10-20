@@ -751,10 +751,11 @@ human (`OPL02`).
   registered human that is not itself linked. Suspending or revoking the
   client, revoking the human, or creating a second client for the agent
   unbinds it at once.
-* **What it does not do.** It is not an operator link: nothing on the token,
-  bearer, viewer or webhook path reads it, so the client keeps minting tokens
-  and keeps its viewer, and an operated agent is still refused whether or not
-  it is allowlisted. It is not an ownership relation (the human does not own
+* **What it does not do.** It is not an operator link: nothing on the token
+  or webhook path reads it, so the client keeps minting tokens and keeps its
+  viewer, and an operated agent is still refused whether or not it is
+  allowlisted. The bearer and viewer read it only to check a DELEGATED run
+  token's delegator (below); an ordinary token never reaches that read. It is not an ownership relation (the human does not own
   the agent's claims). And it does not reach the membership door
   (`epigraph_require_operator_scope` reads links only).
 * **The door gap.** Because of that last point, an allowlisted agent's
@@ -805,6 +806,46 @@ human (`OPL02`).
   `--apply` refuses on them under the same `--allow-unbound-writers`
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
+
+### Delegated run tokens (dormant)
+
+An operated agent is stdio-only, with ONE carve-out: a delegated run token.
+Such a token is an ordinary `agent` access token for the operated agent
+whose `dlg` claim names the agent of the OAuth client that asked for it (the
+DELEGATOR). Nothing mints one yet; the request sites below admit one only
+while its delegation is live, re-checked on every request by
+`AgentRepository::delegated_principal_pool`, which is `Some` only when:
+
+* the process read `EPIGRAPH_RUN_TOKENS=on` at boot (both `epigraph-api` and
+  the MCP HTTP listener; unset, every `dlg` token is refused with no read);
+* the delegator is bound through arm (c) above (`client_allowlist`: the
+  allowance is live and its client `active`);
+* the delegator's human (`epigraph_human_of`) is the operator of the operated
+  agent's ACTING link (not retired, writer row live);
+* the delegator itself holds a live `writer`/`admin` membership of that
+  operator's group, so the token hands out no write authority the delegator
+  does not already hold. Grant it as a membership; a link would make the
+  delegator operated.
+
+A `dlg` token whose delegation is not live is refused whatever the agent's
+link state; an unlinked agent is never delegated to. Revoking the allowance,
+suspending the delegator's client, revoking the delegator's writer row,
+retiring the agent's link or revoking its writer row each refuses the next
+request, with no restart.
+
+| Site | A live delegation |
+|---|---|
+| REST viewer (`middleware/bearer.rs::extract_viewer`) | admitted |
+| MCP viewer (`tools/viewer.rs::request_viewer`) | admitted |
+| Claim ownership (`require_owner_or_admin`) | the actor arm, as on stdio |
+| Federated tools (`enforce_federated_scope`) | refused (the bearer is never forwarded) |
+| Webhooks | not delivered: delivery keys on the principal, which is operated |
+
+An old binary decodes a `dlg` token as an ordinary token for an operated agent
+and refuses it, so any deploy order fails closed. Bearer routes that never
+extract a viewer (scope-only routes) do not run the check, so there a token
+whose delegation has ended stays usable until it expires, exactly as an
+operated agent's token minted before its link does today.
 
 Deploy 149 with or after the system-agent registry (148): its
 "not a registered system agent" conjunct reads `system_agents` softly and is
