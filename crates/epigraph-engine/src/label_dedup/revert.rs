@@ -34,12 +34,13 @@ impl AppliedLabelChange {
     /// so a concurrent change to any other label is never attributed to it.
     #[must_use]
     pub fn from_write(unit: &str, write: &LabelWrite, before: &[String], after: &[String]) -> Self {
-        let _ = (write, before, after);
+        let had = |l: &String| before.contains(l);
+        let has = |l: &String| after.contains(l);
         Self {
             unit: unit.to_string(),
             claim_id: write.claim_id,
-            labels_added: Vec::new(),
-            labels_removed: Vec::new(),
+            labels_added: distinct(write.add.iter().filter(|l| !had(l) && has(l))),
+            labels_removed: distinct(write.remove.iter().filter(|l| had(l) && !has(l))),
         }
     }
 
@@ -53,6 +54,24 @@ impl AppliedLabelChange {
 /// The label writes that undo `applied`, newest change first.
 #[must_use]
 pub fn revert_writes(applied: &[AppliedLabelChange]) -> Vec<LabelWrite> {
-    let _ = applied;
-    Vec::new()
+    applied
+        .iter()
+        .rev()
+        .filter(|c| !c.is_empty())
+        .map(|c| LabelWrite {
+            claim_id: c.claim_id,
+            add: c.labels_removed.clone(),
+            remove: c.labels_added.clone(),
+        })
+        .collect()
+}
+
+/// Sorted and de-duplicated, so a recorded change is canonical whatever order
+/// the write named its labels in.
+fn distinct<'a>(labels: impl Iterator<Item = &'a String>) -> Vec<String> {
+    labels
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }

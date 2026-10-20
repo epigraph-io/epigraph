@@ -57,15 +57,17 @@ fn db_write(labels: &[String], add: &[String], remove: &[String]) -> Vec<String>
 }
 
 fn canonical(labels: &[String]) -> Vec<String> {
-    labels.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect()
+    labels
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Apply `units` to `graph` the way apply does: one write at a time, the
 /// change recorded from the labels before and after each write.
-fn apply_recording(
-    graph: &mut [DedupClaim],
-    units: &[WriteUnit],
-) -> Vec<AppliedLabelChange> {
+fn apply_recording(graph: &mut [DedupClaim], units: &[WriteUnit]) -> Vec<AppliedLabelChange> {
     let mut changes = Vec::new();
     for unit in units {
         for w in &unit.writes {
@@ -75,7 +77,9 @@ fn apply_recording(
                 .expect("write targets a graph claim");
             let before = c.labels.clone();
             let after = db_write(&before, &w.add, &w.remove);
-            changes.push(AppliedLabelChange::from_write(&unit.unit, w, &before, &after));
+            changes.push(AppliedLabelChange::from_write(
+                &unit.unit, w, &before, &after,
+            ));
             c.labels = after;
         }
     }
@@ -112,7 +116,10 @@ fn revert_restores_every_label_set_after_a_full_apply() {
         .zip(&g)
         .filter(|(a, b)| canonical(&a.labels) != canonical(&b.labels))
         .count();
-    assert!(changed >= 5, "the apply must touch many claims, touched {changed}");
+    assert!(
+        changed >= 5,
+        "the apply must touch many claims, touched {changed}"
+    );
     assert!(
         changes.iter().any(|c| !c.labels_removed.is_empty()),
         "some write must have removed a label: {changes:?}"
@@ -158,7 +165,11 @@ fn a_label_the_claim_already_carried_is_not_recorded_and_survives_revert() {
         created_at: None,
     }];
     run_writes(&mut g, &revert_writes(&[change]));
-    assert_eq!(g[0].labels, canonical(&before), "kept-before stays, was-there returns");
+    assert_eq!(
+        g[0].labels,
+        canonical(&before),
+        "kept-before stays, was-there returns"
+    );
 }
 
 #[test]
@@ -204,7 +215,11 @@ fn revert_runs_newest_first() {
     ];
     let writes = revert_writes(&changes);
     assert_eq!(writes.len(), 2, "{writes:?}");
-    assert_eq!(writes[0].add, strings(&["x"]), "u2 is undone first: {writes:?}");
+    assert_eq!(
+        writes[0].add,
+        strings(&["x"]),
+        "u2 is undone first: {writes:?}"
+    );
     assert_eq!(writes[1].remove, strings(&["x"]), "{writes:?}");
 
     let mut g = vec![DedupClaim {
