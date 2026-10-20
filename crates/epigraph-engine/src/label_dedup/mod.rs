@@ -90,9 +90,15 @@ impl Snapshot {
     /// Sort `rows` by id, keep the first `cap`, and flag truncation when more
     /// than `cap` rows were supplied.
     #[must_use]
-    pub fn from_capped(rows: Vec<DedupClaim>, cap: usize) -> Self {
-        let _ = (rows, cap);
-        Self::default()
+    pub fn from_capped(mut rows: Vec<DedupClaim>, cap: usize) -> Self {
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows.dedup_by(|a, b| a.id == b.id);
+        let truncated = rows.len() > cap;
+        rows.truncate(cap);
+        Self {
+            claims: rows,
+            truncated,
+        }
     }
 }
 
@@ -119,8 +125,13 @@ impl Section {
     /// dedup]` hash identically. An empty list means [`Section::default_set`].
     #[must_use]
     pub fn normalize(sections: &[Self]) -> Vec<Self> {
-        let _ = sections;
-        Vec::new()
+        if sections.is_empty() {
+            return Self::default_set();
+        }
+        let mut out = sections.to_vec();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 

@@ -25,8 +25,7 @@ pub const PROFILE_SCHEMA: &str = "label-dedup-profile/v1";
 /// records, and the value `profile_hash` arguments are checked against.
 #[must_use]
 pub fn profile_hash(bytes: &[u8]) -> String {
-    let _ = bytes;
-    String::new()
+    epigraph_crypto::ContentHasher::to_hex(&epigraph_crypto::ContentHasher::hash(bytes))
 }
 
 /// A parsed, validated profile.
@@ -669,8 +668,8 @@ impl ReadSpec {
     /// Whether a claim with `labels` is in this read.
     #[must_use]
     pub fn matches(&self, labels: &[String]) -> bool {
-        let _ = labels;
-        false
+        self.include.iter().all(|l| labels.contains(l))
+            && !self.exclude.iter().any(|l| labels.contains(l))
     }
 }
 
@@ -684,43 +683,32 @@ impl LabelDedupProfile {
     /// unknown placeholder.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, LabelDedupError> {
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)
-            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(e.to_string()))?;
-        let take = |map: &mut serde_json::Map<String, serde_json::Value>, k: &str| map.remove(k);
-        let schema = take(&mut map, "schema")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-        let closeout = take(&mut map, "closeout")
-            .filter(|v| !v.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("closeout: {e}")))?;
-        let lifecycle = take(&mut map, "lifecycle")
-            .filter(|v| !v.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("lifecycle: {e}")))?;
-        let signal_dedup = take(&mut map, "signal_dedup")
-            .filter(|v| !v.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(format!("signal_dedup: {e}")))?;
-        let signal_superseded_by_member = take(&mut map, "signal_superseded_by_member")
-            .filter(|v| !v.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| {
-                LabelDedupError::ProfileSchemaInvalid(format!("signal_superseded_by_member: {e}"))
-            })?;
+            .map_err(|e| invalid(format!("not a JSON object: {e}")))?;
+        let schema = match map.remove("schema") {
+            Some(serde_json::Value::String(s)) => s,
+            _ => return Err(invalid(format!("`schema` must be \"{PROFILE_SCHEMA}\""))),
+        };
+        if schema != PROFILE_SCHEMA {
+            return Err(invalid(format!(
+                "unsupported schema {schema:?}; this engine reads \"{PROFILE_SCHEMA}\""
+            )));
+        }
+        let closeout = section_value(&mut map, "closeout")?;
+        let lifecycle = section_value(&mut map, "lifecycle")?;
+        let signal_dedup = section_value(&mut map, "signal_dedup")?;
+        let signal_superseded_by_member = section_value(&mut map, "signal_superseded_by_member")?;
         let pass: PassProfile = serde_json::from_value(serde_json::Value::Object(map))
-            .map_err(|e| LabelDedupError::ProfileSchemaInvalid(e.to_string()))?;
-        Ok(Self {
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut profile = Self {
             schema,
             pass,
             closeout,
             lifecycle,
             signal_dedup,
             signal_superseded_by_member,
-        })
+        };
+        profile.validate()?;
+        Ok(profile)
     }
 
     /// Check `bytes` against the pinned `expected_hash` BEFORE parsing, then
@@ -733,8 +721,14 @@ impl LabelDedupProfile {
         bytes: &[u8],
         expected_hash: &str,
     ) -> Result<(Self, String), LabelDedupError> {
-        let _ = expected_hash;
-        Ok((Self::from_json_bytes(bytes)?, profile_hash(bytes)))
+        let actual = profile_hash(bytes);
+        if !actual.eq_ignore_ascii_case(expected_hash.trim()) {
+            return Err(LabelDedupError::ProfileHashMismatch {
+                expected: expected_hash.to_string(),
+                actual,
+            });
+        }
+        Ok((Self::from_json_bytes(bytes)?, actual))
     }
 
     /// The reads a plan over `sections` needs, in a fixed order.
@@ -743,8 +737,42 @@ impl LabelDedupProfile {
     /// [`LabelDedupError::SectionNotConfigured`] when a requested section has
     /// no configuration.
     pub fn reads(&self, sections: &[Section]) -> Result<Vec<ReadSpec>, LabelDedupError> {
-        let _ = sections;
-        Ok(Vec::new())
+        let sections = Section::normalize(sections);
+        for s in &sections {
+            self.require_section(*s)?;
+        }
+        let has = |s: Section| sections.contains(&s);
+        let mut out = Vec::new();
+        if has(Section::Hygiene)
+            || has(Section::Dedup)
+            || has(Section::Closeout)
+            || has(Section::SignalDedup)
+        {
+            out.push(self.members_read());
+        }
+        if let (true, Some(lc)) = (has(Section::Lifecycle), self.lifecycle.as_ref()) {
+            out.push(ReadSpec {
+                purpose: ReadPurpose::LifecycleSignals,
+                include: vec![lc.signal_family_label.clone()],
+                exclude: dedup_labels(lc.signal_exclude_labels.iter()),
+                current_only: true,
+            });
+            out.push(ReadSpec {
+                purpose: ReadPurpose::LifecycleTargets,
+                include: vec![self.pass.family_label.clone()],
+                exclude: dedup_labels(lc.target_exclude_labels.iter()),
+                current_only: true,
+            });
+        }
+        if let (true, Some(sp)) = (has(Section::SignalDedup), self.signal_dedup.as_ref()) {
+            out.push(ReadSpec {
+                purpose: ReadPurpose::SignalMembers,
+                include: vec![sp.family_label.clone()],
+                exclude: dedup_labels(sp.closed_label.iter().chain(&sp.index_exclude_labels)),
+                current_only: true,
+            });
+        }
+        Ok(out)
     }
 
     /// The reads a probe needs: the members, plus the closed lifecycle
@@ -757,7 +785,383 @@ impl LabelDedupProfile {
         &self,
         include_closed_signals: bool,
     ) -> Result<Vec<ReadSpec>, LabelDedupError> {
-        let _ = include_closed_signals;
-        Ok(Vec::new())
+        let mut out = vec![self.members_read()];
+        if include_closed_signals {
+            let (Some(lc), Some(closed)) =
+                (self.lifecycle.as_ref(), self.pass.closed_label.as_ref())
+            else {
+                return Err(LabelDedupError::SectionNotConfigured {
+                    section: Section::Lifecycle,
+                });
+            };
+            out.push(ReadSpec {
+                purpose: ReadPurpose::ClosedSignals,
+                include: vec![lc.signal_family_label.clone(), closed.clone()],
+                exclude: Vec::new(),
+                current_only: true,
+            });
+        }
+        Ok(out)
     }
+
+    /// Refuse a section whose configuration (or write template) is absent.
+    pub(crate) fn require_section(&self, section: Section) -> Result<(), LabelDedupError> {
+        let configured = match section {
+            Section::Hygiene => self.pass.hygiene_write.is_some(),
+            Section::Dedup => self.pass.merge.is_some(),
+            Section::Closeout => self.closeout.is_some(),
+            Section::Lifecycle => self.lifecycle.is_some(),
+            Section::SignalDedup => self
+                .signal_dedup
+                .as_ref()
+                .is_some_and(|s| s.hygiene_write.is_some() && s.merge.is_some()),
+        };
+        if configured {
+            Ok(())
+        } else {
+            Err(LabelDedupError::SectionNotConfigured { section })
+        }
+    }
+
+    fn members_read(&self) -> ReadSpec {
+        ReadSpec {
+            purpose: ReadPurpose::Members,
+            include: vec![self.pass.family_label.clone()],
+            exclude: dedup_labels(
+                self.pass
+                    .closed_label
+                    .iter()
+                    .chain(&self.pass.index_exclude_labels),
+            ),
+            current_only: true,
+        }
+    }
+
+    fn validate(&mut self) -> Result<(), LabelDedupError> {
+        validate_pass(&mut self.pass, "")?;
+        let family = self.pass.family_label.clone();
+        if let Some(c) = &self.closeout {
+            check_field_name(&self.pass, &c.date_field, "closeout.date_field")?;
+            let Some(closed) = &self.pass.closed_label else {
+                return Err(invalid(
+                    "closeout needs `closed_label`: a closed member must leave the member read",
+                ));
+            };
+            check_templates(&c.add, &[Var::RunTag, Var::Family], "closeout.add")?;
+            if !c.add.contains(closed) {
+                return Err(invalid(format!(
+                    "closeout.add must add the closed label {closed:?}, or an applied close-out is planned again"
+                )));
+            }
+        }
+        if let Some(lc) = &self.lifecycle {
+            check_label(&lc.signal_family_label, "lifecycle.signal_family_label")?;
+            check_templates(
+                &lc.graduate_add,
+                &[Var::RunTag, Var::Family, Var::Target],
+                "lifecycle.graduate_add",
+            )?;
+            check_templates(
+                &lc.age_out_add,
+                &[Var::RunTag, Var::Family],
+                "lifecycle.age_out_add",
+            )?;
+            let exits = |adds: &[String]| adds.iter().any(|a| lc.signal_exclude_labels.contains(a));
+            if !exits(&lc.graduate_add) {
+                return Err(invalid(
+                    "lifecycle.graduate_add must add a label in signal_exclude_labels, or a graduated signal is planned again",
+                ));
+            }
+            if lc.max_age_days.is_some() && !exits(&lc.age_out_add) {
+                return Err(invalid(
+                    "lifecycle.age_out_add must add a label in signal_exclude_labels, or an aged-out signal is planned again",
+                ));
+            }
+            if lc.max_age_days.is_some_and(|d| d < 0) {
+                return Err(invalid("lifecycle.max_age_days must not be negative"));
+            }
+        }
+        if let Some(sp) = &mut self.signal_dedup {
+            if sp.family_label == family {
+                return Err(invalid(
+                    "signal_dedup.family_label must differ from the main family",
+                ));
+            }
+            validate_pass(sp, "signal_dedup.")?;
+        }
+        if let Some(ss) = &self.signal_superseded_by_member {
+            let Some(sp) = &self.signal_dedup else {
+                return Err(invalid("signal_superseded_by_member needs signal_dedup"));
+            };
+            let vars = [Var::RunTag, Var::Family, Var::Target];
+            check_templates(&ss.add, &vars, "signal_superseded_by_member.add")?;
+            check_templates(&ss.remove, &vars, "signal_superseded_by_member.remove")?;
+            if !leaves_family(&ss.remove, &sp.family_label) {
+                return Err(invalid(
+                    "signal_superseded_by_member.remove must remove {family}, or a superseded signal is planned again",
+                ));
+            }
+            if ss.require.is_empty() {
+                return Err(invalid(
+                    "signal_superseded_by_member.require must name at least one match",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A placeholder a write template may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Var {
+    RunTag,
+    Family,
+    Survivor,
+    Target,
+}
+
+impl Var {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::RunTag => "run_tag",
+            Self::Family => "family",
+            Self::Survivor => "survivor",
+            Self::Target => "target",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [Self::RunTag, Self::Family, Self::Survivor, Self::Target]
+            .into_iter()
+            .find(|v| v.name() == name)
+    }
+}
+
+/// Values bound into a template.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bindings<'a> {
+    pub run_tag: &'a str,
+    pub family: &'a str,
+    pub survivor: Option<&'a str>,
+    pub target: Option<&'a str>,
+}
+
+/// Expand one template. Templates were validated at load, so every
+/// placeholder is known and bound where it is used.
+pub(crate) fn expand(template: &str, b: &Bindings<'_>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let value = match Var::parse(&after[..close]) {
+            Some(Var::RunTag) => Some(b.run_tag),
+            Some(Var::Family) => Some(b.family),
+            Some(Var::Survivor) => b.survivor,
+            Some(Var::Target) => b.target,
+            None => None,
+        };
+        match value {
+            Some(v) => out.push_str(v),
+            None => out.push_str(&rest[open..=open + 1 + close]),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a label is safe to write: not empty, not padded, no control
+/// characters, no `$` (the write path refuses it), no braces (an unexpanded
+/// template).
+pub(crate) fn label_problem(label: &str) -> Option<&'static str> {
+    if label.is_empty() {
+        Some("empty")
+    } else if label.trim() != label {
+        Some("leading or trailing whitespace")
+    } else if label.chars().any(char::is_control) {
+        Some("control character")
+    } else if label.contains('$') {
+        Some("contains `$`, which the label write path refuses")
+    } else if label.contains('{') || label.contains('}') {
+        Some("contains a brace (an unexpanded template)")
+    } else {
+        None
+    }
+}
+
+fn invalid(msg: impl Into<String>) -> LabelDedupError {
+    LabelDedupError::ProfileSchemaInvalid(msg.into())
+}
+
+fn section_value<T: serde::de::DeserializeOwned>(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<T>, LabelDedupError> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v)
+            .map(Some)
+            .map_err(|e| invalid(format!("{key}: {e}"))),
+    }
+}
+
+fn dedup_labels<'a>(labels: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in labels {
+        if !out.contains(l) {
+            out.push(l.clone());
+        }
+    }
+    out
+}
+
+fn check_label(label: &str, at: &str) -> Result<(), LabelDedupError> {
+    match label_problem(label) {
+        Some(p) => Err(invalid(format!(
+            "{at}: label {label:?} is not writable: {p}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn check_templates(templates: &[String], allowed: &[Var], at: &str) -> Result<(), LabelDedupError> {
+    for t in templates {
+        let mut literal = String::new();
+        let mut rest = t.as_str();
+        while let Some(open) = rest.find('{') {
+            literal.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else {
+                return Err(invalid(format!("{at}: unclosed `{{` in {t:?}")));
+            };
+            let name = &after[..close];
+            match Var::parse(name) {
+                Some(v) if allowed.contains(&v) => literal.push('x'),
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "{at}: placeholder {{{name}}} is not bound here (allowed: {})",
+                        allowed
+                            .iter()
+                            .map(|v| format!("{{{}}}", v.name()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+                None => {
+                    return Err(invalid(format!(
+                        "{at}: unknown placeholder {{{name}}} in {t:?}"
+                    )))
+                }
+            }
+            rest = &after[close + 1..];
+        }
+        literal.push_str(rest);
+        check_label(&literal, at)?;
+    }
+    Ok(())
+}
+
+fn leaves_family(remove: &[String], family: &str) -> bool {
+    remove.iter().any(|r| r == "{family}" || r == family)
+}
+
+fn check_field_name(pass: &PassProfile, name: &str, at: &str) -> Result<(), LabelDedupError> {
+    let known = matches!(name, "entity" | "deadline" | "value" | "class")
+        || pass.fields.extra.contains_key(name);
+    if known {
+        Ok(())
+    } else {
+        Err(invalid(format!("{at}: unknown field {name:?}")))
+    }
+}
+
+fn validate_pass(pass: &mut PassProfile, at: &str) -> Result<(), LabelDedupError> {
+    check_label(&pass.family_label, &format!("{at}family_label"))?;
+    for name in pass.fields.extra.keys() {
+        if matches!(
+            name.as_str(),
+            "title" | "entity" | "deadline" | "value" | "class"
+        ) {
+            return Err(invalid(format!(
+                "{at}fields.extra: {name:?} shadows a core field"
+            )));
+        }
+    }
+    for t in [
+        &pass.entity_match.threshold,
+        &pass.title_match.fuzzy_threshold,
+    ] {
+        if t.is_nan() || *t <= 0.0 || *t > 1.0 {
+            return Err(invalid(format!(
+                "{at}thresholds must be in (0, 1], got {t}"
+            )));
+        }
+    }
+    let compile = |pats: &[String], key: &str| -> Result<Vec<Regex>, LabelDedupError> {
+        pats.iter()
+            .map(|p| Regex::new(p).map_err(|e| invalid(format!("{at}ids.{key}: {e}"))))
+            .collect()
+    };
+    pass.ids.compiled_reject = compile(&pass.ids.reject_patterns, "reject_patterns")?;
+    pass.ids.compiled_strong = compile(&pass.ids.strong_patterns, "strong_patterns")?;
+    for name in &pass.unknown.count_fields {
+        check_field_name(pass, name, &format!("{at}unknown.count_fields"))?;
+    }
+    if let Some(h) = &pass.hygiene_write {
+        check_templates(
+            &h.add,
+            &[Var::RunTag, Var::Family],
+            &format!("{at}hygiene_write.add"),
+        )?;
+        check_templates(
+            &h.remove,
+            &[Var::RunTag, Var::Family],
+            &format!("{at}hygiene_write.remove"),
+        )?;
+        if !leaves_family(&h.remove, &pass.family_label) {
+            return Err(invalid(format!(
+                "{at}hygiene_write.remove must remove {{family}}, or an applied hygiene write is planned again"
+            )));
+        }
+    }
+    if let Some(m) = &pass.merge {
+        let loser = [Var::RunTag, Var::Family, Var::Survivor];
+        check_templates(&m.loser_add, &loser, &format!("{at}merge.loser_add"))?;
+        check_templates(&m.loser_remove, &loser, &format!("{at}merge.loser_remove"))?;
+        check_templates(
+            &m.survivor_add,
+            &[Var::RunTag, Var::Family],
+            &format!("{at}merge.survivor_add"),
+        )?;
+        if !leaves_family(&m.loser_remove, &pass.family_label) {
+            return Err(invalid(format!(
+                "{at}merge.loser_remove must remove {{family}}, or a retired loser clusters again"
+            )));
+        }
+        if m.carry_ids && pass.ids.carry_label_prefix.is_none() {
+            return Err(invalid(format!(
+                "{at}merge.carry_ids needs ids.carry_label_prefix"
+            )));
+        }
+        for f in m.carry_later_dates.iter().chain(&m.carry_missing) {
+            check_field_name(pass, f, &format!("{at}merge carry fields"))?;
+        }
+    }
+    for prefix in pass
+        .ids
+        .carry_label_prefix
+        .iter()
+        .chain(&pass.revision_label_prefix)
+        .chain(&pass.distinct_label_prefix)
+    {
+        if prefix.is_empty() {
+            return Err(invalid(format!("{at}label prefixes must not be empty")));
+        }
+    }
+    Ok(())
 }
