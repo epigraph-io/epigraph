@@ -1297,6 +1297,22 @@ async fn consolidate_waits_on_create_or_gets_dedup_lock(pool: PgPool) {
     race_held_open(&pool, PairWriter::CreateOrGet, PairWriter::Consolidate).await;
 }
 
+/// The reverse order: `create_or_get` waits on a held-open legacy create of
+/// the pair, then dedups against its committed row. Proves `create_or_get`'s
+/// find (viewer-filtered) answers with a row the legacy create wrote, not only
+/// that the two share a key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_waits_on_create_conns_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateConn, PairWriter::CreateOrGet).await;
+}
+
+/// The reverse order for a consolidation: `create_or_get` of the merged
+/// content waits on the held-open merge, then returns the merged row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_waits_on_consolidates_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::Consolidate, PairWriter::CreateOrGet).await;
+}
+
 /// The legacy create on BARE (autocommit) connections — the `create(pool)`
 /// shape the conventions routes use — with caller 1 parked inside its INSERT.
 ///
