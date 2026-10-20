@@ -781,9 +781,11 @@ async fn a_caller_is_refused_for_a_group_it_does_not_write(pool: PgPool) {
             )
             .await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{name}: {b}");
+        // Refused as the CALLER's refusal (it names the caller), not only by
+        // the system agent's check that would follow it.
         assert!(
-            b.to_string().contains(&group.to_string()),
-            "{name}: names the group: {b}"
+            b.to_string().contains(&group.to_string()) && b.to_string().contains(&w.h.to_string()),
+            "{name}: names the group and the caller: {b}"
         );
         assert_eq!(
             workflows_named(&pool, name).await,
@@ -799,7 +801,10 @@ async fn a_caller_is_refused_for_a_group_it_does_not_write(pool: PgPool) {
         )
         .await
         .expect_err("MCP-HTTP: refused too");
-        assert!(refused.contains(&group.to_string()), "{name}: {refused}");
+        assert!(
+            refused.contains(&group.to_string()) && refused.contains(&w.h.to_string()),
+            "{name}: names the group and the caller: {refused}"
+        );
         assert_eq!(
             workflows_named(&pool, name).await,
             0,
