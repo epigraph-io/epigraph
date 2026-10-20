@@ -36,6 +36,10 @@ const BYPASS_REFUSAL: &str = "epigraph_bypass";
 /// (no silent zero-row run) restated for a session that is not privileged.
 const ZERO_VISIBLE: &str = "sees no undecomposed claim";
 
+/// The stem both zero-visible refusals share (`sees no undecomposed claim`,
+/// `sees no claim at all`).
+const NO_CLAIM_VISIBLE: &str = "sees no";
+
 async fn create_login(pool: &PgPool, parent: &str) -> (String, String) {
     let role = format!("decomp_{}_{}", parent, Uuid::new_v4().simple());
     let password = Uuid::new_v4().simple().to_string();
@@ -424,6 +428,90 @@ async fn a_fleet_session_that_sees_no_undecomposed_claim_fails_loudly(pool: PgPo
 
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;
+}
+
+/// `--priority conflict` reads a narrower population than every undecomposed
+/// claim: only the targets of a live contradicts/refutes edge. On a corpus
+/// with no such target that population is legitimately EMPTY, and a fleet run
+/// must exit 0, not report a configuration fault (the scheduled prompt files
+/// that message as a bug and does not retry). The guard's purpose still holds
+/// for it: a session that sees no claim at all fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_conflict_queue_is_not_a_zero_visible_fault(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (acting, _) = viewer_fixture::seed_agent_with_group(&pool, "decomp-conflict").await;
+    let (author, author_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "decomp-conflict-a").await;
+    viewer_fixture::seed_group_claim(
+        &pool,
+        author,
+        author_group,
+        "Hidden conflict H has a first part. Hidden conflict H also has a second part.",
+    )
+    .await;
+
+    let acting_s = acting.to_string();
+    let conflict = [
+        "--as-agent",
+        acting_s.as_str(),
+        "--dry-run",
+        "--priority",
+        "conflict",
+        "--limit",
+        "50",
+    ];
+
+    // The session sees no claim at all: still a loud failure.
+    let blind = run(&app_url, &conflict, &[]);
+    assert_ne!(
+        blind.code,
+        Some(0),
+        "a session that sees no claim exited 0 under --priority conflict:\n{}",
+        blind.stderr
+    );
+    assert!(
+        blind.stderr.contains(NO_CLAIM_VISIBLE),
+        "the zero-visible message is missing:\n{}",
+        blind.stderr
+    );
+    assert!(!blind.stderr.contains(BYPASS_REFUSAL), "{}", blind.stderr);
+
+    // A visible, decomposable public claim that nothing contradicts: the
+    // conflict queue is empty, and that is a result, not a fault.
+    let v = viewer_fixture::seed_public_claim(
+        &pool,
+        author,
+        "Visible V has a first part. Visible V also has a second part.",
+    )
+    .await;
+    let empty = run(&app_url, &conflict, &[]);
+    assert!(
+        !empty.stderr.contains(NO_CLAIM_VISIBLE),
+        "an empty conflict queue was reported as a session that cannot see the corpus:\n{}",
+        empty.stderr
+    );
+    let empty = empty.ok();
+    assert_eq!(empty.selection_count("scanned"), 0, "{}", empty.stderr);
+    assert!(!empty.listed().contains(&v), "{}", empty.stdout);
+
+    // Calibration: the same session's ordinary population does see V.
+    let recent = run(
+        &app_url,
+        &[
+            "--as-agent",
+            acting_s.as_str(),
+            "--dry-run",
+            "--priority",
+            "recent",
+            "--limit",
+            "50",
+        ],
+        &[],
+    )
+    .ok();
+    assert!(recent.listed().contains(&v), "{}", recent.stderr);
+
+    drop_login(&pool, &app_role).await;
 }
 
 /// A decomposing `--as-agent` run on the fleet login writes its

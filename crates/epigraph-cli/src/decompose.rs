@@ -648,8 +648,8 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, BatchClaim, BatchTotals, DecomposeDb, DecomposeRead, DecomposeTx, PersistOutcome,
-    PlanDrift, PlanGaps, Priority, Selection,
+    verify_plan, visible_claim_count, BatchClaim, BatchTotals, DecomposeDb, DecomposeRead,
+    DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -767,6 +767,24 @@ mod db_writes {
         async fn write<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError> {
             Ok(DecomposeTx::Scoped(self.begin_as(viewer).await?))
         }
+    }
+
+    /// How many claims `viewer` sees on `db`, through the same visibility
+    /// predicate (and, on a [`epigraph_db::ScopedPool`], the same row
+    /// security) every selection read uses.
+    ///
+    /// The `--as-agent` zero-visible check for a population narrower than
+    /// "every undecomposed claim" (`--priority conflict`): an empty conflict
+    /// queue is a legitimate result, a session that sees no claim at all is
+    /// not.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn visible_claim_count(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+    ) -> Result<i64, DbError> {
+        ClaimRepository::count_conn(&mut *db.read(viewer).await?, viewer, None).await
     }
 
     /// What `persist_decomposition` did, for reporting/tests.

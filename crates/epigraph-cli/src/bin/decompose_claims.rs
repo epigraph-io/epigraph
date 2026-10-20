@@ -160,8 +160,9 @@
 use clap::Parser;
 use epigraph_cli::decompose::{
     atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
-    BatchClaim, DecomposeDb, EligibilityFilters, PlanGaps, Priority, SingletonLedger,
+    run_decomposition_batches, select_candidates, verify_plan, visible_claim_count,
+    write_plan_jsonl, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters, PlanGaps, Priority,
+    SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -455,6 +456,16 @@ fn zero_visible_refusal(agent: uuid::Uuid) -> String {
          read zero rows and exit 0. The login in DATABASE_URL reads through row-level \
          security: check that it is an application login with its table grants, and that the \
          claims it should decompose are public. Refusing to run."
+    )
+}
+
+/// The `--as-agent` refusal for a population that may legitimately be empty
+/// (`--priority conflict`): the session sees no claim at all.
+fn no_claim_visible_refusal(agent: uuid::Uuid) -> String {
+    format!(
+        "--as-agent {agent}: this session sees no claim at all, so the run would read zero \
+         rows and exit 0. The login in DATABASE_URL reads through row-level security: check \
+         that it is an application login with its table grants. Refusing to run."
     )
 }
 
@@ -1022,7 +1033,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // population with nothing eligible (`chosen=0`) is the steady
                 // state. Not for --ids-file, which names every id it skips.
                 if ids.is_none() && sel.scanned == 0 {
-                    return Err(zero_visible_refusal(agent).into());
+                    match cli.priority {
+                        // The population is every undecomposed claim the
+                        // session can see; LLM-judged and short parents stay
+                        // in it, so on a live corpus it is never empty.
+                        PriorityArg::Oldest | PriorityArg::Recent => {
+                            return Err(zero_visible_refusal(agent).into());
+                        }
+                        // Only the targets of a live conflict edge: empty is a
+                        // legitimate answer. Fail only if the session sees no
+                        // claim at all.
+                        PriorityArg::Conflict => {
+                            let visible = visible_claim_count(db, viewer).await?;
+                            if visible == 0 {
+                                return Err(no_claim_visible_refusal(agent).into());
+                            }
+                            eprintln!(
+                                "selection: no undecomposed conflict target among the \
+                                 {visible} claims this session sees; nothing to do"
+                            );
+                        }
+                    }
                 }
             }
             if cli.priority == PriorityArg::Conflict {
