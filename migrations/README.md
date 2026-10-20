@@ -38,14 +38,17 @@ enforced in the application instead: `ClaimRepository::create_or_get_signed`
 and POST /claims (`if_not_exists=false`) take a transaction-scoped advisory
 lock on `(content_hash, agent_id)` (`ClaimRepository::lock_content_hash_agent`)
 before their find, so concurrent first creates serialize rather than both
-inserting. Every other find-then-insert writer of the pair takes the same lock
-before its find: the legacy content-hash creates (`ClaimRepository::create`,
-`create_conn`, `create_with_tx`) and `consolidate_act_conn`'s existing-merge
-probe. Writers with no find do not take it: the unconditional INSERTs
-(`create_strict`, supersede, `evolve_step`, `batch_create`, hypothesis
-creation, raw-SQL fixtures) and the deterministic-id ingest paths
-(`create_with_id_if_absent`, which dedups on the primary key). A concurrent row
-from one of those is not deduplicated by the lock.
+inserting. The other find-then-insert writers of the pair take the same lock
+before their find: the legacy content-hash creates (`ClaimRepository::create`,
+`create_conn`, `create_with_tx`), `consolidate_act_conn`'s existing-merge
+probe, and the `method_search` maintenance binary. Writers that do not take it:
+the unconditional INSERTs, which have no find (`create_strict`, supersede,
+`evolve_step`, `batch_create`, hypothesis creation, raw-SQL fixtures); the
+deterministic-id ingest paths (`create_with_id_if_absent`, which dedups on the
+primary key and so still races a random-id `create_or_get` of the same pair);
+and the policy-challenge route, whose find is scoped to the
+`policy:challenge` label and which serializes its own callers under a separate
+lock. A concurrent row from one of those is not deduplicated by the lock.
 
 **Do not re-add the full constraint.** A bare `ADD CONSTRAINT` fails on the
 duplicates (most are supersession history, which a full UNIQUE would force us

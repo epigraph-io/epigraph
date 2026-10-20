@@ -5667,29 +5667,52 @@ impl ClaimRepository {
     ///
     /// # Who takes it
     ///
-    /// Every writer that looks for an existing row of the pair and inserts on
-    /// a miss: [`Self::create_or_get`] / [`Self::create_or_get_signed`], POST
-    /// /claims' duplicate check (`if_not_exists=false`), the legacy
-    /// content-hash creates ([`Self::create_conn`], and [`Self::create`] /
-    /// [`Self::create_with_tx`], which delegate to it), and
-    /// [`Self::consolidate_act_conn`]'s "identical merged claim already exists"
-    /// probe. Each takes it BEFORE its find, and before any row lock of its own.
+    /// Every writer that looks for an existing row of the pair (or of its
+    /// content hash) and inserts on a miss: [`Self::create_or_get`] /
+    /// [`Self::create_or_get_signed`], POST /claims' duplicate check
+    /// (`if_not_exists=false`), the legacy content-hash creates
+    /// ([`Self::create_conn`], and [`Self::create`] / [`Self::create_with_tx`],
+    /// which delegate to it), [`Self::consolidate_act_conn`]'s "identical
+    /// merged claim already exists" probe, and the `method_search` maintenance
+    /// binary in `epigraph-cli`. Each takes it BEFORE its find, and before any
+    /// row lock of its own.
     ///
-    /// Writers that do not take it, and why that is not a check-then-act race:
-    /// [`Self::create_strict`] and the other unconditional INSERTs (supersede,
-    /// `evolve_step`, `batch_create`, hypothesis creation) have no find to
-    /// race; [`Self::create_with_id_if_absent`] dedups on its caller-supplied
-    /// deterministic id, which the primary key already serializes. A
-    /// concurrent writer of the same pair that does not take this lock can
+    /// Writers that do not take it:
+    ///
+    /// - [`Self::create_strict`] and the other unconditional INSERTs
+    ///   (supersede, `evolve_step`, `batch_create`, hypothesis creation) have
+    ///   no find, so there is no check-then-act to race.
+    /// - [`Self::create_with_id_if_absent`] dedups on its caller-supplied
+    ///   deterministic id (`ON CONFLICT (id)`), which the primary key already
+    ///   serializes among its own callers. It has no pair find, so taking this
+    ///   lock would close only one order of a race against a random-id
+    ///   [`Self::create_or_get`] of the same pair; that cross race stays open.
+    /// - `policies.rs::create_challenge` finds on the pair PLUS the
+    ///   `policy:challenge` label and serializes its own callers under
+    ///   `'epigraph.policy_challenge'`. A non-challenge row of the same pair
+    ///   does not satisfy its find, so the shared key would not change its
+    ///   outcome.
+    ///
+    /// A concurrent writer of the same pair that does not take this lock can
     /// still add a row that a lock holder's find did not see.
+    ///
+    /// # Deadlocks and lock-table use
     ///
     /// The ingest atoms reach it through [`Self::create_conn`] inside one
     /// document transaction, so an ingest holds one lock per distinct atom
-    /// until it commits. Two overlapping same-author ingests that meet atoms in
-    /// opposite orders can deadlock (40P01). Without this lock they waited the
-    /// same way on each other's uncommitted primary-key entry (an atom's id is
-    /// `atom_id(content_hash)`), and the second then failed on that key instead
-    /// of returning the first's row.
+    /// until it commits. Ingest against ingest keeps the wait graph it had
+    /// without the lock: an atom's id is `atom_id(content_hash)`, so an
+    /// overlapping same-author ingest already waited on the other's
+    /// uncommitted primary-key entry (and then failed on that key instead of
+    /// returning the first's row). New: a same-author ingest against a
+    /// multi-pair [`Self::create_or_get`] transaction or a consolidation into
+    /// the same content, meeting shared pairs in opposite orders, can now
+    /// deadlock (40P01, retryable) where it previously minted a duplicate.
+    ///
+    /// Every lock held until commit takes a slot in the shared lock table
+    /// (`max_locks_per_transaction` x `max_connections`), which the
+    /// primary-key waits did not. A document with very many distinct atoms,
+    /// or several concurrent large ones, uses correspondingly many slots.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the lock statement fails.
