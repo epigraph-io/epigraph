@@ -1386,6 +1386,7 @@ pub async fn update_with_evidence(
         claim_id,
         &params.labels,
         &[],
+        &[],
     )
     .await?;
 
@@ -2279,11 +2280,15 @@ async fn gate_retirement_label(
     claim_id: Uuid,
     add: &[String],
     remove: &[String],
+    extra_retirement_labels: &[String],
 ) -> Result<Option<OwnershipGrant>, McpError> {
+    // `extra_retirement_labels`: further labels the CALLER declares carry
+    // retirement semantics for this write (a label-dedup profile's closed
+    // label). Empty for every single-claim tool, so their gate is unchanged.
     let touches_retirement = add
         .iter()
         .chain(remove.iter())
-        .any(|l| l == RETIREMENT_LABEL);
+        .any(|l| l == RETIREMENT_LABEL || extra_retirement_labels.contains(l));
     if !touches_retirement {
         return Ok(None);
     }
@@ -2364,6 +2369,7 @@ pub async fn update_labels(
         id,
         &params.add,
         &params.remove,
+        &[],
     )
     .await?;
     tx.commit().await.map_err(internal_error)?;
@@ -2389,7 +2395,9 @@ pub(crate) struct RelabelOutcome {
 ///
 /// Shared so a tool that writes several claims in ONE transaction
 /// (`apply_label_dedup`'s write units) takes exactly `update_labels`' path per
-/// claim and adds no ungated label path of its own. A refusal returns before
+/// claim and adds no ungated label path of its own. `extra_retirement_labels`
+/// widens the retirement-label gate to further labels the caller treats as
+/// retirement (empty for `update_labels`). A refusal returns before
 /// the write; the caller drops `tx`, which rolls back everything the
 /// transaction wrote, earlier claims included.
 #[allow(clippy::too_many_arguments)]
@@ -2402,6 +2410,7 @@ pub(crate) async fn relabel_claim(
     id: Uuid,
     add: &[String],
     remove: &[String],
+    extra_retirement_labels: &[String],
 ) -> Result<RelabelOutcome, McpError> {
     // `db_caller_error`, not `internal_error`: a label refused by
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
@@ -2428,8 +2437,18 @@ pub(crate) async fn relabel_claim(
     } else {
         None
     };
-    let retirement_grant =
-        gate_retirement_label(server, tx, viewer, auth, caller, id, add, remove).await?;
+    let retirement_grant = gate_retirement_label(
+        server,
+        tx,
+        viewer,
+        auth,
+        caller,
+        id,
+        add,
+        remove,
+        extra_retirement_labels,
+    )
+    .await?;
     let owner_group = crate::tools::admin_write::owner_group_of(tx, viewer, id).await?;
     let admin_path = crate::tools::admin_write::takes_admin_path(
         grant.or(retirement_grant),
@@ -2535,6 +2554,7 @@ pub async fn patch_claim(
         id,
         &params.add_labels,
         &params.remove_labels,
+        &[],
     )
     .await?;
     let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;

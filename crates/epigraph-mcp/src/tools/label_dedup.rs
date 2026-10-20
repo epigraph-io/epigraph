@@ -49,10 +49,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_engine::label_dedup::{
-    self as engine, DedupClaim, LabelDedupError, LabelDedupProfile, PlanInputs, PlanRequest,
-    ProbeCandidate, ReadPurpose, ReadSpec, Section, Snapshot, WriteUnit,
+    self as engine, AppliedLabelChange, DedupClaim, LabelDedupError, LabelDedupProfile, PlanInputs,
+    PlanRequest, ProbeCandidate, ReadPurpose, ReadSpec, Section, Snapshot, WriteUnit,
 };
 use rmcp::model::{CallToolResult, Content, ErrorCode};
 use serde_json::{json, Value};
@@ -695,19 +696,148 @@ pub async fn plan_label_dedup(
 /// Re-plan from live state and apply the plan the caller reviewed.
 ///
 /// # Errors
-/// A refusal carrying `data.code`.
+/// As [`plan_label_dedup`], plus the read-only refusal and a missing write
+/// identity. A truncated read and a drifted plan are NOT errors: they are a
+/// `refused` status with nothing written.
 pub async fn apply_label_dedup(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ApplyLabelDedupParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let _ = (server, viewer, params, auth);
-    Err(McpError {
-        code: ErrorCode::INTERNAL_ERROR,
-        message: "NOT_IMPLEMENTED".into(),
-        data: Some(json!({ "code": "NOT_IMPLEMENTED" })),
-    })
+    server.reject_if_read_only()?;
+    let prepared = prepare(
+        server,
+        auth,
+        &ProfileArgs {
+            path: params.profile_path.as_deref(),
+            json: params.profile_json.as_deref(),
+            claim_id: params.profile_claim_id.as_deref(),
+            hash: &params.profile_hash,
+        },
+        &params.run_tag,
+        params.as_of.as_deref(),
+        &params.sections,
+        params.max_claims,
+    )?;
+    let (plan, at) = compute_plan(server, viewer, &prepared).await?;
+    let refused = |code: &str, message: String| -> Result<CallToolResult, McpError> {
+        success_json(&json!({
+            "applied_plan_hash": Value::Null,
+            "status": "refused",
+            "refusal": {"code": code, "message": message},
+            "plan": plan_json(&plan, at, prepared.max)?,
+            "results": [],
+            "counts": {"units": 0, "ok": 0, "failed": 0, "labels_added": 0, "labels_removed": 0},
+            "applied_units": [],
+        }))
+    };
+    if let Some(e) = plan.apply_refusal() {
+        return refused(e.code(), e.to_string());
+    }
+    if canonical_hash(&plan.plan_hash) != canonical_hash(&params.plan_hash) {
+        return refused(
+            codes::PLAN_DRIFT,
+            "the live family no longer plans to the reviewed plan_hash; review the fresh plan \
+             and apply its plan_hash"
+                .to_string(),
+        );
+    }
+    let units = plan.write_units();
+    if units.is_empty() {
+        return success_json(&json!({
+            "applied_plan_hash": plan.plan_hash,
+            "status": "nothing_to_do",
+            "results": [],
+            "counts": {"units": 0, "ok": 0, "failed": 0, "labels_added": 0, "labels_removed": 0},
+            "applied_units": [],
+            "coverage": plan_json(&plan, at, prepared.max)?["coverage"].clone(),
+        }));
+    }
+
+    let caller = server.write_identity(auth, viewer).await?;
+    let retirement = retirement_labels(&prepared.profile);
+    let mut results = Vec::with_capacity(units.len());
+    let mut applied: Vec<AppliedLabelChange> = Vec::new();
+    let mut failed = 0usize;
+    for unit in &units {
+        match apply_unit(server, viewer, auth, caller, unit, &retirement).await {
+            Ok((changes, admin_path)) => {
+                results.push(json!({"unit": unit.unit, "ok": true, "admin_path": admin_path}));
+                applied.extend(changes);
+            }
+            Err(e) => {
+                failed += 1;
+                results.push(json!({
+                    "unit": unit.unit, "ok": false, "admin_path": false,
+                    "error": e.message,
+                }));
+            }
+        }
+    }
+    let added: usize = applied.iter().map(|c| c.labels_added.len()).sum();
+    let removed: usize = applied.iter().map(|c| c.labels_removed.len()).sum();
+    success_json(&json!({
+        "applied_plan_hash": plan.plan_hash,
+        "status": "applied",
+        "results": results,
+        "counts": {
+            "units": units.len(),
+            "ok": units.len() - failed,
+            "failed": failed,
+            "labels_added": added,
+            "labels_removed": removed,
+        },
+        "applied_units": serde_json::to_value(&applied).map_err(internal_error)?,
+        "coverage": plan_json(&plan, at, prepared.max)?["coverage"].clone(),
+        "max_claims": prepared.max.json(),
+    }))
+}
+
+/// One unit, one transaction stamped from the write identity. Every claim
+/// goes through `update_labels`' per-claim path; any refusal drops the
+/// transaction, so nothing of the unit lands.
+async fn apply_unit(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    unit: &WriteUnit,
+    retirement: &[String],
+) -> Result<(Vec<AppliedLabelChange>, bool), McpError> {
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "apply_label_dedup").await?;
+    let mut changes = Vec::with_capacity(unit.writes.len());
+    let mut admin_path = false;
+    for w in &unit.writes {
+        let (_, before) = ClaimRepository::get_by_id_with_labels(
+            &mut *tx,
+            viewer,
+            ClaimId::from_uuid(w.claim_id),
+        )
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            refusal(
+                codes::INVALID_ARGUMENT,
+                format!("claim {} not found", w.claim_id),
+            )
+        })?;
+        let out = crate::tools::claims::relabel_claim(
+            server, &mut tx, viewer, auth, caller, w.claim_id, &w.add, &w.remove, retirement,
+        )
+        .await?;
+        admin_path |= out.admin_path;
+        changes.push(AppliedLabelChange::from_write(
+            &unit.unit,
+            w,
+            &before,
+            &out.labels,
+        ));
+    }
+    tx.commit().await.map_err(internal_error)?;
+    changes.retain(|c| !c.is_empty());
+    Ok((changes, admin_path))
 }
 
 /// Classify would-be claims against the family index. Read-only.
