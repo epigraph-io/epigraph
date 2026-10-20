@@ -113,10 +113,136 @@ pub enum Decision {
     LeaveNull(LeaveNull),
 }
 
-/// Decide one row's type from its stored provenance.
+/// Writers #573 keeps untyped on purpose: their only type source is declared
+/// by the submitter and would raise the weight (`error_derived`), or the row
+/// is not evidence at all (`prior`, a vacuous hypothesis prior).
+const UNTYPED_BY_DESIGN: [&str; 2] = ["error_derived", "prior"];
+
+/// Methodologies that decide nothing about the kind of support (the typing
+/// study's rules fall through them to the evidence row). Any other non-blank
+/// methodology may contradict a declared or linked type, so it stops the rules.
+const NON_DECIDING_METHODOLOGIES: [&str; 5] = [
+    "extraction",
+    "llm_extraction",
+    "negative_result",
+    "inductive",
+    "inductive_generalization",
+];
+
+/// The claim `source_type`s the study's provisional D10 rule would have typed
+/// `logical`. Measured on too few rows to apply; they stop the rules.
+const PROVISIONAL_SOURCE_TYPES: [&str; 3] = ["textbook", "paper", "internaldocument"];
+
+fn norm(v: Option<&str>) -> Option<String> {
+    v.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty())
+}
+
+/// `raw` through the writers' canonicalization, kept only when it names a
+/// calibrated key: a type the lens cannot weigh is not worth writing.
+fn canonical_calibrated(calibration: &CalibrationConfig, raw: &str) -> Option<String> {
+    calibration
+        .canonical_evidence_type(raw)
+        .filter(|k| calibration.evidence_type_weight_present(k))
+}
+
+fn typed_or_uncalibrated(calibration: &CalibrationConfig, raw: &str, rule: Rule) -> Decision {
+    canonical_calibrated(calibration, raw).map_or(
+        Decision::LeaveNull(LeaveNull::Uncalibrated),
+        |evidence_type| Decision::Type {
+            evidence_type,
+            rule,
+        },
+    )
+}
+
+/// Decide one row's type from its stored provenance. First match wins; see
+/// the module documentation for each rule and each reason.
 #[must_use]
-pub fn decide(_row: &UntypedBbaProvenance, _calibration: &CalibrationConfig) -> Decision {
-    Decision::LeaveNull(LeaveNull::NoDeterminingField)
+pub fn decide(row: &UntypedBbaProvenance, calibration: &CalibrationConfig) -> Decision {
+    use LeaveNull as N;
+
+    // An aggregate has no single type.
+    if row.cached_combination {
+        return Decision::LeaveNull(N::CachedCombination);
+    }
+    if row.unlabelled_slot_shared {
+        return Decision::LeaveNull(N::UnlabelledSharedSlot);
+    }
+
+    let method = row.combination_method.as_deref().unwrap_or("");
+    if UNTYPED_BY_DESIGN.contains(&method) {
+        return Decision::LeaveNull(N::UntypedByDesign);
+    }
+    let not_evidence_label = row
+        .claim_labels
+        .iter()
+        .any(|l| l == "backlog" || l.starts_with("backlog:") || l == "content-draft");
+    if method == "test" || not_evidence_label {
+        return Decision::LeaveNull(N::NotEvidence);
+    }
+    if method.starts_with("propagated_") {
+        return Decision::LeaveNull(N::RelationshipNotStored);
+    }
+    let regulatory_doi =
+        norm(row.claim_source_doi.as_deref()).is_some_and(|d| d.starts_with("cbc-"));
+    let regulatory_perspective =
+        norm(row.perspective_name.as_deref()).is_some_and(|p| p.contains("regulatory"));
+    if regulatory_doi || regulatory_perspective {
+        return Decision::LeaveNull(N::RegulatoryProvisional);
+    }
+
+    let deciding_methodology = norm(row.claim_methodology.as_deref())
+        .is_some_and(|m| !NON_DECIDING_METHODOLOGIES.contains(&m.as_str()));
+    let declared = norm(row.claim_evidence_type.as_deref());
+    let generic_declared = declared
+        .as_deref()
+        .is_some_and(|d| d == "document" || d == "reference");
+
+    // The claim's own declared type, as submit_claim would have stored it.
+    if let Some(d) = declared.as_deref().filter(|_| !generic_declared) {
+        if !DECLARABLE_TYPES.contains(&d) {
+            return Decision::LeaveNull(N::DeclaredTypeNotDeclarable);
+        }
+        if deciding_methodology {
+            return Decision::LeaveNull(N::DeclaredTypeWithMethodology);
+        }
+        return typed_or_uncalibrated(calibration, d, Rule::DeclaredType);
+    }
+    if deciding_methodology {
+        return Decision::LeaveNull(N::MethodologyOnly);
+    }
+
+    // The linked evidence row's tag: only `reference` is reliable enough.
+    if let Some(tag) = norm(row.linked_evidence_type.as_deref()) {
+        if tag == "reference" {
+            return typed_or_uncalibrated(calibration, &tag, Rule::LinkedReference);
+        }
+        return Decision::LeaveNull(N::LinkedTagUnreliable);
+    }
+    if generic_declared {
+        return Decision::LeaveNull(N::GenericDeclaredType);
+    }
+    if norm(row.claim_source_type.as_deref())
+        .is_some_and(|s| PROVISIONAL_SOURCE_TYPES.contains(&s.as_str()))
+    {
+        return Decision::LeaveNull(N::SourceTypeProvisional);
+    }
+    if method == "interview_extraction" {
+        return typed_or_uncalibrated(calibration, "testimonial", Rule::InterviewExtraction);
+    }
+
+    // An OpenStax extractor, known only by its agent's NAME: an operator
+    // decision (see the module documentation), never applied here.
+    let openstax = norm(row.agent_name.as_deref()).is_some_and(|a| {
+        a.split_once(':').is_some_and(|(class, suffix)| {
+            (class == "textbook-extractor" || class == "paper-extractor")
+                && suffix.starts_with("openstax")
+        })
+    });
+    if openstax {
+        return Decision::LeaveNull(N::OpenstaxAgentNameOnly);
+    }
+    Decision::LeaveNull(N::NoDeterminingField)
 }
 
 /// Per-writer counts. The writer is `combination_method`, `<null>` when NULL.
