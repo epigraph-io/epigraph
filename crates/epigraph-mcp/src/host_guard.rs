@@ -50,6 +50,7 @@ use http::{
     header::{HOST, ORIGIN},
     StatusCode,
 };
+use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 
 /// Authorities always permitted, regardless of `--listen` / `--allowed-host`.
 ///
@@ -164,6 +165,23 @@ impl HostAllowlist {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+/// The rmcp [`StreamableHttpServerConfig`] for an MCP HTTP listener.
+///
+/// `tcp_allowlist` is the TCP listener's [`HostAllowlist`] (the one
+/// [`host_guard_middleware`] enforces), or `None` for a unix-socket listener.
+/// `main.rs` and the HTTP tests both build the rmcp service through this
+/// function, so the tests exercise the production configuration.
+///
+/// rmcp 0.15's config has no Host/Origin knob, so today this is the default
+/// config and [`host_guard_middleware`] is the only Host/Origin check.
+#[must_use]
+pub fn streamable_http_server_config(
+    tcp_allowlist: Option<&HostAllowlist>,
+) -> StreamableHttpServerConfig {
+    let _ = tcp_allowlist;
+    StreamableHttpServerConfig::default()
 }
 
 /// 403 for a request whose `Host`/`Origin` this listener does not serve.

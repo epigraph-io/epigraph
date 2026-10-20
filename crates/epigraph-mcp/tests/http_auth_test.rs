@@ -62,10 +62,17 @@ fn mint_token(secret: &[u8], scopes: &[&str]) -> String {
 /// Build the full axum router with bearer middleware around the MCP service.
 /// Uses a lazy pool that never actually opens a DB connection.
 async fn boot_router() -> axum::Router {
+    boot_router_with(rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default())
+        .await
+}
+
+/// [`boot_router`] with a caller-chosen rmcp service config, so a test can serve
+/// the production config from `host_guard::streamable_http_server_config`.
+async fn boot_router_with(
+    config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
+) -> axum::Router {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-    };
+    use rmcp::transport::streamable_http_server::StreamableHttpService;
 
     // connect_lazy with a very short connect_timeout (100ms) so DB queries fail
     // fast. The 401/403 auth-rejection tests never touch the DB; test 4 is
@@ -88,7 +95,7 @@ async fn boot_router() -> axum::Router {
             ))
         },
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        config,
     );
 
     let state = McpAuthState {
@@ -669,7 +676,9 @@ async fn unauthenticated_writes_opt_in_passes_the_scope_gate() {
 // rewrites `Host` from the request URL, so a live-server test could not actually
 // send the rebound header these cases turn on.
 
-use epigraph_mcp::host_guard::{host_guard_middleware, HostAllowlist};
+use epigraph_mcp::host_guard::{
+    host_guard_middleware, streamable_http_server_config, HostAllowlist,
+};
 use tower::ServiceExt;
 
 /// The name an operator would add for a reverse-proxied deployment (Caddy's
@@ -683,12 +692,21 @@ const PROXY_HOST: &str = "mcp.example.com";
 /// on its headers before auth decides anything about it.
 async fn boot_guarded_router() -> axum::Router {
     let allowlist = HostAllowlist::for_tcp_listener("127.0.0.1:3100", &[PROXY_HOST.to_string()]);
-    boot_router()
+    boot_router_with(streamable_http_server_config(Some(&allowlist)))
         .await
         .layer(axum::middleware::from_fn_with_state(
             allowlist,
             host_guard_middleware,
         ))
+}
+
+/// Router shaped like `main.rs`'s unix-socket branch: the rmcp service built
+/// with the unix-listener config and NO Host guard layer (a unix socket has no
+/// DNS-rebinding surface; filesystem permissions are its gate). Served here
+/// through `oneshot`, which is what lets the test choose the `Host` a socket
+/// client happens to send.
+async fn boot_unix_shaped_router() -> axum::Router {
+    boot_router_with(streamable_http_server_config(None)).await
 }
 
 /// A well-formed `initialize` POST with a caller-chosen `Host` (and optional
@@ -765,6 +783,68 @@ async fn allowlisted_hosts_fall_through_to_the_bearer_layer() {
             status_of(init_request(host, None, None)).await,
             401,
             "allowlisted Host {host:?} must reach the auth layer, not be 403'd"
+        );
+    }
+}
+
+/// The other half of the pairing above, and the one that reaches the MCP
+/// service itself: with a VALID token, every allowlisted spelling — the
+/// operator's proxy name (what a reverse proxy forwards as `Host`), its
+/// fully-qualified and port-bearing forms, and the loopback names — must get a
+/// live session from `initialize`, not a 403 from any layer. The guard is not
+/// the only Host check a request meets: the rmcp service config is built by
+/// `streamable_http_server_config` from the same allowlist, and this is the
+/// test that fails if the two ever disagree about a legitimate name.
+#[tokio::test]
+async fn allowlisted_hosts_with_a_valid_token_get_a_session() {
+    let token = mint_token(SECRET, &["claims:read"]);
+    for host in [
+        PROXY_HOST,
+        "mcp.example.com.",
+        "MCP.Example.com:443",
+        "127.0.0.1:3100",
+        "localhost",
+        "localhost.",
+        "[::1]:3100",
+    ] {
+        let resp = boot_guarded_router()
+            .await
+            .oneshot(init_request(host, None, Some(&token)))
+            .await
+            .expect("router is infallible");
+        let status = resp.status().as_u16();
+        let has_session = resp.headers().contains_key(SESSION_HEADER);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        assert!(
+            status == 200 && has_session,
+            "allowlisted Host {host:?} with a valid token must get an MCP session; \
+             got {status} (session header: {has_session}) body: {body}"
+        );
+    }
+}
+
+/// A unix-socket listener applies no Host allowlist at any layer: whatever
+/// `Host` a socket client sends (there is no DNS name involved), `initialize`
+/// gets a session. A loopback-only default inside the rmcp service would turn
+/// every such client into a 403.
+#[tokio::test]
+async fn unix_shaped_listener_serves_any_host() {
+    let token = mint_token(SECRET, &["claims:read"]);
+    for host in ["epigraph-mcp", "mcp.internal", "localhost"] {
+        let resp = boot_unix_shaped_router()
+            .await
+            .oneshot(init_request(host, None, Some(&token)))
+            .await
+            .expect("router is infallible");
+        let status = resp.status().as_u16();
+        let has_session = resp.headers().contains_key(SESSION_HEADER);
+        assert!(
+            status == 200 && has_session,
+            "unix-socket listener must serve Host {host:?}; got {status} \
+             (session header: {has_session})"
         );
     }
 }

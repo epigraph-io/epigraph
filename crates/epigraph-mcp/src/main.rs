@@ -728,9 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-        };
+        use rmcp::transport::streamable_http_server::StreamableHttpService;
 
         // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
         // was already refused above; this catches a link recorded earlier by a
@@ -831,6 +829,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
+        // The TCP listener's Host/Origin allowlist (`None` on a unix socket).
+        // Built once: the rmcp service config and the outer guard layer below
+        // must agree on it.
+        let tcp_allowlist = (!epigraph_mcp::is_unix_listener(addr)).then(|| {
+            epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host)
+        });
+
         let service = StreamableHttpService::new(
             // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
             // this closure runs once PER SESSION. Every session is a clone of
@@ -843,7 +848,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // session. See `SessionFactory` for the measurement.
             move || Ok(sessions.session()),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            epigraph_mcp::host_guard::streamable_http_server_config(tcp_allowlist.as_ref()),
         );
 
         // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
@@ -900,15 +905,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // alone. TCP only — a unix socket is unreachable from a browser, so the
         // guard would add no security there while risking a 403 on the one
         // listener kind allowed to run unauthenticated.
-        let router = if epigraph_mcp::is_unix_listener(addr) {
-            tracing::info!(
-                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
-                 DNS-rebinding surface); filesystem permissions are the trust gate"
-            );
-            router
-        } else {
-            let allowlist =
-                epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host);
+        let router = if let Some(allowlist) = tcp_allowlist {
             tracing::info!(
                 allowed_hosts = %allowlist.describe(),
                 "Host/Origin allowlist active on the MCP HTTP listener (DNS-rebinding guard); \
@@ -918,6 +915,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist,
                 epigraph_mcp::host_guard::host_guard_middleware,
             ))
+        } else {
+            tracing::info!(
+                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
+                 DNS-rebinding surface); filesystem permissions are the trust gate"
+            );
+            router
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
