@@ -66,9 +66,10 @@
 //!   succeeds for a caller that cannot read the steps (and for one holding
 //!   only `claims:read`), moves the counters, and records every step of a
 //!   group-private plan with a NULL `step_claim_id`, for members too.
-//! * `executes` edge mutation: a WRITER of G can rewrite `plan_index` and
-//!   retract an `executes` edge of a G-private workflow; a reader and a
-//!   non-member cannot.
+//! * `executes` edge mutation: any principal that writes G (an `admin` or a
+//!   plain `writer` row) can rewrite `plan_index` and retract an `executes`
+//!   edge of a G-private workflow, over REST and over the stdio MCP tools; a
+//!   reader and a non-member cannot, on either.
 //!
 //! # How a workflow becomes group-private here
 //!
@@ -414,16 +415,23 @@ async fn role_group(pool: &PgPool, writer: Uuid, reader: Uuid) -> Uuid {
     )
     .await
     .expect("the role group");
+    add_member(pool, id, reader, "reader").await;
+    id
+}
+
+/// Give `agent` a live `role` row in group `g` (harness, standing in for the
+/// maintenance session that grants it).
+async fn add_member(pool: &PgPool, g: Uuid, agent: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+         VALUES ($1, $2, ''::bytea, 0, $3)",
     )
-    .bind(id)
-    .bind(reader)
+    .bind(g)
+    .bind(agent)
+    .bind(role)
     .execute(pool)
     .await
-    .expect("the reader row");
-    id
+    .unwrap_or_else(|e| panic!("the {role} row: {e}"));
 }
 
 /// Restrict every claim the workflow executes to `('group', g)`, and check the
@@ -1421,15 +1429,70 @@ async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_s
 // executes edge mutation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// CHARACTERIZATION. Nothing in the edge mutation routes looks at
-/// `relationship`: a WRITER of G rewrites an `executes` edge's `plan_index`
-/// and retracts another, on the authenticated REST surface; a reader of G and
-/// a non-member are refused. A retracted edge stays in the edge listing with
-/// `valid_to` set, so a reader that does not filter on `valid_to` still
-/// counts it.
+/// An `executes` edge's `plan_index` and whether it is still in force
+/// (harness read).
+async fn executes_edge_state(pool: &PgPool, edge: Uuid) -> (Option<i64>, bool) {
+    sqlx::query_as(
+        "SELECT (properties->>'plan_index')::bigint, valid_to IS NULL FROM edges WHERE id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("edge state")
+}
+
+/// MCP `patch_edge` on the stdio transport, as the server's own agent.
+async fn stdio_patch_edge(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    edge: Uuid,
+    properties: Value,
+) -> Result<(), epigraph_mcp::errors::McpError> {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None).await?;
+    let r = epigraph_mcp::tools::edge_mutation::do_patch_edge(
+        server,
+        &viewer,
+        epigraph_mcp::types::PatchEdgeParams {
+            edge_id: edge.to_string(),
+            valid_to: None,
+            properties: Some(properties),
+        },
+        None,
+    )
+    .await?;
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    Ok(())
+}
+
+/// MCP `delete_edge` (a soft retraction) on the stdio transport, as the
+/// server's own agent.
+async fn stdio_delete_edge(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    edge: Uuid,
+) -> Result<(), epigraph_mcp::errors::McpError> {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None).await?;
+    let r = epigraph_mcp::tools::edge_mutation::do_delete_edge(
+        server,
+        &viewer,
+        epigraph_mcp::types::DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+        None,
+    )
+    .await?;
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    Ok(())
+}
+
+/// CHARACTERIZATION. Nothing in the edge mutation paths looks at
+/// `relationship`: any principal that writes G rewrites an `executes` edge's
+/// `plan_index` and retracts another, on REST with real tokens and on the
+/// stdio MCP tools; a reader of G and a non-member are refused on both and
+/// write nothing. "Writes G" is an `admin` or a plain `writer` row, and both
+/// are exercised. A retracted edge stays in the edge listing with `valid_to`
+/// set, so a reader that does not filter on `valid_to` still counts it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: PgPool) {
-    let w = private_workflow(&pool, small_extraction("acme-mutable-plan", 2)).await;
+    let w = private_workflow(&pool, small_extraction("acme-mutable-plan", 4)).await;
     let reader_t = token(w.reader, WRITE_SCOPES);
     let edges = w.api.executes_edges(&reader_t, w.workflow_id).await;
     let id_at = |i: u64| {
@@ -1439,9 +1502,11 @@ async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: 
             .map(|e| uuid_of(&e["id"]))
             .unwrap_or_else(|| panic!("no edge at plan_index {i}"))
     };
-    let (first, second) = (id_at(0), id_at(1));
+    // REST rewrites/retracts the first two; MCP the last two.
+    let (first, second, third, fourth) = (id_at(0), id_at(1), id_at(2), id_at(3));
     let patch = json!({"properties": {"plan_index": 7}});
 
+    // ── REST ──
     // A reader can see the edge but does not write G: 403. A non-member cannot
     // see it at all: 404.
     for (who, label, refused) in [
@@ -1475,21 +1540,26 @@ async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: 
             "{label} must not retract the executes edge: {body}"
         );
     }
+    assert_eq!(executes_edge_state(&pool, first).await, (Some(0), true));
+    assert_eq!(executes_edge_state(&pool, second).await, (Some(1), true));
 
-    let writer_t = token(w.writer, WRITE_SCOPES);
+    // G's creator (an `admin` row) patches; a member with a plain `writer`
+    // row retracts.
+    let (plain_writer, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-writer").await;
+    add_member(&pool, w.g, plain_writer, "writer").await;
     let (status, body) = w
         .api
         .call(
             Method::PATCH,
             &format!("/api/v1/edges/{first}"),
-            &writer_t,
+            &token(w.writer, WRITE_SCOPES),
             Some(&patch),
         )
         .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "the writer patches plan_index: {body}"
+        "G's admin patches plan_index: {body}"
     );
     assert_eq!(body["properties"]["plan_index"], json!(7));
     let (status, body) = w
@@ -1497,14 +1567,14 @@ async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: 
         .call(
             Method::DELETE,
             &format!("/api/v1/edges/{second}"),
-            &writer_t,
+            &token(plain_writer, WRITE_SCOPES),
             None,
         )
         .await;
     assert_eq!(
         status,
         StatusCode::NO_CONTENT,
-        "the writer retracts it: {body}"
+        "a plain writer of G retracts it: {body}"
     );
 
     let after = w.api.executes_edges(&reader_t, w.workflow_id).await;
@@ -1526,5 +1596,64 @@ async fn a_group_writer_rewrites_plan_index_and_retracts_an_executes_edge(pool: 
         .find(|e| uuid_of(&e["id"]) == second)
         .expect("the retracted edge is still listed");
     assert!(!retracted["valid_to"].is_null(), "and carries valid_to");
-    let _ = (w.curator, w.canonical_name);
+
+    // ── stdio MCP (`do_patch_edge`, `do_delete_edge`) ──
+    // Each server acts as its own agent, as a container's `epigraph-mcp` does.
+    let mcp_writer = mcp_server(&pool, 0xC3).await;
+    let writer_agent = stdio_agent(&pool, &mcp_writer, 0xC3).await;
+    add_member(&pool, w.g, writer_agent, "writer").await;
+    let mcp_reader = mcp_server(&pool, 0xD4).await;
+    let reader_agent = stdio_agent(&pool, &mcp_reader, 0xD4).await;
+    add_member(&pool, w.g, reader_agent, "reader").await;
+    let mcp_stranger = mcp_server(&pool, 0xE5).await;
+    stdio_agent(&pool, &mcp_stranger, 0xE5).await;
+
+    // A reader of G sees the edge, so its refusal is the named owner refusal;
+    // a non-member does not, so its refusal is "not found". Neither writes.
+    for (server, label, owner_refusal) in [
+        (&mcp_reader, "MCP reader", true),
+        (&mcp_stranger, "MCP non-member", false),
+    ] {
+        for (what, refusal) in [
+            (
+                "patch",
+                stdio_patch_edge(server, third, json!({"plan_index": 9}))
+                    .await
+                    .err(),
+            ),
+            ("retract", stdio_delete_edge(server, fourth).await.err()),
+        ] {
+            let e = refusal.unwrap_or_else(|| panic!("{label} must not {what} the executes edge"));
+            let not_owner = e.data.as_ref().map(|d| d["error"] == "not_owner");
+            assert_eq!(
+                not_owner == Some(true),
+                owner_refusal,
+                "{label}: refused as not_owner = {owner_refusal}: {e:?}"
+            );
+            assert_eq!(
+                e.message.contains("not found"),
+                !owner_refusal,
+                "{label}: {e:?}"
+            );
+        }
+    }
+    assert_eq!(executes_edge_state(&pool, third).await, (Some(2), true));
+    assert_eq!(executes_edge_state(&pool, fourth).await, (Some(3), true));
+
+    stdio_patch_edge(&mcp_writer, third, json!({"plan_index": 9}))
+        .await
+        .expect("a plain writer of G patches plan_index over stdio");
+    stdio_delete_edge(&mcp_writer, fourth)
+        .await
+        .expect("a plain writer of G retracts over stdio");
+    assert_eq!(
+        executes_edge_state(&pool, third).await,
+        (Some(9), true),
+        "the stdio patch rewrote plan_index and left the edge in force"
+    );
+    assert_eq!(
+        executes_edge_state(&pool, fourth).await,
+        (Some(3), false),
+        "the stdio retraction set valid_to and kept the row"
+    );
 }
