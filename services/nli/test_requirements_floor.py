@@ -30,22 +30,34 @@ SECURITY_FLOORS = {
 _PIN = re.compile(r"^([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*==\s*([0-9][0-9A-Za-z.\-+]*)\s*$")
 
 
-def _version_key(version: str) -> tuple[int, ...]:
-    """Numeric release tuple ("2.13.0" -> (2, 13, 0)).
+_RELEASE = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
 
-    Only the leading numeric release segment is compared; the floors are all
-    final releases, and a pre-release of a floor version is treated as equal to
-    it (the parser stops at the first non-numeric component).
+
+def _version_key(version: str) -> tuple[tuple[int, ...], int]:
+    """Orderable key for a pinned version: (release, phase).
+
+    The release tuple drops trailing zeros, so "2.13" and "2.13.0" are equal
+    and multi-digit components compare numerically ("2.13.0" > "2.3.1").
+    A local tag ("+cpu") is ignored. The phase places a pre-release or dev
+    build (rc1, a1, b2, .dev0, or any other unrecognised suffix) BELOW the
+    final release, because the advisory ranges are "< floor" and those builds
+    predate the fix; a post-release (.post1) sorts above it.
     """
-    parts = []
-    for piece in version.split("."):
-        m = re.match(r"\d+", piece)
-        if not m:
-            break
-        parts.append(int(m.group(0)))
-        if m.end() != len(piece):
-            break
-    return tuple(parts)
+    public = version.split("+", 1)[0].strip().lower()
+    m = _RELEASE.match(public)
+    if not m:
+        return ((), -1)
+    release = [int(p) for p in m.group(1).split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    suffix = m.group(2).lstrip(".-_")
+    if not suffix:
+        phase = 0
+    elif suffix.startswith(("post", "rev")) or re.fullmatch(r"r\d*", suffix):
+        phase = 1
+    else:
+        phase = -1
+    return (tuple(release), phase)
 
 
 def _parse_pins(text: str) -> tuple[dict[str, str], list[str]]:
@@ -111,7 +123,35 @@ class RequirementsSecurityFloorTest(unittest.TestCase):
         # 2.13.0 must sort above 2.3.1 (a string compare gets this wrong).
         self.assertLess(_version_key("2.3.1"), _version_key("2.13.0"))
         self.assertLess(_version_key("4.41.2"), _version_key("5.10.0"))
-        self.assertEqual(_version_key("2.13.0"), (2, 13, 0))
+        self.assertEqual(_version_key("2.13.0"), _version_key("2.13"))
+
+    def test_pre_release_of_a_floor_is_below_the_floor(self):
+        # A pre-release or dev build of the floor version predates the fix
+        # (the advisory ranges are "< floor"), so it must be reported.
+        problems = _floor_violations(
+            "torch==2.13.0\n"
+            "transformers==5.10.0rc1\n"
+            "sentencepiece==0.2.1.dev0\n"
+        )
+        self.assertEqual(
+            problems,
+            [
+                "transformers 5.10.0rc1 < 5.10.0 (CVE-2026-9856)",
+                "sentencepiece 0.2.1.dev0 < 0.2.1 (CVE-2026-1260)",
+            ],
+        )
+
+    def test_local_and_post_releases_of_a_floor_satisfy_it(self):
+        # A local build tag (the CPU wheel index publishes torch==2.13.0+cpu)
+        # and a post-release are the fixed release, not earlier than it.
+        self.assertEqual(
+            _floor_violations(
+                "torch==2.13.0+cpu\n"
+                "transformers==5.10.0.post1\n"
+                "sentencepiece==0.2.1\n"
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":
