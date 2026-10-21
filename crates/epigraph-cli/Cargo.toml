@@ -182,6 +182,13 @@ name = "sweep_semantic_duplicates"
 path = "src/bin/sweep_semantic_duplicates.rs"
 required-features = ["db"]
 
+# Legacy evidence-type backfill for mass_functions (backlog bc06ec6f): a
+# maintenance-only, dry-run-by-default typing pass over untyped BBAs.
+[[bin]]
+name = "backfill_evidence_type"
+path = "src/bin/backfill_evidence_type.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
