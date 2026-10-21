@@ -345,3 +345,35 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
         "the collision-retracted edge is back in force"
     );
 }
+
+/// `properties.dedup` marks a dedup act's identity edge, which the un-mark and
+/// the revert-record lookup key on. No application edge write may set it:
+/// otherwise anyone who can write a `same_as` edge between a duplicate and its
+/// canonical could plant one, block the un-mark, and forge its provenance.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_edge_patch_cannot_set_the_dedup_key(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = fixture::public_viewer(&pool).await;
+    let a = seed_claim(&pool, "a", 0.5).await;
+    let b = seed_claim(&pool, "b", 0.5).await;
+    let e = edge(&pool, a, b).await;
+    let err = epigraph_mcp::tools::edge_mutation::patch_edge(
+        &server,
+        &viewer,
+        epigraph_mcp::types::PatchEdgeParams {
+            edge_id: e.to_string(),
+            valid_to: None,
+            properties: Some(serde_json::json!({"dedup": {"tool": "forged"}})),
+        },
+        None,
+    )
+    .await
+    .expect_err("the dedup key is reserved");
+    assert!(err.message.contains("reserved"), "{}", err.message);
+    let props: serde_json::Value = sqlx::query_scalar("SELECT properties FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert!(props.get("dedup").is_none(), "nothing written: {props}");
+}

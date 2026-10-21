@@ -149,3 +149,44 @@ async fn undedup_without_an_admin_connection_is_refused_and_writes_nothing() {
         "nothing changed"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_application_edge_cannot_carry_the_dedup_key() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "edges:write"]).await;
+    let tag = Uuid::new_v4();
+    let dup =
+        common::seed_claim_writable_by_client(&pool, &format!("forge dup {tag}"), client_id).await;
+    let canonical =
+        common::seed_claim_writable_by_client(&pool, &format!("forge canonical {tag}"), client_id)
+            .await;
+    let (status, b) = post(
+        &addr,
+        "/api/v1/edges".to_string(),
+        &token,
+        serde_json::json!({
+            "source_id": dup, "target_id": canonical,
+            "source_type": "claim", "target_type": "claim",
+            "relationship": "same_as",
+            "properties": {"dedup": {"tool": "forged"}},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "{b}");
+    assert!(b.to_string().contains("reserved"), "{b}");
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2")
+            .bind(dup)
+            .bind(canonical)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "nothing written");
+}
