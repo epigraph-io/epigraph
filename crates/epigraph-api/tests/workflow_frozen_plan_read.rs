@@ -824,6 +824,78 @@ async fn an_append_after_a_retracted_last_item_leaves_no_gap(pool: PgPool) {
     assert!(!ids.contains(&last_target));
 }
 
+/// How many claims hold exactly `content` (harness read).
+async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .expect("harness: count")
+}
+
+/// `add_step` locks the `workflows` row before it reads the plan, so a
+/// concurrent `add_step` on the same workflow waits for it and cannot take
+/// the same next `plan_index`. Here a transaction holds that row lock and the
+/// call, with a short `lock_timeout`, fails on it with nothing written; once
+/// the lock is released the same call goes through.
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let text = "ACME-123456 concurrent step";
+
+    let mut holder = pool.begin().await.expect("holder");
+    sqlx::query("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
+        .bind(wf)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the workflow row");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET lock_timeout = '200ms'")
+        .execute(&mut *conn)
+        .await
+        .expect("lock_timeout");
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    let r = epigraph_ingest_executor::workflow_steps::add_step(
+        &mut *tx,
+        "acme-frozen-plan",
+        text,
+        None,
+    )
+    .await;
+    let code = match &r {
+        Err(epigraph_ingest_executor::workflow_steps::StepOpError::Db(e)) => e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned()),
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("55P03"), "lock_not_available: {r:?}");
+    tx.rollback().await.expect("rollback");
+    assert_eq!(
+        claims_with_content(&pool, text).await,
+        0,
+        "nothing was written"
+    );
+
+    holder.rollback().await.expect("release");
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    let r = epigraph_ingest_executor::workflow_steps::add_step(
+        &mut *tx,
+        "acme-frozen-plan",
+        text,
+        None,
+    )
+    .await
+    .expect("calibration: the same call once the lock is released");
+    tx.commit().await.expect("commit");
+    assert_eq!(r.plan_index, Some(9));
+    assert_eq!(claims_with_content(&pool, text).await, 1);
+}
+
 /// A middle insert into a public plan cannot renumber it: the `executes`
 /// edges past the insertion point are world-owned and no application session
 /// may update them. The chain is rewired as before, no existing index moves,
