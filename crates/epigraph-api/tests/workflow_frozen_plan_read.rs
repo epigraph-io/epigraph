@@ -865,13 +865,9 @@ async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
         .await
         .expect("lock_timeout");
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-    let r = epigraph_ingest_executor::workflow_steps::add_step(
-        &mut *tx,
-        "acme-frozen-plan",
-        text,
-        None,
-    )
-    .await;
+    let r =
+        epigraph_ingest_executor::workflow_steps::add_step(&mut tx, "acme-frozen-plan", text, None)
+            .await;
     let code = match &r {
         Err(epigraph_ingest_executor::workflow_steps::StepOpError::Db(e)) => e
             .as_database_error()
@@ -889,14 +885,10 @@ async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
 
     holder.rollback().await.expect("release");
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-    let r = epigraph_ingest_executor::workflow_steps::add_step(
-        &mut *tx,
-        "acme-frozen-plan",
-        text,
-        None,
-    )
-    .await
-    .expect("calibration: the same call once the lock is released");
+    let r =
+        epigraph_ingest_executor::workflow_steps::add_step(&mut tx, "acme-frozen-plan", text, None)
+            .await
+            .expect("calibration: the same call once the lock is released");
     tx.commit().await.expect("commit");
     assert_eq!(r.plan_index, Some(9));
     assert_eq!(claims_with_content(&pool, text).await, 1);
