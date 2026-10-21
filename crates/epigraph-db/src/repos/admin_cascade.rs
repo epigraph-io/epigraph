@@ -399,3 +399,64 @@ pub async fn retire_pending<'e, E: sqlx::PgExecutor<'e>>(
     }
     Ok(id)
 }
+
+/// The revert record of the latest APPLIED dedup cascade for `dup` whose
+/// repair followed the act with identity edge `identity_edge`
+/// (`details.revert`, written by the administrative cascade), with that row's
+/// id. `None` when no applied row carries one: the dedup was repaired before
+/// revert records existed, or not through the administrative cascade.
+///
+/// Maintenance connection only: application sessions cannot read other
+/// principals' audit rows.
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query.
+pub async fn dedup_revert_record<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    dup: Uuid,
+    identity_edge: Uuid,
+) -> Result<Option<(Uuid, serde_json::Value)>, DbError> {
+    let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, details->'revert' FROM security_events \
+          WHERE event_type = $1 AND details->>'cause' = 'dedup' \
+            AND lower(details->'trigger'->>'subject_id') = $2 \
+            AND lower(details->'revert'->>'identity_edge') = $3 \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(EVENT_APPLIED)
+    .bind(dup.to_string())
+    .bind(identity_edge.to_string())
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+/// The OPEN (deferred or failed, not yet answered by an applied or retired
+/// row) dedup cascades of `dup`, oldest first. An un-mark retires them: their
+/// repair would otherwise run after the duplicate is current again, fail its
+/// "is this a retired duplicate" check, and stay pending until an operator
+/// retired it.
+///
+/// Maintenance connection only.
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query.
+pub async fn open_dedup_cascades<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    dup: Uuid,
+) -> Result<Vec<Uuid>, DbError> {
+    let sql = format!(
+        "{PENDING_CTE} SELECT o.id FROM open o \
+          WHERE o.cause = 'dedup' \
+            AND o.subj = regexp_replace(lower($5), '[^0-9a-f]', '', 'g') \
+          ORDER BY o.created_at, o.id"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(EVENT_DEFERRED)
+        .bind(EVENT_FAILED)
+        .bind(EVENT_APPLIED)
+        .bind(EVENT_RETIRED)
+        .bind(dup.to_string())
+        .fetch_all(executor)
+        .await?)
+}
