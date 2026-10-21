@@ -77,6 +77,24 @@ pub struct DedupResponse {
     pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
 }
 
+/// Response for a successful un-mark (`POST /api/v1/claims/{id}/undedup`).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct UndedupResponse {
+    pub duplicate_id: Uuid,
+    /// The claim it had been marked a duplicate of.
+    pub canonical_id: Uuid,
+    pub mode: &'static str,
+    /// Whether the claim got its embedding back (best-effort; a backfill
+    /// restores it otherwise).
+    pub embedded: bool,
+    /// The administrative reversal (cause `undedup`), counts only.
+    #[schema(value_type = Object)]
+    pub cascade: epigraph_engine::admin_cascade::CascadeStatus,
+    /// The belief re-derivation that followed it.
+    #[schema(value_type = Object)]
+    pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
+}
+
 // =============================================================================
 // SECURITY CONSTANTS
 // =============================================================================
@@ -859,6 +877,197 @@ pub async fn mark_duplicate(
         canonical_id: req.canonical_id,
         mode: "mark_duplicate",
         cascade,
+        belief_cascade,
+    }))
+}
+
+/// Un-mark a duplicate: reverse `POST /api/v1/claims/{id}/dedup`.
+///
+/// POST /api/v1/claims/{id}/undedup
+///
+/// The claim is current again (re-embedded best-effort), its `same_as`
+/// identity edge is retracted, and the dedup's repair is reversed from the
+/// record it kept; both claims' belief is re-derived. Same authority as the
+/// dedup (`claims:write` plus write authority over the duplicate and the
+/// canonical, or `claims:admin`), proved on a transaction stamped with the
+/// caller and rolled back; the act and the reversal then commit together on
+/// the maintenance connection (`admin_cascade::apply_unmark`), because an
+/// un-mark cannot be deferred. A server without that connection answers 409
+/// with nothing written.
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/undedup",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the marked duplicate")),
+    responses(
+        (status = 200, body = UndedupResponse),
+        (status = 400),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+        (status = 409),
+    ),
+    security(("ed25519_signature" = [])),
+    tag = "claims"
+)]
+#[cfg(feature = "db")]
+pub async fn unmark_duplicate(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(dup_id): Path<Uuid>,
+) -> Result<Json<UndedupResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "undedup requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    let db = |e: epigraph_db::DbError| ApiError::InternalError {
+        message: format!("DB error: {e}"),
+    };
+    let not_found = |id: Uuid| ApiError::NotFound {
+        entity: "Claim".to_string(),
+        id: id.to_string(),
+    };
+    // The duplicate (and from it the canonical), read through the CALLER.
+    let (canonical_id, content, dup_target, canonical_target) = {
+        let mut read = state.read_as(&viewer).await.map_err(db)?;
+        let claim = ClaimRepository::get_by_id(&mut *read, &viewer, ClaimId::from_uuid(dup_id))
+            .await
+            .map_err(db)?
+            .ok_or_else(|| not_found(dup_id))?;
+        let canonical_id: Uuid = claim
+            .supersedes
+            .ok_or_else(|| ApiError::Conflict {
+                reason: format!("claim {dup_id} is not a marked duplicate"),
+            })?
+            .into();
+        let dup_target = ClaimRepository::write_target_of(&mut *read, &viewer, dup_id)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| not_found(dup_id))?;
+        let canonical_target = ClaimRepository::write_target_of(&mut *read, &viewer, canonical_id)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| not_found(canonical_id))?;
+        (
+            canonical_id,
+            claim.content.clone(),
+            dup_target,
+            canonical_target,
+        )
+    };
+    crate::middleware::scopes::require_claim_act_authority(
+        &auth,
+        viewer.principal(),
+        viewer.writable_groups(),
+        epigraph_auth::claim_act::ClaimActTarget {
+            author: dup_target.0,
+            owner_group: dup_target.1,
+        },
+        dup_id,
+        "un-mark as a duplicate",
+    )?;
+    crate::middleware::scopes::require_claim_act_authority(
+        &auth,
+        viewer.principal(),
+        viewer.writable_groups(),
+        epigraph_auth::claim_act::ClaimActTarget {
+            author: canonical_target.0,
+            owner_group: canonical_target.1,
+        },
+        canonical_id,
+        "un-mark a duplicate of",
+    )?;
+
+    // No administrative connection: refuse before anything is written.
+    let mut session = state
+        .admin_cascade_session()
+        .await
+        .map_err(|reason| ApiError::Conflict {
+            reason: format!(
+                "an un-mark needs this server's administrative (maintenance) connection and \
+                 cannot be deferred; nothing was written ({reason})"
+            ),
+        })?;
+
+    // The caller's authority, decided by the database: the act on the caller's
+    // stamped transaction, rolled back.
+    let mut tx = state.write_as(&viewer, "unmark_duplicate").await?;
+    ClaimRepository::unmark_duplicate_act_conn(&mut tx, ClaimId::from_uuid(dup_id))
+        .await
+        .map_err(|e| match e {
+            e if crate::errors::db_is_insufficient_privilege(&e) => {
+                crate::errors::write_refused("claim")
+            }
+            epigraph_db::DbError::NotFound { id, .. } => not_found(id),
+            epigraph_db::DbError::QueryFailed { source } => ApiError::Conflict {
+                reason: source.to_string(),
+            },
+            other => ApiError::DatabaseError {
+                message: other.to_string(),
+            },
+        })?;
+    tx.rollback().await.map_err(db)?;
+
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+        epigraph_engine::admin_cascade::CascadeCause::Undedup,
+        viewer.principal(),
+        Some(oauth_principal(&auth)),
+        dup_id,
+        Some(canonical_id),
+    );
+    let (conn, admin_viewer) = session.split();
+    let (outcome, belief_cascade) =
+        epigraph_engine::admin_cascade::apply_unmark(conn, admin_viewer, &viewer, &trigger, dup_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::admin_cascade::UnmarkRefusal::Failed(_) => {
+                    ApiError::InternalError {
+                        message: e.to_string(),
+                    }
+                }
+                other => ApiError::Conflict {
+                    reason: other.to_string(),
+                },
+            })?;
+
+    // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
+    // rule). Stored only if the claim is still current and unsealed.
+    let mut embedded = false;
+    if let Some(embedder) = state.embedding_service() {
+        match embedder.generate(&content).await {
+            Ok(v) => {
+                let pgvec = format!(
+                    "[{}]",
+                    v.iter().map(f32::to_string).collect::<Vec<_>>().join(",")
+                );
+                let (conn, admin_viewer) = session.split();
+                match ClaimRepository::store_embedding_if_unsealed(
+                    conn,
+                    admin_viewer,
+                    dup_id,
+                    &pgvec,
+                )
+                .await
+                {
+                    Ok(stored) => embedded = stored,
+                    Err(e) => {
+                        tracing::warn!(claim = %dup_id, error = %e, "undedup: embedding not stored")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(claim = %dup_id, error = %e, "undedup: embedding failed"),
+        }
+    }
+
+    Ok(Json(UndedupResponse {
+        duplicate_id: dup_id,
+        canonical_id: outcome.canonical_id,
+        mode: "unmark_duplicate",
+        embedded,
+        cascade: outcome.cascade,
         belief_cascade,
     }))
 }

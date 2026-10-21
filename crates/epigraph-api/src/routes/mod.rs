@@ -388,6 +388,10 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/claims/:id/dedup", post(versioning::mark_duplicate))
         .route(
+            "/api/v1/claims/:id/undedup",
+            post(versioning::unmark_duplicate),
+        )
+        .route(
             "/api/v1/claims/:id/revoke-signature",
             post(revoke_signature::revoke_claim_signature),
         )
