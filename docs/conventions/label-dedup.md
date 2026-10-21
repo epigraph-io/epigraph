@@ -85,9 +85,10 @@ losers toward its survivor, so:
 - a revision label is one owner's assertion, and it overrides the strong-id
   veto, so it never decides a merge across owners, whatever the caller's
   grant. A cluster in which a revision label links two members of different
-  owners (neither the same author nor authors of the same operator) fails with
-  `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who otherwise owns
-  every member. A cluster joined across owners by a shared id keeps the
+  owners fails with `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who
+  otherwise owns every member. Two authors are one owner when they are the
+  same agent, when one is the other's operator, or when both are agents of
+  the same operator. A cluster joined across owners by a shared id keeps the
   `claims:admin` grant.
 
 Probe applies the same check: a `match` or `match_only` on a claim the caller

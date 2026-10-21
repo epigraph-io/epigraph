@@ -63,10 +63,11 @@
 //! A revision label is narrower still. It is one owner's assertion that its
 //! claim revises another, and it overrides the strong-id veto, so it never
 //! decides a merge across owners, WHATEVER the caller's grant: a cluster in
-//! which a revision label links two members of different owners (neither the
-//! same author nor authors of the same operator) fails with
+//! which a revision label links two members of different owners fails with
 //! `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who otherwise owns
-//! every member. `unit_check` predicts it ([`cross_owner_revision_link`]).
+//! every member. Two authors are one owner when they are the same agent, when
+//! one is the other's operator, or when both are agents of the same operator:
+//! the operator arm of `require_owner_or_admin`. `unit_check` predicts it ([`cross_owner_revision_link`]).
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -682,8 +683,8 @@ fn revision_links(prefix: Option<&str>, ids: &[Uuid], labels: &LabelsById) -> Ve
 }
 
 /// Why a revision link in this unit crosses owners, or `None` when every
-/// linked pair has one owner: the same author, or authors of the same
-/// operator. Decided for EVERY caller, `claims:admin` included (see the module
+/// linked pair has one owner: the same author, one author the other's
+/// operator, or two authors of the same operator. Decided for EVERY caller, `claims:admin` included (see the module
 /// doc). The ONE check behind `unit_check` and apply, read on `conn`.
 async fn cross_owner_revision_link(
     conn: &mut sqlx::PgConnection,
@@ -730,15 +731,17 @@ async fn cross_owner_revision_link(
                 }
             };
         }
-        match (ops[0], ops[1]) {
-            (Some(x), Some(y)) if x == y => {}
-            _ => {
-                return Ok(Some(format!(
-                    "a revision label links claim {from} (agent {a}) and claim {to} (agent {b}), \
-                     which have different owners; a revision label never merges across owners, \
-                     whatever the caller's grant"
-                )))
-            }
+        // The operator arm: one is the other's operator, or both are agents
+        // of the same operator.
+        let one_owner = ops[0] == Some(b)
+            || ops[1] == Some(a)
+            || matches!((ops[0], ops[1]), (Some(x), Some(y)) if x == y);
+        if !one_owner {
+            return Ok(Some(format!(
+                "a revision label links claim {from} (agent {a}) and claim {to} (agent {b}), \
+                 which have different owners; a revision label never merges across owners, \
+                 whatever the caller's grant"
+            )));
         }
     }
     Ok(None)
