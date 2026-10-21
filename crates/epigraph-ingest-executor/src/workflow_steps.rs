@@ -337,8 +337,21 @@ async fn shift_from(
     plan: &PlanEdges,
     k: u32,
 ) -> Result<Option<u32>, StepOpError> {
+    // Highest index first. The order changes no outcome (the savepoint makes
+    // the shift all or nothing), but it makes a lost rollback observable: the
+    // edge most likely to be refused is a step `add_step` added, which sits at
+    // the LOW end of the range when the insert goes right before it, so
+    // ascending order would hit the refusal before anything had moved and a
+    // kept partial shift would leave no trace for a test to see.
+    let mut moving: Vec<(Uuid, u32)> = plan
+        .indexed
+        .iter()
+        .copied()
+        .filter(|(_, i)| *i >= k)
+        .collect();
+    moving.sort_unstable_by_key(|&(_, i)| std::cmp::Reverse(i));
     let mut savepoint = sqlx::Connection::begin(&mut *conn).await?;
-    for &(edge, index) in plan.indexed.iter().filter(|(_, i)| *i >= k) {
+    for (edge, index) in moving {
         let moved = epigraph_db::EdgeRepository::update_valid_to_and_properties(
             &mut *savepoint,
             edge,
