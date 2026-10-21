@@ -103,7 +103,7 @@ pub use claim::{
     ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
     ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration,
     ConsolidateMode, ConsolidateResult, DedupRepair, DedupReversal, DedupRevert,
-    DuplicateProvenance, EmbeddingSeedScope, EvolveStepResult, FrameClaimBeliefHit,
+    DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope, EvolveStepResult, FrameClaimBeliefHit,
     GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery, LevelAndSourceType, LineageHead,
     MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
     SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,

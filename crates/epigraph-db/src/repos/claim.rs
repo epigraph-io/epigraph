@@ -514,6 +514,20 @@ pub struct MovedBba {
     pub writer_owned: bool,
 }
 
+/// An edge the dedup repair re-pointed, with its tenancy before the move (the
+/// edge tenancy trigger re-derives it from the new endpoints).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct EdgeTenancy {
+    /// The edge.
+    pub id: Uuid,
+    /// Its `owner_group_id` before the re-point.
+    pub owner_group_id: Option<Uuid>,
+    /// Its `visibility` before the re-point.
+    pub visibility: String,
+    /// Its `co_owner_group_id` before the re-point.
+    pub co_owner_group_id: Option<Uuid>,
+}
+
 /// The revert record of one dedup repair: every row it changed, and enough of
 /// the before-state to put each back. Keyed to the act's identity edge.
 ///
@@ -535,6 +549,9 @@ pub struct DedupRevert {
     pub retargeted_edges: Vec<Uuid>,
     /// Edges re-pointed from the duplicate onto the canonical as their SOURCE.
     pub resourced_edges: Vec<Uuid>,
+    /// The tenancy each re-pointed edge had before the re-point.
+    #[serde(default)]
+    pub edge_tenancy: Vec<EdgeTenancy>,
     /// BBAs moved from the duplicate onto the canonical (edge-keyed and pooled).
     pub moved_bbas: Vec<MovedBba>,
     /// BBAs the repair deleted (those of retracted edges, and the duplicate's
@@ -11014,6 +11031,21 @@ async fn repair_marked_duplicate(
     )
     .await?;
 
+    // The tenancy of every in-force edge on the duplicate, before the
+    // re-points below make the edge tenancy trigger re-derive it; the revert
+    // record keeps the re-pointed ones.
+    let edge_tenancy_before: Vec<EdgeTenancy> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT id, owner_group_id, visibility::text AS visibility, co_owner_group_id
+           FROM edges
+          WHERE valid_to IS NULL
+            AND ((target_id = $1 AND target_type = 'claim')
+                 OR (source_id = $1 AND source_type = 'claim'))"#,
+    )
+    .bind(dup_uuid)
+    .fetch_all(&mut *conn)
+    .await?;
+
     let retargeted: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE edges SET target_id = $1 \
          WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
@@ -11267,6 +11299,7 @@ async fn repair_marked_duplicate(
     .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
+    let resourced_rows_ids: Vec<Uuid> = resourced_rows.iter().map(|r| r.0).collect();
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
         .into_iter()
         .filter(|(_, _, _, target_type)| target_type == "claim")
@@ -11285,7 +11318,11 @@ async fn repair_marked_duplicate(
         )
     };
     let retargeted_for_revert = retargeted_ids.clone();
-    let resourced_for_revert: Vec<Uuid> = resourced_edges.iter().map(|(id, _, _)| *id).collect();
+    let resourced_for_revert: Vec<Uuid> = resourced_rows_ids;
+    let edge_tenancy: Vec<EdgeTenancy> = edge_tenancy_before
+        .into_iter()
+        .filter(|t| retargeted_for_revert.contains(&t.id) || resourced_for_revert.contains(&t.id))
+        .collect();
 
     // Claims whose cached scalars no longer match their BBA set: the two
     // dedup endpoints, plus every third claim that lost a BBA above.
@@ -11314,6 +11351,7 @@ async fn repair_marked_duplicate(
             retracted_at,
             retargeted_edges: retargeted_for_revert,
             resourced_edges: resourced_for_revert,
+            edge_tenancy,
             moved_bbas: moved_rows,
             deleted_bbas: deleted_rows,
             copied_frames,
@@ -11392,6 +11430,46 @@ async fn reverse_marked_duplicate(
     let done = out.retargeted_back.clone();
     note_drift(&record.retargeted_edges, &done, &mut drifted);
 
+    // The re-pointed edges take back the tenancy they had: re-pointed onto a
+    // private canonical the trigger re-stamped them private, and re-pointed
+    // back its no-widening arm keeps them so. A recorded PUBLIC tenancy comes
+    // back only while both endpoints are public claims, so this never widens
+    // an edge beyond its endpoints.
+    let repointed: Vec<Uuid> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .collect();
+    if !repointed.is_empty() && !record.edge_tenancy.is_empty() {
+        let tenancy =
+            serde_json::to_value(&record.edge_tenancy).map_err(|e| DbError::InvalidData {
+                reason: format!("revert record: {e}"),
+            })?;
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE edges e
+                SET owner_group_id = r.owner_group_id,
+                    visibility = r.visibility,
+                    co_owner_group_id = r.co_owner_group_id
+               FROM jsonb_to_recordset($1)
+                    AS r(id uuid, owner_group_id uuid, visibility text, co_owner_group_id uuid)
+              WHERE e.id = r.id AND e.id = ANY($2)
+                AND (r.visibility <> 'public'
+                     OR (e.source_type = 'claim' AND e.target_type = 'claim'
+                         AND EXISTS (SELECT 1 FROM claims s
+                                      WHERE s.id = e.source_id AND s.visibility::text = 'public')
+                         AND EXISTS (SELECT 1 FROM claims t
+                                      WHERE t.id = e.target_id AND t.visibility::text = 'public')))
+                AND (e.owner_group_id, e.visibility::text, e.co_owner_group_id)
+                    IS DISTINCT FROM (r.owner_group_id, r.visibility, r.co_owner_group_id)"#,
+        )
+        .bind(&tenancy)
+        .bind(&repointed)
+        .execute(&mut *conn)
+        .await?;
+    }
+
     // Only an edge still retracted BY THE REPAIR (its exact stamp) and still
     // touching the duplicate comes back; any other retraction is a later
     // decision this un-mark has no record of.
@@ -11415,7 +11493,10 @@ async fn reverse_marked_duplicate(
     let done = out.unretracted_edges.clone();
     note_drift(&record.retracted_edges, &done, &mut drifted);
 
-    // BBAs moved onto the canonical go back with their old tenancy. A
+    // BBAs moved onto the canonical go back with their old tenancy while the
+    // duplicate is still public (its audience then is what it was); on a
+    // duplicate that has since gone non-public a row becomes the claim's own,
+    // as every derived row of a private claim is, and is never left public. A
     // returning input's slot on the duplicate may since hold the duplicate's
     // re-derived CACHED combination (the cascade recomputed it); that row is
     // derived and is cleared so the input can return. Any other occupant of
@@ -11447,12 +11528,16 @@ async fn reverse_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              UPDATE mass_functions mf
                 SET claim_id = $2,
-                    owner_group_id = r.owner_group_id,
-                    visibility = r.visibility,
-                    writer_owned = r.writer_owned
+                    owner_group_id = CASE WHEN d.visibility::text = 'public'
+                                          THEN r.owner_group_id ELSE d.owner_group_id END,
+                    visibility = CASE WHEN d.visibility::text = 'public'
+                                      THEN r.visibility ELSE d.visibility END,
+                    writer_owned = CASE WHEN d.visibility::text = 'public'
+                                        THEN r.writer_owned ELSE false END
                FROM jsonb_to_recordset($3)
-                    AS r(id uuid, owner_group_id uuid, visibility text, writer_owned boolean)
-              WHERE mf.id = r.id AND mf.claim_id = $1
+                    AS r(id uuid, owner_group_id uuid, visibility text, writer_owned boolean),
+                    claims d
+              WHERE d.id = $2 AND mf.id = r.id AND mf.claim_id = $1
                 AND NOT EXISTS (SELECT 1 FROM mass_functions k
                                  WHERE k.claim_id = $2 AND k.frame_id = mf.frame_id
                                    AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id
@@ -11490,6 +11575,16 @@ async fn reverse_marked_duplicate(
              SELECT r.* FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
               WHERE EXISTS (SELECT 1 FROM edges e
                              WHERE e.id = r.perspective_id AND e.valid_to IS NULL)
+                -- Every row the record names must still be insertable: its
+                -- claim, frame, perspective, agent and evidence still exist.
+                -- One that is not is reported drifted, never fatal.
+                AND EXISTS (SELECT 1 FROM claims c WHERE c.id = r.claim_id)
+                AND EXISTS (SELECT 1 FROM frames f WHERE f.id = r.frame_id)
+                AND EXISTS (SELECT 1 FROM perspectives p WHERE p.id = r.perspective_id)
+                AND (r.source_agent_id IS NULL
+                     OR EXISTS (SELECT 1 FROM agents a WHERE a.id = r.source_agent_id))
+                AND (r.evidence_id IS NULL
+                     OR EXISTS (SELECT 1 FROM evidence ev WHERE ev.id = r.evidence_id))
              ON CONFLICT DO NOTHING
              RETURNING id"#,
         )
@@ -11497,15 +11592,18 @@ async fn reverse_marked_duplicate(
         .fetch_all(&mut *conn)
         .await?;
         // An INSERT re-derives tenancy from the claim (migrations 070, 114);
-        // the restored row takes back exactly what it had.
+        // the restored row takes back what it had while its claim is still
+        // public, and otherwise keeps the claim's own (never a public row on a
+        // claim that went private since).
         sqlx::query(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              UPDATE mass_functions mf
                 SET owner_group_id = r.owner_group_id,
                     visibility = r.visibility,
                     writer_owned = r.writer_owned
-               FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
+               FROM jsonb_populate_recordset(NULL::mass_functions, $1) r, claims c
               WHERE mf.id = r.id AND mf.id = ANY($2)
+                AND c.id = mf.claim_id AND c.visibility::text = 'public'
                 AND (mf.owner_group_id, mf.visibility, mf.writer_owned)
                     IS DISTINCT FROM (r.owner_group_id, r.visibility, r.writer_owned)"#,
         )

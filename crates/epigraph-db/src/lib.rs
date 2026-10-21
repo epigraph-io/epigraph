@@ -96,7 +96,7 @@ pub use repos::{
     ContextRepository, CorpusCounts, CorpusStatsRepository, CounterfactualRepository,
     CounterfactualRow, DecideOutcome, DedupRepair, DedupReversal, DedupRevert, DerivationEvidence,
     DivergenceRepository, DuplicateProvenance, EdgeEncryptionRepository, EdgeEncryptionRow,
-    EdgeRepository, EmbeddingSeedScope, EntityRepository, EntityRow, EntityTypeEntry,
+    EdgeRepository, EdgeTenancy, EmbeddingSeedScope, EntityRepository, EntityRow, EntityTypeEntry,
     EntityTypeRepository, EpistemicEdgePairRow, EventCursor, EventRepository, EventRow,
     EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
     EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow, EvidenceRepository,
