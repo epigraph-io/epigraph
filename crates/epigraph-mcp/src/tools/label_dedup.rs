@@ -59,6 +59,14 @@
 //! For the same reason probe never answers `match` (or `match_only`) on a
 //! claim the caller does not own: that verdict becomes `review`, keeping
 //! `matched_id` for the human.
+//!
+//! A revision label is narrower still. It is one owner's assertion that its
+//! claim revises another, and it overrides the strong-id veto, so it never
+//! decides a merge across owners, WHATEVER the caller's grant: a cluster in
+//! which a revision label links two members of different owners (neither the
+//! same author nor authors of the same operator) fails with
+//! `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who otherwise owns
+//! every member. `unit_check` predicts it ([`cross_owner_revision_link`]).
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -516,17 +524,27 @@ async fn read_family(
     Ok((out, snapshot_at))
 }
 
+/// The labels of every claim the plan read, by id: what a revision link
+/// between two cluster members is decided from.
+type LabelsById = BTreeMap<Uuid, Vec<String>>;
+
 /// Read the family as `viewer` and plan.
 async fn compute_plan(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     p: &Prepared,
-) -> Result<(engine::Plan, DateTime<Utc>), McpError> {
+) -> Result<(engine::Plan, DateTime<Utc>, LabelsById), McpError> {
     let specs = p
         .profile
         .reads(&p.sections)
         .map_err(|e| engine_refusal(&e))?;
     let (snaps, at) = read_family(server, viewer, &specs, p.max.effective).await?;
+    let mut labels = LabelsById::new();
+    for (_, snap) in &snaps {
+        for c in &snap.claims {
+            labels.entry(c.id).or_insert_with(|| c.labels.clone());
+        }
+    }
     let mut inputs = PlanInputs::default();
     for (purpose, snap) in snaps {
         match purpose {
@@ -545,7 +563,7 @@ async fn compute_plan(
         sections: &p.sections,
     };
     let plan = engine::plan(&req, &inputs).map_err(|e| engine_refusal(&e))?;
-    Ok((plan, at))
+    Ok((plan, at, labels))
 }
 
 /// The plan as the tools return it: the engine's plan plus the snapshot time,
@@ -580,26 +598,150 @@ fn retirement_labels(profile: &LabelDedupProfile) -> Vec<String> {
 
 // ── Ownership of a unit's members ───────────────────────────────────────────
 
+/// The claims a cluster unit's decision joins.
+#[derive(Debug, Default)]
+struct UnitMembers {
+    /// The survivor and every loser.
+    ids: Vec<Uuid>,
+    /// Every pair of members a revision label links: `(labelled, named)`.
+    revision_links: Vec<(Uuid, Uuid)>,
+}
+
 /// The claims a unit's decision joins, keyed by unit name: for every cluster
-/// unit, its survivor and every loser. Built from the plan's cluster records,
-/// NOT from the unit's writes: a survivor with nothing to write is dropped
-/// from the writes, yet it is the claim the losers are retired toward.
-fn unit_members(plan: &engine::Plan) -> BTreeMap<String, Vec<Uuid>> {
+/// unit, its survivor and every loser, and the revision links among them.
+/// Built from the plan's cluster records, NOT from the unit's writes: a
+/// survivor with nothing to write is dropped from the writes, yet it is the
+/// claim the losers are retired toward.
+fn unit_members(
+    plan: &engine::Plan,
+    profile: &LabelDedupProfile,
+    labels: &LabelsById,
+) -> BTreeMap<String, UnitMembers> {
     let mut out = BTreeMap::new();
-    let mut add = |kind: &str, clusters: &[engine::Cluster]| {
+    let mut add = |kind: &str, clusters: &[engine::Cluster], prefix: Option<&str>| {
         for c in clusters {
             let mut ids = Vec::with_capacity(c.members.len() + 1);
             ids.push(c.survivor);
             ids.extend(c.members.iter().map(|m| m.id));
+            let revision_links = revision_links(prefix, &ids, labels);
             // The same unit name `Plan::write_units` gives the cluster.
-            out.insert(format!("{kind}:{}", c.survivor), ids);
+            out.insert(
+                format!("{kind}:{}", c.survivor),
+                UnitMembers {
+                    ids,
+                    revision_links,
+                },
+            );
         }
     };
-    add("cluster", &plan.clusters);
-    if let Some(sd) = &plan.signal_dedup {
-        add("signal_cluster", &sd.clusters);
+    add(
+        "cluster",
+        &plan.clusters,
+        profile.pass.revision_label_prefix.as_deref(),
+    );
+    if let (Some(sd), Some(pass)) = (&plan.signal_dedup, &profile.signal_dedup) {
+        add(
+            "signal_cluster",
+            &sd.clusters,
+            pass.revision_label_prefix.as_deref(),
+        );
     }
     out
+}
+
+/// Every `(labelled, named)` pair of `ids` a revision label links: `labelled`
+/// carries `<prefix><v>` with `v` at least the engine's
+/// `MIN_REVISION_ID_PREFIX` long and a prefix of `named`'s id, as the
+/// engine's revision tier reads it. Compared case-insensitively, so it finds
+/// every link the engine could have used (and never fewer).
+fn revision_links(prefix: Option<&str>, ids: &[Uuid], labels: &LabelsById) -> Vec<(Uuid, Uuid)> {
+    let Some(prefix) = prefix.filter(|p| !p.is_empty()) else {
+        return Vec::new();
+    };
+    let id_strs: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    let mut out = Vec::new();
+    for from in ids {
+        let values: Vec<String> = labels
+            .get(from)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .filter(|v| v.len() >= engine::classify::MIN_REVISION_ID_PREFIX)
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        for (to, to_str) in ids.iter().zip(&id_strs).filter(|(to, _)| *to != from) {
+            if values.iter().any(|v| to_str.starts_with(v.as_str())) {
+                out.push((*from, *to));
+            }
+        }
+    }
+    out
+}
+
+/// Why a revision link in this unit crosses owners, or `None` when every
+/// linked pair has one owner: the same author, or authors of the same
+/// operator. Decided for EVERY caller, `claims:admin` included (see the module
+/// doc). The ONE check behind `unit_check` and apply, read on `conn`.
+async fn cross_owner_revision_link(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    links: &[(Uuid, Uuid)],
+) -> Result<Option<String>, McpError> {
+    let mut authors: BTreeMap<Uuid, Option<Uuid>> = BTreeMap::new();
+    let mut operators: BTreeMap<Uuid, Option<Uuid>> = BTreeMap::new();
+    for (from, to) in links {
+        let mut pair = [None, None];
+        for (slot, id) in pair.iter_mut().zip([from, to]) {
+            *slot = match authors.get(id) {
+                Some(known) => *known,
+                None => {
+                    let author = ClaimRepository::write_target_of(&mut *conn, viewer, *id)
+                        .await
+                        .map_err(db_caller_error)?
+                        .map(|(a, _)| a);
+                    authors.insert(*id, author);
+                    author
+                }
+            };
+        }
+        let [Some(a), Some(b)] = pair else {
+            return Ok(Some(format!(
+                "a revision label links claims {from} and {to}, and one of them is not \
+                 readable by this identity"
+            )));
+        };
+        if a == b {
+            continue;
+        }
+        let mut ops = [None, None];
+        for (slot, agent) in ops.iter_mut().zip([a, b]) {
+            *slot = match operators.get(&agent) {
+                Some(known) => *known,
+                None => {
+                    let op = epigraph_db::AgentRepository::operator_of_author(&mut *conn, agent)
+                        .await
+                        .map_err(internal_error)?
+                        .map(|o| o.operator_id);
+                    operators.insert(agent, op);
+                    op
+                }
+            };
+        }
+        match (ops[0], ops[1]) {
+            (Some(x), Some(y)) if x == y => {}
+            _ => {
+                return Ok(Some(format!(
+                    "a revision label links claim {from} (agent {a}) and claim {to} (agent {b}), \
+                     which have different owners; a revision label never merges across owners, \
+                     whatever the caller's grant"
+                )))
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Why the write identity does not own claim `id`, or `None` when it does:
@@ -649,7 +791,7 @@ async fn write_check(
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     units: &[WriteUnit],
-    members: &BTreeMap<String, Vec<Uuid>>,
+    members: &BTreeMap<String, UnitMembers>,
     retirement: &[String],
 ) -> Result<(Vec<Value>, Vec<Value>), McpError> {
     if units.is_empty() {
@@ -675,10 +817,13 @@ async fn write_check(
                     let ms: Vec<Value> = members
                         .get(&u.unit)
                         .into_iter()
-                        .flatten()
+                        .flat_map(|m| m.ids.iter())
                         .map(|id| json!({"claim_id": id, "owned": false, "reason": reason}))
                         .collect();
-                    json!({"unit": u.unit, "applies": false, "members": ms})
+                    json!({
+                        "unit": u.unit, "applies": false, "members": ms,
+                        "cross_owner_revision_link": Value::Null,
+                    })
                 })
                 .collect();
             return Ok((writes, unit_check));
@@ -694,10 +839,15 @@ async fn write_check(
     for unit in units {
         let mut applies = true;
         let mut member_checks = Vec::new();
-        for id in members.get(&unit.unit).into_iter().flatten() {
-            let why = member_not_owned(server, &mut read, viewer, auth, caller, *id).await?;
-            applies &= why.is_none();
-            member_checks.push(json!({"claim_id": id, "owned": why.is_none(), "reason": why}));
+        let mut revision = None;
+        if let Some(m) = members.get(&unit.unit) {
+            for id in &m.ids {
+                let why = member_not_owned(server, &mut read, viewer, auth, caller, *id).await?;
+                applies &= why.is_none();
+                member_checks.push(json!({"claim_id": id, "owned": why.is_none(), "reason": why}));
+            }
+            revision = cross_owner_revision_link(&mut read, viewer, &m.revision_links).await?;
+            applies &= revision.is_none();
         }
         for w in &unit.writes {
             let target = ClaimRepository::write_target_of(&mut *read, viewer, w.claim_id)
@@ -766,6 +916,7 @@ async fn write_check(
         }
         unit_check.push(json!({
             "unit": unit.unit, "applies": applies, "members": member_checks,
+            "cross_owner_revision_link": revision,
         }));
     }
     read.commit().await.map_err(db_caller_error)?;
@@ -800,14 +951,14 @@ pub async fn plan_label_dedup(
         &params.sections,
         params.max_claims,
     )?;
-    let (plan, at) = compute_plan(server, viewer, &prepared).await?;
+    let (plan, at, labels) = compute_plan(server, viewer, &prepared).await?;
     let mut out = plan_json(&plan, at, prepared.max)?;
     let (checks, unit_check) = write_check(
         server,
         viewer,
         auth,
         &plan.write_units(),
-        &unit_members(&plan),
+        &unit_members(&plan, &prepared.profile, &labels),
         &retirement_labels(&prepared.profile),
     )
     .await?;
@@ -844,7 +995,7 @@ pub async fn apply_label_dedup(
         &params.sections,
         params.max_claims,
     )?;
-    let (plan, at) = match compute_plan(server, viewer, &prepared).await {
+    let (plan, at, labels) = match compute_plan(server, viewer, &prepared).await {
         Ok(planned) => planned,
         // The family read fit `max_claims` but not the engine's pairwise
         // bound: a refusal of the pass, like TRUNCATED, with no plan to show.
@@ -898,12 +1049,13 @@ pub async fn apply_label_dedup(
 
     let caller = server.write_identity(auth, viewer).await?;
     let retirement = retirement_labels(&prepared.profile);
-    let members = unit_members(&plan);
+    let members = unit_members(&plan, &prepared.profile, &labels);
     let mut results = Vec::with_capacity(units.len());
     let mut applied: Vec<AppliedLabelChange> = Vec::new();
     let mut failed = 0usize;
     for unit in &units {
-        let unit_members = members.get(&unit.unit).map_or(&[][..], Vec::as_slice);
+        let empty = UnitMembers::default();
+        let unit_members = members.get(&unit.unit).unwrap_or(&empty);
         match apply_unit(
             server,
             viewer,
@@ -948,10 +1100,11 @@ pub async fn apply_label_dedup(
 }
 
 /// One unit, one transaction stamped from the write identity. Every member
-/// of a cluster unit must be the write identity's own (`CROSS_OWNER_MEMBER`
-/// otherwise, before any write); every claim then goes through
-/// `update_labels`' per-claim path. Any refusal drops the transaction, so
-/// nothing of the unit lands.
+/// of a cluster unit must be the write identity's own, and no revision label
+/// may link members of different owners (`CROSS_OWNER_MEMBER` otherwise,
+/// before any write); every claim then goes through `update_labels`'
+/// per-claim path. Any refusal drops the transaction, so nothing of the unit
+/// lands.
 #[allow(clippy::too_many_arguments)]
 async fn apply_unit(
     server: &EpiGraphMcpFull,
@@ -959,12 +1112,18 @@ async fn apply_unit(
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
     unit: &WriteUnit,
-    members: &[Uuid],
+    members: &UnitMembers,
     retirement: &[String],
 ) -> Result<(Vec<AppliedLabelChange>, bool), McpError> {
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "apply_label_dedup").await?;
-    for id in members {
+    if let Some(why) = cross_owner_revision_link(&mut tx, viewer, &members.revision_links).await? {
+        return Err(refusal(
+            codes::CROSS_OWNER_MEMBER,
+            format!("{}: {why}. Nothing of the unit was written", unit.unit),
+        ));
+    }
+    for id in &members.ids {
         if let Some(why) = member_not_owned(server, &mut tx, viewer, auth, caller, *id).await? {
             return Err(refusal(
                 codes::CROSS_OWNER_MEMBER,

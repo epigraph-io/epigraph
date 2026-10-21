@@ -81,7 +81,14 @@ losers toward its survivor, so:
   agent's claim, and undecided is not owned;
 - a cluster with any other member fails as a unit with `CROSS_OWNER_MEMBER`
   and writes nothing. Membership comes from the plan's cluster records, not
-  from the unit's writes: a survivor with nothing to write is still checked.
+  from the unit's writes: a survivor with nothing to write is still checked;
+- a revision label is one owner's assertion, and it overrides the strong-id
+  veto, so it never decides a merge across owners, whatever the caller's
+  grant. A cluster in which a revision label links two members of different
+  owners (neither the same author nor authors of the same operator) fails with
+  `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who otherwise owns
+  every member. A cluster joined across owners by a shared id keeps the
+  `claims:admin` grant.
 
 Probe applies the same check: a `match` or `match_only` on a claim the caller
 does not own becomes `review`, with `matched_id` kept for the human.
@@ -102,8 +109,11 @@ It returns:
 - `write_units`: exactly the writes apply would make, one transaction each, in
   apply order;
 - `write_check`, per write target;
-- `unit_check`, per unit: `{unit, applies, members}`, where `members` lists
-  every member of a cluster unit with `owned` and a `reason` when not.
+- `unit_check`, per unit: `{unit, applies, members,
+  cross_owner_revision_link}`, where `members` lists every member of a
+  cluster unit with `owned` and a `reason` when not, and
+  `cross_owner_revision_link` is the reason a revision label links members of
+  different owners, or null.
 
 `plan_hash` covers `profile_hash`, `run_tag`, `as_of`, the normalized sections
 and the write units, and nothing else. A new review pair therefore never causes
@@ -114,9 +124,10 @@ write target. It uses the same non-writing gates `update_labels` runs:
 ownership over HTTP, the retirement-label gate, and whether the owner group is
 writable (or reachable through the admin path). It never writes. Row-security
 refusals that only the database decides are reported by apply, per unit.
-`unit_check.applies` is false when any write target is predicted unwritable or
-any cluster member is not the write identity's own; apply's
-`CROSS_OWNER_MEMBER` comes from the same check.
+`unit_check.applies` is false when any write target is predicted unwritable,
+any cluster member is not the write identity's own, or a revision label links
+members of different owners; apply's `CROSS_OWNER_MEMBER` comes from the same
+checks.
 
 ## `apply_label_dedup` (claims:write; refused on a read-only server)
 
@@ -134,8 +145,9 @@ any cluster member is not the write identity's own; apply's
    identity:
    - a unit is a cluster (survivor carry labels plus every loser's retirement),
      one hygiene claim, one close-out claim, or one lifecycle signal;
-   - a cluster unit first checks that every member is the write identity's
-     own (`CROSS_OWNER_MEMBER` otherwise, nothing written);
+   - a cluster unit first checks that no revision label links members of
+     different owners and that every member is the write identity's own
+     (`CROSS_OWNER_MEMBER` otherwise, nothing written);
    - each claim goes through `update_labels`' own per-claim path
      (`tools::claims::relabel_claim`): over HTTP, ownership or `claims:admin`
      (the audited admin path for a group the caller cannot write); on every
