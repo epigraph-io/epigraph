@@ -543,6 +543,7 @@ async fn http_mcp_ingest(
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
     let viewer = epigraph_mcp::tools::viewer::request_viewer(server, Some(&auth))
         .await
