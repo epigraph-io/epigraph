@@ -197,7 +197,8 @@ pub struct FrozenPlan {
     /// never ids. NOT a count of every unreadable target: an `executes` edge
     /// takes its target's tenancy, so a target in a group the caller is not in
     /// usually hides its edge as well, and such an item is not countable on the
-    /// caller's connection. Its absence shows as a gap or a digest mismatch.
+    /// caller's connection. Its absence shows as a gap, or, when it is at the
+    /// end of the plan, only as a mismatch with the pinned digest.
     pub hidden_count: u64,
     /// Live, readable edges whose `plan_index` or `level` is not a JSON integer
     /// `>= 0` fitting `u32` (an `add_step` edge, or a rewritten one).
@@ -210,7 +211,11 @@ pub struct FrozenPlan {
     /// change; such an edge is never an item.
     pub retracted_edges: u64,
     /// The server's [`wfd1`] of `items`, only when every count above is zero
-    /// and there is at least one item. Informational.
+    /// and there is at least one item. Informational, and NOT a statement that
+    /// the plan is complete: if the highest-index items sit in a group the
+    /// caller is not in, their edges are invisible, no count moves, and this is
+    /// the digest of the shortened plan. Only a comparison with the digest the
+    /// publisher pinned detects a missing tail.
     pub digest_echo: Option<String>,
 }
 

@@ -28,6 +28,13 @@ use uuid::Uuid;
 /// means the plan is hidden, not empty. A legacy row written before that
 /// refusal answers the same, which is also right: it has no plan to pin.
 ///
+/// The not-found answer is what a non-member gets only when EVERY item of the
+/// plan is private to groups it is not in. A plan that also executes public
+/// claims (a reused, content-addressed atom, say) shows a non-member those
+/// public edges, so it reads 200 with gaps and no digest echo. That discloses
+/// nothing new (public edges and their properties are readable on their own),
+/// but "not found" is not a general sign of hiding.
+///
 /// # Errors
 /// [`DbError`] for a query fault, and [`DbError::InvalidData`] for a row whose
 /// `generation` is negative (no ingest path writes one).
