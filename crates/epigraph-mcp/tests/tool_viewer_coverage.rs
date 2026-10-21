@@ -442,3 +442,25 @@ fn viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules() {
          defines it. If that changes, revisit every_content_reading_tool_derives_a_viewer."
     );
 }
+
+/// `get_workflow_plan` exists and reads as its caller.
+///
+/// The partition tests above pass for ANY tool that acquires a request
+/// viewer, including one that does not exist, so they cannot say that this
+/// read is registered or how. A pinned-workflow resolver's whole read goes
+/// through it: a plan read without the caller's viewer would show a
+/// non-member every group-private item, or a member none of them.
+#[test]
+fn get_workflow_plan_reads_through_a_request_viewer() {
+    let src = server_src();
+    let found: Vec<Acquisition> = tools(&src)
+        .into_iter()
+        .filter(|(name, _)| name == "get_workflow_plan")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(
+        found,
+        vec![Acquisition::Request],
+        "get_workflow_plan must be one #[tool] whose dispatch body calls request_viewer("
+    );
+}

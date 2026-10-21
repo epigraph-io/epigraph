@@ -359,7 +359,7 @@ async fn evolve_step_supersedes_applies_the_cascade_in_request_with_a_maintenanc
 /// set), so a step-lineage supersession must leave the chain where it is.
 ///
 /// The chain order differs from plan order on purpose: X was added
-/// (`add_step`: no `plan_index`, so plan order puts it last) between the
+/// (an unindexed `add_step` insert, so plan order puts it last) between the
 /// planned S1 and S2. If the cascade re-pointed `S1 -> X` and `X -> S2` onto
 /// X's successor, the walk would stop at S1 and fall back to plan order,
 /// reporting [S1, S2, X]; and a later `add_step` at that slot would find no

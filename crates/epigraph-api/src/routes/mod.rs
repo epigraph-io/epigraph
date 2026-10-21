@@ -910,6 +910,10 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/workflows/:id", get(workflows::get_workflow))
         .route(
+            "/api/v1/workflows/:id/plan",
+            get(workflows::get_workflow_plan),
+        )
+        .route(
             "/api/v1/policies/network",
             get(policies::list_network_policies),
         )

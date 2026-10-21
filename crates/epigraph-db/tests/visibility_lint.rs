@@ -3052,6 +3052,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          agent's stamped transaction that owns these claims; the caller's authority is the \
          workflow authority rule, not read visibility, so no caller viewer is spliced.",
     ),
+    (
+        "workflow.rs",
+        "lock_for_plan_edit",
+        "READ of `workflows` only, `FOR UPDATE`: locks the one row `add_step` is about to \
+         extend, so two concurrent calls cannot take the same next `plan_index`. `workflows` \
+         has no row security and no policy, so there is nothing for a viewer to filter; the \
+         caller's authority is `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "executes_plan_indices",
+        "READ of `edges`: the target, `plan_index` and publicness of each live `executes` edge \
+         of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \
+         existing edge is written. It runs on the ingest system agent's stamped transaction, \
+         so it is bounded to what that stamp may read, and an index is written only when every \
+         edge it read is public, so the index discloses nothing a reader of the new public \
+         edge could not read; the caller's authority is the workflow authority rule, not read \
+         visibility, so no caller viewer is spliced.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
