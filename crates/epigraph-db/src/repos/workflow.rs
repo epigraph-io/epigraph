@@ -1652,9 +1652,12 @@ impl WorkflowRepository {
     /// * `workflows` has no row security, so the row read needs no predicate.
     /// * `heads_diverged` asks whether the target's step lineage has a head
     ///   other than the target that the viewer may read (`{VISIBILITY:h}`). The
-    ///   `supersedes` exclusion inside it is unfiltered, as in
-    ///   [`ClaimRepository::latest_in_lineage`]: a supersedes edge the viewer
-    ///   cannot see must still retire a head.
+    ///   `supersedes` exclusion inside it carries no viewer predicate, as in
+    ///   [`ClaimRepository::latest_in_lineage`], but on an RLS-bound
+    ///   connection the policy still hides a `supersedes` edge in a group the
+    ///   viewer is not in, so a head that edge retired can still count and
+    ///   the flag can read `true` spuriously. It is informational (a resolver
+    ///   warns on it and never refuses), so the over-report is accepted.
     ///
     /// Takes the ONE viewer-stamped connection of the request, so the in-query
     /// predicate and the session's tenancy GUCs agree under forced RLS.
