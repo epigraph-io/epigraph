@@ -932,12 +932,16 @@ async fn a_middle_insert_into_a_public_plan_is_left_unindexed_and_says_so(pool: 
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_leaves_the_items_and_digest_and_sets_heads_diverged(pool: PgPool) {
     let w = private_workflow(&pool).await;
+    // evolve_step needs workflow authority (#636): the submitter, its operator,
+    // or claims:admin. A plain writer of G is refused, so evolve as the curator
+    // that ingested the workflow, given a writer row in G so it can read the step.
+    add_member(&pool, w.g, w.curator, "writer").await;
     let step = uuid_of(&vector_plan()[2]["claim_id"]);
     let (status, body) = w
         .api
         .post(
             &format!("/api/v1/workflows/steps/{step}/evolve"),
-            &token(w.writer, WRITE_SCOPES),
+            &token(w.curator, WRITE_SCOPES),
             &json!({"parent_id": step, "content": "acme-frozen-plan \u{2014} step 1.1: read the queue twice",
                     "edge_type": "supersedes", "reason": "workflow-plan evolve"}),
         )
@@ -964,12 +968,16 @@ async fn evolve_step_leaves_the_items_and_digest_and_sets_heads_diverged(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revises_evolve_sets_heads_diverged_on_a_step_that_stays_current(pool: PgPool) {
     let w = private_workflow(&pool).await;
+    // evolve_step needs workflow authority (#636): the submitter, its operator,
+    // or claims:admin. A plain writer of G is refused, so evolve as the curator
+    // that ingested the workflow, given a writer row in G so it can read the step.
+    add_member(&pool, w.g, w.curator, "writer").await;
     let step = uuid_of(&vector_plan()[5]["claim_id"]);
     let (status, body) = w
         .api
         .post(
             &format!("/api/v1/workflows/steps/{step}/evolve"),
-            &token(w.writer, WRITE_SCOPES),
+            &token(w.curator, WRITE_SCOPES),
             &json!({"parent_id": step, "content": "acme-frozen-plan \u{2014} step 1.2: keep the new rows, sorted",
                     "edge_type": "revises", "reason": "workflow-plan branch"}),
         )
