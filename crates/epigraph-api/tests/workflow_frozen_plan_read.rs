@@ -535,7 +535,10 @@ async fn a_hidden_tail_is_detectable_only_against_the_pinned_digest(pool: PgPool
         .unwrap_or_else(|| panic!("a clean-looking plan echoes: {p}"));
     assert_ne!(echo, vectors()["ingest"]["wfd1"].as_str().unwrap());
     let text = p.to_string();
-    assert!(!text.contains(&moved.to_string()), "no id of the moved item");
+    assert!(
+        !text.contains(&moved.to_string()),
+        "no id of the moved item"
+    );
     assert!(
         !text.contains(tail["content"].as_str().unwrap()),
         "no content of the moved item"
@@ -819,7 +822,11 @@ async fn a_group_writer_reordering_or_retracting_edges_changes_what_the_read_rep
     assert!(status.is_success(), "retract: {status} {body}");
     let p = w.api.plan(&reader, w.workflow_id).await;
     assert_eq!(p["retracted_edges"], json!(1), "{p}");
-    assert_eq!(p["plan_index_gaps"], json!(0), "the tail leaves no gap: {p}");
+    assert_eq!(
+        p["plan_index_gaps"],
+        json!(0),
+        "the tail leaves no gap: {p}"
+    );
     assert!(!item_ids(&p).contains(&edges[8].1));
     assert_eq!(p["digest_echo"], Value::Null);
 }

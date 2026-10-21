@@ -188,7 +188,12 @@ fn content_hash_ok_is_seed_aware() {
         &plain[..16],
         &json!({"level": 2})
     ));
-    assert!(!content_hash_ok(NAME, text, &scoped[..16], &scoped_props(2)));
+    assert!(!content_hash_ok(
+        NAME,
+        text,
+        &scoped[..16],
+        &scoped_props(2)
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,12 +478,18 @@ fn a_duplicate_tail_index_withholds_the_echo_by_its_count_alone() {
 fn a_rewritten_integer_level_is_reported_and_moves_the_digest() {
     let v = vectors();
     let mut edges = readable_edges();
-    assert_eq!(edges[3].properties["level"], json!(3), "calibration: an atom");
+    assert_eq!(
+        edges[3].properties["level"],
+        json!(3),
+        "calibration: an atom"
+    );
     edges[3].properties["level"] = json!(2);
     let p = plan_json(edges);
     assert_eq!(flags(&p), (0, 0, 0, 0, 0));
     assert_eq!(p["items"][3]["level"], json!(2));
-    let echo = p["digest_echo"].as_str().expect("a well-formed plan echoes");
+    let echo = p["digest_echo"]
+        .as_str()
+        .expect("a well-formed plan echoes");
     assert_ne!(echo, v["ingest"]["wfd1"].as_str().unwrap());
 }
 
