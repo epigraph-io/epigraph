@@ -10939,14 +10939,23 @@ async fn repair_marked_duplicate(
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
 /// keyed to any edge (those follow their edge, or stay with it), not an
 /// `attributed_v1` row, and not a cached combination (the duplicate's own fold
-/// of its inputs; folded again on the canonical it would count them twice).
-/// Fully parenthesized: it is spliced after a `NOT`.
+/// of its inputs; folded again on the canonical it would count them twice),
+/// and not wider-reaching on the canonical (`$1`) than it is now: a public row
+/// pools anywhere, a group's row only onto a non-public canonical of the same
+/// group. Otherwise the move would disclose the group's assessment and fold it
+/// into a belief a wider audience reads (migration 114's move rule makes a row
+/// on a public canonical public). Fully parenthesized: it is spliced after a
+/// `NOT`.
 fn poolable_bba_sql() -> String {
     format!(
         "((mf.perspective_id IS NULL \
            OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
           AND mf.combination_method IS DISTINCT FROM 'attributed_v1' \
-          AND NOT {})",
+          AND NOT {} \
+          AND (mf.visibility::text = 'public' \
+               OR EXISTS (SELECT 1 FROM claims k \
+                           WHERE k.id = $1 AND k.visibility::text <> 'public' \
+                             AND k.owner_group_id = mf.owner_group_id)))",
         crate::repos::mass_function::cached_combination_predicate("mf.")
     )
 }
