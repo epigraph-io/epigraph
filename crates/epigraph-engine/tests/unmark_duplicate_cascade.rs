@@ -180,11 +180,16 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
                     .fetch_one(&mut *c)
                     .await
                     .expect("read applied row");
-            let records: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM security_events WHERE details ? 'revert'")
-                    .fetch_one(&mut *c)
-                    .await
-                    .expect("read records");
+            // No row it can read carries a revert record or names the other
+            // writer's BBA (which only the record does).
+            let records: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM security_events WHERE details ? 'revert' \
+                    OR details::text LIKE '%' || $1 || '%'",
+            )
+            .bind(other_writers_bba.to_string())
+            .fetch_one(&mut *c)
+            .await
+            .expect("read records");
             (c, (applied, records))
         })
         .await;
@@ -433,4 +438,301 @@ async fn an_unmark_uses_the_first_record_of_its_identity_edge(pool: PgPool) {
         on, dup,
         "the pooled BBA came back: the first record was used"
     );
+}
+
+async fn betp(pool: &PgPool, id: Uuid) -> Option<f64> {
+    sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("claim")
+}
+
+async fn binary_frame(pool: &PgPool, viewer: &epigraph_db::visibility::Viewer) -> Uuid {
+    epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        viewer,
+    )
+    .await
+    .expect("binary frame")
+}
+
+/// After an un-mark: the canonical's belief is re-derived without the rows it
+/// gave back, the duplicate's from them, and an edge re-sourced back onto the
+/// duplicate has its far-end BBA re-wired from the duplicate. The caller's copy
+/// of the belief report names only claims the caller can read: the far end is
+/// private to another group, and a public caller's report omits it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_rederives_both_claims_and_the_far_end_and_filters_the_report(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let caller = fixture::public_viewer(&pool).await;
+    let f = binary_frame(&pool, &viewer).await;
+    let (author, other) = (new_agent(&pool).await, new_agent(&pool).await);
+    let (x, h) = fixture::seed_agent_with_group(&pool, "far-end owner").await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let far = fixture::seed_group_claim(&pool, x, h, "a private far end").await;
+    for c in [canonical, dup, far] {
+        FrameRepository::assign_claim(&pool, c, f, Some(0))
+            .await
+            .expect("bind");
+    }
+    store(
+        &pool,
+        canonical,
+        f,
+        Some(other),
+        None,
+        serde_json::json!({"0": 0.3, "0,1": 0.7}),
+    )
+    .await;
+    store(
+        &pool,
+        dup,
+        f,
+        Some(author),
+        None,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    let e: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(dup)
+    .bind(far)
+    .fetch_one(&pool)
+    .await
+    .expect("edge");
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
+        .bind(e)
+        .execute(&pool)
+        .await
+        .expect("perspective");
+    let far_bba = store(
+        &pool,
+        far,
+        f,
+        Some(author),
+        Some(e),
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    let far_edge_bba = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        )
+        .bind(far)
+        .bind(e)
+        .fetch_optional(&pool)
+        .await
+        .expect("far bba")
+    };
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+    let after_mark = far_edge_bba(pool.clone()).await;
+    assert_ne!(
+        after_mark,
+        Some(far_bba),
+        "calibration: the mark re-wired the far end"
+    );
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    let (_, report) = apply_unmark(&mut conn, &viewer, &caller, &ut, dup, canonical)
+        .await
+        .expect("unmark");
+    for (what, id) in [("canonical", canonical), ("duplicate", dup)] {
+        let expected = preview_claim_belief_on_frame(&mut conn, &viewer, id, f)
+            .await
+            .expect("preview")
+            .expect("has BBAs")
+            .pignistic_prob;
+        let got = betp(&pool, id).await.expect("cached");
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "{what}: cached {got} vs preview {expected}"
+        );
+    }
+    let after_unmark = far_edge_bba(pool.clone()).await;
+    assert!(
+        after_unmark.is_some(),
+        "the far end's edge factor is re-wired"
+    );
+    assert_ne!(after_unmark, after_mark, "re-derived from the duplicate");
+    assert!(
+        !report.targets.contains(&far) && !report.recomputed.contains(&far),
+        "a public caller's report omits the private far end: {report:?}"
+    );
+}
+
+/// The un-mark is atomic: when the reversal fails after the act ran (here a
+/// record that does not parse), nothing commits: the duplicate is still
+/// marked, its identity edge in force, and no `undedup` row exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_that_fails_after_the_act_changes_nothing(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let identity_edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    sqlx::query(
+        "INSERT INTO security_events (id, event_type, agent_id, success, details) \
+         VALUES (gen_random_uuid(), 'cascade.dedup_revert_record', NULL, true, \
+                 jsonb_build_object('cause', 'dedup', 'applied_event_id', gen_random_uuid(), \
+                                    'subject_id', $1::text, 'identity_edge', $2::text, \
+                                    'revert', jsonb_build_object('moved_bbas', 'not a list')))",
+    )
+    .bind(dup)
+    .bind(identity_edge)
+    .execute(&pool)
+    .await
+    .expect("a record that does not parse");
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect_err("the reversal fails");
+    assert!(matches!(err, UnmarkRefusal::Failed(_)), "{err:?}");
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(canonical), false),
+        "the act rolled back"
+    );
+    let in_force: bool = sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+        .bind(identity_edge)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert!(in_force, "the identity edge is still in force");
+    let undedup_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE details->>'cause' = 'undedup'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(undedup_rows, 0);
+}
+
+/// After the mark, a belief write on the retired duplicate (the evidence and
+/// assess routes store their fold as a cached combination row) puts a cached
+/// row in the (frame, no agent, no perspective) slot. The pooled assess row
+/// returning to that slot clears that derived row, which the cascade
+/// re-derives.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let f = binary_frame(&pool, &viewer).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    for c in [canonical, dup] {
+        FrameRepository::assign_claim(&pool, c, f, Some(0))
+            .await
+            .expect("bind");
+    }
+    store(
+        &pool,
+        canonical,
+        f,
+        Some(author),
+        None,
+        serde_json::json!({"0": 0.3, "0,1": 0.7}),
+    )
+    .await;
+    // Kept on the duplicate: the canonical already holds the author's key.
+    store(
+        &pool,
+        dup,
+        f,
+        Some(author),
+        None,
+        serde_json::json!({"0": 0.9, "0,1": 0.1}),
+    )
+    .await;
+    let assess = epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        f,
+        None,
+        None,
+        &serde_json::json!({"1": 0.2, "0,1": 0.8}),
+        None,
+        Some("discount"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("assess row");
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        f,
+        None,
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        None,
+        Some("Dempster"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a later belief write's cached fold in the slot");
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    let (outcome, _) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect("unmark");
+    assert_eq!(
+        outcome
+            .cascade
+            .touched
+            .as_ref()
+            .map(|t| t["cached_rows_cleared"].clone()),
+        Some(serde_json::json!(1)),
+        "{:?}",
+        outcome.cascade
+    );
+    let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+        .bind(assess)
+        .fetch_one(&pool)
+        .await
+        .expect("assess");
+    assert_eq!(on, dup, "the assess row is back in its slot");
 }
