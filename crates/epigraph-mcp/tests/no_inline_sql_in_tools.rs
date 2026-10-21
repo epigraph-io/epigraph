@@ -67,9 +67,12 @@ use std::path::{Path, PathBuf};
 ///   because `sqlx::query!` needs a compile-time literal of fixed arity and so
 ///   cannot take a `Viewer::splice` result. Relocation to the repo layer is
 ///   outstanding; the leak is not.
-/// * **`workflow_hierarchical.rs` (3 production).** One read, one `UPDATE
-///   workflows`, one `edges ⨝ claims` read on the
-///   `report_hierarchical_outcome` write path. Write paths are PR-16's, so
+/// * **`workflow_hierarchical.rs` (2 production).** One read and one `UPDATE
+///   workflows` on the `report_hierarchical_outcome` write path, both on a
+///   table with no row security. (Was 3: the `edges ⨝ claims` step lookup
+///   moved to `WorkflowRepository::plan_step_claim_ids`, with its viewer
+///   predicates, when the report moved onto a transaction stamped with the
+///   caller's viewer.) Write paths are PR-16's, so
 ///   PR-09 left them alone rather than half-converting a write. (PR-16
 ///   correction: the parenthetical here used to read "`viewer.writable_bind()`,
 ///   which does not exist yet". It has existed since PR-04 and is consumed by
@@ -107,7 +110,7 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // 9 -> 12 (U033 finalize): the row-lock test's holder transaction (the
     // `FOR UPDATE` read and the `use_count = 5` write) and its
     // `pg_stat_activity` lock-wait poll. Fixture SQL again.
-    ("workflow_hierarchical.rs", 3, 12),
+    ("workflow_hierarchical.rs", 2, 12),
     ("workflow_ingest.rs", 0, 10),
     ("workflows.rs", 2, 0),
 ];

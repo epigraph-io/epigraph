@@ -820,6 +820,84 @@ impl WorkflowRepository {
         Ok(resolved)
     }
 
+    /// The workflow's level-2 step claims whose PLAN POSITION `viewer` can
+    /// establish, in plan order: the lookup an outcome report maps each
+    /// `step_index` through, shared by the MCP tool and the HTTP route so step
+    /// N is one step on both transports. Element N is step N; a step whose
+    /// position the viewer cannot establish is not listed, and neither is any
+    /// step after it.
+    ///
+    /// Same order key as [`Self::resolve_steps_to_heads`] (`plan_index` first,
+    /// `created_at` only for edges that carry none), and the same two
+    /// predicates, on the edge and on the claim.
+    ///
+    /// # Run it on the caller's STAMPED transaction
+    ///
+    /// `conn` must be stamped with `viewer`. On an unstamped application
+    /// session row security admits only public rows, so a group's own member
+    /// would get none of its group-private steps back, without an error.
+    ///
+    /// # Only a provable prefix is returned
+    ///
+    /// A step the viewer cannot read is absent from what it reads, so counting
+    /// the visible steps would shift every visible step after a hidden one
+    /// onto the hidden one's index, and an outcome row would be attributed to
+    /// the WRONG step with no signal. That is reachable: `add_step` declares
+    /// its step public (`ClaimRepository::default_decl_for_author` of the
+    /// system agent) and its `executes` edge carries no `plan_index`, so a
+    /// group-private plan can end in a public step that a non-member sees
+    /// alone. So the list stops where the viewer can no longer prove a step's
+    /// position (`provable_plan_steps`):
+    ///
+    /// * The ingest executor numbers EVERY plan claim's `executes` edge
+    ///   `0..n` (`plan_index`, phases included, so `plan_index` is not the step
+    ///   index). A gap in the ordinals the viewer reads means an edge it
+    ///   cannot see; nothing from the gap on is listed.
+    /// * Edges with no ordinal (written by `add_step`, or before the ordinal
+    ///   existed) sort after every ordinal one. They are listed only when the
+    ///   viewer reads the plan they follow: at least one ordinal edge, or (a
+    ///   plan written before the ordinal) a level-1 phase edge.
+    ///
+    /// A step that is not listed is reported by the callers like an
+    /// out-of-range index (NULL `step_claim_id`, disclosed as unresolved). The
+    /// two are deliberately indistinguishable: the difference is the existence
+    /// of a step the caller cannot see. Residual, not detectable without a
+    /// privileged read: hidden ordinal edges AFTER every visible one, followed
+    /// by visible unordered steps. One ingest writes a plan's ordinal edges
+    /// under one owner, so it needs a later re-ownership of part of a plan.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn plan_step_claim_ids(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        // Every level, not only steps: the phases' ordinals are part of the
+        // sequence a gap is detected in.
+        let sql = viewer.splice(
+            "SELECT c.id, c.properties->>'level', \
+                    CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                         THEN (e.properties->>'plan_index')::int END \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q =
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<i32>)>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
+        Ok(provable_plan_steps(&rows))
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
@@ -1641,9 +1719,100 @@ pub struct ExecutedClaim {
     pub shared: bool,
 }
 
+/// The level-2 steps of one plan whose position is provable from the
+/// `executes` edges a viewer reads: `rows` are `(claim id, claim level text,
+/// edge plan_index)` in plan order (ordinal edges first, ascending). See
+/// [`WorkflowRepository::plan_step_claim_ids`] for the rule; element N of the
+/// result is step N.
+#[must_use]
+fn provable_plan_steps(rows: &[(Uuid, Option<String>, Option<i32>)]) -> Vec<Uuid> {
+    let level = |l: &Option<String>| l.as_deref().and_then(|v| v.trim().parse::<i64>().ok());
+    let mut steps = Vec::new();
+    let mut next_ordinal: i32 = 0;
+    let mut unordered = Vec::new();
+    for (id, lvl, plan_index) in rows {
+        match plan_index {
+            Some(pi) => {
+                // A gap (or a repeat) means an ordinal edge this viewer cannot
+                // read, or a plan it cannot number: no later position holds.
+                if *pi != next_ordinal {
+                    return steps;
+                }
+                next_ordinal += 1;
+                if level(lvl) == Some(2) {
+                    steps.push(*id);
+                }
+            }
+            None => unordered.push((*id, level(lvl))),
+        }
+    }
+    let anchored = next_ordinal > 0 || unordered.iter().any(|(_, l)| *l == Some(1));
+    if anchored {
+        steps.extend(
+            unordered
+                .into_iter()
+                .filter(|(_, l)| *l == Some(2))
+                .map(|(id, _)| id),
+        );
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(level: &str, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
+        (Uuid::new_v4(), Some(level.to_string()), plan_index)
+    }
+
+    /// A fully visible current-format plan (phase 0, steps 1..=2, phase 3,
+    /// step 4) plus an appended unordered step: every step is listed, in
+    /// order, and the phases' ordinals do not count as steps.
+    #[test]
+    fn a_complete_plan_lists_every_step_in_plan_order() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(2)),
+            row("1", Some(3)),
+            row("2", Some(4)),
+            row("2", None),
+        ];
+        let want: Vec<Uuid> = [1, 2, 4, 5].iter().map(|i| rows[*i].0).collect();
+        assert_eq!(provable_plan_steps(&rows), want);
+    }
+
+    /// A hidden ordinal edge (here plan_index 2) stops the list: the step at
+    /// plan_index 3 would otherwise be reported as step 1, and the appended
+    /// step after it as step 2.
+    #[test]
+    fn a_gap_in_the_ordinals_stops_the_list() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(3)),
+            row("2", None),
+        ];
+        assert_eq!(provable_plan_steps(&rows), vec![rows[1].0]);
+
+        // A plan whose first ordinal is hidden yields nothing at all.
+        let rows = vec![row("2", Some(1)), row("2", Some(2))];
+        assert!(provable_plan_steps(&rows).is_empty());
+    }
+
+    /// Unordered steps alone, with no ordinal edge and no phase visible, are
+    /// the appended tail of a plan the viewer cannot read: their position is
+    /// unknown, so none is listed. With a phase visible (a plan written before
+    /// the ordinal existed) they are listed positionally, as before.
+    #[test]
+    fn unordered_steps_need_a_visible_plan_to_follow() {
+        let appended = vec![row("2", None)];
+        assert!(provable_plan_steps(&appended).is_empty());
+
+        let legacy = vec![row("1", None), row("2", None), row("2", None)];
+        assert_eq!(provable_plan_steps(&legacy), vec![legacy[1].0, legacy[2].0]);
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {
