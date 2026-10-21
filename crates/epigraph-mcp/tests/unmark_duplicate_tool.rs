@@ -190,10 +190,19 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
             .await
             .expect("app-role ScopedPool")
             .with_maintenance_pool(fixture::downgraded_pool(&pool, "epigraph_maintenance").await);
-    let server = build_scoped_test_server(
-        fixture::downgraded_pool(&pool, "epigraph_app").await,
-        scoped,
-    );
+    // A deterministic embedder (no request leaves the process), so the
+    // un-mark's post-commit re-embed is exercised, not skipped for want of a key.
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(|_text: &str| Ok(vec![0.01_f32; 1536])));
+    let server = epigraph_mcp::EpiGraphMcpFull::new(
+        plain,
+        epigraph_crypto::AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer"),
+        embedder,
+        false,
+    )
+    .with_scoped_pool(scoped);
     let agent = server.server_agent_id().await.expect("server agent");
     let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
         .await
@@ -316,6 +325,29 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
     let b = body(&r);
     assert_eq!(b["cascade"]["status"], "applied", "{b}");
     assert_eq!(state(&pool, dup).await, (None, true, 0));
+    let embedded: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!(b["embedded"], serde_json::json!(embedded), "{b}");
+    assert!(embedded, "the claim is current again and re-embedded");
+    let props: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert_eq!(props["dedup"]["tool"], "mark_duplicate", "{props}");
+    assert_eq!(props["dedup"]["rule"], "caller_asserted", "{props}");
+    assert_eq!(
+        props["dedup"]["marked_by"],
+        serde_json::json!(agent),
+        "{props}"
+    );
+    assert_eq!(props["dedup"]["reason"], "an index restatement", "{props}");
     let back: Option<Uuid> =
         sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
             .bind(diamond_bba)
@@ -376,4 +408,80 @@ async fn an_application_edge_patch_cannot_set_the_dedup_key(pool: PgPool) {
         .await
         .expect("edge");
     assert!(props.get("dedup").is_none(), "nothing written: {props}");
+}
+
+/// A `claims:write` caller that writes neither claim is refused with nothing
+/// written (the gate is mark_duplicate's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_who_writes_neither_claim_cannot_unmark(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
+    let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
+    mark_duplicate(
+        &server,
+        &admin_viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("mark");
+    let (_, stranger_auth, stranger) = common::seed_caller(&pool, &["claims:write"]).await;
+    let err = unmark_duplicate(
+        &server,
+        &stranger,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&stranger_auth),
+    )
+    .await
+    .expect_err("not a writer of either claim");
+    assert!(
+        err.message.contains("nothing was written"),
+        "{}",
+        err.message
+    );
+    assert_eq!(state(&pool, dup).await, (Some(canonical), false, 1));
+}
+
+/// The semantic sweep's collapse records its own provenance on the identity
+/// edge: its tool, the exact-restatement rule, and the acting agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_sweep_records_its_rule_on_the_identity_edge(pool: PgPool) {
+    let survivor = seed_claim(&pool, "a restated claim", 0.5).await;
+    let dup = seed_claim(&pool, "a restated claim (again)", 0.5).await;
+    let acting = common::seed_agent(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_mcp::tools::dedup_sweep::collapse_pair_act(&mut conn, acting, dup, survivor)
+        .await
+        .expect("collapse");
+    let props: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'same_as' AND valid_to IS NULL",
+    )
+    .bind(dup)
+    .bind(survivor)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert_eq!(
+        props["dedup"]["tool"], "sweep_semantic_duplicates",
+        "{props}"
+    );
+    assert_eq!(props["dedup"]["rule"], "exact_restatement", "{props}");
+    assert_eq!(
+        props["dedup"]["marked_by"],
+        serde_json::json!(acting),
+        "{props}"
+    );
 }

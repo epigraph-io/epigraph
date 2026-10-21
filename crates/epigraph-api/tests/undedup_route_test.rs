@@ -85,6 +85,15 @@ async fn dedup_then_undedup_restores_the_duplicate() {
     .await;
     assert_eq!(status, 200, "{b}");
     assert_eq!(dup_state(&pool, dup).await, (Some(canonical), false));
+    let props: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert_eq!(props["dedup"]["tool"], "http:mark_duplicate", "{props}");
+    assert_eq!(props["dedup"]["reason"], "undedup fixture", "{props}");
 
     let (status, b) = post(
         &addr,
@@ -143,6 +152,78 @@ async fn undedup_without_an_admin_connection_is_refused_and_writes_nothing() {
     .await;
     assert_eq!(status, 409, "{b}");
     assert!(b.to_string().contains("administrative"), "{b}");
+    assert_eq!(
+        dup_state(&pool, dup).await,
+        (Some(canonical), false),
+        "nothing changed"
+    );
+    let undedup_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE details->>'cause' = 'undedup' AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(dup.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        undedup_rows, 0,
+        "no un-mark was recorded or deferred for this claim"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undedup_refuses_a_non_writer_and_a_claim_that_is_no_duplicate() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let (owner_token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let (stranger_token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let tag = Uuid::new_v4();
+    let canonical = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("undedup canonical {tag}"),
+        client_id,
+    )
+    .await;
+    let dup = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("undedup duplicate {tag}"),
+        client_id,
+    )
+    .await;
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{canonical}/undedup"),
+        &owner_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 409, "a current claim is no duplicate: {b}");
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/dedup"),
+        &owner_token,
+        serde_json::json!({"canonical_id": canonical}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/undedup"),
+        &stranger_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        status == 403 || status == 404,
+        "a non-writer is refused: {status} {b}"
+    );
     assert_eq!(
         dup_state(&pool, dup).await,
         (Some(canonical), false),
