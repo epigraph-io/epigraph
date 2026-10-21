@@ -41,6 +41,27 @@ async fn stamp(conn: &mut PgConnection, pool: &PgPool, agent: Uuid) {
     .expect("stamp session gucs");
 }
 
+/// A public claim its writer's group owns: the shape the write path gives a
+/// claim its own author submits publicly.
+async fn public_claim_owned_by(pool: &PgPool, agent: Uuid, group: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("unmark fixture {tag}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a public claim owned by a group");
+    id
+}
+
 async fn edge(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -326,8 +347,8 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
             fixture::seed_group_claim(&pool, w, g, "group canonical").await,
         ),
         (
-            fixture::seed_public_claim(&pool, w, "public dup").await,
-            fixture::seed_public_claim(&pool, w, "public canonical").await,
+            public_claim_owned_by(&pool, w, g, "public dup").await,
+            public_claim_owned_by(&pool, w, g, "public canonical").await,
         ),
     ];
     let p = pool.clone();

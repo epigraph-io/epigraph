@@ -493,6 +493,106 @@ pub struct DedupRepair {
     /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
     /// pooled onto it.
     pub canonical_is_compound: bool,
+    /// What the repair changed, with the before-state an un-mark needs. It
+    /// names other writers' rows, so it is persisted only where a privileged
+    /// session reads it (the administrative cascade's applied audit row),
+    /// never returned to a caller.
+    pub revert: DedupRevert,
+}
+
+/// A BBA the dedup repair moved onto the canonical, with its tenancy before
+/// the move.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct MovedBba {
+    /// The `mass_functions` row.
+    pub id: Uuid,
+    /// Its `owner_group_id` on the duplicate.
+    pub owner_group_id: Option<Uuid>,
+    /// Its `visibility` on the duplicate.
+    pub visibility: String,
+    /// Its `writer_owned` on the duplicate.
+    pub writer_owned: bool,
+}
+
+/// The revert record of one dedup repair: every row it changed, and enough of
+/// the before-state to put each back. Keyed to the act's identity edge.
+///
+/// [`ClaimRepository::reverse_marked_duplicate_conn`] reads it. Rows are
+/// restored only while they are still where the repair left them; anything
+/// another write has touched since is left alone and reported.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DedupRevert {
+    /// The `same_as` identity edge of the act this repair followed.
+    pub identity_edge: Option<Uuid>,
+    /// Edges the collision guards retracted (`valid_to` set).
+    pub retracted_edges: Vec<Uuid>,
+    /// Edges re-pointed from the duplicate onto the canonical as their TARGET.
+    pub retargeted_edges: Vec<Uuid>,
+    /// Edges re-pointed from the duplicate onto the canonical as their SOURCE.
+    pub resourced_edges: Vec<Uuid>,
+    /// BBAs moved from the duplicate onto the canonical (edge-keyed and pooled).
+    pub moved_bbas: Vec<MovedBba>,
+    /// BBAs the repair deleted (those of retracted edges, and the duplicate's
+    /// copies the canonical already held), each as its whole row.
+    pub deleted_bbas: Vec<serde_json::Value>,
+    /// Frames the repair bound the canonical to.
+    pub copied_frames: Vec<Uuid>,
+    /// The canonical's own input BBAs on those frames when the repair bound
+    /// it. An un-mark removes a binding only while the canonical has no input
+    /// on that frame beyond these (a later writer's input needs it).
+    #[serde(default)]
+    pub canonical_frame_inputs: Vec<Uuid>,
+}
+
+/// What [`ClaimRepository::reverse_marked_duplicate_conn`] put back, and what
+/// it had to leave.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DedupReversal {
+    /// `(edge_id, target_id, relationship)` of claim->claim edges re-sourced
+    /// back onto the duplicate: their far-end BBAs were re-derived from the
+    /// canonical's interval and must be re-derived from the duplicate's.
+    pub resourced_back: Vec<(Uuid, Uuid, String)>,
+    /// Edges re-pointed back onto the duplicate as their target.
+    pub retargeted_back: Vec<Uuid>,
+    /// Retracted edges back in force.
+    pub unretracted_edges: Vec<Uuid>,
+    /// Moved BBAs returned to the duplicate with their old tenancy.
+    pub returned_bbas: Vec<Uuid>,
+    /// Deleted BBAs re-inserted.
+    pub restored_bbas: Vec<Uuid>,
+    /// Frame bindings the repair added to the canonical, removed again.
+    pub unbound_frames: Vec<Uuid>,
+    /// The canonical's cached combination rows removed because a returning
+    /// input needed their slot on the duplicate (re-derived by the cascade).
+    pub cleared_cached_rows: u64,
+    /// Rows the record names that a later write has moved, re-pointed or
+    /// deleted; left as they are.
+    pub drifted: Vec<Uuid>,
+    /// Claims whose cached belief no longer matches their BBA set.
+    pub stale_claims: Vec<Uuid>,
+}
+
+impl DedupReversal {
+    /// The reversal as the belief cascade's input
+    /// (`retraction_cascade::cascade_after_dedup` with the DUPLICATE as the
+    /// claim whose own interval is refreshed first).
+    #[must_use]
+    pub fn as_repair(&self) -> DedupRepair {
+        DedupRepair {
+            stale_claims: self.stale_claims.clone(),
+            resourced_edges: self.resourced_back.clone(),
+            ..DedupRepair::default()
+        }
+    }
+}
+
+/// A marked duplicate an un-mark's act restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnmarkedDuplicate {
+    /// The canonical it had been marked a duplicate of.
+    pub canonical: Uuid,
+    /// The identity edge the act retracted.
+    pub identity_edge: Uuid,
 }
 
 /// The relationship of the identity edge a dedup's act writes,
@@ -7719,6 +7819,168 @@ impl ClaimRepository {
         Ok(repair)
     }
 
+    /// The un-mark's own act, on the CALLER's stamped transaction: `dup` is
+    /// current again (`is_current = true`, `supersedes = NULL`) and the act's
+    /// `same_as` identity edge is retracted. The database decides write
+    /// authority over both rows.
+    ///
+    /// Only a duplicate a dedup act marked can be un-marked: one with an
+    /// in-force identity edge to the claim its `supersedes` names. A claim
+    /// retired some other way (a consolidation source, a mark made before
+    /// identity edges existed) is refused, because there is no record of
+    /// which rows a reversal would have to put back.
+    ///
+    /// The embeddings stay NULL: the caller re-embeds after commit
+    /// (best-effort, as every write path does), or a backfill does.
+    ///
+    /// # Errors
+    /// `DbError::NotFound` for a missing claim; `DbError::QueryFailed` for a
+    /// claim that is not a marked duplicate or a refused statement.
+    pub async fn unmark_duplicate_act_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+    ) -> Result<UnmarkedDuplicate, DbError> {
+        use sqlx::Acquire;
+        let dup_uuid: Uuid = dup.into();
+        let mut tx = conn.begin().await?;
+        let row: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT supersedes, COALESCE(is_current, true) FROM claims WHERE id = $1 FOR UPDATE"#,
+        )
+        .bind(dup_uuid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((supersedes, current)) = row else {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: dup_uuid,
+            });
+        };
+        let not_marked = |why: &str| DbError::QueryFailed {
+            source: sqlx::Error::Protocol(format!(
+                "unmark_duplicate: claim {dup_uuid} {why}; nothing was written"
+            )),
+        };
+        let canonical = match (supersedes, current) {
+            (Some(c), false) => c,
+            _ => return Err(not_marked("is not a retired duplicate")),
+        };
+        let identity_edge: Option<Uuid> = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT id FROM edges
+             WHERE source_id = $1 AND source_type = 'claim'
+               AND target_id = $2 AND target_type = 'claim'
+               AND relationship = $3 AND valid_to IS NULL AND properties ? $4
+             ORDER BY created_at DESC, id DESC LIMIT 1
+             FOR UPDATE"#,
+        )
+        .bind(dup_uuid)
+        .bind(canonical)
+        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+        .bind(DUPLICATE_IDENTITY_PROPERTY)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(identity_edge) = identity_edge else {
+            return Err(not_marked(
+                "has no dedup identity edge to the claim it supersedes (it was retired by \
+                 another act, or marked before identity edges were recorded)",
+            ));
+        };
+        let restored = sqlx::query(
+            "UPDATE claims SET supersedes = NULL, is_current = true, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(dup_uuid)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let retracted = sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+            .bind(identity_edge)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if restored != 1 || retracted != 1 {
+            return Err(not_marked(
+                "or its identity edge is not writable by this session",
+            ));
+        }
+        tx.commit().await?;
+        Ok(UnmarkedDuplicate {
+            canonical,
+            identity_edge,
+        })
+    }
+
+    /// Put back what a dedup repair did, from its [`DedupRevert`] record:
+    /// re-source and re-target its edges onto `dup`, return its moved BBAs
+    /// with their old tenancy, re-insert the BBAs it deleted, put its
+    /// retracted edges back in force, and remove the frame bindings it added
+    /// to the canonical. Returns what the belief cascade must re-derive.
+    ///
+    /// Each step acts only on rows still where the repair left them (an edge
+    /// still pointing at the canonical, a BBA still on it); a row a later
+    /// write has changed is left alone and reported in
+    /// [`DedupReversal::drifted`].
+    ///
+    /// Runs on a PRIVILEGED session (it re-points other writers' edges and
+    /// moves their BBAs), as the repair does.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session; `DbError::QueryFailed`
+    /// on a failed statement (nothing is changed).
+    pub async fn reverse_marked_duplicate_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+        record: &DedupRevert,
+    ) -> Result<DedupReversal, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "reverse_marked_duplicate_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let out = reverse_marked_duplicate(&mut tx, dup.into(), canonical.into(), record).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// The un-mark's act and its reversal in ONE transaction on a privileged
+    /// connection (the shape the semantic sweep and the tests use; a request
+    /// path runs the act on the caller's stamped transaction instead).
+    ///
+    /// # Errors
+    /// As [`Self::unmark_duplicate_act_conn`] and
+    /// [`Self::reverse_marked_duplicate_conn`].
+    pub async fn unmark_duplicate_with_reversal_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        record: &DedupRevert,
+    ) -> Result<(UnmarkedDuplicate, DedupReversal), DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "unmark_duplicate_with_reversal_conn (its reversal re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let unmarked = Self::unmark_duplicate_act_conn(&mut tx, dup).await?;
+        if record.identity_edge != Some(unmarked.identity_edge) {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "the revert record names identity edge {:?}, but the duplicate's in-force \
+                     identity edge is {}; refusing to reverse another mark's repair",
+                    record.identity_edge, unmarked.identity_edge
+                ),
+            });
+        }
+        let reversal =
+            reverse_marked_duplicate(&mut tx, dup.into(), unmarked.canonical, record).await?;
+        tx.commit().await?;
+        Ok((unmarked, reversal))
+    }
+
     /// Apply a patch atomically on the supplied connection. Returns a diff so
     /// callers can build provenance or HTTP responses. No provenance writing here.
     ///
@@ -10536,6 +10798,23 @@ async fn repair_marked_duplicate(
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
 
+    // The act's identity edge, which keys this repair's revert record (a
+    // mark made before identity edges existed has none).
+    let identity_edge: Option<Uuid> = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT id FROM edges
+          WHERE source_id = $1 AND source_type = 'claim'
+            AND target_id = $2 AND target_type = 'claim'
+            AND relationship = $3 AND valid_to IS NULL AND properties ? $4
+          ORDER BY created_at DESC, id DESC LIMIT 1"#,
+    )
+    .bind(dup_uuid)
+    .bind(canon_uuid)
+    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+    .bind(DUPLICATE_IDENTITY_PROPERTY)
+    .fetch_optional(&mut *conn)
+    .await?;
+
     // Drop incoming dup-edges whose migrated triple already exists on canonical.
     // Alias the outer table as `e` so the correlated subquery references
     // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
@@ -10657,6 +10936,19 @@ async fn repair_marked_duplicate(
     // on a privileged session (the caller's precondition), so it is the plain
     // statement (migration 117).
     let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
+    // The rows are about to be deleted, so the revert record keeps them whole.
+    let mut deleted_rows: Vec<serde_json::Value> = if deleted_edge_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT to_jsonb(mf) FROM mass_functions mf
+              WHERE mf.perspective_id = ANY($1) ORDER BY mf.id"#,
+        )
+        .bind(&deleted_edge_ids)
+        .fetch_all(&mut *conn)
+        .await?
+    };
     let deleted_bbas = crate::repos::mass_function::delete_edge_bbas(
         &mut *conn,
         &deleted_edge_ids,
@@ -10690,6 +10982,9 @@ async fn repair_marked_duplicate(
     let mut moved_bbas = 0_u64;
     let mut dropped_duplicate_copies = 0_u64;
     let mut skipped_false_bindings = 0_u64;
+    let mut copied_frames: Vec<Uuid> = Vec::new();
+    let mut canonical_frame_inputs: Vec<Uuid> = Vec::new();
+    let mut moved_rows: Vec<MovedBba> = Vec::new();
 
     // Part 3 (below) pools the duplicate's own belief inputs on the canonical,
     // unless the canonical is a COMPOUND (an in-force `decomposes_to`
@@ -10752,7 +11047,7 @@ async fn repair_marked_duplicate(
         .fetch_one(&mut *conn)
         .await
         .map(|n| u64::try_from(n).unwrap_or(0))?;
-        sqlx::query(
+        copied_frames = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
              SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf
@@ -10762,12 +11057,26 @@ async fn repair_marked_duplicate(
               WHERE cf.claim_id = $2
                 AND NOT (f.name = 'binary_truth' AND cf.hypothesis_index IS DISTINCT FROM 0
                          AND c.owner_group_id IS DISTINCT FROM d.owner_group_id)
-             ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
+             ON CONFLICT (claim_id, frame_id) DO NOTHING
+             RETURNING frame_id"#,
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
+        if !copied_frames.is_empty() {
+            canonical_frame_inputs = sqlx::query_scalar(&format!(
+                r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+                 SELECT mf.id FROM mass_functions mf
+                  WHERE mf.claim_id = $1 AND mf.frame_id = ANY($2) AND NOT {}
+                  ORDER BY mf.id"#,
+                crate::repos::mass_function::cached_combination_predicate("mf.")
+            ))
+            .bind(canon_uuid)
+            .bind(&copied_frames)
+            .fetch_all(&mut *conn)
+            .await?;
+        }
 
         // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
         // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
@@ -10777,7 +11086,7 @@ async fn repair_marked_duplicate(
         // moment their masses were frozen differs, and the canonical's row may
         // be another writer's contribution, which a dedup does not destroy
         // (migration 115 section 4's rule, now the only one).
-        dropped_duplicate_copies = sqlx::query(
+        let dropped: Vec<serde_json::Value> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions d
               WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
@@ -10786,14 +11095,16 @@ async fn repair_marked_duplicate(
                      WHERE c.claim_id = $1
                        AND c.perspective_id = d.perspective_id
                        AND c.frame_id = d.frame_id
-                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)"#,
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)
+             RETURNING to_jsonb(d)"#,
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
         .bind(&retargeted_ids)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        .fetch_all(&mut *conn)
+        .await?;
+        dropped_duplicate_copies = dropped.len() as u64;
+        deleted_rows.extend(dropped);
 
         // The move keeps "a writer's contribution is the writer's" (migration
         // 114). Onto a PUBLIC canonical, a row keeps its owner and comes out
@@ -10801,28 +11112,21 @@ async fn repair_marked_duplicate(
         // insert on the canonical does not re-stamp it to the canonical's
         // owner); onto a group-private canonical it becomes the claim's own
         // row, as every derived row of a private claim is.
-        let moved = sqlx::query(
+        let moved: Vec<MovedBba> = sqlx::query_as(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
-             UPDATE mass_functions mf
-                SET claim_id       = c.id,
-                    owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
-                                          ELSE c.owner_group_id END,
-                    visibility     = c.visibility,
-                    writer_owned   = CASE
-                                       WHEN c.visibility IS DISTINCT FROM 'public' THEN false
-                                       WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
-                                            THEN true
-                                       ELSE mf.writer_owned END
-               FROM claims c
-              WHERE c.id = $1
-                AND mf.claim_id = $2 AND mf.perspective_id = ANY($3)"#,
-        )
+             WITH before AS (
+                 SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
+                   FROM mass_functions b
+                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3))
+             {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
+        ))
         .bind(canon_uuid)
         .bind(dup_uuid)
         .bind(&retargeted_ids)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
-        moved_bbas = moved.rows_affected();
+        moved_bbas = moved.len() as u64;
+        moved_rows.extend(moved);
     }
 
     // ── Derived-record repair, part 3: POOL the duplicate's own inputs ────
@@ -10847,29 +11151,22 @@ async fn repair_marked_duplicate(
     // reaches them through the identity edge.
     let mut pooled_bbas: Vec<Uuid> = Vec::new();
     if !poolable.is_empty() {
-        pooled_bbas = sqlx::query_scalar(
+        let pooled: Vec<MovedBba> = sqlx::query_as(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
-             UPDATE mass_functions mf
-                SET claim_id       = c.id,
-                    owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
-                                          ELSE c.owner_group_id END,
-                    visibility     = c.visibility,
-                    writer_owned   = CASE
-                                       WHEN c.visibility IS DISTINCT FROM 'public' THEN false
-                                       WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
-                                            THEN true
-                                       ELSE mf.writer_owned END
-               FROM claims c
-              WHERE c.id = $1
-                AND mf.claim_id = $2 AND mf.id = ANY($3)
-             RETURNING mf.id"#,
-        )
+             WITH before AS (
+                 SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
+                   FROM mass_functions b
+                  WHERE b.claim_id = $2 AND b.id = ANY($3))
+             {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
+        ))
         .bind(canon_uuid)
         .bind(dup_uuid)
         .bind(&poolable)
         .fetch_all(&mut *conn)
         .await?;
+        pooled_bbas = pooled.iter().map(|m| m.id).collect();
         pooled_bbas.sort_unstable();
+        moved_rows.extend(pooled);
     }
     let kept_on_duplicate: Vec<Uuid> = sqlx::query_scalar(&format!(
         r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
@@ -10914,6 +11211,10 @@ async fn repair_marked_duplicate(
         .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
         .collect();
 
+    let deleted_edge_ids_for_revert = deleted_edge_ids.clone();
+    let retargeted_for_revert = retargeted_ids.clone();
+    let resourced_for_revert: Vec<Uuid> = resourced_edges.iter().map(|(id, _, _)| *id).collect();
+
     // Claims whose cached scalars no longer match their BBA set: the two
     // dedup endpoints, plus every third claim that lost a BBA above.
     let mut stale_claims = vec![canon_uuid, dup_uuid];
@@ -10935,7 +11236,244 @@ async fn repair_marked_duplicate(
         pooled_bbas,
         kept_on_duplicate,
         canonical_is_compound,
+        revert: DedupRevert {
+            identity_edge,
+            retracted_edges: deleted_edge_ids_for_revert,
+            retargeted_edges: retargeted_for_revert,
+            resourced_edges: resourced_for_revert,
+            moved_bbas: moved_rows,
+            deleted_bbas: deleted_rows,
+            copied_frames,
+            canonical_frame_inputs,
+        },
     })
+}
+
+/// The tail of both BBA moves onto the canonical (`$1`) in the dedup repair:
+/// the UPDATE over a `before` CTE of the rows to move (`id`, and their
+/// tenancy before the move), returning that before-state for the revert
+/// record. The move keeps migration 114's "a writer's contribution is the
+/// writer's" rule.
+const MOVE_BBAS_ONTO_CANONICAL_SQL: &str = "\
+     UPDATE mass_functions mf
+        SET claim_id       = c.id,
+            owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
+                                  ELSE c.owner_group_id END,
+            visibility     = c.visibility,
+            writer_owned   = CASE
+                               WHEN c.visibility IS DISTINCT FROM 'public' THEN false
+                               WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
+                                    THEN true
+                               ELSE mf.writer_owned END
+       FROM claims c, before b
+      WHERE c.id = $1 AND mf.id = b.id
+     RETURNING b.id, b.owner_group_id, b.visibility, b.writer_owned";
+
+/// The reversal of a dedup repair, unchecked: the callers establish the
+/// privilege and own the transaction. See
+/// [`ClaimRepository::reverse_marked_duplicate_conn`].
+async fn reverse_marked_duplicate(
+    conn: &mut sqlx::PgConnection,
+    dup_uuid: Uuid,
+    canon_uuid: Uuid,
+    record: &DedupRevert,
+) -> Result<DedupReversal, DbError> {
+    let mut out = DedupReversal::default();
+    let mut drifted: Vec<Uuid> = Vec::new();
+    let note_drift = |asked: &[Uuid], done: &[Uuid], drifted: &mut Vec<Uuid>| {
+        drifted.extend(asked.iter().filter(|id| !done.contains(id)).copied());
+    };
+
+    // Edges first, so the BBAs below go back beside the edges they are keyed
+    // to. Only an edge still in force and still on the canonical moves.
+    let resourced: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         UPDATE edges SET source_id = $2
+          WHERE id = ANY($3) AND source_id = $1 AND source_type = 'claim' AND valid_to IS NULL
+         RETURNING id, target_id, relationship, target_type"#,
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .bind(&record.resourced_edges)
+    .fetch_all(&mut *conn)
+    .await?;
+    let done: Vec<Uuid> = resourced.iter().map(|r| r.0).collect();
+    note_drift(&record.resourced_edges, &done, &mut drifted);
+    out.resourced_back = resourced
+        .into_iter()
+        .filter(|(_, _, _, tt)| tt == "claim")
+        .map(|(id, target, rel, _)| (id, target, rel))
+        .collect();
+
+    out.retargeted_back = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         UPDATE edges SET target_id = $2
+          WHERE id = ANY($3) AND target_id = $1 AND target_type = 'claim' AND valid_to IS NULL
+         RETURNING id"#,
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .bind(&record.retargeted_edges)
+    .fetch_all(&mut *conn)
+    .await?;
+    let done = out.retargeted_back.clone();
+    note_drift(&record.retargeted_edges, &done, &mut drifted);
+
+    out.unretracted_edges = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         UPDATE edges SET valid_to = NULL
+          WHERE id = ANY($1) AND valid_to IS NOT NULL
+         RETURNING id"#,
+    )
+    .bind(&record.retracted_edges)
+    .fetch_all(&mut *conn)
+    .await?;
+    let done = out.unretracted_edges.clone();
+    note_drift(&record.retracted_edges, &done, &mut drifted);
+
+    // BBAs moved onto the canonical go back with their old tenancy. A
+    // returning input's slot on the duplicate may since hold the duplicate's
+    // re-derived CACHED combination (the cascade recomputed it); that row is
+    // derived and is cleared so the input can return. Any other occupant of
+    // the slot is a later write: the row stays where it is (drifted).
+    let moved_ids: Vec<Uuid> = record.moved_bbas.iter().map(|m| m.id).collect();
+    let moved_json =
+        serde_json::to_value(&record.moved_bbas).map_err(|e| DbError::InvalidData {
+            reason: format!("revert record: {e}"),
+        })?;
+    if !moved_ids.is_empty() {
+        out.cleared_cached_rows = sqlx::query(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM mass_functions k
+              USING mass_functions m
+              WHERE k.claim_id = $2 AND {}
+                AND m.id = ANY($3) AND m.claim_id = $1
+                AND m.frame_id = k.frame_id
+                AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
+                AND m.perspective_id IS NOT DISTINCT FROM k.perspective_id"#,
+            crate::repos::mass_function::cached_combination_predicate("k.")
+        ))
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&moved_ids)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        out.returned_bbas = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET claim_id = $2,
+                    owner_group_id = r.owner_group_id,
+                    visibility = r.visibility,
+                    writer_owned = r.writer_owned
+               FROM jsonb_to_recordset($3)
+                    AS r(id uuid, owner_group_id uuid, visibility text, writer_owned boolean)
+              WHERE mf.id = r.id AND mf.claim_id = $1
+                AND NOT EXISTS (SELECT 1 FROM mass_functions k
+                                 WHERE k.claim_id = $2 AND k.frame_id = mf.frame_id
+                                   AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id
+                                   AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id)
+             RETURNING mf.id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&moved_json)
+        .fetch_all(&mut *conn)
+        .await?;
+        let done = out.returned_bbas.clone();
+        note_drift(&moved_ids, &done, &mut drifted);
+    }
+
+    // BBAs the repair deleted come back whole (same id, same tenancy). One
+    // whose id or key is taken again is a later write's and is skipped.
+    if !record.deleted_bbas.is_empty() {
+        let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
+        let asked: Vec<Uuid> = record
+            .deleted_bbas
+            .iter()
+            .filter_map(|r| {
+                r.get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+            })
+            .collect();
+        out.restored_bbas = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             INSERT INTO mass_functions
+             SELECT * FROM jsonb_populate_recordset(NULL::mass_functions, $1)
+             ON CONFLICT DO NOTHING
+             RETURNING id"#,
+        )
+        .bind(&deleted)
+        .fetch_all(&mut *conn)
+        .await?;
+        // An INSERT re-derives tenancy from the claim (migrations 070, 114);
+        // the restored row takes back exactly what it had.
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET owner_group_id = r.owner_group_id,
+                    visibility = r.visibility,
+                    writer_owned = r.writer_owned
+               FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
+              WHERE mf.id = r.id AND mf.id = ANY($2)
+                AND (mf.owner_group_id, mf.visibility, mf.writer_owned)
+                    IS DISTINCT FROM (r.owner_group_id, r.visibility, r.writer_owned)"#,
+        )
+        .bind(&deleted)
+        .bind(&out.restored_bbas)
+        .execute(&mut *conn)
+        .await?;
+        let done = out.restored_bbas.clone();
+        note_drift(&asked, &done, &mut drifted);
+    }
+
+    // The frame bindings the repair added go, unless the canonical has since
+    // gained an input on that frame (one it did not hold when it was bound and
+    // that is not on its way back to the duplicate above).
+    if !record.copied_frames.is_empty() {
+        out.unbound_frames = sqlx::query_scalar(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM claim_frames cf
+              WHERE cf.claim_id = $1 AND cf.frame_id = ANY($2)
+                AND NOT EXISTS (SELECT 1 FROM mass_functions mf
+                                 WHERE mf.claim_id = $1 AND mf.frame_id = cf.frame_id
+                                   AND NOT {}
+                                   AND NOT (mf.id = ANY($3)))
+             RETURNING cf.frame_id"#,
+            crate::repos::mass_function::cached_combination_predicate("mf.")
+        ))
+        .bind(canon_uuid)
+        .bind(&record.copied_frames)
+        .bind(&record.canonical_frame_inputs)
+        .fetch_all(&mut *conn)
+        .await?;
+        let done = out.unbound_frames.clone();
+        note_drift(&record.copied_frames, &done, &mut drifted);
+    }
+
+    // Claims whose BBA set changed: both endpoints, and every far-end claim a
+    // restored BBA landed on.
+    let mut stale = vec![dup_uuid, canon_uuid];
+    if !out.restored_bbas.is_empty() {
+        let targets: Vec<Uuid> = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT DISTINCT claim_id FROM mass_functions WHERE id = ANY($1)"#,
+        )
+        .bind(&out.restored_bbas)
+        .fetch_all(&mut *conn)
+        .await?;
+        for t in targets {
+            if !stale.contains(&t) {
+                stale.push(t);
+            }
+        }
+    }
+    out.stale_claims = stale;
+    drifted.sort_unstable();
+    drifted.dedup();
+    out.drifted = drifted;
+    Ok(out)
 }
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
