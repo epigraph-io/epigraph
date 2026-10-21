@@ -3,7 +3,7 @@
 //! `epigraph_ingest_executor::workflow_plan::frozen_plan`, so they cannot
 //! answer differently for the same viewer.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -37,7 +37,7 @@ pub async fn get_workflow_plan(
     read.commit().await.map_err(internal_error)?;
     let plan =
         plan.ok_or_else(|| invalid_params(format!("workflow plan {workflow_id} not found")))?;
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&plan).map_err(internal_error)?,
     )]))
 }

@@ -831,13 +831,10 @@ async fn over_stdio_each_outcome_tool_reads_as_the_server_agent(pool: PgPool) {
     let client = ().serve(client_io).await.expect("stdio-shaped client");
 
     for tool in ["report_hierarchical_outcome", "report_workflow_outcome"] {
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        params.arguments = transport_args(tool, w.workflow_id).as_object().cloned();
         let result = client
-            .call_tool(rmcp::model::CallToolRequestParams {
-                meta: None,
-                name: tool.to_string().into(),
-                arguments: transport_args(tool, w.workflow_id).as_object().cloned(),
-                task: None,
-            })
+            .call_tool(params)
             .await
             .unwrap_or_else(|e| panic!("{tool}: {e}"));
         assert_eq!(result.is_error, Some(false), "{tool}: {result:?}");
