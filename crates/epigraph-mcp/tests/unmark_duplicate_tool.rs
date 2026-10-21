@@ -173,3 +173,175 @@ async fn unmark_without_the_administrative_connection_writes_nothing(pool: PgPoo
         .expect("count");
     assert_eq!(events_after, events_before, "no audit row either");
 }
+
+/// The production shape: the tools on an `epigraph_app` server whose
+/// administrative connection runs as `epigraph_maintenance` (not a
+/// superuser), with operator binding ARMED (migration 153 refuses an
+/// application session that clears a `supersedes`). The duplicate's own writer
+/// marks it (a collision-retracted edge's BBA is deleted, another writer's edge
+/// is re-pointed), then un-marks it: the deleted BBA comes back from the
+/// persisted record with its id, the edge comes back, the claim is current.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
+    use epigraph_db::{ScopedPool, SessionGucMode};
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool")
+            .with_maintenance_pool(fixture::downgraded_pool(&pool, "epigraph_maintenance").await);
+    let server = build_scoped_test_server(
+        fixture::downgraded_pool(&pool, "epigraph_app").await,
+        scoped,
+    );
+    let agent = server.server_agent_id().await.expect("server agent");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let group = *viewer.writable_groups().first().expect("a writable group");
+    let auth = epigraph_auth::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_auth::ClientType::Service,
+        scopes: vec!["claims:write".to_string()],
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    };
+    let own = |content: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+            sqlx::query(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                     is_current, visibility, owner_group_id) \
+                 VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+            )
+            .bind(id)
+            .bind(content)
+            .bind(&hash)
+            .bind(agent)
+            .bind(group)
+            .execute(&pool)
+            .await
+            .expect("own public claim");
+            id
+        }
+    };
+    let canonical = own("the writer's canonical").await;
+    let dup = own("the writer's duplicate").await;
+    let third = seed_claim(&pool, "a third claim", 0.5).await;
+    let other = seed_claim(&pool, "another writer's claim", 0.5).await;
+    let e_other = edge(&pool, other, dup).await;
+    let e_diamond = edge(&pool, third, dup).await;
+    edge(&pool, third, canonical).await;
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
+        .bind(e_diamond)
+        .execute(&pool)
+        .await
+        .expect("perspective");
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ('binary_truth', ARRAY['TRUE','FALSE']) \
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("frame");
+    let diamond_bba = epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        frame,
+        Some(agent),
+        Some(e_diamond),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("edge_factor"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("diamond bba");
+
+    let marked = mark_duplicate(
+        &server,
+        &viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: Some("an index restatement".to_string()),
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("the writer marks its own duplicate");
+    assert_eq!(
+        body(&marked)["cascade"]["status"],
+        "applied",
+        "{}",
+        body(&marked)
+    );
+    let gone: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1)")
+            .bind(diamond_bba)
+            .fetch_one(&pool)
+            .await
+            .expect("bba");
+    assert!(
+        gone,
+        "calibration: the collision-retracted edge's BBA was deleted"
+    );
+
+    sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
+        .execute(&pool)
+        .await
+        .expect("arm operator binding");
+
+    let r = unmark_duplicate(
+        &server,
+        &viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("the writer un-marks its own duplicate, armed, on the app role");
+    let b = body(&r);
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(state(&pool, dup).await, (None, true, 0));
+    let back: Option<Uuid> =
+        sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+            .bind(diamond_bba)
+            .fetch_optional(&pool)
+            .await
+            .expect("bba");
+    assert_eq!(
+        back,
+        Some(dup),
+        "the deleted BBA is restored, same id, on the duplicate"
+    );
+    let (target, in_force): (Uuid, bool) =
+        sqlx::query_as("SELECT target_id, valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(e_other)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+    assert_eq!((target, in_force), (dup, true));
+    let diamond_in_force: bool =
+        sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(e_diamond)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+    assert!(
+        diamond_in_force,
+        "the collision-retracted edge is back in force"
+    );
+}
