@@ -2195,3 +2195,232 @@ async fn an_admin_apply_never_retires_another_owners_claim_through_a_revision_la
 async fn an_admin_apply_never_makes_another_owners_claim_a_revision_survivor(pool: PgPool) {
     a_revision_label_never_steers_an_admin_apply_across_owners(pool, false).await;
 }
+
+// ── One owner across an operator link ──────────────────────────────────────
+
+/// Link `agent` to human operator `operator` (migration 107), on the
+/// privileged harness connection.
+async fn link_to_operator(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the agent to its operator");
+    assert!(out.membership_live && out.link_live, "{out:?}");
+}
+
+/// Whether the plan's cluster for `survivor` has `loser` as a revision-label
+/// member.
+fn revision_member(plan: &Value, survivor: Uuid, loser: Uuid) -> bool {
+    plan["clusters"].as_array().is_some_and(|cs| {
+        cs.iter().any(|c| {
+            c["survivor"] == survivor.to_string()
+                && c["members"].as_array().is_some_and(|ms| {
+                    ms.iter()
+                        .any(|m| m["id"] == loser.to_string() && m["tier"] == "revision_label")
+                })
+        })
+    })
+}
+
+/// Two agents of ONE operator are one owner: a revision label between their
+/// claims applies for a `claims:admin` caller, while, in the same apply, a
+/// revision label from one of them to an unlinked agent's claim is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admin(pool: PgPool) {
+    let bytes = serde_json::to_vec(&profile_for(Join::RevisionLabel)).expect("profile");
+    let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (_, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    seed_admin_grant(&pool, &auth).await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "item-operator").await;
+    let (y1, y1_group) = fixture::seed_agent_with_group(&pool, "item-agent-one").await;
+    let (y2, y2_group) = fixture::seed_agent_with_group(&pool, "item-agent-two").await;
+    let (z, z_group) = fixture::seed_agent_with_group(&pool, "item-unlinked").await;
+    link_to_operator(&pool, y1, operator).await;
+    link_to_operator(&pool, y2, operator).await;
+
+    let original = seed(
+        &pool,
+        y2,
+        y2_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let revision = seed(
+        &pool,
+        y1,
+        y1_group,
+        "public",
+        PUMP_REVISED,
+        &[FAMILY, &format!("revises:{original}")],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let foreign = seed(
+        &pool,
+        z,
+        z_group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let foreign_revision = seed(
+        &pool,
+        y1,
+        y1_group,
+        "public",
+        ROOF_REVISED,
+        &[FAMILY, &format!("revises:{foreign}")],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let control_before = snapshot(&pool, &[foreign, foreign_revision]).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    assert!(revision_member(&plan, revision, original), "{plan}");
+    assert!(revision_member(&plan, foreign_revision, foreign), "{plan}");
+    let unit = format!("cluster:{revision}");
+    let control = format!("cluster:{foreign_revision}");
+    assert_eq!(unit_check(&plan, &unit)["applies"], true, "{plan}");
+    assert_eq!(
+        unit_check(&plan, &unit)["cross_owner_revision_link"],
+        Value::Null,
+        "{plan}"
+    );
+    assert_eq!(unit_check(&plan, &control)["applies"], false, "{plan}");
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
+    assert!(
+        labels_of(&pool, original)
+            .await
+            .contains(&format!("duplicate-of:{revision}")),
+        "the operator's two agents' claims merged: {out}"
+    );
+    let refused = result_for(&out, &control);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert_eq!(refused["code"], "CROSS_OWNER_MEMBER", "{out}");
+    assert_eq!(
+        snapshot(&pool, &[foreign, foreign_revision]).await,
+        control_before
+    );
+}
+
+/// An operator and its own agent are one owner: over HTTP with
+/// `claims:write`, the operator owns its agent's claim
+/// (`require_owner_or_admin`'s operator arm), so a revision label between the
+/// operator's own claim and its agent's claim applies, while, in the same
+/// apply, one to an unlinked agent's claim is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_merges_its_own_claim_with_its_agents_through_a_revision_label(pool: PgPool) {
+    let bytes = serde_json::to_vec(&profile_for(Join::RevisionLabel)).expect("profile");
+    let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "item-operator").await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "item-operated").await;
+    let (z, z_group) = fixture::seed_agent_with_group(&pool, "item-unlinked").await;
+    link_to_operator(&pool, agent, operator).await;
+    let viewer = Viewer::resolve(&pool, operator).await.expect("viewer");
+    let auth = epigraph_auth::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(operator),
+        owner_id: Some(Uuid::new_v4()),
+        client_type: epigraph_auth::ClientType::Human,
+        scopes: s(&["claims:write"]),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+    };
+
+    // The agent's claim sits in the operator's group, which both may write.
+    let agents = seed(
+        &pool,
+        agent,
+        operator_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let operators = seed(
+        &pool,
+        operator,
+        operator_group,
+        "public",
+        PUMP_REVISED,
+        &[FAMILY, &format!("revises:{agents}")],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let foreign = seed(
+        &pool,
+        z,
+        z_group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let foreign_revision = seed(
+        &pool,
+        operator,
+        operator_group,
+        "public",
+        ROOF_REVISED,
+        &[FAMILY, &format!("revises:{foreign}")],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let control_before = snapshot(&pool, &[foreign, foreign_revision]).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    assert!(revision_member(&plan, operators, agents), "{plan}");
+    let unit = format!("cluster:{operators}");
+    let control = format!("cluster:{foreign_revision}");
+    // Precondition: the operator owns both members.
+    assert!(
+        unit_check(&plan, &unit)["members"]
+            .as_array()
+            .is_some_and(|ms| ms.len() == 2 && ms.iter().all(|m| m["owned"] == true)),
+        "{plan}"
+    );
+    assert_eq!(unit_check(&plan, &unit)["applies"], true, "{plan}");
+    assert_eq!(unit_check(&plan, &control)["applies"], false, "{plan}");
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
+    assert!(
+        labels_of(&pool, agents)
+            .await
+            .contains(&format!("duplicate-of:{operators}")),
+        "the operator's claim and its agent's merged: {out}"
+    );
+    let refused = result_for(&out, &control);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert_eq!(refused["code"], "CROSS_OWNER_MEMBER", "{out}");
+    assert_eq!(
+        snapshot(&pool, &[foreign, foreign_revision]).await,
+        control_before
+    );
+}
