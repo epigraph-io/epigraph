@@ -85,6 +85,11 @@ epigraph-ingest = { workspace = true }
 reqwest = { workspace = true }
 blake3 = { workspace = true }
 tower = "0.5"
+# `tokio::time::pause` for the session keep-alive tests
+# (`tests/mcp_session_keep_alive.rs`), which wait out minutes of virtual time.
+tokio = { workspace = true, features = ["test-util"] }
+# `StreamExt::next` over rmcp's session stream in the same test file.
+futures = { workspace = true }
 # `no-env-filter` is REQUIRED for integration tests in tests/* to capture
 # events emitted from src/ (different crate target). Without it, the macro's
 # default env filter scopes capture to the test crate only.

@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -454,7 +454,7 @@ pub async fn sweep_semantic_duplicates(
     let response = sweep(session, &params, acting_agent)
         .await
         .map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))
 }

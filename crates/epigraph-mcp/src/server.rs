@@ -2576,7 +2576,7 @@ impl EpiGraphMcpFull {
         // `AuthContext`; stdio has none.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let tools = self.manifest_for(auth.is_some(), auth).await;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
     }
@@ -2618,7 +2618,7 @@ impl EpiGraphMcpFull {
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can be wrapped with durable event emission. Mirrors the macro's expansion
 // for `list_tools` and `get_tool` verbatim — see
-// `rmcp-macros-0.15.0/src/tool_handler.rs` for the canonical body.
+// `rmcp-macros/src/tool_handler.rs` (2.2.0) for the canonical body.
 //
 // `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
@@ -2627,11 +2627,8 @@ impl EpiGraphMcpFull {
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(Self::server_instructions(self.read_only)),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(Self::server_instructions(self.read_only))
     }
 
     async fn call_tool(

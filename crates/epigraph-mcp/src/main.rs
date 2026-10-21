@@ -24,8 +24,9 @@
 //!
 //! Every TCP listener enforces a `Host`/`Origin` allowlist (`localhost`,
 //! `127.0.0.1`, `::1`, the `--listen` authority, plus `--allowed-host`) as the
-//! DNS-rebinding defense rmcp 0.15 does not provide. A reverse-proxied
-//! deployment MUST add the public name, since Caddy forwards the client's Host.
+//! DNS-rebinding defense (rmcp's own Host check is fed the same list). A
+//! reverse-proxied deployment MUST add the public name, since Caddy forwards
+//! the client's Host.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -110,8 +111,8 @@ struct Cli {
     /// (repeatable; comma-separated in the env var).
     ///
     /// The listener rejects any request whose `Host` — or, when present, `Origin`
-    /// — is outside its allowlist, which is the DNS-rebinding defense rmcp 0.15
-    /// does not provide. The allowlist always contains `localhost`, `127.0.0.1`,
+    /// — is outside its allowlist, which is the DNS-rebinding defense (rmcp's
+    /// in-service Host check is given the same list). The allowlist always contains `localhost`, `127.0.0.1`,
     /// `::1` and the `--listen` authority; a reverse-proxied deployment must add
     /// the public name the proxy forwards (e.g. `mcp.example.com`), because
     /// Caddy's `reverse_proxy` preserves the client's original `Host`.
@@ -727,10 +728,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
-        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-        };
 
         // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
         // was already refused above; this catches a link recorded earlier by a
@@ -832,22 +829,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
-        let service = StreamableHttpService::new(
-            // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
-            // this closure runs once PER SESSION. Every session is a clone of
-            // the one template above: it carries the template's `ScopedPool`
-            // (an attachment on the stdio path alone would leave every real
-            // caller on a server whose `scoped` is `None`, turning the 42501
-            // into a total `submit_claim` / `memorize` refusal) and SHARES its
-            // `agent_db_id` cell, so the server agent is resolved — and its
-            // personal group provisioned — once per process, not once per
-            // session. See `SessionFactory` for the measurement.
-            move || Ok(sessions.session()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
+        // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and the
+        // factory closure runs once PER SESSION. Every session is a clone of
+        // the one template above: it carries the template's `ScopedPool` (an
+        // attachment on the stdio path alone would leave every real caller on
+        // a server whose `scoped` is `None`, turning the 42501 into a total
+        // `submit_claim` / `memorize` refusal) and SHARES its `agent_db_id`
+        // cell, so the server agent is resolved — and its personal group
+        // provisioned — once per process, not once per session. See
+        // `SessionFactory` for the measurement.
+        //
+        // `mcp_http_listener` also picks the rmcp config and the session
+        // manager, and returns the TCP Host/Origin allowlist (`None` on a unix
+        // socket) that the outer guard layer below installs: the rmcp config
+        // and that layer are built from one value. The HTTP test suites build
+        // their listeners through the same function.
+        let epigraph_mcp::http_listener::McpHttpListener {
+            service,
+            tcp_allowlist,
+            ..
+        } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
+            Ok(sessions.session())
+        });
 
-        // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
+        // Innermost layer: rewrite rmcp's remaining session-error statuses to the MCP
         // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize
         // 422 -> 400). A 401 on an unknown session made OAuth clients discard a
         // valid token after every restart instead of re-initializing. It wraps
@@ -893,23 +898,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // ── DNS-rebinding guard (CVE-2026-42559 class) ──────────────────
-        // rmcp 0.15's StreamableHttpServerConfig has no allowed_hosts /
-        // allowed_origins knob and the crate validates neither header, so a
-        // browser pointed at a page whose DNS rebinds to this listener could
-        // otherwise drive every tool. Applied LAST, i.e. OUTERMOST, so it runs
+        // A browser pointed at a page whose DNS rebinds to this listener could
+        // otherwise drive every tool. rmcp's service checks Host too (fed the
+        // same allowlist via `streamable_http_server_config`), but only after
+        // auth; this layer is the authoritative one. Applied LAST, i.e. OUTERMOST, so it runs
         // BEFORE the auth layer: a rebound request is refused on its headers
         // alone. TCP only — a unix socket is unreachable from a browser, so the
         // guard would add no security there while risking a 403 on the one
         // listener kind allowed to run unauthenticated.
-        let router = if epigraph_mcp::is_unix_listener(addr) {
-            tracing::info!(
-                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
-                 DNS-rebinding surface); filesystem permissions are the trust gate"
-            );
-            router
-        } else {
-            let allowlist =
-                epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host);
+        let router = if let Some(allowlist) = tcp_allowlist {
             tracing::info!(
                 allowed_hosts = %allowlist.describe(),
                 "Host/Origin allowlist active on the MCP HTTP listener (DNS-rebinding guard); \
@@ -919,6 +916,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist,
                 epigraph_mcp::host_guard::host_guard_middleware,
             ))
+        } else {
+            tracing::info!(
+                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
+                 DNS-rebinding surface); filesystem permissions are the trust gate"
+            );
+            router
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
