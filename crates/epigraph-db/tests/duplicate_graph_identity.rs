@@ -629,3 +629,135 @@ async fn a_dedup_never_pools_the_duplicates_cached_combination(pool: PgPool) {
     assert_eq!(bba_claim(&pool, cache).await, dup, "the cached fold stays");
     assert_eq!(repair.kept_on_duplicate, vec![cache]);
 }
+
+async fn tenancy_of_bba(pool: &PgPool, id: Uuid) -> (Uuid, String, Uuid) {
+    sqlx::query_as(
+        "SELECT claim_id, visibility::text, owner_group_id FROM mass_functions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("bba tenancy")
+}
+
+/// B3, the audience rule. A group-private duplicate's BBA is the group's
+/// assessment. Pooled onto a PUBLIC canonical, or onto another group's
+/// private canonical, it would be disclosed to a wider audience and move a
+/// belief that audience reads, so it stays on the duplicate. Onto a canonical
+/// of the SAME group it pools.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_duplicates_bba_pools_only_within_its_own_audience(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "private-writer").await;
+    let (x, h) = fixture::seed_agent_with_group(&pool, "other-group").await;
+    let frame = seed_frame(&pool).await;
+    let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let mut cases = Vec::new();
+    for (label, canonical) in [
+        (
+            "public canonical",
+            fixture::seed_public_claim(&pool, x, "public canonical").await,
+        ),
+        (
+            "other group's canonical",
+            fixture::seed_group_claim(&pool, x, h, "h canonical").await,
+        ),
+        (
+            "same group's canonical",
+            fixture::seed_group_claim(&pool, w, g, "g canonical").await,
+        ),
+    ] {
+        let dup = fixture::seed_group_claim(&pool, w, g, &format!("g dup for {label}")).await;
+        let row = store_bba(
+            &pool,
+            dup,
+            frame,
+            Some(w),
+            None,
+            m.clone(),
+            "auto_wire",
+            None,
+        )
+        .await;
+        assert_eq!(tenancy_of_bba(&pool, row).await, (dup, "group".into(), g));
+        let repair = mark_with_repair(&pool, dup, canonical).await;
+        cases.push((label, dup, canonical, row, repair));
+    }
+    for (label, dup, canonical, row, repair) in cases {
+        let got = tenancy_of_bba(&pool, row).await;
+        if label == "same group's canonical" {
+            assert_eq!(got, (canonical, "group".into(), g), "{label}: pools");
+            assert_eq!(repair.pooled_bbas, vec![row], "{label}");
+        } else {
+            assert_eq!(
+                got,
+                (dup, "group".into(), g),
+                "{label}: stays private on the duplicate"
+            );
+            assert_eq!(repair.kept_on_duplicate, vec![row], "{label}");
+            assert!(repair.pooled_bbas.is_empty(), "{label}");
+        }
+    }
+}
+
+/// FA07 parity with pooling. A writer's duplicate is bound to binary_truth
+/// at FALSE and holds a BBA but no incoming edge; the canonical is a world
+/// claim the writer cannot write. Pooling would hand the canonical that
+/// binding's frame (or, with the repair's own skip, pooled rows on a frame the
+/// canonical is not bound to), so the act refuses it as it refuses the
+/// edge-triggered case.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_refuses_a_false_bound_duplicate_whose_bbas_would_pool(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "dedup-writer").await;
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let dup = Uuid::new_v4();
+    let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a FALSE-bound duplicate', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(dup)
+    .bind(&hash)
+    .bind(w)
+    .bind(g)
+    .execute(&pool)
+    .await
+    .expect("seed the writer's public duplicate");
+    let frame = seed_frame(&pool).await;
+    FrameRepository::assign_claim(&pool, dup, frame, Some(1))
+        .await
+        .expect("bind FALSE");
+    store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(w),
+        None,
+        serde_json::json!({"1": 0.6, "0,1": 0.4}),
+        "auto_wire",
+        None,
+    )
+    .await;
+
+    let p = pool.clone();
+    let act = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let r = ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await;
+    let err = act.expect_err("FA07: the act refuses");
+    assert!(format!("{err:?}").contains("FA07"), "{err:?}");
+    let (current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("dup");
+    assert!(current, "nothing was written");
+}
