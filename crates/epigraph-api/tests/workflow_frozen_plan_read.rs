@@ -507,6 +507,41 @@ async fn an_item_in_another_group_leaves_a_gap_and_no_digest(pool: PgPool) {
     );
 }
 
+/// The limit of what the read can say. When the LAST item moves to G2, its
+/// edge goes with it, nothing is left behind in the index sequence, and every
+/// count reads 0: the read returns a non-null echo of the SHORTENED plan. Only
+/// a comparison with the digest the publisher pinned (here, the vectors')
+/// detects it. Nothing of the moved item is named.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_tail_is_detectable_only_against_the_pinned_digest(pool: PgPool) {
+    let w = private_workflow(&pool).await;
+    let (other_admin, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
+    let g2 = team_group(&pool, other_admin, "workflow-plan second group").await;
+    let tail = vector_plan()[8].clone();
+    let moved = uuid_of(&tail["claim_id"]);
+    restrict(&pool, w.workflow_id, &[moved], g2).await;
+
+    let p = w
+        .api
+        .plan(&token(w.reader, READ_SCOPES), w.workflow_id)
+        .await;
+    assert_eq!(flags(&p), clean(), "{p}");
+    assert_eq!(
+        p["items"].as_array().unwrap().len(),
+        vector_plan().len() - 1
+    );
+    let echo = p["digest_echo"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a clean-looking plan echoes: {p}"));
+    assert_ne!(echo, vectors()["ingest"]["wfd1"].as_str().unwrap());
+    let text = p.to_string();
+    assert!(!text.contains(&moved.to_string()), "no id of the moved item");
+    assert!(
+        !text.contains(tail["content"].as_str().unwrap()),
+        "no content of the moved item"
+    );
+}
+
 /// An `executes` edge the caller CAN see whose target it cannot read is a
 /// hidden item: counted, never named. The shape is written by the harness
 /// (the tenancy trigger keeps an edge with its target, so no API path makes
@@ -723,7 +758,8 @@ async fn content_hash_ok_accepts_legacy_and_scoped_rows_and_rejects_tampered_one
 ///    and the echo is the digest of the new order (an independent vector),
 ///    not the published one;
 /// 2. the string index: the edge is unindexed, not an item, no echo;
-/// 3. the retraction: counted, not an item.
+/// 3. the retraction (of the tail edge, after the string index is undone):
+///    counted, not an item, no echo, though no gap is left.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_group_writer_reordering_or_retracting_edges_changes_what_the_read_reports(pool: PgPool) {
     let w = private_workflow(&pool).await;
@@ -760,7 +796,17 @@ async fn a_group_writer_reordering_or_retracting_edges_changes_what_the_read_rep
     assert!(!item_ids(&p).contains(&edges[3].1));
     assert_eq!(p["digest_echo"], Value::Null);
 
-    // 3. a retraction
+    // 3. a retraction. Undo the string index first, so the null echo below
+    //    follows from the retraction alone: back to the exchanged order.
+    w.api
+        .patch_edge(&writer, edges[3].0, json!({"plan_index": 3}))
+        .await;
+    let p = w.api.plan(&reader, w.workflow_id).await;
+    assert_eq!(flags(&p), clean(), "calibration: {p}");
+    assert_eq!(
+        p["digest_echo"],
+        v["ingest"]["wfd1_with_plan_index_1_and_2_swapped"]
+    );
     let (status, body) = w
         .api
         .call(
@@ -773,6 +819,7 @@ async fn a_group_writer_reordering_or_retracting_edges_changes_what_the_read_rep
     assert!(status.is_success(), "retract: {status} {body}");
     let p = w.api.plan(&reader, w.workflow_id).await;
     assert_eq!(p["retracted_edges"], json!(1), "{p}");
+    assert_eq!(p["plan_index_gaps"], json!(0), "the tail leaves no gap: {p}");
     assert!(!item_ids(&p).contains(&edges[8].1));
     assert_eq!(p["digest_echo"], Value::Null);
 }
