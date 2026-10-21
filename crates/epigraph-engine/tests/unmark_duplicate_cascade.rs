@@ -373,3 +373,64 @@ async fn an_unmark_refuses_when_the_mark_is_not_the_one_authorized(pool: PgPool)
         "nothing changed"
     );
 }
+
+/// Two records for one identity edge (a stale replay that re-ran the repair
+/// after the first one had already moved everything, and so recorded nothing):
+/// the un-mark reverses from the FIRST record, which did the work.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_uses_the_first_record_of_its_identity_edge(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let f = frame(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let own = store(
+        &pool,
+        dup,
+        f,
+        Some(author),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    let (status, _) = apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+    let identity_edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    // The stale second repair found nothing left to move.
+    audit::record_dedup_revert(
+        &mut *conn,
+        status.audit_event_id.expect("applied"),
+        dup,
+        &serde_json::json!({"identity_edge": identity_edge}),
+    )
+    .await
+    .expect("second, empty record");
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect("unmark");
+    let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+        .bind(own)
+        .fetch_one(&pool)
+        .await
+        .expect("bba");
+    assert_eq!(
+        on, dup,
+        "the pooled BBA came back: the first record was used"
+    );
+}
