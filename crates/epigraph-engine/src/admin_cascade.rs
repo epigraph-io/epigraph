@@ -596,15 +596,18 @@ macro_rules! repair_with_audit {
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
             details["touched"] = $touched;
-            // The revert record names other writers' rows, so it sits beside
-            // `touched` (which the caller sees as counts), never inside it.
             let record: Option<serde_json::Value> = $record;
-            if let Some(record) = record {
-                details["revert"] = record;
-            }
             let id = audit::record(&mut *$tx, EVENT_APPLIED, $trigger.agent_id, true, &details)
                 .await
                 .map_err(|e| format!("the audit row could not be written: {e}"))?;
+            // The revert record names other writers' rows: its own row, which
+            // the triggering principal cannot read (`audit::record_dedup_revert`),
+            // committed with the applied row it belongs to.
+            if let Some(record) = record {
+                audit::record_dedup_revert(&mut *$tx, id, $trigger.subject_id, &record)
+                    .await
+                    .map_err(|e| format!("the revert record could not be written: {e}"))?;
+            }
             $tx.commit().await.map_err(|e| e.to_string())?;
             Ok(($out, id, details["touched"].clone()))
         }
@@ -762,8 +765,8 @@ pub async fn apply_after_dedup(
             "bbas_moved": r.moved_bbas,
             "duplicate_copies_dropped": r.dropped_duplicate_copies,
             "false_bindings_not_copied": r.skipped_false_bindings,
-            "bbas_pooled": r.pooled_bbas,
-            "bbas_kept_on_duplicate": r.kept_on_duplicate,
+            "bbas_pooled": r.pooled_bbas.len(),
+            "bbas_kept_on_duplicate": r.kept_on_duplicate.len(),
         }),
         record: serde_json::to_value(&r.revert).ok()
     );
@@ -894,16 +897,18 @@ pub async fn apply_unmark(
         .await
         .map_err(|e| failed(e.to_string()))?;
     }
+    // Counts only: this row names the caller (`agent_id`), who may read it,
+    // and the reversal's ids are other writers' rows.
     let touched = serde_json::json!({
-        "edges_resourced_back": reversal.resourced_back.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-        "edges_retargeted_back": reversal.retargeted_back,
-        "edges_unretracted": reversal.unretracted_edges,
-        "bbas_returned": reversal.returned_bbas,
-        "bbas_restored": reversal.restored_bbas,
-        "frames_unbound": reversal.unbound_frames,
+        "edges_resourced_back": reversal.resourced_back.len(),
+        "edges_retargeted_back": reversal.retargeted_back.len(),
+        "edges_unretracted": reversal.unretracted_edges.len(),
+        "bbas_returned": reversal.returned_bbas.len(),
+        "bbas_restored": reversal.restored_bbas.len(),
+        "frames_unbound": reversal.unbound_frames.len(),
         "cached_rows_cleared": reversal.cleared_cached_rows,
-        "drifted": reversal.drifted,
-        "cascades_retired": open,
+        "drifted": reversal.drifted.len(),
+        "cascades_retired": open.len(),
     });
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("applied");

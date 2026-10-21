@@ -400,35 +400,72 @@ pub async fn retire_pending<'e, E: sqlx::PgExecutor<'e>>(
     Ok(id)
 }
 
-/// The revert record of the latest APPLIED dedup cascade for `dup` whose
-/// repair followed the act with identity edge `identity_edge`
-/// (`details.revert`, written by the administrative cascade), with that row's
-/// id. `None` when no applied row carries one: the dedup was repaired before
-/// revert records existed, or not through the administrative cascade.
+/// The event type of a dedup's revert record: the before-state of the rows
+/// its repair changed, kept beside the applied row it belongs to.
+pub const EVENT_DEDUP_REVERT: &str = "cascade.dedup_revert_record";
+
+/// Keep a dedup repair's revert record, in the transaction of its applied row
+/// `applied_event_id`.
 ///
-/// Maintenance connection only: application sessions cannot read other
-/// principals' audit rows.
+/// It names OTHER writers' rows (their BBAs whole, with masses and owner
+/// groups), so it is its own row with `agent_id` NULL: `security_events_read`
+/// lets a principal read the rows naming it, which includes the applied row,
+/// and this one must be readable by privileged and admin sessions only.
+///
+/// Maintenance connection only (117 refuses a `cascade.*` row elsewhere).
 ///
 /// # Errors
-/// `DbError::QueryFailed` on a failed query.
+/// `DbError::QueryFailed` if the INSERT is refused or fails.
+pub async fn record_dedup_revert<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    applied_event_id: Uuid,
+    dup: Uuid,
+    revert: &serde_json::Value,
+) -> Result<Uuid, DbError> {
+    let details = serde_json::json!({
+        "cause": "dedup",
+        "applied_event_id": applied_event_id,
+        "subject_id": dup,
+        "identity_edge": revert.get("identity_edge"),
+        "revert": revert,
+    });
+    record(executor, EVENT_DEDUP_REVERT, None, true, &details).await
+}
+
+/// The revert record kept for the dedup of `dup` whose act wrote identity edge
+/// `identity_edge` ([`record_dedup_revert`]), with the id of the applied row it
+/// belongs to. `None` when there is none: the dedup was repaired before revert
+/// records existed, or not through the administrative cascade.
+///
+/// Maintenance connection only.
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query, or a record without a readable
+/// applied row id.
 pub async fn dedup_revert_record<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     dup: Uuid,
     identity_edge: Uuid,
 ) -> Result<Option<(Uuid, serde_json::Value)>, DbError> {
-    let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, details->'revert' FROM security_events \
-          WHERE event_type = $1 AND details->>'cause' = 'dedup' \
-            AND lower(details->'trigger'->>'subject_id') = $2 \
-            AND lower(details->'revert'->>'identity_edge') = $3 \
+    let row: Option<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT (details->>'applied_event_id')::uuid, details->'revert' FROM security_events \
+          WHERE event_type = $1 AND agent_id IS NULL \
+            AND lower(details->>'subject_id') = $2 \
+            AND lower(details->>'identity_edge') = $3 \
           ORDER BY created_at DESC, id DESC LIMIT 1",
     )
-    .bind(EVENT_APPLIED)
+    .bind(EVENT_DEDUP_REVERT)
     .bind(dup.to_string())
     .bind(identity_edge.to_string())
     .fetch_optional(executor)
     .await?;
-    Ok(row)
+    match row {
+        None => Ok(None),
+        Some((Some(applied), record)) => Ok(Some((applied, record))),
+        Some((None, _)) => Err(DbError::InvalidData {
+            reason: "a dedup revert record names no applied row".to_string(),
+        }),
+    }
 }
 
 /// The OPEN (deferred or failed, not yet answered by an applied or retired
