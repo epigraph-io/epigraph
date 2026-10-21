@@ -526,6 +526,11 @@ pub struct DedupRevert {
     pub identity_edge: Option<Uuid>,
     /// Edges the collision guards retracted (`valid_to` set).
     pub retracted_edges: Vec<Uuid>,
+    /// The `valid_to` the repair stamped on them (its transaction's `now()`).
+    /// An un-mark puts back only an edge still carrying exactly this stamp: a
+    /// different `valid_to` is a later decision, not the repair's.
+    #[serde(default)]
+    pub retracted_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Edges re-pointed from the duplicate onto the canonical as their TARGET.
     pub retargeted_edges: Vec<Uuid>,
     /// Edges re-pointed from the duplicate onto the canonical as their SOURCE.
@@ -11212,6 +11217,16 @@ async fn repair_marked_duplicate(
         .collect();
 
     let deleted_edge_ids_for_revert = deleted_edge_ids.clone();
+    // The collision guards stamped `valid_to = now()`, the transaction's time.
+    let retracted_at: Option<chrono::DateTime<chrono::Utc>> = if deleted_edge_ids.is_empty() {
+        None
+    } else {
+        Some(
+            sqlx::query_scalar("SELECT now()")
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    };
     let retargeted_for_revert = retargeted_ids.clone();
     let resourced_for_revert: Vec<Uuid> = resourced_edges.iter().map(|(id, _, _)| *id).collect();
 
@@ -11239,6 +11254,7 @@ async fn repair_marked_duplicate(
         revert: DedupRevert {
             identity_edge,
             retracted_edges: deleted_edge_ids_for_revert,
+            retracted_at,
             retargeted_edges: retargeted_for_revert,
             resourced_edges: resourced_for_revert,
             moved_bbas: moved_rows,
@@ -11319,15 +11335,26 @@ async fn reverse_marked_duplicate(
     let done = out.retargeted_back.clone();
     note_drift(&record.retargeted_edges, &done, &mut drifted);
 
-    out.unretracted_edges = sqlx::query_scalar(
-        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
-         UPDATE edges SET valid_to = NULL
-          WHERE id = ANY($1) AND valid_to IS NOT NULL
-         RETURNING id"#,
-    )
-    .bind(&record.retracted_edges)
-    .fetch_all(&mut *conn)
-    .await?;
+    // Only an edge still retracted BY THE REPAIR (its exact stamp) and still
+    // touching the duplicate comes back; any other retraction is a later
+    // decision this un-mark has no record of.
+    out.unretracted_edges = match record.retracted_at {
+        Some(at) => {
+            sqlx::query_scalar(
+                r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+                 UPDATE edges SET valid_to = NULL
+                  WHERE id = ANY($1) AND valid_to = $2
+                    AND (source_id = $3 OR target_id = $3)
+                 RETURNING id"#,
+            )
+            .bind(&record.retracted_edges)
+            .bind(at)
+            .bind(dup_uuid)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        None => Vec::new(),
+    };
     let done = out.unretracted_edges.clone();
     note_drift(&record.retracted_edges, &done, &mut drifted);
 
@@ -11384,8 +11411,11 @@ async fn reverse_marked_duplicate(
         note_drift(&moved_ids, &done, &mut drifted);
     }
 
-    // BBAs the repair deleted come back whole (same id, same tenancy). One
-    // whose id or key is taken again is a later write's and is skipped.
+    // BBAs the repair deleted come back whole (same id, same tenancy), but
+    // only beside an edge that is in force again: every one of them is keyed
+    // to an edge, and a BBA on a retracted edge is exactly the orphan the
+    // repair exists to prevent. One whose id or key is taken again is a later
+    // write's and is skipped.
     if !record.deleted_bbas.is_empty() {
         let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
         let asked: Vec<Uuid> = record
@@ -11400,7 +11430,9 @@ async fn reverse_marked_duplicate(
         out.restored_bbas = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              INSERT INTO mass_functions
-             SELECT * FROM jsonb_populate_recordset(NULL::mass_functions, $1)
+             SELECT r.* FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
+              WHERE EXISTS (SELECT 1 FROM edges e
+                             WHERE e.id = r.perspective_id AND e.valid_to IS NULL)
              ON CONFLICT DO NOTHING
              RETURNING id"#,
         )

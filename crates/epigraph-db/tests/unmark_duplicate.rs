@@ -402,6 +402,24 @@ async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: 
     let diamond = fixture::seed_public_claim(&pool, b, "diamond source").await;
     let e_dup = edge(&pool, diamond, dup, "corroborates").await;
     edge(&pool, diamond, canonical, "corroborates").await;
+    let frame = FrameRepository::create(
+        &pool,
+        "binary_truth",
+        None,
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let e_dup_bba = bba(
+        &pool,
+        dup,
+        frame,
+        Some(b),
+        Some(e_dup),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
 
     let mut conn = pool.acquire().await.expect("acquire");
     let repair = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
@@ -432,5 +450,16 @@ async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: 
         .await
         .expect("edge");
     assert!(!in_force, "a later retraction is not the repair's to undo");
-    assert_eq!(reversal.drifted, vec![e_dup]);
+    let restored: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE id = $1")
+        .bind(e_dup_bba)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        restored, 0,
+        "no BBA is restored onto an edge that stays retracted"
+    );
+    let mut expected = vec![e_dup, e_dup_bba];
+    expected.sort_unstable();
+    assert_eq!(reversal.drifted, expected);
 }
