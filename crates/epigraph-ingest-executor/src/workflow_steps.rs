@@ -249,6 +249,10 @@ pub async fn ordered_steps(
 
 // ── plan_index for an added step ────────────────────────────────────────────
 
+/// The largest `plan_index` every plan-order reader honours: their
+/// `^[0-9]{1,9}$` treats a longer one as unindexed.
+const PLAN_INDEX_MAX: u32 = 999_999_999;
+
 /// The live `executes` edges of one workflow this session can see, as read
 /// for [`add_step`]'s placement.
 struct PlanEdges {
@@ -289,7 +293,8 @@ async fn plan_edges(
 ///
 /// Only an APPEND to a plan whose every live `executes` edge is public is
 /// indexed, one past the plan's largest index (atoms and later phases
-/// included, so nothing moves). Then the level-2 `plan_index` order is the
+/// included, so nothing moves), and only while that stays within
+/// [`PLAN_INDEX_MAX`]. Then the level-2 `plan_index` order is the
 /// `step_follows` order [`ordered_steps`] walks.
 ///
 /// * The new edge is public: `add_step` writes a public step claim, and the
@@ -311,7 +316,9 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
     if !append || !plan.all_public {
         return None;
     }
-    plan.max_index.and_then(|max| max.checked_add(1))
+    plan.max_index
+        .and_then(|max| max.checked_add(1))
+        .filter(|k| *k <= PLAN_INDEX_MAX)
 }
 
 // ── add_step ────────────────────────────────────────────────────────────────
@@ -680,5 +687,18 @@ mod tests {
     #[test]
     fn a_plan_with_no_integer_index_gives_no_index() {
         assert_eq!(plan_placement(true, &plan(None, true)), None);
+    }
+
+    /// Every plan-order reader's `^[0-9]{1,9}$` reads a ten-digit index as
+    /// unindexed, so an append that would need one is written unindexed and
+    /// says so, instead of reporting an index no reader honours.
+    #[test]
+    fn an_append_past_nine_digits_gives_no_index() {
+        assert_eq!(
+            plan_placement(true, &plan(Some(999_999_998), true)),
+            Some(999_999_999)
+        );
+        assert_eq!(plan_placement(true, &plan(Some(999_999_999), true)), None);
+        assert_eq!(plan_placement(true, &plan(Some(u32::MAX), true)), None);
     }
 }
