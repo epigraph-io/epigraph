@@ -870,9 +870,14 @@ run on an unprivileged role once policies land reads a subset and exits 0 with
 no warning. The refusal that protects you is at the API and CLI boundary only.
 
 **Deploy surfaces that need the variable** (each currently takes the WARN
-fallback): `decompose_claims` (a bind-mounted host binary, not baked into the
-image), the binaries layered into `epigraph-agent:latest`, `epiclaw.env`, the
-decomposition-cycle schedule, and foreman.
+fallback): the binaries layered into `epigraph-agent:latest`, `epiclaw.env`,
+and foreman. `decompose_claims` (a bind-mounted host binary, not baked into the
+image) needs it only on its maintenance path. A scheduled decomposition-cycle
+run in an agent container should pass `--as-agent <agent id>` (the agent its API
+token acts as); it then runs on the application login in `DATABASE_URL`
+through row-level security and needs no maintenance DSN. This takes effect only
+once the deployed binary has the flag and the schedule's command passes it. See
+the binary's module doc, "Running as an agent".
 
 **Known prerequisite, NOT shipped by PR-15.** `epigraph_maintenance` is NOLOGIN
 and `epigraph_admin` is not a member of it, so today no non-superuser role both

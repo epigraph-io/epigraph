@@ -2768,6 +2768,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "session_writer_group",
+        "Reads NO table row of its own: `SELECT public.epigraph_writer_group()` (migration \
+         114), which returns the SESSION's own writer group (its operator's or its own \
+         personal group, and only if it is in the session's writable set) from the session's \
+         principal stamp. It answers a question about the caller's identity, not about any \
+         row a viewer predicate could filter.",
+    ),
+    (
+        "edge.rs",
         "is_in_force",
         "READ of one `edges` row by primary key, returning only whether it is in force. Its \
          callers are the DS edge-factor wiring deciding whether to fire on an edge the SAME \
