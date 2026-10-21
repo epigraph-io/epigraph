@@ -428,6 +428,10 @@ async fn a_non_member_gets_404_and_nothing_of_the_plan(pool: PgPool) {
         .plan_status(&token(w.stranger, READ_SCOPES), w.workflow_id)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // A typed answer, not a missing route (which 404s with an empty body): a
+    // caller can tell "this plan is hidden from you" from "no such route".
+    assert_eq!(body["error"], json!("NotFound"), "{body}");
+    assert_eq!(body["details"]["entity"], json!("workflow plan"), "{body}");
     let text = body.to_string();
     for item in vector_plan() {
         assert!(
