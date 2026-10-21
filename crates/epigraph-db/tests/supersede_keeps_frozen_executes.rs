@@ -484,3 +484,61 @@ async fn public_step_dedup_and_consolidate_still_move_executes(pool: PgPool) {
         assert_eq!(after[i], before[i], "untouched item {i}");
     }
 }
+
+/// The request path's shape for a PUBLIC plan: each act on the caller's
+/// transaction, each edge half on the maintenance role. Fail-closed makes an
+/// unreadable row count as non-public, so this is what proves the maintenance
+/// connection reads a public claim's `visibility` in all three migrations
+/// (an unreadable row would freeze, and these edges would not move).
+#[sqlx::test(migrations = "../../migrations")]
+async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
+    let p = seed_plan(&pool, false).await;
+    let before = plan(&pool, p.workflow).await;
+    let canonical = fixture::seed_public_claim(&pool, p.agent, "step 0, stated elsewhere").await;
+    let outside = fixture::seed_public_claim(&pool, p.agent, "a note outside the plan").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(p.steps[0]),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup act");
+    let (new_id, _) = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(p.steps[1]),
+        "step 1: do the thing, restated",
+        TruthValue::clamped(0.6),
+        "restated",
+    )
+    .await
+    .expect("supersede act");
+    let merged = ClaimRepository::consolidate_act_conn(
+        &mut tx,
+        &[p.steps[2], outside],
+        "step 2 and a note, merged",
+        0.6,
+        ConsolidateMode::Merge,
+        "merge",
+        p.agent,
+    )
+    .await
+    .expect("merge act")
+    .merged_id;
+    tx.commit().await.unwrap();
+    replay_dedup(&pool, p.steps[0], canonical).await;
+    replay_supersede(&pool, p.steps[1], new_id).await;
+    replay_consolidate(&pool, merged, vec![p.steps[2], outside]).await;
+
+    let after = plan(&pool, p.workflow).await;
+    assert_eq!(after.len(), 4);
+    for (i, want) in [(0, canonical), (1, new_id), (2, merged)] {
+        assert_eq!(
+            (after[i].1, after[i].2),
+            (before[i].1, want),
+            "a public step's executes follows its replacement on the replay (item {i})"
+        );
+    }
+    assert_eq!(after[3], before[3], "untouched item 3");
+}
