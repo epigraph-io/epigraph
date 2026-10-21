@@ -550,3 +550,181 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
         "the chain is not undone.\nmissing: {lost:#?}\nextra: {gained:#?}"
     );
 }
+
+async fn bba_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String, Uuid, bool) {
+    sqlx::query_as(
+        "SELECT claim_id, visibility::text, owner_group_id, writer_owned \
+           FROM mass_functions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("bba")
+}
+
+async fn mark(pool: &PgPool, dup: Uuid, canonical: Uuid) -> epigraph_db::DedupRepair {
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
+    )
+    .await
+    .expect("mark")
+}
+
+async fn unmark(
+    pool: &PgPool,
+    dup: Uuid,
+    record: &epigraph_db::DedupRevert,
+) -> epigraph_db::DedupReversal {
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::unmark_duplicate_with_reversal_conn(&mut conn, ClaimId::from_uuid(dup), record)
+        .await
+        .expect("unmark")
+        .1
+}
+
+/// A BBA returns to the duplicate with the tenancy the record kept only while
+/// that is still the duplicate's audience: a duplicate that went private after
+/// the mark gets its returned row as the claim's own (group, its group, not
+/// writer-owned), never a public row on a private claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_returned_bba_takes_the_duplicates_audience_if_it_narrowed(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let dup = public_claim_owned_by(&pool, w, g, "duplicate").await;
+    let frame = FrameRepository::create(
+        &pool,
+        "binary_truth",
+        None,
+        &["TRUE".into(), "FALSE".into()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let row = bba(
+        &pool,
+        dup,
+        frame,
+        Some(w),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(repair.pooled_bbas, vec![row], "calibration: pooled");
+    assert_eq!(
+        bba_tenancy(&pool, row).await,
+        (canonical, "public".into(), g, true)
+    );
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(dup)
+        .execute(&pool)
+        .await
+        .expect("the duplicate goes private");
+    let reversal = unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(reversal.returned_bbas, vec![row]);
+    assert_eq!(
+        bba_tenancy(&pool, row).await,
+        (dup, "group".into(), g, false),
+        "the returned row is the private claim's own"
+    );
+}
+
+/// An edge re-pointed onto a group-private canonical is re-stamped private by
+/// the edge tenancy trigger; re-pointed back, the trigger's no-widening arm
+/// would keep it private. The un-mark gives it back the tenancy it had.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repointed_edge_gets_its_tenancy_back(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "other").await;
+    let dup = public_claim_owned_by(&pool, w, g, "public duplicate").await;
+    let canonical = fixture::seed_group_claim(&pool, w, g, "private canonical").await;
+    let supporter = fixture::seed_public_claim(&pool, x, "public supporter").await;
+    let e = edge(&pool, supporter, dup, "supports").await;
+    let tenancy = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, Uuid, Option<Uuid>)>(
+            "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+        )
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge")
+    };
+    let before = tenancy(pool.clone()).await;
+    assert_eq!(before.0, "public", "calibration: a public edge");
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(repair.retargeted_edges, vec![e]);
+    assert_eq!(
+        tenancy(pool.clone()).await.0,
+        "group",
+        "calibration: re-stamped private"
+    );
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        tenancy(pool.clone()).await,
+        before,
+        "the edge's own tenancy is back"
+    );
+}
+
+/// A BBA the repair deleted cites an evidence row that is deleted after the
+/// mark. The un-mark cannot restore it (its foreign key is gone): it reports
+/// the row drifted and restores everything else, rather than failing forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_restore_whose_evidence_is_gone_drifts_instead_of_failing(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "other").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let diamond = fixture::seed_public_claim(&pool, b, "diamond").await;
+    let e_dup = edge(&pool, diamond, dup, "corroborates").await;
+    edge(&pool, diamond, canonical, "corroborates").await;
+    let frame = FrameRepository::create(
+        &pool,
+        "binary_truth",
+        None,
+        &["TRUE".into(), "FALSE".into()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let ev = fixture::seed_evidence(&pool, dup, "observation").await;
+    let cited = MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        frame,
+        Some(b),
+        Some(e_dup),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        Some(ev),
+    )
+    .await
+    .expect("bba citing evidence");
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        repair.revert.deleted_bbas.len(),
+        1,
+        "calibration: deleted with its edge"
+    );
+    sqlx::query("DELETE FROM evidence WHERE id = $1")
+        .bind(ev)
+        .execute(&pool)
+        .await
+        .expect("the evidence row goes");
+    let reversal = unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(reversal.drifted, vec![cited], "reported, not fatal");
+    assert_eq!(
+        reversal.unretracted_edges,
+        vec![e_dup],
+        "the rest is restored"
+    );
+}
