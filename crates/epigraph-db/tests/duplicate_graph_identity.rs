@@ -598,3 +598,34 @@ async fn a_dedup_pools_nothing_onto_a_compound_canonical(pool: PgPool) {
     assert!(repair.pooled_bbas.is_empty());
     assert_eq!(repair.kept_on_duplicate, vec![row]);
 }
+
+/// B3, the derived-row rule. A cached combination row (no agent, no
+/// perspective, a combination label) is the duplicate's OWN fold of its inputs.
+/// Pooled as an input it would count that evidence a second time, so it stays
+/// on the duplicate even when the canonical's slot for it is free.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_never_pools_the_duplicates_cached_combination(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let frame = seed_frame(&pool).await;
+    let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let input = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(a),
+        None,
+        m.clone(),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let cache = store_bba(&pool, dup, frame, None, None, m, "Dempster", None).await;
+
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+
+    assert_eq!(bba_claim(&pool, input).await, canonical, "the input pools");
+    assert_eq!(bba_claim(&pool, cache).await, dup, "the cached fold stays");
+    assert_eq!(repair.kept_on_duplicate, vec![cache]);
+}
