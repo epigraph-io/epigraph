@@ -212,7 +212,7 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
     }
 
     let ut = trigger(CascadeCause::Undedup, author, dup, None);
-    let (outcome, report) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup)
+    let (outcome, report) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
         .await
         .expect("unmark");
     assert_eq!(outcome.canonical_id, canonical);
@@ -286,7 +286,7 @@ async fn an_unmark_of_a_deferred_mark_retires_its_pending_cascade(pool: PgPool) 
     );
 
     let ut = trigger(CascadeCause::Undedup, author, dup, None);
-    apply_unmark(&mut conn, &viewer, &viewer, &ut, dup)
+    apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
         .await
         .expect("unmark of a deferred mark");
     assert_eq!(current(&pool, dup).await, (None, true));
@@ -317,7 +317,7 @@ async fn an_unmark_without_a_record_is_refused_and_changes_nothing(pool: PgPool)
     .await
     .expect("repository mark, no audit row");
     let ut = trigger(CascadeCause::Undedup, author, dup, None);
-    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup)
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
         .await
         .expect_err("no record");
     assert_eq!(err, UnmarkRefusal::NoRecord);
@@ -334,4 +334,42 @@ async fn an_unmark_without_a_record_is_refused_and_changes_nothing(pool: PgPool)
     .await
     .expect("identity edge");
     assert!(edge_in_force, "the identity edge is untouched");
+}
+
+/// The caller's authority was checked against the canonical it read. If the
+/// duplicate has since been re-marked onto ANOTHER canonical, the un-mark must
+/// refuse rather than reverse a mark the caller was never checked against.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_refuses_when_the_mark_is_not_the_one_authorized(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let checked = new_claim(
+        &pool,
+        author,
+        "the canonical the caller was checked against",
+    )
+    .await;
+    let other = new_claim(&pool, author, "the canonical it is marked onto now").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(other),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(other));
+    apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, other).await;
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(checked));
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, checked)
+        .await
+        .expect_err("a different mark");
+    assert!(matches!(err, UnmarkRefusal::Act(_)), "{err:?}");
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(other), false),
+        "nothing changed"
+    );
 }
