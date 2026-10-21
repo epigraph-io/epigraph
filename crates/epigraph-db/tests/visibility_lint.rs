@@ -1926,8 +1926,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim.rs",
         "migrate_superseded_edges",
         "WRITE. The two edge-migration statements, unchecked; called only after the caller \
-         established the privilege and the supersession. Its one read classifies the pair \
-         (a shared step lineage) for the statements that follow.",
+         established the privilege and the supersession. Its reads classify the pair (a shared \
+         step lineage; a non-public old claim, OD-32) for the statements that follow.",
+    ),
+    (
+        "claim.rs",
+        "non_public_frozen_relationships",
+        "WRITE-path probe, privileged only through its callers (`migrate_superseded_edges`, \
+         `repair_marked_duplicate`). Reads the retired claim's own `visibility` to decide which \
+         relationships its edge migration leaves on it (OD-32); returns a relationship list, \
+         never row content, and is no disclosure to a caller.",
     ),
     (
         "claim.rs",
