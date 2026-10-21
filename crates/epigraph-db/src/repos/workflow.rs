@@ -142,6 +142,13 @@ pub struct IngestAnchors {
     pub linked_parent: Option<Uuid>,
 }
 
+/// An `executes` edge's `plan_index` as a `bigint`, or NULL unless it is a
+/// JSON integer of at most nine digits. A `CASE`, not a `WHERE` guard plus a
+/// cast: PostgreSQL does not promise to evaluate a guard before the cast.
+const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') = 'number' \
+                                    AND properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                               THEN (properties->>'plan_index')::bigint END)";
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -264,6 +271,51 @@ impl WorkflowRepository {
         .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
+    }
+
+    /// Lock one `workflows` row (`FOR UPDATE`) for the rest of the caller's
+    /// transaction. `Ok(false)` when no row has this id.
+    ///
+    /// `add_step` takes it before it reads the plan it is about to extend, so
+    /// two concurrent `add_step`s on one workflow cannot both compute the same
+    /// next `plan_index`. `workflows` has no row security, so this needs no
+    /// viewer.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lock_for_plan_edit<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_optional(executor)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// Every `executes` edge of `workflow_id` this session can see, retracted
+    /// ones included, as `(edge id, target claim, plan_index)`. The index is `None`
+    /// unless the edge's `plan_index` is a JSON integer of at most nine digits
+    /// (the bound every plan-order reader's `^[0-9]{1,9}$` uses), so a string
+    /// `"3"` or a fraction is unindexed here as it is in the frozen plan read.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn executes_plan_indices<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid, Option<i64>)>, sqlx::Error> {
+        let sql = format!(
+            "SELECT id, target_id, {PLAN_INDEX_INT} FROM edges \
+              WHERE source_id = $1 AND source_type = 'workflow' \
+                AND relationship = 'executes'"
+        );
+        sqlx::query_as(&sql)
+            .bind(workflow_id)
+            .fetch_all(executor)
+            .await
     }
 
     /// The existing rows an ingest of `(canonical_name, generation)` with
