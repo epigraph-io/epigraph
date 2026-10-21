@@ -179,7 +179,11 @@ async fn seed_plan(pool: &PgPool, private: bool) -> Plan {
     }
     let want = if private { "group" } else { "public" };
     for step in steps {
-        assert_eq!(visibility(pool, step).await, want, "fixture tenancy of {step}");
+        assert_eq!(
+            visibility(pool, step).await,
+            want,
+            "fixture tenancy of {step}"
+        );
     }
     Plan {
         agent,
@@ -426,7 +430,10 @@ async fn public_step_supersede_still_moves_executes(pool: PgPool) {
     let after = plan(&pool, p.workflow).await;
     assert_eq!(after.len(), 4);
     assert_eq!(after[1].1, before[1].1, "the same executes edge");
-    assert_eq!(after[1].2, new_id, "a public step's executes follows the replacement");
+    assert_eq!(
+        after[1].2, new_id,
+        "a public step's executes follows the replacement"
+    );
     for i in [0, 2, 3] {
         assert_eq!(after[i], before[i], "untouched item {i}");
     }
