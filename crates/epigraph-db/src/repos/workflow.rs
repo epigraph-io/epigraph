@@ -295,12 +295,13 @@ impl WorkflowRepository {
         Ok(row.is_some())
     }
 
-    /// Every `executes` edge of `workflow_id` this session can see, retracted
-    /// ones included, as `(target claim, plan_index, is public)`. The index is
-    /// `None` unless the edge's `plan_index` is a JSON integer of at most nine
-    /// digits (the bound every plan-order reader's `^[0-9]{1,9}$` uses), so a
-    /// string `"3"` or a fraction is unindexed here as it is in the frozen plan
-    /// read.
+    /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
+    /// session can see, as `(target claim, plan_index, is public)`. The index
+    /// is `None` unless the edge's `plan_index` is a JSON integer of at most
+    /// nine digits (the bound every plan-order reader's `^[0-9]{1,9}$` uses),
+    /// so a string `"3"` or a fraction is unindexed here as it is in the frozen
+    /// plan read. A retracted edge is not a plan item for any reader, so it
+    /// takes no part in where a new item goes.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -311,7 +312,7 @@ impl WorkflowRepository {
         let sql = format!(
             "SELECT target_id, {PLAN_INDEX_INT}, COALESCE(visibility::text = 'public', false) FROM edges \
               WHERE source_id = $1 AND source_type = 'workflow' \
-                AND relationship = 'executes'"
+                AND relationship = 'executes' AND valid_to IS NULL"
         );
         sqlx::query_as(&sql)
             .bind(workflow_id)

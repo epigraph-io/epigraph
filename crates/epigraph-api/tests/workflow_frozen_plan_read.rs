@@ -790,6 +790,40 @@ async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(p
     );
 }
 
+/// A retracted `executes` edge is not a plan item for any reader, so it takes
+/// no part in where an appended step goes: retracting the last item and then
+/// appending gives the new step the retracted item's index, and the items
+/// read with no gap and no duplicate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_append_after_a_retracted_last_item_leaves_no_gap(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let edges = executes_edges(&pool, wf).await;
+    let (last_edge, last_target, last_index) = *edges.last().expect("edges");
+    assert_eq!(last_index, 8, "calibration: the vectors' last item");
+    // World-owned: only a privileged session retracts it (harness write).
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(last_edge)
+        .execute(&pool)
+        .await
+        .expect("harness: retract the last executes edge");
+
+    let body = add_step(&api, &t, "ACME-123456 appended step", None).await;
+    let added = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body["plan_index"], json!(8), "{body}");
+    let p = api.plan(&t, wf).await;
+    assert_eq!(p["retracted_edges"], json!(1), "{p}");
+    assert_eq!(p["plan_index_gaps"], json!(0), "{p}");
+    assert_eq!(p["duplicate_plan_indices"], json!(0), "{p}");
+    assert_eq!(p["unindexed_edges"], json!(0), "{p}");
+    let ids = item_ids(&p);
+    assert_eq!(ids.len(), 9, "{p}");
+    assert_eq!(ids[8], added);
+    assert!(!ids.contains(&last_target));
+}
+
 /// A middle insert into a public plan cannot renumber it: the `executes`
 /// edges past the insertion point are world-owned and no application session
 /// may update them. The chain is rewired as before, no existing index moves,

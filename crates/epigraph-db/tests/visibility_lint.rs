@@ -2984,7 +2984,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "executes_plan_indices",
-        "READ of `edges`: the target, `plan_index` and publicness of each `executes` edge \
+        "READ of `edges`: the target, `plan_index` and publicness of each live `executes` edge \
          of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \
          existing edge is written. It runs on the ingest system agent's stamped transaction, \
          so it is bounded to what that stamp may read, and an index is written only when every \

@@ -249,8 +249,8 @@ pub async fn ordered_steps(
 
 // ── plan_index for an added step ────────────────────────────────────────────
 
-/// The `executes` edges of one workflow this session can see, as read for
-/// [`add_step`]'s placement.
+/// The live `executes` edges of one workflow this session can see, as read
+/// for [`add_step`]'s placement.
 struct PlanEdges {
     /// Each target's integer `plan_index` (`None` for an edge without one).
     /// When a target has more than one edge, an indexed one wins.
@@ -287,10 +287,10 @@ async fn plan_edges(
 /// The `plan_index` an added step's `executes` edge gets, or `None` to write
 /// it unindexed.
 ///
-/// Only an APPEND to a plan whose every `executes` edge is public is indexed,
-/// one past the plan's largest index (atoms and later phases included, so
-/// nothing moves). Then the level-2 `plan_index` order is the `step_follows`
-/// order [`ordered_steps`] walks.
+/// Only an APPEND to a plan whose every live `executes` edge is public is
+/// indexed, one past the plan's largest index (atoms and later phases
+/// included, so nothing moves). Then the level-2 `plan_index` order is the
+/// `step_follows` order [`ordered_steps`] walks.
 ///
 /// * The new edge is public: `add_step` writes a public step claim, and the
 ///   edge between it and the workflow is public and world-owned (migration
@@ -321,7 +321,7 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 ///
 /// # plan_index
 ///
-/// An append to a plan whose every `executes` edge is public writes the
+/// An append to a plan whose every live `executes` edge is public writes the
 /// new edge as `{"level": 2, "plan_index": max + 1}`, and nothing else moves.
 /// Every other add (an insert, an append to a plan with a non-public
 /// `executes` edge or with no integer `plan_index`) writes the edge WITHOUT
