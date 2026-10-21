@@ -639,8 +639,9 @@ async fn migrate_superseded_edges(
 
     // Is this a step-lineage supersession? Both rows must carry the SAME
     // lineage: a plain supersede of a step writes a successor with no
-    // `step_lineage_id` (supersede_act_conn's INSERT omits it), so it keeps
-    // moving `executes` like every other supersession.
+    // `step_lineage_id` (supersede_act_conn's INSERT omits it), so the lineage
+    // rule does not apply to it; its `executes` still moves unless the old
+    // claim is non-public (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, below).
     let step_lineage: bool = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the supersession the mutation below carries out.
         SELECT EXISTS (
@@ -10179,7 +10180,10 @@ async fn repair_marked_duplicate(
     // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
     // frozen workflow generation, so neither the collision guards nor the
     // migration below touch them. Read from the duplicate's row, so the
-    // deferred replay gives the same result.
+    // deferred replay gives the same result. Every shipped `executes` writer
+    // is workflow-sourced, so only the incoming retarget below meets one
+    // today; the outgoing clauses and the claim-sourced incoming collision
+    // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
 
     // Drop incoming dup-edges whose migrated triple already exists on canonical.
