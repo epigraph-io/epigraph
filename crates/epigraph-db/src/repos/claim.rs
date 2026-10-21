@@ -7558,8 +7558,8 @@ impl ClaimRepository {
     /// non-zero index (FALSE) does not hand that binding to a canonical the
     /// caller cannot write and that has none (FA07, review finding W2). The
     /// repair also skips such a copy; refusing here keeps the act and the
-    /// repair from diverging when the caller can see the edge that would move
-    /// it.
+    /// repair from diverging when the caller can see the edge or the BBA (the
+    /// repair pools the duplicate's own BBAs too) that would carry it.
     ///
     /// And it keeps 114's attach rule for the canonical (FA04: a non-owner may
     /// attach only to a PUBLIC claim). The repair moves the duplicate's
@@ -7641,11 +7641,13 @@ impl ClaimRepository {
                       AND cf.hypothesis_index IS DISTINCT FROM 0
                       AND NOT EXISTS (SELECT 1 FROM claim_frames c2
                                        WHERE c2.claim_id = $2 AND c2.frame_id = cf.frame_id))
-               AND EXISTS (
+               AND (EXISTS (
                    SELECT 1 FROM edges e
                     WHERE e.target_id = $1 AND e.target_type = 'claim'
                       AND e.relationship != 'supersedes' AND e.valid_to IS NULL
-                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))"#,
+                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))
+                 -- The repair's pooling (part 3) copies the frame bindings too.
+                 OR EXISTS (SELECT 1 FROM mass_functions m WHERE m.claim_id = $1))"#,
         )
         .bind(dup_uuid)
         .bind(canon_uuid)
