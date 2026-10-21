@@ -702,6 +702,12 @@ async fn an_appended_step_is_indexed_after_the_last_item(pool: PgPool) {
         by_index, chain,
         "plan_index order equals step_follows order"
     );
+
+    // An idempotent re-add reports the index the step already has.
+    let again = add_step(&api, &t, "ACME-123456 appended step", None).await;
+    assert_eq!(again["already_present"], json!(true), "{again}");
+    assert_eq!(uuid_of(&again["step_claim_id"]), added);
+    assert_eq!(again["plan_index"], json!(9), "{again}");
 }
 
 /// The tenancy and properties of `target`'s `executes` edge from

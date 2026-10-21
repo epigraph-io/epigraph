@@ -386,6 +386,63 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
     );
 }
 
+/// An append to a plan whose `executes` edges carry no integer `plan_index`
+/// (written before the ordinal existed) has no numbering to extend: the new
+/// edge is written unindexed and the tool answers a null `plan_index`, rather
+/// than starting a numbering of its own that would put the step FIRST in plan
+/// order, ahead of every unindexed item.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_append_to_a_plan_without_plan_index_is_left_unindexed(pool: PgPool) {
+    let wf = legacy_workflow(&pool).await;
+    let stripped = sqlx::query(
+        "UPDATE edges SET properties = properties - 'plan_index' \
+          WHERE source_type = 'workflow' AND relationship = 'executes' \
+            AND source_id = (SELECT id FROM workflows WHERE canonical_name = $1)",
+    )
+    .bind(&wf.name)
+    .execute(&pool)
+    .await
+    .expect("harness: strip the ordinals")
+    .rows_affected();
+    assert_eq!(stripped, 4, "fixture shape: the phase and three steps");
+    let server = app_role_server(&pool).await;
+
+    let added = first_text(
+        &epigraph_mcp::tools::step_ops::add_step(
+            &server,
+            &stdio_viewer(&server).await,
+            AddStepParams {
+                canonical_name: wf.name.clone(),
+                step_text: "appended to an unindexed plan".to_string(),
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect("add_step"),
+    );
+    assert_eq!(
+        added.get("plan_index"),
+        Some(&serde_json::Value::Null),
+        "{added}"
+    );
+    let a = parse_uuid_field(&added, "step_claim_id");
+    let properties: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_type = 'workflow' \
+            AND relationship = 'executes' AND target_id = $1",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("the new executes edge");
+    assert_eq!(properties, serde_json::json!({"level": 2}));
+    assert_eq!(
+        successors(&pool, wf.steps[2].0).await,
+        vec![a],
+        "calibration: the append landed at the end of the chain"
+    );
+}
+
 /// `delete_step` on a step claim the stamped session may not write is
 /// REFUSED; it used to report `truth_value: 0.05` while the claim kept its
 /// value.
