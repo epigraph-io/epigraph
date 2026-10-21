@@ -816,7 +816,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
     )]
     pub step_index: usize,
 
@@ -934,7 +934,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 

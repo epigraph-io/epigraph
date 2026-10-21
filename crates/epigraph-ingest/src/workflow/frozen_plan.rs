@@ -201,7 +201,8 @@ pub struct FrozenPlan {
     /// end of the plan, only as a mismatch with the pinned digest.
     pub hidden_count: u64,
     /// Live, readable edges whose `plan_index` or `level` is not a JSON integer
-    /// `>= 0` fitting `u32` (an `add_step` edge, or a rewritten one).
+    /// `>= 0` fitting `u32` (an `add_step` insert that could not renumber the
+    /// plan, or a rewritten edge).
     pub unindexed_edges: u64,
     /// Indices missing from `0..=max(plan_index)` over the items.
     pub plan_index_gaps: u64,
