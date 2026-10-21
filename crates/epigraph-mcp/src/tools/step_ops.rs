@@ -16,13 +16,12 @@ pub struct AddStepParams {
     /// Step text to append/insert.
     pub step_text: String,
     /// 0-indexed insertion slot in the `step_follows` chain. `None` (or
-    /// out-of-range) appends. An append is always placed last in plan order
-    /// (`plan_index` one past the plan's largest). An insert takes the
-    /// `plan_index` of the step it now precedes and moves every later
-    /// `executes` edge up by one, only when this session may update every one
-    /// of them; otherwise (a public plan, or an insert before a step added
-    /// earlier) it is left unindexed (`plan_index: null` in the response) and
-    /// plan order lists it after every indexed step.
+    /// out-of-range) appends. An append to a plan whose every `executes` edge
+    /// the workflow-ingest stamp can read is public is indexed one past the
+    /// largest `plan_index` it can read. Every other add (an insert, or an
+    /// append to a plan with a non-public `executes` edge or with no integer
+    /// `plan_index`) is left unindexed (`plan_index: null` in the response),
+    /// and plan order lists it after every indexed step.
     #[serde(default)]
     pub position: Option<u32>,
 }
@@ -32,8 +31,7 @@ pub struct AddStepResponse {
     pub workflow_id: Uuid,
     pub step_claim_id: Uuid,
     pub step_index: u32,
-    /// The step's `plan_index`, or `null` when the plan could not be
-    /// renumbered under this session and the step was left unindexed.
+    /// The step's `plan_index`, or `null` when the step was left unindexed.
     pub plan_index: Option<u32>,
     pub step_lineage_id: Uuid,
     pub already_present: bool,

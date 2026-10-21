@@ -296,19 +296,20 @@ impl WorkflowRepository {
     }
 
     /// Every `executes` edge of `workflow_id` this session can see, retracted
-    /// ones included, as `(edge id, target claim, plan_index)`. The index is `None`
-    /// unless the edge's `plan_index` is a JSON integer of at most nine digits
-    /// (the bound every plan-order reader's `^[0-9]{1,9}$` uses), so a string
-    /// `"3"` or a fraction is unindexed here as it is in the frozen plan read.
+    /// ones included, as `(target claim, plan_index, is public)`. The index is
+    /// `None` unless the edge's `plan_index` is a JSON integer of at most nine
+    /// digits (the bound every plan-order reader's `^[0-9]{1,9}$` uses), so a
+    /// string `"3"` or a fraction is unindexed here as it is in the frozen plan
+    /// read.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
     pub async fn executes_plan_indices<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         workflow_id: Uuid,
-    ) -> Result<Vec<(Uuid, Uuid, Option<i64>)>, sqlx::Error> {
+    ) -> Result<Vec<(Uuid, Option<i64>, bool)>, sqlx::Error> {
         let sql = format!(
-            "SELECT id, target_id, {PLAN_INDEX_INT} FROM edges \
+            "SELECT target_id, {PLAN_INDEX_INT}, COALESCE(visibility::text = 'public', false) FROM edges \
               WHERE source_id = $1 AND source_type = 'workflow' \
                 AND relationship = 'executes'"
         );

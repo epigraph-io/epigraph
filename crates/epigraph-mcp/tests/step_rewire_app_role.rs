@@ -254,11 +254,12 @@ async fn a_mid_chain_add_step_never_forks_the_chain(pool: PgPool) {
 /// mid-chain insert into a chain the system agent wrote itself (the ordinary
 /// shape: `add_step` twice) rewires cleanly.
 ///
-/// `plan_index` on the stdio tool: each append is indexed one past the plan's
-/// last edge (the phase and steps hold 0..=3). The mid-chain insert would have
-/// to move `b`'s world-owned `executes` edge up by one, which no application
-/// session may update, so the new edge is left unindexed and the tool answers
-/// a null `plan_index` instead of colliding with `b`'s index.
+/// `plan_index` on the stdio tool: each append to this all-public plan is
+/// indexed one past the plan's last edge (the phase and steps hold 0..=3).
+/// An insert is never indexed: it would have to move `b`'s world-owned
+/// `executes` edge up by one, which no application session may update, so the
+/// new edge is left unindexed and the tool answers a null `plan_index` instead
+/// of colliding with `b`'s index.
 #[sqlx::test(migrations = "../../migrations")]
 async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPool) {
     let wf = legacy_workflow(&pool).await;

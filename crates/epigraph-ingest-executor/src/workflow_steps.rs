@@ -42,10 +42,10 @@ pub struct AddStepResult {
     pub step_claim_id: Uuid,
     pub step_index: u32,
     /// The `plan_index` on the step's `executes` edge, or `None` when it has
-    /// none. A new step is indexed where the chain puts it (see
-    /// [`add_step`]'s "plan_index" section); `None` means the plan could not
-    /// be renumbered under this session, so the edge was written unindexed
-    /// and the frozen plan read reports the plan as mutated in place.
+    /// none. Only an append to an all-public plan is indexed (see
+    /// [`add_step`]'s "plan_index" section); `None` means the edge was written
+    /// unindexed, and the frozen plan read reports the plan as mutated in
+    /// place.
     pub plan_index: Option<u32>,
     pub step_lineage_id: Uuid,
     /// `true` if the step already existed under this workflow (idempotent
@@ -137,7 +137,7 @@ pub async fn find_workflow_head(
 ///
 /// The `plan_index` ordinal `execute_workflow_ingest_plan` records on each edge,
 /// then `(c.created_at, c.id)` for edges that carry none (written before the
-/// ordinal existed, or by an [`add_step`] that could not renumber the plan). `c.created_at` cannot lead: the
+/// ordinal existed, or by an [`add_step`] it did not index). `c.created_at` cannot lead: the
 /// executor writes a whole plan in ONE transaction, so every claim and every
 /// edge of it shares one `NOW()`, and the order would fall through to `c.id` — a
 /// content-derived UUID. See the comment on the `executes` loop in
@@ -249,139 +249,69 @@ pub async fn ordered_steps(
 
 // ── plan_index for an added step ────────────────────────────────────────────
 
-/// Where an added step's `executes` edge goes in plan order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Placement {
-    /// At this index, which no edge holds yet: an append.
-    At(u32),
-    /// At this index, after every edge at or past it moves up by one: the
-    /// index of the step the new one now precedes.
-    Before(u32),
-    /// No index can be derived (the step it precedes, or every edge of the
-    /// plan, carries none): written unindexed.
-    Unindexed,
-}
-
 /// The `executes` edges of one workflow this session can see, as read for
 /// [`add_step`]'s placement.
 struct PlanEdges {
     /// Each target's integer `plan_index` (`None` for an edge without one).
     /// When a target has more than one edge, an indexed one wins.
     by_target: HashMap<Uuid, Option<u32>>,
-    /// Every indexed edge, as `(edge id, plan_index)`.
-    indexed: Vec<(Uuid, u32)>,
+    /// The largest integer `plan_index` among them.
+    max_index: Option<u32>,
+    /// Whether every one of them is public.
+    all_public: bool,
 }
 
 async fn plan_edges(
     conn: &mut sqlx::PgConnection,
     workflow_id: Uuid,
 ) -> Result<PlanEdges, StepOpError> {
-    let mut by_target: HashMap<Uuid, Option<u32>> = HashMap::new();
-    let mut indexed = Vec::new();
-    for (edge, target, index) in
+    let mut plan = PlanEdges {
+        by_target: HashMap::new(),
+        max_index: None,
+        all_public: true,
+    };
+    for (target, index, public) in
         epigraph_db::WorkflowRepository::executes_plan_indices(&mut *conn, workflow_id).await?
     {
         let index = index.and_then(|i| u32::try_from(i).ok());
-        if let Some(i) = index {
-            indexed.push((edge, i));
-        }
-        let slot = by_target.entry(target).or_insert(None);
+        plan.max_index = plan.max_index.max(index);
+        plan.all_public &= public;
+        let slot = plan.by_target.entry(target).or_insert(None);
         if slot.is_none() {
             *slot = index;
         }
     }
-    Ok(PlanEdges { by_target, indexed })
+    Ok(plan)
 }
 
-/// The new step goes immediately before `chain[position]` in plan order, so
-/// it takes that step's index; an append goes one past the plan's largest
-/// index (atoms and later phases included, so nothing moves). Either way the
-/// level-2 `plan_index` order stays the `step_follows` order `ordered_steps`
-/// walks, which is what the plan-order readers (`find_workflow*`, the outcome
-/// reports, the frozen plan read) and the chain must agree on.
-fn plan_placement(chain: &[Uuid], position: usize, plan: &PlanEdges) -> Placement {
-    if let Some(next) = chain.get(position) {
-        return match plan.by_target.get(next).copied().flatten() {
-            Some(k) => Placement::Before(k),
-            None => Placement::Unindexed,
-        };
-    }
-    match plan.indexed.iter().map(|(_, i)| *i).max() {
-        Some(max) => max
-            .checked_add(1)
-            .map_or(Placement::Unindexed, Placement::At),
-        None => Placement::Unindexed,
-    }
-}
-
-/// Make room at `k` by moving every indexed `executes` edge at or past `k` up
-/// by one, all or nothing, inside a SAVEPOINT. `Some(k)` when every one of them
-/// moved; `None` (and nothing moved) when this session may not update one.
+/// The `plan_index` an added step's `executes` edge gets, or `None` to write
+/// it unindexed.
 ///
-/// Each move goes through [`epigraph_db::EdgeRepository::update_valid_to_and_properties`],
-/// the gated edge write `patch_edge` uses, which reports an edge the session
-/// can read but row security will not let it update as `WriteRefused` (and a
-/// `WITH CHECK` refusal surfaces as 42501).
+/// Only an APPEND to a plan whose every `executes` edge is public is indexed,
+/// one past the plan's largest index (atoms and later phases included, so
+/// nothing moves). Then the level-2 `plan_index` order is the `step_follows`
+/// order [`ordered_steps`] walks.
 ///
-/// That refusal is the expected case on the production shape, not an error: a
-/// public plan's `executes` edges are world-owned (migration 120) and
-/// migration 117's RESTRICTIVE `edges_update_owner` lets no application session
-/// update them, and a step `add_step` added is a public claim whose edge is
-/// world-owned in any plan. Writing `k` anyway would give two items one index;
-/// refusing the insert would turn every middle insert into a public workflow
-/// into an error. The edge is written unindexed instead, which the frozen plan
-/// read reports as an in-place mutation, and `AddStepResult::plan_index` says
-/// so.
-async fn shift_from(
-    conn: &mut sqlx::PgConnection,
-    plan: &PlanEdges,
-    k: u32,
-) -> Result<Option<u32>, StepOpError> {
-    // Highest index first. The order changes no outcome (the savepoint makes
-    // the shift all or nothing), but it makes a lost rollback observable: the
-    // edge most likely to be refused is a step `add_step` added, which sits at
-    // the LOW end of the range when the insert goes right before it, so
-    // ascending order would hit the refusal before anything had moved and a
-    // kept partial shift would leave no trace for a test to see.
-    let mut moving: Vec<(Uuid, u32)> = plan
-        .indexed
-        .iter()
-        .copied()
-        .filter(|(_, i)| *i >= k)
-        .collect();
-    moving.sort_unstable_by_key(|&(_, i)| std::cmp::Reverse(i));
-    let mut savepoint = sqlx::Connection::begin(&mut *conn).await?;
-    for (edge, index) in moving {
-        let moved = epigraph_db::EdgeRepository::update_valid_to_and_properties(
-            &mut *savepoint,
-            edge,
-            None,
-            Some(serde_json::json!({ "plan_index": index + 1 })),
-        )
-        .await;
-        match moved {
-            Ok(_) => {}
-            Err(e) if is_row_security_refusal(&e) => {
-                savepoint.rollback().await?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
-        }
+/// * The new edge is public: `add_step` writes a public step claim, and the
+///   edge between it and the workflow is public and world-owned (migration
+///   120). An index derived from a group-private edge would tell every
+///   reader of that edge something about the private plan (its size, or a
+///   private step's position), so a plan with any non-public `executes` edge
+///   gets none.
+/// * An insert would have to move every `executes` edge at or past its index
+///   up by one. On an all-public plan those edges are world-owned, and no
+///   application session may update them (migration 117's owner-scoped
+///   UPDATE); taking the index without moving them would give two items one
+///   index. So an insert is never indexed.
+///
+/// An unindexed edge is what every `add_step` wrote before this: the frozen
+/// plan read counts it in `unindexed_edges`, and plan order lists it after
+/// every indexed item.
+fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
+    if !append || !plan.all_public {
+        return None;
     }
-    savepoint.commit().await?;
-    Ok(Some(k))
-}
-
-/// Row security refused an edge update: the USING half (`WriteRefused`, the
-/// row stayed readable) or the `WITH CHECK` half (42501).
-fn is_row_security_refusal(e: &epigraph_db::DbError) -> bool {
-    match e {
-        epigraph_db::DbError::WriteRefused { .. } => true,
-        epigraph_db::DbError::QueryFailed { source } => {
-            source.as_database_error().and_then(|d| d.code()).as_deref() == Some("42501")
-        }
-        _ => false,
-    }
+    plan.max_index.and_then(|max| max.checked_add(1))
 }
 
 // ── add_step ────────────────────────────────────────────────────────────────
@@ -391,20 +321,18 @@ fn is_row_security_refusal(e: &epigraph_db::DbError) -> bool {
 ///
 /// # plan_index
 ///
-/// The new `executes` edge carries `{"level": 2, "plan_index": k}`, so the
-/// plan-order readers and the chain agree on where the step is:
+/// An append to a plan whose every `executes` edge is public writes the
+/// new edge as `{"level": 2, "plan_index": max + 1}`, and nothing else moves.
+/// Every other add (an insert, an append to a plan with a non-public
+/// `executes` edge or with no integer `plan_index`) writes the edge WITHOUT
+/// `plan_index`, and [`AddStepResult::plan_index`] is `None`: the frozen plan
+/// read counts it in `unindexed_edges` and plan order lists it after every
+/// indexed item. `plan_placement` says why.
 ///
-/// * an append takes one past the plan's largest index, and no edge moves;
-/// * an insert takes the index of the step it now precedes, after every
-///   `executes` edge at or past that index (atoms and later phases included)
-///   moves up by one, all or nothing.
-///
-/// When this session may not move every one of those edges (a public plan's
-/// edges are world-owned, and no application session may update them), or the
-/// step it precedes has no index, the edge is written WITHOUT `plan_index` and
-/// [`AddStepResult::plan_index`] is `None`: the chain is still rewired, no
-/// index changes, and the frozen plan read counts the edge in
-/// `unindexed_edges`, as it did for every `add_step` before this.
+/// The placement sees only the edges this session can read. On a plan with
+/// an item the workflow-ingest stamp cannot read, `max + 1` can repeat that
+/// hidden item's index, visible only to its readers: the hidden-tail limit the
+/// frozen plan read documents.
 ///
 /// The `workflows` row is locked first, so two concurrent calls on one
 /// workflow cannot both take the same index.
@@ -451,7 +379,7 @@ pub async fn add_step(
         Some(p) if (p as usize) <= chain.len() => p as usize,
         _ => chain.len(),
     };
-    let placement = plan_placement(&chain, position, &plan);
+    let plan_index = plan_placement(position == chain.len(), &plan);
 
     // A mid-chain insert first removes `prev -> next`, and REFUSES before
     // writing anything if it could not: under row security (115's owner-scoped
@@ -567,11 +495,6 @@ pub async fn add_step(
     .rows_affected()
         == 1;
 
-    let plan_index = match placement {
-        Placement::At(k) => Some(k),
-        Placement::Unindexed => None,
-        Placement::Before(k) => shift_from(&mut *conn, &plan, k).await?,
-    };
     let executes_properties = match plan_index {
         Some(k) => serde_json::json!({"level": 2, "plan_index": k}),
         None => serde_json::json!({"level": 2}),
@@ -724,4 +647,38 @@ pub async fn delete_step(
         step_lineage_id,
         truth_value: new_truth,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(max_index: Option<u32>, all_public: bool) -> PlanEdges {
+        PlanEdges {
+            by_target: HashMap::new(),
+            max_index,
+            all_public,
+        }
+    }
+
+    #[test]
+    fn an_append_to_an_all_public_plan_takes_one_past_its_largest_index() {
+        assert_eq!(plan_placement(true, &plan(Some(8), true)), Some(9));
+        assert_eq!(plan_placement(true, &plan(Some(0), true)), Some(1));
+    }
+
+    #[test]
+    fn an_insert_is_never_indexed() {
+        assert_eq!(plan_placement(false, &plan(Some(8), true)), None);
+    }
+
+    #[test]
+    fn a_plan_with_a_non_public_edge_gives_no_index() {
+        assert_eq!(plan_placement(true, &plan(Some(8), false)), None);
+    }
+
+    #[test]
+    fn a_plan_with_no_integer_index_gives_no_index() {
+        assert_eq!(plan_placement(true, &plan(None, true)), None);
+    }
 }

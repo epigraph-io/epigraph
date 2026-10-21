@@ -2984,12 +2984,13 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "executes_plan_indices",
-        "READ of `edges`: the id and `plan_index` of each `executes` edge of one workflow, which \
-         plans `add_step`'s WRITE (where the new edge goes and which edges move; the moves go \
-         through `EdgeRepository::update_valid_to_and_properties`). It runs on the \
-         ingest system agent's stamped transaction, the identity that writes those edges, so \
-         row security already limits it to what that write may touch; the caller's authority \
-         is the workflow authority rule, not read visibility, so no caller viewer is spliced.",
+        "READ of `edges`: the target, `plan_index` and publicness of each `executes` edge \
+         of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \
+         existing edge is written. It runs on the ingest system agent's stamped transaction, \
+         so it is bounded to what that stamp may read, and an index is written only when every \
+         edge it read is public, so the index discloses nothing a reader of the new public \
+         edge could not read; the caller's authority is the workflow authority rule, not read \
+         visibility, so no caller viewer is spliced.",
     ),
 ];
 
