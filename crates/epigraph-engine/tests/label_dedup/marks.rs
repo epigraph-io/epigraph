@@ -57,8 +57,10 @@ fn a_cluster_marks_each_loser_and_writes_no_loser_label() {
 
 #[test]
 fn the_plan_hash_covers_the_marks() {
+    // Same unit name and writes; only the mark differs, so nothing but the
+    // mark can move the hash.
     let mark = |canonical: u32| WriteUnit {
-        unit: format!("cluster:{}", id(canonical)),
+        unit: "cluster:fixed".to_string(),
         writes: vec![],
         marks: vec![DuplicateMark {
             dup: id(9),
