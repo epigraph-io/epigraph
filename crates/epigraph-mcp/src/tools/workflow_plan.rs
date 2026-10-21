@@ -9,43 +9,32 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::GetWorkflowPlanParams;
 
-/// Read the plan on ONE connection: stamped with `viewer` when this server has
-/// a tenancy-aware pool (every served configuration), so the in-query
-/// predicates and the session's GUCs agree under forced RLS. A server built
-/// without one reads on a plain connection of its pool, which the in-query
-/// viewer predicates still filter: it can show less than the viewer may read,
-/// never more.
+/// Read the plan on ONE connection stamped with `viewer` (the server's
+/// tenancy-aware pool, `read_as`), so the in-query predicates and the session's
+/// GUCs agree under forced RLS. A server built without a tenancy-aware pool
+/// refuses rather than reading on its plain pool: an unstamped session reads
+/// public rows only, so a member of a private plan would get a plan with holes
+/// in it instead of an error.
 ///
 /// # Errors
 /// `invalid_params` for a malformed id and for a plan that is not found (no
 /// such workflow, or none of its `executes` edges visible to the caller);
-/// `internal_error` for a database fault.
+/// `internal_error` for a server with no tenancy-aware pool and for a
+/// database fault.
 pub async fn get_workflow_plan(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: GetWorkflowPlanParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
-    let plan = match server.scoped.as_ref() {
-        Some(scoped) => {
-            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
-            let plan = epigraph_ingest_executor::workflow_plan::frozen_plan(
-                &mut read,
-                viewer,
-                workflow_id,
-            )
-            .await
-            .map_err(internal_error)?;
-            read.commit().await.map_err(internal_error)?;
-            plan
-        }
-        None => {
-            let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-            epigraph_ingest_executor::workflow_plan::frozen_plan(&mut conn, viewer, workflow_id)
-                .await
-                .map_err(internal_error)?
-        }
-    };
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        internal_error("get_workflow_plan needs a tenancy-aware pool; this server has none")
+    })?;
+    let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
+    let plan = epigraph_ingest_executor::workflow_plan::frozen_plan(&mut read, viewer, workflow_id)
+        .await
+        .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
     let plan =
         plan.ok_or_else(|| invalid_params(format!("workflow plan {workflow_id} not found")))?;
     Ok(CallToolResult::success(vec![Content::text(
