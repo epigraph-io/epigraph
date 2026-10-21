@@ -165,6 +165,8 @@ async fn ingest_as(server: &EpiGraphMcpFull, auth: &AuthContext, canonical: &str
         &http_viewer(server, auth).await,
         IngestWorkflowParams {
             extraction: extraction(canonical, "gen0", ops),
+            tenancy: None,
+            embed: None,
         },
         Some(auth),
     )
@@ -332,7 +334,11 @@ async fn a_new_generation_records_one_author_edge_per_created_claim(pool: PgPool
     tools::workflow_ingest::ingest_workflow(
         &server,
         &http_viewer(&server, &auth).await,
-        IngestWorkflowParams { extraction: again },
+        IngestWorkflowParams {
+            extraction: again,
+            tenancy: None,
+            embed: None,
+        },
         Some(&auth),
     )
     .await

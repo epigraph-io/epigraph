@@ -383,6 +383,7 @@ pub async fn store_workflow(
             viewer,
             &extraction,
             auth,
+            None,
         )
         .await?;
 

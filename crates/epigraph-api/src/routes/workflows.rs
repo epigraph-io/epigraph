@@ -1880,13 +1880,49 @@ pub async fn record_behavioral_execution(
     })))
 }
 
+/// The body of `POST /api/v1/workflows/ingest`: a `WorkflowExtraction`, with
+/// two optional keys beside its own.
+///
+/// * `tenancy`: `{"visibility": "group", "owner_group_id": G}` declares
+///   `('group', G)` for every claim the ingest creates (absent: public).
+/// * `embed`: `false` embeds nothing (default `true`).
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
+pub struct IngestWorkflowRequest {
+    #[serde(flatten)]
+    pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+    #[serde(default)]
+    pub embed: Option<bool>,
+}
+
 /// POST /api/v1/workflows/ingest - Ingest a hierarchical `WorkflowExtraction`.
 ///
 /// Parses a `WorkflowExtraction` JSON body, persists the claim hierarchy
 /// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
 /// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
 /// if the workflow row already has `executes` edges, returns `already_ingested: true`
-/// without touching the DB further.
+/// without touching the DB further. `executes_edges` then counts only the
+/// existing plan's edges the caller can read.
+///
+/// # A declared tenancy
+///
+/// With `tenancy` (see [`IngestWorkflowRequest`]) every claim the ingest
+/// creates is `('group', G)`. The REQUEST's principal itself must hold a live
+/// writer or admin membership of G (checked on its own viewer before any
+/// transaction, so a refusal writes nothing; its operator's membership does
+/// not count), and so must the workflow-ingest system agent (checked by the
+/// executor on the stamped transaction). Both refusals are 403. The response
+/// then carries `reused_items`: every planned claim the call did not create
+/// whose tenancy is not `('group', G)`, with its tenancy (`null` when the
+/// caller cannot read it, which only a re-ingest can report). Nothing
+/// re-tenants a reused claim, and a plan that reuses a claim private to a group
+/// the caller does not write is refused (403) before any edge is written.
+///
+/// The `workflows` row itself has no row security: its `canonical_name`,
+/// `goal`, `metadata` and (unless `embed` is `false`) `goal_embedding` stay
+/// instance-readable whatever the tenancy, so a caller must keep them neutral.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1904,8 +1940,25 @@ pub async fn ingest_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Json(mut extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
+    Json(request): Json<IngestWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let IngestWorkflowRequest {
+        mut extraction,
+        tenancy,
+        embed,
+    } = request;
+    let declared_group = tenancy.map(|t| t.owner_group_id);
+    // The caller's OWN membership of a declared group, before anything is
+    // begun (`require_caller_writes_group`). A viewer with no principal names
+    // no caller and is refused.
+    if let Some(group) = declared_group {
+        let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
+            reason: "workflow ingest: a declared tenancy needs an authenticated agent principal"
+                .to_string(),
+        })?;
+        epigraph_ingest_executor::require_caller_writes_group(&viewer, caller, group)
+            .map_err(workflow_ingest_error)?;
+    }
     // H3 (batch H-b): the submitter key is this route's to write, never the
     // caller's; see `workflow_ingest_submitter`.
     if let Some(obj) = extraction.source.metadata.as_object_mut() {
@@ -1916,10 +1969,15 @@ pub async fn ingest_workflow(
         begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
     let auth = auth_ctx.as_ref().map(|a| &a.0);
     let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
-    let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
-            .await
-            .map_err(workflow_ingest_error)?;
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+        &mut tx,
+        &plan,
+        &extraction,
+        &viewer,
+        declared_group,
+    )
+    .await
+    .map_err(workflow_ingest_error)?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
@@ -1939,7 +1997,13 @@ pub async fn ingest_workflow(
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
-    if let Some(embedder) = state.embedding_service() {
+    // `embed: false` (OD-6) sends no text to the embedder at all.
+    let embedder = if embed.unwrap_or(true) {
+        state.embedding_service()
+    } else {
+        None
+    };
+    if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
         embed_inserted_workflow_claims(
             &state,
@@ -1967,7 +2031,7 @@ pub async fn ingest_workflow(
         }
     }
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "workflow_id": result.workflow_id,
         "canonical_name": result.canonical_name,
         "generation": result.generation,
@@ -1976,7 +2040,21 @@ pub async fn ingest_workflow(
         "executes_edges": result.executes_edges_created,
         "relationships_created": result.relationship_edges_created,
         "already_ingested": result.already_ingested,
-    })))
+    });
+    if declared_group.is_some() {
+        body["reused_items"] = result
+            .reused_items
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "claim_id": r.claim_id,
+                    "visibility": r.visibility,
+                    "owner_group_id": r.owner_group_id,
+                })
+            })
+            .collect();
+    }
+    Ok(Json(body))
 }
 
 // ── Internal helpers ──
@@ -2382,6 +2460,10 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
                 message: format!("workflow ingest: {e}"),
             }
         }
+        // A declared group the caller, or the system agent, does not write.
+        e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
+            reason: format!("workflow ingest: {e}"),
+        },
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
         },
