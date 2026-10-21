@@ -148,8 +148,8 @@ async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
         .expect("claim")
 }
 
-/// A four-step workflow, every step in `group` (or public when `None`), and a
-/// third claim supporting each step.
+/// A four-step workflow, each step in `group` or public, and a third claim
+/// supporting each step.
 struct Plan {
     agent: Uuid,
     group: Uuid,
@@ -159,26 +159,34 @@ struct Plan {
     support_edges: [Uuid; 4],
 }
 
+/// Every step group-private (`private`) or every step public.
 async fn seed_plan(pool: &PgPool, private: bool) -> Plan {
+    seed_mixed_plan(pool, [private; 4]).await
+}
+
+/// Step `i` is group-private when `private[i]`, else public. The supporter is
+/// group-private when any step is.
+async fn seed_mixed_plan(pool: &PgPool, private: [bool; 4]) -> Plan {
     let (agent, group) = fixture::seed_agent_with_group(pool, "plan-author").await;
-    let tenancy = private.then_some(group);
     let workflow = seed_workflow(pool).await;
     let mut steps = [Uuid::nil(); 4];
     for (i, slot) in steps.iter_mut().enumerate() {
+        let tenancy = private[i].then_some(group);
         let step = seed_step(pool, agent, tenancy, &format!("step {i}: do the thing")).await;
         seed_executes(pool, workflow, step, i as i32).await;
         *slot = step;
     }
-    let supporter = match tenancy {
-        Some(g) => fixture::seed_group_claim(pool, agent, g, "a supporting note").await,
-        None => fixture::seed_public_claim(pool, agent, "a supporting note").await,
+    let supporter = if private.contains(&true) {
+        fixture::seed_group_claim(pool, agent, group, "a supporting note").await
+    } else {
+        fixture::seed_public_claim(pool, agent, "a supporting note").await
     };
     let mut support_edges = [Uuid::nil(); 4];
     for (slot, step) in support_edges.iter_mut().zip(steps) {
         *slot = seed_supports(pool, supporter, step).await;
     }
-    let want = if private { "group" } else { "public" };
-    for step in steps {
+    for (step, private) in steps.into_iter().zip(private) {
+        let want = if private { "group" } else { "public" };
         assert_eq!(
             visibility(pool, step).await,
             want,
@@ -541,4 +549,217 @@ async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
         );
     }
     assert_eq!(after[3], before[3], "untouched item 3");
+}
+
+// ── mixed tenancy: the rule is keyed on the RETIRED claim ───────────────────
+//
+// A dedup and a merge may join claims of different visibility: a non-owner may
+// attach a duplicate to a PUBLIC canonical, and a merge accepts one group plus
+// public sources. The freeze must follow the retired claim's own visibility,
+// never the replacement's, and in a merge each source's own.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_step_deduped_onto_a_public_canonical_keeps_its_executes(pool: PgPool) {
+    let p = seed_plan(&pool, true).await;
+    let before = plan(&pool, p.workflow).await;
+    let canon_0 = fixture::seed_public_claim(&pool, p.agent, "step 0, stated publicly").await;
+    let canon_1 = fixture::seed_public_claim(&pool, p.agent, "step 1, stated publicly").await;
+
+    // Step 0: the request path's shape (act, then the edge half replayed twice
+    // on the maintenance role).
+    let mut tx = pool.begin().await.unwrap();
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(p.steps[0]),
+        ClaimId::from_uuid(canon_0),
+    )
+    .await
+    .expect("dedup act onto a public canonical");
+    tx.commit().await.unwrap();
+    replay_dedup(&pool, p.steps[0], canon_0).await;
+    replay_dedup(&pool, p.steps[0], canon_0).await;
+
+    // Step 1: the combined form (the semantic-duplicate sweep's call).
+    let mut conn = pool.acquire().await.unwrap();
+    ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        ClaimId::from_uuid(p.steps[1]),
+        ClaimId::from_uuid(canon_1),
+    )
+    .await
+    .expect("dedup of a group-private step onto a public canonical");
+    drop(conn);
+
+    assert_eq!(visibility(&pool, canon_0).await, "public");
+    assert_eq!(
+        ends(&pool, p.support_edges[0]).await,
+        (p.supporter, canon_0, true),
+        "supports follows the public canonical (replay)"
+    );
+    assert_eq!(
+        ends(&pool, p.support_edges[1]).await,
+        (p.supporter, canon_1, true),
+        "supports follows the public canonical (combined)"
+    );
+    assert_eq!(
+        plan(&pool, p.workflow).await,
+        before,
+        "a group-private step keeps its executes even when its canonical is public"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn public_step_deduped_onto_a_group_canonical_still_moves_executes(pool: PgPool) {
+    let p = seed_plan(&pool, false).await;
+    let before = plan(&pool, p.workflow).await;
+    let canonical =
+        fixture::seed_group_claim(&pool, p.agent, p.group, "step 0, stated in the group").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        ClaimId::from_uuid(p.steps[0]),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup of a public step onto a group canonical");
+    drop(conn);
+
+    assert_eq!(visibility(&pool, canonical).await, "group");
+    let after = plan(&pool, p.workflow).await;
+    assert_eq!(after.len(), 4);
+    assert_eq!(
+        (after[0].1, after[0].2),
+        (before[0].1, canonical),
+        "a public step's executes follows its canonical even when the canonical is group-private"
+    );
+    for i in 1..4 {
+        assert_eq!(after[i], before[i], "untouched item {i}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn merge_of_a_public_and_a_group_step_freezes_only_the_group_steps_executes(pool: PgPool) {
+    // Steps 0, 1 and 3 group-private; step 2 public.
+    let p = seed_mixed_plan(&pool, [true, true, false, true]).await;
+    let before = plan(&pool, p.workflow).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let merged = ClaimRepository::consolidate_act_conn(
+        &mut tx,
+        &[p.steps[2], p.steps[3]],
+        "steps 2 and 3, merged",
+        0.6,
+        ConsolidateMode::Merge,
+        "merge",
+        p.agent,
+    )
+    .await
+    .expect("merge act of one public and one group step")
+    .merged_id;
+    tx.commit().await.unwrap();
+    replay_consolidate(&pool, merged, vec![p.steps[2], p.steps[3]]).await;
+    replay_consolidate(&pool, merged, vec![p.steps[2], p.steps[3]]).await;
+
+    assert_eq!(
+        visibility(&pool, merged).await,
+        "group",
+        "the merge takes the one group's tenancy"
+    );
+    assert_eq!(
+        live_supports(&pool, p.supporter, merged).await,
+        1,
+        "the two supports edges collapse onto the merge"
+    );
+    let after = plan(&pool, p.workflow).await;
+    assert_eq!(after.len(), 4, "no executes edge was retracted");
+    assert_eq!(
+        (after[2].1, after[2].2),
+        (before[2].1, merged),
+        "the public source's executes follows the merge"
+    );
+    assert_eq!(
+        after[3], before[3],
+        "the group-private source keeps its executes"
+    );
+    for i in [0, 1] {
+        assert_eq!(after[i], before[i], "untouched item {i}");
+    }
+}
+
+// ── the outgoing direction ─────────────────────────────────────────────────
+//
+// Every shipped `executes` writer is workflow-sourced, so the retired step is
+// the TARGET. The rule also holds when the retired non-public claim is the
+// SOURCE of an `executes` edge.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_public_claim_keeps_its_outgoing_executes_through_all_three_acts(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "plan-author").await;
+    let target = fixture::seed_group_claim(&pool, agent, group, "the executed claim").await;
+    let (mut sources, mut executes, mut supports) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..3_i32 {
+        let source = fixture::seed_group_claim(&pool, agent, group, &format!("runner {i}")).await;
+        let edge: Uuid = sqlx::query_scalar(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                                properties) \
+             VALUES ($1, 'claim', $2, 'claim', 'executes', \
+                     jsonb_build_object('plan_index', $3::int)) RETURNING id",
+        )
+        .bind(source)
+        .bind(target)
+        .bind(i)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a claim-sourced executes");
+        supports.push(seed_supports(&pool, source, target).await);
+        executes.push(edge);
+        sources.push(source);
+    }
+    let canonical = fixture::seed_group_claim(&pool, agent, group, "runner 1, elsewhere").await;
+    let partner = fixture::seed_group_claim(&pool, agent, group, "runner 2's partner").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let (new_id, _) = ClaimRepository::supersede_conn(
+        &mut conn,
+        ClaimId::from_uuid(sources[0]),
+        "runner 0, restated",
+        TruthValue::clamped(0.6),
+        "restated",
+    )
+    .await
+    .expect("supersede");
+    ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        ClaimId::from_uuid(sources[1]),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup");
+    let merged = ClaimRepository::consolidate_conn(
+        &mut conn,
+        &[sources[2], partner],
+        "runner 2, merged",
+        0.6,
+        ConsolidateMode::Merge,
+        "merge",
+        agent,
+    )
+    .await
+    .expect("merge")
+    .merged_id;
+    drop(conn);
+
+    for (i, replacement) in [new_id, canonical, merged].into_iter().enumerate() {
+        assert_eq!(
+            ends(&pool, supports[i]).await,
+            (replacement, target, true),
+            "an outgoing supports follows the replacement (act {i})"
+        );
+        assert_eq!(
+            ends(&pool, executes[i]).await,
+            (sources[i], target, true),
+            "a non-public claim keeps its outgoing executes (act {i})"
+        );
+    }
 }
