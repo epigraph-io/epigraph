@@ -2953,6 +2953,7 @@ pub async fn add_step(
         "workflow_id": r.workflow_id,
         "step_claim_id": r.step_claim_id,
         "step_index": r.step_index,
+        "plan_index": r.plan_index,
         "step_lineage_id": r.step_lineage_id,
         "already_present": r.already_present,
     })))

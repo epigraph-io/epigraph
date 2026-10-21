@@ -24,7 +24,7 @@
 //! refusal at the rewire left a step claim linked into a broken chain. Handed
 //! `&mut *tx` the whole rewire is one unit.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -41,6 +41,12 @@ pub struct AddStepResult {
     pub workflow_id: Uuid,
     pub step_claim_id: Uuid,
     pub step_index: u32,
+    /// The `plan_index` on the step's `executes` edge, or `None` when it has
+    /// none. A new step is indexed where the chain puts it (see
+    /// [`add_step`]'s "plan_index" section); `None` means the plan could not
+    /// be renumbered under this session, so the edge was written unindexed
+    /// and the frozen plan read reports the plan as mutated in place.
+    pub plan_index: Option<u32>,
     pub step_lineage_id: Uuid,
     /// `true` if the step already existed under this workflow (idempotent
     /// re-add); the existing position/lineage_id are returned and the chain
@@ -131,7 +137,7 @@ pub async fn find_workflow_head(
 ///
 /// The `plan_index` ordinal `execute_workflow_ingest_plan` records on each edge,
 /// then `(c.created_at, c.id)` for edges that carry none (written before the
-/// ordinal existed, or by [`add_step`]). `c.created_at` cannot lead: the
+/// ordinal existed, or by an [`add_step`] that could not renumber the plan). `c.created_at` cannot lead: the
 /// executor writes a whole plan in ONE transaction, so every claim and every
 /// edge of it shares one `NOW()`, and the order would fall through to `c.id` — a
 /// content-derived UUID. See the comment on the `executes` loop in
@@ -241,8 +247,154 @@ pub async fn ordered_steps(
     Ok(chain)
 }
 
+// ── plan_index for an added step ────────────────────────────────────────────
+
+/// Where an added step's `executes` edge goes in plan order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// At this index, which no edge holds yet: an append.
+    At(u32),
+    /// At this index, after every edge at or past it moves up by one: the
+    /// index of the step the new one now precedes.
+    Before(u32),
+    /// No index can be derived (the step it precedes, or every edge of the
+    /// plan, carries none): written unindexed.
+    Unindexed,
+}
+
+/// The `executes` edges of one workflow this session can see, as read for
+/// [`add_step`]'s placement.
+struct PlanEdges {
+    /// Each target's integer `plan_index` (`None` for an edge without one).
+    /// When a target has more than one edge, an indexed one wins.
+    by_target: HashMap<Uuid, Option<u32>>,
+    /// Every indexed edge, as `(edge id, plan_index)`.
+    indexed: Vec<(Uuid, u32)>,
+}
+
+async fn plan_edges(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+) -> Result<PlanEdges, StepOpError> {
+    let mut by_target: HashMap<Uuid, Option<u32>> = HashMap::new();
+    let mut indexed = Vec::new();
+    for (edge, target, index) in
+        epigraph_db::WorkflowRepository::executes_plan_indices(&mut *conn, workflow_id).await?
+    {
+        let index = index.and_then(|i| u32::try_from(i).ok());
+        if let Some(i) = index {
+            indexed.push((edge, i));
+        }
+        let slot = by_target.entry(target).or_insert(None);
+        if slot.is_none() {
+            *slot = index;
+        }
+    }
+    Ok(PlanEdges { by_target, indexed })
+}
+
+/// The new step goes immediately before `chain[position]` in plan order, so
+/// it takes that step's index; an append goes one past the plan's largest
+/// index (atoms and later phases included, so nothing moves). Either way the
+/// level-2 `plan_index` order stays the `step_follows` order `ordered_steps`
+/// walks, which is what the plan-order readers (`find_workflow*`, the outcome
+/// reports, the frozen plan read) and the chain must agree on.
+fn plan_placement(chain: &[Uuid], position: usize, plan: &PlanEdges) -> Placement {
+    if let Some(next) = chain.get(position) {
+        return match plan.by_target.get(next).copied().flatten() {
+            Some(k) => Placement::Before(k),
+            None => Placement::Unindexed,
+        };
+    }
+    match plan.indexed.iter().map(|(_, i)| *i).max() {
+        Some(max) => max
+            .checked_add(1)
+            .map_or(Placement::Unindexed, Placement::At),
+        None => Placement::Unindexed,
+    }
+}
+
+/// Make room at `k` by moving every indexed `executes` edge at or past `k` up
+/// by one, all or nothing, inside a SAVEPOINT. `Some(k)` when every one of them
+/// moved; `None` (and nothing moved) when this session may not update one.
+///
+/// Each move goes through [`epigraph_db::EdgeRepository::update_valid_to_and_properties`],
+/// the gated edge write `patch_edge` uses, which reports an edge the session
+/// can read but row security will not let it update as `WriteRefused` (and a
+/// `WITH CHECK` refusal surfaces as 42501).
+///
+/// That refusal is the expected case on the production shape, not an error: a
+/// public plan's `executes` edges are world-owned (migration 120) and
+/// migration 117's RESTRICTIVE `edges_update_owner` lets no application session
+/// update them, and a step `add_step` added is a public claim whose edge is
+/// world-owned in any plan. Writing `k` anyway would give two items one index;
+/// refusing the insert would turn every middle insert into a public workflow
+/// into an error. The edge is written unindexed instead, which the frozen plan
+/// read reports as an in-place mutation, and `AddStepResult::plan_index` says
+/// so.
+async fn shift_from(
+    conn: &mut sqlx::PgConnection,
+    plan: &PlanEdges,
+    k: u32,
+) -> Result<Option<u32>, StepOpError> {
+    let mut savepoint = sqlx::Connection::begin(&mut *conn).await?;
+    for &(edge, index) in plan.indexed.iter().filter(|(_, i)| *i >= k) {
+        let moved = epigraph_db::EdgeRepository::update_valid_to_and_properties(
+            &mut *savepoint,
+            edge,
+            None,
+            Some(serde_json::json!({ "plan_index": index + 1 })),
+        )
+        .await;
+        match moved {
+            Ok(_) => {}
+            Err(e) if is_row_security_refusal(&e) => {
+                savepoint.rollback().await?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    savepoint.commit().await?;
+    Ok(Some(k))
+}
+
+/// Row security refused an edge update: the USING half (`WriteRefused`, the
+/// row stayed readable) or the `WITH CHECK` half (42501).
+fn is_row_security_refusal(e: &epigraph_db::DbError) -> bool {
+    match e {
+        epigraph_db::DbError::WriteRefused { .. } => true,
+        epigraph_db::DbError::QueryFailed { source } => {
+            source.as_database_error().and_then(|d| d.code()).as_deref() == Some("42501")
+        }
+        _ => false,
+    }
+}
+
 // ── add_step ────────────────────────────────────────────────────────────────
 
+/// Append (`position` `None` or past the end) or insert a step at slot
+/// `position` of the `step_follows` chain [`ordered_steps`] walks.
+///
+/// # plan_index
+///
+/// The new `executes` edge carries `{"level": 2, "plan_index": k}`, so the
+/// plan-order readers and the chain agree on where the step is:
+///
+/// * an append takes one past the plan's largest index, and no edge moves;
+/// * an insert takes the index of the step it now precedes, after every
+///   `executes` edge at or past that index (atoms and later phases included)
+///   moves up by one, all or nothing.
+///
+/// When this session may not move every one of those edges (a public plan's
+/// edges are world-owned, and no application session may update them), or the
+/// step it precedes has no index, the edge is written WITHOUT `plan_index` and
+/// [`AddStepResult::plan_index`] is `None`: the chain is still rewired, no
+/// index changes, and the frozen plan read counts the edge in
+/// `unindexed_edges`, as it did for every `add_step` before this.
+///
+/// The `workflows` row is locked first, so two concurrent calls on one
+/// workflow cannot both take the same index.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
     canonical_name: &str,
@@ -253,8 +405,12 @@ pub async fn add_step(
         return Err(StepOpError::Invalid("step_text must not be empty".into()));
     }
     let (workflow_id, _generation) = find_workflow_head(&mut *conn, canonical_name).await?;
+    // Before the plan is read: a concurrent add_step on this workflow waits
+    // here, so the two cannot both take the same next `plan_index`.
+    epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *conn, workflow_id).await?;
     let phase_id = find_phase(&mut *conn, workflow_id).await?;
     let chain = ordered_steps(&mut *conn, workflow_id).await?;
+    let plan = plan_edges(&mut *conn, workflow_id).await?;
 
     let step_hash = content_hash(step_text);
     let step_claim_id = compound_claim_id(&step_hash, canonical_name);
@@ -270,6 +426,7 @@ pub async fn add_step(
             workflow_id,
             step_claim_id,
             step_index: idx as u32,
+            plan_index: plan.by_target.get(&step_claim_id).copied().flatten(),
             step_lineage_id: existing_lineage.unwrap_or_else(Uuid::nil),
             already_present: true,
             inserted_content: None,
@@ -281,6 +438,7 @@ pub async fn add_step(
         Some(p) if (p as usize) <= chain.len() => p as usize,
         _ => chain.len(),
     };
+    let placement = plan_placement(&chain, position, &plan);
 
     // A mid-chain insert first removes `prev -> next`, and REFUSES before
     // writing anything if it could not: under row security (115's owner-scoped
@@ -396,6 +554,15 @@ pub async fn add_step(
     .rows_affected()
         == 1;
 
+    let plan_index = match placement {
+        Placement::At(k) => Some(k),
+        Placement::Unindexed => None,
+        Placement::Before(k) => shift_from(&mut *conn, &plan, k).await?,
+    };
+    let executes_properties = match plan_index {
+        Some(k) => serde_json::json!({"level": 2, "plan_index": k}),
+        None => serde_json::json!({"level": 2}),
+    };
     epigraph_db::EdgeRepository::create_if_not_exists_conn(
         &mut *conn,
         workflow_id,
@@ -403,7 +570,7 @@ pub async fn add_step(
         step_claim_id,
         "claim",
         "executes",
-        Some(serde_json::json!({"level": 2})),
+        Some(executes_properties),
         None,
         None,
     )
@@ -481,6 +648,7 @@ pub async fn add_step(
         workflow_id,
         step_claim_id,
         step_index: position as u32,
+        plan_index,
         step_lineage_id: step_lineage,
         already_present: false,
         inserted_content: Some(step_text.to_string()),
