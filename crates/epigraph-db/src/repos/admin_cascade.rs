@@ -434,7 +434,8 @@ pub async fn record_dedup_revert<'e, E: sqlx::PgExecutor<'e>>(
 
 /// The revert record kept for the dedup of `dup` whose act wrote identity edge
 /// `identity_edge` ([`record_dedup_revert`]), with the id of the applied row it
-/// belongs to. `None` when there is none: the dedup was repaired before revert
+/// belongs to. The FIRST one: a later repair of the same mark (a stale replay)
+/// finds nothing left to move, so its record is empty. `None` when there is none: the dedup was repaired before revert
 /// records existed, or not through the administrative cascade.
 ///
 /// Maintenance connection only.
@@ -452,7 +453,7 @@ pub async fn dedup_revert_record<'e, E: sqlx::PgExecutor<'e>>(
           WHERE event_type = $1 AND agent_id IS NULL \
             AND lower(details->>'subject_id') = $2 \
             AND lower(details->>'identity_edge') = $3 \
-          ORDER BY created_at DESC, id DESC LIMIT 1",
+          ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .bind(EVENT_DEDUP_REVERT)
     .bind(dup.to_string())
