@@ -146,15 +146,55 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
     let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
     let (status, _) = apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
     let dedup_row = status.audit_event_id.expect("applied dedup row");
-    let revert: serde_json::Value =
-        sqlx::query_scalar("SELECT details->'revert' FROM security_events WHERE id = $1")
-            .bind(dedup_row)
-            .fetch_one(&pool)
-            .await
-            .expect("applied row");
-    assert!(
-        revert.get("moved_bbas").is_some(),
-        "the applied row keeps the revert record: {revert}"
+    let identity_edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    let (rec_applied, revert) = audit::dedup_revert_record(&mut *conn, dup, identity_edge)
+        .await
+        .expect("lookup")
+        .expect("the revert record is kept");
+    assert_eq!(
+        rec_applied, dedup_row,
+        "the record names the applied row it belongs to"
+    );
+    assert!(revert.get("moved_bbas").is_some(), "{revert}");
+
+    // The record names other writers' rows, so the TRIGGERING principal, which
+    // `security_events_read` lets read the applied row it is named on, must
+    // not be able to read the record. Calibrated on the applied row itself.
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let (applied_visible, record_rows) =
+        fixture::as_role(&pool, "epigraph_app", |mut c| async move {
+            sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+                .bind(author.to_string())
+                .execute(&mut *c)
+                .await
+                .expect("stamp principal");
+            let applied: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM security_events WHERE id = $1")
+                    .bind(dedup_row)
+                    .fetch_one(&mut *c)
+                    .await
+                    .expect("read applied row");
+            let records: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM security_events WHERE details ? 'revert'")
+                    .fetch_one(&mut *c)
+                    .await
+                    .expect("read records");
+            (c, (applied, records))
+        })
+        .await;
+    assert_eq!(
+        applied_visible, 1,
+        "calibration: the triggering agent reads its applied row"
+    );
+    assert_eq!(
+        record_rows, 0,
+        "the triggering agent cannot read any revert record"
     );
     let caller_copy = serde_json::to_string(&status).expect("status");
     assert!(
