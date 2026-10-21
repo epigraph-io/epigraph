@@ -128,6 +128,9 @@ async fn a_deprecated_workflow_reads_truth_0_05_with_its_frozen_items(pool: PgPo
     for item in p["items"].as_array().unwrap() {
         let structural = item["level"].as_u64().unwrap() <= 2;
         assert_eq!(item["is_current"], json!(!structural), "{item}");
+        // Deprecation retires without writing a new head, so no item's
+        // lineage diverged, current or not.
+        assert_eq!(item["heads_diverged"], json!(false), "{item}");
     }
 }
 

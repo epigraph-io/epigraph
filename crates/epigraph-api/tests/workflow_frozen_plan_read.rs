@@ -617,6 +617,39 @@ async fn evolve_step_leaves_the_items_and_digest_and_sets_heads_diverged(pool: P
     }
 }
 
+/// The same with a `revises` evolve, which leaves BOTH heads current: the
+/// frozen step reports `heads_diverged` while it is still current. This is
+/// what tells `heads_diverged` apart from `!is_current`, which the
+/// `supersedes` case cannot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revises_evolve_sets_heads_diverged_on_a_step_that_stays_current(pool: PgPool) {
+    let w = private_workflow(&pool).await;
+    let step = uuid_of(&vector_plan()[5]["claim_id"]);
+    let (status, body) = w
+        .api
+        .post(
+            &format!("/api/v1/workflows/steps/{step}/evolve"),
+            &token(w.writer, WRITE_SCOPES),
+            &json!({"parent_id": step, "content": "acme-frozen-plan \u{2014} step 1.2: keep the new rows, sorted",
+                    "edge_type": "revises", "reason": "workflow-plan branch"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "evolve_step: {body}");
+
+    let p = w
+        .api
+        .plan(&token(w.reader, READ_SCOPES), w.workflow_id)
+        .await;
+    assert_items_are_the_vectors(&p);
+    assert_eq!(flags(&p), clean());
+    assert_eq!(p["digest_echo"], vectors()["ingest"]["wfd1"]);
+    for item in p["items"].as_array().unwrap() {
+        let is_step = uuid_of(&item["claim_id"]) == step;
+        assert_eq!(item["heads_diverged"], json!(is_step), "{item}");
+        assert_eq!(item["is_current"], json!(true), "{item}");
+    }
+}
+
 /// `content_hash_ok` is seed-aware. A legacy row (no scope marker, plain
 /// digest) and the rows the builder writes today (marked, digest scoped to the
 /// workflow's name) are both `true`. A body edited out of band is `false`, and
