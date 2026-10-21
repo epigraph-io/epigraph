@@ -120,6 +120,12 @@ pub struct EpiGraphMcpFull {
     /// is. Off, a token without `elv` resolves the plain scoped viewer with no
     /// liveness round trip at all.
     pub(crate) connector_elevation: bool,
+    /// Whether an HTTP request may carry a DELEGATED run token (a token with
+    /// `dlg`): admitted by `call_tool`'s dispatch check
+    /// (`tools::viewer::admit_delegated_call`) only while its delegation is
+    /// live, refused by every federated tool whatever this says. OFF in every constructor; `main` sets it from
+    /// `EPIGRAPH_RUN_TOKENS` at boot ([`Self::with_run_tokens`]).
+    pub(crate) run_tokens: epigraph_db::RunTokens,
     /// The admin-scope switch (migration 128) as this process reads it,
     /// behind a short cache (elevation plan EL-10); shared by every session
     /// the factory clones. [`Self::admin_scope_posture`].
@@ -756,6 +762,19 @@ impl EpiGraphMcpFull {
                 data: None,
             });
         };
+        // A DELEGATED run token never reaches a federated tool, whatever its
+        // scopes: the call would forward its bearer to the extension, which
+        // runs no delegation check of its own.
+        if auth.delegated_by.is_some() {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: federated tool '{tool_name}' is unavailable to a delegated run \
+                     token (its bearer is never forwarded to an extension)"
+                )),
+                data: None,
+            });
+        }
         if !auth.has_scope(required) {
             return Err(McpError {
                 code: rmcp::model::ErrorCode::INVALID_REQUEST,
@@ -1065,6 +1084,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
         }
@@ -1103,6 +1123,14 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_connector_elevation(mut self, enabled: bool) -> Self {
         self.connector_elevation = enabled;
+        self
+    }
+
+    /// Set the delegated run-token switch (see the field's doc; OFF is the
+    /// default).
+    #[must_use]
+    pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
+        self.run_tokens = run_tokens;
         self
     }
 
@@ -1182,6 +1210,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
         }
@@ -2622,6 +2651,23 @@ impl ServerHandler for EpiGraphMcpFull {
                 .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
                 .map(|t| t.0.clone());
         }
+        // A DELEGATED run token (`dlg`) is checked FIRST, on every call, before
+        // any other gate, the lineage write or the tool
+        // (`tools::viewer::admit_delegated_call`: one read, none for any other
+        // token). A tool that resolves no viewer is covered like one that
+        // does; the live answer is handed to the tool's own viewer and
+        // ownership checks below (`with_admitted_delegation`).
+        let admitted_delegation =
+            match tools::viewer::admit_delegated_call(self, auth_owned.as_ref(), &request.name)
+                .await
+            {
+                Ok(admitted) => admitted,
+                Err(err) => {
+                    self.emit_tool_invoked(&format!("denied:{}", request.name))
+                        .await;
+                    return Err(err);
+                }
+            };
         // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
         // caller's admin-only scopes count (`AuthContext::has_scope`). Read
         // before any scope gate, the federated one included, for a token it
@@ -2825,7 +2871,11 @@ impl ServerHandler for EpiGraphMcpFull {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = tools::viewer::with_admitted_delegation(
+            admitted_delegation,
+            self.tool_router.call(tcc),
+        )
+        .await;
         match (elevated, recording) {
             (Some(viewer), Some((tool, arguments, jti))) => {
                 crate::elevated_access::record_elevated_call(
@@ -2901,6 +2951,7 @@ mod scope_guard_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

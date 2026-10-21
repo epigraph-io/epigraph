@@ -30,6 +30,7 @@ async fn inject_dummy_auth(
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
     req.extensions_mut().insert(auth);
     next.run(req).await

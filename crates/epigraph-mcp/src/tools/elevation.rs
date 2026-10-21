@@ -453,6 +453,7 @@ mod tests {
                 family_id: Uuid::new_v4(),
             }),
             admin_scopes: epigraph_auth::AdminScopePosture::Armed,
+            delegated_by: None,
         }
     }
 
