@@ -792,7 +792,7 @@ pub async fn get_workflow_plan(
         }
     })?;
     let plan =
-        epigraph_ingest_executor::workflow_plan::frozen_plan(&mut *read, &viewer, workflow_id)
+        epigraph_ingest_executor::workflow_plan::frozen_plan(&mut read, &viewer, workflow_id)
             .await
             .map_err(|e| {
                 tracing::error!(

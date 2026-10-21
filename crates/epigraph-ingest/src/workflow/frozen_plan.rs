@@ -276,7 +276,7 @@ pub fn assemble(input: FrozenPlanInput) -> FrozenPlan {
     }
 
     // The stored order; the claim id only makes ties deterministic.
-    items.sort_by(|a, b| (a.plan_index, a.claim_id).cmp(&(b.plan_index, b.claim_id)));
+    items.sort_by_key(|i| (i.plan_index, i.claim_id));
     let distinct: BTreeSet<u32> = items.iter().map(|i| i.plan_index).collect();
     let distinct_len = distinct.len() as u64;
     let duplicate_plan_indices = items.len() as u64 - distinct_len;
