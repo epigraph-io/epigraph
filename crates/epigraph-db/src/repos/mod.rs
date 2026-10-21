@@ -102,11 +102,12 @@ pub use claim::{
     AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
     ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
     ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration,
-    ConsolidateMode, ConsolidateResult, DedupRepair, EmbeddingSeedScope, EvolveStepResult,
-    FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
-    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    ConsolidateMode, ConsolidateResult, DedupRepair, DuplicateProvenance, EmbeddingSeedScope,
+    EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
+    LabelQuery, LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
     SortDirection, SupersedeEdgeMigration, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    CONSOLIDATE_MIN_SOURCES, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
+    EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

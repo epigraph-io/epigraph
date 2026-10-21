@@ -761,10 +761,17 @@ pub async fn mark_duplicate(
     // unstamped on the raw pool, where the application role refused even the
     // caller's own duplicate. Only the act's failure is an error.
     let mut tx = state.write_as(&viewer, "mark_duplicate").await?;
-    ClaimRepository::mark_duplicate_act_conn(
+    let provenance = epigraph_db::DuplicateProvenance::new(
+        "http:mark_duplicate",
+        epigraph_db::DuplicateProvenance::RULE_CALLER_ASSERTED,
+    )
+    .marked_by(viewer.principal())
+    .reason(req.reason.as_deref());
+    ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
         ClaimId::from_uuid(dup_id),
         ClaimId::from_uuid(req.canonical_id),
+        &provenance,
     )
     .await
     .map_err(|e| match e {

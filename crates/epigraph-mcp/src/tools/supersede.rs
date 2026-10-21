@@ -4,7 +4,7 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{MarkDuplicateParams, SupersedeClaimParams};
 use epigraph_core::{ClaimId, TruthValue};
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, DuplicateProvenance};
 use epigraph_engine::admin_cascade::{
     self, CascadeCause, CascadeStatus, CascadeTrigger, OauthPrincipal,
 };
@@ -294,9 +294,18 @@ pub async fn mark_duplicate(
     )
     .await?;
 
-    ClaimRepository::mark_duplicate_act_conn(&mut tx, dup_claim_id, ClaimId::from_uuid(canon))
-        .await
-        .map_err(internal_error)?;
+    let provenance =
+        DuplicateProvenance::new("mark_duplicate", DuplicateProvenance::RULE_CALLER_ASSERTED)
+            .marked_by(Some(actor))
+            .reason(params.reason.as_deref());
+    ClaimRepository::mark_duplicate_act_attributed_conn(
+        &mut tx,
+        dup_claim_id,
+        ClaimId::from_uuid(canon),
+        &provenance,
+    )
+    .await
+    .map_err(internal_error)?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Dedup,

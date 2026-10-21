@@ -485,6 +485,117 @@ pub struct DedupRepair {
     pub skipped_false_bindings: u64,
 }
 
+/// The relationship of the identity edge a dedup's act writes,
+/// `duplicate -> canonical`.
+pub const DUPLICATE_IDENTITY_RELATIONSHIP: &str = "same_as";
+
+/// The key under which the identity edge's `properties` carry its
+/// [`DuplicateProvenance`]. An in-force `same_as` edge out of a retired claim
+/// with this key is a dedup's record; a `same_as` edge without it is somebody's
+/// assertion and no dedup reads or retracts it.
+pub const DUPLICATE_IDENTITY_PROPERTY: &str = "dedup";
+
+/// Who marked a duplicate, through which tool, and by which rule: the
+/// `properties.dedup` of the `same_as` identity edge the act writes. The act
+/// adds `marked_at` (the transaction's `now()`), and `marked_by` from the
+/// session principal when the caller names none.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateProvenance {
+    /// The surface that marked it (`mark_duplicate`, `http:mark_duplicate`,
+    /// `sweep_semantic_duplicates`, `label_dedup`, ...).
+    pub tool: String,
+    /// Why the two claims are one: [`Self::RULE_CALLER_ASSERTED`],
+    /// [`Self::RULE_EXACT_RESTATEMENT`], or a caller's own rule name.
+    pub rule: String,
+    /// What the rule matched on (a shared identifier, a score), when it has
+    /// something to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_on: Option<serde_json::Value>,
+    /// The run that marked it, when the caller is a batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_tag: Option<String>,
+    /// The hash of the plan the mark came from, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
+    /// The acting agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_by: Option<Uuid>,
+    /// The caller's free-text reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DuplicateProvenance {
+    /// A caller named the canonical itself (`mark_duplicate`).
+    pub const RULE_CALLER_ASSERTED: &'static str = "caller_asserted";
+    /// The two claims have the same content hash (the semantic sweep's only
+    /// automatic collapse).
+    pub const RULE_EXACT_RESTATEMENT: &'static str = "exact_restatement";
+
+    /// Provenance with only the tool and rule set.
+    #[must_use]
+    pub fn new(tool: impl Into<String>, rule: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            rule: rule.into(),
+            matched_on: None,
+            run_tag: None,
+            plan_hash: None,
+            marked_by: None,
+            reason: None,
+        }
+    }
+
+    /// What the repository's own wrappers record when their caller gave no
+    /// provenance: the act through [`ClaimRepository::mark_duplicate`] and the
+    /// other provenance-less entry points.
+    #[must_use]
+    pub fn unattributed() -> Self {
+        Self::new("repository", Self::RULE_CALLER_ASSERTED)
+    }
+
+    /// Set the acting agent.
+    #[must_use]
+    pub fn marked_by(mut self, agent: Option<Uuid>) -> Self {
+        self.marked_by = agent;
+        self
+    }
+
+    /// Set what the rule matched on.
+    #[must_use]
+    pub fn matched_on(mut self, matched_on: serde_json::Value) -> Self {
+        self.matched_on = Some(matched_on);
+        self
+    }
+
+    /// Set the batch run tag.
+    #[must_use]
+    pub fn run_tag(mut self, tag: impl Into<String>) -> Self {
+        self.run_tag = Some(tag.into());
+        self
+    }
+
+    /// Set the plan hash.
+    #[must_use]
+    pub fn plan_hash(mut self, hash: impl Into<String>) -> Self {
+        self.plan_hash = Some(hash.into());
+        self
+    }
+
+    /// The longest reason, in characters, an identity edge keeps.
+    pub const MAX_REASON_CHARS: usize = 1000;
+
+    /// Set the caller's reason (an empty one is dropped; a longer one is cut
+    /// at [`Self::MAX_REASON_CHARS`]).
+    #[must_use]
+    pub fn reason(mut self, reason: Option<&str>) -> Self {
+        self.reason = reason
+            .filter(|r| !r.is_empty())
+            .map(|r| r.chars().take(Self::MAX_REASON_CHARS).collect());
+        self
+    }
+}
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -7385,6 +7496,26 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
+        Self::mark_duplicate_with_repair_attributed_conn(
+            conn,
+            dup,
+            canonical,
+            &DuplicateProvenance::unattributed(),
+        )
+        .await
+    }
+
+    /// [`Self::mark_duplicate_with_repair_conn`] with the caller's
+    /// [`DuplicateProvenance`] on the identity edge the act writes.
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_with_repair_conn`].
+    pub async fn mark_duplicate_with_repair_attributed_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+        provenance: &DuplicateProvenance,
+    ) -> Result<DedupRepair, DbError> {
         use sqlx::Acquire;
         require_privileged_session(
             &mut *conn,
@@ -7394,7 +7525,7 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
         let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
         tx.commit().await?;
         Ok(repair)
@@ -7441,11 +7572,33 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<(), DbError> {
+        Self::mark_duplicate_act_attributed_conn(
+            conn,
+            dup,
+            canonical,
+            &DuplicateProvenance::unattributed(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::mark_duplicate_act_conn`] with the caller's
+    /// [`DuplicateProvenance`]. Returns the id of the `same_as` identity edge
+    /// the act wrote.
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_act_conn`].
+    pub async fn mark_duplicate_act_attributed_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+        provenance: &DuplicateProvenance,
+    ) -> Result<Uuid, DbError> {
         use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        let identity_edge = mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
         let foreign_private_canonical: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -7498,7 +7651,7 @@ impl ClaimRepository {
             });
         }
         tx.commit().await?;
-        Ok(())
+        Ok(identity_edge)
     }
 
     /// The dedup's repair, as the administrative cascade runs it after the
@@ -10222,14 +10375,16 @@ impl ClaimRepository {
     }
 }
 
-/// The checks and the one `claims` UPDATE of a dedup's act. The callers
-/// ([`ClaimRepository::mark_duplicate_act_conn`],
-/// [`ClaimRepository::mark_duplicate_with_repair_conn`]) own the transaction.
+/// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.
+/// The callers ([`ClaimRepository::mark_duplicate_act_attributed_conn`],
+/// [`ClaimRepository::mark_duplicate_with_repair_attributed_conn`]) own the
+/// transaction. Returns the identity edge's id.
 async fn mark_duplicate_act(
     conn: &mut sqlx::PgConnection,
     dup_uuid: Uuid,
     canon_uuid: Uuid,
-) -> Result<(), DbError> {
+    provenance: &DuplicateProvenance,
+) -> Result<Uuid, DbError> {
     if dup_uuid == canon_uuid {
         return Err(DbError::QueryFailed {
             source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
@@ -10282,7 +10437,41 @@ async fn mark_duplicate_act(
     .bind(dup_uuid)
     .execute(&mut *conn)
     .await?;
-    Ok(())
+    // The identity, as a traversable and attributed graph fact: one `same_as`
+    // edge duplicate -> canonical carrying who marked it, how and when.
+    // `supersedes` stays the pointer readers already follow; the edge is what
+    // an audit or an un-mark reads.
+    //
+    // Written AFTER the UPDATE above on purpose: `auto_create_factor_from_edge`
+    // skips an edge with a non-current endpoint, so the identity edge never
+    // becomes a belief factor between the pair. `same_as` is in no DS auto-wire
+    // list either, so no BBA is keyed to it.
+    //
+    // It is the caller's own row (its tenancy is derived from the two
+    // endpoints), so it lands on the caller's stamped transaction with the act.
+    // The repair's resource and collision clauses all exclude edges whose
+    // other end is the canonical, so the edge stays on the duplicate.
+    let provenance_json = serde_json::to_value(provenance).map_err(|e| DbError::InvalidData {
+        reason: format!("mark_duplicate: provenance does not serialize: {e}"),
+    })?;
+    let identity_edge: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+           VALUES ($1, 'claim', $2, 'claim', $3,
+                   jsonb_build_object($4::text,
+                       jsonb_strip_nulls(jsonb_build_object(
+                           'marked_by', public.epigraph_principal_id()))
+                       || $5::jsonb
+                       || jsonb_build_object('marked_at', now())))
+           RETURNING id"#,
+    )
+    .bind(dup_uuid)
+    .bind(canon_uuid)
+    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+    .bind(DUPLICATE_IDENTITY_PROPERTY)
+    .bind(&provenance_json)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(identity_edge)
 }
 
 /// The dedup's repair of the edge and derived-record layers, unchecked: the

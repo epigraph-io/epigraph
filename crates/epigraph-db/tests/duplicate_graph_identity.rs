@@ -17,10 +17,39 @@
 //! semantic-duplicate sweep runs them). The tenancy arms of the same
 //! behaviour, on `epigraph_app` and `epigraph_maintenance`, are below them.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, FrameRepository, MassFunctionRepository};
-use sqlx::PgPool;
+use epigraph_db::visibility::Viewer;
+use epigraph_db::{ClaimRepository, DuplicateProvenance, FrameRepository, MassFunctionRepository};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+fn csv(ids: &[Uuid]) -> String {
+    ids.iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Stamp `conn` for `agent` exactly as `ScopedPool::begin_as` would.
+async fn stamp(conn: &mut PgConnection, pool: &PgPool, agent: Uuid) {
+    let v = Viewer::resolve(pool, agent).await.expect("resolve viewer");
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(groups)
+    .bind(writable)
+    .bind(agent.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp session gucs");
+}
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -281,4 +310,117 @@ async fn a_dedup_records_its_identity_as_an_attributed_same_as_edge(pool: PgPool
             same_as[0]
         );
     }
+}
+
+/// B2 on the application role. A writer marks its own group-private claim a
+/// duplicate of another of its group's claims on a STAMPED `epigraph_app`
+/// session: the act's identity edge lands on that session (no privilege), takes
+/// the endpoints' group, names the session principal as `marked_by` when the
+/// caller named nobody, and is visible to the group and to no stranger.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_identity_edge_lands_on_the_app_role_and_is_hidden_from_a_stranger(pool: PgPool) {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(&pool)
+            .await
+            .expect("read epigraph_app's rolbypassrls");
+    assert!(!bypassrls, "epigraph_app bypasses RLS; this arm is vacuous");
+    let (w, group) = fixture::seed_agent_with_group(&pool, "dup-writer").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let canonical = fixture::seed_group_claim(&pool, w, group, "group canonical").await;
+    let dup = fixture::seed_group_claim(&pool, w, group, "group duplicate").await;
+
+    let p = pool.clone();
+    let (edge, seen_by_writer, seen_by_stranger) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let edge = ClaimRepository::mark_duplicate_act_attributed_conn(
+                &mut conn,
+                ClaimId::from_uuid(dup),
+                ClaimId::from_uuid(canonical),
+                &DuplicateProvenance::unattributed(),
+            )
+            .await
+            .expect("the act lands on the writer's stamped app session");
+            let count = "SELECT count(*) FROM edges WHERE id = $1";
+            let by_writer: i64 = sqlx::query_scalar(count)
+                .bind(edge)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("writer reads");
+            stamp(&mut conn, &p, stranger).await;
+            let by_stranger: i64 = sqlx::query_scalar(count)
+                .bind(edge)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("stranger reads");
+            (conn, (edge, by_writer, by_stranger))
+        })
+        .await;
+    assert_eq!(seen_by_writer, 1, "the group reads its identity edge");
+    assert_eq!(
+        seen_by_stranger, 0,
+        "RLS hides the identity edge from a stranger"
+    );
+
+    let (rel, vis, owner, props): (String, String, Uuid, serde_json::Value) = sqlx::query_as(
+        "SELECT relationship, visibility::text, owner_group_id, properties \
+           FROM edges WHERE id = $1 AND source_id = $2 AND target_id = $3",
+    )
+    .bind(edge)
+    .bind(dup)
+    .bind(canonical)
+    .fetch_one(&pool)
+    .await
+    .expect("the identity edge, duplicate -> canonical");
+    assert_eq!(rel, "same_as");
+    assert_eq!(
+        (vis.as_str(), owner),
+        ("group", group),
+        "the endpoints' group owns it"
+    );
+    assert_eq!(
+        props["dedup"]["marked_by"],
+        serde_json::json!(w),
+        "marked_by falls back to the session principal: {props}"
+    );
+    assert_eq!(props["dedup"]["tool"], "repository");
+}
+
+/// A second mark of the same duplicate is refused and writes no second
+/// identity edge (the act's existing "already superseded" refusal now also
+/// guards the edge).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_re_mark_is_refused_and_writes_no_second_identity_edge(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, author, "canonical").await;
+    let other = seed_claim(&pool, author, "another canonical").await;
+    let dup = seed_claim(&pool, author, "duplicate").await;
+    let prov = DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED);
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &prov,
+    )
+    .await
+    .expect("first mark");
+    let err = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(other),
+        &prov,
+    )
+    .await
+    .expect_err("a second mark is refused");
+    assert!(format!("{err:?}").contains("already superseded"), "{err:?}");
+    let identity_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(identity_edges, 1, "the refused re-mark wrote no edge");
 }
