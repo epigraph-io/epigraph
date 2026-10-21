@@ -10702,13 +10702,14 @@ async fn repair_marked_duplicate(
     .bind(canon_uuid)
     .fetch_one(&mut *conn)
     .await?;
+    let poolable_sql = poolable_bba_sql();
     let poolable: Vec<Uuid> = if canonical_is_compound {
         Vec::new()
     } else {
         sqlx::query_scalar(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              SELECT mf.id FROM mass_functions mf
-              WHERE mf.claim_id = $2 AND {POOLABLE_BBA_SQL}
+              WHERE mf.claim_id = $2 AND {poolable_sql}
                 AND NOT EXISTS ({CANONICAL_HOLDS_KEY_SQL})
               ORDER BY mf.id"#
         ))
@@ -10874,7 +10875,7 @@ async fn repair_marked_duplicate(
           WHERE mf.claim_id = $2
             AND (mf.perspective_id IS NULL
                  OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id))
-            AND ($3 OR NOT {POOLABLE_BBA_SQL} OR EXISTS ({CANONICAL_HOLDS_KEY_SQL}))
+            AND ($3 OR NOT {poolable_sql} OR EXISTS ({CANONICAL_HOLDS_KEY_SQL}))
           ORDER BY mf.id"#
     ))
     .bind(canon_uuid)
@@ -10936,11 +10937,19 @@ async fn repair_marked_duplicate(
 }
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
-/// keyed to any edge (those follow their edge, or stay with it), and not an
-/// `attributed_v1` row. Fully parenthesized: it is spliced after a `NOT`.
-const POOLABLE_BBA_SQL: &str = "((mf.perspective_id IS NULL \
-       OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
-      AND mf.combination_method IS DISTINCT FROM 'attributed_v1')";
+/// keyed to any edge (those follow their edge, or stay with it), not an
+/// `attributed_v1` row, and not a cached combination (the duplicate's own fold
+/// of its inputs; folded again on the canonical it would count them twice).
+/// Fully parenthesized: it is spliced after a `NOT`.
+fn poolable_bba_sql() -> String {
+    format!(
+        "((mf.perspective_id IS NULL \
+           OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
+          AND mf.combination_method IS DISTINCT FROM 'attributed_v1' \
+          AND NOT {})",
+        crate::repos::mass_function::cached_combination_predicate("mf.")
+    )
+}
 
 /// The canonical (`$1`) already holds a row under the duplicate row `mf`'s
 /// `mass_functions_unique_per_perspective` key (migration 034).
