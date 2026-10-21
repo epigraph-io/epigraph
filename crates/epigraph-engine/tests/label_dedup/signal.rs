@@ -15,6 +15,7 @@ fn signal_profile() -> LabelDedupProfile {
         "signal_dedup".into(),
         serde_json::json!({
             "family_label": "lead",
+            "family_kind": "index",
             "closed_label": "resolved",
             "retired_labels": ["lead-dropped", "lead-duplicate"],
             "hygiene_write": {"add": ["lead-dropped", "{run_tag}"], "remove": ["{family}"]},
@@ -25,8 +26,6 @@ fn signal_profile() -> LabelDedupProfile {
             "ids": {"reject": ["iso_date", "us_date", "bare_year", "money", "clock_time"]},
             "entity_match": {"aliases": [["amc", "acme medical center"]]},
             "merge": {
-                "loser_add": ["lead-duplicate", "duplicate-of:{survivor}", "{run_tag}"],
-                "loser_remove": ["{family}"],
                 "survivor_add": ["{run_tag}"]
             }
         }),
@@ -85,13 +84,23 @@ fn the_signal_family_is_deduplicated_on_its_own_index() {
         "the newer signal survives: {:?}",
         s.clusters
     );
-    let loser = &s.clusters[0].members[0];
-    assert!(loser.add.contains(&format!("duplicate-of:{}", id(2))));
+    // The older signal is marked a duplicate of the newer one, like a family
+    // member: no label is written on it.
+    let marks = s.clusters[0].marks();
     assert_eq!(
-        loser.remove,
-        vec!["lead".to_string()],
-        "`{{family}}` is the signal family here"
+        marks
+            .iter()
+            .map(|m| (m.dup, m.canonical))
+            .collect::<Vec<_>>(),
+        vec![(id(1), id(2))]
     );
+    let units = p.write_units();
+    let unit = units
+        .iter()
+        .find(|u| u.unit == format!("signal_cluster:{}", id(2)))
+        .expect("the signal cluster's unit");
+    assert_eq!(unit.marks, marks);
+    assert!(unit.writes.iter().all(|w| w.claim_id != id(1)), "{unit:?}");
     assert_eq!(
         s.hygiene.iter().map(|h| h.id).collect::<Vec<_>>(),
         vec![id(5)]

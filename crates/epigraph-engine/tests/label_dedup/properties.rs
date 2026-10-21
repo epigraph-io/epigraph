@@ -20,6 +20,14 @@ fn rich_graph() -> Vec<DedupClaim> {
             "2026-07-01T00:00:00Z",
         )
     };
+    // A re-filing of the weir item that names an id the survivor lacks, so
+    // the carried-id stage has work.
+    g.push(claim(
+        0x3800_0001,
+        "Tender: GWX KX-4417 Granite Weir Channel Upgrade — Acme County PUA, due 2026-07-15, ref ZR-880011.",
+        &["notice"],
+        "2026-09-01T00:00:00Z",
+    ));
     g.push(chain(0x3000_0001, "TND 55501A"));
     g.push(chain(0x3000_0002, ""));
     g.push(chain(0x3000_0003, "TND 55502C"));
@@ -204,20 +212,17 @@ fn the_label_rich_claims_reach_their_label_order_paths() {
             .find(|c| c.survivor == f::id(tag))
             .unwrap_or_else(|| panic!("no cluster survived by {tag:x}: {:?}", p.clusters))
     };
-    // Two carried dates on one survivor: both are replaced.
-    assert_eq!(by_survivor(0x3200_0001).survivor_remove.len(), 2);
-    // Two carried values on one loser: exactly one is carried.
-    let crane = by_survivor(0x3300_0001);
-    assert_eq!(
-        crane
-            .carry_add
-            .iter()
-            .filter(|l| l.starts_with("value-carried:"))
-            .count(),
-        1,
-        "{:?}",
-        crane.carry_add
-    );
+    // The carried-date and carried-value label paths these two claims were
+    // added for are gone (a later date or a value stays on the marked
+    // duplicate); they still cluster, and still write no such label.
+    for tag in [0x3200_0001, 0x3300_0001] {
+        let c = by_survivor(tag);
+        assert!(
+            !c.carry_add.iter().any(|l| l.contains("-carried:")),
+            "{:?}",
+            c.carry_add
+        );
+    }
     // Two retirement labels: both are named.
     let h = p
         .hygiene

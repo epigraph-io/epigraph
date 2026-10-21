@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::{LabelDedupError, Section};
 
 /// The only schema id this engine accepts.
-pub const PROFILE_SCHEMA: &str = "label-dedup-profile/v1";
+pub const PROFILE_SCHEMA: &str = "label-dedup-profile/v2";
 
 /// BLAKE3 of the exact profile bytes, lowercase hex. The pin a workflow step
 /// records, and the value `profile_hash` arguments are checked against.
@@ -47,6 +47,11 @@ pub struct LabelDedupProfile {
 pub struct PassProfile {
     /// (required) The index key. Retirement removes it.
     pub family_label: String,
+    /// (required) What the family is. Only an [`FamilyKind::Index`] is ever
+    /// planned: label-only cleanup is bookkeeping on an operational index (a
+    /// lead list, a signal list) and must never be pointed at a family of
+    /// knowledge claims ([`LabelDedupError::FamilyNotIndex`](super::LabelDedupError::FamilyNotIndex)).
+    pub family_kind: FamilyKind,
     /// Extra labels the member read excludes (the closed label is always
     /// excluded). Partial retirements must NOT be listed here: they have to be
     /// loaded so hygiene can see them.
@@ -99,6 +104,20 @@ pub struct PassProfile {
     /// Required when the dedup section is planned.
     #[serde(default)]
     pub merge: Option<MergeSpec>,
+}
+
+/// What a deduplicated family is. Declared by every pass, never inferred.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FamilyKind {
+    /// An operational index (a lead list, a signal list): its members are
+    /// bookkeeping, and label hygiene on it is allowed.
+    Index,
+    /// A family of knowledge claims. Refused: duplicates there are marked
+    /// one by one through `mark_duplicate`, never by a label pass. The
+    /// default, so a pass that forgets to declare nothing is planned.
+    #[default]
+    Knowledge,
 }
 
 /// How a pair of claims was matched, strongest first.
@@ -321,10 +340,6 @@ pub struct FieldSpec {
     /// Take the canonical leading `[FLAG]` as this field's value.
     #[serde(default)]
     pub from_flag: bool,
-    /// The stem of this field's carry label: `<stem>-carried:<value>`.
-    /// Defaults to the field name.
-    #[serde(default)]
-    pub carry_label: Option<String>,
 }
 
 /// What counts as a missing value.
@@ -536,27 +551,20 @@ impl TieBreak {
 /// Cluster writes.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+///
+/// A cluster's losers are not relabelled: each becomes a
+/// [`DuplicateMark`](super::DuplicateMark) of the survivor, which the apply
+/// tool performs through the graph-native dedup act (the loser leaves the
+/// index by becoming non-current). What a loser knew stays on it and is read
+/// through the survivor's identity edges, so no later date or missing value is
+/// copied onto the survivor as a label. Only ids, which are the index's keys,
+/// are still carried.
 pub struct MergeSpec {
-    /// Must contain a `{survivor}` pointer or not; must leave the family via
-    /// `loser_remove`.
-    #[serde(default)]
-    pub loser_add: Vec<String>,
-    #[serde(default)]
-    pub loser_remove: Vec<String>,
     #[serde(default)]
     pub survivor_add: Vec<String>,
     /// Carry every loser id the survivor lacks as `<carry_label_prefix><NORM>`.
     #[serde(default)]
     pub carry_ids: bool,
-    /// Date fields whose later loser value is carried onto the survivor.
-    #[serde(default)]
-    pub carry_later_dates: Vec<String>,
-    /// Fields whose loser value is carried when the survivor has none.
-    #[serde(default)]
-    pub carry_missing: Vec<String>,
-    /// Read by the apply tool: attach loser sources to the survivor.
-    #[serde(default)]
-    pub attach_loser_sources: bool,
 }
 
 /// Past-due close-out of live members.
@@ -1133,26 +1141,15 @@ fn validate_pass(pass: &mut PassProfile, at: &str) -> Result<(), LabelDedupError
         }
     }
     if let Some(m) = &pass.merge {
-        let loser = [Var::RunTag, Var::Family, Var::Survivor];
-        check_templates(&m.loser_add, &loser, &format!("{at}merge.loser_add"))?;
-        check_templates(&m.loser_remove, &loser, &format!("{at}merge.loser_remove"))?;
         check_templates(
             &m.survivor_add,
             &[Var::RunTag, Var::Family],
             &format!("{at}merge.survivor_add"),
         )?;
-        if !leaves_family(&m.loser_remove, &pass.family_label) {
-            return Err(invalid(format!(
-                "{at}merge.loser_remove must remove {{family}}, or a retired loser clusters again"
-            )));
-        }
         if m.carry_ids && pass.ids.carry_label_prefix.is_none() {
             return Err(invalid(format!(
                 "{at}merge.carry_ids needs ids.carry_label_prefix"
             )));
-        }
-        for f in m.carry_later_dates.iter().chain(&m.carry_missing) {
-            check_field_name(pass, f, &format!("{at}merge carry fields"))?;
         }
     }
     for prefix in pass

@@ -71,6 +71,11 @@ pub struct ParsedRecord {
     pub created_at: Option<DateTime<Utc>>,
     pub facts: Facts,
     pub keys: MatchKeys,
+    /// The facts of the claims marked duplicates of this one
+    /// ([`DedupClaim::duplicates`](super::DedupClaim::duplicates)), ordered by
+    /// id. Read for a field's value (a later date) only: never for matching,
+    /// never written.
+    pub duplicate_facts: Vec<Facts>,
 }
 
 impl ParsedRecord {
@@ -115,13 +120,21 @@ pub fn parse_content(pass: &PassProfile, content: &str) -> Facts {
 /// and adding carried ids.
 #[must_use]
 pub fn parse_record(pass: &PassProfile, claim: &DedupClaim) -> ParsedRecord {
-    parse_parts(
+    let mut r = parse_parts(
         pass,
         Some(claim.id),
         &claim.content,
         &claim.labels,
         claim.created_at,
-    )
+    );
+    let mut dups: Vec<&DedupClaim> = claim.duplicates.iter().collect();
+    dups.sort_by_key(|d| d.id);
+    dups.dedup_by_key(|d| d.id);
+    r.duplicate_facts = dups
+        .into_iter()
+        .map(|d| parse_parts(pass, Some(d.id), &d.content, &d.labels, d.created_at).facts)
+        .collect();
+    r
 }
 
 /// Parse a probe candidate.
@@ -184,6 +197,7 @@ fn parse_parts(
         created_at,
         facts,
         keys,
+        duplicate_facts: Vec::new(),
     }
 }
 
