@@ -166,10 +166,13 @@ async fn snapshot(pool: &PgPool, claims: &[Uuid]) -> Vec<String> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
-    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (a, ga) = fixture::seed_agent_with_group(&pool, "author").await;
     let (b, _) = fixture::seed_agent_with_group(&pool, "other-writer").await;
     let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
-    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    // Owned by a's group (the canonical is world-owned), so every BBA moved
+    // onto the canonical changes tenancy (writer-owned) and the snapshot's
+    // tenancy columns see whether the un-mark puts it back.
+    let dup = public_claim_owned_by(&pool, a, ga, "duplicate").await;
     let supporter = fixture::seed_public_claim(&pool, b, "supporter").await;
     let supported = fixture::seed_public_claim(&pool, b, "supported").await;
     let diamond = fixture::seed_public_claim(&pool, b, "diamond source").await;
@@ -201,7 +204,7 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     let e_dia_dup = edge(&pool, diamond, dup, "corroborates").await;
     edge(&pool, diamond, canonical, "corroborates").await;
     bba(&pool, dup, frame, Some(b), Some(e_dia_dup), m.clone()).await;
-    bba(&pool, dup, frame, None, None, m.clone()).await;
+    let pooled = bba(&pool, dup, frame, None, None, m.clone()).await;
     bba(&pool, dup, frame, Some(a), None, m.clone()).await;
     bba(&pool, canonical, frame, Some(a), None, m).await;
 
@@ -227,6 +230,17 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     assert_eq!(repair.revert.deleted_bbas.len(), 1);
     let marked = snapshot(&pool, &claims).await;
     assert_ne!(before, marked, "the mark must change the snapshot");
+    let wo: (Uuid, bool) =
+        sqlx::query_as("SELECT claim_id, writer_owned FROM mass_functions WHERE id = $1")
+            .bind(pooled)
+            .fetch_one(&pool)
+            .await
+            .expect("pooled row");
+    assert_eq!(
+        wo,
+        (canonical, true),
+        "calibration: the move changed the row's tenancy"
+    );
 
     let (unmarked, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
@@ -280,6 +294,17 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     .await
     .expect_err("a stale record is refused");
     assert!(format!("{err:?}").contains("another mark"), "{err:?}");
+    let (sup, cur): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!(
+        (sup, cur),
+        (Some(canonical), false),
+        "the refusal left the second mark"
+    );
 }
 
 /// Only a dedup-marked duplicate can be un-marked: a current claim, and a
@@ -367,6 +392,17 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
             let by_stranger =
                 ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(dup))
                     .await;
+            let after_stranger: (Option<Uuid>, bool) =
+                sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+                    .bind(dup)
+                    .fetch_one(&p)
+                    .await
+                    .expect("dup");
+            assert_eq!(
+                after_stranger,
+                (Some(canonical), false),
+                "a stranger's refused un-mark wrote nothing"
+            );
             stamp(&mut conn, &p, w).await;
             let by_writer =
                 ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(dup))
@@ -378,7 +414,14 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
     .await;
     for (dup, stranger_refused, by_writer) in results {
         assert!(stranger_refused, "a stranger cannot un-mark {dup}");
-        by_writer.expect("the writer un-marks its own duplicate on the app role");
+        let unmarked = by_writer.expect("the writer un-marks its own duplicate on the app role");
+        let retracted: bool =
+            sqlx::query_scalar("SELECT valid_to IS NOT NULL FROM edges WHERE id = $1")
+                .bind(unmarked.identity_edge)
+                .fetch_one(&pool)
+                .await
+                .expect("identity edge");
+        assert!(retracted, "the act retracted the identity edge");
         let (sup, cur): (Option<Uuid>, bool) =
             sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
                 .bind(dup)
@@ -770,4 +813,126 @@ async fn a_repointed_edge_keeps_the_current_meet_when_an_endpoint_narrowed(pool:
         ("group".into(), h, Some(g)),
         "co-owned by both groups (the trigger's meet), not the recorded G-only edge"
     );
+}
+
+/// A claim retired with a PLAIN `same_as` edge (no `dedup` key) to the claim it
+/// supersedes is not a dedup-marked duplicate, and an unknown id is not found.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_refuses_a_plain_same_as_and_an_unknown_claim(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let target = fixture::seed_public_claim(&pool, a, "target").await;
+    let retired = fixture::seed_public_claim(&pool, a, "retired").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $2, is_current = false, embedding = NULL WHERE id = $1",
+    )
+    .bind(retired)
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("retire");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'same_as')",
+    )
+    .bind(retired)
+    .bind(target)
+    .execute(&pool)
+    .await
+    .expect("a plain same_as");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(retired))
+        .await
+        .expect_err("not a dedup mark");
+    assert!(
+        format!("{err:?}").contains("no dedup identity edge"),
+        "{err:?}"
+    );
+    let err =
+        ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(Uuid::new_v4()))
+            .await
+            .expect_err("unknown");
+    assert!(
+        matches!(err, epigraph_db::DbError::NotFound { .. }),
+        "{err:?}"
+    );
+}
+
+/// The reversal leaves alone, and reports, rows a later write changed: a frame
+/// binding the canonical now needs for an input of its own, a pooled row a
+/// later write moved elsewhere, and a re-pointed edge retracted since.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_reports_and_leaves_rows_a_later_write_changed(pool: PgPool) {
+    let (a, ga) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "other").await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "later writer").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = public_claim_owned_by(&pool, a, ga, "duplicate").await;
+    let elsewhere = fixture::seed_public_claim(&pool, c, "elsewhere").await;
+    let supporter = fixture::seed_public_claim(&pool, b, "supporter").await;
+    let e = edge(&pool, supporter, dup, "supports").await;
+    let frame = FrameRepository::create(
+        &pool,
+        "binary_truth",
+        None,
+        &["TRUE".into(), "FALSE".into()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    FrameRepository::assign_claim(&pool, dup, frame, Some(0))
+        .await
+        .expect("bind dup");
+    let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let moved_later = bba(&pool, dup, frame, Some(a), None, m.clone()).await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(repair.revert.copied_frames, vec![frame], "calibration");
+    assert_eq!(repair.retargeted_edges, vec![e], "calibration");
+
+    // Later writes: an input of the canonical's own on that frame; the pooled
+    // row moved to another claim; the re-pointed edge retracted.
+    bba(&pool, canonical, frame, Some(c), None, m).await;
+    sqlx::query("UPDATE mass_functions SET claim_id = $2 WHERE id = $1")
+        .bind(moved_later)
+        .bind(elsewhere)
+        .execute(&pool)
+        .await
+        .expect("moved by a later write");
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(e)
+        .execute(&pool)
+        .await
+        .expect("retracted later");
+
+    let reversal = unmark(&pool, dup, &repair.revert).await;
+    for id in [frame, moved_later, e] {
+        assert!(
+            reversal.drifted.contains(&id),
+            "{id} reported drifted: {:?}",
+            reversal.drifted
+        );
+    }
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM claim_frames WHERE claim_id = $1 AND frame_id = $2)",
+    )
+    .bind(canonical)
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("binding");
+    assert!(bound, "the canonical keeps the binding its own input needs");
+    let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+        .bind(moved_later)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(
+        on, elsewhere,
+        "the moved row stays where the later write put it"
+    );
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(target, canonical, "a retracted edge is not re-pointed");
 }
