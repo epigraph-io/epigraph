@@ -188,6 +188,7 @@ fn content_hash_ok_is_seed_aware() {
         &plain[..16],
         &json!({"level": 2})
     ));
+    assert!(!content_hash_ok(NAME, text, &scoped[..16], &scoped_props(2)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -429,7 +430,56 @@ fn a_tampered_item_is_flagged_per_item() {
         .collect();
     assert_eq!(oks.iter().filter(|ok| !**ok).count(), 1);
     assert!(!oks[2]);
-    assert_ne!(p["digest_echo"], vectors()["ingest"]["wfd1"]);
+    assert_eq!(flags(&p), (0, 0, 0, 0, 0));
+    let echo = p["digest_echo"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a per-item flag does not withhold the echo: {p}"));
+    assert_ne!(echo, vectors()["ingest"]["wfd1"].as_str().unwrap());
+}
+
+/// A hidden target at the END of the plan leaves no gap, so the hidden count
+/// alone withholds the echo: no other flag is raised.
+#[test]
+fn a_hidden_tail_target_withholds_the_echo_by_its_count_alone() {
+    let mut edges = readable_edges();
+    let hidden = edges[8].target_id;
+    edges[8].target = None;
+    let p = plan_json(edges);
+    assert_eq!(flags(&p), (1, 0, 0, 0, 0));
+    assert_eq!(p["items"].as_array().unwrap().len(), 8);
+    assert!(!p.to_string().contains(&hidden.to_string()));
+    assert_eq!(p["digest_echo"], Value::Null);
+}
+
+/// A tenth readable edge reusing the last index: a duplicate with no gap, so
+/// the duplicate count alone withholds the echo.
+#[test]
+fn a_duplicate_tail_index_withholds_the_echo_by_its_count_alone() {
+    let mut edges = readable_edges();
+    let mut extra = edges[8].clone();
+    extra.target_id = Uuid::from_u128(0xac0e_0001);
+    edges.push(extra);
+    let p = plan_json(edges);
+    assert_eq!(flags(&p), (0, 0, 0, 1, 0));
+    assert_eq!(p["items"].as_array().unwrap().len(), 10);
+    assert_eq!(p["digest_echo"], Value::Null);
+}
+
+/// PM-7 reaches every edge property, not only `plan_index`: a group writer
+/// rewrites an atom edge's integer `level` from 3 to 2. The read reports the
+/// level the edge now carries (it does not cross-check the claim), raises no
+/// count, and the echo moves off the published digest.
+#[test]
+fn a_rewritten_integer_level_is_reported_and_moves_the_digest() {
+    let v = vectors();
+    let mut edges = readable_edges();
+    assert_eq!(edges[3].properties["level"], json!(3), "calibration: an atom");
+    edges[3].properties["level"] = json!(2);
+    let p = plan_json(edges);
+    assert_eq!(flags(&p), (0, 0, 0, 0, 0));
+    assert_eq!(p["items"][3]["level"], json!(2));
+    let echo = p["digest_echo"].as_str().expect("a well-formed plan echoes");
+    assert_ne!(echo, v["ingest"]["wfd1"].as_str().unwrap());
 }
 
 #[test]
