@@ -24,6 +24,11 @@ fn csv(ids: &[Uuid]) -> String {
         .join(",")
 }
 
+/// The bypass viewer a privileged (harness superuser) session acts with.
+async fn bypass_viewer(pool: &PgPool) -> Viewer {
+    fixture::bypass(pool).await.1
+}
+
 async fn stamp(conn: &mut PgConnection, pool: &PgPool, agent: Uuid) {
     let v = Viewer::resolve(pool, agent).await.expect("resolve viewer");
     let groups = csv(v.group_bind().expect("scoped viewer"));
@@ -244,6 +249,7 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
 
     let (unmarked, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(dup),
         &repair.revert,
     )
@@ -288,6 +294,7 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     // And the first mark's record no longer matches the duplicate.
     let err = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(dup),
         &repair.revert,
     )
@@ -342,9 +349,13 @@ async fn unmark_refuses_a_claim_no_dedup_marked(pool: PgPool) {
 
     let mut conn = pool.acquire().await.expect("acquire");
     for (what, id) in [("a current claim", current), ("a consolidated source", s1)] {
-        let err = ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(id))
-            .await
-            .expect_err(what);
+        let err = ClaimRepository::unmark_duplicate_act_conn(
+            &mut conn,
+            &bypass_viewer(&pool).await,
+            ClaimId::from_uuid(id),
+        )
+        .await
+        .expect_err(what);
         assert!(
             format!("{err:?}").contains("nothing was written"),
             "{what}: {err:?}"
@@ -389,9 +400,13 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
             .await
             .expect("the writer marks");
             stamp(&mut conn, &p, stranger).await;
-            let by_stranger =
-                ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(dup))
-                    .await;
+            let stranger_viewer = Viewer::resolve(&p, stranger).await.expect("viewer");
+            let by_stranger = ClaimRepository::unmark_duplicate_act_conn(
+                &mut conn,
+                &stranger_viewer,
+                ClaimId::from_uuid(dup),
+            )
+            .await;
             let after_stranger: (Option<Uuid>, bool) =
                 sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
                     .bind(dup)
@@ -404,9 +419,13 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
                 "a stranger's refused un-mark wrote nothing"
             );
             stamp(&mut conn, &p, w).await;
-            let by_writer =
-                ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(dup))
-                    .await;
+            let writer_viewer = Viewer::resolve(&p, w).await.expect("viewer");
+            let by_writer = ClaimRepository::unmark_duplicate_act_conn(
+                &mut conn,
+                &writer_viewer,
+                ClaimId::from_uuid(dup),
+            )
+            .await;
             out.push((dup, by_stranger.is_err(), by_writer));
         }
         (conn, out)
@@ -482,6 +501,7 @@ async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: 
 
     let (_, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(dup),
         &repair.revert,
     )
@@ -563,6 +583,7 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
 
     let err = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(d1),
         &r1.revert,
     )
@@ -572,6 +593,7 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
 
     ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(c1),
         &r2.revert,
     )
@@ -579,6 +601,7 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
     .expect("un-mark c1");
     let (_, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
         &mut conn,
+        &bypass_viewer(&pool).await,
         ClaimId::from_uuid(d1),
         &r1.revert,
     )
@@ -623,10 +646,15 @@ async fn unmark(
     record: &epigraph_db::DedupRevert,
 ) -> epigraph_db::DedupReversal {
     let mut conn = pool.acquire().await.expect("acquire");
-    ClaimRepository::unmark_duplicate_with_reversal_conn(&mut conn, ClaimId::from_uuid(dup), record)
-        .await
-        .expect("unmark")
-        .1
+    ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        &bypass_viewer(pool).await,
+        ClaimId::from_uuid(dup),
+        record,
+    )
+    .await
+    .expect("unmark")
+    .1
 }
 
 /// A BBA returns to the duplicate with the tenancy the record kept only while
@@ -840,17 +868,24 @@ async fn unmark_refuses_a_plain_same_as_and_an_unknown_claim(pool: PgPool) {
     .await
     .expect("a plain same_as");
     let mut conn = pool.acquire().await.expect("acquire");
-    let err = ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(retired))
-        .await
-        .expect_err("not a dedup mark");
+    let err = ClaimRepository::unmark_duplicate_act_conn(
+        &mut conn,
+        &bypass_viewer(&pool).await,
+        ClaimId::from_uuid(retired),
+    )
+    .await
+    .expect_err("not a dedup mark");
     assert!(
         format!("{err:?}").contains("no dedup identity edge"),
         "{err:?}"
     );
-    let err =
-        ClaimRepository::unmark_duplicate_act_conn(&mut conn, ClaimId::from_uuid(Uuid::new_v4()))
-            .await
-            .expect_err("unknown");
+    let err = ClaimRepository::unmark_duplicate_act_conn(
+        &mut conn,
+        &bypass_viewer(&pool).await,
+        ClaimId::from_uuid(Uuid::new_v4()),
+    )
+    .await
+    .expect_err("unknown");
     assert!(
         matches!(err, epigraph_db::DbError::NotFound { .. }),
         "{err:?}"

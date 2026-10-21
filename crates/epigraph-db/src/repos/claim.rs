@@ -7875,18 +7875,24 @@ impl ClaimRepository {
     /// claim that is not a marked duplicate or a refused statement.
     pub async fn unmark_duplicate_act_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         dup: ClaimId,
     ) -> Result<UnmarkedDuplicate, DbError> {
         use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let mut tx = conn.begin().await?;
-        let row: Option<(Option<Uuid>, bool)> = sqlx::query_as(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT supersedes, COALESCE(is_current, true) FROM claims WHERE id = $1 FOR UPDATE"#,
-        )
-        .bind(dup_uuid)
-        .fetch_optional(&mut *tx)
-        .await?;
+        // Every read below is filtered by the viewer, like the writes: a claim
+        // or edge it cannot read is "not marked", never an existence oracle.
+        let sql = viewer.splice(
+            "SELECT c.supersedes, COALESCE(c.is_current, true) FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */ FOR UPDATE",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Option<Uuid>, bool)>(&sql).bind(dup_uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(&mut *tx).await?;
         let Some((supersedes, current)) = row else {
             return Err(DbError::NotFound {
                 entity: "Claim".into(),
@@ -7902,28 +7908,34 @@ impl ClaimRepository {
             (Some(c), false) => c,
             _ => return Err(not_marked("is not a retired duplicate")),
         };
-        let identity_edge: Option<Uuid> = sqlx::query_scalar(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT id FROM edges
-             WHERE source_id = $1 AND source_type = 'claim'
-               AND target_id = $2 AND target_type = 'claim'
-               AND relationship = $3 AND valid_to IS NULL AND properties ? $4
-             ORDER BY created_at DESC, id DESC LIMIT 1
-             FOR UPDATE"#,
-        )
-        .bind(dup_uuid)
-        .bind(canonical)
-        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
-        .bind(DUPLICATE_IDENTITY_PROPERTY)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let canonical_current: Option<bool> = sqlx::query_scalar(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
-        )
-        .bind(canonical)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.created_at DESC, e.id DESC LIMIT 1 FOR UPDATE",
+            5,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(dup_uuid)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let identity_edge = q.fetch_optional(&mut *tx).await?;
+        let sql = viewer.splice(
+            "SELECT COALESCE(c.is_current, true) FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(canonical);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let canonical_current = q.fetch_optional(&mut *tx).await?;
         if canonical_current == Some(false) {
             // A chain (this duplicate's canonical was itself marked, or
             // retired): this mark's repaired rows have moved on from the
@@ -7938,19 +7950,28 @@ impl ClaimRepository {
                  another act, or marked before identity edges were recorded)",
             ));
         };
-        let restored = sqlx::query(
-            "UPDATE claims SET supersedes = NULL, is_current = true, updated_at = NOW() \
-             WHERE id = $1",
-        )
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        let retracted = sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
-            .bind(identity_edge)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        // Both writes carry the write predicate: on an application session the
+        // viewer's writable groups, on the maintenance session (a bypass
+        // viewer) nothing, as row security decides there too.
+        let claim_sql = viewer.splice_write(
+            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW() \
+              WHERE c.id = $1 /* {WRITABLE:c} */",
+            2,
+        );
+        let mut q = sqlx::query(&claim_sql).bind(dup_uuid);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let restored = q.execute(&mut *tx).await?.rows_affected();
+        let edge_sql = viewer.splice_write(
+            "UPDATE edges AS e SET valid_to = now() WHERE e.id = $1 /* {WRITABLE:e} */",
+            2,
+        );
+        let mut q = sqlx::query(&edge_sql).bind(identity_edge);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let retracted = q.execute(&mut *tx).await?.rows_affected();
         if restored != 1 || retracted != 1 {
             return Err(not_marked(
                 "or its identity edge is not writable by this session",
@@ -8043,6 +8064,7 @@ impl ClaimRepository {
     /// [`Self::reverse_marked_duplicate_conn`].
     pub async fn unmark_duplicate_with_reversal_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         dup: ClaimId,
         record: &DedupRevert,
     ) -> Result<(UnmarkedDuplicate, DedupReversal), DbError> {
@@ -8053,7 +8075,7 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
-        let unmarked = Self::unmark_duplicate_act_conn(&mut tx, dup).await?;
+        let unmarked = Self::unmark_duplicate_act_conn(&mut tx, viewer, dup).await?;
         if record.identity_edge != Some(unmarked.identity_edge) {
             return Err(DbError::InvalidData {
                 reason: format!(

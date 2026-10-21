@@ -854,9 +854,13 @@ pub async fn apply_unmark(
     let mut tx = sqlx::Acquire::begin(&mut *admin)
         .await
         .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
-    let unmarked = ClaimRepository::unmark_duplicate_act_conn(&mut tx, ClaimId::from_uuid(dup_id))
-        .await
-        .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
+    let unmarked = ClaimRepository::unmark_duplicate_act_conn(
+        &mut tx,
+        admin_viewer,
+        ClaimId::from_uuid(dup_id),
+    )
+    .await
+    .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
     let canonical_id = unmarked.canonical;
     // The act locked the duplicate's row; the mark it found must be the one
     // the caller was authorized against (read earlier, on its own transaction).
