@@ -1174,6 +1174,15 @@ impl ClaimRepository {
     /// internal callers of this method are migrated as a separate
     /// out-of-band task.
     ///
+    /// **Concurrency:** a first, unlocked find answers a dedup HIT on an
+    /// already-committed row without taking any lock. On a miss, the find is
+    /// re-run and the insert made under [`Self::lock_content_hash_agent`] for
+    /// the `(content_hash, agent_id)` the INSERT writes, inside one scope (a
+    /// real `BEGIN` on a bare connection, a SAVEPOINT in a caller's
+    /// transaction). Two concurrent first creates of one pair therefore yield
+    /// one row, and the lock is shared with `create_or_get`. Creates of the
+    /// same content by DIFFERENT agents are not serialized against each other.
+    ///
     /// `decl` declares the row's tenancy. Migration 074 drops the
     /// `visibility` / `owner_group_id` defaults, so a write that names neither
     /// and has no parent to inherit from raises `23502`. This method's INSERT
@@ -1214,6 +1223,91 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
+        use sqlx::Acquire;
+
+        // A dedup HIT on an already-committed row is answered here, unlocked
+        // and outside any scope, exactly as before the dedup lock existed. Only
+        // a MISS goes on to take the lock: inside `ingest_document`'s document
+        // transaction a lock taken on a hit would be held until the whole
+        // document commits, so two same-author ingests sharing pre-existing
+        // atoms would serialize (and could deadlock) on rows neither writes.
+        // This find decides nothing on a miss; the one under the lock does.
+        let content_hash = ContentHasher::hash(claim.content.as_bytes());
+        if let Some(existing) =
+            Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
+        {
+            return Ok(existing);
+        }
+
+        // The serialization scope, exactly as in `create_or_get_signed`: a real
+        // BEGIN on a bare connection (the `create(pool)` path, where an
+        // advisory xact lock taken in autocommit would be released at the end
+        // of its own statement), a SAVEPOINT inside the caller's transaction
+        // (the lock then lives until the caller's transaction ends). Closed
+        // explicitly on every path below.
+        let mut scope = conn
+            .begin()
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        match Self::create_conn_serialized(&mut scope, claim, decl).await {
+            Ok(out) => {
+                scope
+                    .commit()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Ok(out)
+            }
+            Err(e) => {
+                scope
+                    .rollback()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The legacy content-hash dedup probe of [`Self::create_conn`]: any row
+    /// with this `content_hash`, by any agent. Run twice by a create that
+    /// misses: unlocked first (a hit returns without taking the dedup lock),
+    /// then again under the lock, where its answer decides the insert.
+    async fn find_by_content_hash_legacy_conn(
+        conn: &mut sqlx::PgConnection,
+        content_hash: &[u8],
+    ) -> Result<Option<Claim>, DbError> {
+        let existing = sqlx::query!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+               FROM claims WHERE content_hash = $1 LIMIT 1"#,
+            content_hash
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        existing
+            .map(|row| {
+                let tv = TruthValue::new(row.truth_value)?;
+                Ok(claim_from_row(
+                    row.id,
+                    row.content,
+                    row.agent_id,
+                    row.trace_id,
+                    tv,
+                    row.created_at,
+                    row.updated_at,
+                ))
+            })
+            .transpose()
+    }
+
+    /// The miss path of [`Self::create_conn`], run inside its serialization
+    /// scope: the `(content_hash, agent_id)` dedup lock, the legacy
+    /// content-hash find again (now deciding), then the insert.
+    async fn create_conn_serialized(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+    ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -1224,29 +1318,23 @@ impl ClaimRepository {
         // Calculate content hash using BLAKE3
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
-        // Dedup: if a claim with this content already exists, return it instead of
-        // inserting a duplicate. Two round-trips are acceptable; the race window is
-        // tiny and duplicate claims are idempotent in practice.
-        let existing = sqlx::query!(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-               FROM claims WHERE content_hash = $1 LIMIT 1"#,
-            content_hash.as_slice()
-        )
-        .fetch_optional(&mut *conn)
-        .await?;
+        // Serialize against every other find-then-insert of this
+        // `(content_hash, agent_id)` — `create_or_get`, POST /claims, a
+        // consolidation, and another caller of this method — before the
+        // deciding find (backlog 00f1a517). Without it two first creates both
+        // miss the find (neither can see the other's uncommitted row) and both
+        // insert. The find stays content-hash-only (the legacy contract); the
+        // lock serializes the pair the INSERT writes.
+        Self::lock_content_hash_agent(&mut *conn, content_hash.as_slice(), agent_id).await?;
 
-        if let Some(existing_row) = existing {
-            let tv = TruthValue::new(existing_row.truth_value)?;
-            return Ok(claim_from_row(
-                existing_row.id,
-                existing_row.content,
-                existing_row.agent_id,
-                existing_row.trace_id,
-                tv,
-                existing_row.created_at,
-                existing_row.updated_at,
-            ));
+        // Dedup, re-run under the lock: a new statement under READ COMMITTED,
+        // so it sees a row a previous lock holder committed after
+        // `create_conn`'s unlocked probe missed. If a claim with this content
+        // now exists, return it instead of inserting a duplicate.
+        if let Some(existing) =
+            Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
+        {
+            return Ok(existing);
         }
 
         let row = sqlx::query!(
@@ -2366,7 +2454,7 @@ impl ClaimRepository {
     /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
-    /// Uses runtime query (not compile-time macro) to support the connection executor.
+    /// Delegates to [`Self::create_conn`], which is the same contract.
     ///
     /// **Legacy behavior:** see the note on `create()` — this method shares
     /// the same cross-agent collapse bug. New transactional code should use
@@ -2379,88 +2467,10 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
-        let id: Uuid = claim.id.into();
-        let agent_id: Uuid = claim.agent_id.into();
-        let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
-        let truth_value = claim.truth_value.value();
-        let created_at = claim.created_at;
-        let updated_at = claim.updated_at;
-        let content_hash = ContentHasher::hash(claim.content.as_bytes());
-
-        use sqlx::Row;
-
-        // Dedup check within the same transaction
-        let existing = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-             FROM claims WHERE content_hash = $1 LIMIT 1"#,
-        )
-        .bind(content_hash.as_slice())
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        if let Some(existing_row) = existing {
-            let truth_val: f64 = existing_row.get("truth_value");
-            let tv = TruthValue::new(truth_val)?;
-            return Ok(claim_from_row(
-                existing_row.get("id"),
-                existing_row.get("content"),
-                existing_row.get("agent_id"),
-                existing_row.get("trace_id"),
-                tv,
-                existing_row.get("created_at"),
-                existing_row.get("updated_at"),
-            ));
-        }
-
-        let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
-        )
-        .bind(id)
-        .bind(&claim.content)
-        .bind(content_hash.as_slice())
-        .bind(truth_value)
-        .bind(agent_id)
-        .bind(trace_id)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(decl.visibility_bind())
-        .bind(decl.owner_group_bind())
-        .fetch_one(&mut *conn)
-        .await?;
-
-        let row_id: Uuid = row.get("id");
-        let row_agent_id: Uuid = row.get("agent_id");
-        let row_truth_value: f64 = row.get("truth_value");
-
-        // Fire-and-forget claim.created event (closes #61). Same rationale
-        // as the create() method: emitted only on the post-INSERT branch
-        // (the dedup early-return above does not reach here). Uses
-        // publish_or_log_conn so the event rides the caller's transaction.
-        let _ = crate::repos::EventRepository::publish_or_log_conn(
-            &mut *conn,
-            "claim.created",
-            Some(row_agent_id),
-            &serde_json::json!({
-                "claim_id": row_id,
-                "agent_id": row_agent_id,
-                "truth_value": row_truth_value,
-            }),
-        )
-        .await;
-
-        let tv = TruthValue::new(row_truth_value)?;
-        Ok(claim_from_row(
-            row_id,
-            row.get("content"),
-            row_agent_id,
-            row.get("trace_id"),
-            tv,
-            row.get("created_at"),
-            row.get("updated_at"),
-        ))
+        // One implementation of the legacy find-then-insert, so this entry point
+        // takes the same `(content_hash, agent_id)` dedup lock (backlog
+        // 00f1a517) and emits the same `claim.created` event.
+        Self::create_conn(conn, claim, decl).await
     }
 
     /// The authoring agent of a claim, or `None` when no such claim exists.
@@ -5674,8 +5684,10 @@ impl ClaimRepository {
     ///
     /// # How a caller must use it
     ///
-    /// Take it as its OWN statement, inside a transaction, BEFORE the find, and
-    /// keep that transaction open until the insert commits. A
+    /// Take it as its OWN statement, inside a transaction, BEFORE the find whose
+    /// answer decides the insert, and keep that transaction open until the
+    /// insert commits. An earlier unlocked find may answer a hit on its own (a
+    /// committed row is a committed row); it must not decide a miss. A
     /// `pg_advisory_xact_lock` is released at the end of the transaction that
     /// took it — on an autocommit connection that is the end of this very
     /// statement, which serializes nothing. Under READ COMMITTED the find,
@@ -5688,6 +5700,66 @@ impl ClaimRepository {
     ///
     /// A caller that creates many claims in one transaction holds one lock per
     /// distinct pair until it commits, in input order.
+    ///
+    /// # Who takes it
+    ///
+    /// Every writer that looks for an existing row of the pair (or of its
+    /// content hash) and inserts on a miss: [`Self::create_or_get`] /
+    /// [`Self::create_or_get_signed`], POST /claims' duplicate check
+    /// (`if_not_exists=false`), the legacy content-hash creates
+    /// ([`Self::create_conn`], and [`Self::create`] / [`Self::create_with_tx`],
+    /// which delegate to it), [`Self::consolidate_act_conn`]'s "identical
+    /// merged claim already exists" probe, and the `method_search` maintenance
+    /// binary in `epigraph-cli`. Each takes it BEFORE the find that decides its
+    /// insert, and before any row lock of its own. `create_conn` and
+    /// `method_search` first run an unlocked find that answers only a hit.
+    ///
+    /// Writers that do not take it:
+    ///
+    /// - [`Self::create_strict`] and the other unconditional INSERTs
+    ///   (supersede, `evolve_step`, `batch_create`, hypothesis creation) have
+    ///   no find, so there is no check-then-act to race.
+    /// - [`Self::create_with_id_if_absent`] and the ingest-executor's
+    ///   workflow `add_step` dedup on a caller-derived deterministic id
+    ///   (`ON CONFLICT (id)`), which the primary key already serializes among
+    ///   their own callers; one id means one pair. They have NO pair dedup at
+    ///   all, so they do not dedup against a random-id row of the same pair:
+    ///   a [`Self::create_or_get`] of exact atom text by the same agent,
+    ///   committed earlier or running concurrently, followed by a
+    ///   deterministic-id create of that atom, leaves two rows of the pair.
+    ///   Taking this lock without adding a pair find would close neither
+    ///   case, so the gap stays open here and is tracked separately.
+    /// - `policies.rs::create_challenge` finds on the pair PLUS the
+    ///   `policy:challenge` label and serializes its own callers under
+    ///   `'epigraph.policy_challenge'`. A non-challenge row of the same pair
+    ///   does not satisfy its find, so the shared key would not change its
+    ///   outcome.
+    ///
+    /// A concurrent writer of the same pair that does not take this lock can
+    /// still add a row that a lock holder's find did not see.
+    ///
+    /// # Deadlocks and lock-table use
+    ///
+    /// The ingest atoms reach it through [`Self::create_conn`] inside one
+    /// document transaction. `create_conn` answers a hit on an
+    /// already-committed atom with an unlocked find and takes the lock only
+    /// on a MISS, so an ingest holds one lock per NEWLY INSERTED atom until it
+    /// commits; atoms that already existed cost no lock and add no wait.
+    /// Ingest against ingest keeps the wait graph it had without the lock: a
+    /// miss is an atom some concurrent ingest may be inserting, and since an
+    /// atom's id is `atom_id(content_hash)` an overlapping same-author ingest
+    /// already waited on the other's uncommitted primary-key entry (and then
+    /// failed on that key instead of returning the first's row). New: a
+    /// same-author ingest against a multi-pair [`Self::create_or_get`]
+    /// transaction or a consolidation into the same content, meeting shared
+    /// NEW pairs in opposite orders, can now deadlock (40P01, retryable) where
+    /// it previously minted a duplicate.
+    ///
+    /// Every lock held until commit takes a slot in the shared lock table
+    /// (`max_locks_per_transaction` x (`max_connections` +
+    /// `max_prepared_transactions`)), which the primary-key waits did not. A
+    /// document with very many new atoms, or several concurrent large ones,
+    /// uses correspondingly many slots.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the lock statement fails.
@@ -5873,7 +5945,8 @@ impl ClaimRepository {
     /// caller's still-uncommitted row from being missed.
     ///
     /// **Belt-and-braces catch:** a writer that inserts the pair WITHOUT the
-    /// lock can still win between the find and the insert. Where a unique
+    /// lock (see [`Self::lock_content_hash_agent`], "Who takes it") can still
+    /// win between the find and the insert. Where a unique
     /// constraint on the pair exists, the INSERT then fails; this helper
     /// catches that error, re-runs the find, and returns the resulting row with
     /// `was_created=false`. Without such a constraint that writer's row is a
@@ -9315,6 +9388,19 @@ impl ClaimRepository {
 
         let mut tx = conn.begin().await?;
 
+        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
+
+        // Serialize every find-then-insert of the merged claim's
+        // `(content_hash, acting agent)` — another consolidation into the same
+        // content, `create_or_get`, POST /claims, the legacy creates — before
+        // the "already exists" probe below (backlog 00f1a517). Without it two
+        // concurrent merges into identical content both miss the probe and
+        // both insert. Taken FIRST, before the sources' row locks: a merge
+        // then never holds a source row lock while it waits on the pair, which
+        // is the order every other holder of this lock uses (pair lock, then
+        // its own row writes).
+        Self::lock_content_hash_agent(&mut tx, content_hash.as_slice(), acting_agent_id).await?;
+
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.
         let locked = sqlx::query!(
@@ -9489,11 +9575,10 @@ impl ClaimRepository {
             }
         }
 
-        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
-
-        // Post-107 (content_hash, agent_id) uniqueness: an identical merged
-        // claim by this agent is returned rather than erroring (novelty-gate
-        // style), so a retried merge is idempotent instead of fatal.
+        // An identical merged claim by this agent is returned rather than
+        // inserted again (novelty-gate style), so a retried merge is idempotent
+        // instead of minting a second row. Runs under the pair lock taken above,
+        // so a concurrent merge's committed row is visible here.
         if let Some(existing) = sqlx::query!(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2"#,
