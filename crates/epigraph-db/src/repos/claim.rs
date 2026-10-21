@@ -7885,6 +7885,21 @@ impl ClaimRepository {
         .bind(DUPLICATE_IDENTITY_PROPERTY)
         .fetch_optional(&mut *tx)
         .await?;
+        let canonical_current: Option<bool> = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
+        )
+        .bind(canonical)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if canonical_current == Some(false) {
+            // A chain (this duplicate's canonical was itself marked, or
+            // retired): this mark's repaired rows have moved on from the
+            // canonical, so reversing it now would only report them drifted.
+            return Err(not_marked(&format!(
+                "supersedes {canonical}, which is itself retired; un-mark {canonical} first"
+            )));
+        }
         let Some(identity_edge) = identity_edge else {
             return Err(not_marked(
                 "has no dedup identity edge to the claim it supersedes (it was retired by \
@@ -10838,6 +10853,7 @@ async fn repair_marked_duplicate(
          WHERE e.target_id = $2 AND e.target_type = 'claim'
          AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
          AND NOT (e.relationship = ANY($3))
+         AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
          AND e.source_type = 'claim' AND e.source_id != $1
          AND e.valid_to IS NULL
          AND EXISTS (
@@ -10867,6 +10883,7 @@ async fn repair_marked_duplicate(
              WHERE e.source_id = $2 AND e.source_type = 'claim'
              AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
              AND NOT (e.relationship = ANY($3))
+             AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
              AND e.target_type = 'claim' AND e.target_id != $1
              AND e.valid_to IS NULL
              AND EXISTS (
@@ -10971,6 +10988,9 @@ async fn repair_marked_duplicate(
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = ANY($3)) \
+           -- A dedup identity edge names the claim its duplicate SUPERSEDES;
+           -- it stays with it when that claim is itself marked a duplicate.
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(canon_uuid)
@@ -11203,6 +11223,7 @@ async fn repair_marked_duplicate(
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (target_type = 'claim' AND target_id = $1) \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id, target_id, relationship, target_type",
     )
     .bind(canon_uuid)
