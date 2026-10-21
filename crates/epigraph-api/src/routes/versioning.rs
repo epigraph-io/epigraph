@@ -1019,19 +1019,23 @@ pub async fn unmark_duplicate(
         Some(canonical_id),
     );
     let (conn, admin_viewer) = session.split();
-    let (outcome, belief_cascade) =
-        epigraph_engine::admin_cascade::apply_unmark(conn, admin_viewer, &viewer, &trigger, dup_id)
-            .await
-            .map_err(|e| match e {
-                epigraph_engine::admin_cascade::UnmarkRefusal::Failed(_) => {
-                    ApiError::InternalError {
-                        message: e.to_string(),
-                    }
-                }
-                other => ApiError::Conflict {
-                    reason: other.to_string(),
-                },
-            })?;
+    let (outcome, belief_cascade) = epigraph_engine::admin_cascade::apply_unmark(
+        conn,
+        admin_viewer,
+        &viewer,
+        &trigger,
+        dup_id,
+        canonical_id,
+    )
+    .await
+    .map_err(|e| match e {
+        epigraph_engine::admin_cascade::UnmarkRefusal::Failed(_) => ApiError::InternalError {
+            message: e.to_string(),
+        },
+        other => ApiError::Conflict {
+            reason: other.to_string(),
+        },
+    })?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.

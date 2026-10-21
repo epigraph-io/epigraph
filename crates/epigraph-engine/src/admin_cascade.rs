@@ -839,13 +839,16 @@ impl std::fmt::Display for UnmarkRefusal {
 /// transaction and rolling it back.
 ///
 /// # Errors
-/// [`UnmarkRefusal`]: nothing was changed.
+/// [`UnmarkRefusal`]: nothing was changed. `expected_canonical` is the
+/// canonical the caller's authority was checked against; a duplicate marked
+/// onto any other is refused as [`UnmarkRefusal::Act`].
 pub async fn apply_unmark(
     admin: &mut sqlx::PgConnection,
     admin_viewer: &Viewer,
     caller: &Viewer,
     trigger: &CascadeTrigger,
     dup_id: Uuid,
+    expected_canonical: Uuid,
 ) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
     use epigraph_core::ClaimId;
     let mut tx = sqlx::Acquire::begin(&mut *admin)
@@ -855,6 +858,15 @@ pub async fn apply_unmark(
         .await
         .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
     let canonical_id = unmarked.canonical;
+    // The act locked the duplicate's row; the mark it found must be the one
+    // the caller was authorized against (read earlier, on its own transaction).
+    if canonical_id != expected_canonical {
+        return Err(UnmarkRefusal::Act(format!(
+            "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
+             {expected_canonical}, which the caller's authority was checked against; \
+             nothing was changed"
+        )));
+    }
     let failed = |e: String| UnmarkRefusal::Failed(e);
     let record = audit::dedup_revert_record(&mut *tx, dup_id, unmarked.identity_edge)
         .await

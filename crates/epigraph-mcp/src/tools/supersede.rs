@@ -416,7 +416,7 @@ pub async fn unmark_duplicate(
     );
     let (conn, admin_viewer) = session.split();
     let (outcome, belief_cascade) =
-        admin_cascade::apply_unmark(conn, admin_viewer, viewer, &trigger, dup)
+        admin_cascade::apply_unmark(conn, admin_viewer, viewer, &trigger, dup, canonical)
             .await
             .map_err(|e| match e {
                 admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
