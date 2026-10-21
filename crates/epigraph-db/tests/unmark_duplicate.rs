@@ -728,3 +728,46 @@ async fn a_restore_whose_evidence_is_gone_drifts_instead_of_failing(pool: PgPool
         "the rest is restored"
     );
 }
+
+/// The recorded edge tenancy is put back only where the trigger cannot derive
+/// it (both endpoints public): if an endpoint went private after the mark, the
+/// edge keeps the meet of its endpoints NOW, never a recorded group that would
+/// show it to a group that may not read the endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repointed_edge_keeps_the_current_meet_when_an_endpoint_narrowed(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (x, h) = fixture::seed_agent_with_group(&pool, "other").await;
+    let dup = fixture::seed_group_claim(&pool, w, g, "private duplicate").await;
+    let canonical = fixture::seed_group_claim(&pool, w, g, "private canonical").await;
+    let supporter = fixture::seed_public_claim(&pool, x, "public supporter").await;
+    let e = edge(&pool, supporter, dup, "supports").await;
+    let tenancy = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, Uuid, Option<Uuid>)>(
+            "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+        )
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge")
+    };
+    assert_eq!(
+        tenancy(pool.clone()).await,
+        ("group".into(), g, None),
+        "calibration"
+    );
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(repair.retargeted_edges, vec![e]);
+    // The supporter goes private to another group after the mark.
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(supporter)
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("the supporter narrows");
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        tenancy(pool.clone()).await,
+        ("group".into(), h, Some(g)),
+        "co-owned by both groups (the trigger's meet), not the recorded G-only edge"
+    );
+}
