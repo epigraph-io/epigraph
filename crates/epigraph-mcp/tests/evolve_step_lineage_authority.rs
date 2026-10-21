@@ -110,6 +110,8 @@ async fn ingest_as(
         viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical),
+            tenancy: None,
+            embed: None,
         },
         Some(auth),
     )
