@@ -627,6 +627,21 @@ pub const DUPLICATE_IDENTITY_RELATIONSHIP: &str = "same_as";
 /// assertion and no dedup reads or retracts it.
 pub const DUPLICATE_IDENTITY_PROPERTY: &str = "dedup";
 
+/// Whether an application edge write's `properties` carry
+/// [`DUPLICATE_IDENTITY_PROPERTY`]. That key marks a dedup act's identity edge,
+/// which the un-mark and the revert-record lookup key on, so only the act
+/// writes it: every application surface that writes edge `properties` (create
+/// and patch, HTTP and MCP) refuses a body that carries it.
+#[must_use]
+pub fn carries_dedup_identity_key(properties: &serde_json::Value) -> bool {
+    properties.get(DUPLICATE_IDENTITY_PROPERTY).is_some()
+}
+
+/// The refusal text for [`carries_dedup_identity_key`].
+pub const DEDUP_IDENTITY_KEY_RESERVED: &str =
+    "properties.dedup is reserved for the identity edge a dedup act writes \
+     (mark_duplicate); nothing was written";
+
 /// Who marked a duplicate, through which tool, and by which rule: the
 /// `properties.dedup` of the `same_as` identity edge the act writes. The act
 /// adds `marked_at` (the transaction's `now()`), and `marked_by` from the
