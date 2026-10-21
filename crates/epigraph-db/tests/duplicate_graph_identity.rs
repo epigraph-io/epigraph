@@ -12,10 +12,12 @@
 //!   act wrote `supersedes` and bumped `updated_at`; it wrote no edge and no
 //!   row naming who marked the duplicate or by which rule.
 //!
-//! The arms run on the harness connection (the superuser, so the session is
+//! Most arms run on the harness connection (the superuser, so the session is
 //! privileged and the act and the repair run in one transaction, as the
-//! semantic-duplicate sweep runs them). The tenancy arms of the same
-//! behaviour, on `epigraph_app` and `epigraph_maintenance`, are below them.
+//! semantic-duplicate sweep runs them). The act's arms run on a stamped
+//! `epigraph_app` session, and one pooling arm runs the repair as
+//! `epigraph_maintenance` (no BYPASSRLS, so RESTRICTIVE policies still bind it,
+//! unlike the superuser).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -760,4 +762,261 @@ async fn the_act_refuses_a_false_bound_duplicate_whose_bbas_would_pool(pool: PgP
         .await
         .expect("dup");
     assert!(current, "nothing was written");
+}
+
+/// The repair, pooling only (no edges), as production runs it: the act on the
+/// writer's stamped `epigraph_app` session, the repair as `epigraph_maintenance`.
+/// The duplicate's frame binding is copied to the canonical even though no edge
+/// moved, because pooled rows need it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pooling_runs_as_the_maintenance_role_and_binds_the_canonical(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "dup-writer").await;
+    let canonical = fixture::seed_group_claim(&pool, w, g, "group canonical").await;
+    let dup = fixture::seed_group_claim(&pool, w, g, "group duplicate").await;
+    let frame = seed_frame(&pool).await;
+    FrameRepository::assign_claim(&pool, dup, frame, Some(0))
+        .await
+        .expect("bind the duplicate only");
+    let row = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(w),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let p = pool.clone();
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("the act on the writer's session");
+        (conn, ())
+    })
+    .await;
+    let repair = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the repair as epigraph_maintenance");
+    assert_eq!(repair.pooled_bbas, vec![row]);
+    assert_eq!(bba_claim(&pool, row).await, canonical);
+    assert_eq!(
+        repair.revert.copied_frames,
+        vec![frame],
+        "pool-only frame copy"
+    );
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM claim_frames WHERE claim_id = $1 AND frame_id = $2)",
+    )
+    .bind(canonical)
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("binding");
+    assert!(bound, "the canonical is bound to the pooled row's frame");
+}
+
+/// FA07's allowed arm: the same FALSE-bound duplicate with no BBA and no
+/// incoming edge has nothing a repair could carry, and the act lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_allows_a_false_bound_duplicate_with_nothing_to_pool(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "dedup-writer").await;
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let dup = Uuid::new_v4();
+    let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a FALSE-bound duplicate', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(dup)
+    .bind(&hash)
+    .bind(w)
+    .bind(g)
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let frame = seed_frame(&pool).await;
+    FrameRepository::assign_claim(&pool, dup, frame, Some(1))
+        .await
+        .expect("bind FALSE");
+    let p = pool.clone();
+    let act = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let r = ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await;
+    act.expect("nothing to pool or move: FA07 does not apply");
+}
+
+/// The compound rule's calibration: a RETRACTED `decomposes_to` out-edge does
+/// not make the canonical a compound, so the duplicate's row pools.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_decomposes_to_does_not_make_a_compound(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "once a compound").await;
+    let atom = seed_claim(&pool, a, "an atom").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            valid_to) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to', now())",
+    )
+    .bind(canonical)
+    .bind(atom)
+    .execute(&pool)
+    .await
+    .expect("retracted decomposes_to");
+    let frame = seed_frame(&pool).await;
+    let row = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(a),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+    assert!(!repair.canonical_is_compound);
+    assert_eq!(repair.pooled_bbas, vec![row]);
+}
+
+/// The audience rule's other half: a PUBLIC row pools onto a group-private
+/// canonical (narrowing, never widening), as that claim's own row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_duplicates_bba_pools_onto_a_private_canonical_as_its_own(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let canonical = fixture::seed_group_claim(&pool, w, g, "private canonical").await;
+    let dup = fixture::seed_public_claim(&pool, w, "public duplicate").await;
+    let frame = seed_frame(&pool).await;
+    let row = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(w),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+    assert_eq!(repair.pooled_bbas, vec![row]);
+    let (on, vis, owner, wo): (Uuid, String, Uuid, bool) = sqlx::query_as(
+        "SELECT claim_id, visibility::text, owner_group_id, writer_owned \
+           FROM mass_functions WHERE id = $1",
+    )
+    .bind(row)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert_eq!(
+        (on, vis.as_str(), owner, wo),
+        (canonical, "group", g, false)
+    );
+}
+
+/// The identity edge never becomes a belief factor between the pair: it is
+/// written after the duplicate is retired, so `auto_create_factor_from_edge`
+/// skips it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_identity_edge_creates_no_factor(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    // Calibration: an ordinary same_as between two CURRENT claims does make one.
+    let x = seed_claim(&pool, a, "x").await;
+    let y = seed_claim(&pool, a, "y").await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'same_as')",
+    )
+    .bind(x)
+    .bind(y)
+    .execute(&pool)
+    .await
+    .expect("plain same_as");
+    let factors = |pool: PgPool, l: Uuid, r: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM factors WHERE $1 = ANY(variable_ids) AND $2 = ANY(variable_ids)",
+        )
+        .bind(l)
+        .bind(r)
+        .fetch_one(&pool)
+        .await
+        .expect("factors")
+    };
+    assert!(
+        factors(pool.clone(), x, y).await > 0,
+        "calibration: same_as makes a factor"
+    );
+    mark_with_repair(&pool, dup, canonical).await;
+    assert_eq!(factors(pool.clone(), dup, canonical).await, 0);
+}
+
+/// Provenance: `marked_by` is the caller's agent when named (not overwritten
+/// by the session principal), and a reason is cut at MAX_REASON_CHARS.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_identity_edge_keeps_the_named_agent_and_a_bounded_reason(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let named = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let long = "r".repeat(DuplicateProvenance::MAX_REASON_CHARS + 50);
+    let prov = DuplicateProvenance::new("a-tool", "a-rule")
+        .marked_by(Some(named))
+        .reason(Some(&long));
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+        .bind(a.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("a different session principal");
+    ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &prov,
+    )
+    .await
+    .expect("mark");
+    let props: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("edge");
+    let d = &props["dedup"];
+    assert_eq!(d["marked_by"], serde_json::json!(named), "{props}");
+    assert_eq!(d["tool"], "a-tool");
+    assert_eq!(d["rule"], "a-rule");
+    assert_eq!(
+        d["reason"].as_str().map(|r| r.chars().count()),
+        Some(DuplicateProvenance::MAX_REASON_CHARS)
+    );
 }
