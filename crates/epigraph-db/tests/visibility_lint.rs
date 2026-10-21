@@ -1980,6 +1980,45 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "mark_duplicate_act_attributed_conn",
+        "WRITE. mark_duplicate_act_conn with the caller's provenance on the identity edge; the \
+         same act on the caller's stamped transaction, authorised by claims_tenancy's and \
+         edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_with_repair_attributed_conn",
+        "WRITE, privileged only (refuses otherwise). mark_duplicate_with_repair_conn with the \
+         caller's provenance; act and repair in one transaction on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "unmark_duplicate_act_conn",
+        "WRITE. The un-mark's act on the caller's stamped transaction: current again and the \
+         identity edge retracted, authorised by claims_tenancy's and edges_tenancy's WITH CHECK. \
+         Its reads lock the duplicate's row and its identity edge; they return ids only to the \
+         caller of the act.",
+    ),
+    (
+        "claim.rs",
+        "unmark_duplicate_with_reversal_conn",
+        "WRITE, privileged only (refuses otherwise). The un-mark's act and the reversal of the \
+         dedup's repair in one transaction on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate_conn",
+        "WRITE, privileged only (refuses otherwise). The reversal of a dedup's repair from its \
+         revert record, on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate",
+        "WRITE. The reversal's statements, unchecked; called only after the caller established \
+         the privilege.",
+    ),
+    (
+        "claim.rs",
         "repair_marked_duplicate_conn",
         "WRITE, privileged only (refuses otherwise). The dedup's repair on the maintenance \
          connection; its read verifies the committed act.",
@@ -2386,6 +2425,27 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "Calls 117's `epigraph_record_cascade_deferral` definer on the CALLER's session: an \
          audit-row write whose control is the definer's own (attribution to the session \
          principal, the act must be the session's). Returns the new row's id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "record_dedup_revert",
+        "INSERT INTO `security_events` of a `cascade.dedup_revert_record` row with agent_id \
+         NULL, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
+         session). Returns the new id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "dedup_revert_record",
+        "READ of `security_events` for the administrative un-mark, on the maintenance \
+         connection: the revert record is agent-less, so `security_events_read` shows it to \
+         privileged and admin sessions only; nothing reaches a caller (apply_unmark reports \
+         counts).",
+    ),
+    (
+        "admin_cascade.rs",
+        "open_dedup_cascades",
+        "READ of `security_events` (the replay's pending window) for the administrative \
+         un-mark, on the maintenance connection; returns row ids it retires, never to a caller.",
     ),
     (
         "admin_cascade.rs",
