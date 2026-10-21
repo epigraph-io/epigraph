@@ -34,8 +34,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::common::ids::{compound_content_hash, content_hash};
+use crate::common::ids::content_hash;
 use crate::document::stored_content_hash_is_canonical_name_scoped;
+use crate::workflow::builder::canonical_name_scoped_hash_matches;
 
 /// The domain-separation prefix of [`wfd1`].
 pub const WFD1_DOMAIN: &[u8] = b"epigraph-wf-v1\n";
@@ -107,13 +108,15 @@ pub fn content_hash_ok(
     stored: &[u8],
     properties: &serde_json::Value,
 ) -> bool {
-    let plain = content_hash(content);
-    let expected = if stored_content_hash_is_canonical_name_scoped(properties) {
-        compound_content_hash(&plain, canonical_name)
+    if stored_content_hash_is_canonical_name_scoped(properties) {
+        // The same seed formula `verify_claim` checks, with the one seed known
+        // here. A stored hash that is not 32 bytes cannot match.
+        <[u8; 32]>::try_from(stored).is_ok_and(|stored| {
+            canonical_name_scoped_hash_matches(content, &stored, [canonical_name]) == Some(true)
+        })
     } else {
-        plain
-    };
-    stored == expected.as_slice()
+        stored == content_hash(content).as_slice()
+    }
 }
 
 /// A plan target the caller may read, as the repository read returns it.
