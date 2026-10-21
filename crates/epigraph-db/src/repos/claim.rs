@@ -7931,6 +7931,42 @@ impl ClaimRepository {
         })
     }
 
+    /// Whether THIS session may un-mark `dup` from `canonical`: a privileged
+    /// writer may; otherwise it writes the duplicate, and it writes the
+    /// canonical or the canonical is public (the dedup act's FA04 attach rule,
+    /// mirrored: the reversal moves rows off the canonical with administrative
+    /// authority). The same predicates the act's own row security and FA04
+    /// check apply.
+    ///
+    /// The request paths ask this on the caller's stamped transaction instead
+    /// of rehearsing [`Self::unmark_duplicate_act_conn`] there: once operator
+    /// binding is armed, migration 153 refuses any application session that
+    /// clears a `supersedes`, whatever its authority, and the act that commits
+    /// runs on the maintenance connection anyway.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn session_may_unmark_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<bool, DbError> {
+        let dup_uuid: Uuid = dup.into();
+        let canon_uuid: Uuid = canonical.into();
+        Ok(sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT public.epigraph_session_is_privileged_writer()
+                OR (public.epigraph_session_writes_node($1, 'claim')
+                    AND (public.epigraph_session_writes_node($2, 'claim')
+                         OR EXISTS (SELECT 1 FROM claims k
+                                     WHERE k.id = $2 AND k.visibility::text = 'public')))"#,
+        )
+        .bind(dup_uuid)
+        .bind(canon_uuid)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// Put back what a dedup repair did, from its [`DedupRevert`] record:
     /// re-source and re-target its edges onto `dup`, return its moved BBAs
     /// with their old tenancy, re-insert the BBAs it deleted, put its

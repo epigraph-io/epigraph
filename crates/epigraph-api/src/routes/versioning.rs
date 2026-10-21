@@ -992,24 +992,23 @@ pub async fn unmark_duplicate(
             ),
         })?;
 
-    // The caller's authority, decided by the database: the act on the caller's
-    // stamped transaction, rolled back.
+    // The caller's authority, decided by the database's write predicate on the
+    // caller's stamped transaction. Not a rehearsal of the act: once operator
+    // binding is armed an application session may not clear a `supersedes`
+    // (migration 153); the act commits with the reversal on the maintenance
+    // connection.
     let mut tx = state.write_as(&viewer, "unmark_duplicate").await?;
-    ClaimRepository::unmark_duplicate_act_conn(&mut tx, ClaimId::from_uuid(dup_id))
-        .await
-        .map_err(|e| match e {
-            e if crate::errors::db_is_insufficient_privilege(&e) => {
-                crate::errors::write_refused("claim")
-            }
-            epigraph_db::DbError::NotFound { id, .. } => not_found(id),
-            epigraph_db::DbError::QueryFailed { source } => ApiError::Conflict {
-                reason: source.to_string(),
-            },
-            other => ApiError::DatabaseError {
-                message: other.to_string(),
-            },
-        })?;
+    let may = ClaimRepository::session_may_unmark_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup_id),
+        ClaimId::from_uuid(canonical_id),
+    )
+    .await
+    .map_err(db)?;
     tx.rollback().await.map_err(db)?;
+    if !may {
+        return Err(crate::errors::write_refused("claim"));
+    }
 
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Undedup,

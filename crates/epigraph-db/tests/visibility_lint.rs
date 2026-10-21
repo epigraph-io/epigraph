@@ -2001,6 +2001,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "session_may_unmark_conn",
+        "READ of the session's own write authority (`epigraph_session_writes_node`) over two \
+         claims the caller already read through its viewer, plus the canonical's visibility; \
+         projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
         "unmark_duplicate_with_reversal_conn",
         "WRITE, privileged only (refuses otherwise). The un-mark's act and the reversal of the \
          dedup's repair in one transaction on the maintenance connection.",

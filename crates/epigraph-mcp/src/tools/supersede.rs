@@ -388,10 +388,11 @@ pub async fn unmark_duplicate(
             data: None,
         })?;
 
-    // THE CALLER'S AUTHORITY, decided by the database: the act on the caller's
-    // own stamped transaction (the same gate as mark_duplicate), rolled back.
-    // The act that commits runs with the reversal on the administrative
-    // connection, so the two cannot be split.
+    // THE CALLER'S AUTHORITY: the same gate as mark_duplicate, then the
+    // database's own write predicate on the caller's stamped transaction. Not
+    // a rehearsal of the act: once operator binding is armed, an application
+    // session may not clear a `supersedes` at all (migration 153), and the act
+    // that commits runs with the reversal on the administrative connection.
     let (mut tx, actor) = begin_claim_act(
         server,
         viewer,
@@ -402,10 +403,20 @@ pub async fn unmark_duplicate(
         "un-mark as a duplicate",
     )
     .await?;
-    ClaimRepository::unmark_duplicate_act_conn(&mut tx, ClaimId::from_uuid(dup))
-        .await
-        .map_err(crate::errors::db_caller_error)?;
+    let may = ClaimRepository::session_may_unmark_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .map_err(internal_error)?;
     tx.rollback().await.map_err(internal_error)?;
+    if !may {
+        return Err(crate::errors::claim_not_writer(
+            dup,
+            "un-mark as a duplicate",
+        ));
+    }
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Undedup,
