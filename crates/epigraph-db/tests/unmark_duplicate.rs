@@ -463,3 +463,90 @@ async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: 
     expected.sort_unstable();
     assert_eq!(reversal.drifted, expected);
 }
+
+/// Chained dedups, the normal case for a repeated dedup run: D1 is marked onto
+/// C1, then C1 itself onto C2. D1's identity edge must keep naming the claim
+/// D1 supersedes (C1) rather than following C1's repair onto C2; un-marking D1
+/// while C1 is retired is refused with the order to follow; un-marking C1 and
+/// then D1 restores everything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "other-writer").await;
+    let c2 = fixture::seed_public_claim(&pool, a, "newest canonical").await;
+    let c1 = fixture::seed_public_claim(&pool, a, "first canonical").await;
+    let d1 = fixture::seed_public_claim(&pool, a, "first duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, b, "supporter").await;
+    let e = edge(&pool, supporter, d1, "supports").await;
+    let claims = [c2, c1, d1, supporter];
+    let before = snapshot(&pool, &claims).await;
+    let prov = DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED);
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r1 = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(d1),
+        ClaimId::from_uuid(c1),
+        &prov,
+    )
+    .await
+    .expect("mark d1 onto c1");
+    let r2 = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(c1),
+        ClaimId::from_uuid(c2),
+        &prov,
+    )
+    .await
+    .expect("mark c1 onto c2");
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(r1.revert.identity_edge.expect("d1's identity edge"))
+        .fetch_one(&pool)
+        .await
+        .expect("identity edge");
+    assert_eq!(
+        target, c1,
+        "d1's identity edge keeps naming the claim it supersedes"
+    );
+    let on: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(
+        on, c2,
+        "calibration: the supporter's edge followed the chain to c2"
+    );
+
+    let err = ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        ClaimId::from_uuid(d1),
+        &r1.revert,
+    )
+    .await
+    .expect_err("d1 cannot be un-marked while c1 is retired");
+    assert!(format!("{err:?}").contains("first"), "{err:?}");
+
+    ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        ClaimId::from_uuid(c1),
+        &r2.revert,
+    )
+    .await
+    .expect("un-mark c1");
+    let (_, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        ClaimId::from_uuid(d1),
+        &r1.revert,
+    )
+    .await
+    .expect("then un-mark d1");
+    assert!(reversal.drifted.is_empty(), "{:?}", reversal.drifted);
+    let after = snapshot(&pool, &claims).await;
+    let lost: Vec<&String> = before.iter().filter(|r| !after.contains(r)).collect();
+    let gained: Vec<&String> = after.iter().filter(|r| !before.contains(r)).collect();
+    assert!(
+        lost.is_empty() && gained.is_empty(),
+        "the chain is not undone.\nmissing: {lost:#?}\nextra: {gained:#?}"
+    );
+}
