@@ -11430,11 +11430,12 @@ async fn reverse_marked_duplicate(
     let done = out.retargeted_back.clone();
     note_drift(&record.retargeted_edges, &done, &mut drifted);
 
-    // The re-pointed edges take back the tenancy they had: re-pointed onto a
-    // private canonical the trigger re-stamped them private, and re-pointed
-    // back its no-widening arm keeps them so. A recorded PUBLIC tenancy comes
-    // back only while both endpoints are public claims, so this never widens
-    // an edge beyond its endpoints.
+    // The re-pointed edges take back the tenancy they had where the trigger
+    // cannot derive it: re-pointed onto a private canonical it re-stamped them
+    // private, and re-pointed back onto two PUBLIC endpoints its no-widening
+    // arm keeps them so. Only that case is restored. With either endpoint
+    // non-public the re-point has already given the edge its endpoints' meet
+    // as they are NOW, and a recorded tenancy could only be wider.
     let repointed: Vec<Uuid> = out
         .retargeted_back
         .iter()
@@ -11455,12 +11456,11 @@ async fn reverse_marked_duplicate(
                FROM jsonb_to_recordset($1)
                     AS r(id uuid, owner_group_id uuid, visibility text, co_owner_group_id uuid)
               WHERE e.id = r.id AND e.id = ANY($2)
-                AND (r.visibility <> 'public'
-                     OR (e.source_type = 'claim' AND e.target_type = 'claim'
-                         AND EXISTS (SELECT 1 FROM claims s
-                                      WHERE s.id = e.source_id AND s.visibility::text = 'public')
-                         AND EXISTS (SELECT 1 FROM claims t
-                                      WHERE t.id = e.target_id AND t.visibility::text = 'public')))
+                AND e.source_type = 'claim' AND e.target_type = 'claim'
+                AND EXISTS (SELECT 1 FROM claims s
+                             WHERE s.id = e.source_id AND s.visibility::text = 'public')
+                AND EXISTS (SELECT 1 FROM claims t
+                             WHERE t.id = e.target_id AND t.visibility::text = 'public')
                 AND (e.owner_group_id, e.visibility::text, e.co_owner_group_id)
                     IS DISTINCT FROM (r.owner_group_id, r.visibility, r.co_owner_group_id)"#,
         )
