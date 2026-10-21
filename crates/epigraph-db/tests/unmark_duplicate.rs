@@ -388,3 +388,49 @@ async fn the_unmark_act_lands_on_the_app_role_for_the_writer_only(pool: PgPool) 
         assert_eq!((sup, cur), (None, true));
     }
 }
+
+/// A collision-retracted edge comes back only while its retraction is still
+/// the repair's. If a later write re-decided it (here: reinstated, then
+/// retracted again by its owner at a different moment), the un-mark leaves it
+/// retracted and reports it drifted, rather than resurrecting a withdrawal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "other-writer").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let diamond = fixture::seed_public_claim(&pool, b, "diamond source").await;
+    let e_dup = edge(&pool, diamond, dup, "corroborates").await;
+    edge(&pool, diamond, canonical, "corroborates").await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let repair = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
+    )
+    .await
+    .expect("mark");
+    assert_eq!(repair.retracted_edges, vec![e_dup], "calibration");
+    sqlx::query("UPDATE edges SET valid_to = valid_to + interval '1 minute' WHERE id = $1")
+        .bind(e_dup)
+        .execute(&pool)
+        .await
+        .expect("a later, different retraction");
+
+    let (_, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        &repair.revert,
+    )
+    .await
+    .expect("unmark");
+    let in_force: bool = sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+        .bind(e_dup)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert!(!in_force, "a later retraction is not the repair's to undo");
+    assert_eq!(reversal.drifted, vec![e_dup]);
+}
