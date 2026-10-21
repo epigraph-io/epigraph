@@ -597,30 +597,258 @@ async fn a_visible_edge_to_an_unreadable_claim_is_counted_and_never_named(pool: 
     );
 }
 
-/// `add_step` writes an `executes` edge with no `plan_index`: the plan was
-/// mutated in place. The edge is counted as unindexed, it is not an item (it
-/// has no position to digest), and the echo is withheld.
+// ─────────────────────────────────────────────────────────────────────────────
+// add_step and plan_index
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The vectors' three level-2 steps, in plan order: 1.1, 1.2, 2.1.
+fn vector_steps() -> [Uuid; 3] {
+    let plan = vector_plan();
+    [2, 5, 7].map(|i| uuid_of(&plan[i]["claim_id"]))
+}
+
+/// The workflow-ingest system agent: the author of every claim the ingest
+/// wrote (harness read of the vectors' thesis row).
+async fn ingest_system_agent(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(uuid_of(&vector_plan()[0]["claim_id"]))
+        .fetch_one(pool)
+        .await
+        .expect("the thesis row's author")
+}
+
+/// The two step orders `add_step` must keep equal (harness reads): the
+/// `step_follows` chain `workflow_steps::ordered_steps` walks, and the
+/// workflow's live level-2 `executes` targets by their integer `plan_index`.
+async fn chain_and_plan_steps(pool: &PgPool, workflow_id: Uuid) -> (Vec<Uuid>, Vec<Uuid>) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let chain = epigraph_ingest_executor::workflow_steps::ordered_steps(&mut conn, workflow_id)
+        .await
+        .expect("ordered_steps");
+    let by_index: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT e.target_id FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' AND e.valid_to IS NULL \
+            AND (c.properties->>'level')::int = 2 \
+            AND jsonb_typeof(e.properties->'plan_index') = 'number' \
+          ORDER BY (e.properties->>'plan_index')::bigint",
+    )
+    .bind(workflow_id)
+    .fetch_all(pool)
+    .await
+    .expect("level-2 targets by plan_index");
+    (chain, by_index)
+}
+
+/// `POST /api/v1/workflows/steps`, insisting on 200.
+async fn add_step(api: &Api, t: &str, text: &str, position: Option<u32>) -> Value {
+    let mut req = json!({"canonical_name": "acme-frozen-plan", "step_text": text});
+    if let Some(p) = position {
+        req["position"] = json!(p);
+    }
+    let (status, body) = api.post("/api/v1/workflows/steps", t, &req).await;
+    assert_eq!(status, StatusCode::OK, "add_step {text:?}: {body}");
+    body
+}
+
+/// The plan's items are the vectors with `added` spliced in at index `at`:
+/// every vector item keeps its id, level, content and hash, and its index
+/// moves up by one exactly when it sat at or after `at`.
+fn assert_vectors_with_one_insert(p: &Value, at: u64, added: Uuid) {
+    let items = p["items"].as_array().expect("items");
+    let want = vector_plan();
+    assert_eq!(items.len(), want.len() + 1, "one more item: {p}");
+    let inserted = &items[at as usize];
+    assert_eq!(uuid_of(&inserted["claim_id"]), added, "{p}");
+    assert_eq!(inserted["plan_index"], json!(at));
+    assert_eq!(inserted["level"], json!(2));
+    let rest: Vec<&Value> = items
+        .iter()
+        .filter(|i| uuid_of(&i["claim_id"]) != added)
+        .collect();
+    for (got, want) in rest.iter().zip(&want) {
+        let old = want["plan_index"].as_u64().unwrap();
+        let moved = if old >= at { old + 1 } else { old };
+        assert_eq!(got["plan_index"], json!(moved), "vector item {old}: {p}");
+        for key in ["level", "claim_id", "content", "content_hash"] {
+            assert_eq!(got[key], want[key], "{key} of vector item {old}");
+        }
+    }
+}
+
+/// An appended step is indexed one past the plan's last item, on the
+/// production shape (a public plan, whose `executes` edges are world-owned
+/// and which no application session may update): appending moves no existing
+/// index. The plan reads clean, the step is an item, both step orders agree,
+/// and the echo is the digest of the new plan, not the published one.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_add_step_edge_is_unindexed(pool: PgPool) {
+async fn an_appended_step_is_indexed_after_the_last_item(pool: PgPool) {
     let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
     let wf = api.ingest(&t, &extraction()).await;
-    let (status, body) = api
-        .post(
-            "/api/v1/workflows/steps",
-            &t,
-            &json!({"canonical_name": "acme-frozen-plan", "step_text": "ACME-123456 appended step"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "add_step: {body}");
+    let body = add_step(&api, &t, "ACME-123456 appended step", None).await;
     let added = uuid_of(&body["step_claim_id"]);
 
     let p = api.plan(&t, wf).await;
+    assert_eq!(flags(&p), clean(), "{p}");
+    assert_eq!(body["plan_index"], json!(9), "{body}");
+    assert_vectors_with_one_insert(&p, 9, added);
+    assert!(p["digest_echo"].is_string(), "{p}");
+    assert_ne!(p["digest_echo"], vectors()["ingest"]["wfd1"]);
+    let [s11, s12, s21] = vector_steps();
+    let (chain, by_index) = chain_and_plan_steps(&pool, wf).await;
+    assert_eq!(chain, vec![s11, s12, s21, added]);
+    assert_eq!(
+        by_index, chain,
+        "plan_index order equals step_follows order"
+    );
+}
+
+/// An insert into a plan whose `executes` edges the ingest stamp may update
+/// (a group-private plan whose group the workflow-ingest system agent writes)
+/// renumbers it: the new step takes the index of the step it now precedes and
+/// every later edge, at every level, moves up by one. After a head insert, a
+/// middle insert and an append the plan still reads clean, with contiguous
+/// indices and both step orders equal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_insert_renumbers_a_plan_the_ingest_stamp_may_update(pool: PgPool) {
+    let w = private_workflow(&pool).await;
+    let system = ingest_system_agent(&pool).await;
+    add_member(&pool, w.g, system, "writer").await;
+    let curator = token(w.curator, WRITE_SCOPES);
+    let reader = token(w.reader, READ_SCOPES);
+    let [s11, s12, s21] = vector_steps();
+
+    // Before 1.1 (index 2): every vector edge from 2 on moves up by one.
+    let body = add_step(&w.api, &curator, "ACME-123456 first step", Some(0)).await;
+    let first = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body["step_index"], json!(0));
+    let p = w.api.plan(&reader, w.workflow_id).await;
+    assert_eq!(flags(&p), clean(), "{p}");
+    assert_eq!(body["plan_index"], json!(2), "{body}");
+    assert_vectors_with_one_insert(&p, 2, first);
+    assert!(p["digest_echo"].is_string(), "{p}");
+    let (chain, by_index) = chain_and_plan_steps(&pool, w.workflow_id).await;
+    assert_eq!(chain, vec![first, s11, s12, s21]);
+    assert_eq!(
+        by_index, chain,
+        "plan_index order equals step_follows order"
+    );
+
+    // Between 1.1 (now 3, atoms 4 and 5) and 1.2 (now 6), then after the last.
+    let body = add_step(&w.api, &curator, "ACME-123456 inserted step", Some(2)).await;
+    let mid = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body["plan_index"], json!(6), "{body}");
+    let body = add_step(&w.api, &curator, "ACME-123456 last step", None).await;
+    let last = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body["plan_index"], json!(11), "{body}");
+    let p = w.api.plan(&reader, w.workflow_id).await;
+    assert_eq!(flags(&p), clean(), "{p}");
+    let indices: Vec<u64> = p["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["plan_index"].as_u64().unwrap())
+        .collect();
+    assert_eq!(indices, (0..12).collect::<Vec<u64>>(), "contiguous: {p}");
+    let (chain, by_index) = chain_and_plan_steps(&pool, w.workflow_id).await;
+    assert_eq!(chain, vec![first, s11, mid, s12, s21, last]);
+    assert_eq!(
+        by_index, chain,
+        "plan_index order equals step_follows order"
+    );
+}
+
+/// The renumber is all or nothing. A step `add_step` added is a public claim,
+/// so its `executes` edge is world-owned even in a group plan; an insert
+/// BEFORE it would have to move that edge along with the group-owned ones the
+/// stamp may move. Nothing moves: the movable edges are not shifted on their
+/// own, the new edge is left unindexed, and every existing item keeps its
+/// index, with no duplicate and no gap.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_insert_that_would_move_an_edge_the_stamp_may_not_update_moves_nothing(pool: PgPool) {
+    let w = private_workflow(&pool).await;
+    let system = ingest_system_agent(&pool).await;
+    add_member(&pool, w.g, system, "writer").await;
+    let curator = token(w.curator, WRITE_SCOPES);
+    let reader = token(w.reader, READ_SCOPES);
+    let [s11, s12, s21] = vector_steps();
+
+    let body = add_step(&w.api, &curator, "ACME-123456 inserted step", Some(1)).await;
+    let mid = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body["plan_index"], json!(5), "{body}");
+    // Calibration: the edges past the insertion point are mixed.
+    let owners: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT target_id, visibility::text, owner_group_id FROM edges \
+          WHERE source_id = $1 AND relationship = 'executes' \
+            AND (properties->>'plan_index')::bigint >= 5",
+    )
+    .bind(w.workflow_id)
+    .fetch_all(&pool)
+    .await
+    .expect("harness: edge tenancy");
+    assert_eq!(owners.len(), 5, "{owners:?}");
+    for (target, visibility, owner) in &owners {
+        if *target == mid {
+            assert_eq!((visibility.as_str(), *owner), ("public", Uuid::nil()));
+        } else {
+            assert_eq!((visibility.as_str(), *owner), ("group", w.g));
+        }
+    }
+
+    // Before the added step: it would have to move from 5 to 6.
+    let body = add_step(
+        &w.api,
+        &curator,
+        "ACME-123456 before the added step",
+        Some(1),
+    )
+    .await;
+    let blocked = uuid_of(&body["step_claim_id"]);
+    assert_eq!(body.get("plan_index"), Some(&Value::Null), "{body}");
+    let p = w.api.plan(&reader, w.workflow_id).await;
     assert_eq!(p["unindexed_edges"], json!(1), "{p}");
-    assert!(!item_ids(&p).contains(&added));
+    assert_eq!(p["duplicate_plan_indices"], json!(0), "{p}");
+    assert_eq!(p["plan_index_gaps"], json!(0), "{p}");
+    assert!(!item_ids(&p).contains(&blocked));
+    assert_vectors_with_one_insert(&p, 5, mid);
+    let (chain, _) = chain_and_plan_steps(&pool, w.workflow_id).await;
+    assert_eq!(
+        chain,
+        vec![s11, blocked, mid, s12, s21],
+        "the chain was rewired"
+    );
+}
+
+/// A middle insert into a plan whose `executes` edges the ingest stamp may
+/// NOT update (a public plan: its edges are world-owned) cannot renumber. The
+/// chain is rewired as before, no existing index moves, the new edge is left
+/// unindexed (so the read flags the plan as mutated in place) and the
+/// response says so with a null `plan_index`, rather than writing an index
+/// that collides with the step it precedes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_middle_insert_the_stamp_cannot_renumber_is_left_unindexed_and_says_so(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let body = add_step(&api, &t, "ACME-123456 inserted step", Some(1)).await;
+    let mid = uuid_of(&body["step_claim_id"]);
+    assert_eq!(
+        body.get("plan_index"),
+        Some(&Value::Null),
+        "the response names the missing index: {body}"
+    );
+
+    let p = api.plan(&t, wf).await;
+    assert_eq!(p["unindexed_edges"], json!(1), "{p}");
+    assert_eq!(p["duplicate_plan_indices"], json!(0), "{p}");
+    assert!(!item_ids(&p).contains(&mid));
     assert_items_are_the_vectors(&p);
     assert_eq!(p["digest_echo"], Value::Null);
+    let [s11, s12, s21] = vector_steps();
+    let (chain, _) = chain_and_plan_steps(&pool, wf).await;
+    assert_eq!(chain, vec![s11, mid, s12, s21], "the chain was rewired");
 }
 
 /// `evolve_step` writes a new head in the step's lineage; the generation's
