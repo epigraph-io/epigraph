@@ -412,6 +412,61 @@ impl WorkflowRepository {
         q.fetch_all(pool).await.map_err(DbError::from)
     }
 
+    /// The ids of every workflow that EXECUTES the step lineage of `claim_id`:
+    /// a `workflow —executes→ claim` edge into `claim_id` itself or into any
+    /// claim sharing its non-null `step_lineage_id`. Ascending by id.
+    ///
+    /// Exists for the `evolve_step` authority gate (MCP
+    /// `tools/evolve_step.rs`, REST `routes/workflows.rs::evolve_step`), which
+    /// requires workflow authority over EVERY workflow returned. The lineage is
+    /// read, not just the parent's own edges, because `executes` stays on the
+    /// frozen step when it is evolved (`migrate_superseded_edges`' step-lineage
+    /// rule): the new head is executed by nothing directly, and a gate keyed on
+    /// the parent's edges would admit anyone to the second evolve. A parent
+    /// with no lineage yet (`evolve_step` mints one for it) is its own lineage.
+    ///
+    /// RETRACTED edges are included ON PURPOSE, as in
+    /// [`Self::executing_canonical_names`]. Any principal that writes the
+    /// owning group of a group-private `executes` edge can retract it
+    /// (`EdgeRepository::retract_by_id`), so filtering on `valid_to` would let
+    /// that writer lift the gate it is held to. Edge `properties` (e.g.
+    /// `plan_index`, which the same writers can rewrite) play no part.
+    ///
+    /// NOT viewer-spliced, deliberately: this is an authority read, and an
+    /// in-query viewer predicate could only remove workflows from the set the
+    /// caller must hold authority over. It runs on the caller's own write
+    /// transaction, so the one filter left is the row security that session is
+    /// held to. Residual, stated: a lineage member or `executes` edge that
+    /// row security hides from the caller is not counted. Every claim of a
+    /// lineage takes its parent's tenancy at `evolve_step`, and an `executes`
+    /// edge takes its step's, so a caller who can lock the parent can normally
+    /// see them all; a lineage whose members were later split across tenancies
+    /// out of band is the case this does not cover.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn workflows_executing_step_lineage(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT w.id \
+             FROM edges e \
+             JOIN workflows w ON w.id = e.source_id \
+             WHERE e.relationship = 'executes' \
+               AND e.source_type = 'workflow' AND e.target_type = 'claim' \
+               AND (e.target_id = $1 \
+                    OR e.target_id IN ( \
+                        SELECT m.id FROM claims m \
+                        JOIN claims p ON p.step_lineage_id = m.step_lineage_id \
+                        WHERE p.id = $1)) \
+             ORDER BY w.id",
+        )
+        .bind(claim_id)
+        .fetch_all(&mut *conn)
+        .await
+    }
+
     /// Look up a workflow root by `(canonical_name, generation)`.
     pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,

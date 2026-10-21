@@ -1502,6 +1502,16 @@ pub struct EvolveStepResponse {
 /// chain (`step_follows` / `phase_follows`), the lineage's `revises` history
 /// and other agents' `asserts` / `AUTHORED` stay on the retired step.
 /// `revises` retires nothing and runs no cascade.
+///
+/// Authority: when any workflow executes the parent's step lineage (the
+/// parent or any claim sharing its `step_lineage_id`, retracted `executes`
+/// edges included), the caller needs workflow authority over EVERY such
+/// workflow, as `add_step` / `delete_step` need over theirs: its recorded
+/// submitter, the submitter's operator, or the audited `claims:admin` path (a
+/// workflow with no recorded submitter admits only that path). Anyone else is
+/// refused 403 with nothing written. Each admitted write records one
+/// `workflows.caller_write` (or `workflows.admin_write`) row per workflow. A
+/// claim no workflow executes is unaffected.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1512,6 +1522,7 @@ pub struct EvolveStepResponse {
         (status = 200, body = EvolveStepResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = [])),
@@ -1552,6 +1563,10 @@ pub async fn evolve_step(
     };
     let level = req.level.unwrap_or(2);
     let mut tx = state.begin_claim_write(&viewer, "evolve_step").await?;
+    // Workflow authority over every workflow executing the parent's
+    // step lineage, checked for the SAME principal the step is authored as,
+    // on the act's own transaction and before it, so a refusal writes nothing.
+    let grants = require_api_lineage_authority(&mut tx, &auth, agent, parent_id).await?;
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(parent_id),
@@ -1572,6 +1587,20 @@ pub async fn evolve_step(
             message: other.to_string(),
         },
     })?;
+    record_api_lineage_writes(
+        &mut tx,
+        &auth,
+        agent,
+        &grants,
+        serde_json::json!({
+            "parent_claim_id": parent_id,
+            "claim_id": result.new_claim_id,
+            "step_lineage_id": result.step_lineage_id,
+            "edge_type": result.edge_type,
+            "level": level,
+        }),
+    )
+    .await?;
     // A `supersedes` step is a supersession (`claims.supersedes` names the
     // parent), so it runs `versioning::supersede_claim`'s administrative
     // cascade (backlog 8d3b4527): the act above moved no edge, and the retired
@@ -2758,6 +2787,85 @@ async fn require_api_workflow_authority(
     };
     let grant = workflow_authority(conn, Some(auth), auth.agent_id, head).await?;
     Ok(Some((head, grant)))
+}
+
+/// Lineage-wide authority (the MCP twin is
+/// `tools/evolve_step.rs::require_lineage_authority`):
+/// [`workflow_authority`] for `caller` over EVERY workflow that executes the
+/// step lineage of `parent`
+/// (`WorkflowRepository::workflows_executing_step_lineage`: the parent and
+/// every claim sharing its `step_lineage_id`, retracted `executes` edges
+/// included). A step two workflows execute needs authority over both; the
+/// head an earlier evolve left unexecuted is still gated through its lineage;
+/// a lineage no workflow executes returns no grant and is unaffected.
+///
+/// `caller` must be the principal the step is authored as (the viewer's), so
+/// the identity checked is the identity that writes. Run on the act's own
+/// transaction, before the act. Returns each workflow with its grant, for
+/// [`record_api_lineage_writes`].
+#[cfg(feature = "db")]
+async fn require_api_lineage_authority(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    caller: Uuid,
+    parent: Uuid,
+) -> Result<Vec<(Uuid, ApiWorkflowGrant)>, ApiError> {
+    let workflows =
+        epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut *conn, parent)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!(
+                    "evolve_step: could not read the workflows executing the step's lineage: {e}"
+                ),
+            })?;
+    let mut grants = Vec::with_capacity(workflows.len());
+    for workflow in workflows {
+        let grant = workflow_authority(&mut *conn, Some(auth), Some(caller), workflow).await?;
+        grants.push((workflow, grant));
+    }
+    Ok(grants)
+}
+
+/// Record an admitted `evolve_step` once per workflow
+/// [`require_api_lineage_authority`] checked, on the act's own transaction:
+/// [`audit_api_admin_workflow_write`] for the audited admin arm,
+/// [`record_api_caller_workflow_write`] for the submitter and operator arms.
+/// The rows are attributed to the session principal, here the caller itself,
+/// whose stamp the step claim is written on.
+#[cfg(feature = "db")]
+async fn record_api_lineage_writes(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    caller: Uuid,
+    grants: &[(Uuid, ApiWorkflowGrant)],
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    for (workflow, grant) in grants {
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut *conn,
+                auth,
+                caller,
+                "evolve_step",
+                *workflow,
+                grant.owner,
+                details.clone(),
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut *conn,
+                Some(auth),
+                caller,
+                "evolve_step",
+                *workflow,
+                *grant,
+                details.clone(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// AUTHORSHIP (operator rulings, 2026-10-13; the MCP twin's
