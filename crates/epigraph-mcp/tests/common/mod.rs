@@ -26,6 +26,7 @@ pub fn admin_auth() -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -544,6 +545,7 @@ pub async fn server_admin(
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         },
         viewer,
     )
@@ -609,6 +611,7 @@ pub async fn seed_caller(
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         },
         viewer,
     )

@@ -460,7 +460,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        3,
+        4,
         "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
@@ -473,7 +473,15 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          principal's own link. The third is access_token_is_revoked (migration 141): the \
          RFC 7009 denylist lookup both middlewares and /oauth/introspect run after verifying a \
          token's signature and BEFORE any principal exists (a revoked token gets none), keyed by \
-         that signature-verified jti, on a non-tenant credential table read by primary key.",
+         that signature-verified jti, on a non-tenant credential table read by primary key. The \
+         fourth is admit_delegated's AgentRepository::delegated_principal_pool: the per-request \
+         liveness check of a delegated run token, which both middlewares run (only for a token \
+         carrying a `dlg` claim) right after the revocation lookup and for the same reason: it \
+         decides whether the verified token yields a principal at all, BEFORE any viewer exists. \
+         It reads only through app-executable SECURITY DEFINER functions (migrations 077, 107, \
+         122, 149) that do not depend on the session's stamp, and returns only the named \
+         delegator's and principal's own binding, link and membership answers. extract_viewer \
+         reuses its answer from the request's extensions and reads nothing for it.",
     ),
     (
         "middleware/rate_limit.rs",
@@ -651,7 +659,21 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 ///
 /// Nightly staging 2026-10-14 merged both: 256 - 3 (U033) - 1 (X12) = 252, disjoint
 /// files, re-measured by `the_unconverted_register_is_exactly_what_was_measured`.
-const HIGH_WATER: usize = 252;
+///
+/// 252 -> 249 (backlog 850dcc61): `create_entity`, `batch_create_mentions` and
+/// `batch_create_triples` write on `AppState::write_as` transactions;
+/// `routes/entities.rs` 3 -> 0 and its key was deleted, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure.
+///
+/// 252 -> 251 (#632's own branch): `report_hierarchical_outcome`'s transaction moved from
+/// `state.db_pool.begin()` to `AppState::write_as` with the caller's viewer, so
+/// its step lookup reads what the caller may read (`routes/workflows.rs` 9 -> 8,
+/// keeping sites), read off `the_scanner_is_not_vacuous`'s own failure
+/// (`left: 251, right: 252`).
+///
+/// Nightly staging 2026-10-21 merged both: 252 - 3 (entities, backlog 850dcc61)
+/// and then 1 more (`routes/workflows.rs` 9 -> 8) is 248; the two touch disjoint files.
+const HIGH_WATER: usize = 248;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -713,7 +735,8 @@ const HIGH_WATER: usize = 252;
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// (`recorded 10, measured 5`).
 /// 44 -> 43 when `routes/reasoning.rs` reached zero (see [`HIGH_WATER`]).
-const HIGH_WATER_FILES: usize = 43;
+/// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
+const HIGH_WATER_FILES: usize = 42;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -837,17 +860,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // commit on the raw pool exactly as before.
     ("routes/edges.rs", 5),
     ("routes/embeddings.rs", 2),
-    // 8 before conversion shard 7, and the largest single-file drop in that
-    // shard. `entity_neighborhood` (2 sites) is category A. `query_triples`
-    // (3 sites) is NOT: PR #460 filed it C because its classification computes
-    // `write verb OR no Viewer OR unrouted` from the HANDLER, and the verb is a
-    // property of the route table rather than of the statement. Measured here:
-    // it is a POST that holds a `ViewerExtractor`, runs three SELECTs, opens no
-    // transaction and writes nothing — the same "true of the rule, false of the
-    // reachability" shape shard 6 found in `edges.rs::evidence_by_relationship`.
-    // The three that remain are `create_entity`, `batch_create_mentions` and
-    // `batch_create_triples`, all writes.
-    ("routes/entities.rs", 3),
+    // `routes/entities.rs` was 8 and is GONE, not zeroed. Conversion shard 7
+    // took 5 (`entity_neighborhood` 2, category A; `query_triples` 3, filed C by
+    // PR #460 on the handler's verb but measured as a read). Backlog 850dcc61
+    // took the last 3, the writes `create_entity`, `batch_create_mentions` and
+    // `batch_create_triples`: each now runs on ONE `AppState::write_as`
+    // transaction, and the two batches authorize every target claim through the
+    // caller's viewer before their first insert.
     ("routes/events.rs", 6),
     ("routes/experiment_loop.rs", 20),
     ("routes/experiments.rs", 8),
@@ -1034,7 +1053,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // a refused step row rolls the counters back. A plain transaction: neither
     // `workflows` nor `behavioral_executions` has row security. Read off this
     // test's failure output (`recorded 12, measured 9`).
-    ("routes/workflows.rs", 9),
+    //
+    // 9 -> 8: that `state.db_pool.begin()` became `AppState::write_as` with
+    // the caller's viewer. The two writes still need no stamp; the step lookup
+    // does, or row security hides every group-private step from the group's
+    // own members. Read off this test's failure output (`recorded 9, measured
+    // 8`).
+    ("routes/workflows.rs", 8),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

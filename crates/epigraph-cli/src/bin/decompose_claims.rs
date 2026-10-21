@@ -24,7 +24,9 @@
 //! would be laundered from it. Only `visibility = 'public'` parents are
 //! selected ([`epigraph_cli::decompose::check_publicly_decomposable`]).
 //!
-//! Required: DATABASE_URL, and CLAUDE_CODE_OAUTH_TOKEN.
+//! Required: DATABASE_URL (plus MAINTENANCE_DATABASE_URL on the maintenance
+//! path; see "Running as an agent" for the path without it), and
+//! CLAUDE_CODE_OAUTH_TOKEN.
 //! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
 //! default http://127.0.0.1:8080. Auth token: EPIGRAPH_TOKEN if set, otherwise
 //! minted via client_credentials from EPIGRAPH_SERVICE_CLIENT_ID +
@@ -63,6 +65,67 @@
 //! (`skipped_judged_atomic=` on the `selection:` line; `--include-judged-atomic`
 //! asks again). `--dry-run` and `--plan` only read it. A parent whose text
 //! changes is asked again.
+//!
+//! # Running as an agent (`--as-agent <agent id>`; backlog 9a877b7c)
+//!
+//! Without the flag the binary is a maintenance job: it connects through
+//! `epigraph_cli::MaintenancePool` and refuses to start unless the connection
+//! satisfies `epigraph_bypass()`. An agent container holds only the ordinary
+//! application login in `DATABASE_URL`, which that refusal rejects. A
+//! scheduled run in an agent container therefore takes this path, which
+//! needs no maintenance DSN:
+//!
+//! * the application login in `DATABASE_URL` as a `ScopedPool`; no
+//!   maintenance DSN is read and no privilege is asserted;
+//! * every read on a connection stamped for the acting agent, so selection
+//!   sees what row-level security shows that agent (public rows, plus rows of
+//!   its own groups), and the `decomposes_to` edges in a transaction stamped
+//!   for it, so each edge records the agent's group as its writer (migration
+//!   120) rather than landing ownerless. Atoms still go through
+//!   `POST /api/v1/claims` with the API token;
+//! * a writing run asks the database which group its edges would record
+//!   (`epigraph_writer_group()`, the trigger's own function), prints it on
+//!   the `connection:` line (`writer_group=`), and refuses when there is none
+//!   (`has no writer group`);
+//! * the old refusal's purpose, no silent zero-row run, is kept by the
+//!   result: a `--priority oldest|recent` scan that reads NO undecomposed
+//!   claim fails (`sees no undecomposed claim`); judged-atomic and short
+//!   parents stay in that population, so on a live corpus it is never empty.
+//!   `--priority conflict` reads only the targets of a live conflict edge,
+//!   which may legitimately be none: it fails only when the session sees no
+//!   claim at all (`sees no claim at all`). `chosen=0` over a visible
+//!   population is the steady state and exits 0. `--ids-file` names every id
+//!   it skips, so it is not subject to this;
+//! * `--retarget` stays on the maintenance path, and `--priority conflict`'s
+//!   report of decomposed conflict parents is printed only there.
+//!
+//! Pass the agent the API token acts as (the service client's agent). The
+//! binary does not check that the two match: atoms are created as the
+//! token's agent and edges as `--as-agent`, so a mismatch splits their
+//! attribution. That is an operator check at deploy time, not a privilege
+//! question (the application login can already stamp any agent).
+//!
+//! Coverage against the maintenance view (measured on a fixture in
+//! `tests/decompose_claims_as_agent.rs`):
+//!
+//! 1. a group-private parent outside the agent's groups is not read at all.
+//!    That loses nothing: only public parents are ever decomposed
+//!    (`skipped_not_public` on the maintenance path);
+//! 2. a PUBLIC parent whose only `decomposes_to` edges are hidden from the
+//!    agent (private to a group it is not in) reads as undecomposed, because
+//!    row security also filters the `NOT EXISTS` edge probe. The run
+//!    decomposes it again. Where the hidden edge points at a private atom,
+//!    the result is a second set of public atoms. Where it points at a
+//!    PUBLIC atom and the model returns the same text, `if_not_exists`
+//!    returns that same atom, and the edge dedup probe
+//!    (`EdgeRepository::create_if_absent_including_retracted_conn`) is
+//!    filtered by row security on this login too, so a second, public
+//!    `(parent, atom, decomposes_to)` edge is written next to the hidden
+//!    one (no unique index stops it since migration 018). The second case is
+//!    derived from the code, not measured.
+//!
+//! The `--singleton-ledger` and `--count-eligible` flags behave identically
+//! on both paths.
 //!
 //! # Modes
 //!
@@ -120,8 +183,9 @@
 use clap::Parser;
 use epigraph_cli::decompose::{
     atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
-    BatchClaim, EligibilityFilters, PlanGaps, Priority, SingletonLedger,
+    run_decomposition_batches, select_candidates, verify_plan, visible_claim_count,
+    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
+    PlanGaps, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -203,6 +267,15 @@ struct Cli {
     /// Stop reading the undecomposed population after this many rows.
     #[arg(long, default_value_t = 20_000)]
     max_scan: usize,
+    /// Run as this agent (an `agents.id`) on the ordinary application login
+    /// in DATABASE_URL, through row-level security, with NO maintenance DSN:
+    /// selection reads what that agent can see, and `decomposes_to` edges are
+    /// written as it. A decomposing run needs the agent to hold a writable
+    /// group. Without the flag the run takes the maintenance path
+    /// (MAINTENANCE_DATABASE_URL, privilege checked at startup). Not with
+    /// --retarget. See the module doc, "Running as an agent".
+    #[arg(long)]
+    as_agent: Option<uuid::Uuid>,
     /// Call the LLM, print the proposed atoms, write this JSONL plan, and
     /// write NOTHING to the graph.
     #[arg(long)]
@@ -290,6 +363,11 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     if cli.dry_run && (cli.apply || cli.apply_plan.is_some()) {
         return Err("--dry-run cannot be combined with --apply or --apply-plan".into());
     }
+    if cli.as_agent.is_some() && cli.retarget {
+        return Err(
+            "--retarget runs only on the maintenance path; it does not apply to --as-agent".into(),
+        );
+    }
     if cli.include_judged_atomic && cli.singleton_ledger.is_none() {
         return Err("--include-judged-atomic needs --singleton-ledger".into());
     }
@@ -352,6 +430,83 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
         return Ok(Mode::Enumerate);
     }
     Ok(Mode::Run)
+}
+
+/// The `--as-agent` connection: the application login in DATABASE_URL as a
+/// [`epigraph_db::ScopedPool`], and the acting agent's viewer resolved on it.
+///
+/// No maintenance DSN is read and no privilege is asserted: this path is
+/// unprivileged on purpose. A mode that writes asks the database which group
+/// its `decomposes_to` edges would record as their writer
+/// ([`epigraph_cli::decompose::writer_group`], the very function the edge
+/// trigger uses) and refuses when the answer is none, because those edges
+/// would carry no owner. A read-only mode proceeds as whatever the agent can
+/// see (for an agent with no group, public rows only).
+async fn connect_as_agent(
+    agent: uuid::Uuid,
+    writes: bool,
+) -> Result<(epigraph_db::ScopedPool, epigraph_db::visibility::Viewer), Box<dyn std::error::Error>>
+{
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set; --as-agent runs on the application login in it")?;
+    let guc_mode = epigraph_db::SessionGucMode::from_env(
+        std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let scoped = epigraph_db::ScopedPool::connect(&url, guc_mode).await?;
+    if guc_mode == epigraph_db::SessionGucMode::Session {
+        scoped.probe_session_gucs().await?;
+    }
+    let viewer = epigraph_db::visibility::Viewer::resolve(scoped.inner(), agent).await?;
+    let groups = viewer.group_bind().map_or(0, <[uuid::Uuid]>::len);
+    let writable = viewer.writable_groups().len();
+    // Only a writing mode asks: the question opens a write transaction.
+    let writer = if writes {
+        Some(writer_group(&scoped, &viewer).await?)
+    } else {
+        None
+    };
+    let shown = match writer {
+        None => "n/a (read-only mode)".to_string(),
+        Some(None) => "none".to_string(),
+        Some(Some(g)) => g.to_string(),
+    };
+    eprintln!(
+        "connection: --as-agent {agent} on the application login (DATABASE_URL), through \
+         row-level security; no maintenance DSN; groups={groups} writable={writable} \
+         writer_group={shown}"
+    );
+    if writer == Some(None) {
+        return Err(format!(
+            "--as-agent {agent}: the agent has no writer group (epigraph_writer_group() is \
+             NULL for it), so the decomposes_to edges this run writes would carry no owner. \
+             Pass the agent the API token acts as (the service client's agent); it needs a \
+             writable personal group of its own or of its operator."
+        )
+        .into());
+    }
+    Ok((scoped, viewer))
+}
+
+/// The `--as-agent` zero-visible refusal (see its call site).
+fn zero_visible_refusal(agent: uuid::Uuid) -> String {
+    format!(
+        "--as-agent {agent}: this session sees no undecomposed claim at all, so the run would \
+         read zero rows and exit 0. The login in DATABASE_URL reads through row-level \
+         security: check that it is an application login with its table grants, and that the \
+         claims it should decompose are public. Refusing to run."
+    )
+}
+
+/// The `--as-agent` refusal for a population that may legitimately be empty
+/// (`--priority conflict`): the session sees no claim at all.
+fn no_claim_visible_refusal(agent: uuid::Uuid) -> String {
+    format!(
+        "--as-agent {agent}: this session sees no claim at all, so the run would read zero \
+         rows and exit 0. The login in DATABASE_URL reads through row-level security: check \
+         that it is an application login with its table grants. Refusing to run."
+    )
 }
 
 /// Parse an `--ids-file`: one UUID per line, blank lines and `#` comments
@@ -724,20 +879,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cannot write must fail now, not after the verdicts are paid for.
     let mut ledger = open_singleton_ledger(cli.singleton_ledger.as_deref(), &mode)?;
 
-    // CLI maintenance bin: the operator is the authority and the work is
-    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
-    // bypass and a request handler does not.
-    //
     // Built AFTER clap has parsed: an argv error must be reported as an argv
-    // error, not as a connection failure. And `_maint_conn` is held for the
-    // whole run — the lease attests to THAT connection, and the pre-PR-15
-    // template dropped it while the viewer lived on.
-    let maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
-    let session = maint
-        .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
-        .await?;
-    let viewer = session.viewer();
-    let pool = maint.pool();
+    // error, not as a connection failure.
+    //
+    // Two paths. Without --as-agent: the maintenance bin it always was — the
+    // operator is the authority and the work is corpus-wide (see
+    // `epigraph_cli::MaintenancePool` for why that earns a bypass and a
+    // request handler does not), and the session is held for the whole run
+    // because the lease attests to THAT connection. With --as-agent: the
+    // ordinary application login, no bypass, every statement stamped for the
+    // acting agent (see `DecomposeDb`).
+    let maint;
+    let session;
+    let scoped;
+    let acting;
+    let (db, viewer, maint_pool): (
+        &dyn DecomposeDb,
+        &epigraph_db::visibility::Viewer,
+        Option<&sqlx::PgPool>,
+    ) = match cli.as_agent {
+        None => {
+            maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
+            session = maint
+                .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
+                .await?;
+            (
+                maint.pool() as &dyn DecomposeDb,
+                session.viewer(),
+                Some(maint.pool()),
+            )
+        }
+        Some(agent) => {
+            let (pool, viewer) = connect_as_agent(agent, mode.writes(&cli.provider)).await?;
+            scoped = pool;
+            acting = viewer;
+            (&scoped as &dyn DecomposeDb, &acting, None)
+        }
+    };
 
     // API base: EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the
     // container-standard name exposed by epiclaw-host. If neither is set we
@@ -777,6 +955,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_base,
                 token,
             });
+            let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let run =
                 run_retarget(pool, viewer, llm.as_ref(), api.as_ref(), &manifest, opts).await?;
             eprintln!(
@@ -816,6 +995,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Each applied line is appended to the manifest as its entry
             // finishes, not at the end.
+            let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let applied = apply_retarget(pool, viewer, &api, &plan, Some(&manifest)).await?;
             print_applied(&applied);
         }
@@ -826,7 +1006,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 planned.len(),
                 path.display()
             );
-            let (ok, drifted) = verify_plan(pool, viewer, planned).await?;
+            let (ok, drifted) = verify_plan(db, viewer, planned).await?;
             for (p, why) in &drifted {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
@@ -835,7 +1015,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
             let totals =
-                persist_planned(pool, viewer, &ok, embedder, ledger.as_mut(), &submit).await?;
+                persist_planned(db, viewer, &ok, embedder, ledger.as_mut(), &submit).await?;
             for (id, why) in &totals.failed {
                 eprintln!("FAILED {id}: {why}");
             }
@@ -872,7 +1052,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limit
             };
             let mut sel = select_candidates(
-                pool,
+                db,
                 viewer,
                 cli.priority.into(),
                 ids.as_deref(),
@@ -886,8 +1066,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .count_eligible
                 .then(|| keep_within_limit(&mut sel, limit, scan_limit));
             report_selection(&sel, ids.is_some(), cli.priority, eligible);
+            if let Some(agent) = cli.as_agent {
+                // What the maintenance path's startup refusal protected: a
+                // job that cannot see the corpus must not read zero rows and
+                // exit 0. Keyed on rows READ, before any filter: a visible
+                // population with nothing eligible (`chosen=0`) is the steady
+                // state. Not for --ids-file, which names every id it skips.
+                if ids.is_none() && sel.scanned == 0 {
+                    match cli.priority {
+                        // The population is every undecomposed claim the
+                        // session can see; LLM-judged and short parents stay
+                        // in it, so on a live corpus it is never empty.
+                        PriorityArg::Oldest | PriorityArg::Recent => {
+                            return Err(zero_visible_refusal(agent).into());
+                        }
+                        // Only the targets of a live conflict edge: empty is a
+                        // legitimate answer. Fail only if the session sees no
+                        // claim at all.
+                        PriorityArg::Conflict => {
+                            let visible = visible_claim_count(db, viewer).await?;
+                            if visible == 0 {
+                                return Err(no_claim_visible_refusal(agent).into());
+                            }
+                            eprintln!(
+                                "selection: no undecomposed conflict target among the \
+                                 {visible} claims this session sees; nothing to do"
+                            );
+                        }
+                    }
+                }
+            }
             if cli.priority == PriorityArg::Conflict {
-                report_decomposed_conflict_parents(pool, viewer).await?;
+                match maint_pool {
+                    Some(pool) => report_decomposed_conflict_parents(pool, viewer).await?,
+                    None => eprintln!(
+                        "conflict: decomposed parents that are still conflict targets are \
+                         reported only on the maintenance path (they go to --retarget)"
+                    ),
+                }
             }
             let claims: Vec<BatchClaim> = sel
                 .chosen
@@ -945,7 +1161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let embedder = epigraph_cli::embedding_service();
             let totals = run_decomposition_batches(
-                pool,
+                db,
                 viewer,
                 &claims,
                 llm.as_ref(),
@@ -1241,6 +1457,33 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         resolve_mode(&cli, now)
+    }
+
+    /// `--as-agent` accepts every decomposition mode and refuses every
+    /// `--retarget` mode, which stays on the maintenance path.
+    #[test]
+    fn as_agent_takes_the_decomposition_modes_and_refuses_retarget() {
+        let a = "5f1c2d3e-0000-4000-8000-000000000001";
+        assert_eq!(mode_of(&["--as-agent", a]).unwrap(), Mode::Run);
+        assert_eq!(
+            mode_of(&["--as-agent", a, "--dry-run"]).unwrap(),
+            Mode::Enumerate
+        );
+        assert!(matches!(
+            mode_of(&["--as-agent", a, "--apply-plan", "p.jsonl"]).unwrap(),
+            Mode::ApplyPlan(_)
+        ));
+        for retarget in [
+            &["--retarget"][..],
+            &["--retarget", "--apply"][..],
+            &["--retarget", "--apply-plan", "m.jsonl"][..],
+        ] {
+            let mut args = vec!["--as-agent", a];
+            args.extend_from_slice(retarget);
+            let err = mode_of(&args).unwrap_err();
+            assert!(err.contains("--as-agent"), "{retarget:?}: {err}");
+        }
+        assert!(mode_of(&["--as-agent", "not-a-uuid"]).is_err());
     }
 
     /// No flags = the historical write run, `oldest` order.

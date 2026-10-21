@@ -142,6 +142,13 @@ pub struct IngestAnchors {
     pub linked_parent: Option<Uuid>,
 }
 
+/// An `executes` edge's `plan_index` as a `bigint`, or NULL unless it is a
+/// JSON integer of at most nine digits. A `CASE`, not a `WHERE` guard plus a
+/// cast: PostgreSQL does not promise to evaluate a guard before the cast.
+const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') = 'number' \
+                                    AND properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                               THEN (properties->>'plan_index')::bigint END)";
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -264,6 +271,53 @@ impl WorkflowRepository {
         .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
+    }
+
+    /// Lock one `workflows` row (`FOR UPDATE`) for the rest of the caller's
+    /// transaction. `Ok(false)` when no row has this id.
+    ///
+    /// `add_step` takes it before it reads the plan it is about to extend, so
+    /// two concurrent `add_step`s on one workflow cannot both compute the same
+    /// next `plan_index`. `workflows` has no row security, so this needs no
+    /// viewer.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lock_for_plan_edit<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_optional(executor)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
+    /// session can see, as `(target claim, plan_index, is public)`. The index
+    /// is `None` unless the edge's `plan_index` is a JSON integer of at most
+    /// nine digits (the bound every plan-order reader's `^[0-9]{1,9}$` uses),
+    /// so a string `"3"` or a fraction is unindexed here as it is in the frozen
+    /// plan read. A retracted edge is not a plan item for any reader, so it
+    /// takes no part in where a new item goes.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn executes_plan_indices<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<Vec<(Uuid, Option<i64>, bool)>, sqlx::Error> {
+        let sql = format!(
+            "SELECT target_id, {PLAN_INDEX_INT}, COALESCE(visibility::text = 'public', false) FROM edges \
+              WHERE source_id = $1 AND source_type = 'workflow' \
+                AND relationship = 'executes' AND valid_to IS NULL"
+        );
+        sqlx::query_as(&sql)
+            .bind(workflow_id)
+            .fetch_all(executor)
+            .await
     }
 
     /// The existing rows an ingest of `(canonical_name, generation)` with
@@ -410,6 +464,61 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         q.fetch_all(pool).await.map_err(DbError::from)
+    }
+
+    /// The ids of every workflow that EXECUTES the step lineage of `claim_id`:
+    /// a `workflow —executes→ claim` edge into `claim_id` itself or into any
+    /// claim sharing its non-null `step_lineage_id`. Ascending by id.
+    ///
+    /// Exists for the `evolve_step` authority gate (MCP
+    /// `tools/evolve_step.rs`, REST `routes/workflows.rs::evolve_step`), which
+    /// requires workflow authority over EVERY workflow returned. The lineage is
+    /// read, not just the parent's own edges, because `executes` stays on the
+    /// frozen step when it is evolved (`migrate_superseded_edges`' step-lineage
+    /// rule): the new head is executed by nothing directly, and a gate keyed on
+    /// the parent's edges would admit anyone to the second evolve. A parent
+    /// with no lineage yet (`evolve_step` mints one for it) is its own lineage.
+    ///
+    /// RETRACTED edges are included ON PURPOSE, as in
+    /// [`Self::executing_canonical_names`]. Any principal that writes the
+    /// owning group of a group-private `executes` edge can retract it
+    /// (`EdgeRepository::retract_by_id`), so filtering on `valid_to` would let
+    /// that writer lift the gate it is held to. Edge `properties` (e.g.
+    /// `plan_index`, which the same writers can rewrite) play no part.
+    ///
+    /// NOT viewer-spliced, deliberately: this is an authority read, and an
+    /// in-query viewer predicate could only remove workflows from the set the
+    /// caller must hold authority over. It runs on the caller's own write
+    /// transaction, so the one filter left is the row security that session is
+    /// held to. Residual, stated: a lineage member or `executes` edge that
+    /// row security hides from the caller is not counted. Every claim of a
+    /// lineage takes its parent's tenancy at `evolve_step`, and an `executes`
+    /// edge takes its step's, so a caller who can lock the parent can normally
+    /// see them all; a lineage whose members were later split across tenancies
+    /// out of band is the case this does not cover.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn workflows_executing_step_lineage(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT w.id \
+             FROM edges e \
+             JOIN workflows w ON w.id = e.source_id \
+             WHERE e.relationship = 'executes' \
+               AND e.source_type = 'workflow' AND e.target_type = 'claim' \
+               AND (e.target_id = $1 \
+                    OR e.target_id IN ( \
+                        SELECT m.id FROM claims m \
+                        JOIN claims p ON p.step_lineage_id = m.step_lineage_id \
+                        WHERE p.id = $1)) \
+             ORDER BY w.id",
+        )
+        .bind(claim_id)
+        .fetch_all(&mut *conn)
+        .await
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
@@ -818,6 +927,84 @@ impl WorkflowRepository {
             )
             .collect();
         Ok(resolved)
+    }
+
+    /// The workflow's level-2 step claims whose PLAN POSITION `viewer` can
+    /// establish, in plan order: the lookup an outcome report maps each
+    /// `step_index` through, shared by the MCP tool and the HTTP route so step
+    /// N is one step on both transports. Element N is step N; a step whose
+    /// position the viewer cannot establish is not listed, and neither is any
+    /// step after it.
+    ///
+    /// Same order key as [`Self::resolve_steps_to_heads`] (`plan_index` first,
+    /// `created_at` only for edges that carry none), and the same two
+    /// predicates, on the edge and on the claim.
+    ///
+    /// # Run it on the caller's STAMPED transaction
+    ///
+    /// `conn` must be stamped with `viewer`. On an unstamped application
+    /// session row security admits only public rows, so a group's own member
+    /// would get none of its group-private steps back, without an error.
+    ///
+    /// # Only a provable prefix is returned
+    ///
+    /// A step the viewer cannot read is absent from what it reads, so counting
+    /// the visible steps would shift every visible step after a hidden one
+    /// onto the hidden one's index, and an outcome row would be attributed to
+    /// the WRONG step with no signal. That is reachable: `add_step` declares
+    /// its step public (`ClaimRepository::default_decl_for_author` of the
+    /// system agent) and its `executes` edge carries no `plan_index`, so a
+    /// group-private plan can end in a public step that a non-member sees
+    /// alone. So the list stops where the viewer can no longer prove a step's
+    /// position (`provable_plan_steps`):
+    ///
+    /// * The ingest executor numbers EVERY plan claim's `executes` edge
+    ///   `0..n` (`plan_index`, phases included, so `plan_index` is not the step
+    ///   index). A gap in the ordinals the viewer reads means an edge it
+    ///   cannot see; nothing from the gap on is listed.
+    /// * Edges with no ordinal (written by `add_step`, or before the ordinal
+    ///   existed) sort after every ordinal one. They are listed only when the
+    ///   viewer reads the plan they follow: at least one ordinal edge, or (a
+    ///   plan written before the ordinal) a level-1 phase edge.
+    ///
+    /// A step that is not listed is reported by the callers like an
+    /// out-of-range index (NULL `step_claim_id`, disclosed as unresolved). The
+    /// two are deliberately indistinguishable: the difference is the existence
+    /// of a step the caller cannot see. Residual, not detectable without a
+    /// privileged read: hidden ordinal edges AFTER every visible one, followed
+    /// by visible unordered steps. One ingest writes a plan's ordinal edges
+    /// under one owner, so it needs a later re-ownership of part of a plan.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn plan_step_claim_ids(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        // Every level, not only steps: the phases' ordinals are part of the
+        // sequence a gap is detected in.
+        let sql = viewer.splice(
+            "SELECT c.id, c.properties->>'level', \
+                    CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                         THEN (e.properties->>'plan_index')::int END \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q =
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<i32>)>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
+        Ok(provable_plan_steps(&rows))
     }
 
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
@@ -1630,6 +1817,133 @@ impl WorkflowRepository {
             .map(|(id, shared)| ExecutedClaim { id, shared })
             .collect())
     }
+
+    /// The `workflows` row and every `executes` edge of `workflow_id` that
+    /// `viewer` may see, each joined to its target claim when `viewer` may read
+    /// it. The raw input of the frozen-plan read
+    /// (`epigraph_ingest_executor::workflow_plan::frozen_plan`), which derives
+    /// the order, the integrity counts and the digest echo from these rows.
+    ///
+    /// `Ok(None)` when no `workflows` row has this id.
+    ///
+    /// # What is and is not filtered
+    ///
+    /// * The edges carry `{EDGE_VISIBILITY:e}` and the target claim
+    ///   `{VISIBILITY:c}`, so a target the viewer cannot read comes back as an
+    ///   edge with `readable = false` and no claim column: the caller counts it
+    ///   and never sees its id or content past this function. An edge the viewer
+    ///   cannot see does not come back at all. That is most hidden items: an
+    ///   `executes` edge takes its target's tenancy (migration 072's meet).
+    /// * RETRACTED edges (`valid_to` set) are returned, flagged, not dropped:
+    ///   a retraction changes the plan and the caller must be able to say so.
+    /// * `workflows` has no row security, so the row read needs no predicate.
+    /// * `heads_diverged` asks whether the target's step lineage has a head
+    ///   other than the target that the viewer may read (`{VISIBILITY:h}`). The
+    ///   `supersedes` exclusion inside it carries no viewer predicate, as in
+    ///   [`ClaimRepository::latest_in_lineage`], but on an RLS-bound
+    ///   connection the policy still hides a `supersedes` edge in a group the
+    ///   viewer is not in, so a head that edge retired can still count and
+    ///   the flag can read `true` spuriously. It is informational (a resolver
+    ///   warns on it and never refuses), so the over-report is accepted.
+    ///
+    /// Takes the ONE viewer-stamped connection of the request, so the in-query
+    /// predicate and the session's tenancy GUCs agree under forced RLS.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a query fails.
+    pub async fn frozen_plan(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Option<FrozenPlanRead>, DbError> {
+        let row: Option<FrozenPlanRow> = sqlx::query_as(
+            "SELECT id, canonical_name, generation, goal, parent_id, truth_value, metadata \
+               FROM workflows WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let sql = viewer.splice(
+            r#"
+            SELECT e.properties AS edge_properties,
+                   (e.valid_to IS NOT NULL) AS retracted,
+                   e.target_id,
+                   (t.id IS NOT NULL) AS readable,
+                   t.content, t.content_hash, t.properties AS claim_properties,
+                   t.visibility, t.owner_group_id, t.truth_value, t.is_current,
+                   t.heads_diverged
+              FROM edges e
+              LEFT JOIN LATERAL (
+                  SELECT c.id, c.content, c.content_hash, c.properties,
+                         c.visibility::text AS visibility, c.owner_group_id,
+                         c.truth_value, c.is_current,
+                         (c.step_lineage_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM claims h
+                               WHERE h.step_lineage_id = c.step_lineage_id
+                                 AND h.id <> c.id
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM edges s
+                                      WHERE s.target_id = h.id
+                                        AND s.relationship = 'supersedes')
+                                 /* {VISIBILITY:h} */
+                         )) AS heads_diverged
+                    FROM claims c
+                   WHERE c.id = e.target_id AND e.target_type = 'claim'
+                     /* {VISIBILITY:c} */
+              ) t ON true
+             WHERE e.source_id = $1 AND e.relationship = 'executes'
+               /* {EDGE_VISIBILITY:e} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrozenPlanEdgeRow>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let edges = q.fetch_all(&mut *conn).await?;
+        Ok(Some(FrozenPlanRead { row, edges }))
+    }
+}
+
+/// The `workflows` row of [`WorkflowRepository::frozen_plan`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub truth_value: f64,
+    pub metadata: serde_json::Value,
+}
+
+/// One visible `executes` edge of [`WorkflowRepository::frozen_plan`]. Every
+/// claim column is `None` when `readable` is false.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanEdgeRow {
+    pub edge_properties: Option<serde_json::Value>,
+    pub retracted: bool,
+    pub target_id: Uuid,
+    pub readable: bool,
+    pub content: Option<String>,
+    pub content_hash: Option<Vec<u8>>,
+    pub claim_properties: Option<serde_json::Value>,
+    pub visibility: Option<String>,
+    pub owner_group_id: Option<Uuid>,
+    pub truth_value: Option<f64>,
+    pub is_current: Option<bool>,
+    pub heads_diverged: Option<bool>,
+}
+
+/// What [`WorkflowRepository::frozen_plan`] read.
+#[derive(Debug, Clone)]
+pub struct FrozenPlanRead {
+    pub row: FrozenPlanRow,
+    pub edges: Vec<FrozenPlanEdgeRow>,
 }
 
 /// One row of [`WorkflowRepository::executed_structural_claims`].
@@ -1641,9 +1955,100 @@ pub struct ExecutedClaim {
     pub shared: bool,
 }
 
+/// The level-2 steps of one plan whose position is provable from the
+/// `executes` edges a viewer reads: `rows` are `(claim id, claim level text,
+/// edge plan_index)` in plan order (ordinal edges first, ascending). See
+/// [`WorkflowRepository::plan_step_claim_ids`] for the rule; element N of the
+/// result is step N.
+#[must_use]
+fn provable_plan_steps(rows: &[(Uuid, Option<String>, Option<i32>)]) -> Vec<Uuid> {
+    let level = |l: &Option<String>| l.as_deref().and_then(|v| v.trim().parse::<i64>().ok());
+    let mut steps = Vec::new();
+    let mut next_ordinal: i32 = 0;
+    let mut unordered = Vec::new();
+    for (id, lvl, plan_index) in rows {
+        match plan_index {
+            Some(pi) => {
+                // A gap (or a repeat) means an ordinal edge this viewer cannot
+                // read, or a plan it cannot number: no later position holds.
+                if *pi != next_ordinal {
+                    return steps;
+                }
+                next_ordinal += 1;
+                if level(lvl) == Some(2) {
+                    steps.push(*id);
+                }
+            }
+            None => unordered.push((*id, level(lvl))),
+        }
+    }
+    let anchored = next_ordinal > 0 || unordered.iter().any(|(_, l)| *l == Some(1));
+    if anchored {
+        steps.extend(
+            unordered
+                .into_iter()
+                .filter(|(_, l)| *l == Some(2))
+                .map(|(id, _)| id),
+        );
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(level: &str, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
+        (Uuid::new_v4(), Some(level.to_string()), plan_index)
+    }
+
+    /// A fully visible current-format plan (phase 0, steps 1..=2, phase 3,
+    /// step 4) plus an appended unordered step: every step is listed, in
+    /// order, and the phases' ordinals do not count as steps.
+    #[test]
+    fn a_complete_plan_lists_every_step_in_plan_order() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(2)),
+            row("1", Some(3)),
+            row("2", Some(4)),
+            row("2", None),
+        ];
+        let want: Vec<Uuid> = [1, 2, 4, 5].iter().map(|i| rows[*i].0).collect();
+        assert_eq!(provable_plan_steps(&rows), want);
+    }
+
+    /// A hidden ordinal edge (here plan_index 2) stops the list: the step at
+    /// plan_index 3 would otherwise be reported as step 1, and the appended
+    /// step after it as step 2.
+    #[test]
+    fn a_gap_in_the_ordinals_stops_the_list() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(3)),
+            row("2", None),
+        ];
+        assert_eq!(provable_plan_steps(&rows), vec![rows[1].0]);
+
+        // A plan whose first ordinal is hidden yields nothing at all.
+        let rows = vec![row("2", Some(1)), row("2", Some(2))];
+        assert!(provable_plan_steps(&rows).is_empty());
+    }
+
+    /// Unordered steps alone, with no ordinal edge and no phase visible, are
+    /// the appended tail of a plan the viewer cannot read: their position is
+    /// unknown, so none is listed. With a phase visible (a plan written before
+    /// the ordinal existed) they are listed positionally, as before.
+    #[test]
+    fn unordered_steps_need_a_visible_plan_to_follow() {
+        let appended = vec![row("2", None)];
+        assert!(provable_plan_steps(&appended).is_empty());
+
+        let legacy = vec![row("1", None), row("2", None), row("2", None)];
+        assert_eq!(provable_plan_steps(&legacy), vec![legacy[1].0, legacy[2].0]);
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {

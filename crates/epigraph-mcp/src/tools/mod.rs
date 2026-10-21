@@ -37,4 +37,5 @@ pub mod viewer;
 pub mod workflow_authority;
 pub mod workflow_hierarchical;
 pub mod workflow_ingest;
+pub mod workflow_plan;
 pub mod workflows;

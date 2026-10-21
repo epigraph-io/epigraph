@@ -112,6 +112,8 @@ async fn an_ingest_records_its_caller_and_strips_a_forged_submitter(pool: PgPool
                 "h3-forged",
                 serde_json::json!({"epigraph_submitted_by": forged.to_string(), "keep": 1}),
             ),
+            tenancy: None,
+            embed: None,
         },
         Some(&token),
     )
@@ -145,6 +147,8 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-owned", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )
@@ -224,6 +228,8 @@ async fn legacy_workflow(
         owner_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(owner_token),
     )
@@ -523,6 +529,8 @@ async fn a_reingest_by_another_caller_does_not_take_the_workflow_over(pool: PgPo
             viewer,
             IngestWorkflowParams {
                 extraction: extraction("h3-reingest", serde_json::json!({})),
+                tenancy: None,
+                embed: None,
             },
             Some(token),
         )
@@ -547,6 +555,8 @@ async fn a_reingest_by_another_caller_does_not_take_the_workflow_over(pool: PgPo
         &other_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-reingest", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&other_token),
     )
@@ -569,6 +579,8 @@ async fn improving_someone_elses_workflow_is_refused(pool: PgPool) {
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-improve", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )
@@ -623,6 +635,8 @@ async fn an_ingest_with_null_metadata_still_records_its_caller(pool: PgPool) {
         &viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-null-metadata", serde_json::Value::Null),
+            tenancy: None,
+            embed: None,
         },
         Some(&token),
     )
@@ -649,6 +663,8 @@ async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-http-owned-stdio", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )
@@ -668,6 +684,8 @@ async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
         &public,
         IngestWorkflowParams {
             extraction: extraction("h3-stdio-owned", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         None,
     )
@@ -727,6 +745,8 @@ async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(poo
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-lineage", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )
@@ -740,7 +760,11 @@ async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(poo
         let err = tools::workflow_ingest::ingest_workflow(
             &server,
             &attacker_viewer,
-            IngestWorkflowParams { extraction: hijack },
+            IngestWorkflowParams {
+                extraction: hijack,
+                tenancy: None,
+                embed: None,
+            },
             Some(&attacker_token),
         )
         .await
@@ -774,7 +798,11 @@ async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(poo
     tools::workflow_ingest::ingest_workflow(
         &server,
         &owner_viewer,
-        IngestWorkflowParams { extraction: next },
+        IngestWorkflowParams {
+            extraction: next,
+            tenancy: None,
+            embed: None,
+        },
         Some(&owner_token),
     )
     .await
@@ -798,6 +826,8 @@ async fn a_fork_under_a_new_name_needs_authority_over_the_linked_parent(pool: Pg
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-fork-parent", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )
@@ -811,6 +841,8 @@ async fn a_fork_under_a_new_name_needs_authority_over_the_linked_parent(pool: Pg
         &stranger_viewer,
         IngestWorkflowParams {
             extraction: fork.clone(),
+            tenancy: None,
+            embed: None,
         },
         Some(&stranger_token),
     )
@@ -824,7 +856,11 @@ async fn a_fork_under_a_new_name_needs_authority_over_the_linked_parent(pool: Pg
     tools::workflow_ingest::ingest_workflow(
         &server,
         &stranger_viewer,
-        IngestWorkflowParams { extraction: fork },
+        IngestWorkflowParams {
+            extraction: fork,
+            tenancy: None,
+            embed: None,
+        },
         Some(&stranger_token),
     )
     .await
@@ -849,6 +885,8 @@ async fn a_workflow_admin_write_is_audited_and_a_grantless_admin_is_refused(pool
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-admin", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
         },
         Some(&owner_token),
     )

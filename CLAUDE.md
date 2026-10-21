@@ -143,6 +143,18 @@ is_current embedding gap. The write path already skips embedding them
 (`submit.rs` `is_host_telemetry`), and `find_claims_needing_embeddings` excludes
 them. Do NOT treat them as `live_missing`. (backlog a4aaa487)
 
+**Declared opt-out:** `ingest_workflow` (MCP) and `POST /api/v1/workflows/ingest`
+take `embed: false`, which sends no claim or goal text to the embedding
+provider and stores no vector. Those claims are current and unembedded BY
+REQUEST (typically group-private workflow plans, which pinned resolution never
+searches), so they show up in the `live_missing` audit below; that count is not
+a write-path defect for them. The opt-out is NOT recorded on the row: a later
+backfill (`find_claims_needing_embeddings`, e.g. `embed_backfill`) does not
+know it and will embed them. A declared-tenancy (`tenancy`) ingest that does
+embed stores through the claims' known author
+(`workflow_ingest::store_ingest_embedding`), because the embedder's
+public-reader path cannot resolve a group-private claim's author.
+
 ### Write paths (must embed on insert)
 
 When adding a new code path that inserts a claim, embed inline post-commit,

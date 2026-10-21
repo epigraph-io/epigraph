@@ -195,6 +195,7 @@ impl Server {
                 AccessTokenBinding {
                     family_id: fam,
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -214,6 +215,7 @@ impl Server {
                 AccessTokenBinding {
                     family_id: Some(p.family),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -2619,6 +2621,7 @@ async fn an_elevated_viewer_is_refused_outside_the_recorder(pool: PgPool) {
             AccessTokenBinding {
                 family_id: Some(p.family),
                 elevation_id: elv,
+                delegated_by: None,
             },
         )
         .expect("mint")
@@ -3056,6 +3059,7 @@ async fn an_agent_cannot_propose(pool: PgPool) {
                 AccessTokenBinding {
                     family_id: Some(p.family),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")

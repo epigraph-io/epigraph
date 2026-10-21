@@ -60,7 +60,7 @@
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::errors::McpError;
 use crate::server::EpiGraphMcpFull;
@@ -194,7 +194,7 @@ fn scoped<'a>(
 }
 
 fn json_result(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string(value).map_err(crate::errors::internal_error)?,
     )]))
 }
@@ -453,6 +453,7 @@ mod tests {
                 family_id: Uuid::new_v4(),
             }),
             admin_scopes: epigraph_auth::AdminScopePosture::Armed,
+            delegated_by: None,
         }
     }
 

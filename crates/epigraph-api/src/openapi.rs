@@ -420,6 +420,7 @@ async fn update_labels_doc() {}
         (status = 200, body = EvolveStepResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = []))

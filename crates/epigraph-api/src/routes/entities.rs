@@ -16,7 +16,7 @@
 //! triple index today; `index_populated` (whether any triple is visible to the
 //! caller) is what tells an empty index apart from a query that matched nothing.
 //!
-//! # Tenancy: 5 of this file's 8 raw-pool sites are converted
+//! # Tenancy: all 8 of this file's raw-pool sites are converted
 //!
 //! Conversion shard 7, and the largest single-file drop in it.
 //! `entity_neighborhood` (2 sites) and `query_triples` (3) each resolve their
@@ -47,11 +47,41 @@
 //! whose disposition is unchanged by this shard. Nothing further about it is
 //! recorded here — see `docs/tenancy/progress.json`.
 //!
-//! The other 3 sites are `create_entity`, `batch_create_mentions` and
-//! `batch_create_triples` — all writes, owned by `ScopedPool::begin_as` plus
-//! `Viewer::splice_write`.
+//! # The writes are authorized against their target claim (backlog 850dcc61)
+//!
+//! `create_entity`, `batch_create_mentions` and `batch_create_triples` are the
+//! other 3 sites. Each mention or triple write is authorized against the claim
+//! it attaches to, through the caller's viewer, and every one of the three runs
+//! on ONE [`AppState::write_as`] transaction stamped with that viewer:
+//!
+//! * The two batch writes first resolve EVERY distinct `claim_id` in the batch
+//!   through the caller's viewer (`ClaimRepository::write_target_of`, the read
+//!   `supersede_claim` decides on). A claim the caller cannot read is `404`,
+//!   answered exactly like one that does not exist. A readable claim whose
+//!   owning group is not in the caller's writable set (`admin` / `writer`
+//!   membership) is `403 not_owner`, rule `not_claim_writer`. That is the same
+//!   test as the derived-row `*_tenancy` policy's `WITH CHECK` (migration 077):
+//!   a `triples` / `entity_mentions` row inherits its claim's owner group
+//!   (migrations 070/074), and unlike `evidence` it is never writer-owned
+//!   (migration 114). There is deliberately no `claims:admin` arm, because the
+//!   stamped insert would be refused anyway. Every check precedes the first
+//!   insert, and a refusal drops the transaction, so a batch is all or nothing.
+//! * `create_entity` has no target claim: `entities` is an instance-wide
+//!   dictionary with no tenancy columns and no row security. It stays at
+//!   `claims:write` and writes on the stamped transaction (so `write_as`'s
+//!   `ElevatedReadOnly` refusal applies to it as to every stamped write). Who
+//!   may add to the dictionary, or change an existing entry through the upsert's
+//!   conflict arm (`canonical_name`, merged `properties`, `embedding`), beyond
+//!   `claims:write` is an open operator decision, tracked as a backlog
+//!   follow-up; this change does not settle it.
+//!
+//! The MCP server has no entity / mention / triple WRITE tool (its three RDF
+//! tools, `query_triples`, `entity_neighborhood` and `search_triples`, read), so
+//! these three handlers are the only writers of those tables outside the repo
+//! layer's own tests.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
+//! [`AppState::write_as`]: crate::AppState::write_as
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -63,7 +93,7 @@ use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use axum::extract::Path;
 #[cfg(feature = "db")]
-use epigraph_db::{EntityRepository, TripleRepository};
+use epigraph_db::{ClaimRepository, EntityRepository, TripleRepository};
 
 // =============================================================================
 // Request / Response types
@@ -179,19 +209,22 @@ pub struct BatchIdsResponse {
 // =============================================================================
 
 /// POST /api/v1/entities — upsert an entity
+///
+/// `claims:write`, on a transaction stamped with the caller's viewer. See the
+/// module doc for why there is no per-claim check here.
 #[cfg(feature = "db")]
 pub async fn create_entity(
     State(state): State<AppState>,
     _scope: crate::middleware::bearer::RequireScopeWrite,
+    ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<CreateEntityRequest>,
 ) -> Result<Json<EntityResponse>, ApiError> {
-    // Scope gate ran in the extractor; if we reach the body, the caller has
-    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
     let properties = req
         .properties
         .unwrap_or(serde_json::Value::Object(Default::default()));
+    let mut tx = state.write_as(&viewer, "create_entity").await?;
     let row = EntityRepository::upsert(
-        &state.db_pool,
+        &mut *tx,
         &req.canonical_name,
         &req.type_top,
         req.type_sub.as_deref(),
@@ -199,6 +232,9 @@ pub async fn create_entity(
         properties,
     )
     .await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the entity: {e}"),
+    })?;
 
     Ok(Json(EntityResponse {
         id: row.id,
@@ -210,6 +246,47 @@ pub async fn create_entity(
     }))
 }
 
+/// Refuse the batch unless the caller may write EVERY claim it attaches to.
+///
+/// Runs on the batch's own stamped transaction, before its first insert. Each
+/// distinct claim id is resolved through the caller's viewer, in request
+/// order: one the caller cannot read is `404` (indistinguishable from a
+/// missing id); one whose owning group is not in the caller's writable set is
+/// `403 not_claim_writer`. The first refused item decides the answer.
+#[cfg(feature = "db")]
+async fn require_writable_targets(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+    action: &'static str,
+) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for &claim_id in claim_ids {
+        if !seen.insert(claim_id) {
+            continue;
+        }
+        let (_author, owner_group) = ClaimRepository::write_target_of(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id.to_string(),
+            })?;
+        if !viewer.writable_groups().contains(&owner_group) {
+            return Err(ApiError::ClaimNotWritable {
+                claim_id,
+                message: format!(
+                    "cannot {action} claim {claim_id}: the caller holds no admin or writer \
+                     membership in the group that owns it; nothing in this batch was written"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "db"))]
 pub async fn create_entity(
     State(_state): State<AppState>,
@@ -219,14 +296,25 @@ pub async fn create_entity(
 }
 
 /// POST /api/v1/entity-mentions/batch — batch insert entity mentions
+///
+/// All or nothing: every mention's claim must be one the caller can write
+/// (module doc), and the rows are inserted on one stamped transaction.
 #[cfg(feature = "db")]
 pub async fn batch_create_mentions(
     State(state): State<AppState>,
     _scope: crate::middleware::bearer::RequireScopeWrite,
+    ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<BatchMentionsRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
-    // Scope gate ran in the extractor; if we reach the body, the caller has
-    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
+    let mut tx = state.write_as(&viewer, "batch_create_mentions").await?;
+    require_writable_targets(
+        &mut tx,
+        &viewer,
+        &req.mentions.iter().map(|m| m.claim_id).collect::<Vec<_>>(),
+        "attach an entity mention to",
+    )
+    .await?;
+
     let data = req
         .mentions
         .into_iter()
@@ -244,7 +332,10 @@ pub async fn batch_create_mentions(
         })
         .collect();
 
-    let ids = TripleRepository::batch_create_mentions(&state.db_pool, data).await?;
+    let ids = TripleRepository::batch_create_mentions(&mut tx, data).await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the mentions: {e}"),
+    })?;
     let count = ids.len();
     Ok(Json(BatchIdsResponse { ids, count }))
 }
@@ -258,14 +349,25 @@ pub async fn batch_create_mentions(
 }
 
 /// POST /api/v1/triples/batch — batch insert RDF-style triples
+///
+/// All or nothing: every triple's claim must be one the caller can write
+/// (module doc), and the rows are inserted on one stamped transaction.
 #[cfg(feature = "db")]
 pub async fn batch_create_triples(
     State(state): State<AppState>,
     _scope: crate::middleware::bearer::RequireScopeWrite,
+    ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<BatchTriplesRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
-    // Scope gate ran in the extractor; if we reach the body, the caller has
-    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
+    let mut tx = state.write_as(&viewer, "batch_create_triples").await?;
+    require_writable_targets(
+        &mut tx,
+        &viewer,
+        &req.triples.iter().map(|t| t.claim_id).collect::<Vec<_>>(),
+        "attach a triple to",
+    )
+    .await?;
+
     let data = req
         .triples
         .into_iter()
@@ -284,7 +386,10 @@ pub async fn batch_create_triples(
         })
         .collect();
 
-    let ids = TripleRepository::batch_create_triples(&state.db_pool, data).await?;
+    let ids = TripleRepository::batch_create_triples(&mut tx, data).await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the triples: {e}"),
+    })?;
     let count = ids.len();
     Ok(Json(BatchIdsResponse { ids, count }))
 }
