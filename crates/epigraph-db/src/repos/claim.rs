@@ -483,6 +483,16 @@ pub struct DedupRepair {
     /// `binary_truth` bindings at a non-zero index that were NOT copied onto a
     /// canonical owned by another group (review finding W2's rule, FA07).
     pub skipped_false_bindings: u64,
+    /// The duplicate's non-edge BBAs (its creation row, assess rows, agent
+    /// BBAs) moved onto the canonical so their evidence is pooled there.
+    pub pooled_bbas: Vec<Uuid>,
+    /// The duplicate's non-edge BBAs left on it: a key the canonical already
+    /// holds (the same source counted once), an `attributed_v1` row, or every
+    /// such row when the canonical is a compound.
+    pub kept_on_duplicate: Vec<Uuid>,
+    /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
+    /// pooled onto it.
+    pub canonical_is_compound: bool,
 }
 
 /// The relationship of the identity edge a dedup's act writes,
@@ -10678,7 +10688,37 @@ async fn repair_marked_duplicate(
     let mut moved_bbas = 0_u64;
     let mut dropped_duplicate_copies = 0_u64;
     let mut skipped_false_bindings = 0_u64;
-    if !retargeted_ids.is_empty() {
+
+    // Part 3 (below) pools the duplicate's own belief inputs on the canonical,
+    // unless the canonical is a COMPOUND (an in-force `decomposes_to`
+    // out-edge): under atom-level belief a compound is a query over its atoms
+    // and takes no BBA of its own, so nothing is moved onto one.
+    let canonical_is_compound: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT EXISTS (SELECT 1 FROM edges e
+                         WHERE e.source_id = $1 AND e.source_type = 'claim'
+                           AND e.relationship = 'decomposes_to' AND e.valid_to IS NULL)"#,
+    )
+    .bind(canon_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let poolable: Vec<Uuid> = if canonical_is_compound {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT mf.id FROM mass_functions mf
+              WHERE mf.claim_id = $2 AND {POOLABLE_BBA_SQL}
+                AND NOT EXISTS ({CANONICAL_HOLDS_KEY_SQL})
+              ORDER BY mf.id"#
+        ))
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+
+    if !retargeted_ids.is_empty() || !poolable.is_empty() {
         // `canonical` must be assigned to every frame whose BBAs it is about
         // to inherit, or the frame-scoped read paths
         // (`claim_frames.hypothesis_index`) would not see them. The copy is
@@ -10782,6 +10822,67 @@ async fn repair_marked_duplicate(
         moved_bbas = moved.rows_affected();
     }
 
+    // ── Derived-record repair, part 3: POOL the duplicate's own inputs ────
+    // Parts 1 and 2 move only EDGE-keyed BBAs, with their edges. The
+    // duplicate's other BBAs -- its auto-wired creation row, assess rows,
+    // agent BBAs (`perspective_id` NULL or naming no edge) -- would otherwise
+    // stay on a claim no reader folds (V-1), so the canonical would not count
+    // evidence the duplicate had. They move under part 2's ownership rule
+    // (migration 114). Three kinds stay on the duplicate, and are reported:
+    //
+    // * a row whose (frame, source agent, perspective) key the canonical
+    //   already holds: the same source's view of the same proposition, which
+    //   pooling would count twice; the canonical keeps its own and the
+    //   duplicate's copy is KEPT (not dropped, unlike part 2's edge rule), so
+    //   nothing is destroyed and an un-mark has nothing to restore;
+    // * an `attributed_v1` row: under atom-level belief those are re-derived
+    //   by the attributor for the canonical, never moved;
+    // * every row, when the canonical is a compound (above).
+    //
+    // The duplicate's `evidence` rows never move: they are its provenance, a
+    // moved BBA keeps citing its row through `evidence_id`, and the canonical
+    // reaches them through the identity edge.
+    let mut pooled_bbas: Vec<Uuid> = Vec::new();
+    if !poolable.is_empty() {
+        pooled_bbas = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET claim_id       = c.id,
+                    owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
+                                          ELSE c.owner_group_id END,
+                    visibility     = c.visibility,
+                    writer_owned   = CASE
+                                       WHEN c.visibility IS DISTINCT FROM 'public' THEN false
+                                       WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
+                                            THEN true
+                                       ELSE mf.writer_owned END
+               FROM claims c
+              WHERE c.id = $1
+                AND mf.claim_id = $2 AND mf.id = ANY($3)
+             RETURNING mf.id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&poolable)
+        .fetch_all(&mut *conn)
+        .await?;
+        pooled_bbas.sort_unstable();
+    }
+    let kept_on_duplicate: Vec<Uuid> = sqlx::query_scalar(&format!(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT mf.id FROM mass_functions mf
+          WHERE mf.claim_id = $2
+            AND (mf.perspective_id IS NULL
+                 OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id))
+            AND ($3 OR NOT {POOLABLE_BBA_SQL} OR EXISTS ({CANONICAL_HOLDS_KEY_SQL}))
+          ORDER BY mf.id"#
+    ))
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .bind(canonical_is_compound)
+    .fetch_all(&mut *conn)
+    .await?;
+
     // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
     // far end and are unmoved, but their *content* was frozen from `dup`'s
     // interval at wire time, so they now misattribute. They cannot be fixed
@@ -10828,5 +10929,22 @@ async fn repair_marked_duplicate(
         retargeted_edges: retargeted_ids,
         dropped_duplicate_copies,
         skipped_false_bindings,
+        pooled_bbas,
+        kept_on_duplicate,
+        canonical_is_compound,
     })
 }
+
+/// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
+/// keyed to any edge (those follow their edge, or stay with it), and not an
+/// `attributed_v1` row. Fully parenthesized: it is spliced after a `NOT`.
+const POOLABLE_BBA_SQL: &str = "((mf.perspective_id IS NULL \
+       OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
+      AND mf.combination_method IS DISTINCT FROM 'attributed_v1')";
+
+/// The canonical (`$1`) already holds a row under the duplicate row `mf`'s
+/// `mass_functions_unique_per_perspective` key (migration 034).
+const CANONICAL_HOLDS_KEY_SQL: &str = "SELECT 1 FROM mass_functions k \
+      WHERE k.claim_id = $1 AND k.frame_id = mf.frame_id \
+        AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
+        AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id";

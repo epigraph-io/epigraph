@@ -424,3 +424,177 @@ async fn a_re_mark_is_refused_and_writes_no_second_identity_edge(pool: PgPool) {
     .expect("count");
     assert_eq!(identity_edges, 1, "the refused re-mark wrote no edge");
 }
+
+async fn bba_masses(pool: &PgPool, id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar("SELECT masses FROM mass_functions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("bba masses")
+}
+
+async fn mark_with_repair(pool: &PgPool, dup: Uuid, canonical: Uuid) -> epigraph_db::DedupRepair {
+    ClaimRepository::mark_duplicate_with_repair(
+        pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup")
+}
+
+/// B3, the same-source rule. The canonical already holds agent A's BBA on
+/// the frame; the duplicate holds A's own BBA under the same key and B's.
+/// B's moves; A's duplicate copy stays on the duplicate (A counted once, the
+/// canonical's own row untouched, nothing deleted), and the repair says so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_keeps_a_source_the_canonical_already_counts_on_the_duplicate(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let b = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let frame = seed_frame(&pool).await;
+    let canon_a = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let dup_a = serde_json::json!({"1": 0.9, "0,1": 0.1});
+    let a_on_canonical = store_bba(
+        &pool,
+        canonical,
+        frame,
+        Some(a),
+        None,
+        canon_a.clone(),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let a_on_dup = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(a),
+        None,
+        dup_a.clone(),
+        "auto_wire",
+        None,
+    )
+    .await;
+    let b_on_dup = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(b),
+        None,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+        "auto_wire",
+        None,
+    )
+    .await;
+
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+
+    assert_eq!(
+        bba_claim(&pool, b_on_dup).await,
+        canonical,
+        "B's row is pooled"
+    );
+    assert_eq!(
+        bba_claim(&pool, a_on_dup).await,
+        dup,
+        "A's duplicate copy is kept on the duplicate"
+    );
+    assert_eq!(bba_masses(&pool, a_on_dup).await, dup_a, "and kept intact");
+    assert_eq!(
+        (
+            bba_claim(&pool, a_on_canonical).await,
+            bba_masses(&pool, a_on_canonical).await
+        ),
+        (canonical, canon_a),
+        "the canonical's own row for A is untouched"
+    );
+    assert_eq!(repair.pooled_bbas, vec![b_on_dup]);
+    assert_eq!(repair.kept_on_duplicate, vec![a_on_dup]);
+    assert!(!repair.canonical_is_compound);
+}
+
+/// B3, the atom-level rule. An `attributed_v1` row is never moved by a dedup;
+/// it stays on the duplicate and is reported, while the plain row beside it
+/// pools.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_never_moves_an_attributed_v1_row(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let b = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let frame = seed_frame(&pool).await;
+    let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let attributed = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(a),
+        None,
+        m.clone(),
+        "attributed_v1",
+        None,
+    )
+    .await;
+    let plain = store_bba(&pool, dup, frame, Some(b), None, m, "auto_wire", None).await;
+
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+
+    assert_eq!(
+        bba_claim(&pool, attributed).await,
+        dup,
+        "the attributed_v1 row stays"
+    );
+    assert_eq!(
+        bba_claim(&pool, plain).await,
+        canonical,
+        "the plain row pools"
+    );
+    assert_eq!(repair.kept_on_duplicate, vec![attributed]);
+    assert_eq!(repair.pooled_bbas, vec![plain]);
+}
+
+/// B3, the compound rule. A canonical with an in-force `decomposes_to`
+/// out-edge is a compound: none of the duplicate's non-edge rows is moved
+/// onto it, and the repair says why.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_pools_nothing_onto_a_compound_canonical(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "compound canonical").await;
+    let atom = seed_claim(&pool, a, "an atom of it").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(canonical)
+    .bind(atom)
+    .execute(&pool)
+    .await
+    .expect("decomposes_to");
+    let frame = seed_frame(&pool).await;
+    let row = store_bba(
+        &pool,
+        dup,
+        frame,
+        Some(a),
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        "auto_wire",
+        None,
+    )
+    .await;
+
+    let repair = mark_with_repair(&pool, dup, canonical).await;
+
+    assert_eq!(
+        bba_claim(&pool, row).await,
+        dup,
+        "nothing moves onto a compound"
+    );
+    assert!(repair.canonical_is_compound);
+    assert!(repair.pooled_bbas.is_empty());
+    assert_eq!(repair.kept_on_duplicate, vec![row]);
+}
