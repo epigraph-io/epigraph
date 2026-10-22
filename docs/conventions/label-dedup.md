@@ -12,7 +12,11 @@ items, and signals that materialized.
 - Everything else (hygiene, close-out, lifecycle, the survivor's carried ids)
   is a **label write**.
 - Claim content is never rewritten, and one call undoes a whole apply
-  (`revert_label_dedup`).
+  (`revert_label_dedup`), but only on a server that holds the administrative
+  (maintenance) connection. Request-serving servers hold none and refuse a
+  revert with marks, and no shipped surface runs one elsewhere, so today a
+  mark is one-way (see
+  [duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md)).
 
 Label dedup is index bookkeeping. It is never a merge of knowledge claims: a
 duplicate knowledge claim is marked on its own with `mark_duplicate`. To keep
@@ -25,6 +29,9 @@ it that way:
   empty refuses every family, `FAMILY_NOT_ALLOWED`).
 
 Both checks are decided from the profile alone, before any read.
+
+Not sure label dedup is the right tool? See
+[duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md).
 
 The planner is the pure engine `epigraph_engine::label_dedup`; the tools are
 `crates/epigraph-mcp/src/tools/label_dedup.rs`.
@@ -250,6 +257,11 @@ concurrent change to other labels). Rolled-back units are absent.
 Use it to undo an apply, for example when an apply generation mis-merged. Its
 input is that apply's `applied_units` and `applied_marks`, exactly as
 returned.
+
+A revert with marks needs the administrative connection, which
+request-serving servers do not hold: there it is refused
+(`ADMIN_CONNECTION_REQUIRED`) with nothing written. A label-only revert (no
+`applied_marks`) runs anywhere.
 
 1. Nothing is written until every un-mark is proved admissible:
    - the server's administrative connection must be usable
