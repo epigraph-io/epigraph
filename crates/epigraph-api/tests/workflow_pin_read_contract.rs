@@ -29,8 +29,10 @@
 //!   extra PERMISSIVE policies on `claims`/`edges`/`evidence` is not a shape
 //!   this repository creates, and no fixture here installs one.
 //! * (b) Every ingest `executes` edge carries an integer `plan_index` and a
-//!   `level`; an `add_step` edge carries `level` only. The plan includes the
-//!   level-3 operation atoms: an ingest `executes` every one of them.
+//!   `level`. An `add_step` append to an all-public plan carries
+//!   `plan_index = max + 1`; an insert, or any add to a plan with a non-public
+//!   `executes` edge, carries none (#639). The plan includes the level-3
+//!   operation atoms: an ingest `executes` every one of them.
 //! * (c) `GET /api/v1/workflows/:id` returns the recorded submitter.
 //! * (d) `workflow_root_id`, `compound_claim_id`, `compound_content_hash`,
 //!   `atom_id` and the plan order equal frozen vectors
@@ -62,10 +64,11 @@
 //! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
 //!   `workflows` has no row security. A rewritten submitter is then honoured by
 //!   the workflow authority gate.
-//! * Outcome report: `POST /api/v1/workflows/hierarchical/:id/outcome`
-//!   succeeds for a caller that cannot read the steps (and for one holding
-//!   only `claims:read`), moves the counters, and records every step of a
-//!   group-private plan with a NULL `step_claim_id`, for members too.
+//! * Outcome report (as changed by #632): `POST
+//!   /api/v1/workflows/hierarchical/:id/outcome` needs `claims:write`; on a
+//!   group-private plan a member's report resolves the steps, a non-member's
+//!   records every step with a NULL `step_claim_id` and lists it in
+//!   `unresolved_step_indices`.
 //! * `executes` edge mutation: any principal that writes G (an `admin` or a
 //!   plain `writer` row) can rewrite `plan_index` and retract an `executes`
 //!   edge of a G-private workflow, over REST and over the stdio MCP tools; a
@@ -672,10 +675,12 @@ async fn an_ingest_writes_the_frozen_ids_and_integer_contiguous_plan_indices(poo
     }
 }
 
-/// (b) An `add_step` edge carries `level` and NO `plan_index`, so a reader
-/// that requires a contiguous `plan_index` sees one unindexed edge after it.
+/// (b) An `add_step` append to an all-public plan carries `level` and
+/// `plan_index = max + 1` (#639), so a reader that requires a contiguous
+/// `plan_index` sees the appended step as the plan's last item and no
+/// unindexed edge.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_add_step_executes_edge_carries_level_but_no_plan_index(pool: PgPool) {
+async fn an_add_step_append_to_a_public_plan_carries_the_next_plan_index(pool: PgPool) {
     let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
@@ -696,17 +701,33 @@ async fn an_add_step_executes_edge_carries_level_but_no_plan_index(pool: PgPool)
         .filter(|e| uuid_of(&e["target_id"]) == step)
         .collect();
     assert_eq!(added.len(), 1);
+    let max_before = before
+        .iter()
+        .filter_map(|e| e["properties"]["plan_index"].as_u64())
+        .max()
+        .expect("an indexed plan");
     assert_eq!(
         added[0]["properties"],
-        json!({"level": 2}),
-        "the add_step edge is unindexed"
+        json!({"level": 2, "plan_index": max_before + 1}),
+        "the appended edge takes the next index"
     );
     assert_eq!(
         after
             .iter()
             .filter(|e| e["properties"].get("plan_index").is_none())
             .count(),
-        1
+        0,
+        "no unindexed edge"
+    );
+    let mut indices: Vec<u64> = after
+        .iter()
+        .filter_map(|e| e["properties"]["plan_index"].as_u64())
+        .collect();
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (0..=max_before + 1).collect::<Vec<_>>(),
+        "still contiguous from 0"
     );
 }
 
@@ -892,7 +913,11 @@ async fn stdio_ingest(
     epigraph_mcp::tools::workflow_ingest::ingest_workflow(
         server,
         &viewer,
-        epigraph_mcp::types::IngestWorkflowParams { extraction },
+        epigraph_mcp::types::IngestWorkflowParams {
+            extraction,
+            tenancy: None,
+            embed: None,
+        },
         None,
     )
     .await
@@ -910,6 +935,7 @@ fn auth_for(agent: Uuid) -> epigraph_auth::AuthContext {
         jti: Uuid::new_v4(),
         family_id: None,
         elevation_claim: None,
+        delegated_by: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
@@ -1344,13 +1370,20 @@ async fn use_count(pool: &PgPool, wf: Uuid) -> i64 {
     .expect("use_count")
 }
 
-/// CHARACTERIZATION. A hierarchical outcome report reads the plan on an
-/// unstamped transaction. On a G-private plan it therefore succeeds for a
-/// non-member holding only `claims:read`, moves the counters, and records
-/// every step with a NULL `step_claim_id`; a member's report records NULL too.
-/// The MCP twin behaves the same.
+/// CHARACTERIZATION (as changed by #632, the stamped outcome report). A
+/// hierarchical outcome report on a G-private plan runs on ONE transaction
+/// stamped with the caller's viewer, and the REST route needs `claims:write`:
+///
+/// * a non-member holding only `claims:read` is refused (403) and nothing
+///   moves;
+/// * a non-member holding `claims:write` records the run, every step with a
+///   NULL `step_claim_id`, and the response lists every index in
+///   `unresolved_step_indices` with a `warning`;
+/// * a member's report resolves the group's steps (the plan's level-2 claims);
+/// * the MCP twin, as the stdio server's own agent (not a member of G),
+///   records NULL steps and reports them unresolved.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_steps(pool: PgPool) {
+async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(pool: PgPool) {
     let w = private_workflow(&pool, small_extraction("acme-outcome-plan", 2)).await;
     let steps: Vec<Value> = (0..2)
         .map(|i| json!({"step_index": i, "planned": format!("step {i}"), "actual": "done", "deviated": false}))
@@ -1364,60 +1397,77 @@ async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_s
     let rest_rows = |pool: PgPool, wf: Uuid| async move {
         sqlx::query_scalar::<_, Option<Uuid>>(
             "SELECT step_claim_id FROM behavioral_executions \
-              WHERE workflow_id = $1 AND run_label IS NULL",
+              WHERE workflow_id = $1 AND run_label IS NULL ORDER BY step_claim_id NULLS FIRST",
         )
         .bind(wf)
         .fetch_all(&pool)
         .await
         .expect("rows")
     };
-    let mut expected_count = use_count(&pool, w.workflow_id).await;
-    let mut expected_rows = 0;
-    for (who, label, scopes) in [
-        (
-            w.stranger,
-            "non-member holding claims:read only",
-            READ_SCOPES,
-        ),
-        (w.reader, "member", WRITE_SCOPES),
-    ] {
-        let (status, resp) = w.api.post(&uri, &token(who, scopes), &body(label)).await;
-        assert_eq!(status, StatusCode::OK, "{label}: {resp}");
-        expected_count += 1;
-        expected_rows += 2;
-        assert_eq!(
-            use_count(&pool, w.workflow_id).await,
-            expected_count,
-            "{label}"
-        );
-        let rows = rest_rows(pool.clone(), w.workflow_id).await;
-        assert_eq!(
-            rows.len(),
-            expected_rows,
-            "{label}: one row per reported step"
-        );
-        assert!(
-            rows.iter().all(Option::is_none),
-            "{label}: every step row is unattributed: {rows:?}"
-        );
-    }
-    // Calibration: the steps exist and are the workflow's level-2 claims.
-    let level2: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM edges e JOIN claims c ON c.id = e.target_id \
+    let mut level2: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT c.id FROM edges e JOIN claims c ON c.id = e.target_id \
           WHERE e.source_id = $1 AND e.relationship = 'executes' \
             AND (c.properties->>'level')::int = 2",
     )
     .bind(w.workflow_id)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .expect("level-2 steps");
-    assert_eq!(level2, 2, "the harness sees both steps the report lost");
+    level2.sort();
+    assert_eq!(level2.len(), 2, "precondition: the plan's two steps");
+    let start = use_count(&pool, w.workflow_id).await;
 
-    // The MCP twin, through the served tool entrypoint on an app-role server
-    // (it picks the server's pool and embedder itself).
+    // A non-member holding claims:read only: refused, nothing moves.
+    let (status, resp) = w
+        .api
+        .post(&uri, &token(w.stranger, READ_SCOPES), &body("read only"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
+    assert_eq!(use_count(&pool, w.workflow_id).await, start);
+    assert!(rest_rows(pool.clone(), w.workflow_id).await.is_empty());
+
+    // A non-member holding claims:write: recorded, every step unresolved.
+    let (status, resp) = w
+        .api
+        .post(&uri, &token(w.stranger, WRITE_SCOPES), &body("non-member"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(use_count(&pool, w.workflow_id).await, start + 1);
+    assert_eq!(resp["unresolved_step_indices"], json!([0, 1]), "{resp}");
+    assert!(resp["warning"].is_string(), "{resp}");
+    assert_eq!(
+        rest_rows(pool.clone(), w.workflow_id).await,
+        vec![None, None],
+        "the non-member's rows are unattributed"
+    );
+
+    // A member: the group's steps resolve.
+    let (status, resp) = w
+        .api
+        .post(&uri, &token(w.reader, WRITE_SCOPES), &body("member"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(use_count(&pool, w.workflow_id).await, start + 2);
+    assert!(
+        resp["unresolved_step_indices"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{resp}"
+    );
+    let mut rows = rest_rows(pool.clone(), w.workflow_id).await;
+    rows.retain(Option::is_some);
+    let mut resolved: Vec<Uuid> = rows.into_iter().flatten().collect();
+    resolved.sort();
+    assert_eq!(resolved, level2, "the member's rows name the plan's steps");
+
+    // The MCP twin, as the stdio server's own agent (not a member of G).
     let server = mcp_server(&pool, 0x0C).await;
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("the stdio viewer");
     let r = epigraph_mcp::tools::workflow_hierarchical::report_hierarchical_outcome(
         &server,
+        &viewer,
         epigraph_mcp::types::ReportHierarchicalOutcomeParams {
             workflow_id: w.workflow_id.to_string(),
             success: true,
@@ -1431,12 +1481,11 @@ async fn an_outcome_report_on_a_private_plan_succeeds_for_anyone_and_loses_the_s
     .await
     .expect("the MCP report succeeds");
     assert_ne!(r.is_error, Some(true), "{r:?}");
-    assert_eq!(use_count(&pool, w.workflow_id).await, expected_count + 1);
-    let mcp_rows = step_rows(&pool, w.workflow_id, "mcp-report").await;
+    assert_eq!(use_count(&pool, w.workflow_id).await, start + 3);
     assert_eq!(
-        mcp_rows,
+        step_rows(&pool, w.workflow_id, "mcp-report").await,
         vec![None, None],
-        "the MCP twin loses the steps too"
+        "a non-member's MCP report leaves the steps unresolved"
     );
 }
 
