@@ -177,6 +177,29 @@ fn doi_normalization_folds_spellings_and_rejects_non_dois() {
     assert_ne!(normalize_doi("10.5555/a"), normalize_doi("10.5555/b"));
 }
 
+#[test]
+fn a_non_10_identifier_meets_its_doi_label() {
+    // Ingest stores a non-`10.` identifier bare in `properties.doi` and links
+    // to it as `doi:<id>`; both must give one key, and it must not be a url.
+    let bare = evidence(Some("arXiv:2401.01234"), None);
+    let label = evidence(None, Some("doi:arXiv:2401.01234"));
+    let r1 = row(
+        Some(INGEST_ASSERTION_METHOD),
+        Some(Uuid::new_v4()),
+        Some(bare.id),
+        Some(bare.id),
+    );
+    let r2 = row(
+        Some(ATTRIBUTED_METHOD),
+        Some(Uuid::new_v4()),
+        Some(label.id),
+        Some(label.id),
+    );
+    let k1 = item_key(&r1, Some(&bare), None);
+    assert!(matches!(k1, ItemKey::Doi(_)), "{k1}");
+    assert_eq!(k1, item_key(&r2, Some(&label), None));
+}
+
 // ── (2) one paper read by two agents is one source ─────────────────────────
 
 proptest! {
