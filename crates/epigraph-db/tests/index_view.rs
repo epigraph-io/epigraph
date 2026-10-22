@@ -35,6 +35,7 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     let d2 = fixture::seed_public_claim(&pool, a, "second duplicate").await;
     let plain = fixture::seed_public_claim(&pool, a, "a plain same_as neighbour").await;
     let undone = fixture::seed_public_claim(&pool, a, "a duplicate un-marked since").await;
+    let elsewhere = fixture::seed_public_claim(&pool, a, "another canonical").await;
     mark(&pool, d2, d1).await;
     mark(&pool, d1, c).await;
     sqlx::query(
@@ -46,6 +47,12 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     .execute(&pool)
     .await
     .expect("plain same_as");
+    // Retired by another act, so only the edge filter can keep it out.
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(plain)
+        .execute(&pool)
+        .await
+        .expect("retire the plain neighbour");
     let r = mark(&pool, undone, c).await;
     let mut conn = pool.acquire().await.expect("acquire");
     ClaimRepository::unmark_duplicate_with_reversal_conn(
@@ -56,6 +63,10 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     )
     .await
     .expect("unmark");
+    drop(conn);
+    // Re-marked onto another claim: non-current, with a RETRACTED dedup
+    // identity edge to `c`, so only the in-force filter keeps it out of `c`.
+    mark(&pool, undone, elsewhere).await;
 
     let rows = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[c], 100)
         .await
@@ -67,7 +78,22 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
         got, want,
         "both levels, under the top canonical; nothing else"
     );
-    assert!(rows.iter().all(|r| !r.content.is_empty()));
+    for row in &rows {
+        let want = if row.id == d1 {
+            "first duplicate"
+        } else {
+            "second duplicate"
+        };
+        assert_eq!(row.content, want);
+    }
+    let moved = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[elsewhere], 100)
+        .await
+        .expect("index view");
+    assert_eq!(
+        moved.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![undone],
+        "the re-marked duplicate is read under its current canonical only"
+    );
 
     // The read of a mid-chain claim starts there.
     let mid = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[d1], 100)
@@ -107,4 +133,28 @@ async fn the_index_view_is_filtered_by_the_viewer(pool: PgPool) {
     };
     assert_eq!(seen(member).await, 1);
     assert_eq!(seen(outsider).await, 0);
+}
+
+/// The realistic leak: a PUBLIC canonical with a duplicate private to a group.
+/// A stranger reads the canonical but not the duplicate; a member reads both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_duplicate_of_a_public_canonical_is_read_only_by_its_group(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let c = fixture::seed_public_claim(&pool, w, "public canonical").await;
+    let d = fixture::seed_group_claim(&pool, w, g, "private duplicate").await;
+    mark(&pool, d, c).await;
+    let member = Viewer::resolve(&pool, w).await.expect("viewer");
+    let outsider = Viewer::resolve(&pool, stranger).await.expect("viewer");
+    let member_rows = ClaimRepository::marked_duplicates_of(&pool, &member, &[c], 100)
+        .await
+        .expect("read");
+    assert_eq!(
+        member_rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![d]
+    );
+    let outsider_rows = ClaimRepository::marked_duplicates_of(&pool, &outsider, &[c], 100)
+        .await
+        .expect("read");
+    assert!(outsider_rows.is_empty(), "{outsider_rows:?}");
 }
