@@ -225,11 +225,11 @@ pub fn combine_with_source_dependence(
 
 // ── Canonical item key (atom-level belief, SPEC §3.3) ──────────────────────
 //
-// Skeleton: the API the atom fold, the compound conjunction and the framed
-// reads will share. The bodies below reproduce today's default for a row
-// with no source identity (every row its own independent item, plain
-// Dempster) so the property tests in `tests/source_dependence_item_key.rs`
-// fail on numbers, not on missing symbols. Nothing calls this yet.
+// The grouping the atom fold, the compound conjunction and the framed reads
+// share once atom-level folding is switched on. It does not replace
+// `SourceKey` / `combine_with_source_dependence`: the legacy fold keeps its
+// (agent, source_url) key unchanged, and nothing on a served path calls the
+// functions below yet.
 
 /// `combination_method` of an attribution row: an original BBA's evidence
 /// re-cited onto an atom (`perspective_id` = the original evidence id for a
@@ -438,21 +438,96 @@ impl KeyedItem {
     }
 }
 
-/// Partition keyed rows into items. Skeleton: one item per row.
-#[must_use]
-pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
-    rows.into_iter()
-        .map(|r| KeyedItem {
-            id: ItemId {
-                key: r.key,
-                side: ItemSide::Own(r.row_id),
-            },
-            atoms: vec![(r.atom_id, r.bba)],
-        })
-        .collect()
+/// The side of its key a row belongs to, and its weight there.
+///
+/// On a 2-hypothesis frame (index 0 = the claim holds), with t = m({0}) and
+/// f = m({1}):
+/// - f = 0: pure support, weight t. This includes a vacuous or open-world-only
+///   row (weight 0), which any real support row of the key outweighs;
+/// - t = 0 < f: pure refutation, weight f;
+/// - t > 0 and f > 0 (a mixed row), any mass on a focal element other than
+///   {0}, {1}, Θ and `~` (conflict, a complement set), or a frame of another
+///   size: the row is its own item, with its exact BBA.
+fn within_group_side(row_id: Uuid, m: &MassFunction) -> (ItemSide, f64) {
+    let frame = m.frame();
+    if frame.hypothesis_count() != 2 {
+        return (ItemSide::Own(row_id), 0.0);
+    }
+    let t_fe = FocalElement::positive(std::collections::BTreeSet::from([0]));
+    let f_fe = FocalElement::positive(std::collections::BTreeSet::from([1]));
+    let theta = FocalElement::theta(frame);
+    let missing = FocalElement::missing(frame);
+    let unexpected = m
+        .focal_elements()
+        .any(|(fe, &v)| v > 0.0 && *fe != t_fe && *fe != f_fe && *fe != theta && *fe != missing);
+    let (t, f) = (m.mass_of(&t_fe), m.mass_of(&f_fe));
+    if unexpected || (t > 0.0 && f > 0.0) {
+        (ItemSide::Own(row_id), 0.0)
+    } else if f > 0.0 {
+        (ItemSide::Refute, f)
+    } else {
+        (ItemSide::Support, t)
+    }
 }
 
-/// Fold one atom's keyed, discounted BBAs by item. Skeleton: plain Dempster.
+/// Partition keyed, discounted rows into items, applying the within-group
+/// rule (SPEC §3.3):
+/// - one key's pure-support rows form ONE item; on each atom it keeps the row
+///   with the largest m(TRUE) (the max, never a Dempster product of one
+///   source's repeats);
+/// - the key's pure-refutation rows form a SEPARATE item (`<key>#neg`,
+///   [`ItemSide::Refute`]) keeping the largest m(FALSE) per atom, so a
+///   lineage that both supports and refutes keeps its refutation when the
+///   items are combined by Dempster;
+/// - a mixed row (or one this rule cannot read, see `within_group_side`) is
+///   its own single-atom item with its exact BBA.
+///
+/// `combination::cautious_combine` is never used here: it models no `~`
+/// mass, and on a support and a refutation of one lineage it turns the
+/// refutation into empty-set mass and normalizes it away.
+///
+/// An item spans every atom its key has rows on. Items never merge across
+/// keys, so the item a row belongs to depends only on its own key and masses,
+/// never on which other rows or atoms are in the query. Ties keep the first
+/// row; items and their atoms are in first-appearance order. Callers pass one
+/// 2-hypothesis frame per atom (the atom fold coarsens first).
+#[must_use]
+pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
+    let mut items: Vec<KeyedItem> = Vec::new();
+    // Per item, per atom (same order as `atoms`): the kept row's weight.
+    let mut weights: Vec<Vec<f64>> = Vec::new();
+    let mut index: HashMap<ItemId, usize> = HashMap::new();
+    for r in rows {
+        let (side, w) = within_group_side(r.row_id, &r.bba);
+        let id = ItemId { key: r.key, side };
+        let i = *index.entry(id.clone()).or_insert_with(|| {
+            items.push(KeyedItem {
+                id,
+                atoms: Vec::new(),
+            });
+            weights.push(Vec::new());
+            items.len() - 1
+        });
+        let item = &mut items[i];
+        match item.atoms.iter().position(|(a, _)| *a == r.atom_id) {
+            None => {
+                item.atoms.push((r.atom_id, r.bba));
+                weights[i].push(w);
+            }
+            Some(j) if w > weights[i][j] => {
+                item.atoms[j].1 = r.bba;
+                weights[i][j] = w;
+            }
+            Some(_) => {}
+        }
+    }
+    items
+}
+
+/// Fold ONE atom's keyed, discounted BBAs by item: [`item_partition`], then
+/// Dempster across the items. The item-keyed counterpart of
+/// [`combine_with_source_dependence`], with the same return shape (the
+/// combined BBA and the conflict the fold saw).
 ///
 /// # Errors
 /// Propagates `DsError` from the Dempster fold, including
