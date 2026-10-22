@@ -198,6 +198,21 @@ pub struct LabelFamilyRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One row of [`ClaimRepository::marked_duplicates_of`]: a claim marked a
+/// duplicate (at any depth) of `canonical`, with the fields a label-family
+/// planner reads.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarkedDuplicateRow {
+    pub canonical: Uuid,
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
+pub const MAX_DUPLICATE_CHAIN_DEPTH: i32 = 16;
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -5268,6 +5283,77 @@ impl ClaimRepository {
             .bind(include)
             .bind(exclude)
             .bind(current_only)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The label-dedup `index_view`: for each of `canonicals`, every claim
+    /// marked a duplicate of it, down a chain (a duplicate of a duplicate, to
+    /// [`MAX_DUPLICATE_CHAIN_DEPTH`]), through IN-FORCE dedup identity edges
+    /// only (`same_as` carrying `properties.dedup`; a plain `same_as`, or the
+    /// retracted edge of an un-marked duplicate, is not followed). Only
+    /// non-current claims are returned (a marked duplicate is retired).
+    ///
+    /// Filtered by `viewer` on every edge and claim it reads: a duplicate the
+    /// viewer cannot read is not returned, so a caller that needs every
+    /// duplicate must use a viewer that reads them all.
+    ///
+    /// Ordered by `(canonical, id)`; at most `cap + 1` rows, so a caller sees
+    /// that more than `cap` exist.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for a negative cap; `DbError::QueryFailed`.
+    pub async fn marked_duplicates_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        canonicals: &[Uuid],
+        cap: i64,
+    ) -> Result<Vec<MarkedDuplicateRow>, DbError> {
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("an index-view read needs a non-negative cap, got {cap}"),
+            });
+        }
+        if canonicals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE walk(canonical, dup, depth) AS (
+                SELECT e.target_id, e.source_id, 1
+                  FROM edges e
+                 WHERE e.target_id = ANY($1) AND e.target_type = 'claim'
+                   AND e.source_type = 'claim' AND e.relationship = $2
+                   AND e.valid_to IS NULL AND e.properties ? $3
+                   /* {EDGE_VISIBILITY:e} */
+                UNION
+                SELECT w.canonical, e.source_id, w.depth + 1
+                  FROM walk w
+                  JOIN edges e ON e.target_id = w.dup
+                 WHERE e.target_type = 'claim' AND e.source_type = 'claim'
+                   AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+                   AND w.depth < $4
+                   /* {EDGE_VISIBILITY:e} */
+            )
+            SELECT DISTINCT w.canonical, c.id, c.content,
+                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at
+              FROM walk w
+              JOIN claims c ON c.id = w.dup
+             WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
+               /* {VISIBILITY:c} */
+             ORDER BY w.canonical, c.id
+             LIMIT $5
+            "#,
+            6,
+        );
+        let mut q = sqlx::query_as::<_, MarkedDuplicateRow>(&sql)
+            .bind(canonicals)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(MAX_DUPLICATE_CHAIN_DEPTH)
             .bind(cap.saturating_add(1));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

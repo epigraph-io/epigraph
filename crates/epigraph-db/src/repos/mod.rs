@@ -105,9 +105,9 @@ pub use claim::{
     ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
     DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
     EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
-    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MovedBba, NearestClaimHit,
-    PatchClaimDiff, PatchClaimInput, SortDirection, SupersedeEdgeMigration, SweepCandidate,
-    UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
+    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow, MovedBba,
+    NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SupersedeEdgeMigration,
+    SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
     DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
     EXPANSION_RELATIONSHIPS,
 };
