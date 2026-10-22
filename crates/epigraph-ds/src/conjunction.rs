@@ -274,3 +274,549 @@ impl<A: Ord + Clone> Item<A> {
         out
     }
 }
+
+// ---------------------------------------------------------------------------
+// The exact DP
+// ---------------------------------------------------------------------------
+
+/// Most leaves the exact DP takes (SPEC §3.3 cap; the spine cutoff).
+pub const MAX_LEAVES: usize = 16;
+
+/// Most live states the exact DP keeps before it gives up (SPEC §3.3 cap).
+pub const MAX_STATES: usize = 100_000;
+
+/// Fréchet envelope of a conjunction: the bounds that hold whatever the
+/// dependence between leaves, given their marginals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frechet {
+    /// max(0, Σ Belᵢ − (n − 1)).
+    pub lo: f64,
+    /// min Plᵢ.
+    pub hi: f64,
+    /// min NRᵢ (the upper bound on NR).
+    pub hi_nr: f64,
+}
+
+/// The result of a conjunction query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConjResult {
+    /// Bel(∧L): proven.
+    pub bel: f64,
+    /// Pl(∧L): consistent with the evidence, and not open-world.
+    pub pl: f64,
+    /// NR(∧L) = 1 − Dis(∧L): not refuted (the gate statistic); Pl ≤ NR.
+    pub nr: f64,
+    /// Product-frame `BetP`(∧L): ½ per free leaf. Display only.
+    pub betp: f64,
+    /// Bel(∨L), computed directly.
+    pub bel_or: f64,
+    /// Mass of ⊥ before normalization (conflict, including `~` annihilated
+    /// by touched states, as in the served fold).
+    pub k: f64,
+    /// Fréchet envelope. In the exact case it is built from the leaves'
+    /// marginals in the same joint, so lo ≤ Bel ≤ Pl ≤ hi and NR ≤ `hi_nr`
+    /// always hold; over the cap it is built from each leaf queried alone.
+    pub frechet: Frechet,
+    /// `false` when the cap was hit and the result is R-IND + R-FRE.
+    pub exact: bool,
+}
+
+/// Letter codes inside a DP state (3 bits per query position).
+const STAR: u8 = 0;
+const THETA: u8 = 1;
+const LT: u8 = 2;
+const LF: u8 = 3;
+const LO: u8 = 4;
+/// Flag bit: the state also carries the `not_all` valuation ¬(∧L).
+const NOT_ALL: u64 = 1 << 63;
+
+const fn code(letter: Letter) -> u8 {
+    match letter {
+        Letter::Theta => THETA,
+        Letter::T => LT,
+        Letter::F => LF,
+        Letter::O => LO,
+    }
+}
+
+/// The meet table of SPEC §3.3; `None` is ⊥.
+const fn meet(a: u8, b: u8) -> Option<u8> {
+    if a == STAR {
+        return Some(b);
+    }
+    if b == STAR {
+        return Some(a);
+    }
+    if a == LO || b == LO {
+        return if a == b { Some(LO) } else { None };
+    }
+    if a == THETA {
+        return Some(b);
+    }
+    if b == THETA || a == b {
+        return Some(a);
+    }
+    None
+}
+
+fn get(state: u64, pos: usize) -> u8 {
+    // Truncation is the intent: one 3-bit field.
+    #[allow(clippy::cast_possible_truncation)]
+    let v = ((state >> (3 * pos)) & 0b111) as u8;
+    v
+}
+
+fn put(state: u64, pos: usize, letter: u8) -> u64 {
+    (state & !(0b111 << (3 * pos))) | (u64::from(letter) << (3 * pos))
+}
+
+/// One focal element projected onto the query: its mass and a letter code
+/// per query position it touches.
+type ProjectedFocal = (f64, Vec<(usize, u8)>);
+
+/// A query and its items, projected onto the query's positions.
+struct Prepared {
+    /// Letter code that makes each query literal hold (T or F).
+    holds: Vec<u8>,
+    /// Whether some item gives O mass on this position. Where none does, Θ
+    /// is written as `*` (they meet everything alike there).
+    open: Vec<bool>,
+    /// Per item: its focal elements as (mass, [(position, letter code)]).
+    items: Vec<Vec<ProjectedFocal>>,
+}
+
+impl Prepared {
+    fn n(&self) -> usize {
+        self.holds.len()
+    }
+
+    const fn fails(holds: u8) -> u8 {
+        if holds == LT {
+            LF
+        } else {
+            LT
+        }
+    }
+
+    /// Θ as written at `pos` (merged into `*` where no O can occur).
+    fn theta(&self, pos: usize) -> u8 {
+        if self.open[pos] {
+            THETA
+        } else {
+            STAR
+        }
+    }
+}
+
+fn prepare<A: Ord + Clone>(query: &[Lit<A>], items: &[Item<A>]) -> Result<Prepared, DsError> {
+    if query.is_empty() {
+        return Err(DsError::InsufficientSources);
+    }
+    let mut position = std::collections::BTreeMap::new();
+    for (i, lit) in query.iter().enumerate() {
+        if position.insert(lit.atom.clone(), i).is_some() {
+            return Err(DsError::InvalidConjunction {
+                reason: "an atom appears twice in the query".into(),
+            });
+        }
+    }
+    let holds: Vec<u8> = query
+        .iter()
+        .map(|l| if l.positive { LT } else { LF })
+        .collect();
+    let mut open = vec![false; query.len()];
+    for item in items {
+        for e in &item.entries {
+            if let Some(&p) = position.get(&e.atom) {
+                open[p] |= e.o > 0.0;
+            }
+        }
+    }
+    let mut prepared = Prepared {
+        holds,
+        open,
+        items: Vec::new(),
+    };
+    for item in items {
+        // Atoms outside the query (for example, leaves the viewer cannot
+        // see) are projected away; an item touching none is vacuous here.
+        if !item.atoms().any(|a| position.contains_key(a)) {
+            continue;
+        }
+        let mut focals: Vec<ProjectedFocal> = Vec::new();
+        for f in item.focal_elements() {
+            let assign: Vec<(usize, u8)> = f
+                .letters
+                .iter()
+                .filter_map(|(a, l)| {
+                    position.get(a).map(|&p| {
+                        let c = code(*l);
+                        (p, if c == THETA { prepared.theta(p) } else { c })
+                    })
+                })
+                .collect();
+            match focals.iter_mut().find(|(_, x)| *x == assign) {
+                Some((m, _)) => *m += f.mass,
+                None => focals.push((f.mass, assign)),
+            }
+        }
+        prepared.items.push(focals);
+    }
+    Ok(prepared)
+}
+
+/// Settle a state carrying `not_all`: drop the flag once a literal is
+/// contradicted, turn it into ⊥ once every literal holds, and resolve it
+/// when exactly one literal is still open (that literal must fail).
+fn settle(p: &Prepared, state: u64) -> Option<u64> {
+    if state & NOT_ALL == 0 {
+        return Some(state);
+    }
+    let mut open_pos = None;
+    let mut open_count = 0;
+    for pos in 0..p.n() {
+        let l = get(state, pos);
+        if l == Prepared::fails(p.holds[pos]) {
+            return Some(state & !NOT_ALL);
+        }
+        if l != p.holds[pos] {
+            open_count += 1;
+            open_pos = Some(pos);
+        }
+    }
+    match (open_count, open_pos) {
+        (0, _) => None,
+        (1, Some(pos)) => {
+            // The valuation is a closed-world set on L's atoms, so it meets
+            // O as ⊥; elsewhere the open literal is forced to fail.
+            if get(state, pos) == LO {
+                None
+            } else {
+                Some(put(state, pos, Prepared::fails(p.holds[pos])) & !NOT_ALL)
+            }
+        }
+        _ => Some(state),
+    }
+}
+
+/// Final DP states (mass not yet normalized) and the conflict mass.
+struct Joint {
+    states: Vec<(u64, f64)>,
+    k: f64,
+}
+
+/// Run the DP. `Ok(None)` means the live-state cap was hit.
+fn run_dp(p: &Prepared, not_all: f64) -> Result<Option<Joint>, DsError> {
+    let mut states: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    let mut k = 0.0;
+    if not_all > 0.0 {
+        // The valuation is one more item over the product frame of L's
+        // atoms: ¬(∧L) with mass m, the frame itself with 1 − m. Both are
+        // closed-world sets on L's atoms, so they meet O as ⊥ (exact CDST).
+        let base = (0..p.n()).fold(0u64, |s, pos| put(s, pos, p.theta(pos)));
+        if not_all < 1.0 {
+            states.insert(base, 1.0 - not_all);
+        }
+        match settle(p, base | NOT_ALL) {
+            Some(s) => *states.entry(s).or_insert(0.0) += not_all,
+            None => k += not_all,
+        }
+    } else {
+        states.insert(0, 1.0);
+    }
+    for focals in &p.items {
+        let mut next: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+        for (&s, &ms) in &states {
+            'focal: for (mf, assign) in focals {
+                let mass = ms * mf;
+                if mass == 0.0 {
+                    continue;
+                }
+                let mut t = s;
+                for &(pos, letter) in assign {
+                    if let Some(l) = meet(get(t, pos), letter) {
+                        t = put(t, pos, l);
+                    } else {
+                        k += mass;
+                        continue 'focal;
+                    }
+                }
+                match settle(p, t) {
+                    Some(t) => *next.entry(t).or_insert(0.0) += mass,
+                    None => k += mass,
+                }
+            }
+        }
+        if next.len() > MAX_STATES {
+            return Ok(None);
+        }
+        states = next;
+    }
+    let total: f64 = states.values().sum();
+    if total < TOL {
+        return Err(DsError::TotalConflict);
+    }
+    Ok(Some(Joint {
+        states: states.into_iter().collect(),
+        k,
+    }))
+}
+
+fn unit(x: f64) -> f64 {
+    x.clamp(0.0, 1.0)
+}
+
+fn check_not_all(m: f64) -> Result<(), DsError> {
+    if m.is_finite() && (0.0..=1.0).contains(&m) {
+        Ok(())
+    } else {
+        Err(DsError::InvalidProbability { value: m })
+    }
+}
+
+/// Evaluate every measure on the final DP states.
+fn evaluate(p: &Prepared, joint: &Joint) -> ConjResult {
+    let n = p.n();
+    let total: f64 = joint.states.iter().map(|(_, m)| m).sum();
+    let (mut bel, mut pl, mut dis, mut betp, mut bel_or) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    let mut bel_i = vec![0.0; n];
+    let mut pl_i = vec![0.0; n];
+    let mut dis_i = vec![0.0; n];
+    for &(s, m) in &joint.states {
+        let not_all = s & NOT_ALL != 0;
+        let (mut all, mut any, mut refuted, mut open_world, mut free) =
+            (true, false, false, false, 0i32);
+        for pos in 0..n {
+            let l = get(s, pos);
+            let fails = Prepared::fails(p.holds[pos]);
+            // A settled not_all state has at least two open literals and none
+            // refuted, so each leaf's own marginal reads it as unflagged.
+            if l == p.holds[pos] {
+                any = true;
+                bel_i[pos] += m;
+            } else {
+                all = false;
+            }
+            if l == fails {
+                refuted = true;
+                dis_i[pos] += m;
+            } else if l != LO {
+                pl_i[pos] += m;
+            }
+            open_world |= l == LO;
+            if l == STAR || l == THETA {
+                free += 1;
+            }
+        }
+        if all {
+            bel += m;
+        }
+        if any {
+            bel_or += m;
+        }
+        if refuted || not_all {
+            dis += m;
+        }
+        if !refuted && !open_world && !not_all {
+            pl += m;
+            betp += m * 0.5f64.powi(free);
+        }
+    }
+    let frechet = envelope(
+        bel_i.iter().map(|b| b / total),
+        pl_i.iter().map(|x| x / total),
+        dis_i.iter().map(|d| 1.0 - d / total),
+    );
+    ConjResult {
+        bel: unit(bel / total),
+        pl: unit(pl / total),
+        nr: unit(1.0 - dis / total),
+        betp: unit(betp / total),
+        bel_or: unit(bel_or / total),
+        k: unit(joint.k),
+        frechet,
+        exact: true,
+    }
+}
+
+fn envelope(
+    bels: impl Iterator<Item = f64>,
+    pls: impl Iterator<Item = f64>,
+    nrs: impl Iterator<Item = f64>,
+) -> Frechet {
+    let (mut sum, mut n) = (0.0, 0.0);
+    for b in bels {
+        sum += b;
+        n += 1.0;
+    }
+    Frechet {
+        lo: unit(sum - (n - 1.0)),
+        hi: unit(pls.fold(1.0, f64::min)),
+        hi_nr: unit(nrs.fold(1.0, f64::min)),
+    }
+}
+
+/// R-DEP: belief in the conjunction of `query`, from the items over its
+/// atoms, with an optional `not_all` valuation m on ¬(∧L) (SPEC §3.6; pass
+/// 0 for none).
+///
+/// Exact (`exact: true`) up to [`MAX_LEAVES`] leaves and [`MAX_STATES`] live
+/// states. Above either cap it returns R-IND over each leaf queried alone,
+/// with the Fréchet envelope of those leaves, and the `not_all` closed form
+/// applied on top (`exact: false`).
+///
+/// Entries on atoms outside the query are ignored. The `not_all` valuation
+/// is a closed-world set on the query's atoms, so when it is present (m > 0)
+/// it meets open-world states on those atoms as conflict, exactly as any
+/// positive BBA does in the served fold; with m = 0 it is absent.
+///
+/// # Errors
+/// - `InsufficientSources` for an empty query;
+/// - `InvalidConjunction` if an atom appears twice in the query;
+/// - `InvalidProbability` if `not_all` is NaN or outside [0, 1];
+/// - `TotalConflict` if the evidence is in total conflict (as
+///   `dempster_combine`).
+pub fn conj_belief<A: Ord + Clone>(
+    query: &[Lit<A>],
+    items: &[Item<A>],
+    not_all: f64,
+) -> Result<ConjResult, DsError> {
+    check_not_all(not_all)?;
+    let p = prepare(query, items)?;
+    if p.n() <= MAX_LEAVES {
+        if let Some(joint) = run_dp(&p, not_all)? {
+            return Ok(evaluate(&p, &joint));
+        }
+    }
+    independent_fallback(query, items, not_all)
+}
+
+/// R-IND + R-FRE over each leaf queried alone (the over-cap path).
+fn independent_fallback<A: Ord + Clone>(
+    query: &[Lit<A>],
+    items: &[Item<A>],
+    not_all: f64,
+) -> Result<ConjResult, DsError> {
+    let mut singles = Vec::with_capacity(query.len());
+    for lit in query {
+        let p = prepare(std::slice::from_ref(lit), items)?;
+        let joint = run_dp(&p, 0.0)?.ok_or(DsError::ConjunctionOverCap {
+            leaves: 1,
+            states: MAX_STATES,
+        })?;
+        singles.push(evaluate(&p, &joint));
+    }
+    let prod = |f: fn(&ConjResult) -> f64| singles.iter().map(f).product::<f64>();
+    let base = ConjResult {
+        bel: unit(prod(|s| s.bel)),
+        pl: unit(prod(|s| s.pl)),
+        nr: unit(prod(|s| s.nr)),
+        betp: unit(prod(|s| s.betp)),
+        bel_or: unit(1.0 - prod(|s| 1.0 - s.bel)),
+        k: unit(1.0 - prod(|s| 1.0 - s.k)),
+        frechet: envelope(
+            singles.iter().map(|s| s.bel),
+            singles.iter().map(|s| s.pl),
+            singles.iter().map(|s| s.nr),
+        ),
+        exact: false,
+    };
+    if not_all > 0.0 {
+        apply_negative_valuation(&base, base.bel, not_all)
+    } else {
+        Ok(base)
+    }
+}
+
+/// Bel of the conjunction of the query literals at `positions`, taken in the
+/// joint over the whole query (same items, same conflict, same `not_all`).
+/// This is the `Bel_DEP(aᵢ ∧ aⱼ)` that [`single_negative_sibling`] needs:
+/// a two-leaf query on its own can differ when items conflict on other
+/// leaves.
+///
+/// # Errors
+/// As [`conj_belief`], plus `InvalidConjunction` for an empty, repeated or
+/// out-of-range position and `ConjunctionOverCap` above the exact cap.
+pub fn joint_bel<A: Ord + Clone>(
+    query: &[Lit<A>],
+    items: &[Item<A>],
+    not_all: f64,
+    positions: &[usize],
+) -> Result<f64, DsError> {
+    check_not_all(not_all)?;
+    let distinct: BTreeSet<usize> = positions.iter().copied().collect();
+    if positions.is_empty()
+        || distinct.len() != positions.len()
+        || positions.iter().any(|&i| i >= query.len())
+    {
+        return Err(DsError::InvalidConjunction {
+            reason: "positions must be distinct indices into the query".into(),
+        });
+    }
+    let p = prepare(query, items)?;
+    let over = DsError::ConjunctionOverCap {
+        leaves: query.len(),
+        states: MAX_STATES,
+    };
+    if p.n() > MAX_LEAVES {
+        return Err(over);
+    }
+    let joint = run_dp(&p, not_all)?.ok_or(over)?;
+    let total: f64 = joint.states.iter().map(|(_, m)| m).sum();
+    let fixed: f64 = joint
+        .states
+        .iter()
+        .filter(|(s, _)| positions.iter().all(|&i| get(*s, i) == p.holds[i]))
+        .map(|(_, m)| m)
+        .sum();
+    Ok(unit(fixed / total))
+}
+
+/// Combine `base` with a negative valuation of mass `m` on ¬(∧C), where C
+/// is a subset of the query literals and `covered_bel` = Bel(∧C) in the
+/// same joint (C = L for `not_all`, a sibling pair for a negative edge).
+///
+/// The closed-world (ow = 0) form of SPEC §3.3 / §3.6. States that fix C
+/// meet ¬(∧C) as ⊥ (mass m·`covered_bel` = K'); every other surviving
+/// state that carries the valuation refutes ∧L, because ∧L ⊆ ∧C:
+///
+/// ```text
+/// Bel   = Bel·(1 − m)/(1 − K')        Pl = Pl·(1 − m)/(1 − K')
+/// BetP  = BetP·(1 − m)/(1 − K')
+/// Dis   = ((1 − m)·Dis + m·(1 − Bel(∧C)))/(1 − K'),  NR = 1 − Dis
+/// Bel(∨L) = (Bel(∨L) − K')/(1 − K')
+/// K     = K + (1 − K)·K'
+/// ```
+///
+/// The envelope is left as it was: it describes the leaves before the
+/// valuation.
+fn apply_negative_valuation(
+    base: &ConjResult,
+    covered_bel: f64,
+    m: f64,
+) -> Result<ConjResult, DsError> {
+    check_not_all(m)?;
+    check_mass(covered_bel)?;
+    if covered_bel + TOL < base.bel {
+        return Err(DsError::InvalidConjunction {
+            reason: "Bel of a sub-conjunction cannot be below Bel of the whole".into(),
+        });
+    }
+    let k_prime = m * covered_bel;
+    let z = 1.0 - k_prime;
+    if z < TOL {
+        return Err(DsError::TotalConflict);
+    }
+    let keep = (1.0 - m) / z;
+    let dis = ((1.0 - m) * (1.0 - base.nr) + m * (1.0 - covered_bel)) / z;
+    Ok(ConjResult {
+        bel: unit(base.bel * keep),
+        pl: unit(base.pl * keep),
+        nr: unit(1.0 - dis),
+        betp: unit(base.betp * keep),
+        bel_or: unit((base.bel_or - k_prime) / z),
+        k: unit(base.k + (1.0 - base.k) * k_prime),
+        frechet: base.frechet,
+        exact: base.exact,
+    })
+}
