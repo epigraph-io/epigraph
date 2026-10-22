@@ -984,6 +984,21 @@ pub async fn submit_evidence(
 
     let pool = &state.db_pool;
 
+    // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
+    // addressable only through assess: a row keyed (agent, that agent's slot
+    // perspective) would overwrite or forge that owner's one assessment.
+    if epigraph_db::repos::mass_function::is_assessment_slot(
+        request.agent_id,
+        request.perspective_id,
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "perspective_id".to_string(),
+            reason: "this is the agent's assessment slot, written only by \
+                     POST /api/v1/claims/:id/assess"
+                .to_string(),
+        });
+    }
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?

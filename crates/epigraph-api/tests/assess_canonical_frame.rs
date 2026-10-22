@@ -31,8 +31,8 @@
 //! also a pin on that.
 //!
 //! The handler is invoked directly as an `async fn`, on the `#[sqlx::test]`
-//! superuser pool, with the viewer of a seeded agent (the call's evidence
-//! perspective records that principal, and `perspectives.owner_agent_id` is a
+//! superuser pool, with the viewer of a seeded agent (the owner's assessment
+//! slot perspective records the owner, and `perspectives.owner_agent_id` is a
 //! foreign key, so the nil-principal public viewer cannot call it). That is
 //! deliberate: this file pins
 //! the handler's FRAME and CACHE semantics, not its tenancy (the stamping of
@@ -455,6 +455,181 @@ async fn the_assessment_slot_never_overwrites_another_writers_row(pool: PgPool) 
         .expect("count");
     assert_eq!(kept, 1, "the other writer's row survives");
     assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 2);
+}
+
+/// An agent whose sole oauth client is allowlisted to human `human` (migration
+/// 149's third binding), as a maintenance session.
+async fn allowlist_client_of(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, client_type, \
+                                    allowed_scopes, granted_scopes, status, agent_id, \
+                                    legal_entity_name, legal_contact_email) \
+         VALUES ($1, $2, 'assess host', 'service', ARRAY['claims:write'], \
+                 ARRAY['claims:write'], 'active', $3, 'Fixture Org', \
+                 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("epigraph_assess_{agent}"))
+    .bind(blake3::hash(agent.as_bytes()).as_bytes().as_slice())
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("the service client");
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET ROLE epigraph_maintenance")
+        .execute(&mut *conn)
+        .await
+        .expect("maintenance role");
+    sqlx::query("SELECT * FROM public.epigraph_allow_author_binding_client($1, $2, 'assess')")
+        .bind(client)
+        .bind(human)
+        .execute(&mut *conn)
+        .await
+        .expect("allow the client");
+    sqlx::query("RESET ROLE")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+}
+
+/// The owner is the caller's HUMAN across every binding of migration 149: an
+/// agent whose client is allowlisted to the human shares the human's one slot
+/// with the human and with the human's linked agent (no aggregation through
+/// the allowlist binding).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowlisted_client_shares_its_humans_one_slot(pool: PgPool) {
+    let (claim, _viewer, _author) = seed_claim(&pool, "assess allowlist").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "assess-allow-human").await;
+    let (linked, _) = seed_agent_with_group(&pool, "assess-allow-linked").await;
+    let (service, _) = seed_agent_with_group(&pool, "assess-allow-service").await;
+    link_to_operator(&pool, linked, human).await;
+    allowlist_client_of(&pool, service, human).await;
+
+    let first = assess(&pool, service, claim, request(true, 0.9, None)).await;
+    assert_eq!(
+        first.owner_agent_id,
+        Some(human),
+        "the allowlisted client acts for the human"
+    );
+    assert_eq!(first.assessed_by, Some(service));
+    let second = assess(&pool, linked, claim, request(true, 0.9, None)).await;
+    assert_eq!(second.owner_agent_id, Some(human));
+    assert_eq!(second.replaced_assessments.len(), 1);
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
+    assert!(
+        (second.pignistic_prob.expect("BetP") - first.pignistic_prob.expect("BetP")).abs() < 1e-9,
+        "one human does not aggregate through the allowlist binding"
+    );
+}
+
+/// A caller whose only binding is a RETIRED operator link is refused: its own
+/// slot would give its human a second assessment. Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_with_only_a_retired_link_is_refused(pool: PgPool) {
+    let (claim, _viewer, _author) = seed_claim(&pool, "assess retired link").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "assess-retired-human").await;
+    let (retired, _) = seed_agent_with_group(&pool, "assess-retired-agent").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let out = epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("a retired link");
+        assert!(out.link_retired, "{out:?}");
+    }
+    let before = mass_function_count(&pool, claim).await;
+    let err = try_assess(&pool, retired, claim, request(true, 0.9, None))
+        .await
+        .expect_err("a retired-only binding is refused");
+    assert!(matches!(err, ApiError::Forbidden { .. }), "{err:?}");
+    assert_eq!(
+        mass_function_count(&pool, claim).await,
+        before,
+        "nothing written"
+    );
+    // Control: the human itself assesses.
+    assess(&pool, human, claim, request(true, 0.9, None)).await;
+}
+
+/// `contested` is the DIRECTION of the verdict, not a BetP threshold: a weak
+/// then a strong support is not a contest (a 0.5 BetP cut flags it on the
+/// 3-way frame), and a weak refutation then a weak support is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn contested_is_a_change_of_direction(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess direction").await;
+    assess(&pool, caller, claim, request(true, 0.3, None)).await;
+    let stronger = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    assert!(
+        !stronger.replaced_assessments[0].contested,
+        "same direction, stronger"
+    );
+    let prior = stronger.replaced_assessments[0]
+        .prior_pignistic_prob
+        .expect("the prior BetP");
+    assert!(prior < stronger.pignistic_prob.expect("BetP"), "{prior}");
+
+    let (claim2, _viewer, caller2) = seed_claim(&pool, "assess direction two").await;
+    assess(&pool, caller2, claim2, request(false, 0.1, None)).await;
+    let flipped = assess(&pool, caller2, claim2, request(true, 0.3, None)).await;
+    assert!(
+        flipped.replaced_assessments[0].contested,
+        "weak refute then weak support"
+    );
+}
+
+/// The slot is addressable only through assess: `/frames/:id/evidence` naming
+/// an agent together with that agent's slot perspective is refused, and
+/// nothing is written. Control: the same body with another perspective lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_route_cannot_write_into_an_assessment_slot(pool: PgPool) {
+    use epigraph_api::routes::belief::{submit_evidence, SubmitEvidenceRequest};
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess slot forge").await;
+    let first = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(caller));
+    let body = |perspective: Uuid| -> SubmitEvidenceRequest {
+        serde_json::from_value(serde_json::json!({
+            "claim_id": claim, "agent_id": caller, "perspective_id": perspective,
+            "masses": {"1": 0.9, "0,1,2": 0.1},
+        }))
+        .expect("evidence request")
+    };
+    let before = rows_on(&pool, claim, first.frame_id).await;
+    let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let err = submit_evidence(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        Path(first.frame_id),
+        Json(body(slot)),
+    )
+    .await
+    .expect_err("the assessment slot is refused");
+    assert!(matches!(err, ApiError::ValidationError { .. }), "{err:?}");
+    assert_eq!(
+        rows_on(&pool, claim, first.frame_id).await,
+        before,
+        "nothing written"
+    );
+
+    let other = Uuid::new_v4();
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, other, Some(caller))
+        .await
+        .expect("another perspective");
+    let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+    let scoped_state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
+    let _ = submit_evidence(
+        ViewerExtractor(viewer),
+        State(scoped_state),
+        Path(first.frame_id),
+        Json(body(other)),
+    )
+    .await
+    .expect("control: another perspective lands");
+    assert_eq!(
+        rows_on(&pool, claim, first.frame_id).await.len(),
+        before.len() + 1
+    );
 }
 
 /// Ruling Q-U027F-2, the other half: assessments by DIFFERENT owners are

@@ -174,6 +174,32 @@ fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
     sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
 }
 
+/// The perspective that keys `owner`'s ONE assessment slot on any (claim,
+/// frame): the `/claims/:id/assess` row is `(claim, frame, owner, this)`
+/// (ruling Q-U027F-2: one assessment per claim, frame and owner, the owner being
+/// the caller's human). Deterministic and domain-separated from every other
+/// perspective id (random v4s, edge ids). Because it is computable, every other
+/// evidence writer must refuse a row whose perspective is the slot of its own
+/// source agent ([`is_assessment_slot`]): that pair is the only way to address
+/// an owner's assessment from another route. `None` is the slot of a caller
+/// with no principal.
+#[must_use]
+pub fn assessment_slot_perspective(owner: Option<Uuid>) -> Uuid {
+    let owner = owner.map_or_else(|| "anonymous".to_string(), |o| o.to_string());
+    let hash = blake3::hash(format!("epigraph/assess-slot/v1/{owner}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Whether a BBA keyed `(source_agent_id, perspective_id)` would sit in an
+/// assessment slot (see [`assessment_slot_perspective`]). Writers other than
+/// `/claims/:id/assess` refuse such a row.
+#[must_use]
+pub fn is_assessment_slot(source_agent_id: Option<Uuid>, perspective_id: Option<Uuid>) -> bool {
+    perspective_id == Some(assessment_slot_perspective(source_agent_id))
+}
+
 /// A boolean SQL expression, TRUE exactly for a cached combination row (see
 /// `with_cached_combination_excluded` for what that is), with every column
 /// qualified by `qualifier` (`""` or `"mf."`). Never NULL: a row whose label
@@ -207,8 +233,9 @@ pub fn cached_combination_predicate(qualifier: &str) -> String {
 /// The cached row's key is (claim, frame, NULL agent, NULL perspective). The
 /// unique key is `NULLS NOT DISTINCT` (migration 034), so this is ONE slot per
 /// pair, and an agent-less, perspective-less INPUT lives in that slot too:
-/// `/assess` always stores its input there, and `/frames/:id/evidence` does
-/// when the body names neither an agent nor a perspective. Writing the cache
+/// `/assess` stored its input there before ruling Q-U027F-2 (legacy rows
+/// remain), and `/frames/:id/evidence` does when the body names neither an
+/// agent nor a perspective. Writing the cache
 /// would overwrite that input, and the readers would then drop it as a cached
 /// row, losing the evidence (backlog b5cb3efb). When this returns `true` the
 /// writer skips the cache. The input stays in the slot and is folded once.

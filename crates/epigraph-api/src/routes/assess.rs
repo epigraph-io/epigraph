@@ -77,41 +77,35 @@ pub struct AssessClaimResponse {
     pub mass_on_conflict: Option<f64>,
     pub embedded: bool,
     pub combination_reports: Vec<serde_json::Value>,
-    /// The assessments this call replaced (ruling Q-U027F-2): the caller's own
-    /// earlier one, or one by another agent of the same human. Empty when the
-    /// owner had none on this frame.
+    /// The identity this assessment is recorded under (ruling Q-U027F-2): the
+    /// caller's human (its operator, or the human its client is allowlisted
+    /// to), or the caller itself when bound to none. One assessment per
+    /// (claim, frame, owner).
+    pub owner_agent_id: Option<Uuid>,
+    /// The agent that made this call (the row records the owner).
+    pub assessed_by: Option<Uuid>,
+    /// The owner's earlier assessment this call replaced in place (the slot row
+    /// keeps its id, `mass_function_id` above). Empty when the owner had none.
     pub replaced_assessments: Vec<ReplacedAssessment>,
 }
 
-/// One assessment a call replaced.
+/// The owner's earlier assessment a call replaced.
 #[derive(Debug, Serialize)]
 pub struct ReplacedAssessment {
+    /// The slot row (now holding this call's masses).
     pub mass_function_id: Uuid,
-    /// The owner it was recorded under (the caller's human operator, or the
-    /// caller itself when it has none).
+    /// The owner it was recorded under.
     pub source_agent_id: Option<Uuid>,
-    /// Whether it reached the opposite verdict on the claim's hypothesis
-    /// (BetP on the other side of 0.5): the new assessment contests it.
+    /// Its BetP on the claim's hypothesis, alone, before this call replaced it.
+    pub prior_pignistic_prob: Option<f64>,
+    /// Whether it pointed the other way (more belief against the claim's
+    /// hypothesis than for it, or the reverse): the new assessment contests it.
     pub contested: bool,
 }
 
 // =============================================================================
 // HANDLER
 // =============================================================================
-
-/// The perspective that keys `owner`'s ONE assessment slot on any (claim,
-/// frame) (ruling Q-U027F-2). Deterministic, domain-separated from every other
-/// perspective id (random v4s and edge ids), so the slot's key (claim, frame,
-/// owner, this perspective) is assess's alone: no other writer's row can sit on
-/// it and be overwritten. `None` is the slot of a caller with no principal.
-#[cfg(feature = "db")]
-fn assessment_slot_perspective(owner: Option<Uuid>) -> Uuid {
-    let owner = owner.map_or_else(|| "anonymous".to_string(), |o| o.to_string());
-    let hash = blake3::hash(format!("epigraph/assess-slot/v1/{owner}").as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash.as_bytes()[..16]);
-    Uuid::from_bytes(bytes)
-}
 
 /// Assess a claim: compute BBA, submit evidence, combine, update belief,
 /// and optionally generate embedding — all in one call.
@@ -279,24 +273,37 @@ pub async fn assess_claim(
     // `source_agent_id` names the owner, the identity whose one assessment
     // this is.
     //
-    // The owner is the caller's ACTING operator (`operator_actor`: a live,
-    // non-retired link with a live membership), the read a caller-side
-    // identity must use; a retired or dormant link makes the agent its own
-    // owner. A principal-less viewer has one anonymous slot.
-    let owner = match viewer.principal() {
+    // The owner is the caller's HUMAN, by migration 149's `epigraph_human_of`
+    // (live bindings only): the caller itself when it is a human, its live
+    // operator link, or the human its sole client is allowlisted to; the
+    // caller itself when bound to no human. A caller whose ONLY binding is a
+    // retired link is refused: falling back to its own slot would let one
+    // human assess twice through it. A principal-less viewer has one
+    // anonymous slot.
+    let caller = viewer.principal();
+    let owner = match caller {
         Some(agent) => {
             let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
                 message: format!("acquire connection: {e}"),
             })?;
-            Some(
-                epigraph_db::AgentRepository::operator_actor(&mut conn, agent)
+            match epigraph_db::AgentRepository::human_of(&mut conn, agent, true).await? {
+                Some(human) => Some(human),
+                None if epigraph_db::AgentRepository::human_of(&mut conn, agent, false)
                     .await?
-                    .map_or(agent, |l| l.operator_id),
-            )
+                    .is_some() =>
+                {
+                    return Err(ApiError::Forbidden {
+                        reason: "this agent's link to its human is retired, so it cannot \
+                                 assess on that human's behalf; nothing was written"
+                            .to_string(),
+                    });
+                }
+                None => Some(agent),
+            }
         }
         None => None,
     };
-    let slot = assessment_slot_perspective(owner);
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
     epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
     // The owner's assessment this call replaces: exactly the row the upsert
     // below overwrites.
@@ -421,22 +428,27 @@ pub async fn assess_claim(
     let (final_bel, final_pl, final_betp, m_missing) =
         super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
 
-    // Each replaced assessment, and whether this call reverses its verdict.
-    let new_betp = super::belief::compute_hypothesis_belief(&mass_function, &ds_frame, h_idx).2;
+    // Each replaced assessment, and whether this call reverses its direction:
+    // Bel(h) against Bel(not h) = 1 - Pl(h), so the sign does not depend on
+    // the frame's size (a 0.5 BetP threshold misreads a 3-way frame).
+    let direction = |m: &MassFunction| {
+        let (bel, pl, _, _) = super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx);
+        bel - (1.0 - pl)
+    };
+    let new_direction = direction(&mass_function);
     let replaced_assessments: Vec<ReplacedAssessment> = replaced_rows
         .iter()
         .map(|(id, source, masses)| {
-            let contested = MassFunction::from_json_masses(ds_frame.clone(), masses)
-                .ok()
-                .is_some_and(|old| {
-                    let old_betp =
-                        super::belief::compute_hypothesis_belief(&old, &ds_frame, h_idx).2;
-                    (old_betp - 0.5) * (new_betp - 0.5) < 0.0
-                });
+            let old = MassFunction::from_json_masses(ds_frame.clone(), masses).ok();
             ReplacedAssessment {
                 mass_function_id: *id,
                 source_agent_id: *source,
-                contested,
+                prior_pignistic_prob: old
+                    .as_ref()
+                    .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
+                contested: old
+                    .as_ref()
+                    .is_some_and(|m| direction(m) * new_direction < 0.0),
             }
         })
         .collect();
@@ -480,8 +492,9 @@ pub async fn assess_claim(
     // input BBA's key and overwrote it, and a recompute must never re-combine a
     // combined row. The per-frame result is cached by the upsert below.
     // So no cached row can ever sit over an agent-less input (backlog
-    // b5cb3efb): the input is keyed by its own perspective, and nothing is
-    // stored on the (claim, frame, NULL, NULL) slot.
+    // b5cb3efb): the input is keyed by its owner's assessment slot
+    // perspective, and nothing is stored on the (claim, frame, NULL, NULL)
+    // slot.
 
     // Store global scoped belief cache
     let _ = epigraph_db::ScopedBeliefRepository::upsert(
@@ -587,6 +600,8 @@ pub async fn assess_claim(
         mass_on_conflict: Some(m_empty),
         embedded,
         combination_reports,
+        owner_agent_id: owner,
+        assessed_by: caller,
         replaced_assessments,
     }))
 }

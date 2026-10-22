@@ -366,3 +366,49 @@ async fn auto_wire_ds_batch_canonicalizes_and_keeps_none(pool: PgPool) {
     );
     assert_eq!(auto_wire_types(&pool, untyped).await, vec![None]);
 }
+
+/// Ruling Q-U027F-2: an owner's `/claims/:id/assess` slot (the owner's slot
+/// perspective, keyed by the owner) is written only by assess. A
+/// `submit_ds_evidence` call naming the calling agent's own slot perspective is
+/// refused and writes nothing; the same call with no perspective lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_ds_evidence_cannot_write_into_the_callers_assessment_slot(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let agent = server.server_agent_id().await.expect("server agent");
+    let frame_id = epigraph_mcp::tools::ds_auto::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent));
+    // The slot perspective exists (assess created it), so only the slot rule
+    // can refuse the call.
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, slot, Some(agent))
+        .await
+        .expect("the slot perspective");
+    let claim = seed_claim(
+        &pool,
+        &format!("assess slot via ds {}", Uuid::new_v4()),
+        0.5,
+    )
+    .await;
+    let mut params = ds_params(claim, frame_id, None);
+    params.perspective_id = Some(slot.to_string());
+    let err = tools::ds::submit_ds_evidence(&server, &viewer, params, None)
+        .await
+        .expect_err("the caller's assessment slot is refused");
+    assert!(err.message.contains("assessment slot"), "{err:?}");
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(written, 0, "nothing written");
+
+    tools::ds::submit_ds_evidence(&server, &viewer, ds_params(claim, frame_id, None), None)
+        .await
+        .expect("control: no perspective lands");
+}

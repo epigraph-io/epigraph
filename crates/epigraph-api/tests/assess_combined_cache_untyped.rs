@@ -7,13 +7,14 @@
 //! Until U027 the handler also stored a "combined result" row on the input's
 //! `(claim, frame, NULL agent, NULL perspective)` key, which replaced the input
 //! in the same request (main later skipped that store while an input held the
-//! slot, backlog b5cb3efb). Each call now stores its input under its own evidence
-//! perspective and no combined row at all, so the row that survives IS the
-//! `discount` input row.
+//! slot, backlog b5cb3efb). Each call now stores its input in its OWNER's one
+//! assessment slot (ruling Q-U027F-2: key (claim, frame, owner, the owner's
+//! slot perspective)) and no combined row at all, so the row that survives IS
+//! the `discount` input row.
 //!
-//! Driven over HTTP with a real bearer agent, so it also pins that the call's
-//! evidence perspective records that agent as `owner_agent_id` (attribution,
-//! as for the DS auto-wire's evidence perspectives; `TenancyDecl::instance_wide`).
+//! Driven over HTTP with a real bearer agent, so it also pins that the slot is
+//! that agent's own (an unlinked agent is its own owner) and that the slot
+//! perspective records it as `owner_agent_id` (`TenancyDecl::instance_wide`).
 #![cfg(feature = "db")]
 
 mod common;

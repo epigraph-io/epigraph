@@ -1539,6 +1539,29 @@ impl AgentRepository {
         }))
     }
 
+    /// The HUMAN `agent` acts for (migration 149's `epigraph_human_of`): the
+    /// agent itself when it is a registered human operator; else its operator
+    /// link (only a non-retired one when `live_only`); else the human its sole
+    /// client is allowlisted to (149 arm (c)). `None` when it is bound to no
+    /// human, and, with `live_only`, when its only link is retired. The one
+    /// read that answers "which human is this" across all three bindings.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn human_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        live_only: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_human_of($1, $2)")
+                .bind(agent_id)
+                .bind(live_only)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
     /// [`Self::operator_actor`] for a caller holding a pool.
     ///
     /// # Errors
