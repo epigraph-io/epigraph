@@ -26,6 +26,9 @@ it that way:
 
 Both checks are decided from the profile alone, before any read.
 
+Not sure label dedup is the right tool? See
+[duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md).
+
 The planner is the pure engine `epigraph_engine::label_dedup`; the tools are
 `crates/epigraph-mcp/src/tools/label_dedup.rs`.
 
