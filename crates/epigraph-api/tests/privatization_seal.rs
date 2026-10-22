@@ -478,6 +478,79 @@ async fn the_seal_ceremony_round_trips_through_its_own_routes(pool: PgPool) {
     );
 }
 
+/// `evidence.source_url` is sealed plaintext too, and it comes back on unseal.
+///
+/// Before backlog 43ab8c73 every writer bound NULL to the column, so a seal that
+/// encrypted only `raw_content` and `properties` left nothing behind. Writers
+/// now store the URL there, so the seal must carry it in the ciphertext (the
+/// manifest folds it into the encrypted properties), NULL the column, and the
+/// unseal must split it back out. Played through the routes, encrypting and
+/// decrypting exactly as the client does, because the fold lives in the
+/// manifest the client is served and a repository-level test that built its
+/// own payload would not exercise it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_evidence_url_is_sealed_with_its_row_and_restored_on_unseal(pool: PgPool) {
+    use epigraph_db::repos::privatization::SEALED_EVIDENCE_SOURCE_URL_KEY;
+
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let claim = seed_subject(&pool, &world, "a confidential result with a link").await;
+    let url = format!("https://example.org/sealed/{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE evidence SET source_url = $2 WHERE claim_id = $1")
+        .bind(claim)
+        .bind(&url)
+        .execute(&pool)
+        .await
+        .expect("give the evidence a URL");
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
+        .await
+        .expect("seal manifest");
+    assert_eq!(manifest.items[0].evidence.len(), 1);
+    assert_eq!(
+        manifest.items[0].evidence[0].properties[SEALED_EVIDENCE_SOURCE_URL_KEY],
+        serde_json::json!(url),
+        "the manifest must hand the client the URL inside the properties it encrypts, or \
+         the seal can only destroy it"
+    );
+    let body = seal_body(&manifest).await;
+    let resp = post_seal_commit(&pool, &world, plan, body)
+        .await
+        .expect("seal commit");
+    assert_eq!(resp.committed, 1);
+
+    let sealed: Vec<(Option<String>, serde_json::Value)> =
+        sqlx::query_as("SELECT source_url, properties FROM evidence WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_all(&pool)
+            .await
+            .expect("read the sealed evidence");
+    assert_eq!(
+        sealed,
+        vec![(None, serde_json::json!({}))],
+        "a sealed evidence row keeps its URL in plaintext"
+    );
+
+    unseal_through_routes(&pool, &world, plan, 1).await;
+
+    let (source_url, properties): (Option<String>, serde_json::Value) =
+        sqlx::query_as("SELECT source_url, properties FROM evidence WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the unsealed evidence");
+    assert_eq!(
+        source_url.as_deref(),
+        Some(url.as_str()),
+        "unseal must restore the URL the seal took out of the column"
+    );
+    assert!(
+        properties.get(SEALED_EVIDENCE_SOURCE_URL_KEY).is_none(),
+        "the carrier key is the seal's, not the row's; unseal must strip it, got {properties}"
+    );
+}
+
 /// A commit that omits a TCB member is refused, and NOTHING is sealed.
 ///
 /// The second half is the assertion that matters: §6.5.4's indictment of the

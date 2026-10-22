@@ -156,6 +156,7 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
     "refines",               // claim → claim (refinement)
     "cites",                 // claim → claim (citation link)
+    "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
     "CONTRADICTS",           // claim → claim (contradiction)
     "supersedes",            // claim → claim (version chain)
@@ -668,6 +669,16 @@ pub async fn create_edge(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(epigraph_db::carries_dedup_identity_key)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+        });
+    }
 
     // ONE transaction stamped with the CALLER's viewer (migration 120, D8):
     // the validation reads, the existence probes and the INSERT. Unstamped, an
@@ -1366,6 +1377,16 @@ pub async fn patch_edge(
     // — the column changes from object to array with no error. The downstream
     // SQL update relies on object-||-object shallow merge semantics; rejecting
     // non-objects up front is the only safe option.
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(epigraph_db::carries_dedup_identity_key)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+        });
+    }
     if let Some(ref props) = request.properties {
         if !props.is_object() {
             return Err(ApiError::ValidationError {
@@ -3000,6 +3021,19 @@ mod tests {
         assert!(!is_valid_relationship(""));
     }
 
+    /// `qualifies` (backlog 99582af7, a belief-neutral scope caveat) is
+    /// accepted in its lower-case canonical spelling ONLY, per the U014 casing
+    /// ruling. The whitelist already mixes cases for older relations
+    /// (`CONTRADICTS`, `EQUIVALENT_TO`, `derived_from`/`DERIVED_FROM`); an
+    /// upper-case `QUALIFIES` alias would split one relation into two
+    /// spellings that readers and the MCP twin treat differently.
+    #[test]
+    fn qualifies_is_valid_in_lower_case_only() {
+        assert!(is_valid_relationship("qualifies"));
+        assert!(!is_valid_relationship("QUALIFIES"));
+        assert!(!is_valid_relationship("Qualifies"));
+    }
+
     #[test]
     fn test_create_edge_request_deserializes() {
         let json = serde_json::json!({
@@ -4027,6 +4061,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

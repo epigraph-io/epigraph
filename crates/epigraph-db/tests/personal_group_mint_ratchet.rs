@@ -311,8 +311,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-cli/src/bin/method_search.rs",
         "default_decl_for_author",
-        1,
-        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused.",
+        2,
+        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused. \
+         The second call is in the bin's #[cfg(test)] dedup_race_tests module: it mints the \
+         fixture author's personal group, committed, on the throwaway #[sqlx::test] database \
+         before the racers start, and runs in no build of the binary.",
     ),
 ];
 
@@ -343,6 +346,13 @@ const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
         "`epigraph_community_add_member`'s restore of a REVOKED community row at the requested \
          `reader` role, reachable only by a live admin actor (`'denied_readmit'` otherwise); \
          pinned by `community_membership_integrity.rs`.",
+    ),
+    (
+        "migrations/159_community_bootstrap_maintenance_only.sql",
+        1,
+        "159 re-states `epigraph_community_add_member` (bootstrap of a never-populated group \
+         only from a maintenance session); the revival is 106's restore, unchanged: a REVOKED \
+         community row at `reader`, only for a live admin actor.",
     ),
 ];
 

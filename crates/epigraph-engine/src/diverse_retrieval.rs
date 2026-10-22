@@ -335,9 +335,9 @@ pub struct DiverseRetrievalConfig {
     /// Coverage vs relevance tradeoff for `diverse_select`
     /// (0.0 = pure relevance, 1.0 = pure coverage).
     pub alpha: f32,
-    /// When true, restrict candidates to `level=2` paragraphs. Used by
-    /// MCP `recall_with_context` (paragraph-primary). REST passes
-    /// `false` (matches its pre-helper behaviour).
+    /// When true, restrict candidates to `level=2` paragraphs. Both callers
+    /// now pass `false`: REST (its pre-helper behaviour) and, since drain
+    /// U082, MCP `recall_with_context`, which seeds on the whole corpus.
     pub paragraph_only: bool,
     /// Optional `claims.created_at >= since` window on the candidate pool.
     /// `None` (the default everywhere it is not explicitly requested) is

@@ -431,6 +431,84 @@ impl BehavioralExecutionRepository {
             .map(|r| (r.workflow_id, r.avg_similarity, r.execution_count))
             .collect())
     }
+
+    /// Behavioral affinity for HIERARCHICAL workflows (U033): executions whose
+    /// `workflow_id` is a `workflows.id`, as `report_hierarchical_outcome`
+    /// writes them. [`Self::behavioral_affinity_lineage`] cannot see these: its
+    /// lineage roots must be claims, and a `workflows.id` never is.
+    ///
+    /// A SEPARATE query with its own `limit`, not a second arm of the lineage
+    /// query: callers take the top `limit` roots BEFORE looking up the rows
+    /// they hold, and HTTP `search_workflows` only ever looks up flat roots, so
+    /// hierarchical roots in a shared ranking would push flat roots out of the
+    /// budget and silently strip their affinity.
+    ///
+    /// Keyed on the `workflows` row itself: `WorkflowRepository::find_lineage_root`
+    /// walks claim->claim edges only and returns a hierarchical id unchanged,
+    /// which is the key `find_workflow`'s hierarchical leg looks up.
+    ///
+    /// Counted once per outcome REPORT, not per step row: a report writes one
+    /// row per step, all sharing `created_at` and the goal embedding, so a
+    /// per-row count would let one long report clear `min_executions` alone.
+    ///
+    /// Deprecated workflows (`truth_value <= 0.1`) are excluded. `workflows`
+    /// and `behavioral_executions` carry no visibility columns and no row
+    /// security, so there is no viewer predicate to apply.
+    ///
+    /// Returns `(workflows.id, avg_similarity, report_count)`.
+    #[instrument(skip(executor, goal_embedding_pgvec))]
+    pub async fn behavioral_affinity_hierarchical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        goal_embedding_pgvec: &str,
+        min_similarity: f64,
+        min_executions: i64,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, f64, i64)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct AffinityRow {
+            workflow_id: Uuid,
+            avg_similarity: f64,
+            execution_count: i64,
+        }
+
+        let rows: Vec<AffinityRow> = sqlx::query_as(
+            r#"
+            WITH reports AS (
+                SELECT DISTINCT ON (be.workflow_id, be.created_at)
+                       be.workflow_id, be.goal_embedding
+                FROM behavioral_executions be
+                JOIN workflows w ON w.id = be.workflow_id
+                WHERE be.success = TRUE
+                  AND be.goal_embedding IS NOT NULL
+                  AND w.truth_value > 0.1
+                ORDER BY be.workflow_id, be.created_at, be.id
+            ),
+            query_vec AS (SELECT $1::vector AS vec)
+            SELECT
+                r.workflow_id                                          AS workflow_id,
+                AVG(1.0 - (r.goal_embedding <=> q.vec))::float8       AS avg_similarity,
+                COUNT(*)::bigint                                       AS execution_count
+            FROM reports r
+            CROSS JOIN query_vec q
+            GROUP BY r.workflow_id
+            HAVING AVG(1.0 - (r.goal_embedding <=> q.vec)) >= $2
+               AND COUNT(*) >= $3
+            ORDER BY avg_similarity DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(goal_embedding_pgvec)
+        .bind(min_similarity)
+        .bind(min_executions)
+        .bind(limit)
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.workflow_id, r.avg_similarity, r.execution_count))
+            .collect())
+    }
 }
 
 #[cfg(test)]

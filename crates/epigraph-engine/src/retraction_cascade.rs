@@ -110,9 +110,12 @@
 //!   fuses *several* sources into one synthesis, so "which supporters does the
 //!   synthesis inherit" is a semantic question, not the mechanical re-pointing
 //!   that dedup does.
-//! * `ClaimRepository::deprecate_claim` and `ClaimRepository::evolve_step`
-//!   retire a claim without moving its edges, so only the
-//!   frozen-downstream-BBA half applies to them, not the orphan/strand half.
+//! * `ClaimRepository::deprecate_claim` retires a claim without moving its
+//!   edges, so only the frozen-downstream-BBA half applies to it, not the
+//!   orphan/strand half. `ClaimRepository::evolve_step` with `supersedes`
+//!   records `claims.supersedes`, and its request paths run the Supersede
+//!   admin cascade (`admin_cascade::apply_after_supersede`, backlog 8d3b4527);
+//!   with `revises` nothing is retired.
 
 use std::collections::HashSet;
 

@@ -1,7 +1,11 @@
-//! `recall_with_context` MCP tool — paragraph-primary semantic search with
-//! batched structural context. See docs/superpowers/specs/2026-05-05-recall-with-context-design.md.
+//! `recall_with_context` MCP tool — semantic search over every embedded claim
+//! with batched structural context. See
+//! docs/superpowers/specs/2026-05-05-recall-with-context-design.md for the
+//! original paragraph-primary design; since drain U082 (backlog a1d89aab,
+//! operator ruling 2026-10-14) the seed is the whole corpus and paper/section
+//! parentage is an enrichment attribute, omitted for a parentless hit.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -9,20 +13,29 @@ use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
 
-/// Fraction of level-2 paragraphs carrying a 3072-d embedding, viewer-scoped.
+/// Fraction of the claims `recall_with_context` can seed on — every claim
+/// carrying a vector in EITHER column — that carry a 3072-d one,
+/// viewer-scoped.
+///
+/// Drain U082: the denominator was level-2 paragraphs while the seed was
+/// level-2 paragraphs. Now that the seed is the whole corpus it must be the
+/// whole embedded corpus too, or auto-detect hides exactly the claims the
+/// ruling made candidates: the `submit_claim` / `memorize` write paths embed
+/// only the 1536-d `embedding` column (`epigraph-cli reembed` alone writes
+/// `embedding_3072`), so a corpus whose PARAGRAPHS were re-embedded at 3072
+/// would auto-select 3072 and every parentless claim would silently stop
+/// being a candidate.
 ///
 /// PR-09: took a bare pool. The ratio itself is not the disclosure — the
-/// denominator is: `COUNT(*) FROM claims WHERE level = 2` told any caller the
-/// exact paragraph population of the whole corpus, and the result is surfaced
-/// through `recall_with_context`'s `corpus_scope`. Scoped, both counts are the
-/// reader's own, and the auto-detect decision is made on the corpus the reader
-/// will actually search — which is also the more correct answer.
-pub async fn paragraph_3072_population(
+/// denominator is, and the auto-detect decision is surfaced through
+/// `centroid_dim_used`. Scoped, both counts are the reader's own, and the
+/// decision is made on the corpus the reader will actually search.
+pub async fn embedded_3072_population(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<f64, sqlx::Error> {
@@ -32,7 +45,7 @@ pub async fn paragraph_3072_population(
             COUNT(*) FILTER (WHERE c.embedding_3072 IS NOT NULL)::float8
               / NULLIF(COUNT(*), 0)::float8 AS frac_3072
         FROM claims c
-        WHERE (c.properties->>'level')::int = 2
+        WHERE (c.embedding IS NOT NULL OR c.embedding_3072 IS NOT NULL)
           AND ($1::bool OR c.visibility = 'public'
                OR c.owner_group_id = ANY($2::uuid[]))
         "#,
@@ -48,7 +61,7 @@ async fn detect_centroid_dim(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<u32, sqlx::Error> {
-    let frac = paragraph_3072_population(pool, viewer).await?;
+    let frac = embedded_3072_population(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
@@ -121,7 +134,7 @@ pub struct RecallWithContextParams {
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
     /// Max epistemic-edge neighbours returned **per relationship** per hit
-    /// (supports / refutes / contradicts / specializes / elaborates / cites).
+    /// (supports / refutes / contradicts / specializes / elaborates / cites / qualifies).
     /// Default 4, minimum 1 (0 is raised to 1). Per-relationship rather than
     /// per-hit so a claim with many `supports` edges cannot crowd out its single
     /// `refutes`. The floor keeps `epistemic_edges_total` honest: the total rides
@@ -148,7 +161,7 @@ pub struct RecallWithContextParams {
     pub diversity_weight: Option<f32>,
     /// Candidate-pool top-K — the second-stage cutoff after theme
     /// selection. The diverse pipeline first picks the `max_themes`
-    /// most-similar themes, then pulls up to this many paragraphs from
+    /// most-similar themes, then pulls up to this many claims from
     /// them as input to submodular `diverse_select`. Bigger pool =
     /// finer cluster granularity reaches retrieval, at the cost of more
     /// SQL work and a quadratic in-memory similarity matrix.
@@ -269,9 +282,9 @@ pub struct RecallWithContextParams {
     /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
     /// with no vector in the searched column is not known to be near anything.
     ///
-    /// Runs LAST, after `min_truth`, `exclude_contested` and the
-    /// missing-paper-attribution drop, so only a hit that is ITSELF being
-    /// returned can suppress another. Ordering it earlier would let a paragraph
+    /// Runs LAST, after `min_truth` and `exclude_contested`, so only a hit
+    /// that is ITSELF being returned can suppress another. Ordering it
+    /// earlier would let a paragraph
     /// those filters are about to discard evict its surviving near-duplicate on
     /// the way out — which makes switching on a de-duplication filter DELETE a
     /// hit rather than merely de-duplicate.
@@ -525,6 +538,10 @@ pub struct RecallWithContextResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallHit {
+    /// The hit's claim id. Named for the paragraph-primary design it predates
+    /// (and kept, since every consumer reads it): since drain U082 a hit can
+    /// be any embedded claim — a paragraph, an atom, a section, a workflow
+    /// step, a `submit_claim` / `memorize` claim.
     pub paragraph_id: Uuid,
     pub paragraph_content: String,
     pub similarity: f64,
@@ -552,7 +569,17 @@ pub struct RecallHit {
     /// Distinct from `lensed_belief`, which is a per-perspective annotation and
     /// gates nothing.
     pub belief_score: f64,
-    pub paper: PaperMeta,
+    /// The paper that `asserts` this hit (an `ingest_document` paragraph,
+    /// section or atom). OMITTED — never `null`, never fabricated — for a hit
+    /// with no paper attribution: a `submit_claim` / `memorize` claim, a
+    /// workflow step. Since drain U082 (backlog a1d89aab) parentage is an
+    /// enrichment attribute, not an eligibility filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paper: Option<PaperMeta>,
+    /// The level-1 section this hit decomposes from; `null` when there is
+    /// none (every non-paragraph hit, and a paragraph with no section). Kept
+    /// serialized as `null`, as it always was, so existing paragraph hits
+    /// keep the same key set; only `paper` changed shape in drain U082.
     pub section: Option<SectionMeta>,
     pub atoms: Vec<AtomChild>,
     pub atoms_total: usize,
@@ -564,8 +591,9 @@ pub struct RecallHit {
     pub corroborates_total: usize,
     pub corroborates_truncated: bool,
     /// Epistemic-edge neighbours (supports / refutes / contradicts / specializes /
-    /// elaborates / cites), capped at `epistemic_limit` PER RELATIONSHIP. `direction`
-    /// is from this paragraph's view: incoming `refutes` = "is refuted by".
+    /// elaborates / cites / qualifies), capped at `epistemic_limit` PER RELATIONSHIP.
+    /// `direction` is from this paragraph's view: incoming `refutes` = "is refuted
+    /// by", incoming `qualifies` = "is qualified by" (a scope caveat).
     /// Always serialized (like `corroborates`), so an empty list means "none
     /// visible", not "not computed" (backlog 922a1e54).
     pub epistemic_edges: Vec<EpistemicEdgeNeighbor>,
@@ -649,6 +677,10 @@ const EPISTEMIC_EDGE_RELATIONSHIPS: &[&str] = &[
     "specializes",
     "elaborates",
     "cites",
+    // A scope caveat ("A bounds the conditions under which B applies"; backlog
+    // 99582af7) travels with the claim it bounds, so a reader of the hit also
+    // reads where it does not hold. Belief-neutral, so not in `is_contested`.
+    "qualifies",
 ];
 
 /// Whether a returned epistemic-edge hit is the source or the target of the
@@ -729,12 +761,12 @@ pub async fn recall_with_context(
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = paragraph_3072_population(&server.pool, viewer)
+        let frac = embedded_3072_population(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
         if frac == 0.0 {
             return Err(invalid_params(
-                "centroid_dim=3072 requested but embedding_3072 has no populated rows on level=2 paragraphs; re-run with centroid_dim=1536 or omit to auto-detect"
+                "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
                     .to_string(),
             ));
         }
@@ -793,11 +825,10 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    tool layer (which only takes a single relationship string and returns
 ///    a serialized `CallToolResult`).
 /// 2. Dedup: a claim already in `seeds` is never added a second time as an
-///    expansion hit, even if graph-reachable from another seed. Then the level
-///    filter (backlog `4e856a99`): only `(properties->>'level')::int = 2`
-///    claims are EMITTED, matching both ANN seed surfaces. The walk still
-///    traverses through non-paragraphs; it just cannot promote one into the
-///    top-level hit list.
+///    expansion hit, even if graph-reachable from another seed. Every level is
+///    emitted, matching both ANN seed surfaces, which seed on the whole corpus
+///    since drain U082 (the level-2 emission filter of backlog `4e856a99` was
+///    removed with it).
 /// 3. Assign each expanded claim a base "similarity" derived from the
 ///    HIGHEST-similarity seed in the whole seed set, decayed by the hop
 ///    count at which BFS first reached the claim
@@ -842,35 +873,14 @@ async fn apply_graph_expansion(
     .await
     .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
 
-    // ... and every row it contributes must ALSO be a paragraph (backlog
-    // 4e856a99). Both ANN seed surfaces are level=2 only — the flat kNN by its
-    // own SQL, the diverse path by `paragraph_only: true` — but the walk above
-    // has no level predicate, and `EXPANSION_RELATIONSHIPS`
-    // (supports/corroborates/elaborates) includes atom-atom edges. So a level-3
-    // atom could be folded into `raw_hits` as a TOP-LEVEL hit, where the
-    // batched context fetch then returns it with empty `atoms` and no
-    // `section`, beside paragraphs that have both.
-    //
-    // The paper-attribution drop further down does NOT already catch this:
-    // `ingest_document` writes a `paper -asserts-> claim` edge for every
-    // planned claim, atoms included, so an atom has paper meta and survives.
-    //
-    // Filtered HERE rather than inside the SQL walk on purpose: the BFS must
-    // still be able to traverse THROUGH an atom to reach a paragraph beyond it.
-    // Pushing the predicate into the walk would silently change reachability,
-    // not just emission. The cost is that a filtered-out atom has already
-    // consumed one unit of the walk's emission budget.
-    let paragraph_ids = epigraph_db::ClaimRepository::paragraph_level_ids(
-        pool,
-        viewer,
-        &expansion.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
-    )
-    .await
-    .map_err(|e| internal_error(format!("graph expansion level filter: {e}")))?;
-    let expansion: Vec<_> = expansion
-        .into_iter()
-        .filter(|h| paragraph_ids.contains(&h.claim_id))
-        .collect();
+    // No level filter on the emitted rows. Backlog 4e856a99 added one
+    // (`ClaimRepository::paragraph_level_ids`, removed with it) so that
+    // expansion could not promote an atom
+    // while both ANN seed surfaces were level=2 only. Since drain U082
+    // (backlog a1d89aab; operator ruling 2026-10-14) both seed surfaces draw
+    // from the whole corpus, so the rule that kept expansion consistent with
+    // them is now "no level filter" too: an atom reached by a supports edge is
+    // exactly as eligible as an atom reached by the kNN.
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
@@ -967,8 +977,8 @@ async fn recall_with_context_post_embed(
     //    which REST `/api/v1/search/semantic?diverse=true` applies too), OR
     //    when no candidates were found in the selected themes.
     //
-    //  - `diverse=false` (default): flat paragraph-primary ANN over
-    //    `claims.embedding[_3072]`. Unchanged from pre-diverse behaviour.
+    //  - `diverse=false` (default): flat whole-corpus ANN over
+    //    `claims.embedding[_3072]`.
     //
     // The `paper_doi_filter` does NOT apply to the diverse path —
     // candidates_in_themes_at_dim has no DOI predicate. If the caller
@@ -1009,10 +1019,12 @@ async fn recall_with_context_post_embed(
             candidate_pool,
             budget: limit as usize,
             alpha,
-            // recall_with_context is paragraph-primary; restrict candidates
-            // to level=2 so the downstream batched-context fetch (which
-            // assumes paragraphs) has nothing to drop.
-            paragraph_only: true,
+            // recall_with_context seeds on the whole corpus (drain U082,
+            // backlog a1d89aab), like the flat path above: a parentless claim
+            // in a selected theme is a candidate, and the batched context
+            // fetch omits what it has no edges for (`paper`, `section`, the
+            // hierarchy lists) rather than dropping it.
+            paragraph_only: false,
             // The diverse pipeline bypasses `search_by_embedding` entirely,
             // so the window has to reach it here or `diverse=true` would
             // silently ignore `since`.
@@ -1040,6 +1052,7 @@ async fn recall_with_context_post_embed(
                 flat_limit,
                 params.paper_doi_filter.as_deref(),
                 params.since,
+                epigraph_db::EmbeddingSeedScope::AllClaims,
             )
             .await
             .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
@@ -1055,7 +1068,8 @@ async fn recall_with_context_post_embed(
                 .collect()
         }
     } else {
-        // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
+        // Flat whole-corpus kNN (every embedded claim the viewer can see, at
+        // any level; optional paper_doi pre-filter).
         epigraph_db::ClaimRepository::search_by_embedding_since(
             &server.pool,
             viewer,
@@ -1064,6 +1078,7 @@ async fn recall_with_context_post_embed(
             flat_limit,
             params.paper_doi_filter.as_deref(),
             params.since,
+            epigraph_db::EmbeddingSeedScope::AllClaims,
         )
         .await
         .map_err(|e| internal_error(format!("kNN: {e}")))?
@@ -1262,7 +1277,7 @@ async fn recall_with_context_post_embed(
         }
     };
 
-    // Stage 4 + 6: filter min_truth, drop paragraphs missing core or paper, assemble.
+    // Stage 4 + 6: filter min_truth, drop hits whose core vanished, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
@@ -1283,10 +1298,16 @@ async fn recall_with_context_post_embed(
         if belief_score < min_truth {
             continue;
         }
-        let paper = match ctx.paper_meta.get(&paragraph_id) {
-            Some(p) => p.clone(),
-            None => continue, // paragraph with no paper attribution — drop
-        };
+        // No paper attribution is NOT a reason to drop the hit (drain U082,
+        // backlog a1d89aab): `paper` is omitted from it instead. Below,
+        // `section`, `atoms`, `siblings` and `neighbor_paragraphs` are keyed by
+        // the paper hierarchy's edges (decomposes_to / continues_argument /
+        // atom bridges), so in practice only a level-2 paragraph hit gets them
+        // filled — an atom or section hit keeps its `paper` with those empty.
+        // `corroborates` and `epistemic_edges` are keyed by the hit's OWN
+        // edges with no level or paper predicate, so a parentless claim with
+        // supports / refutes / corroborates edges gets them populated.
+        let paper = ctx.paper_meta.get(&paragraph_id).cloned();
 
         let atoms = ctx
             .atoms_by_paragraph
@@ -1501,8 +1522,8 @@ async fn recall_with_context_post_embed(
     // high-truth near-duplicate and then be dropped itself by `min_truth`. The
     // measured result was a page that returned the 0.9 paragraph WITHOUT the
     // radius and nothing at all WITH it — switching on a de-duplication filter
-    // deleted the good hit. `exclude_contested` and the missing-paper drop have
-    // the same shape.
+    // deleted the good hit. `exclude_contested` has the same shape (as did the
+    // missing-paper drop, removed in drain U082).
     //
     // Running last makes the rule "a hit may only be suppressed by a hit that
     // is itself being returned", and makes this surface agree with
@@ -2487,13 +2508,24 @@ pub fn assemble_neighbor_paragraphs(
 #[doc(hidden)]
 pub mod __test_only {
     pub use super::{
-        assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population,
+        assemble_neighbor_paragraphs, embedded_3072_population, fetch_batched_context,
         BatchedContext, ParagraphCore,
     };
     use super::{
         recall_with_context_post_embed, EpiGraphMcpFull, McpError, RecallWithContextParams,
     };
     use rmcp::model::CallToolResult;
+
+    /// The `centroid_dim` auto-detect decision `recall_with_context` makes
+    /// when the caller omits `centroid_dim` (the private
+    /// `detect_centroid_dim`), so tests can pin the decision itself, not only
+    /// the fraction it is computed from.
+    pub async fn detect_centroid_dim(
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<u32, sqlx::Error> {
+        super::detect_centroid_dim(pool, viewer).await
+    }
 
     /// Integration-test entry point that skips the OpenAI embedder.
     ///

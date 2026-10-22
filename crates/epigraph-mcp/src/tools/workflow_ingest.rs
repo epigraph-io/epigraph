@@ -20,7 +20,7 @@ use crate::types::{ImproveWorkflowHierarchyParams, IngestWorkflowParams};
 use epigraph_ingest::workflow::WorkflowExtraction;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -37,6 +37,35 @@ pub struct IngestWorkflowResponse {
     pub executes_edges: usize,
     pub relationships_created: usize,
     pub already_ingested: bool,
+    /// Present only when the call DECLARED a tenancy: every planned claim the
+    /// call did not create whose tenancy differs from the declared one
+    /// (`epigraph_ingest_executor::ReusedClaim`). `visibility` and
+    /// `owner_group_id` are `null` for a claim the caller cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_items: Option<Vec<ReusedItem>>,
+    /// The agent that authored the created claims (the workflow-ingest system
+    /// agent), for the post-commit embed of a declared-tenancy ingest. Never
+    /// serialized.
+    #[serde(skip)]
+    pub(crate) author: Option<uuid::Uuid>,
+}
+
+/// One entry of [`IngestWorkflowResponse::reused_items`].
+#[derive(Debug, serde::Serialize)]
+pub struct ReusedItem {
+    pub claim_id: uuid::Uuid,
+    pub visibility: Option<String>,
+    pub owner_group_id: Option<uuid::Uuid>,
+}
+
+impl From<epigraph_ingest_executor::ReusedClaim> for ReusedItem {
+    fn from(r: epigraph_ingest_executor::ReusedClaim) -> Self {
+        Self {
+            claim_id: r.claim_id,
+            visibility: r.visibility,
+            owner_group_id: r.owner_group_id,
+        }
+    }
 }
 
 // ── Pool-only inner ────────────────────────────────────────────────────────
@@ -69,15 +98,33 @@ pub struct IngestWorkflowResponse {
 /// and their `executes` edges behind. Now the ingest either lands whole or
 /// leaves nothing — and re-running it converges, because every write in the walk
 /// is keyed on a deterministic id with an `ON CONFLICT` clause.
+///
+/// # A declared group (`declared_group`)
+///
+/// `Some(g)` makes every claim the walk creates `('group', g)`
+/// (`epigraph_ingest_executor::execute_workflow_ingest_plan_in_group`). Two
+/// memberships are required, and each is checked before its write could
+/// happen: the CALLER's own (`require_caller_writes_group` on `viewer`, before
+/// any transaction, so a refusal writes nothing at all), and the system
+/// agent's (the executor, on the stamped transaction). The caller's human
+/// writing `g` is not enough: `require_caller_write_authority` in
+/// `begin_system_ingest_stamped_tx` still binds the caller to the system
+/// agent's human, as for every ingest, but it is a question about the system
+/// agent's DEFAULT group and would admit every agent that human operates.
 pub(crate) async fn execute_workflow_ingest_with_inserted(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
+    declared_group: Option<uuid::Uuid>,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
     // H3 (batch H-b): the submitter is recorded by THIS entry point, never
     // taken from the caller's metadata; see `tools::workflow_authority`.
     let caller = server.write_identity(auth, viewer).await?;
+    if let Some(group) = declared_group {
+        epigraph_ingest_executor::require_caller_writes_group(viewer, caller.agent_id(), group)
+            .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    }
     let mut extraction = extraction.clone();
     crate::tools::workflow_authority::strip_submitter(&mut extraction.source.metadata);
     let extraction = &extraction;
@@ -107,6 +154,10 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // record); `None` = a brand-new lineage, whose submitter is the caller.
     let mut inherited: Option<Option<uuid::Uuid>> = None;
     let mut admin_write = false;
+    // Every anchor's grant, so the arm that admitted the caller over it is
+    // recorded with the write (`record_caller_workflow_write`).
+    let mut grants: Vec<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)> =
+        Vec::with_capacity(2);
     if creating {
         let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -126,7 +177,8 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 "workflow_ingest",
             )
             .await?;
-            admin_write |= grant.admin;
+            admin_write |= grant.is_admin();
+            grants.push((anchor, grant));
             // The lineage head is checked first, so a new generation of an
             // existing name inherits ITS submitter; a new name forked from a
             // parent inherits the parent's.
@@ -134,9 +186,28 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         }
     }
 
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
-        .await
-        .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+        &mut tx,
+        &plan,
+        extraction,
+        viewer,
+        declared_group,
+    )
+    .await
+    .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
+    // over HTTP, this server's pinned agent on stdio) AUTHORED every claim this
+    // ingest CREATED (`result.inserted`: thesis, phase, step and operation
+    // claims new to the graph); a reused claim keeps its creator's edge.
+    let created: Vec<uuid::Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    epigraph_ingest_executor::record_caller_authorship(
+        &mut tx,
+        caller.agent_id(),
+        &created,
+        "workflow_ingest",
+    )
+    .await
+    .map_err(|e| internal_error(format!("workflow ingest: could not record authorship: {e}")))?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));
@@ -150,6 +221,29 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             .await
             .map_err(internal_error)?;
         }
+    }
+    // The provenance of the authority exercised over each existing anchor
+    // through a non-admin authenticated arm: one row per anchor, naming the
+    // anchor (the workflow the caller had authority over) and the row created.
+    for (anchor, grant) in &grants {
+        crate::tools::workflow_authority::record_caller_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "workflow_ingest",
+            *anchor,
+            *grant,
+            serde_json::json!({
+                "created_workflow_id": result.workflow_id,
+                "canonical_name": extraction.source.canonical_name,
+                "generation": extraction.source.generation,
+                "parent_canonical_name": extraction.source.parent_canonical_name,
+                "lineage_head_before": anchors.lineage_head,
+                "linked_parent": anchors.linked_parent,
+                "recorded_submitter": submitter,
+            }),
+        )
+        .await?;
     }
     if admin_write {
         crate::tools::workflow_authority::audit_admin_workflow_write(
@@ -219,6 +313,14 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         executes_edges: result.executes_edges_created,
         relationships_created: result.relationship_edges_created,
         already_ingested: result.already_ingested,
+        reused_items: declared_group.map(|_| {
+            result
+                .reused_items
+                .into_iter()
+                .map(ReusedItem::from)
+                .collect()
+        }),
+        author: result.system_agent_id,
     };
     Ok((response, inserted))
 }
@@ -374,27 +476,101 @@ pub async fn do_ingest_workflow_via_pool(
         executes_edges: result.executes_edges_created,
         relationships_created: result.relationship_edges_created,
         already_ingested: result.already_ingested,
+        reused_items: None,
+        author: result.system_agent_id,
     })
 }
 
 // ── MCP entry point ────────────────────────────────────────────────────────
 
+/// Store `pgvec` as `claim_id`'s embedding, for a claim a workflow ingest just
+/// created. Best-effort: `false` (with a WARN) when nothing was stored.
+///
+/// `author` is the agent that authored the claim, which the ingest knows
+/// (`IngestWorkflowResponse::author`, the workflow-ingest system agent).
+/// `Some` stores on a transaction stamped from that agent
+/// (`claim_helper::store_embedding_author_stamped`), which is the only way to
+/// store on a GROUP-PRIVATE claim: the embedder's own path
+/// (`McpEmbedder::store_vector`) resolves the author by reading the claim as
+/// PUBLIC, which a group-private claim is not, so it stores nothing there.
+/// `None` keeps that path, for the public claims every other ingest writes.
+pub async fn store_ingest_embedding(
+    server: &EpiGraphMcpFull,
+    author: Option<uuid::Uuid>,
+    claim_id: uuid::Uuid,
+    pgvec: &str,
+) -> bool {
+    let stored = match author {
+        Some(author) => {
+            crate::claim_helper::store_embedding_author_stamped(
+                server.scoped.as_ref(),
+                &server.pool,
+                author,
+                claim_id,
+                pgvec,
+                "workflow_ingest",
+            )
+            .await
+        }
+        None => server.embedder.store_vector(claim_id, pgvec).await,
+    };
+    match stored {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                "workflow ingest embedding stored nothing (claim missing, sealed, superseded, or \
+                 not writable by its author's viewer)"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(claim_id = %claim_id, "workflow ingest embedding store failed: {e}");
+            false
+        }
+    }
+}
+
 /// MCP tool: ingest a `WorkflowExtraction` JSON.
+///
+/// `tenancy`: see [`execute_workflow_ingest_with_inserted`]'s declared group.
+/// `embed = false` skips every embedding call (the claims and the goal), so no
+/// text reaches the embedding provider (OD-6).
 pub async fn do_ingest_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
+    tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+    embed: bool,
 ) -> Result<CallToolResult, McpError> {
+    let declared_group = tenancy.map(|t| t.owner_group_id);
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(server, viewer, extraction, auth).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, extraction, auth, declared_group)
+            .await?;
+
+    if !embed {
+        return success_json(&response);
+    }
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue —
     // embedding is recoverable via backfill; the workflow ingest is not.
     // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
+    // A DECLARED group's claims are not readable as public, so they are stored
+    // through their known author instead (`store_ingest_embedding`).
     for (claim_id, content) in &inserted {
-        let _ = server.embedder.embed_and_store(*claim_id, content).await;
+        if declared_group.is_some() {
+            match server.embedder.generate(content).await {
+                Ok(v) => {
+                    let pgvec = crate::embed::format_pgvector(&v);
+                    store_ingest_embedding(server, response.author, *claim_id, &pgvec).await;
+                }
+                Err(e) => tracing::warn!("embedding failed (claim still stored): {e}"),
+            }
+        } else {
+            let _ = server.embedder.embed_and_store(*claim_id, content).await;
+        }
     }
 
     // Also embed the workflows-table goal for semantic find_workflow_hierarchical.
@@ -425,7 +601,15 @@ pub async fn ingest_workflow(
     params: IngestWorkflowParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_workflow(server, viewer, &params.extraction, auth).await
+    do_ingest_workflow(
+        server,
+        viewer,
+        &params.extraction,
+        auth,
+        params.tenancy,
+        params.embed.unwrap_or(true),
+    )
+    .await
 }
 
 // ── improve_workflow_hierarchy ─────────────────────────────────────────────
@@ -485,7 +669,7 @@ async fn improve_workflow_hierarchy_with_inserted(
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(server, viewer, &extraction, auth).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, &extraction, auth, None).await?;
 
     let improve_response = ImproveWorkflowHierarchyResponse {
         parent_canonical_name: parent_canonical_name.to_string(),

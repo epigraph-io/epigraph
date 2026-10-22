@@ -1,4 +1,6 @@
 #[cfg(feature = "db")]
+pub mod backfill_factors;
+#[cfg(feature = "db")]
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;
@@ -6,6 +8,8 @@ pub mod decompose;
 #[cfg(feature = "db")]
 pub mod embed_backfill;
 pub mod enrichment;
+#[cfg(feature = "db")]
+pub mod evidence_type_backfill;
 #[cfg(feature = "genai")]
 pub mod matching_client;
 #[cfg(feature = "db")]

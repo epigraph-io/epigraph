@@ -212,6 +212,7 @@ async fn serve_api_hanging(
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_api::middleware::bearer::AdminScopePosture::Unarmed,
+                delegated_by: None,
             },
         ))
         .with_state(state);

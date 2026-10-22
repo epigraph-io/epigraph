@@ -105,7 +105,7 @@ pub async fn challenge_claim(
 
     tx.commit().await.map_err(internal_error)?;
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "challenge_id": challenge_id,
             "claim_id": claim_id,
@@ -143,7 +143,7 @@ pub async fn list_challenges(
         })
         .collect();
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "challenges": results,
             "total": results.len(),

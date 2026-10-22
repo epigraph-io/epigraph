@@ -113,9 +113,12 @@ const fn combination_method_label(method: epigraph_ds::CombinationMethod) -> &'s
     }
 }
 
-/// Every `combination_method` label a cached combination row can carry, other
-/// than the `cautious+…` family.
-const CACHED_COMBINATION_LABELS: [&str; 8] = {
+/// The `combination_method` label of every [`epigraph_ds::CombinationMethod`]
+/// (its `Debug` name). A cached combination row carries one, and so does a
+/// `submit_ds_evidence` INPUT row (which has an agent), so a label alone does
+/// not mark a cache. Public so the legacy evidence-type backfill recognises
+/// these inputs by the same list.
+pub const COMBINATION_METHOD_LABELS: [&str; 7] = {
     use epigraph_ds::CombinationMethod as M;
     [
         combination_method_label(M::Conjunctive),
@@ -125,6 +128,21 @@ const CACHED_COMBINATION_LABELS: [&str; 8] = {
         combination_method_label(M::DuboisPrade),
         combination_method_label(M::Inagaki),
         combination_method_label(M::TbmConjunctive),
+    ]
+};
+
+/// Every `combination_method` label a cached combination row can carry, other
+/// than the `cautious+…` family.
+const CACHED_COMBINATION_LABELS: [&str; 8] = {
+    let l = COMBINATION_METHOD_LABELS;
+    [
+        l[0],
+        l[1],
+        l[2],
+        l[3],
+        l[4],
+        l[5],
+        l[6],
         CACHED_COMBINATION_UNFOLDED,
     ]
 };
@@ -152,18 +170,31 @@ fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
         sql.contains(NOT_CACHED_COMBINATION_MARKER),
         "combine-input query has no {NOT_CACHED_COMBINATION_MARKER} marker:\n{sql}"
     );
+    let predicate = format!("AND NOT {}", cached_combination_predicate(qualifier));
+    sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
+}
+
+/// A boolean SQL expression, TRUE exactly for a cached combination row (see
+/// `with_cached_combination_excluded` for what that is), with every column
+/// qualified by `qualifier` (`""` or `"mf."`). Never NULL: a row whose label
+/// is NULL is not a cached combination by this test.
+///
+/// Public so a maintenance job that must leave cached rows alone (the
+/// legacy evidence-type backfill, backlog bc06ec6f) uses the SAME predicate
+/// the combine-input readers exclude, rather than a copy that could drift.
+#[must_use]
+pub fn cached_combination_predicate(qualifier: &str) -> String {
     let labels = CACHED_COMBINATION_LABELS
         .iter()
         .map(|l| format!("'{l}'"))
         .collect::<Vec<_>>()
         .join(", ");
     let q = qualifier;
-    let predicate = format!(
-        "AND NOT COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
+    format!(
+        "COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
          AND ({q}combination_method IN ({labels}) \
               OR {q}combination_method LIKE '{CACHED_COMBINATION_CAUTIOUS_PREFIX}%'), false)"
-    );
-    sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
+    )
 }
 
 /// Whether a writer must NOT store its cached combination row for this pair,
@@ -1102,12 +1133,9 @@ impl MassFunctionRepository {
     /// List every distinct `frame_id` a claim carries BBAs on, paired with the
     /// frame's name and **ordered by frame name**.
     ///
-    /// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-    /// frame-agnostic scalars (last-writer-wins), so callers that recompute a
-    /// claim across all its frames must process them in a deterministic order
-    /// for two runs to converge to the same cached value. Frame-name order is
-    /// that canonical order — it matches the `epigraph-recompute-belief`
-    /// operator binary.
+    /// Name order is a stable LISTING order only. It does not say which frame
+    /// owns the claim's cached `claims.{belief, plausibility, pignistic_prob,
+    /// ...}` scalars: that is [`Self::cache_owner_frame_for_claim`].
     #[instrument(skip(executor, viewer))]
     pub async fn list_frames_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -1132,6 +1160,79 @@ impl MassFunctionRepository {
         let rows: Vec<(Uuid, String)> = vq.fetch_all(executor).await?;
 
         Ok(rows)
+    }
+
+    /// The frame that owns a claim's cached `claims.{belief, plausibility,
+    /// mass_on_empty, pignistic_prob, mass_on_missing, belief_frame_id}`
+    /// scalars, or `None` when the claim has no combine input the viewer can see.
+    ///
+    /// Only combine inputs count: cached combination rows are excluded exactly
+    /// as [`Self::get_for_claim_frame`] excludes them, so the owner is always a
+    /// frame the recompute can fold. Among the frames holding the claim's inputs:
+    ///
+    /// 1. the frame named `binary_truth`, when the claim has an input on it;
+    /// 2. else the frame named `claim_validity`, when the claim has an input on it;
+    /// 3. else the claim's recorded owner (`claims.belief_frame_id`), while that
+    ///    frame still holds an input;
+    /// 4. else the first-writer frame: the frame holding the claim's earliest
+    ///    input (`mass_functions.created_at`), ties broken by frame id.
+    ///
+    /// `frames.name` is UNIQUE, so the two canonical names identify at most one
+    /// frame each (migration 114 treats the frame named `binary_truth` the same
+    /// way). No other frame name plays a part.
+    ///
+    /// Once a claim's cache has an owner, a later input on another non-canonical
+    /// frame does not move it (rule 3): `belief_frame_id` is written only by the
+    /// claim's owner or by migration 114's definer, which keeps the recorded
+    /// frame. Rule 3 also means the owner does not follow `created_at` once
+    /// recorded; `created_at` is set by the database and is reset when an agent
+    /// replaces its own BBA ([`Self::store_with_perspective`]'s upsert), so it
+    /// decides only a claim with no recorded owner, or one whose recorded owner
+    /// no longer holds an input. A canonical frame still outranks the recorded
+    /// owner as soon as the claim has an input on it.
+    ///
+    /// Read-only: no frame is created.
+    #[instrument(skip(executor, viewer))]
+    pub async fn cache_owner_frame_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &with_cached_combination_excluded(
+                r#"
+            SELECT mf.frame_id
+            FROM mass_functions mf
+            JOIN frames f ON f.id = mf.frame_id
+            WHERE mf.claim_id = $1
+              /* {NOT_CACHED_COMBINATION} */
+              /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
+            ORDER BY CASE
+                       WHEN f.name = 'binary_truth' THEN 0
+                       WHEN f.name = 'claim_validity' THEN 1
+                       WHEN mf.frame_id = (
+                           SELECT c.belief_frame_id
+                           FROM claims c
+                           WHERE c.id = $1
+                             /* {VISIBILITY:c} */
+                       ) THEN 2
+                       ELSE 3
+                     END,
+                     mf.created_at,
+                     mf.frame_id
+            LIMIT 1
+            "#,
+                "mf.",
+            ),
+            2,
+        );
+        let mut vq = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let owner: Option<Uuid> = vq.fetch_optional(executor).await?;
+
+        Ok(owner)
     }
 
     /// List distinct `claim_id`s of **current** claims that have at least one
@@ -1181,6 +1282,156 @@ impl MassFunctionRepository {
         .await?;
 
         Ok(rows)
+    }
+}
+
+/// One legacy BBA with no `evidence_type`, and the stored provenance the
+/// evidence-type backfill decides from (backlog bc06ec6f).
+///
+/// Every field is read from a stored column; nothing here is inferred. The
+/// decision itself lives with the caller (`epigraph_cli::evidence_type_backfill`),
+/// which holds the calibration this crate does not depend on.
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct UntypedBbaProvenance {
+    pub id: Uuid,
+    pub combination_method: Option<String>,
+    /// `mass_functions.source_agent_id`.
+    pub source_agent_id: Option<Uuid>,
+    /// `mass_functions.perspective_id`.
+    pub perspective_id: Option<Uuid>,
+    /// `frames.name` of the BBA's frame.
+    pub frame_name: Option<String>,
+    /// TRUE for a cached combination row, by [`cached_combination_predicate`].
+    pub cached_combination: bool,
+    /// TRUE for an UNLABELLED (`combination_method` NULL) row with no agent and
+    /// no perspective that shares its (claim, frame) with another BBA: the
+    /// shape of the single-input cache copy writers stored before b5cb3efb,
+    /// which the predicate above cannot tell from a lone legacy input.
+    pub unlabelled_slot_shared: bool,
+    /// `evidence.evidence_type` of the linked evidence row (`evidence_id`).
+    pub linked_evidence_type: Option<String>,
+    /// `claims.properties->>'evidence_type'`.
+    pub claim_evidence_type: Option<String>,
+    /// `claims.properties->>'methodology'`.
+    pub claim_methodology: Option<String>,
+    /// `claims.properties->>'source_doi'`.
+    pub claim_source_doi: Option<String>,
+    /// `claims.properties->>'source_type'`.
+    pub claim_source_type: Option<String>,
+    /// `claims.labels` (empty when the claim row is missing).
+    pub claim_labels: Vec<String>,
+    /// `perspectives.name` when `perspective_id` names a perspective.
+    pub perspective_name: Option<String>,
+    /// The BBA's source agent's display name, else its claim's agent's.
+    pub agent_name: Option<String>,
+}
+
+impl MassFunctionRepository {
+    /// One keyset page of BBAs whose `evidence_type` is NULL or empty, in `id`
+    /// order, strictly after `after` (from the start when `None`), at most
+    /// `limit` rows, each with the provenance the backfill decides from.
+    ///
+    /// MAINTENANCE ONLY: it reads every tenant's rows and must run on the
+    /// maintenance connection; on an application session RLS hides most of
+    /// the corpus and the backfill would silently cover a fraction of it.
+    ///
+    /// The cursor is `m.id > COALESCE($1, nil uuid)`, never `$1 IS NULL OR
+    /// m.id > $1`: the statement is prepared once and re-executed per page, and
+    /// under a generic plan the OR form cannot be an index condition, so every
+    /// page would re-walk the key from the start.
+    ///
+    /// # Errors
+    /// `DbError` on a query failure.
+    pub async fn untyped_provenance_page<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<UntypedBbaProvenance>, DbError> {
+        let sql = format!(
+            r#"
+            SELECT m.id,
+                   m.combination_method,
+                   m.source_agent_id,
+                   m.perspective_id,
+                   f.name::text AS frame_name,
+                   {cached} AS cached_combination,
+                   (m.combination_method IS NULL
+                    AND m.source_agent_id IS NULL AND m.perspective_id IS NULL
+                    AND EXISTS (SELECT 1 FROM mass_functions s
+                                 WHERE s.claim_id = m.claim_id AND s.frame_id = m.frame_id
+                                   AND s.id <> m.id)) AS unlabelled_slot_shared,
+                   e.evidence_type::text              AS linked_evidence_type,
+                   c.properties->>'evidence_type'     AS claim_evidence_type,
+                   c.properties->>'methodology'       AS claim_methodology,
+                   c.properties->>'source_doi'        AS claim_source_doi,
+                   c.properties->>'source_type'       AS claim_source_type,
+                   COALESCE(c.labels, ARRAY[]::text[]) AS claim_labels,
+                   p.name::text                       AS perspective_name,
+                   COALESCE(sa.display_name, ca.display_name)::text AS agent_name
+              FROM mass_functions m
+              LEFT JOIN claims c        ON c.id = m.claim_id
+              LEFT JOIN frames f        ON f.id = m.frame_id
+              LEFT JOIN evidence e      ON e.id = m.evidence_id
+              LEFT JOIN perspectives p  ON p.id = m.perspective_id
+              LEFT JOIN agents sa       ON sa.id = m.source_agent_id
+              LEFT JOIN agents ca       ON ca.id = c.agent_id
+             WHERE (m.evidence_type IS NULL OR m.evidence_type = '')
+               AND m.id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+             ORDER BY m.id
+             LIMIT $2
+            "#,
+            cached = cached_combination_predicate("m.")
+        );
+        let rows = sqlx::query_as::<_, UntypedBbaProvenance>(&sql)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(executor)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Set `evidence_type` on each `ids[i]` to `types[i]`, ONLY where the row
+    /// is still untyped (NULL or empty). Returns the number of rows written.
+    ///
+    /// The untyped guard makes the backfill idempotent and safe beside a live
+    /// writer: a row a writer typed after the page was read is left as the
+    /// writer stored it. No other column is touched.
+    ///
+    /// MAINTENANCE ONLY (see [`Self::untyped_provenance_page`]).
+    ///
+    /// # Errors
+    /// `DbError` on a query failure, or if the two slices differ in length.
+    pub async fn backfill_evidence_type_where_untyped<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+        types: &[String],
+    ) -> Result<u64, DbError> {
+        if ids.len() != types.len() {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "backfill_evidence_type_where_untyped: {} ids but {} types",
+                    ids.len(),
+                    types.len()
+                ),
+            });
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let done = sqlx::query(
+            r#"
+            UPDATE mass_functions m
+               SET evidence_type = v.t
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, t)
+             WHERE m.id = v.id
+               AND (m.evidence_type IS NULL OR m.evidence_type = '')
+            "#,
+        )
+        .bind(ids)
+        .bind(types)
+        .execute(executor)
+        .await?;
+        Ok(done.rows_affected())
     }
 }
 

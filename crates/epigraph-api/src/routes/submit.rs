@@ -1460,7 +1460,9 @@ async fn persist_packet(
             evidence_uuid,
             content_hash_bytes.as_slice(),
             evidence_type_str,
-            None::<String>,
+            // A Document's URL, so the column REST `claim_provenance` and
+            // `get_evidence` read is not always NULL (backlog 43ab8c73).
+            epigraph_db::EvidenceRepository::source_url_of(&evidence_type_domain),
             evidence_submission.raw_content.as_deref(),
             claim_uuid,
             signature_bytes.as_deref(),
@@ -2420,6 +2422,7 @@ mod signature_verification_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
     use super::*;

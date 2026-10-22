@@ -1,0 +1,42 @@
+# gitleaks configuration for the CI secret scan (.github/workflows/ci.yml,
+# job `secrets`; scan logic in .github/scripts/gitleaks-scan.sh, self-test in
+# .github/scripts/test-gitleaks-scan.sh).
+#
+# CI scans ONLY the commits a PR (or a push to main) adds, so pre-existing
+# history can never fail the job. A full-history audit is an OPERATOR step,
+# run by hand from a full clone and with the report kept out of public places:
+#
+#     gitleaks git . --config .gitleaks.toml --redact --log-opts="--all"
+#
+# Allowlist entries are keyed on the exact fixture VALUE (regexTarget =
+# "secret"), never on a file path, so a new secret placed next to a fixture is
+# still reported. Add an entry only for a value that is provably not a
+# credential (a test fixture or a public identifier), and say why.
+
+title = "epigraph"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures that look like secrets but are not credentials"
+regexTarget = "secret"
+regexes = [
+  # Webhook HMAC test secret used by the epigraph-api webhooks.rs unit tests.
+  '''^Xk9mP2qL7vN8wBjH5cT0yDrF3gU6eA1s$''',
+  # `"0123456789abcdef".repeat(4)` — a dummy 64-hex-char key in CLI/MCP tests.
+  '''^0123456789abcdef$''',
+  # Idempotency-key fixture in epigraph-api submit_packet tests.
+  '''^unique_idempotency_key_12345$''',
+  # A synthetic procurement-style identifier in its normalized form (uppercase
+  # alphanumerics), the comparison key of the label-dedup engine's id tests
+  # (crates/epigraph-engine/tests/label_dedup/ids.rs). Not a credential.
+  '''^ACSDFACLCPFY29317$''',
+]
+
+[[allowlists]]
+description = "did:key Ed25519 PUBLIC key identifiers (multicodec 0xed01 => z6Mk prefix) are public by design"
+regexTarget = "secret"
+regexes = [
+  '''^z6Mk[1-9A-HJ-NP-Za-km-z]{44}$''',
+]

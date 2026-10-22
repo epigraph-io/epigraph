@@ -19,7 +19,7 @@ use epigraph_db::{
 use crate::embed::{format_pgvector, HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -261,6 +261,9 @@ pub async fn memorize(
                     // resolves the tag to its canonical key, `testimonial`, whose
                     // calibrated weight is the 0.6 stored above (bc06ec6f).
                     evidence_type: Some("testimony"),
+                    // memorize takes no source_url, so its evidence row can
+                    // carry no source identity; the BBA stays unkeyed.
+                    evidence_id: None,
                 },
                 /* persist_truth_from_pignistic */ false,
                 "memorize",

@@ -144,6 +144,7 @@ mod tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: crate::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

@@ -177,12 +177,21 @@ pub struct QueryClaimsParams {
                        merge the results."
     )]
     pub is_current: Option<bool>,
+
+    #[schemars(
+        description = "When true, drop EVERY claim whose properties.level is 0, 1 or 2, in SQL \
+                       before LIMIT: document thesis/section/paragraph nodes (headings, keyword \
+                       lists, captions, transcript turns) AND workflow thesis/phase/step nodes \
+                       (including evolve_step rows). Atoms (level 3) and unleveled claims are \
+                       kept. Default false (no level filter)."
+    )]
+    pub exclude_spine: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryUndecomposedClaimsParams {
     #[schemars(
-        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first), so paging with offset is stable. Atomic rows (looks_atomic=true) never leave this list, so the row count is not a progress measure."
     )]
     pub limit: Option<i64>,
 
@@ -191,6 +200,14 @@ pub struct QueryUndecomposedClaimsParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowPlanParams {
+    #[schemars(
+        description = "The hierarchical workflow's id: the `workflows`-table id that ingest_workflow returns (deterministic from canonical_name and generation)."
+    )]
+    pub workflow_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -719,6 +736,12 @@ pub struct QueryClaimsByLabelParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
+    )]
+    #[serde(default)]
+    pub include_source_urls: bool,
 }
 
 // ── Workflows ──
@@ -793,7 +816,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
     )]
     pub step_index: usize,
 
@@ -834,7 +857,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching on both paths; for a workflows-table id an omitted goal is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -871,6 +894,18 @@ pub struct IngestWorkflowParams {
     )]
     #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+
+    #[schemars(
+        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public."
+    )]
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Whether to embed the created claims and the workflow goal (default true). false sends no text to the embedding provider and stores no vector, so the claims stay out of semantic recall and semantic dedup."
+    )]
+    #[serde(default)]
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -911,7 +946,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -960,7 +995,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). A non-blank goal is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow; the 'hierarchical' default is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -1221,6 +1256,38 @@ pub struct ClaimResponse {
     /// authored value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief_score: Option<f64>,
+}
+
+/// A [`ClaimResponse`] with the claim's evidence URLs, for tools that surface
+/// them (`query_claims_by_label`'s `include_source_urls`).
+///
+/// A flattened wrapper rather than a `ClaimResponse` field so the other tools'
+/// claim literals are untouched, and so the serialized claim is byte-identical
+/// to a bare `ClaimResponse` when `source_urls` is `None`.
+#[derive(Debug, Serialize)]
+pub struct ClaimWithSources {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// URLs of the evidence attached to the claim, oldest first, deduplicated
+    /// (`EvidenceRepository::source_urls_by_claim_ids`). `None` = not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_urls: Option<Vec<String>>,
+}
+
+/// A [`ClaimResponse`] row of `query_undecomposed_claims`, with whether the
+/// claim is atomic and so terminal.
+///
+/// A flattened wrapper, like [`ClaimWithSources`], so the other tools' claim
+/// literals are untouched and the claim fields serialize as before.
+#[derive(Debug, Serialize)]
+pub struct UndecomposedClaimResponse {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// `epigraph_core::atomicity::looks_atomic(content)`: one sentence and at
+    /// most 160 chars. `decompose_claims` skips these by default, and the
+    /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
+    /// backlog and not a defect.
+    pub looks_atomic: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2053,7 +2120,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or the structural relations that move no belief: cites, and qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief). Use qualifies, not contradicts, for a caveat that limits where the target holds without saying it is false. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -2479,6 +2546,12 @@ pub struct MarkDuplicateParams {
     pub canonical_id: String,
     #[schemars(description = "Reason for marking duplicate")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnmarkDuplicateParams {
+    #[schemars(description = "UUID of the claim to un-mark (a claim mark_duplicate retired)")]
+    pub claim_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3016,15 +3089,23 @@ pub struct UpdatePartitionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryTriplesParams {
-    #[schemars(description = "Subject entity name (optional — omit to wildcard)")]
+    #[schemars(
+        description = "Subject entity name (optional; omit to match any subject). Requires subject_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub subject: Option<String>,
-    #[schemars(description = "Subject entity type: Material, Molecule, Method, etc. (optional)")]
+    #[schemars(
+        description = "Subject entity type_top: Material, Molecule, Method, etc. Required when subject is given; there is no default."
+    )]
     pub subject_type: Option<String>,
     #[schemars(description = "Predicate pattern — matches via trigram similarity (optional)")]
     pub predicate: Option<String>,
-    #[schemars(description = "Object entity name (optional)")]
+    #[schemars(
+        description = "Object entity name (optional; omit to match any object). Requires object_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub object: Option<String>,
-    #[schemars(description = "Object entity type (optional)")]
+    #[schemars(
+        description = "Object entity type_top. Required when object is given; there is no default."
+    )]
     pub object_type: Option<String>,
     #[schemars(
         description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"
@@ -3258,4 +3339,149 @@ pub struct RecomputeBeliefsParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+}
+
+// ── Label-family dedup (plan / apply / probe) ──
+
+/// One would-be claim a writer asks `probe_label_dedup` about.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupCandidateParam {
+    #[schemars(description = "Caller-chosen key, echoed back with the verdict")]
+    pub key: String,
+    #[schemars(description = "The content the writer is about to file")]
+    pub content: String,
+    #[schemars(description = "The labels the writer is about to file it with")]
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlanLabelDedupParams {
+    #[schemars(
+        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_path: Option<String>,
+    #[schemars(
+        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v1). Refused on stdio. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_json: Option<String>,
+    #[schemars(
+        description = "Reserved: reading the profile from a stored claim is not available yet; a call that sets it is refused (PROFILE_CLAIM_DEFERRED)."
+    )]
+    pub profile_claim_id: Option<String>,
+    #[schemars(
+        description = "REQUIRED. BLAKE3 (hex) of the exact profile bytes; a profile that hashes differently is refused (PROFILE_HASH_MISMATCH). On stdio it must also equal the pin this server was started with (EPIGRAPH_MCP_PROFILE_PIN) when one is set."
+    )]
+    pub profile_hash: String,
+    #[schemars(description = "Run tag substituted into {run_tag}; must be a valid label")]
+    pub run_tag: String,
+    #[schemars(
+        description = "YYYY-MM-DD. Required by the closeout and lifecycle sections; never defaulted to today"
+    )]
+    pub as_of: Option<String>,
+    #[schemars(
+        description = "Sections to plan: any of hygiene, dedup, closeout, lifecycle, signal_dedup. Default [hygiene, dedup]"
+    )]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(
+        description = "Most claims read per family (default and server cap 5000; a larger value is clamped and the clamp reported). A family larger than this is reported truncated, and apply refuses a truncated plan."
+    )]
+    pub max_claims: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ApplyLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub run_tag: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub as_of: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+    #[schemars(
+        description = "REQUIRED. The plan_hash of the plan you reviewed. Apply re-plans from live state with the same arguments and refuses with PLAN_DRIFT, writing nothing, when the hash differs."
+    )]
+    pub plan_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProbeLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "At most 100 would-be claims to classify")]
+    pub candidates: Vec<LabelDedupCandidateParam>,
+    #[schemars(
+        description = "Also match against closed lifecycle signals (verdict match_only). Default false"
+    )]
+    #[serde(default)]
+    pub include_closed_signals: bool,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+}
+
+/// One label change an apply committed, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedLabelChangeParam {
+    pub unit: String,
+    pub claim_id: String,
+    #[serde(default)]
+    pub labels_added: Vec<String>,
+    #[serde(default)]
+    pub labels_removed: Vec<String>,
+}
+
+/// One duplicate an apply marked, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedMarkParam {
+    pub unit: String,
+    #[schemars(description = "The marked duplicate")]
+    pub dup: String,
+    #[schemars(description = "The claim it was marked a duplicate of")]
+    pub canonical: String,
+    #[schemars(description = "The matching tier, as the apply returned it")]
+    pub rule: String,
+    #[serde(default)]
+    pub matched_on: String,
+    #[schemars(
+        description = "The identity edge the mark wrote; when given, a claim marked again since (a new edge) is not un-marked"
+    )]
+    #[serde(default)]
+    pub identity_edge: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertLabelDedupParams {
+    #[schemars(description = "applied_units from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_units: Vec<AppliedLabelChangeParam>,
+    #[schemars(description = "applied_marks from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_marks: Vec<AppliedMarkParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupIndexViewParams {
+    #[schemars(description = "Canonical claim ids (at most 100)")]
+    pub claim_ids: Vec<String>,
+    #[schemars(
+        description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
+    )]
+    pub max_claims: Option<i64>,
 }

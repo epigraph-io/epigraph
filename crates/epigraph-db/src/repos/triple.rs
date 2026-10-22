@@ -1,7 +1,6 @@
 //! Triple repository for RDF-style structured knowledge queries
 
 use crate::errors::DbError;
-use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -54,11 +53,13 @@ pub struct IndexCounts {
 pub struct TripleRepository;
 
 impl TripleRepository {
-    /// Batch insert entity mentions.
+    /// Batch insert entity mentions on the caller's connection.
     ///
-    /// Inserts each mention individually and collects the returned IDs.
-    /// This is deliberately non-transactional at the repository level — callers
-    /// that need atomicity should wrap in a transaction before calling.
+    /// Inserts each mention individually and collects the returned IDs. It
+    /// opens no transaction of its own: `routes/entities.rs` passes the ONE
+    /// viewer-stamped transaction on which it has already authorized every
+    /// target claim, so the batch commits or rolls back as a whole and
+    /// `entity_mentions_tenancy`'s `WITH CHECK` applies to each row.
     ///
     /// # Arguments
     /// Each tuple is: (entity_id, claim_id, surface_form, mention_role,
@@ -67,9 +68,9 @@ impl TripleRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if any insert fails.
     #[allow(clippy::type_complexity)]
-    #[instrument(skip(pool, mentions_data))]
+    #[instrument(skip(conn, mentions_data))]
     pub async fn batch_create_mentions(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         mentions_data: Vec<(
             Uuid,
             Uuid,
@@ -111,7 +112,7 @@ impl TripleRepository {
                 span_start,
                 span_end
             )
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
             ids.push(row.id);
@@ -120,10 +121,11 @@ impl TripleRepository {
         Ok(ids)
     }
 
-    /// Batch insert triples.
+    /// Batch insert triples on the caller's connection.
     ///
-    /// Inserts each triple individually and collects the returned IDs.
-    /// Callers that need atomicity should wrap in a transaction before calling.
+    /// Inserts each triple individually and collects the returned IDs. Like
+    /// [`Self::batch_create_mentions`] it opens no transaction of its own; the
+    /// route passes its viewer-stamped transaction.
     ///
     /// # Arguments
     /// Each tuple is: (claim_id, subject_id, predicate, object_id, object_literal,
@@ -132,9 +134,9 @@ impl TripleRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if any insert fails.
     #[allow(clippy::type_complexity)]
-    #[instrument(skip(pool, triples_data))]
+    #[instrument(skip(conn, triples_data))]
     pub async fn batch_create_triples(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         triples_data: Vec<(
             Uuid,
             Uuid,
@@ -176,7 +178,7 @@ impl TripleRepository {
                 extractor,
                 properties
             )
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
             ids.push(row.id);
@@ -440,6 +442,38 @@ impl TripleRepository {
         Ok(row.exists)
     }
 
+    /// Return `true` if at least one triple is visible to `viewer`.
+    ///
+    /// The RDF read surfaces (`query_triples`, `search_triples`,
+    /// `entity_neighborhood`, over MCP and HTTP) report this as
+    /// `index_populated`. No pipeline populates the triple index today, so an
+    /// empty answer from those reads usually means the index is empty, not that
+    /// the corpus lacks the fact. This flag lets a caller tell the two apart.
+    ///
+    /// **Viewer-relative, unlike [`Self::index_counts`].** It is an `EXISTS`
+    /// through the ordinary tenancy predicate, so it stops at the first visible
+    /// row and cannot report that a row private to another group exists. On a
+    /// viewer-stamped connection RLS narrows it the same way, which is what lets
+    /// the HTTP handlers evaluate it on the connection they already hold.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn index_populated<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS(SELECT 1 FROM triples t WHERE true /* {VISIBILITY:t} */)",
+            1,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Return total row counts for the structured triple/entity index.
     ///
     /// One round-trip over the three index tables (`triples`, `entities`,
@@ -543,8 +577,9 @@ mod tests {
         let (_agent_id, claim_id) = insert_agent_and_claim(&pool).await;
         let subject_id = insert_entity(&pool, &format!("subject-{}", Uuid::new_v4())).await;
 
+        let mut conn = pool.acquire().await.unwrap();
         TripleRepository::batch_create_triples(
-            &pool,
+            &mut conn,
             vec![(
                 claim_id,
                 subject_id,

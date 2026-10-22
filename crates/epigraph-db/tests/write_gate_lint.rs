@@ -250,6 +250,12 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
          (acts only on an absent or out-of-force edge)",
     ),
     (
+        "mass_function.rs::backfill_evidence_type_where_untyped",
+        "legacy evidence-type backfill (backlog bc06ec6f), on the maintenance connection only \
+         (`backfill_evidence_type` refuses an unset MAINTENANCE_DATABASE_URL); corpus-wide by \
+         definition, and it writes only `evidence_type` on rows that are still untyped",
+    ),
+    (
         "match_candidate.rs::retract_candidate_edges",
         "dedup sweep, corpus-wide; privileged session only (the cascade half of `retire`, split by batch W10; not a new write)",
     ),

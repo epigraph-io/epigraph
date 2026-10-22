@@ -412,6 +412,7 @@ async fn main() {
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
+            .with_run_tokens(run_tokens_from_env())
             .with_passkeys(passkeys);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
@@ -726,4 +727,27 @@ async fn main() {
     tracing::info!("Server listening on {}", addr);
 
     axum::serve(listener, app).await.expect("Server error");
+}
+
+/// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a
+/// delegated run token (`epigraph_db::RunTokens`). Logged when ON, so a
+/// journal shows which processes were armed.
+#[cfg(feature = "db")]
+fn run_tokens_from_env() -> epigraph_db::RunTokens {
+    let raw = std::env::var(epigraph_db::RUN_TOKENS_ENV).ok();
+    if epigraph_db::RunTokens::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_RUN_TOKENS is set to a value that is neither `on` nor `off`: delegated \
+             run tokens stay OFF on this process (only `on` admits them)"
+        );
+    }
+    let switch = epigraph_db::RunTokens::parse(raw.as_deref());
+    if switch == epigraph_db::RunTokens::On {
+        tracing::warn!(
+            "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \
+             is live"
+        );
+    }
+    switch
 }

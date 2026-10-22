@@ -870,9 +870,14 @@ run on an unprivileged role once policies land reads a subset and exits 0 with
 no warning. The refusal that protects you is at the API and CLI boundary only.
 
 **Deploy surfaces that need the variable** (each currently takes the WARN
-fallback): `decompose_claims` (a bind-mounted host binary, not baked into the
-image), the binaries layered into `epigraph-agent:latest`, `epiclaw.env`, the
-decomposition-cycle schedule, and foreman.
+fallback): the binaries layered into `epigraph-agent:latest`, `epiclaw.env`,
+and foreman. `decompose_claims` (a bind-mounted host binary, not baked into the
+image) needs it only on its maintenance path. A scheduled decomposition-cycle
+run in an agent container should pass `--as-agent <agent id>` (the agent its API
+token acts as); it then runs on the application login in `DATABASE_URL`
+through row-level security and needs no maintenance DSN. This takes effect only
+once the deployed binary has the flag and the schedule's command passes it. See
+the binary's module doc, "Running as an agent".
 
 **Known prerequisite, NOT shipped by PR-15.** `epigraph_maintenance` is NOLOGIN
 and `epigraph_admin` is not a member of it, so today no non-superuser role both
@@ -2628,6 +2633,59 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   its narrow meet until that endpoint is reversed. The declassification
   interlock is armed transaction-locally around the one claims UPDATE, for
   claims recorded as originally public only.
-- **Not covered**: edges whose endpoint is the claim's EVIDENCE are not
-  re-met by the tenancy trigger and keep their tenancy (the plan counts
-  them). `claims.updated_at` is stamped by its trigger on apply and reverse.
+- **Nodes stay; links narrow.** The claim's own dependent rows (evidence,
+  traces, BBAs, beliefs, versions, challenges, triples, revocations) and its
+  LINK rows (edges, cluster / frame / neighbourhood assignments, entity
+  mentions, provenance links) narrow. A node at the other end (another claim
+  or its evidence, a frame, a cluster, an entity) is never written. A harvester
+  fragment narrows only if every claim it is the provenance of is restricted
+  into the target; otherwise it keeps its tuple. The classification is
+  `restrict::TABLE_ROLES`; an unclassified table is refused.
+- **Edges with an evidence endpoint** (claim->evidence, evidence->evidence)
+  are not re-met by the tenancy trigger, so the tool narrows them itself: an
+  edge is no more visible than its least visible endpoint. Each takes the meet
+  of its endpoints (the same tuple a claim-endpoint edge gets) unless it is
+  already at least as narrow; each is recorded and restored like every other
+  edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
+- **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
+  reverse.
+
+## `backfill_evidence_type` — legacy BBA typing (no migration, operator-gated)
+
+Backlog bc06ec6f. #573 made every BBA write path store the canonical
+`mass_functions.evidence_type`; rows written before it stay NULL, so
+`effective_source_strength` uses their stored `source_strength` (or 0.5) instead
+of `[evidence_type_weights]`, and the perspective lens never sees them. This
+binary types the rows whose stored provenance determines their type and leaves
+every other row NULL, counted per writer (`combination_method`) and reason.
+Rules and reasons: `crates/epigraph-cli/src/evidence_type_backfill.rs`.
+
+- **Authority**: `MAINTENANCE_DATABASE_URL` must be set (the fallback to
+  `DATABASE_URL` is refused) and its login must bypass row security.
+- **`--calibration <path>` is required** and must be the `calibration.toml` the
+  API and MCP servers load; the report echoes it. A file that does not load, or
+  has no `[evidence_type_weights]`, is refused.
+- **Dry run by default.** `--apply` writes `evidence_type` only, only on rows
+  still untyped, one transaction per `--batch` (default 1000). A re-run writes
+  nothing on rows already typed. On a live database it also decides the rows
+  written untyped since by the same rules, so it can type some (e.g. a REST
+  input sent without a type on a claim that declares one): run the re-apply
+  right after the apply and expect `written` near 0, any rows it does write
+  being ones created after the first apply started. `--max-batches N` bounds a
+  run; pass the report's `last_id` as `--after` to continue.
+- **Never typed**: cached combination rows (the predicate the combine-input
+  readers exclude), unlabelled agent-less rows sharing their (claim, frame)
+  with another BBA, `error_derived` / `prior` / `truth_value_seed`, rows whose
+  masses already carry their weight (`masses_already_weighted`: agent-less,
+  perspective-less `discount` inputs, and lone unlabelled agent-less rows on
+  `research_validity` / `paper_validity_*`), other rows labelled with a
+  combination-rule name in any case (`combination_labelled_input`), test and
+  backlog rows, propagated BBAs, linked `observation` / `testimony` /
+  `computation` / `document` tags, declared aliases, rows with a deciding
+  methodology.
+- **Counted, not applied: `openstax_agent_name_only`.** OpenStax extractor rows
+  have only their agent's name to go on. Typing them `logical` would move them
+  from 0.3 to 0.85; that needs its own operator decision.
+- **Beliefs**: typing changes the weight each typed row contributes (the
+  calibrated weight of its type, times the locality factor) and nothing else.
+  Cached beliefs are NOT recomputed: run the belief recompute after an apply.

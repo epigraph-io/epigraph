@@ -29,7 +29,7 @@ fn load_evidence_type_weight(evidence_type: &str) -> f64 {
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -383,6 +383,7 @@ pub async fn store_workflow(
             viewer,
             &extraction,
             auth,
+            None,
         )
         .await?;
 
@@ -505,6 +506,29 @@ async fn find_workflow_post_embed(
         } else {
             std::collections::HashMap::new()
         };
+    // Hierarchical outcome reports (U033) are keyed on their `workflows.id`,
+    // which `find_lineage_root` returns unchanged for a hierarchical row. A
+    // SEPARATE query with its own budget: sharing the lineage query's limit
+    // would let hierarchical roots push flat roots out of it. The key spaces
+    // are disjoint (a `workflows.id` is never a claim id), so extending the
+    // map cannot overwrite a flat entry.
+    let mut affinity_map = affinity_map;
+    if let Some(pgvec) = pgvec_opt.as_deref() {
+        match BehavioralExecutionRepository::behavioral_affinity_hierarchical(
+            &server.pool,
+            pgvec,
+            0.5, // min_similarity
+            1,   // min_executions
+            20,  // limit
+        )
+        .await
+        {
+            Ok(rows) => {
+                affinity_map.extend(rows.into_iter().map(|(id, sim, count)| (id, (sim, count))))
+            }
+            Err(e) => tracing::warn!("hierarchical behavioral affinity lookup failed: {e}"),
+        }
+    }
 
     // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
     // `workflows` table and labels its claims `workflow_thesis` / `workflow_step`
@@ -942,8 +966,12 @@ pub async fn report_workflow_outcome(
                 deviation_reason: s.deviation_reason.clone(),
             })
             .collect();
-        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
-            &server.pool,
+        // Resolved through the caller's viewer on a stamped transaction, so a
+        // member reads its group's private steps (see the callee).
+        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_with_embedder(
+            server.scoped.as_ref(),
+            viewer,
+            server.embedder.as_ref(),
             workflow_id,
             params.success,
             &step_executions,
@@ -1624,25 +1652,25 @@ async fn deprecate_hierarchical_workflow(
                 row_retired.push(c.id.to_string());
             }
         }
-        if grant.admin {
-            crate::tools::workflow_authority::audit_admin_workflow_write(
-                &mut tx,
-                auth,
-                caller,
-                TOOL,
-                row,
-                grant.owner,
-                serde_json::json!({
-                    "truth_value_after": 0.05,
-                    "workflow_row_changed": row_changed > 0,
-                    "retired_claim_ids": row_retired,
-                    "kept_shared_claim_ids": row_kept,
-                    "cascade": cascade,
-                    "reason": params.reason,
-                }),
-            )
-            .await?;
-        }
+        // From the post-lock grant only (step 3): the admin arm's audit row,
+        // or the provenance row of any other authenticated arm.
+        crate::tools::workflow_authority::record_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            TOOL,
+            row,
+            *grant,
+            serde_json::json!({
+                "truth_value_after": 0.05,
+                "workflow_row_changed": row_changed > 0,
+                "retired_claim_ids": row_retired,
+                "kept_shared_claim_ids": row_kept,
+                "cascade": cascade,
+                "reason": params.reason,
+            }),
+        )
+        .await?;
         if row_changed > 0 {
             deprecated_ids.push(row.to_string());
         }

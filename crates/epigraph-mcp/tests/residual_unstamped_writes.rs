@@ -127,17 +127,19 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/evolve_step.rs",
-        "ClaimRepository::evolve_step",
+        "server.pool.begin",
         1,
         "`evolve_step`'s FALLBACK for a server built without a ScopedPool (test fixtures). On \
-         a scoped server (every deployed one) the tool now writes on \
-         `begin_author_stamped_tx` + `ClaimRepository::evolve_step_conn` (operator-binding \
-         delta review: migration 122 refuses a claim written by an application session with no \
-         principal once armed). History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
+         a scoped server (every deployed one) the tool writes on `begin_author_stamped_tx` + \
+         `ClaimRepository::evolve_step_conn` (operator-binding delta review: migration 122 \
+         refuses a claim written by an application session with no principal once armed). The \
+         fallback runs the same `evolve_step_conn` on a `server.pool.begin()` transaction (it \
+         used to call `ClaimRepository::evolve_step`, which opened that transaction itself), so \
+         the lineage-wide workflow authority gate and its provenance rows run on the act's own \
+         transaction there too. History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
          review); MEASURED refused on a clean migrate (config A, 42501 on claims) unstamped. The \
          stamp is the step's AUTHOR (the caller), so a parent owned by a group the caller does \
-         not write is still refused by row security there: the H3 question (backlog 84b2a98d) \
-         about system-owned workflow rows remains.",
+         not write is still refused by row security there.",
     ),
     (
         "tools/ingestion.rs",
@@ -266,7 +268,16 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
      `epigraph_live_memberships` (SECURITY DEFINER) before the stamp exists. The WRITE inside that \
      helper runs on `ScopedPool::begin_as`, which is the whole point of it.",
-)];
+),
+    (
+        "tools/workflow_ingest.rs",
+        "claim_helper::store_embedding_author_stamped",
+        "`store_ingest_embedding`, the post-commit embed of a declared-tenancy ingest's claims. \
+         The same helper as the `claim_helper.rs` entry above, for the same reason: \
+         `&server.pool` is its READ pool for resolving the author's viewer, and the UPDATE runs \
+         on `ScopedPool::begin_as` from that author.",
+    ),
+];
 
 /// Tokens that make a callee name write-shaped. Deliberately broad: a name this
 /// misses is a site this lint cannot see, and the inherited inventory's own
@@ -872,6 +883,9 @@ fn the_production_embedder_scan_sees_the_two_known_sites() {
 /// deliberate addition here, not silently uncovered.
 const EXECUTOR_ENTRY_POINTS: &[&str] = &[
     "execute_workflow_ingest_plan(",
+    // The declared-tenancy form; `execute_workflow_ingest_plan` delegates to
+    // it inside the executor crate, which this scan does not read.
+    "execute_workflow_ingest_plan_in_group(",
     "epigraph_ingest_executor::add_step(",
     "epigraph_ingest_executor::delete_step(",
 ];
@@ -892,7 +906,7 @@ const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
         4,
         4,
         "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
-         `execute_workflow_ingest_plan` each) plus `POST /workflows/steps` and \
+         `execute_workflow_ingest_plan` / `execute_workflow_ingest_plan_in_group` each) plus `POST /workflows/steps` and \
          `/workflows/steps/delete`. All four stamp through this module's own \
          `begin_system_ingest_stamped_tx`; none is exempt.",
     ),

@@ -38,8 +38,19 @@ enforced in the application instead: `ClaimRepository::create_or_get_signed`
 and POST /claims (`if_not_exists=false`) take a transaction-scoped advisory
 lock on `(content_hash, agent_id)` (`ClaimRepository::lock_content_hash_agent`)
 before their find, so concurrent first creates serialize rather than both
-inserting. A writer that inserts into `claims` WITHOUT that lock (the
-deterministic-id ingest paths, raw-SQL fixtures) is not deduplicated by it.
+inserting. The other find-then-insert writers of the pair take the same lock
+before their find: the legacy content-hash creates (`ClaimRepository::create`,
+`create_conn`, `create_with_tx`), `consolidate_act_conn`'s existing-merge
+probe, and the `method_search` maintenance binary. Writers that do not take it:
+the unconditional INSERTs, which have no find (`create_strict`, supersede,
+`evolve_step`, `batch_create`, hypothesis creation, raw-SQL fixtures); the
+deterministic-id paths (`create_with_id_if_absent` and the ingest-executor's
+workflow `add_step`, which dedup only on their primary key through
+`ON CONFLICT (id)` and not on the pair at all, so a random-id `create_or_get`
+of the same pair by the same agent, earlier or concurrent, still leaves a
+second row); and the policy-challenge route, whose find is scoped to the
+`policy:challenge` label and which serializes its own callers under a separate
+lock. A row from one of those is not deduplicated by the lock.
 
 **Do not re-add the full constraint.** A bare `ADD CONSTRAINT` fails on the
 duplicates (most are supersession history, which a full UNIQUE would force us
@@ -1344,6 +1355,55 @@ restart.
   carries a `154`. **Deploy order:** apply before (or with) the binary that
   resolves by id; that binary refuses assess with no `frame_id` until the row
   exists. **Applied to throwaway databases only, NOT to any deployed database.**
+- **158**: public `maintenance_delete_frames` (drain U048, backlog 34b3175c) —
+  `GRANT DELETE ON public.frames TO epigraph_maintenance`, role-guarded like
+  117 section 4, and nothing else. 070 gives the maintenance role no DELETE;
+  `epigraph-operator delete-frames` removes listed test/probe frames on a
+  NOSUPERUSER maintenance login and failed there with "permission denied for
+  table frames". The four cascade tables are emptied by their FKs' ON DELETE
+  CASCADE, which runs as the child table's owner, so 158 grants no DELETE on
+  them (the role already holds DELETE on `mass_functions` from 115, and none
+  on `claim_frames`, `ds_combined_beliefs` or `ds_bayesian_divergence`); the
+  tool's plan, `FOR UPDATE` re-plan and `pg_stat_xact_user_tables` census
+  account for every cascaded row. **Effective reach:** any session acting as
+  `epigraph_maintenance` (not only `delete-frames`) can now delete a frame,
+  and through the cascade that also deletes the frame's rows in those three
+  tables. A bare `DELETE FROM frames` on the maintenance DSN neither refuses
+  nor audits; only the tool does. Row security is unchanged (115's
+  `frames_delete_owner` admits a maintenance session through
+  `epigraph_bypass()`). Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-cli/tests/operator_delete_frames.rs`. Undo in the file's header.
+  Slot from the drain register (155-157 reserved); checked before claiming: no
+  migration on main and no open PR branch carries a `158`. **Deploy order:**
+  none against other migrations or the binaries (a grant; an older binary has
+  no `delete-frames`). **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **159**: public `community_bootstrap_maintenance_only` (drain X14, backlog
+  `7cdea6f1`). Re-states 106's `epigraph_community_add_member(uuid, uuid,
+  uuid)` (`CREATE OR REPLACE`, same signature; owner and grants kept, so no
+  re-own and no `REVOKE`/`GRANT`) with ONE condition changed: a group that has
+  NEVER had a membership row (migration 068's legacy communities) is
+  bootstrapped only by a maintenance session (`epigraph_bypass()`); any other
+  actor answers `'denied'`, nothing written. Before it, the first
+  `groups:admin` principal to list a perspective into such a group became its
+  live member and could then admit anyone. Every outcome for a maintenance
+  session, and every other rule of 106 (actor, locks, `'denied_readmit'`,
+  projection), is unchanged. The same condition also closes a community with
+  no projected group of kind `'community'` to app sessions: under 106 it
+  accepted a bare `community_members` row from any actor. A later migration
+  that re-states this function must start from 159's body and keep its
+  `OR NOT public.epigraph_bypass()` term. A copy of 106's body re-opens the
+  bootstrap, and an out-of-order apply on a deployed database would let it
+  win. Pinned as `epigraph_app` by
+  `epigraph-db/tests/community_membership_integrity.rs`. Undo: re-run 106's
+  `CREATE OR REPLACE FUNCTION public.epigraph_community_add_member` statement
+  (re-opens the hole); it creates and changes no rows. **Deploy order:** none
+  against the binaries (the refusal is the existing `'denied'` outcome, already
+  mapped to 403). After it applies, a legacy community with no member stays
+  closed until an operator seeds a member from a maintenance session or gives
+  it an admin (PR-18). Slot 159 per the drain's slot register; 154-158 are
+  claimed elsewhere. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 

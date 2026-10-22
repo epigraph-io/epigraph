@@ -24,8 +24,9 @@
 //!
 //! Every TCP listener enforces a `Host`/`Origin` allowlist (`localhost`,
 //! `127.0.0.1`, `::1`, the `--listen` authority, plus `--allowed-host`) as the
-//! DNS-rebinding defense rmcp 0.15 does not provide. A reverse-proxied
-//! deployment MUST add the public name, since Caddy forwards the client's Host.
+//! DNS-rebinding defense (rmcp's own Host check is fed the same list). A
+//! reverse-proxied deployment MUST add the public name, since Caddy forwards
+//! the client's Host.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -110,8 +111,8 @@ struct Cli {
     /// (repeatable; comma-separated in the env var).
     ///
     /// The listener rejects any request whose `Host` — or, when present, `Origin`
-    /// — is outside its allowlist, which is the DNS-rebinding defense rmcp 0.15
-    /// does not provide. The allowlist always contains `localhost`, `127.0.0.1`,
+    /// — is outside its allowlist, which is the DNS-rebinding defense (rmcp's
+    /// in-service Host check is given the same list). The allowlist always contains `localhost`, `127.0.0.1`,
     /// `::1` and the `--listen` authority; a reverse-proxied deployment must add
     /// the public name the proxy forwards (e.g. `mcp.example.com`), because
     /// Caddy's `reverse_proxy` preserves the client's original `Host`.
@@ -727,10 +728,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
-        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-        };
 
         // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
         // was already refused above; this catches a link recorded earlier by a
@@ -759,10 +756,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_scoped_pool(scoped.clone())
         .with_connector_elevation(connector_elevation_from_env())
+        .with_run_tokens(run_tokens_from_env())
         // The ceremony page's public origin, for the URL `sudo` returns
         // (elevation plan EL-11): the API's own variable. Unset, `sudo`
         // refuses.
-        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok());
+        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok())
+        // `max_claims` cap only: HTTP refuses `profile_path` and ignores the pin.
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         let template = if identity_declared {
             template
         } else {
@@ -831,22 +831,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
-        let service = StreamableHttpService::new(
-            // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
-            // this closure runs once PER SESSION. Every session is a clone of
-            // the one template above: it carries the template's `ScopedPool`
-            // (an attachment on the stdio path alone would leave every real
-            // caller on a server whose `scoped` is `None`, turning the 42501
-            // into a total `submit_claim` / `memorize` refusal) and SHARES its
-            // `agent_db_id` cell, so the server agent is resolved — and its
-            // personal group provisioned — once per process, not once per
-            // session. See `SessionFactory` for the measurement.
-            move || Ok(sessions.session()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
+        // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and the
+        // factory closure runs once PER SESSION. Every session is a clone of
+        // the one template above: it carries the template's `ScopedPool` (an
+        // attachment on the stdio path alone would leave every real caller on
+        // a server whose `scoped` is `None`, turning the 42501 into a total
+        // `submit_claim` / `memorize` refusal) and SHARES its `agent_db_id`
+        // cell, so the server agent is resolved — and its personal group
+        // provisioned — once per process, not once per session. See
+        // `SessionFactory` for the measurement.
+        //
+        // `mcp_http_listener` also picks the rmcp config and the session
+        // manager, and returns the TCP Host/Origin allowlist (`None` on a unix
+        // socket) that the outer guard layer below installs: the rmcp config
+        // and that layer are built from one value. The HTTP test suites build
+        // their listeners through the same function.
+        let epigraph_mcp::http_listener::McpHttpListener {
+            service,
+            tcp_allowlist,
+            ..
+        } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
+            Ok(sessions.session())
+        });
 
-        // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
+        // Innermost layer: rewrite rmcp's remaining session-error statuses to the MCP
         // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize
         // 422 -> 400). A 401 on an unknown session made OAuth clients discard a
         // valid token after every restart instead of re-initializing. It wraps
@@ -892,23 +900,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // ── DNS-rebinding guard (CVE-2026-42559 class) ──────────────────
-        // rmcp 0.15's StreamableHttpServerConfig has no allowed_hosts /
-        // allowed_origins knob and the crate validates neither header, so a
-        // browser pointed at a page whose DNS rebinds to this listener could
-        // otherwise drive every tool. Applied LAST, i.e. OUTERMOST, so it runs
+        // A browser pointed at a page whose DNS rebinds to this listener could
+        // otherwise drive every tool. rmcp's service checks Host too (fed the
+        // same allowlist via `streamable_http_server_config`), but only after
+        // auth; this layer is the authoritative one. Applied LAST, i.e. OUTERMOST, so it runs
         // BEFORE the auth layer: a rebound request is refused on its headers
         // alone. TCP only — a unix socket is unreachable from a browser, so the
         // guard would add no security there while risking a 403 on the one
         // listener kind allowed to run unauthenticated.
-        let router = if epigraph_mcp::is_unix_listener(addr) {
-            tracing::info!(
-                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
-                 DNS-rebinding surface); filesystem permissions are the trust gate"
-            );
-            router
-        } else {
-            let allowlist =
-                epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host);
+        let router = if let Some(allowlist) = tcp_allowlist {
             tracing::info!(
                 allowed_hosts = %allowlist.describe(),
                 "Host/Origin allowlist active on the MCP HTTP listener (DNS-rebinding guard); \
@@ -918,6 +918,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist,
                 epigraph_mcp::host_guard::host_guard_middleware,
             ))
+        } else {
+            tracing::info!(
+                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
+                 DNS-rebinding surface); filesystem permissions are the trust gate"
+            );
+            router
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
@@ -941,7 +947,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stdio transport writes too — epiclaw's scheduled agents reach
         // `submit_claim` / `memorize` over stdio — so it needs the same stamped
         // pool as the HTTP factory above, not a read-only subset of it.
-        .with_scoped_pool(scoped);
+        .with_scoped_pool(scoped)
+        // The label-dedup profile root and pin (set by the host when a
+        // workflow ships a dedup profile).
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         // Rung-4 signer: the owner-equality fallback in
         // `require_owner_or_admin` has no stable identity to compare against.
         // See `EpiGraphMcpFull::with_generated_signer_identity`.
@@ -1358,6 +1367,28 @@ fn connector_elevation_from_env() -> bool {
         );
     }
     on
+}
+
+/// `EPIGRAPH_RUN_TOKENS`: whether this listener admits a delegated run token
+/// (`epigraph_db::RunTokens`; only the exact value `on` enables it). Logged
+/// when ON.
+fn run_tokens_from_env() -> epigraph_db::RunTokens {
+    let raw = std::env::var(epigraph_db::RUN_TOKENS_ENV).ok();
+    if epigraph_db::RunTokens::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_RUN_TOKENS is set to a value that is neither `on` nor `off`: delegated \
+             run tokens stay OFF on this listener (only `on` admits them)"
+        );
+    }
+    let switch = epigraph_db::RunTokens::parse(raw.as_deref());
+    if switch == epigraph_db::RunTokens::On {
+        tracing::warn!(
+            "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \
+             is live"
+        );
+    }
+    switch
 }
 
 /// The switch's parse, apart from the environment: only `on`.

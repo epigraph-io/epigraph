@@ -14,7 +14,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::recompute_betp::{preview_claim, run_claim};
+use epigraph_cli::recompute_betp::{predict_cached_after, preview_claim, run_claim};
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -165,4 +165,82 @@ async fn dry_run_previews_without_writing_and_differs_from_stale_cache(pool: PgP
         after, 0.5,
         "written value must differ from the original stale cache"
     );
+}
+
+/// The dry-run prediction is the OWNER frame's value, the one `run_claim`
+/// actually caches. Three frames; the owner (`mmm_owner`, the claim's first
+/// writer) has the middle name, so it is neither first nor last by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dry_run_predicts_the_owner_frames_value(pool: PgPool) {
+    let claim_owner = seed_agent(&pool).await;
+    let source = seed_agent(&pool).await;
+    let claim = seed_claim_with_stale_betp(&pool, claim_owner, "multi-frame claim").await;
+
+    let owner = seed_binary_frame(&pool, "mmm_owner").await;
+    let aaa = seed_binary_frame(&pool, "aaa_other").await;
+    let zzz = seed_binary_frame(&pool, "zzz_other").await;
+    for (frame, masses, at) in [
+        (
+            owner,
+            serde_json::json!({"0": 0.9, "0,1": 0.1}),
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            aaa,
+            serde_json::json!({"1": 0.8, "0,1": 0.2}),
+            "2026-01-02T00:00:00Z",
+        ),
+        (
+            zzz,
+            serde_json::json!({"1": 0.7, "0,1": 0.3}),
+            "2026-01-03T00:00:00Z",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO mass_functions \
+               (claim_id, frame_id, source_agent_id, masses, locality_tag, created_at) \
+             VALUES ($1, $2, $3, $4, 'unknown', $5::timestamptz)",
+        )
+        .bind(claim)
+        .bind(frame)
+        .bind(source)
+        .bind(masses)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .expect("seed BBA");
+    }
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let (predicted_frame, predicted) = predict_cached_after(&pool, &viewer, claim)
+        .await
+        .expect("predict_cached_after")
+        .expect("the claim has inputs");
+    assert_eq!(
+        predicted_frame, owner,
+        "the prediction must come from the owner frame mmm_owner {owner} \
+         (aaa_other {aaa}, zzz_other {zzz})"
+    );
+    assert_eq!(
+        cached_pignistic(&pool, claim).await,
+        Some(0.5),
+        "the prediction must not write"
+    );
+
+    run_claim(&pool, &viewer, claim).await.expect("run_claim");
+    let written = cached_pignistic(&pool, claim)
+        .await
+        .expect("a real run writes the cache");
+    assert!(
+        (written - predicted.pignistic_prob).abs() < 1e-9,
+        "the predicted value {} must be what run_claim writes ({written})",
+        predicted.pignistic_prob
+    );
+    let recorded: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("belief_frame_id");
+    assert_eq!(recorded, Some(owner), "run_claim records the owner frame");
 }

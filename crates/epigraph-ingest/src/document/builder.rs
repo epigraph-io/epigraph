@@ -419,7 +419,14 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
         });
     }
 
-    for (author_idx, _author) in extraction.source.authors.iter().enumerate() {
+    for (author_idx, author) in extraction.source.authors.iter().enumerate() {
+        // Placeholder names ("Authors Not Specified", "Unknown", ...) get no
+        // per-claim assertion (backlog a55aac45). Skip WITHOUT re-enumerating:
+        // `author_index` keeps the ORIGINAL position, which is the key the MCP
+        // walk's author-agent map uses for the same (equally skipped) entry.
+        if author.is_placeholder() {
+            continue;
+        }
         for planned_claim in &claims {
             edges.push(PlannedEdge {
                 source_id: Uuid::nil(),

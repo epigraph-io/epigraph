@@ -98,7 +98,10 @@ pub async fn auto_wire_ds_for_edge(
     // into the BBA mass shape via `restrict_epistemic_*` — that shape and
     // the stored source_strength are independent Dempster-Shafer levers:
     // the shape encodes WHAT the supporter says about the target, and
-    // source_strength encodes HOW reliable the supporter is.)
+    // source_strength encodes HOW reliable the supporter is. For a Negative
+    // edge the shape is mutual exclusion: only the contradictor's belief
+    // arrives, as mass on the target being FALSE, so the BBA never puts mass
+    // on TRUE and a disbelieved contradictor writes a near-vacuous BBA.)
     let transmission_factor: f64 = match restriction {
         RestrictionKind::Positive(f)
         | RestrictionKind::Negative(f)
@@ -910,43 +913,37 @@ async fn compute_combined_belief(
         warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
     }
 
+    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
+    // one `source_url`) are folded cautiously into one before the Dempster
+    // fold (backlog 4c42c0bf, `crate::source_dependence`); the write path
+    // `ds_auto::auto_wire_ds_update` uses the same function, so a recompute
+    // cannot re-inflate what the write left honest.
+    //
     // `fold_conflict` is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of
     // the combined mass (`combined.mass_of_conflict()` is 0), so the
     // multi-BBA arm takes it from the per-step reports via
     // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
-    // A single BBA is not folded: its own empty-set mass is the conflict.
-    let (combined, fold_conflict) = if all_rows.len() == 1 {
-        let r = &all_rows[0];
-        let mf = parse_stored_bba(frame, &r.masses)?;
+    // A single (or single-source) BBA is not folded: its own empty-set mass
+    // is the conflict.
+    let source_keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+        .await
+        .map_err(|e| format!("evidence source_url read: {e}"))?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    for (row, key) in all_rows.iter().zip(source_keys) {
+        let mf = parse_stored_bba(frame, &row.masses)?;
         let reliability = effective_source_strength(
-            r,
+            row,
             per_frame_intra,
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
         let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-        let k = d.mass_of_conflict();
-        (d, k)
-    } else {
-        let mut mass_fns = Vec::with_capacity(all_rows.len());
-        for row in &all_rows {
-            let mf = parse_stored_bba(frame, &row.masses)?;
-            let reliability = effective_source_strength(
-                row,
-                per_frame_intra,
-                per_frame_evidence_weights.as_ref(),
-                &calibration,
-            );
-            let d =
-                combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-            mass_fns.push(d);
-        }
-        let (c, reports) = combination::combine_multiple(&mass_fns, 0.9)
+        items.push((key, d));
+    }
+    let (combined, fold_conflict) =
+        crate::source_dependence::combine_with_source_dependence(items, 0.9)
             .map_err(|e| format!("combine_multiple: {e}"))?;
-        let k = combination::fold_conflict(&c, &reports);
-        (c, k)
-    };
 
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
     // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.
@@ -1112,15 +1109,35 @@ async fn recompute_combined_belief(
 /// cache is a performance artifact for the unframed read; the framed read is the
 /// source of truth for any specific context.
 ///
-/// `binary_truth` is the designated summary frame because it is what the
-/// edge-wiring path writes and what unframed `get_belief` serves. The claim row
-/// records which frame the cache summarizes in `belief_frame_id`, so the number is
-/// self-describing rather than an anonymous one-of-N.
+/// ## Which frame owns the cache
 ///
-/// When the claim has no `binary_truth` BBA there is no canonical opinion to
-/// preserve, so the previous last-frame-wins behaviour is kept rather than leaving
-/// the cache unwritten — this function never makes a claim's cache emptier than it
-/// was.
+/// [`MassFunctionRepository::cache_owner_frame_for_claim`] decides, among the
+/// frames holding the claim's combine inputs (cached combination rows are
+/// excluded, as the combine itself excludes them):
+///
+/// 1. `binary_truth`, when the claim has an input on it. It is what the
+///    edge-wiring path writes and what unframed `get_belief` serves.
+/// 2. Else `claim_validity`, when the claim has an input on it.
+/// 3. Else the frame the cache already records (`claims.belief_frame_id`),
+///    while that frame still holds an input.
+/// 4. Else the first-writer frame: the frame holding the claim's earliest
+///    input, ties broken by frame id.
+///
+/// No other frame name plays a part. Once the cache records an owner, an input
+/// on another non-canonical frame, whenever it is written, does not move it; a
+/// canonical frame does, as soon as the claim has an input there. If the
+/// recorded owner no longer holds an input, ownership falls through to the
+/// first writer. The claim row records the owner in `belief_frame_id`, so the
+/// number is self-describing rather than an anonymous one-of-N.
+///
+/// The owner is always a frame this recompute can fold, and every claim with an
+/// input the viewer can see has one, so this function never makes a claim's
+/// cache emptier than it was.
+///
+/// Resolving the owner is a read: this function creates no frame. (It used to
+/// get-or-create `binary_truth` here only to compare ids.)
+/// `cdst_maintenance::recompute_beliefs` takes the same two steps itself so it
+/// can report the owner it targeted.
 ///
 /// Returns whether the cache was written.
 pub async fn recompute_claim_cached_belief(
@@ -1128,18 +1145,12 @@ pub async fn recompute_claim_cached_belief(
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<bool, String> {
-    let frames = MassFunctionRepository::list_frames_for_claim(&mut *conn, viewer, claim_id)
-        .await
-        .map_err(|e| format!("list_frames_for_claim: {e}"))?;
-    let Some((last_frame, _)) = frames.last().cloned() else {
+    let Some(owner) =
+        MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+    else {
         return Ok(false);
-    };
-
-    let canonical = ensure_binary_frame(&mut *conn, viewer).await?;
-    let owner = if frames.iter().any(|(id, _)| *id == canonical) {
-        canonical
-    } else {
-        last_frame
     };
 
     recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, owner).await

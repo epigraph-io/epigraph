@@ -6,15 +6,21 @@
 //! wrapper that builds an [`epigraph_ingest::workflow::IngestPlan`] and calls
 //! [`execute_workflow_ingest_plan`].
 
+pub mod authorship;
 pub mod error;
 pub mod system_agent;
 pub mod workflow;
+pub mod workflow_plan;
 pub mod workflow_steps;
 
+pub use authorship::record_caller_authorship;
 pub use error::IngestExecutorError;
 pub use system_agent::{
     get_or_create_system_agent, require_caller_write_authority, system_agent_write_authority,
     SystemAgentAuthority,
 };
-pub use workflow::{execute_workflow_ingest_plan, InsertedPlanEdge, WorkflowIngestExecutionResult};
+pub use workflow::{
+    execute_workflow_ingest_plan, execute_workflow_ingest_plan_in_group,
+    require_caller_writes_group, InsertedPlanEdge, ReusedClaim, WorkflowIngestExecutionResult,
+};
 pub use workflow_steps::{add_step, delete_step, AddStepResult, DeleteStepResult, StepOpError};

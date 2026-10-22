@@ -43,6 +43,7 @@ mod tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: posture,
+            delegated_by: None,
         })
     }
 

@@ -72,6 +72,16 @@ async fn read_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
         .expect("read pignistic_prob")
 }
 
+/// Read the target's cached `belief` (Bel of TRUE) from the same recompute
+/// output as [`read_betp`]. `None` while the column is still NULL.
+async fn read_belief(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT belief FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read belief")
+}
+
 async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM edges \
@@ -246,6 +256,131 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
     assert!(
         betp < 0.5,
         "contradicts edge must lower the target's pignistic_prob below the 0.5 neutral point, got {betp}"
+    );
+}
+
+/// The direction the guard above leaves open: a contradictor that is itself
+/// DISBELIEVED (bel 0.05, pl 0.20). `contradicts` means mutual exclusion (the
+/// two cannot both be true; migration 001 labels it `'mutual_exclusion'`), so
+/// only the source's belief may transfer, as disbelief in the target. The
+/// source's disbelief says nothing about the target and must not become
+/// support for it.
+///
+/// Under the old complement law (`restrict_epistemic_negative` as a polarity
+/// flip) this edge wrote a BBA with m(TRUE) = (1 - 0.20) * 0.90 = 0.72 onto the
+/// target, so filing a weak or refuted claim as a contradictor made its target
+/// MORE believed (backlog I014, drain U075).
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_from_disbelieved_source_does_not_raise_target_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.05, 0.20, Some(0.125)).await;
+    let target = seed_claim(&pool, "target of a weak contradictor", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("contradicts wire succeeds"),
+    );
+
+    // The restricted interval is not vacuous under either law (width 0.235
+    // under the complement, 0.955 under mutual exclusion; the cutoff is
+    // 0.999), so a BBA really is written: this cannot pass by not wiring.
+    assert!(resp.was_created);
+    assert!(
+        resp.belief_wired,
+        "contradicts from a source with bel 0.05 must still wire belief"
+    );
+
+    let belief = read_belief(&pool, target)
+        .await
+        .expect("target must have a computed belief after the contradicts wire");
+    assert!(
+        belief < 1e-9,
+        "a contradicts edge from a disbelieved source (bel 0.05, pl 0.20) must put no mass on the \
+         target being TRUE; got target belief {belief}"
+    );
+    let betp = read_betp(&pool, target)
+        .await
+        .expect("target must have a computed pignistic_prob after the contradicts wire");
+    assert!(
+        betp <= 0.5 + 1e-9,
+        "a contradicts edge from a disbelieved source (bel 0.05, pl 0.20) must not raise its \
+         target above neutral; got {betp}"
+    );
+}
+
+/// The most-inverted case on the complement law: a fully REFUTED claim
+/// (bel 0, pl 0) filed as a contradictor. The complement law restricted it to
+/// [0.9, 1.0] at f = 0.9 and wired m(TRUE) = 0.9 onto the target, so refuting
+/// a claim and filing it against another made that other claim near-certain.
+///
+/// Under mutual exclusion the refuted source transfers nothing: its restricted
+/// interval is [0, 1], which `auto_wire_ds_for_edge` short-circuits as
+/// `EdgeFactorOutcome::Vacuous`. The edge is still written, but no BBA is
+/// stored and `belief_wired` is false (the `link_epistemic` contract lists
+/// this reason).
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_from_refuted_source_writes_no_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.0, 0.0, Some(0.0)).await;
+    let target = seed_claim(&pool, "target of a refuted contradictor", 0.5).await;
+
+    let resp = parse_response(
+        &do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("contradicts wire succeeds"),
+    );
+    assert!(resp.was_created, "the durable edge is written either way");
+    let edge_id = Uuid::parse_str(&resp.edge_id).expect("edge_id is a uuid");
+
+    // The inversion first, so a regression names it: no target belief and no
+    // edge-factor BBA.
+    let belief = read_belief(&pool, target).await;
+    assert!(
+        belief.is_none_or(|b| b < 1e-9),
+        "a refuted contradictor (bel 0, pl 0) must put no mass on the target being TRUE; \
+         got target belief {belief:?}"
+    );
+    let betp = read_betp(&pool, target).await;
+    assert!(
+        betp.is_none_or(|p| p <= 0.5 + 1e-9),
+        "a refuted contradictor must not raise its target above neutral; got {betp:?}"
+    );
+    let bba_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edge-factor BBA rows");
+    assert_eq!(
+        bba_count, 0,
+        "a refuted contradictor restricts to the vacuous [0, 1]: no BBA may be stored"
+    );
+    assert!(
+        !resp.belief_wired,
+        "no belief moved, so belief_wired must be false (restricted mass is vacuous)"
     );
 }
 
@@ -625,6 +760,132 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
         1,
         "re-hit must not create a duplicate edge"
     );
+}
+
+// ── qualifies is accepted (belief-neutral scope caveat) — backlog 99582af7 ──
+
+/// `A qualifies B`: A bounds the conditions under which B applies, without
+/// saying B is false. Before this relation existed a scope caveat could only be
+/// wired as `contradicts`/`refutes`, which pushes B's belief down for a reason
+/// that is not about B's truth.
+///
+/// Stronger than the `cites` test above on purpose: the target already CARRIES
+/// a belief (wired by a `supports` edge in this same test, which also proves
+/// this fixture wires a non-neutral relation), and the caveat's source has a
+/// 0.9 interval. A `qualifies` that leaked into the Negative or Positive arm
+/// would move that number; a NULL-belief target could hide it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn qualifies_edge_is_created_but_does_not_move_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let evidence = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let caveat = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let hub = seed_claim(&pool, "anchor-design hub", 0.5).await;
+
+    let support = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: evidence.to_string(),
+            target_claim_id: hub.to_string(),
+            relationship: "supports".to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("supports wire succeeds");
+    assert!(
+        parse_response(&support).belief_wired,
+        "fixture: the supports edge must wire, so the hub has a belief to protect"
+    );
+    let before = read_betp(&pool, hub)
+        .await
+        .expect("hub has a pignistic_prob after the supports wire");
+
+    let result = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: caveat.to_string(),
+            target_claim_id: hub.to_string(),
+            relationship: "qualifies".to_string(),
+            properties: Some(serde_json::json!({"condition": "1 M monovalent NaCl only"})),
+        },
+        None,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "link_epistemic must accept 'qualifies', got {result:?}"
+    );
+    let resp = parse_response(&result.unwrap());
+
+    assert!(
+        resp.was_created,
+        "first qualifies call must create the edge"
+    );
+    assert_eq!(resp.relationship, "qualifies");
+    assert!(
+        !resp.belief_wired,
+        "qualifies is a belief-neutral scope caveat — it must NOT wire belief"
+    );
+    assert_eq!(
+        resp.belief_target_claim_id,
+        hub.to_string(),
+        "qualifies is directional: the caveat points at the claim it bounds"
+    );
+    assert_eq!(edge_count(&pool, caveat, hub, "qualifies").await, 1);
+
+    let after = read_betp(&pool, hub).await.expect("hub keeps its belief");
+    assert!(
+        (after - before).abs() < 1e-12,
+        "a qualifies edge must not move the qualified claim's belief: {before} -> {after}"
+    );
+    let bbas: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions mf \
+         JOIN edges e ON e.id = mf.perspective_id \
+         WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = 'qualifies'",
+    )
+    .bind(caveat)
+    .bind(hub)
+    .fetch_one(&pool)
+    .await
+    .expect("count qualifies BBAs");
+    assert_eq!(
+        bbas, 0,
+        "no mass function may be materialized for a qualifies edge"
+    );
+
+    // Directionality, by behaviour: `hub qualifies caveat` is a DIFFERENT fact
+    // from `caveat qualifies hub`, so it must be a new row. A symmetric
+    // relation (`contradicts`, `corroborates`) dedups the unordered pair and
+    // would return the forward edge with was_created=false here.
+    let reverse = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: hub.to_string(),
+            target_claim_id: caveat.to_string(),
+            relationship: "qualifies".to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("the reverse qualifies call succeeds");
+    let reverse = parse_response(&reverse);
+    assert!(
+        reverse.was_created,
+        "'hub qualifies caveat' is not 'caveat qualifies hub': it must create its own edge, \
+         not dedup onto the forward one"
+    );
+    assert_ne!(
+        reverse.edge_id, resp.edge_id,
+        "the reverse qualifies must be a distinct edge"
+    );
+    assert_eq!(edge_count(&pool, caveat, hub, "qualifies").await, 1);
+    assert_eq!(edge_count(&pool, hub, caveat, "qualifies").await, 1);
 }
 
 // ── validation: supersedes is excluded (belongs to supersede_claim) ─────────
@@ -1026,4 +1287,38 @@ async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
          A downward, so any drift here means the orientation was taken from the \
          argument order rather than the row. Got {a_betp}"
     );
+}
+
+// ── the contract an agent reads ─────────────────────────────────────────────
+
+/// An agent picks a relationship from the tool description and the
+/// `relationship` parameter's schema text, not from the source. A `qualifies`
+/// the validator accepts but neither text names would leave caveats filed as
+/// `contradicts` exactly as before (backlog 99582af7). Pins both texts
+/// positively: the relation is named, and so is the fact that it moves no
+/// belief.
+#[test]
+fn the_contract_advertises_qualifies_as_a_belief_neutral_scope_caveat() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let tool = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "link_epistemic")
+        .expect("link_epistemic is registered")
+        .clone();
+    let description = tool["description"]
+        .as_str()
+        .expect("link_epistemic has a description");
+    let relationship = tool["inputSchema"]["properties"]["relationship"]["description"]
+        .as_str()
+        .expect("relationship parameter has a description");
+    for (what, text) in [("description", description), ("relationship", relationship)] {
+        assert!(
+            text.contains(
+                "qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief)"
+            ),
+            "link_epistemic's {what} must advertise qualifies as a belief-neutral scope caveat; got: {text}"
+        );
+    }
 }
