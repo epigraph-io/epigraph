@@ -50,14 +50,15 @@ const AS_OF: &str = "2026-10-15";
 
 fn profile_value() -> Value {
     json!({
-        "schema": "label-dedup-profile/v1",
+        "schema": "label-dedup-profile/v2",
         "family_label": FAMILY,
+        "family_kind": "index",
         "closed_label": "resolved",
         "retired_labels": ["tracked-item-duplicate"],
         "hygiene_write": {"add": ["{run_tag}"], "remove": ["{family}"]},
         "fields": {
             "entity": {"pipe_position": 1},
-            "deadline": {"keys": ["due:"], "carry_label": "due"}
+            "deadline": {"keys": ["due:"]}
         },
         "ids": {
             "reject": ["iso_date", "us_date", "bare_year", "year_range", "fiscal_year",
@@ -65,11 +66,8 @@ fn profile_value() -> Value {
             "carry_label_prefix": "also-id:"
         },
         "merge": {
-            "loser_add": ["tracked-item-duplicate", "duplicate-of:{survivor}", "{run_tag}"],
-            "loser_remove": ["{family}"],
             "survivor_add": ["{run_tag}"],
-            "carry_ids": true,
-            "carry_later_dates": ["deadline"]
+            "carry_ids": true
         },
         "closeout": {"date_field": "deadline", "add": ["resolved", "closed-past-due", "{run_tag}"]}
     })
@@ -97,11 +95,23 @@ fn profile_root(bytes: &[u8]) -> PathBuf {
     dir
 }
 
+/// The server settings every arm runs with: the fixture family is the one
+/// index family the operator allowlisted.
 fn config(root: Option<&Path>, pin: Option<&str>, cap: usize) -> LabelDedupConfig {
+    config_allowing(root, pin, cap, &[FAMILY])
+}
+
+fn config_allowing(
+    root: Option<&Path>,
+    pin: Option<&str>,
+    cap: usize,
+    index_families: &[&str],
+) -> LabelDedupConfig {
     LabelDedupConfig {
         profile_root: root.map(Path::to_path_buf),
         profile_pin: pin.map(str::to_string),
         max_claims_cap: cap,
+        index_families: index_families.iter().map(|f| (*f).to_string()).collect(),
     }
 }
 
@@ -2425,4 +2435,92 @@ async fn an_operator_merges_its_own_claim_with_its_agents_through_a_revision_lab
         snapshot(&pool, &[foreign, foreign_revision]).await,
         control_before
     );
+}
+
+// ── A1: only operator-allowlisted index families ────────────────────────────
+
+/// The family allowlist is decided from the profile alone, before any read: a
+/// server with no `ScopedPool` (whose every read fails) answers
+/// `FAMILY_NOT_ALLOWED` for plan, apply and probe, and an empty allowlist
+/// refuses every family. Calibrated: with the family allowlisted the same
+/// server gets past the check and fails at the read instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let bytes = profile_bytes();
+    for allowed in [&[][..], &["some-other-index"][..]] {
+        let server = build_test_server(pool.clone())
+            .with_label_dedup_config(config_allowing(None, None, 5000, allowed));
+        let p = plan_params_json(&bytes, DEDUP);
+        let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
+            .await
+            .expect_err("plan refused");
+        assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{allowed:?}: {}", e.message);
+        let e = apply_label_dedup(&server, &viewer, apply_params(&p, "00"), None)
+            .await
+            .expect_err("apply refused");
+        assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
+        let e = probe_label_dedup(
+            &server,
+            &viewer,
+            ProbeLabelDedupParams {
+                profile_path: None,
+                profile_json: p.profile_json.clone(),
+                profile_claim_id: None,
+                profile_hash: p.profile_hash.clone(),
+                candidates: vec![],
+                include_closed_signals: false,
+                max_claims: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("probe refused");
+        assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
+    }
+    // Calibration: allowlisted, the same unscoped server reaches the read.
+    let server = build_test_server(pool.clone()).with_label_dedup_config(config(None, None, 5000));
+    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
+        .await
+        .expect_err("no ScopedPool");
+    assert_ne!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
+}
+
+/// A family the profile declares `knowledge` is refused even when its label is
+/// allowlisted, and so is a profile whose OTHER family (the signal pass's) is
+/// not allowlisted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let mut knowledge = profile_value();
+    knowledge["family_kind"] = json!("knowledge");
+    let bytes = serde_json::to_vec(&knowledge).expect("json");
+    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
+        .await
+        .expect_err("knowledge");
+    assert_eq!(code(&e), "FAMILY_NOT_INDEX", "{}", e.message);
+
+    let mut with_signal = profile_value();
+    with_signal["signal_dedup"] = json!({
+        "family_label": "tracked-lead",
+        "family_kind": "index",
+        "hygiene_write": {"add": ["{run_tag}"], "remove": ["{family}"]},
+        "merge": {"survivor_add": ["{run_tag}"]}
+    });
+    let bytes = serde_json::to_vec(&with_signal).expect("json");
+    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
+        .await
+        .expect_err("signal family not allowlisted");
+    assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
+    assert!(e.message.contains("tracked-lead"), "{}", e.message);
+    // Control: allowlisting it too admits the profile.
+    let server = superuser_server(
+        &pool,
+        config_allowing(None, None, 5000, &[FAMILY, "tracked-lead"]),
+    )
+    .await;
+    plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
+        .await
+        .expect("both families allowlisted");
 }
