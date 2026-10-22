@@ -95,7 +95,7 @@ use crate::types::{DeleteEdgeParams, DeleteEdgeResponse, PatchEdgeParams, PatchE
 use epigraph_db::{DbError, EdgeRepository, EventRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -196,6 +196,13 @@ pub async fn do_patch_edge(
         if !props.is_object() {
             return Err(invalid_params("properties must be a JSON object"));
         }
+    }
+    if params
+        .properties
+        .as_ref()
+        .is_some_and(epigraph_db::carries_dedup_identity_key)
+    {
+        return Err(invalid_params(epigraph_db::DEDUP_IDENTITY_KEY_RESERVED));
     }
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;

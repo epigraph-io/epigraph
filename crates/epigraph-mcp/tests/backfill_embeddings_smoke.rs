@@ -17,7 +17,7 @@ use epigraph_crypto::AgentSigner;
 use epigraph_mcp::tools;
 use epigraph_mcp::tools::embeddings::BackfillEmbeddingsParams;
 use epigraph_mcp::{embed::McpEmbedder, EpiGraphMcpFull};
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -60,8 +60,8 @@ async fn insert_unembedded_claim(pool: &PgPool, agent: Uuid) -> Uuid {
 
 fn result_text(out: CallToolResult) -> String {
     let first = out.content.first().cloned().expect("first content");
-    match first.raw {
-        RawContent::Text(t) => t.text,
+    match first {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text content, got {other:?}"),
     }
 }

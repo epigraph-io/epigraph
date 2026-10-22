@@ -1075,6 +1075,21 @@ pub async fn submit_evidence(
 
     let pool = &state.db_pool;
 
+    // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
+    // addressable only through assess: a row keyed (agent, that agent's slot
+    // perspective) would overwrite or forge that owner's one assessment.
+    if epigraph_db::repos::mass_function::is_assessment_slot(
+        request.agent_id,
+        request.perspective_id,
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "perspective_id".to_string(),
+            reason: "this is the agent's assessment slot, written only by \
+                     POST /api/v1/claims/:id/assess"
+                .to_string(),
+        });
+    }
+
     // 0. The body's `agent_id` is the BBA's author and half its upsert key
     //    `(claim, frame, source_agent_id, perspective)`. A caller may name only
     //    itself (or no one): naming another agent would attribute evidence to

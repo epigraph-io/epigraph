@@ -55,6 +55,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("get_workflow_executions", "claims:read"),
+    ("get_workflow_plan", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),
@@ -64,6 +65,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_claims", "claims:read"),
     ("query_claims_by_evidence", "claims:read"),
     ("query_claims_by_label", "claims:read"),
+    ("plan_label_dedup", "claims:read"),
+    ("probe_label_dedup", "claims:read"),
+    ("label_dedup_index_view", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
@@ -135,10 +139,18 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // administrative: it runs on the maintenance connection and is deferred to
     // the replay timer, never with the caller's authority.
     ("mark_duplicate", "claims:write"),
+    // Its reversal: the same per-claim rule over the duplicate and the
+    // canonical it was marked onto; the reversal itself is administrative.
+    ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
+    // Marks through mark_duplicate's act and writes labels through the
+    // `update_labels` path, each claim under its own per-claim rule.
+    ("apply_label_dedup", "claims:write"),
+    // Its reversal: each step through `update_labels` / `unmark_duplicate`.
+    ("revert_label_dedup", "claims:write"),
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
@@ -287,6 +299,23 @@ mod tests {
     fn claim_acts_are_write_scoped() {
         assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
         assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
+        assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+    }
+
+    /// Plan and probe only read, so a `claims:read` bearer reaches them; apply
+    /// writes (above). Asserted by name: the label-dedup tool tests call the
+    /// tool functions directly and never pass through the router's scope
+    /// check, and the coverage test passes for any mapping.
+    #[test]
+    fn label_dedup_reads_are_read_scoped() {
+        assert_eq!(required_scope("plan_label_dedup"), Some("claims:read"));
+        assert_eq!(required_scope("probe_label_dedup"), Some("claims:read"));
+        assert_eq!(
+            required_scope("label_dedup_index_view"),
+            Some("claims:read")
+        );
     }
 
     /// The three maintenance tools act across every tenant on a bypass viewer,

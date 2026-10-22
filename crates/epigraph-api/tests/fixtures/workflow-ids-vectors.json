@@ -1,0 +1,203 @@
+{
+  "schema": "workflow-ids-vectors/v1",
+  "about": "Frozen expected values for epigraph-ingest/src/common/ids.rs and the workflow ingest plan order. Computed by an implementation independent of the Rust crate (gen_workflow_ids_vectors.py, beside this file, run by hand); the Rust test compares, it never regenerates. A change here is a change to every stored workflow id.",
+  "namespaces": {
+    "workflow": "f10e55a5-3742-4bc0-9d21-8ea6f3126c88",
+    "compound": "c04d90d1-e2f3-4456-789a-bcdef01234a5",
+    "atom": "a1b2c3d4-e5f6-4789-9abc-def012345678"
+  },
+  "definitions": {
+    "blake3": "BLAKE3-256 of the UTF-8 bytes",
+    "uuid5": "RFC 4122 UUIDv5: SHA-1(namespace bytes || name bytes)[0..16], version 5, variant 10; name is raw bytes",
+    "workflow_root_id": "uuid5(workflow, blake3(canonical_name || ':' || decimal(generation)))",
+    "compound_claim_id": "uuid5(compound, blake3(content) || canonical_name), levels 0-2",
+    "compound_content_hash": "blake3(blake3(content) || canonical_name), the stored content_hash of levels 0-2",
+    "atom_id": "uuid5(atom, blake3(content)), level 3; its stored content_hash is blake3(content)",
+    "plan_order": "thesis (level 0); then per phase: the phase (level 1, summary or the title when the summary is blank), then per step: the step (level 2) followed by its operations (level 3)"
+  },
+  "workflow_root_ids": [
+    {
+      "canonical_name": "acme-workflow-plan",
+      "generation": 0,
+      "workflow_id": "fa778aa6-2d08-5bae-8077-af14e986780b"
+    },
+    {
+      "canonical_name": "acme-workflow-plan",
+      "generation": 1,
+      "workflow_id": "b99cf97a-8c79-5e46-a7d4-8cef36a7e2a3"
+    },
+    {
+      "canonical_name": "acme-workflow-plan",
+      "generation": 12,
+      "workflow_id": "9c459930-34fb-5760-8213-0a4ec9f5bac7"
+    },
+    {
+      "canonical_name": "acme-workflow-plan-üß",
+      "generation": 3,
+      "workflow_id": "b4884743-d8f5-5c67-b279-ac940742e282"
+    },
+    {
+      "canonical_name": "ACME-123456",
+      "generation": 4294967295,
+      "workflow_id": "f1c09bd6-e373-5d6a-9328-071617122c70"
+    }
+  ],
+  "compound_claims": [
+    {
+      "content": "Read the input list for ACME-123456.",
+      "seed": "acme-workflow-plan",
+      "claim_id": "fb49fbd3-63ae-5b9c-8662-c919d8e44d3f",
+      "content_hash": "3faea502c3301c3b8dc5e2f9f9c0c65adf2f832bca23f77dc65d23e04def4ee2",
+      "plain_content_hash": "660ed6ddffc9e9d2fc326e2f8d05252cf979e9e8d1355f26fad56621672e4885"
+    },
+    {
+      "content": "Read the input list for ACME-123456.",
+      "seed": "acme-other-plan",
+      "claim_id": "d69c23e1-1298-5a3a-88cb-0ab8c9ebbaec",
+      "content_hash": "e8303b47da8fd90401dd2acf862f3ea6000ace9cf742bc7c47881a8a682cf31d",
+      "plain_content_hash": "660ed6ddffc9e9d2fc326e2f8d05252cf979e9e8d1355f26fad56621672e4885"
+    },
+    {
+      "content": "Prüfe die Eingabeliste.",
+      "seed": "acme-workflow-plan-üß",
+      "claim_id": "7d687253-a792-5148-bc86-c10964854bc4",
+      "content_hash": "f78cc433292fc701732ff8407d32b4e5c266da9c5fbf2463b7bd54f1bf3ff8ce",
+      "plain_content_hash": "6ecc7476a24a376c76b25b856fdaa277feb3ac94bca3d1ad3603ed4e1605212d"
+    }
+  ],
+  "atoms": [
+    {
+      "content": "open the ACME-123456 input list",
+      "claim_id": "081e8dab-8c8c-5064-8cf4-585693aabccd",
+      "content_hash": "1e208430f2f01d29ce38a6a18d3f42cd8197378743e0fbdadb85a26f9a6ac1d5"
+    }
+  ],
+  "extraction": {
+    "source": {
+      "canonical_name": "acme-workflow-plan",
+      "goal": "ACME-123456 workflow-plan: produce the weekly summary",
+      "generation": 0,
+      "parent_canonical_name": null,
+      "authors": [],
+      "expected_outcome": null,
+      "tags": [],
+      "metadata": {}
+    },
+    "thesis": "ACME-123456 workflow-plan thesis: the weekly summary is built from a complete input list.",
+    "thesis_derivation": "TopDown",
+    "phases": [
+      {
+        "title": "Collect",
+        "summary": "Collect the inputs for ACME-123456.",
+        "steps": [
+          {
+            "compound": "Read the input list for ACME-123456.",
+            "rationale": "the list drives every later step",
+            "operations": [
+              "open the ACME-123456 input list"
+            ],
+            "generality": [
+              2
+            ],
+            "confidence": 0.8,
+            "evidence_type": null
+          },
+          {
+            "compound": "Check that the ACME-123456 input list is complete.",
+            "rationale": "a partial list gives a partial summary",
+            "operations": [],
+            "generality": [],
+            "confidence": 0.7,
+            "evidence_type": null
+          }
+        ]
+      },
+      {
+        "title": "Report",
+        "summary": "",
+        "steps": [
+          {
+            "compound": "Write the summary for ACME-123456.",
+            "rationale": "the summary is the deliverable",
+            "operations": [
+              "write the ACME-123456 summary file"
+            ],
+            "generality": [
+              1
+            ],
+            "confidence": 0.9,
+            "evidence_type": null
+          }
+        ]
+      }
+    ],
+    "relationships": []
+  },
+  "workflow_id": "fa778aa6-2d08-5bae-8077-af14e986780b",
+  "plan": [
+    {
+      "plan_index": 0,
+      "level": 0,
+      "content": "ACME-123456 workflow-plan thesis: the weekly summary is built from a complete input list.",
+      "claim_id": "08bc0306-b169-5759-8f90-9a02235fb51d",
+      "content_hash": "366ed5756cf7ad7176c8bd27dc0bae24651fcc977d7f417ad6351c8e81b27256",
+      "plain_content_hash": "392d38bd73253f4723007f4e1805de89b7993374b5203fab263279ae33558284"
+    },
+    {
+      "plan_index": 1,
+      "level": 1,
+      "content": "Collect the inputs for ACME-123456.",
+      "claim_id": "0e4700de-f38e-503f-affa-f294f1dc8bc9",
+      "content_hash": "d001225e814b68fe87bd850c4d35c2561f9b5de8152d1f6ed1dc1cc9d5013a61",
+      "plain_content_hash": "8a94c51689f2c8e0020c8810bcddf2f5c864f179c4a935d1bbb5f34776b49236"
+    },
+    {
+      "plan_index": 2,
+      "level": 2,
+      "content": "Read the input list for ACME-123456.",
+      "claim_id": "fb49fbd3-63ae-5b9c-8662-c919d8e44d3f",
+      "content_hash": "3faea502c3301c3b8dc5e2f9f9c0c65adf2f832bca23f77dc65d23e04def4ee2",
+      "plain_content_hash": "660ed6ddffc9e9d2fc326e2f8d05252cf979e9e8d1355f26fad56621672e4885"
+    },
+    {
+      "plan_index": 3,
+      "level": 3,
+      "content": "open the ACME-123456 input list",
+      "claim_id": "081e8dab-8c8c-5064-8cf4-585693aabccd",
+      "content_hash": "1e208430f2f01d29ce38a6a18d3f42cd8197378743e0fbdadb85a26f9a6ac1d5",
+      "plain_content_hash": "1e208430f2f01d29ce38a6a18d3f42cd8197378743e0fbdadb85a26f9a6ac1d5"
+    },
+    {
+      "plan_index": 4,
+      "level": 2,
+      "content": "Check that the ACME-123456 input list is complete.",
+      "claim_id": "fd0ac0cd-21a2-5702-91f0-6903d44e04c2",
+      "content_hash": "4b873801b132a55692cc1ee129c182c2ef925048c6b34256c74fbb3b7ed1583d",
+      "plain_content_hash": "0082681d89e8674dcf972818d65648ab7875fa33ac51ab7ed8eb004afe1808f0"
+    },
+    {
+      "plan_index": 5,
+      "level": 1,
+      "content": "Report",
+      "claim_id": "96869907-029b-5278-bd0d-bb8719fb0b49",
+      "content_hash": "8636a9eec7a63215663c6a8ca2d99bf6aa322ff77f8bde71b14b16cc4072ec1a",
+      "plain_content_hash": "07d32c56981a06943f340ee87a1806f4665b0ad4dc88bb58953e6110b91b4408"
+    },
+    {
+      "plan_index": 6,
+      "level": 2,
+      "content": "Write the summary for ACME-123456.",
+      "claim_id": "9e97b503-04f4-583a-90d0-20ae4e12866c",
+      "content_hash": "049dd1ce253657cde3128c6a90153af3c453b3c08a5a8f79a0173aa5fa35531c",
+      "plain_content_hash": "ef419df086b66d018d16d30c0972cea6b86da7619463ea0c5f3529ed2e04bd54"
+    },
+    {
+      "plan_index": 7,
+      "level": 3,
+      "content": "write the ACME-123456 summary file",
+      "claim_id": "97449d25-1387-58cc-8834-49e7f8c9a5bf",
+      "content_hash": "08978f163552fb24772a8ae1ae0771e252d53675970fb58bfbd1887706d9d720",
+      "plain_content_hash": "08978f163552fb24772a8ae1ae0771e252d53675970fb58bfbd1887706d9d720"
+    }
+  ]
+}

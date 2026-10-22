@@ -126,6 +126,7 @@ fn token(agent: Uuid, client_type: ClientType) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -554,6 +555,7 @@ async fn evolve_step_binds_the_authenticated_caller(pool: PgPool) {
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+                delegated_by: None,
             };
             let req: epigraph_api::routes::workflows::EvolveStepRequest =
                 serde_json::from_value(serde_json::json!({
