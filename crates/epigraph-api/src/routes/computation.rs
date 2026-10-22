@@ -730,13 +730,17 @@ pub async fn propagate_beliefs(
         });
     }
 
-    // Load factors from DB
-    let factors: Vec<FactorRow> = sqlx::query_as(
-        "SELECT id, factor_type, variable_ids, potential, description \
-         FROM factors \
-         WHERE ($1::uuid IS NULL OR frame_id = $1) \
-         ORDER BY created_at",
-    )
+    // Load factors from DB. This is the one loader that feeds the BP engines
+    // (`run_cdst_bp`, `run_bp`; interval mode runs the scalar track here), so
+    // the `decomposes_to` exclusion (SPEC §6.2, D3) is applied here, once.
+    let factors: Vec<FactorRow> = sqlx::query_as(&format!(
+        "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description \
+         FROM factors f \
+         WHERE ($1::uuid IS NULL OR f.frame_id = $1) \
+           AND {} \
+         ORDER BY f.created_at",
+        epigraph_db::repos::factor::bp_readable_factor_sql()
+    ))
     .bind(request.frame_id)
     .fetch_all(&state.db_pool)
     .await

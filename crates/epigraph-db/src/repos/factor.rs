@@ -11,6 +11,41 @@ use crate::repos::edge::EDGE_IN_FORCE;
 // A COMPOUND is a claim with an in-force `decomposes_to` out-edge to a claim:
 // a query over its atoms, with no belief cache of its own for BP to write.
 
+/// SQL predicate over a `factors` row aliased `f`: TRUE when belief
+/// propagation may read the row, FALSE for a `decomposes_to` factor (D3).
+///
+/// The `edges_auto_factor` trigger mints a `directional_support` factor for
+/// every `decomposes_to` edge. Read by BP, it carries an atom's evidence up
+/// into its compound and back (an echo), so no BP run reads one:
+///
+/// * a KEYED row: `properties.relationship` is `decomposes_to` (any case);
+/// * a LEGACY row, minted before the trigger keyed its rows: no
+///   `relationship` key, type `directional_support` (the only type any
+///   trigger version maps `decomposes_to` to), two variables, and those two
+///   are the ends of an in-force `decomposes_to` edge, in either order.
+///
+/// Every other factor stays readable, including `evidential_support` and
+/// `mutual_exclusion` rows that name a compound: read-only BP keeps them as a
+/// diagnostic (D4 is stated for BP APPLY). The legacy arm reads `edges`, so
+/// it sees the edges visible to the session it runs on.
+#[must_use]
+pub fn bp_readable_factor_sql() -> String {
+    format!(
+        "NOT ( \
+            lower(COALESCE(f.properties->>'relationship', '')) = 'decomposes_to' \
+            OR ( NOT COALESCE(f.properties ? 'relationship', false) \
+                 AND f.factor_type = 'directional_support' \
+                 AND cardinality(f.variable_ids) = 2 \
+                 AND EXISTS ( \
+                     SELECT 1 FROM edges e \
+                      WHERE e.relationship = 'decomposes_to' \
+                        AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                        AND ( (e.source_id = f.variable_ids[1] AND e.target_id = f.variable_ids[2]) \
+                           OR (e.source_id = f.variable_ids[2] AND e.target_id = f.variable_ids[1]) ) \
+                        AND {EDGE_IN_FORCE} ) ) )"
+    )
+}
+
 /// SQL: of the claim ids bound as `$1` (`uuid[]`), the COMPOUNDS — those with
 /// an in-force `decomposes_to` out-edge to a claim.
 ///
