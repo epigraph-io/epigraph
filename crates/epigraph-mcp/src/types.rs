@@ -3340,3 +3340,148 @@ pub struct RecomputeBeliefsParams {
     #[serde(default)]
     pub offset: Option<i64>,
 }
+
+// ── Label-family dedup (plan / apply / probe) ──
+
+/// One would-be claim a writer asks `probe_label_dedup` about.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupCandidateParam {
+    #[schemars(description = "Caller-chosen key, echoed back with the verdict")]
+    pub key: String,
+    #[schemars(description = "The content the writer is about to file")]
+    pub content: String,
+    #[schemars(description = "The labels the writer is about to file it with")]
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlanLabelDedupParams {
+    #[schemars(
+        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_path: Option<String>,
+    #[schemars(
+        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v1). Refused on stdio. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_json: Option<String>,
+    #[schemars(
+        description = "Reserved: reading the profile from a stored claim is not available yet; a call that sets it is refused (PROFILE_CLAIM_DEFERRED)."
+    )]
+    pub profile_claim_id: Option<String>,
+    #[schemars(
+        description = "REQUIRED. BLAKE3 (hex) of the exact profile bytes; a profile that hashes differently is refused (PROFILE_HASH_MISMATCH). On stdio it must also equal the pin this server was started with (EPIGRAPH_MCP_PROFILE_PIN) when one is set."
+    )]
+    pub profile_hash: String,
+    #[schemars(description = "Run tag substituted into {run_tag}; must be a valid label")]
+    pub run_tag: String,
+    #[schemars(
+        description = "YYYY-MM-DD. Required by the closeout and lifecycle sections; never defaulted to today"
+    )]
+    pub as_of: Option<String>,
+    #[schemars(
+        description = "Sections to plan: any of hygiene, dedup, closeout, lifecycle, signal_dedup. Default [hygiene, dedup]"
+    )]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(
+        description = "Most claims read per family (default and server cap 5000; a larger value is clamped and the clamp reported). A family larger than this is reported truncated, and apply refuses a truncated plan."
+    )]
+    pub max_claims: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ApplyLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub run_tag: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub as_of: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+    #[schemars(
+        description = "REQUIRED. The plan_hash of the plan you reviewed. Apply re-plans from live state with the same arguments and refuses with PLAN_DRIFT, writing nothing, when the hash differs."
+    )]
+    pub plan_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProbeLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "At most 100 would-be claims to classify")]
+    pub candidates: Vec<LabelDedupCandidateParam>,
+    #[schemars(
+        description = "Also match against closed lifecycle signals (verdict match_only). Default false"
+    )]
+    #[serde(default)]
+    pub include_closed_signals: bool,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+}
+
+/// One label change an apply committed, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedLabelChangeParam {
+    pub unit: String,
+    pub claim_id: String,
+    #[serde(default)]
+    pub labels_added: Vec<String>,
+    #[serde(default)]
+    pub labels_removed: Vec<String>,
+}
+
+/// One duplicate an apply marked, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedMarkParam {
+    pub unit: String,
+    #[schemars(description = "The marked duplicate")]
+    pub dup: String,
+    #[schemars(description = "The claim it was marked a duplicate of")]
+    pub canonical: String,
+    #[schemars(description = "The matching tier, as the apply returned it")]
+    pub rule: String,
+    #[serde(default)]
+    pub matched_on: String,
+    #[schemars(
+        description = "The identity edge the mark wrote; when given, a claim marked again since (a new edge) is not un-marked"
+    )]
+    #[serde(default)]
+    pub identity_edge: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertLabelDedupParams {
+    #[schemars(description = "applied_units from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_units: Vec<AppliedLabelChangeParam>,
+    #[schemars(description = "applied_marks from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_marks: Vec<AppliedMarkParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupIndexViewParams {
+    #[schemars(description = "Canonical claim ids (at most 100)")]
+    pub claim_ids: Vec<String>,
+    #[schemars(
+        description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
+    )]
+    pub max_claims: Option<i64>,
+}

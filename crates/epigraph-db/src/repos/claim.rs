@@ -188,6 +188,36 @@ impl Default for LabelQuery<'_> {
     }
 }
 
+/// One row of [`ClaimRepository::list_all_by_labels_ordered_by_id`]: the
+/// fields a label-family planner reads, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LabelFamilyRow {
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row of [`ClaimRepository::marked_duplicates_of`]: a claim marked a
+/// duplicate (at any depth) of `canonical`, with the fields a label-family
+/// planner reads.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarkedDuplicateRow {
+    pub canonical: Uuid,
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The duplicate's author.
+    pub agent_id: Uuid,
+    /// The canonical's author, so a caller can tell a duplicate of another
+    /// owner from one of the canonical's own.
+    pub canonical_agent_id: Uuid,
+}
+
+/// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
+pub const MAX_DUPLICATE_CHAIN_DEPTH: i32 = 16;
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -5202,6 +5232,177 @@ impl ClaimRepository {
         Ok(out)
     }
 
+    /// Every claim carrying ALL of `include` and NONE of `exclude`, in id
+    /// order, with no offset: a whole label family in one deterministic read.
+    ///
+    /// Returns at most `cap + 1` rows. A caller that receives more than `cap`
+    /// knows the family is larger than its cap and must treat the read as
+    /// truncated (the planner refuses to act on a prefix), which offset paging
+    /// over `created_at` could never tell it: a page boundary drifts under
+    /// concurrent writes.
+    ///
+    /// Viewer-scoped: rows the viewer cannot read are absent. Under forced
+    /// row security a group-private row is visible only on a connection
+    /// stamped from a viewer that reads its group, so call it on
+    /// `ScopedPool::read_as`.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` when `include` is empty (that would read every
+    /// claim) or `cap` is negative; `DbError::QueryFailed` on a database
+    /// failure.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_all_by_labels_ordered_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        include: &[String],
+        exclude: &[String],
+        current_only: bool,
+        cap: i64,
+    ) -> Result<Vec<LabelFamilyRow>, DbError> {
+        if include.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: "a label-family read needs at least one include label; an empty set \
+                         would read every claim"
+                    .to_string(),
+            });
+        }
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("a label-family read needs a non-negative cap, got {cap}"),
+            });
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at
+            FROM claims c
+            WHERE c.labels @> $1
+              AND ($2::text[] = '{}'::text[] OR NOT (c.labels && $2))
+              AND ($3 = false OR COALESCE(c.is_current, true) = true)
+              /* {VISIBILITY:c} */
+            ORDER BY c.id
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, LabelFamilyRow>(&sql)
+            .bind(include)
+            .bind(exclude)
+            .bind(current_only)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The label-dedup `index_view`: for each of `canonicals`, every claim
+    /// marked a duplicate of it, down a chain (a duplicate of a duplicate, to
+    /// [`MAX_DUPLICATE_CHAIN_DEPTH`]), through IN-FORCE dedup identity edges
+    /// only (`same_as` carrying `properties.dedup`; a plain `same_as`, or the
+    /// retracted edge of an un-marked duplicate, is not followed). Only
+    /// non-current claims are returned (a marked duplicate is retired).
+    ///
+    /// Filtered by `viewer` on every edge and claim it reads: a duplicate the
+    /// viewer cannot read is not returned, so a caller that needs every
+    /// duplicate must use a viewer that reads them all.
+    ///
+    /// Ordered by `(canonical, id)`; at most `cap + 1` rows, so a caller sees
+    /// that more than `cap` exist.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for a negative cap; `DbError::QueryFailed`.
+    pub async fn marked_duplicates_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        canonicals: &[Uuid],
+        cap: i64,
+    ) -> Result<Vec<MarkedDuplicateRow>, DbError> {
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("an index-view read needs a non-negative cap, got {cap}"),
+            });
+        }
+        if canonicals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE walk(canonical, dup, depth) AS (
+                SELECT e.target_id, e.source_id, 1
+                  FROM edges e
+                 WHERE e.target_id = ANY($1) AND e.target_type = 'claim'
+                   AND e.source_type = 'claim' AND e.relationship = $2
+                   AND e.valid_to IS NULL AND e.properties ? $3
+                   /* {EDGE_VISIBILITY:e} */
+                UNION
+                SELECT w.canonical, e.source_id, w.depth + 1
+                  FROM walk w
+                  JOIN edges e ON e.target_id = w.dup
+                 WHERE e.target_type = 'claim' AND e.source_type = 'claim'
+                   AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+                   AND w.depth < $4
+                   /* {EDGE_VISIBILITY:e} */
+            )
+            SELECT DISTINCT w.canonical, c.id, c.content,
+                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
+                   c.agent_id, k.agent_id AS canonical_agent_id
+              FROM walk w
+              JOIN claims c ON c.id = w.dup
+              JOIN claims k ON k.id = w.canonical
+             WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
+               /* {VISIBILITY:c} */
+               /* {VISIBILITY:k} */
+             ORDER BY w.canonical, c.id
+             LIMIT $5
+            "#,
+            6,
+        );
+        let mut q = sqlx::query_as::<_, MarkedDuplicateRow>(&sql)
+            .bind(canonicals)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(MAX_DUPLICATE_CHAIN_DEPTH)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The in-force dedup identity edge out of `dup` (`same_as` carrying
+    /// `properties.dedup`), with the claim it names, when the viewer can read
+    /// it: which mark a claim currently carries, so a revert can tell the mark
+    /// it made from a later one onto the same canonical.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn dedup_identity_edge_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+    ) -> Result<Option<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.target_id
+              FROM edges e
+             WHERE e.source_id = $1 AND e.source_type = 'claim' AND e.target_type = 'claim'
+               AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+               /* {EDGE_VISIBILITY:e} */
+             ORDER BY e.created_at DESC, e.id
+             LIMIT 1
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
+            .bind(dup)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
     /// List claims that have NEVER been touched by decomposition: claims that
     /// are neither the source (parent) nor the target (child) of any
     /// `decomposes_to` edge.
@@ -8018,6 +8219,23 @@ impl ClaimRepository {
         .bind(canon_uuid)
         .fetch_one(&mut *conn)
         .await?)
+    }
+
+    /// Whether THIS session's [`Self::mark_duplicate_act_attributed_conn`]
+    /// would pass the act's authority checks for `dup` onto `canonical`: the
+    /// same predicate as [`Self::session_may_unmark_conn`] (row security on
+    /// the duplicate, and FA04's attach rule for the canonical). A prediction
+    /// that writes nothing, for a planner showing which marks will apply;
+    /// FA07 and a concurrent change are left to the act.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn session_may_mark_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<bool, DbError> {
+        Self::session_may_unmark_conn(conn, dup, canonical).await
     }
 
     /// Put back what a dedup repair did, from its [`DedupRevert`] record:

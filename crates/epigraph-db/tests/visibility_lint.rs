@@ -2000,6 +2000,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "session_may_mark_conn",
+        "READ. session_may_unmark_conn's predicate (the mark act's own authority), asked by a \
+         planner predicting which marks apply; projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
         "reverse_marked_duplicate_conn",
         "WRITE, privileged only (refuses otherwise). The reversal of a dedup's repair from its \
          revert record, on the maintenance connection.",
