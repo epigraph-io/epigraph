@@ -99,6 +99,20 @@ pub struct ReplacedAssessment {
 // HANDLER
 // =============================================================================
 
+/// The perspective that keys `owner`'s ONE assessment slot on any (claim,
+/// frame) (ruling Q-U027F-2). Deterministic, domain-separated from every other
+/// perspective id (random v4s and edge ids), so the slot's key (claim, frame,
+/// owner, this perspective) is assess's alone: no other writer's row can sit on
+/// it and be overwritten. `None` is the slot of a caller with no principal.
+#[cfg(feature = "db")]
+fn assessment_slot_perspective(owner: Option<Uuid>) -> Uuid {
+    let owner = owner.map_or_else(|| "anonymous".to_string(), |o| o.to_string());
+    let hash = blake3::hash(format!("epigraph/assess-slot/v1/{owner}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 /// Assess a claim: compute BBA, submit evidence, combine, update belief,
 /// and optionally generate embedding — all in one call.
 ///
@@ -257,36 +271,40 @@ pub async fn assess_claim(
     // combine as independent evidence. U027F's per-call perspective let one
     // caller stack: ten identical calls took BetP 0.61 -> 0.997.
     //
-    // The row is keyed (claim, frame, OWNER, NULL perspective), so the slot is
-    // the table's own `UNIQUE NULLS NOT DISTINCT` key: every agent of one human
-    // upserts the same row, atomically, with no delete authority needed over a
-    // sibling's row and no race between two siblings. `source_agent_id` thus
-    // names the owner, the identity whose one assessment this is. A
-    // principal-less viewer keeps the shared anonymous slot (agent and
-    // perspective NULL), which a repeat overwrites.
+    // The row is keyed (claim, frame, OWNER, the owner's slot perspective), so
+    // the slot is the table's own `UNIQUE NULLS NOT DISTINCT` key: every agent
+    // of one human upserts the same row, atomically, with no delete authority
+    // needed over a sibling's row and no race between two siblings, and no
+    // other writer's row can share the key (`assessment_slot_perspective`).
+    // `source_agent_id` names the owner, the identity whose one assessment
+    // this is.
+    //
+    // The owner is the caller's ACTING operator (`operator_actor`: a live,
+    // non-retired link with a live membership), the read a caller-side
+    // identity must use; a retired or dormant link makes the agent its own
+    // owner. A principal-less viewer has one anonymous slot.
     let owner = match viewer.principal() {
         Some(agent) => {
             let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
                 message: format!("acquire connection: {e}"),
             })?;
             Some(
-                epigraph_db::AgentRepository::operator_of_author(&mut conn, agent)
+                epigraph_db::AgentRepository::operator_actor(&mut conn, agent)
                     .await?
-                    .map_or(agent, |o| o.operator_id),
+                    .map_or(agent, |l| l.operator_id),
             )
         }
         None => None,
     };
-    // The owner's assessment this call replaces, read before the upsert.
+    let slot = assessment_slot_perspective(owner);
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
+    // The owner's assessment this call replaces: exactly the row the upsert
+    // below overwrites.
     let replaced_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> =
         epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
             .await?
             .into_iter()
-            .filter(|row| {
-                row.source_agent_id == owner
-                    && row.perspective_id.is_none()
-                    && row.combination_method.as_deref() == Some("discount")
-            })
+            .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
             .map(|row| (row.id, row.source_agent_id, row.masses))
             .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
@@ -294,7 +312,7 @@ pub async fn assess_claim(
         claim_id,
         frame_id,
         owner,
-        None,
+        Some(slot),
         &bba_json,
         None,
         Some("discount"),
