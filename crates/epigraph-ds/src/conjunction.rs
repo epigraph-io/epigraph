@@ -861,3 +861,97 @@ pub fn single_negative_sibling(
 ) -> Result<ConjResult, DsError> {
     apply_negative_valuation(base, pair_bel, m)
 }
+
+// ---------------------------------------------------------------------------
+// Profile (spine and over-cap nodes)
+// ---------------------------------------------------------------------------
+
+/// The rule tag of a [`Profile`].
+pub const PROFILE_RULE: &str = "profile_v1";
+
+/// Minimum, median and maximum of a per-leaf statistic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Summary {
+    /// Smallest value.
+    pub min: f64,
+    /// Median (mean of the two middle values for an even count).
+    pub median: f64,
+    /// Largest value.
+    pub max: f64,
+}
+
+impl Summary {
+    fn of(mut values: Vec<f64>) -> Self {
+        values.sort_by(f64::total_cmp);
+        let n = values.len();
+        let median = if n % 2 == 1 {
+            values[n / 2]
+        } else {
+            0.5 * (values[n / 2 - 1] + values[n / 2])
+        };
+        Self {
+            min: values[0],
+            median,
+            max: values[n - 1],
+        }
+    }
+}
+
+/// A profile of a node's leaves, served instead of a conjunction for spine
+/// nodes (SPEC §2.2): "the whole paper is true" has Bel ≈ 0 by construction,
+/// so a conjunction there carries no information.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    /// Always [`PROFILE_RULE`].
+    pub rule: &'static str,
+    /// Number of leaves.
+    pub n: usize,
+    /// Leaves that some item touches with mass other than Θ.
+    pub evidenced: usize,
+    /// Per-leaf Bel.
+    pub bel: Summary,
+    /// Per-leaf `BetP`.
+    pub betp: Summary,
+    /// Leaves with Pl < 0.5.
+    pub contested: usize,
+    /// Fréchet envelope of the leaves, each queried alone.
+    pub frechet: Frechet,
+}
+
+/// Profile `leaves` (each read as its positive literal, alone) from `items`.
+///
+/// # Errors
+/// `InsufficientSources` for no leaves, `InvalidConjunction` for a repeated
+/// leaf, `TotalConflict` if a leaf's own evidence is in total conflict.
+pub fn profile<A: Ord + Clone>(leaves: &[A], items: &[Item<A>]) -> Result<Profile, DsError> {
+    if leaves.is_empty() {
+        return Err(DsError::InsufficientSources);
+    }
+    let distinct: BTreeSet<&A> = leaves.iter().collect();
+    if distinct.len() != leaves.len() {
+        return Err(DsError::InvalidConjunction {
+            reason: "a leaf appears twice in the profile".into(),
+        });
+    }
+    let mut singles = Vec::with_capacity(leaves.len());
+    for a in leaves {
+        singles.push(conj_belief(&[Lit::pos(a.clone())], items, 0.0)?);
+    }
+    let evidenced = leaves
+        .iter()
+        .filter(|a| items.iter().any(|it| it.is_evidence_on(a)))
+        .count();
+    Ok(Profile {
+        rule: PROFILE_RULE,
+        n: leaves.len(),
+        evidenced,
+        bel: Summary::of(singles.iter().map(|s| s.bel).collect()),
+        betp: Summary::of(singles.iter().map(|s| s.betp).collect()),
+        contested: singles.iter().filter(|s| s.pl < 0.5).count(),
+        frechet: envelope(
+            singles.iter().map(|s| s.bel),
+            singles.iter().map(|s| s.pl),
+            singles.iter().map(|s| s.nr),
+        ),
+    })
+}
