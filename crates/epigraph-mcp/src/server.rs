@@ -1379,6 +1379,20 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Reverse a mark_duplicate: the claim is current again (supersedes cleared, re-embedded best-effort), its same_as identity edge is retracted, and the dedup's repair is undone from the record the repair kept (edges re-pointed back onto it, its mass functions returned with their old ownership, edges and mass functions the repair retracted or deleted restored, frame bindings it added to the canonical removed); both claims' belief is then re-derived. Rows a later write has changed are left as they are and counted as drifted. WHO MAY: as mark_duplicate (scope claims:write, and write authority over the duplicate's AND the canonical's owning groups, or claims:admin); the caller's authority is proved on a transaction stamped with its own identity, then the act and the reversal commit together on the server's administrative connection, audited as cause \"undedup\" naming the caller. Only a claim a dedup marked (one with an in-force same_as identity edge to the claim it supersedes, and a recorded repair or a still-pending one) can be un-marked; anything else is refused with nothing written. REQUIRES the administrative connection: an un-mark cannot be deferred to the replay, so a server without it refuses the call before writing anything."
+    )]
+    async fn unmark_duplicate(
+        &self,
+        Parameters(params): Parameters<crate::types::UnmarkDuplicateParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::supersede::unmark_duplicate(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Atomically add and/or remove labels on an existing claim. Idempotent. Over HTTP (authenticated) the WHOLE label mutation requires ownership of the claim, as patch_claim and PATCH /api/v1/claims/:id/labels do: you authored it, you are its author's operator, or your token carries claims:admin; anyone else is refused with nothing written, whatever the labels. On stdio only the 'resolved' label is gated (adding or removing it needs you to be the author or an agent linked to the same operator as its author; a server with no declared signer identity, i.e. no --agent-key / --agent-model, may retire only claims it authored), and every other label is ungated. When claims:admin is what admits you (HTTP) and the claim is owned by a group you cannot write, the write goes through the AUDITED ADMIN PATH: it records you (the admin) as principal, never the claim's author, and a security_events audit row (claims.admin_write) names you, your token, the claim and the before/after state; it requires a live claims:admin grant on your token's own client record, and is refused with nothing written otherwise. On an --allow-unauthenticated-http listener the injected context carries claims:admin but no client record, so a claim owned by a group this server cannot write is refused there (ADM02) with nothing written. The response's admin_path field says which path ran."
     )]
     async fn update_labels(

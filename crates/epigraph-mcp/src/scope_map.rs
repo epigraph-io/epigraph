@@ -136,6 +136,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // administrative: it runs on the maintenance connection and is deferred to
     // the replay timer, never with the caller's authority.
     ("mark_duplicate", "claims:write"),
+    // Its reversal: the same per-claim rule over the duplicate and the
+    // canonical it was marked onto; the reversal itself is administrative.
+    ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
@@ -288,6 +291,7 @@ mod tests {
     fn claim_acts_are_write_scoped() {
         assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
         assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
     }
 
     /// The three maintenance tools act across every tenant on a bypass viewer,
