@@ -491,7 +491,18 @@ const SUPPORTS: &str = r#"{"0":0.9,"0,1":0.1}"#;
 const REFUTES: &str = r#"{"1":0.85,"0,1":0.15}"#;
 
 /// Insert a two-hypothesis frame, with an explicit id when one is given.
+///
+/// `claim_validity` is never inserted: migration 154 seeds the canonical row
+/// (`8a594393`, `frames.name` is UNIQUE) on every database, so the helper
+/// returns that row, as assess itself resolves it.
 async fn insert_frame(pool: &PgPool, id: Option<Uuid>, name: &str) -> Uuid {
+    if name == "claim_validity" {
+        assert!(id.is_none(), "claim_validity is the seeded canonical row");
+        return sqlx::query_scalar("SELECT id FROM frames WHERE name = 'claim_validity'")
+            .fetch_one(pool)
+            .await
+            .expect("migration 154's canonical claim_validity row");
+    }
     sqlx::query_scalar(
         "INSERT INTO frames (id, name, description, hypotheses)
          VALUES (COALESCE($1, gen_random_uuid()), $2, 'cache-owner test frame',
