@@ -314,6 +314,12 @@ pub struct AppState {
     /// handed a maintenance pool (the test harness) enables it.
     #[cfg(feature = "db")]
     pub admin_cascade: bool,
+    /// Whether this process admits a DELEGATED run token (a token carrying
+    /// `dlg`), which the bearer middlewares check on every request
+    /// (`middleware::bearer::admit_delegated`). OFF in every constructor;
+    /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
+    #[cfg(feature = "db")]
+    pub run_tokens: epigraph_db::RunTokens,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -1068,6 +1074,8 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1140,6 +1148,14 @@ impl AppState {
     #[must_use]
     pub fn with_admin_cascade(mut self, enabled: bool) -> Self {
         self.admin_cascade = enabled;
+        self
+    }
+
+    /// Set the delegated run-token switch; see [`Self::run_tokens`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
+        self.run_tokens = run_tokens;
         self
     }
 
@@ -1430,6 +1446,8 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1498,6 +1516,8 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

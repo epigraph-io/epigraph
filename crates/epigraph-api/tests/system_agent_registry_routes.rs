@@ -96,6 +96,7 @@ fn token(agent: Uuid, client_type: ClientType) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 

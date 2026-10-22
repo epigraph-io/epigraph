@@ -14,6 +14,12 @@
 //!   (CVE-2026-41676 `Deriver::derive`, CVE-2026-41678 AES key wrap,
 //!   CVE-2026-41681 `MdCtxRef::digest_final`, CVE-2026-41898 PSK/cookie
 //!   callback length, CVE-2026-42327 `X509Ref::ocsp_responders`).
+//! - `rmcp` < 2.1.0: the MCP SDK that serves `epigraph-mcp --listen` and the
+//!   federation client. Streamable HTTP server: Host-header DNS rebinding
+//!   (CVE-2026-42559, fixed in 1.4.0) and an unauthenticated session-table leak
+//!   (CVE-2026-63128, 2.0.0); client: OAuth protected-resource metadata
+//!   validation (CVE-2026-63127 and GHSA-c9xm-49cp-xcr9, 2.0.0) and custom
+//!   headers forwarded to cross-origin redirect targets (CVE-2026-64684, 2.1.0).
 //!
 //! Every resolved copy of a package is checked, not just the first, and the
 //! comparison is numeric (a string compare orders 0.10.9 above 0.10.80).
@@ -22,7 +28,11 @@ use std::path::PathBuf;
 
 /// (package, first fixed version). A package listed here MUST be in the lockfile:
 /// a floor that silently passes because the package vanished pins nothing.
-const FLOORS: &[(&str, [u64; 3])] = &[("jsonwebtoken", [10, 3, 0]), ("openssl", [0, 10, 80])];
+const FLOORS: &[(&str, [u64; 3])] = &[
+    ("jsonwebtoken", [10, 3, 0]),
+    ("openssl", [0, 10, 80]),
+    ("rmcp", [2, 1, 0]),
+];
 
 fn workspace_lockfile() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");

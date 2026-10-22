@@ -103,6 +103,7 @@ fn token(agent: Uuid, client_id: Uuid) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -196,6 +197,8 @@ async fn workflow_submitted_by(
         &ingester_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, 0, "gen0"),
+            tenancy: None,
+            embed: None,
         },
         Some(&ingester_token),
     )

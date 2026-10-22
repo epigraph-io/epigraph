@@ -669,6 +669,16 @@ pub async fn create_edge(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(epigraph_db::carries_dedup_identity_key)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+        });
+    }
 
     // ONE transaction stamped with the CALLER's viewer (migration 120, D8):
     // the validation reads, the existence probes and the INSERT. Unstamped, an
@@ -1367,6 +1377,16 @@ pub async fn patch_edge(
     // — the column changes from object to array with no error. The downstream
     // SQL update relies on object-||-object shallow merge semantics; rejecting
     // non-objects up front is the only safe option.
+    if request
+        .properties
+        .as_ref()
+        .is_some_and(epigraph_db::carries_dedup_identity_key)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+        });
+    }
     if let Some(ref props) = request.properties {
         if !props.is_object() {
             return Err(ApiError::ValidationError {
@@ -4041,6 +4061,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

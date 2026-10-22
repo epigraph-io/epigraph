@@ -13,7 +13,7 @@ use epigraph_mcp::types::{
     RetireMatchCandidateParams,
 };
 use epigraph_mcp::{embed::McpEmbedder, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -184,8 +184,8 @@ async fn edge_relationships(pool: &PgPool, a: Uuid, b: Uuid) -> Vec<String> {
 
 fn result_text(out: rmcp::model::CallToolResult) -> String {
     let first = out.content.first().cloned().expect("first content");
-    match first.raw {
-        RawContent::Text(t) => t.text,
+    match first {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text content, got {other:?}"),
     }
 }

@@ -275,7 +275,11 @@ async fn rest_ingest_workflow_embeds_every_claim_it_writes(pool: PgPool) {
         ViewerExtractor(Viewer::resolve(&pool, caller).await.expect("viewer")),
         State(state),
         None,
-        Json(extraction),
+        Json(epigraph_api::routes::workflows::IngestWorkflowRequest {
+            extraction,
+            tenancy: None,
+            embed: None,
+        }),
     )
     .await
     .map_err(|e| format!("{e:?}"))

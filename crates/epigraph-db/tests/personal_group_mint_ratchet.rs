@@ -311,8 +311,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-cli/src/bin/method_search.rs",
         "default_decl_for_author",
-        1,
-        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused.",
+        2,
+        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused. \
+         The second call is in the bin's #[cfg(test)] dedup_race_tests module: it mints the \
+         fixture author's personal group, committed, on the throwaway #[sqlx::test] database \
+         before the racers start, and runs in no build of the binary.",
     ),
 ];
 

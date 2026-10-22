@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -159,13 +159,15 @@ pub async fn find_workflow_hierarchical(
 
 pub async fn report_hierarchical_outcome(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ReportHierarchicalOutcomeParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id =
         Uuid::parse_str(&params.workflow_id).map_err(|_| invalid_uuid("workflow_id"))?;
 
     do_report_hierarchical_outcome_with_embedder(
-        &server.pool,
+        server.scoped.as_ref(),
+        viewer,
         server.embedder.as_ref(),
         workflow_id,
         params.success,
@@ -198,7 +200,8 @@ fn report_goal_to_embed(goal_text: Option<&str>) -> Option<&str> {
 /// hierarchical branch of `report_workflow_outcome`.
 #[allow(clippy::too_many_arguments)]
 pub async fn do_report_hierarchical_outcome_with_embedder(
-    pool: &sqlx::PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     workflow_id: Uuid,
     success: bool,
@@ -219,8 +222,9 @@ pub async fn do_report_hierarchical_outcome_with_embedder(
         },
         None => None,
     };
-    do_report_hierarchical_outcome_via_pool(
-        pool,
+    do_report_hierarchical_outcome_as(
+        scoped,
+        viewer,
         workflow_id,
         success,
         step_executions,
@@ -249,10 +253,34 @@ fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
     }
 }
 
-/// Pool-only outcome reporting for hierarchical workflows. Updates
-/// `workflows.metadata` rolling counters and writes per-step
-/// `behavioral_executions` rows with `step_claim_id` resolved from the
-/// workflow's `executes` edges (level=2 claims, in plan order).
+/// The disclosure a report carries when some of its rows could not be
+/// attributed to a step: which `step_index` values were recorded with a NULL
+/// `step_claim_id`, and a warning saying why. `None` when every row resolved.
+///
+/// The warning names BOTH causes and never says which applied, and never how
+/// many steps the plan has: telling "out of range" apart from "not visible to
+/// you" would disclose that a step the caller cannot read exists. Shared with
+/// the HTTP route (`epigraph-api` `routes/workflows.rs`) so both transports
+/// say the same thing.
+#[must_use]
+pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
+    if unresolved.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} step row(s) were recorded with a null step_claim_id: step_index {:?} did not match \
+         a step of this workflow that you can read (the index is out of range, or the step is \
+         not visible to you). The run and its counters were recorded.",
+        unresolved.len(),
+        unresolved
+    ))
+}
+
+/// Outcome reporting for hierarchical workflows, on ONE transaction stamped
+/// with the REPORTER's viewer. Updates `workflows.metadata` rolling counters and
+/// writes per-step `behavioral_executions` rows with `step_claim_id` resolved
+/// from the workflow's `executes` edges (level=2 claims, in plan order) that
+/// the reporter can read.
 ///
 /// ALL OR NOTHING (U033 / I229). The counter read, the counter write, the
 /// step lookup and every step row run on ONE transaction, and the counter
@@ -261,17 +289,29 @@ fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
 /// database refuses fails the whole report and rolls the counters back; it
 /// used to be logged and skipped while the tool answered success.
 ///
-/// The transaction is a plain `pool.begin()`, not an author-stamped one:
-/// neither `workflows` nor `behavioral_executions` has row security, so there
-/// is no `WITH CHECK` for a stamp to satisfy. It is named `unstamped_tx` so
-/// `tests/residual_unstamped_writes.rs` does not count it as stamped.
+/// # Why the transaction is stamped
+///
+/// `workflows` and `behavioral_executions` have no row security, so the two
+/// writes need no stamp. The step LOOKUP does: it reads `claims` and `edges`,
+/// and on an UNSTAMPED application session row security admits only public
+/// rows. This used to run on a plain `pool.begin()`, so for a workflow whose
+/// steps are group-private EVERY reporter, the group's own members included,
+/// had each row written with a NULL `step_claim_id`, silently. Stamped, a
+/// member resolves its group's steps; a non-member records the run, gets NULL
+/// ids, and is told which indices did not resolve
+/// ([`unresolved_steps_warning`], plus a WARN log line per report).
+///
+/// Refuses, rather than falling back to an unstamped transaction, when this
+/// process has no [`epigraph_db::ScopedPool`]: a fallback would be the
+/// silently-NULL path again.
 ///
 /// `goal_embedding` is computed by the caller BEFORE this runs (embedder
 /// latency stays out of the row lock) and is written on every step row, so
 /// the report feeds `behavioral_affinity_hierarchical`.
 #[allow(clippy::too_many_arguments)]
-pub async fn do_report_hierarchical_outcome_via_pool(
-    pool: &sqlx::PgPool,
+pub async fn do_report_hierarchical_outcome_as(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
     workflow_id: Uuid,
     success: bool,
     step_executions: &[HierarchicalStepExecution],
@@ -283,14 +323,36 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     // 0. Validate before touching the database.
     validate_quality(quality)?;
 
-    let mut unstamped_tx = pool.begin().await.map_err(internal_error)?;
+    let scoped = scoped.ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = "report_hierarchical_outcome",
+            "report refused: this process was not built from a ScopedPool"
+        );
+        internal_error(
+            "report_hierarchical_outcome: this process was not built from a ScopedPool, so the \
+             step lookup cannot be stamped with the caller's viewer. Nothing was written.",
+        )
+    })?;
+    let mut tx = scoped
+        .begin_as(viewer)
+        .await
+        .map_err(crate::errors::db_caller_error)?;
 
     // 1. Confirm hierarchical workflow exists, and lock its row for the
     //    read-modify-write of the counters below.
+    //
+    // VISIBILITY-EXEMPT: this statement and the counter `UPDATE` touch only
+    // `workflows`, which is not in migration 062's `tier_a` array and carries
+    // neither `visibility` nor `owner_group_id`, so no predicate can be written
+    // for them (same category as `workflows.rs::report_workflow_outcome`'s
+    // routing probe). The viewer IS spent where there is something to filter:
+    // the step lookup, `WorkflowRepository::plan_step_claim_ids`, splices the
+    // edge and claim predicates, on this transaction stamped with the viewer.
     let row: Option<(serde_json::Value,)> =
         sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(&mut *unstamped_tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
     let mut metadata = match row {
@@ -340,54 +402,32 @@ pub async fn do_report_hierarchical_outcome_via_pool(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(&mut *unstamped_tx)
+        .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
 
     // 4. Resolve step_index → step_claim_id via this workflow's `executes`
-    //    edges, restricted to level=2 (steps), in PLAN order.
-    //
-    //    The leading key is the `plan_index` ordinal the ingest executor records
-    //    on each `executes` edge — the same key `resolve_steps_to_heads` uses, so
-    //    "step N" means one step everywhere. `e.created_at` is only the fallback
-    //    for edges written before the ordinal existed (and for `add_step`'s,
-    //    which carry none). It CANNOT be the primary key any more: the executor
-    //    writes a whole plan in one transaction, `NOW()` is transaction-start
-    //    time, so every edge ties and `c.id` — a content-derived UUID — decided
-    //    the order. MEASURED on the real binary as `epigraph_app`, 6 steps
-    //    reported 0..5: 2 attached to the right step claim, 4 to the wrong one,
-    //    tool result `isError: false`.
-    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT c.id \
-         FROM edges e \
-         JOIN claims c ON c.id = e.target_id \
-         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
-                       THEN (e.properties->>'plan_index')::int \
-                       ELSE 2147483647 END, \
-                  e.created_at ASC, c.id ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(&mut *unstamped_tx)
-    .await
-    .map_err(internal_error)?;
-    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
+    //    edges, restricted to level=2 (steps), in PLAN order, through the
+    //    reporter's viewer on this stamped transaction. The order key (the
+    //    `plan_index` ordinal, `created_at` only as the fallback) lives in
+    //    `WorkflowRepository::plan_step_claim_ids`, which the HTTP route
+    //    shares, so "step N" means one step on both transports.
+    let step_claim_ids =
+        epigraph_db::WorkflowRepository::plan_step_claim_ids(&mut tx, viewer, workflow_id)
+            .await
+            .map_err(internal_error)?;
 
     // 5. Per-step behavioral_executions rows. Single timestamp groups them.
-    //    A refused row fails the report: `?` drops `unstamped_tx`, which rolls
-    //    back the counter UPDATE and every earlier step row.
+    //    A refused row fails the report: `?` drops `tx`, which rolls back the
+    //    counter UPDATE and every earlier step row.
     let report_ts = chrono::Utc::now();
     let goal_text_owned = goal_text.unwrap_or(GOAL_PLACEHOLDER).to_string();
     let goal_embedding_pgvec = goal_embedding.map(crate::embed::format_pgvector);
+    let mut unresolved: Vec<usize> = Vec::new();
     for step_exec in step_executions {
         let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
-        if step_claim_id.is_none() && !step_claim_ids.is_empty() {
-            tracing::warn!(
-                workflow_id = %workflow_id,
-                step_index = step_exec.step_index,
-                known_steps = step_claim_ids.len(),
-                "step_index out of range; behavioral_executions row will have NULL step_claim_id"
-            );
+        if step_claim_id.is_none() {
+            unresolved.push(step_exec.step_index);
         }
         let step_beliefs = serde_json::json!({
             "deviated": step_exec.deviated,
@@ -408,7 +448,7 @@ pub async fn do_report_hierarchical_outcome_via_pool(
             run_label: run_label.map(str::to_string),
         };
         epigraph_db::BehavioralExecutionRepository::create(
-            &mut *unstamped_tx,
+            &mut *tx,
             row,
             goal_embedding_pgvec.as_deref(),
         )
@@ -416,9 +456,24 @@ pub async fn do_report_hierarchical_outcome_via_pool(
         .map_err(internal_error)?;
     }
 
-    unstamped_tx.commit().await.map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
 
-    success_json(&serde_json::json!({
+    let warning = unresolved_steps_warning(&unresolved);
+    if warning.is_some() {
+        // Every unattributed row is logged, the all-invisible case included:
+        // the old guard (`!step_claim_ids.is_empty()`) is what kept that case
+        // silent. The count of visible steps is deliberately not logged
+        // alongside the principal, for the same reason the warning omits it.
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            principal = ?viewer.principal(),
+            unresolved_step_indices = ?unresolved,
+            "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
+             (step_index out of range, or the step is not visible to the reporter)"
+        );
+    }
+
+    let mut response = serde_json::json!({
         "workflow_id": workflow_id,
         "use_count": use_count,
         "success_count": success_count,
@@ -428,7 +483,13 @@ pub async fn do_report_hierarchical_outcome_via_pool(
         // All or nothing: every requested step row was written, or the call
         // returned an error and none was.
         "step_executions_written": step_executions.len(),
-    }))
+        // The rows written with a NULL step_claim_id, in request order.
+        "unresolved_step_indices": unresolved,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    success_json(&response)
 }
 
 #[cfg(test)]
@@ -437,6 +498,98 @@ mod tests {
     use crate::tools::workflow_ingest::do_ingest_workflow_via_pool;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
     use epigraph_ingest::workflow::WorkflowExtraction;
+
+    /// A [`epigraph_db::ScopedPool`] over the `#[sqlx::test]` database, built
+    /// from the pool's own connect options (no query: see
+    /// `crate::maintenance`'s `scoped_pool_over` for why a `sqlx::query*` here
+    /// would trip `tests/no_inline_sql_in_tools.rs`).
+    async fn scoped_over(pool: &sqlx::PgPool) -> epigraph_db::ScopedPool {
+        let db = pool
+            .connect_options()
+            .get_database()
+            .expect("the #[sqlx::test] pool names its ephemeral database")
+            .to_string();
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        let url = match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        };
+        epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("ScopedPool::connect over the ephemeral test database")
+    }
+
+    /// The viewer these unit tests report as: a principal with no groups. The
+    /// test pool is the superuser, so row security filters nothing here and
+    /// these tests pin the counters / atomicity / ordering contract only. What
+    /// a stamped reporter can and cannot resolve is pinned on the application
+    /// role in `tests/hierarchical_outcome_stamped_reads.rs`.
+    async fn test_viewer(pool: &sqlx::PgPool) -> epigraph_db::visibility::Viewer {
+        epigraph_db::visibility::Viewer::resolve(pool, Uuid::nil())
+            .await
+            .expect("resolve viewer")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn report_on_test_scope(
+        pool: &sqlx::PgPool,
+        workflow_id: Uuid,
+        success: bool,
+        step_executions: &[HierarchicalStepExecution],
+        quality: Option<f64>,
+        goal_text: Option<&str>,
+        run_label: Option<&str>,
+        goal_embedding: Option<&[f32]>,
+    ) -> Result<CallToolResult, McpError> {
+        let scoped = scoped_over(pool).await;
+        do_report_hierarchical_outcome_as(
+            Some(&scoped),
+            &test_viewer(pool).await,
+            workflow_id,
+            success,
+            step_executions,
+            quality,
+            goal_text,
+            run_label,
+            goal_embedding,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn report_with_embedder_on_test_scope(
+        pool: &sqlx::PgPool,
+        embedder: &dyn epigraph_embeddings::EmbeddingService,
+        workflow_id: Uuid,
+        success: bool,
+        step_executions: &[HierarchicalStepExecution],
+        quality: Option<f64>,
+        goal_text: Option<&str>,
+        run_label: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let scoped = scoped_over(pool).await;
+        do_report_hierarchical_outcome_with_embedder(
+            Some(&scoped),
+            &test_viewer(pool).await,
+            embedder,
+            workflow_id,
+            success,
+            step_executions,
+            quality,
+            goal_text,
+            run_label,
+        )
+        .await
+    }
 
     fn extraction(canonical_name: &str) -> WorkflowExtraction {
         WorkflowExtraction {
@@ -509,7 +662,7 @@ mod tests {
             },
         ];
 
-        do_report_hierarchical_outcome_via_pool(
+        report_on_test_scope(
             &pool,
             workflow_id,
             true,
@@ -623,7 +776,7 @@ mod tests {
         .await
         .unwrap();
 
-        let res = do_report_hierarchical_outcome_via_pool(
+        let res = report_on_test_scope(
             &pool,
             workflow_id,
             true,
@@ -660,7 +813,7 @@ mod tests {
     async fn report_outcome_rejects_out_of_range_quality_without_side_effects(pool: sqlx::PgPool) {
         let workflow_id = ingest_fixture(&pool, "test-outcome-quality").await;
         for bad in [1.5_f64, -0.1, f64::NAN] {
-            let err = do_report_hierarchical_outcome_via_pool(
+            let err = report_on_test_scope(
                 &pool,
                 workflow_id,
                 true,
@@ -686,7 +839,7 @@ mod tests {
         assert_eq!(rows, 0, "a refused report must write no step rows");
 
         // Positive control: the boundary value 1.0 is accepted and lands.
-        do_report_hierarchical_outcome_via_pool(
+        report_on_test_scope(
             &pool,
             workflow_id,
             true,
@@ -713,7 +866,7 @@ mod tests {
         for i in 0..8 {
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
-                do_report_hierarchical_outcome_via_pool(
+                report_on_test_scope(
                     &pool,
                     workflow_id,
                     i % 2 == 0,
@@ -769,7 +922,7 @@ mod tests {
 
         let report_pool = pool.clone();
         let report = tokio::spawn(async move {
-            do_report_hierarchical_outcome_via_pool(
+            report_on_test_scope(
                 &report_pool,
                 workflow_id,
                 true,
@@ -849,7 +1002,7 @@ mod tests {
         let workflow_id = ingest_fixture(&pool, "test-outcome-embedding").await;
         let goal = "Validate hierarchical outcome reporting";
         let embedder = mock_embedder();
-        do_report_hierarchical_outcome_with_embedder(
+        report_with_embedder_on_test_scope(
             &pool,
             &embedder,
             workflow_id,
@@ -897,7 +1050,7 @@ mod tests {
     async fn an_embedder_failure_does_not_fail_the_report(pool: sqlx::PgPool) {
         let workflow_id = ingest_fixture(&pool, "test-outcome-embed-fail").await;
         let failing = mock_embedder().with_failures(1.0);
-        do_report_hierarchical_outcome_with_embedder(
+        report_with_embedder_on_test_scope(
             &pool,
             &failing,
             workflow_id,
@@ -923,21 +1076,58 @@ mod tests {
         assert_eq!(embedded, 0);
     }
 
+    /// A process with no `ScopedPool` cannot stamp the step lookup, so the
+    /// report is REFUSED and writes nothing: no fallback to an unstamped
+    /// transaction, which would be the silently-NULL path this replaced.
+    /// Positive control on the same workflow: with a `ScopedPool` the same
+    /// report lands.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
-        let bogus = Uuid::new_v4();
-        let err = do_report_hierarchical_outcome_via_pool(
-            &pool,
-            bogus,
+    async fn a_report_without_a_scoped_pool_is_refused_and_writes_nothing(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-no-scope").await;
+        let err = do_report_hierarchical_outcome_as(
+            None,
+            &test_viewer(&pool).await,
+            workflow_id,
             true,
-            &[],
-            None,
-            None,
+            &two_steps(),
+            Some(0.5),
+            Some("no scope"),
             None,
             None,
         )
         .await
-        .expect_err("unknown workflow id must error");
+        .expect_err("no ScopedPool: the report must be refused");
+        assert!(err.message.contains("ScopedPool"), "{err:?}");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        report_on_test_scope(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            Some(0.5),
+            Some("no scope"),
+            None,
+            None,
+        )
+        .await
+        .expect("with a ScopedPool the report lands");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
+        let bogus = Uuid::new_v4();
+        let err = report_on_test_scope(&pool, bogus, true, &[], None, None, None, None)
+            .await
+            .expect_err("unknown workflow id must error");
         assert!(err.message.contains("no hierarchical workflow"));
     }
 }

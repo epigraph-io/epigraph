@@ -28,6 +28,10 @@ regexes = [
   '''^0123456789abcdef$''',
   # Idempotency-key fixture in epigraph-api submit_packet tests.
   '''^unique_idempotency_key_12345$''',
+  # A synthetic procurement-style identifier in its normalized form (uppercase
+  # alphanumerics), the comparison key of the label-dedup engine's id tests
+  # (crates/epigraph-engine/tests/label_dedup/ids.rs). Not a credential.
+  '''^ACSDFACLCPFY29317$''',
 ]
 
 [[allowlists]]

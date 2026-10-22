@@ -1059,9 +1059,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "lock_content_hash_agent",
         "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
          (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
-         no row for a viewer to filter. Both callers (create_or_get_signed and POST /claims' \
-         if_not_exists=false branch) follow it with find_by_content_hash_and_agent, which takes \
-         the caller's viewer.",
+         no row for a viewer to filter. Its callers follow it with their own find: \
+         create_or_get_signed and POST /claims' if_not_exists=false branch with \
+         find_by_content_hash_and_agent, which takes the caller's viewer; create_conn_serialized \
+         and consolidate_act_conn with their existing VISIBILITY-EXEMPT write-path probes; \
+         epigraph-cli's method_search binary (a maintenance connection) with its content-hash \
+         probe.",
     ),
     (
         "claim.rs",
@@ -1682,6 +1685,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "claim.rs",
+        "tenancy_on_session_conn",
+        "READ of `claims` (`id, visibility, owner_group_id` only) for ids the caller already \
+         holds, with row security on the CONNECTION as the only filter, deliberately: the \
+         question is what the connection's own stamp can see, not what a viewer can. Its one \
+         caller is a declared-tenancy workflow ingest, on its system-agent stamped transaction, \
+         asking about the claims it reused before it writes an edge to any of them; an id \
+         missing from the answer exists but is invisible to the stamp and refuses the ingest. \
+         The answer is never returned to a caller (the caller-filtered read is \
+         `tenancy_of_conn`, which takes a viewer).",
+    ),
+    (
         "security_event.rs",
         "workflow_caller_write",
         "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
@@ -1724,6 +1739,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
          viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
          own transaction so the row authority-checked is the row linked.",
+    ),
+    (
+        "workflow.rs",
+        "workflows_executing_step_lineage",
+        "AUTHORITY READ of `edges` (`executes`), `claims` (the parent's `step_lineage_id` \
+         siblings) and `workflows` (no row security), for the `evolve_step` gate: it returns the \
+         workflows the caller must hold workflow authority over, so a spliced viewer predicate \
+         could only DROP workflows from that set, which makes the gate fail open, never safer. \
+         Both callers run it on the caller's own stamped write transaction (MCP \
+         `begin_author_stamped_tx`, REST `begin_claim_write`), before the act it gates, so row \
+         security on that connection still applies; the residual it leaves (lineage members \
+         split across tenancies out of band) is stated on the function. Returns workflow ids \
+         only, never content.",
     ),
     (
         "system_agent.rs",
@@ -1843,6 +1871,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_conn_serialized",
+        "WRITE. `create_conn`'s body, run inside the scope `create_conn` opens so the \
+         (content_hash, agent_id) dedup lock outlives its own statement (backlog 00f1a517). Same \
+         argument as create_conn: the lock reads no row, the `content_hash` dedup probe is the \
+         existing VISIBILITY-EXEMPT write-path read, and the INSERT is authorised by \
+         claims_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim.rs",
+        "find_by_content_hash_legacy_conn",
+        "WRITE-PATH READ. `create_conn`'s legacy `content_hash` dedup probe, moved into one \
+         function so the unlocked hit check and the re-check under the (content_hash, agent_id) \
+         dedup lock run the same SQL (backlog 00f1a517). It is the existing VISIBILITY-EXEMPT \
+         write-path read: its only callers are create_conn and create_conn_serialized, which \
+         return the row as the answer to their own create, not a disclosure to a viewer.",
+    ),
+    (
+        "claim.rs",
         "set_properties_conn",
         "WRITE. `UPDATE claims SET properties` by primary key on a claim the same transaction \
          just created — the ingest walk's hierarchy metadata. Authorised by claims_tenancy's \
@@ -1880,8 +1926,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim.rs",
         "migrate_superseded_edges",
         "WRITE. The two edge-migration statements, unchecked; called only after the caller \
-         established the privilege and the supersession. Its one read classifies the pair \
-         (a shared step lineage) for the statements that follow.",
+         established the privilege and the supersession. Its reads classify the pair (a shared \
+         step lineage; a non-public old claim, OD-32) for the statements that follow.",
+    ),
+    (
+        "claim.rs",
+        "non_public_frozen_relationships",
+        "WRITE-path probe, privileged only through its callers (`migrate_superseded_edges`, \
+         `repair_marked_duplicate`). Reads the retired claim's own `visibility` to decide which \
+         relationships its edge migration leaves on it (OD-32); returns a relationship list, \
+         never row content, and is no disclosure to a caller.",
     ),
     (
         "claim.rs",
@@ -1923,6 +1977,44 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "mark_duplicate_act",
         "WRITE. The act's checks and single claims UPDATE; the caller owns the stamped \
          transaction, and claims_tenancy's WITH CHECK authorises it.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_act_attributed_conn",
+        "WRITE. mark_duplicate_act_conn with the caller's provenance on the identity edge; the \
+         same act on the caller's stamped transaction, authorised by claims_tenancy's and \
+         edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_with_repair_attributed_conn",
+        "WRITE, privileged only (refuses otherwise). mark_duplicate_with_repair_conn with the \
+         caller's provenance; act and repair in one transaction on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "session_may_unmark_conn",
+        "READ of the session's own write authority (`epigraph_session_writes_node`) over two \
+         claims the caller already read through its viewer, plus the canonical's visibility; \
+         projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
+        "session_may_mark_conn",
+        "READ. session_may_unmark_conn's predicate (the mark act's own authority), asked by a \
+         planner predicting which marks apply; projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate_conn",
+        "WRITE, privileged only (refuses otherwise). The reversal of a dedup's repair from its \
+         revert record, on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate",
+        "WRITE. The reversal's statements, unchecked; called only after the caller established \
+         the privilege.",
     ),
     (
         "claim.rs",
@@ -2102,6 +2194,28 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          was COMPUTED from, not the set the connection CARRIES — the question is the latter. \
          Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
          `IngestTx::owner_decl`, which refuses the ingest when it is false.",
+    ),
+    // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
+    // the raw pool onto the route's stamped transaction.
+    (
+        "triple.rs",
+        "batch_create_mentions",
+        "WRITE of `entity_mentions` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_mentions` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `entity_mentions_tenancy`'s WITH CHECK applies on the \
+         stamped connection. An INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "triple.rs",
+        "batch_create_triples",
+        "WRITE of `triples` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_triples` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `triples_tenancy`'s WITH CHECK applies on the stamped \
+         connection. An INSERT has no read for a viewer marker to filter.",
     ),
 ];
 
@@ -2310,6 +2424,27 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "Calls 117's `epigraph_record_cascade_deferral` definer on the CALLER's session: an \
          audit-row write whose control is the definer's own (attribution to the session \
          principal, the act must be the session's). Returns the new row's id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "record_dedup_revert",
+        "INSERT INTO `security_events` of a `cascade.dedup_revert_record` row with agent_id \
+         NULL, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
+         session). Returns the new id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "dedup_revert_record",
+        "READ of `security_events` for the administrative un-mark, on the maintenance \
+         connection: the revert record is agent-less, so `security_events_read` shows it to \
+         privileged and admin sessions only; nothing reaches a caller (apply_unmark reports \
+         counts).",
+    ),
+    (
+        "admin_cascade.rs",
+        "open_dedup_cascades",
+        "READ of `security_events` (the replay's pending window) for the administrative \
+         un-mark, on the maintenance connection; returns row ids it retires, never to a caller.",
     ),
     (
         "admin_cascade.rs",
@@ -2643,6 +2778,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
          in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
     ),
+    (
+        "entity.rs",
+        "upsert",
+        "WRITE of one `entities` row (insert, or merge on the canonical `(lower(name), type_top)` \
+         pair). `entities` is the instance-wide RDF dictionary: no `visibility` / \
+         `owner_group_id` column and row security off, the posture `entity.rs::get` records above, \
+         so there is no predicate to splice and no policy to select. Widened from `&PgPool` so \
+         `routes/entities.rs::create_entity` writes on the caller's STAMPED transaction (backlog \
+         850dcc61), which refuses an elevated read-only token; the SQL is unchanged and the \
+         engine tests' `&PgPool` callers still satisfy the bound.",
+    ),
     // ── FIVE MORE WRITES, from the conversion of the MCP tools PR #494 left
     // unconverted. Same argument as the three writes at the top of this
     // register — the control on a write is migration 077's `WITH CHECK`
@@ -2768,6 +2914,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "session_writer_group",
+        "Reads NO table row of its own: `SELECT public.epigraph_writer_group()` (migration \
+         114), which returns the SESSION's own writer group (its operator's or its own \
+         personal group, and only if it is in the session's writable set) from the session's \
+         principal stamp. It answers a question about the caller's identity, not about any \
+         row a viewer predicate could filter.",
+    ),
+    (
+        "edge.rs",
         "is_in_force",
         "READ of one `edges` row by primary key, returning only whether it is in force. Its \
          callers are the DS edge-factor wiring deciding whether to fire on an edge the SAME \
@@ -2821,6 +2976,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
+        "backfill_evidence_type_where_untyped",
+        "WRITE: `UPDATE mass_functions SET evidence_type` for the legacy evidence-type backfill \
+         (backlog bc06ec6f), only on rows still untyped. Maintenance connection only (the binary \
+         refuses an unset MAINTENANCE_DATABASE_URL); the backfill is corpus-wide by definition, \
+         so there is no viewer to filter by.",
+    ),
+    (
+        "mass_function.rs",
         "clear_claim_belief",
         "WRITE: `UPDATE claims` clearing the cached belief columns. Authorised by claims_tenancy's \
          WITH CHECK on the caller's stamped connection, like `update_claim_belief`.",
@@ -2842,6 +3005,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
          authorised by migration 115's cascade definer on the caller's connection, not by a \
          viewer.",
+    ),
+    (
+        "mass_function.rs",
+        "untyped_provenance_page",
+        "READ of every tenant's untyped `mass_functions` rows with their stored provenance, for \
+         the legacy evidence-type backfill (backlog bc06ec6f). Maintenance connection only: a \
+         per-viewer page would leave every other tenant's rows untyped while reporting the run \
+         complete.",
     ),
     (
         "mass_function.rs",
@@ -2972,6 +3143,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          that follows (carries a `VISIBILITY-EXEMPT: WRITE path` note), on the ingest system \
          agent's stamped transaction that owns these claims; the caller's authority is the \
          workflow authority rule, not read visibility, so no caller viewer is spliced.",
+    ),
+    (
+        "workflow.rs",
+        "lock_for_plan_edit",
+        "READ of `workflows` only, `FOR UPDATE`: locks the one row `add_step` is about to \
+         extend, so two concurrent calls cannot take the same next `plan_index`. `workflows` \
+         has no row security and no policy, so there is nothing for a viewer to filter; the \
+         caller's authority is `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "executes_plan_indices",
+        "READ of `edges`: the target, `plan_index` and publicness of each live `executes` edge \
+         of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \
+         existing edge is written. It runs on the ingest system agent's stamped transaction, \
+         so it is bounded to what that stamp may read, and an index is written only when every \
+         edge it read is public, so the index discloses nothing a reader of the new public \
+         edge could not read; the caller's authority is the workflow authority rule, not read \
+         visibility, so no caller viewer is spliced.",
     ),
 ];
 

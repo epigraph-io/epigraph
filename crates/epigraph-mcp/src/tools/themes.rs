@@ -136,7 +136,7 @@ pub async fn theme_cluster(
         );
     }
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
@@ -347,7 +347,7 @@ pub async fn list_themes(
         "has_more": i64::from(offset) + returned < total,
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
@@ -449,7 +449,7 @@ pub async fn get_theme(
         "members_has_more": i64::from(members_offset) + members_returned < members_total,
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
