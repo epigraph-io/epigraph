@@ -208,6 +208,11 @@ pub struct MarkedDuplicateRow {
     pub content: String,
     pub labels: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The duplicate's author.
+    pub agent_id: Uuid,
+    /// The canonical's author, so a caller can tell a duplicate of another
+    /// owner from one of the canonical's own.
+    pub canonical_agent_id: Uuid,
 }
 
 /// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
@@ -5339,11 +5344,14 @@ impl ClaimRepository {
                    /* {EDGE_VISIBILITY:e} */
             )
             SELECT DISTINCT w.canonical, c.id, c.content,
-                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at
+                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
+                   c.agent_id, k.agent_id AS canonical_agent_id
               FROM walk w
               JOIN claims c ON c.id = w.dup
+              JOIN claims k ON k.id = w.canonical
              WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
                /* {VISIBILITY:c} */
+               /* {VISIBILITY:k} */
              ORDER BY w.canonical, c.id
              LIMIT $5
             "#,
@@ -5359,6 +5367,40 @@ impl ClaimRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The in-force dedup identity edge out of `dup` (`same_as` carrying
+    /// `properties.dedup`), with the claim it names, when the viewer can read
+    /// it: which mark a claim currently carries, so a revert can tell the mark
+    /// it made from a later one onto the same canonical.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn dedup_identity_edge_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+    ) -> Result<Option<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.target_id
+              FROM edges e
+             WHERE e.source_id = $1 AND e.source_type = 'claim' AND e.target_type = 'claim'
+               AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+               /* {EDGE_VISIBILITY:e} */
+             ORDER BY e.created_at DESC, e.id
+             LIMIT 1
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
+            .bind(dup)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// List claims that have NEVER been touched by decomposition: claims that

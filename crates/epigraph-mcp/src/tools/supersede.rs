@@ -358,25 +358,48 @@ pub async fn unmark_duplicate(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let dup = parse_uuid(&params.claim_id)?;
-    let out = unmark_duplicate_expecting(server, viewer, auth, dup, None).await?;
+    let out =
+        unmark_duplicate_expecting(server, viewer, auth, dup, UnmarkExpectation::default()).await?;
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&out).map_err(internal_error)?,
     )]))
 }
 
-/// [`unmark_duplicate`]'s body, for a caller that knows which dedup it means
-/// to undo (`revert_label_dedup`): with `expected_canonical`, a claim that is
-/// now a duplicate of ANOTHER claim is refused, nothing written. Returns the
-/// tool's response object.
-pub(crate) async fn unmark_duplicate_expecting(
+/// Which mark a caller means to undo (`revert_label_dedup`): the canonical it
+/// was marked onto and, when known, the identity edge that mark wrote. A claim
+/// marked since onto another claim, or marked again (a new identity edge),
+/// is refused with nothing written.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UnmarkExpectation {
+    pub canonical: Option<uuid::Uuid>,
+    pub identity_edge: Option<uuid::Uuid>,
+}
+
+/// What [`unmark_gate`] proved: the claim's canonical, its author and text,
+/// and the principal the un-mark acts as.
+pub(crate) struct UnmarkGate {
+    pub canonical: uuid::Uuid,
+    author: uuid::Uuid,
+    content: String,
+    actor: uuid::Uuid,
+}
+
+/// Every check `unmark_duplicate` makes before it writes, and nothing else:
+/// the claim and its canonical read through the CALLER (a claim it cannot
+/// read is "not found", like a missing one), the expectation, then the same
+/// gate as mark_duplicate and the database's own write predicate on the
+/// caller's stamped transaction, rolled back. Not a rehearsal of the act:
+/// once operator binding is armed, an application session may not clear a
+/// `supersedes` at all (migration 153), and the act that commits runs with
+/// the reversal on the administrative connection. Read-only, so a caller can
+/// prove a batch of un-marks admissible before writing any of it.
+pub(crate) async fn unmark_gate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     dup: uuid::Uuid,
-    expected_canonical: Option<uuid::Uuid>,
-) -> Result<serde_json::Value, McpError> {
-    // The canonical, the author and the text, read through the CALLER: a claim
-    // it cannot read is "not found", like a missing one.
+    expected: UnmarkExpectation,
+) -> Result<UnmarkGate, McpError> {
     let (canonical, author, content) = {
         let mut tx = crate::claim_helper::begin_author_stamped_tx(
             server,
@@ -392,29 +415,25 @@ pub(crate) async fn unmark_duplicate_expecting(
             .supersedes
             .ok_or_else(|| invalid_params(format!("claim {dup} is not a marked duplicate")))?
             .into();
+        if let Some(edge) = expected.identity_edge {
+            let live = ClaimRepository::dedup_identity_edge_of(&mut *tx, viewer, dup)
+                .await
+                .map_err(internal_error)?;
+            if live.map(|(id, _)| id) != Some(edge) {
+                return Err(invalid_params(format!(
+                    "claim {dup} no longer carries the mark with identity edge {edge} (it was \
+                     un-marked or marked again since); nothing was written"
+                )));
+            }
+        }
         (canonical, claim.agent_id.into(), claim.content.clone())
     };
-    if let Some(expected) = expected_canonical.filter(|e| *e != canonical) {
+    if let Some(expected) = expected.canonical.filter(|e| *e != canonical) {
         return Err(invalid_params(format!(
             "claim {dup} is now a duplicate of {canonical}, not of {expected}; nothing was \
              written"
         )));
     }
-
-    // No administrative connection: refuse before anything is written.
-    let mut session = crate::maintenance::admin_cascade_session(server)
-        .await
-        .map_err(|reason| McpError {
-            code: rmcp::model::ErrorCode::INVALID_REQUEST,
-            message: format!("{UNMARK_NEEDS_ADMIN_CONNECTION} ({reason})").into(),
-            data: None,
-        })?;
-
-    // THE CALLER'S AUTHORITY: the same gate as mark_duplicate, then the
-    // database's own write predicate on the caller's stamped transaction. Not
-    // a rehearsal of the act: once operator binding is armed, an application
-    // session may not clear a `supersedes` at all (migration 153), and the act
-    // that commits runs with the reversal on the administrative connection.
     let (mut tx, actor) = begin_claim_act(
         server,
         viewer,
@@ -439,6 +458,39 @@ pub(crate) async fn unmark_duplicate_expecting(
             "un-mark as a duplicate",
         ));
     }
+    Ok(UnmarkGate {
+        canonical,
+        author,
+        content,
+        actor,
+    })
+}
+
+/// [`unmark_duplicate`]'s body, for a caller that knows which dedup it means
+/// to undo (`revert_label_dedup`, see [`UnmarkExpectation`]). Returns the
+/// tool's response object.
+pub(crate) async fn unmark_duplicate_expecting(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dup: uuid::Uuid,
+    expected: UnmarkExpectation,
+) -> Result<serde_json::Value, McpError> {
+    let UnmarkGate {
+        canonical,
+        author,
+        content,
+        actor,
+    } = unmark_gate(server, viewer, auth, dup, expected).await?;
+
+    // No administrative connection: refuse before anything is written.
+    let mut session = crate::maintenance::admin_cascade_session(server)
+        .await
+        .map_err(|reason| McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: format!("{UNMARK_NEEDS_ADMIN_CONNECTION} ({reason})").into(),
+            data: None,
+        })?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Undedup,

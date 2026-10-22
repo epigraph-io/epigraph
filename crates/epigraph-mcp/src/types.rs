@@ -3455,6 +3455,15 @@ pub struct AppliedMarkParam {
     pub dup: String,
     #[schemars(description = "The claim it was marked a duplicate of")]
     pub canonical: String,
+    #[schemars(description = "The matching tier, as the apply returned it")]
+    pub rule: String,
+    #[serde(default)]
+    pub matched_on: String,
+    #[schemars(
+        description = "The identity edge the mark wrote; when given, a claim marked again since (a new edge) is not un-marked"
+    )]
+    #[serde(default)]
+    pub identity_edge: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

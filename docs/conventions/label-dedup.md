@@ -85,8 +85,13 @@ clamped}`. A read that hits the cap sets `coverage.truncated`.
 The reads are of **current** claims only, so a marked duplicate is not a
 member. Each claim read carries its marked duplicates (the index view below):
 the engine reads their fields where the claim's own are read. For example, a
-duplicate's later deadline holds off the canonical's close-out. A duplicate
-read that hits the cap truncates the read too.
+duplicate's later deadline holds off the canonical's close-out.
+
+- A duplicate read that hits the cap truncates the read too.
+- Only duplicates of the canonical's own owner count. A claim another owner
+  marked onto a public member (a far deadline, say) must not move the
+  member's dates. It is left out and listed in
+  `coverage.foreign_duplicates_ignored`.
 
 Every claim the caller can read that carries the family label is a member.
 That includes another author's public claim, so membership is not ownership.
@@ -121,11 +126,17 @@ its losers onto its survivor, so:
   - So the same agent, an operator and its agents, and two agents of one
     operator are each one owner.
   - A `claims:admin` caller owns every member and is still refused.
-- **A mark is the caller's own act**, on its own stamped transaction. It must
-  write the duplicate, and write the canonical or the canonical must be
-  public: the dedup act's row security and FA04 rule. A `claims:admin` caller
-  therefore cannot mark inside a group it cannot write, even where it could
-  relabel through the audited admin path.
+- **A mark is the caller's own act**, on its own stamped transaction, under
+  `mark_duplicate`'s rules:
+  - the caller must write the duplicate (the act's row security);
+  - it must write the group that owns the canonical, since the cascade moves
+    other writers' edges and mass functions onto it;
+  - the canonical must still be current.
+
+  A `claims:admin` caller therefore cannot mark inside a group it cannot
+  write, even where it could relabel through the audited admin path. That
+  keeps every mark one its own `unmark_duplicate`, and so the revert, can
+  undo.
 
 Probe applies the same ownership check: a `match` or `match_only` on a claim
 the caller does not own becomes `review`, with `matched_id` kept for the
@@ -161,11 +172,12 @@ write target. It uses:
 - the gates `update_labels` runs: the retirement-label gate, and whether the
   owner group is writable or reachable through the admin path.
 
-`may_mark` is asked of the dedup act's own write predicates
-(`ClaimRepository::session_may_mark_conn`), on a transaction stamped as the
-write identity and then rolled back. Nothing is written. Refusals that only
-the act or the database decides (FA07, a concurrent change) are reported by
-apply, per unit.
+`may_mark` checks the canonical rule above, then asks the dedup act's own
+write predicates (`ClaimRepository::session_may_mark_conn`), on a transaction
+stamped as the write identity and then rolled back. Nothing is written. An
+identity that cannot open a write transaction gets `may_mark: false`, not an
+error. Refusals that only the act or the database decides (FA07, a concurrent
+change) are reported by apply, per unit.
 
 `unit_check.applies` is false when any of these predictions fails. Apply's
 refusals come from the same checks.
@@ -187,7 +199,8 @@ refusals come from the same checks.
    - A unit is one of: a cluster (its losers marked, then the survivor's
      labels), one hygiene claim, one close-out claim, or one lifecycle signal.
    - **Ownership first**, as above (`CROSS_OWNER_MEMBER`, `TARGET_NOT_OWNED`,
-     or `review`). Nothing is written before it passes.
+     or `review`), then the canonical rule (`MARK_REFUSED`). Nothing is
+     written before they pass.
    - **Then each mark**, through `mark_duplicate`'s act on this transaction
      (`ClaimRepository::mark_duplicate_act_attributed_conn`). The duplicate
      becomes non-current, its embedding is cleared, and it gains a `same_as`
@@ -197,8 +210,9 @@ refusals come from the same checks.
      - the `run_tag` and the `plan_hash`;
      - the acting agent.
 
-     The repair (moving the duplicate's edges and evidence) is the dedup
-     cascade:
+     The repair (re-pointing the duplicate's edges and moving its mass
+     functions onto the canonical; its evidence rows stay with it) is the
+     dedup cascade:
      - it runs after the commit, on the administrative connection;
      - on a server without that connection, it is deferred on the same
        transaction and runs at the next replay.
@@ -237,10 +251,18 @@ Use it to undo an apply, for example when an apply generation mis-merged. Its
 input is that apply's `applied_units` and `applied_marks`, exactly as
 returned.
 
-1. With marks to undo, the server's administrative connection is proved
-   usable first. Without it, the call is refused with
-   `ADMIN_CONNECTION_REQUIRED` and nothing is written. An un-mark has no
-   deferred form, and the label half alone would leave the marks without the
+1. Nothing is written until every un-mark is proved admissible:
+   - the server's administrative connection must be usable
+     (`ADMIN_CONNECTION_REQUIRED` otherwise; an un-mark has no deferred form);
+   - each un-mark's own gate must pass, read-only: the claim still carries
+     the mark the apply made (the same canonical and, when the input gives
+     it, the same `identity_edge`), and the caller has `unmark_duplicate`'s
+     authority over it;
+   - a canonical that is itself a marked duplicate must be un-marked earlier
+     by the same revert.
+
+   Otherwise the call is refused with `UNMARK_REFUSED`, naming every un-mark
+   that would fail. The label half alone would leave the marks without the
    labels they were applied with.
 2. Then the label writes are undone, newest first
    (`epigraph_engine::label_dedup::revert_writes`: added and removed swapped,
@@ -248,15 +270,17 @@ returned.
    under the caller's identity.
 3. Then the marks are undone, newest first
    (`epigraph_engine::label_dedup::revert_marks`), each through
-   `unmark_duplicate` with the canonical the apply recorded. A claim that has
-   since been marked onto another claim is refused. An un-mark is refused
-   while the duplicate's canonical is itself a marked duplicate, which is why
-   the order matters.
+   `unmark_duplicate`. An un-mark is refused while the duplicate's canonical
+   is itself a marked duplicate, which is why the order matters: a chain made
+   across applies is undone by reverting the later apply first, or both in
+   one call.
 4. Re-plan with the original arguments. When nothing else changed the family
    meanwhile, the plan is the original one again: the same `plan_hash`.
 
-Each step is reported (`steps[]`, with `ok` and `error`). A failed step does
-not stop the others, and `status` is then `partial` instead of `reverted`.
+Each step is reported (`steps[]`, with `ok` and `error`). A step that still
+fails (a race after the proof) does not stop the others, and `status` is then
+`partial` instead of `reverted`. One call takes at most 10,000 label changes
+and as many marks.
 Every step takes the gates its single-claim tool takes, so a revert can do
 nothing `update_labels` and `unmark_duplicate` would not let the caller do.
 
@@ -267,10 +291,11 @@ on the original set.
 What it restores, and what it does not:
 
 - **Index membership, currency and `supersedes`, exactly.** The un-mark puts
-  back what the dedup cascade moved, from the record that cascade kept. A
-  mark whose cascade was deferred and has not yet been replayed has no record,
-  and its un-mark is refused until the replay runs. The identity edge stays,
-  retracted (`valid_to` set), as the audit of the mark and its reversal.
+  back what the dedup cascade moved, from the record that cascade kept. For a
+  mark whose cascade was deferred and has not run, there is nothing to move
+  back: the un-mark retires the open deferral instead. The identity edge
+  stays, retracted (`valid_to` set), as the audit of the mark and its
+  reversal.
 - **Label sets, exactly.** The write path stores a claim's labels sorted and
   distinct. A claim whose labels were stored in another order (or with
   duplicates) before the apply comes back with the same set, in sorted order.
@@ -304,6 +329,10 @@ included.
   extra id, where the canonical is.
 - It reads through the caller's viewer, as the plan does. An unreadable
   canonical is listed in `missing`.
+- Each duplicate carries its `agent_id`. Unlike the plan, the view does not
+  leave out a duplicate of another owner: a reader that takes dates from it
+  should do the same.
+- It takes any claim ids; it does not check the index-family allowlist.
 - `max_claims` caps the duplicates read; `truncated` reports a read that hit
   the cap.
 
@@ -344,10 +373,15 @@ Tool errors carry `data.code`:
   review-pair bounds; a family that reads in under `max_claims` can still be
   refused here)
 - `TRUNCATED` (probe)
-- `FAMILY_NOT_INDEX`, `FAMILY_NOT_ALLOWED` (every tool, before any read)
-- `ADMIN_CONNECTION_REQUIRED` (revert)
+- `FAMILY_NOT_INDEX`, `FAMILY_NOT_ALLOWED` (plan, apply and probe, before any
+  read; revert and the index view take no profile)
+- `ADMIN_CONNECTION_REQUIRED`, `UNMARK_REFUSED` (revert)
 
 Apply's `TRUNCATED`, `RESOURCE_CAP` and `PLAN_DRIFT` are a `refused` status, not
-an error. A failed unit carries its code in `results[].code`: one of
-`CROSS_OWNER_MEMBER`, `TARGET_NOT_OWNED`, or `MARK_REFUSED` (the dedup act
-refused the mark).
+an error. A failed unit carries its code in `results[].code`:
+
+- `CROSS_OWNER_MEMBER`;
+- `TARGET_NOT_OWNED`;
+- `MARK_REFUSED` (the canonical rule, or the dedup act refused the mark);
+- null, for a label write refused by `update_labels`' own gates or an
+  internal error (see `error`).

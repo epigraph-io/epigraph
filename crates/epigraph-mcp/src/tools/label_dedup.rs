@@ -151,6 +151,7 @@ pub mod codes {
     pub const TARGET_NOT_OWNED: &str = "TARGET_NOT_OWNED";
     pub const MARK_REFUSED: &str = "MARK_REFUSED";
     pub const ADMIN_CONNECTION_REQUIRED: &str = "ADMIN_CONNECTION_REQUIRED";
+    pub const UNMARK_REFUSED: &str = "UNMARK_REFUSED";
 }
 
 /// Per-process label-dedup settings, read once at startup.
@@ -581,12 +582,14 @@ fn check_families(
 /// carries its marked duplicates ([`ClaimRepository::marked_duplicates_of`],
 /// the `index_view`), read on the same connection and capped like the family
 /// read: a member whose duplicates did not all fit marks the read truncated.
+/// A duplicate of another owner than its canonical's is left out (and
+/// reported), so it cannot move the canonical's dates.
 async fn read_family(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     specs: &[ReadSpec],
     cap: usize,
-) -> Result<(Vec<(ReadPurpose, Snapshot)>, DateTime<Utc>), McpError> {
+) -> Result<FamilyRead, McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         internal_error(
             "label-dedup reads need a ScopedPool (EpiGraphMcpFull::with_scoped_pool): an \
@@ -597,6 +600,8 @@ async fn read_family(
     let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
     let snapshot_at = Utc::now();
     let mut out = Vec::with_capacity(specs.len());
+    let mut owners = OwnerCache::default();
+    let mut foreign = Vec::new();
     for spec in specs {
         let rows = ClaimRepository::list_all_by_labels_ordered_by_id(
             &mut *read,
@@ -615,6 +620,15 @@ async fn read_family(
         let dups_truncated = dups.len() > cap;
         let mut by_canonical: BTreeMap<Uuid, Vec<DedupClaim>> = BTreeMap::new();
         for d in dups.into_iter().take(cap) {
+            // Only the canonical's own owner's duplicates feed the plan: a
+            // stranger who marked a claim onto a public member must not move
+            // its dates (a far deadline would hold off its close-out).
+            if owners.owner_of(&mut read, d.agent_id).await?
+                != owners.owner_of(&mut read, d.canonical_agent_id).await?
+            {
+                foreign.push(json!({"canonical": d.canonical, "id": d.id}));
+                continue;
+            }
             by_canonical
                 .entry(d.canonical)
                 .or_default()
@@ -641,7 +655,21 @@ async fn read_family(
         out.push((spec.purpose, snapshot));
     }
     read.commit().await.map_err(db_caller_error)?;
-    Ok((out, snapshot_at))
+    foreign.sort_by_key(Value::to_string);
+    foreign.dedup();
+    Ok(FamilyRead {
+        snapshots: out,
+        at: snapshot_at,
+        foreign_duplicates: foreign,
+    })
+}
+
+/// One read of a profile's families.
+struct FamilyRead {
+    snapshots: Vec<(ReadPurpose, Snapshot)>,
+    at: DateTime<Utc>,
+    /// Duplicates marked onto a member by another owner, left out of the plan.
+    foreign_duplicates: Vec<Value>,
 }
 
 /// Read the family as `viewer` and plan.
@@ -649,14 +677,14 @@ async fn compute_plan(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     p: &Prepared,
-) -> Result<(engine::Plan, DateTime<Utc>), McpError> {
+) -> Result<Planned, McpError> {
     let specs = p
         .profile
         .reads(&p.sections)
         .map_err(|e| engine_refusal(&e))?;
-    let (snaps, at) = read_family(server, viewer, &specs, p.max.effective).await?;
+    let read = read_family(server, viewer, &specs, p.max.effective).await?;
     let mut inputs = PlanInputs::default();
-    for (purpose, snap) in snaps {
+    for (purpose, snap) in read.snapshots {
         match purpose {
             ReadPurpose::Members => inputs.members = snap,
             ReadPurpose::LifecycleSignals => inputs.lifecycle_signals = Some(snap),
@@ -673,14 +701,27 @@ async fn compute_plan(
         sections: &p.sections,
     };
     let plan = engine::plan(&req, &inputs).map_err(|e| engine_refusal(&e))?;
-    Ok((plan, at))
+    Ok(Planned {
+        plan,
+        at: read.at,
+        foreign_duplicates: read.foreign_duplicates,
+    })
+}
+
+/// A plan and what its read saw.
+struct Planned {
+    plan: engine::Plan,
+    at: DateTime<Utc>,
+    foreign_duplicates: Vec<Value>,
 }
 
 /// The plan as the tools return it: the engine's plan plus the snapshot time,
 /// the `max_claims` report and the write units apply would run.
-fn plan_json(plan: &engine::Plan, at: DateTime<Utc>, max: MaxClaims) -> Result<Value, McpError> {
+fn plan_json(planned: &Planned, max: MaxClaims) -> Result<Value, McpError> {
+    let plan = &planned.plan;
     let mut v = serde_json::to_value(plan).map_err(internal_error)?;
-    v["coverage"]["snapshot_at"] = json!(at.to_rfc3339());
+    v["coverage"]["snapshot_at"] = json!(planned.at.to_rfc3339());
+    v["coverage"]["foreign_duplicates_ignored"] = json!(planned.foreign_duplicates);
     v["max_claims"] = max.json();
     v["write_units"] = serde_json::to_value(plan.write_units()).map_err(internal_error)?;
     Ok(v)
@@ -759,30 +800,53 @@ async fn cross_owner(
     ids: &[Uuid],
 ) -> Result<Option<String>, McpError> {
     let mut first: Option<(Uuid, Uuid)> = None;
+    let mut owners = OwnerCache::default();
     for id in ids {
+        // An unreadable member is not a cross-owner verdict: the ownership
+        // check refuses it on its own.
         let Some((author, _)) = ClaimRepository::write_target_of(&mut *conn, viewer, *id)
             .await
             .map_err(db_caller_error)?
         else {
-            return Ok(Some(format!("claim {id} is not readable by this identity")));
+            continue;
         };
-        let owner = epigraph_db::AgentRepository::operator_of_author(&mut *conn, author)
-            .await
-            .map_err(internal_error)?
-            .map_or(author, |o| o.operator_id);
+        let owner = owners.owner_of(&mut *conn, author).await?;
         match first {
             None => first = Some((*id, owner)),
+            // The owner ids stay out of the text: an operator link is not
+            // something a reader of these claims may otherwise learn.
             Some((other, other_owner)) if other_owner != owner => {
                 return Ok(Some(format!(
-                    "claim {other} (owner {other_owner}) and claim {id} (owner {owner}) have \
-                     different owners; label dedup never marks across owners, whatever the \
-                     caller's grant: review the cluster"
+                    "claims {other} and {id} have different owners; label dedup never marks \
+                     across owners, whatever the caller's grant: review the cluster"
                 )));
             }
             Some(_) => {}
         }
     }
     Ok(None)
+}
+
+/// A claim author's owner (its operator, else itself), read once per author.
+#[derive(Default)]
+struct OwnerCache(BTreeMap<Uuid, Uuid>);
+
+impl OwnerCache {
+    async fn owner_of(
+        &mut self,
+        conn: &mut sqlx::PgConnection,
+        author: Uuid,
+    ) -> Result<Uuid, McpError> {
+        if let Some(owner) = self.0.get(&author) {
+            return Ok(*owner);
+        }
+        let owner = epigraph_db::AgentRepository::operator_of_author(&mut *conn, author)
+            .await
+            .map_err(internal_error)?
+            .map_or(author, |o| o.operator_id);
+        self.0.insert(author, owner);
+        Ok(owner)
+    }
 }
 
 /// Why the write identity does not own claim `id`, or `None` when it does:
@@ -815,6 +879,42 @@ async fn member_not_owned(
             Err(e) => Some(format!("claim {id}: {}", e.message)),
         },
     )
+}
+
+/// Why the write identity may not mark a duplicate onto `canonical`, or
+/// `None`: `mark_duplicate`'s own rule for the canonical (its owning group
+/// must be one the caller writes, since the cascade moves other writers'
+/// edges and mass functions onto it), and the canonical must still be
+/// current (a mark onto a retired claim would build a chain the plan never
+/// showed). Without it a label-dedup apply could make a mark that
+/// `mark_duplicate` refuses, and that `unmark_duplicate` (the revert) then
+/// refuses too.
+async fn canonical_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    canonical: Uuid,
+) -> Result<Option<String>, McpError> {
+    let Some((_, group)) = ClaimRepository::write_target_of(&mut *conn, viewer, canonical)
+        .await
+        .map_err(db_caller_error)?
+    else {
+        return Ok(Some(format!(
+            "canonical {canonical} is not readable by this identity"
+        )));
+    };
+    if !viewer.writable_groups().contains(&group) {
+        return Ok(Some(format!(
+            "this identity does not write the group that owns canonical {canonical}, so \
+             mark_duplicate (and its un-mark) would refuse the mark"
+        )));
+    }
+    if !ClaimRepository::are_all_current(&mut *conn, viewer, &[canonical])
+        .await
+        .map_err(db_caller_error)?
+    {
+        return Ok(Some(format!("canonical {canonical} is no longer current")));
+    }
+    Ok(None)
 }
 
 // ── write_check: a prediction, never a write ────────────────────────────────
@@ -890,11 +990,21 @@ async fn write_check(
     let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
     // The act's authority is the write identity's: asked on ITS stamped
     // transaction, which writes nothing and is rolled back.
+    let mut act_refusal = None;
     let mut act = if units.iter().any(|u| !u.marks.is_empty()) {
-        Some(
-            crate::claim_helper::begin_author_stamped_tx(server, caller, "plan_label_dedup")
-                .await?,
-        )
+        // A reader with no writable group cannot open one: every mark is then
+        // predicted refused, and the plan (a read) still answers.
+        match crate::claim_helper::begin_author_stamped_tx(server, caller, "plan_label_dedup").await
+        {
+            Ok(tx) => Some(tx),
+            Err(e) => {
+                act_refusal = Some(format!(
+                    "no write transaction for this identity: {}",
+                    e.message
+                ));
+                None
+            }
+        }
     } else {
         None
     };
@@ -913,23 +1023,28 @@ async fn write_check(
         applies &= cross.is_none();
         let mut mark_checks = Vec::with_capacity(unit.marks.len());
         for m in &unit.marks {
-            let may = match act.as_mut() {
-                Some(tx) => ClaimRepository::session_may_mark_conn(
-                    tx,
-                    ClaimId::from_uuid(m.dup),
-                    ClaimId::from_uuid(m.canonical),
-                )
-                .await
-                .map_err(db_caller_error)?,
-                None => false,
+            let why = match act.as_mut() {
+                None => act_refusal.clone(),
+                Some(tx) => match canonical_refusal(tx, viewer, m.canonical).await? {
+                    Some(why) => Some(why),
+                    None => (!ClaimRepository::session_may_mark_conn(
+                        tx,
+                        ClaimId::from_uuid(m.dup),
+                        ClaimId::from_uuid(m.canonical),
+                    )
+                    .await
+                    .map_err(db_caller_error)?)
+                    .then(|| {
+                        "this identity's own write predicates refuse the dedup act (it must \
+                         write the duplicate)"
+                            .to_string()
+                    }),
+                },
             };
-            applies &= may;
+            applies &= why.is_none();
             mark_checks.push(json!({
-                "dup": m.dup, "canonical": m.canonical, "may_mark": may,
-                "reason": (!may).then_some(
-                    "this identity's own write predicates refuse the dedup act (it must write \
-                     the duplicate, and write the canonical or the canonical be public)"
-                ),
+                "dup": m.dup, "canonical": m.canonical, "may_mark": why.is_none(),
+                "reason": why,
             }));
         }
         for w in &unit.writes {
@@ -1035,14 +1150,15 @@ pub async fn plan_label_dedup(
         &params.sections,
         params.max_claims,
     )?;
-    let (plan, at) = compute_plan(server, viewer, &prepared).await?;
-    let mut out = plan_json(&plan, at, prepared.max)?;
+    let planned = compute_plan(server, viewer, &prepared).await?;
+    let mut out = plan_json(&planned, prepared.max)?;
+    let plan = &planned.plan;
     let (checks, unit_check) = write_check(
         server,
         viewer,
         auth,
         &plan.write_units(),
-        &unit_members(&plan),
+        &unit_members(plan),
         &retirement_labels(&prepared.profile),
     )
     .await?;
@@ -1092,7 +1208,7 @@ pub async fn apply_label_dedup(
         &params.sections,
         params.max_claims,
     )?;
-    let (plan, at) = match compute_plan(server, viewer, &prepared).await {
+    let planned = match compute_plan(server, viewer, &prepared).await {
         Ok(planned) => planned,
         // The family read fit `max_claims` but not the engine's pairwise
         // bound: a refusal of the pass, like TRUNCATED, with no plan to show.
@@ -1110,9 +1226,10 @@ pub async fn apply_label_dedup(
         let mut v = nothing_applied("refused");
         v["applied_plan_hash"] = Value::Null;
         v["refusal"] = json!({"code": code, "message": message});
-        v["plan"] = plan_json(&plan, at, prepared.max)?;
+        v["plan"] = plan_json(&planned, prepared.max)?;
         success_json(&v)
     };
+    let plan = &planned.plan;
     if let Some(e) = plan.apply_refusal() {
         return refused(e.code(), e.to_string());
     }
@@ -1128,7 +1245,7 @@ pub async fn apply_label_dedup(
     if units.is_empty() {
         let mut v = nothing_applied("nothing_to_do");
         v["applied_plan_hash"] = json!(plan.plan_hash);
-        v["coverage"] = plan_json(&plan, at, prepared.max)?["coverage"].clone();
+        v["coverage"] = plan_json(&planned, prepared.max)?["coverage"].clone();
         return success_json(&v);
     }
 
@@ -1142,7 +1259,7 @@ pub async fn apply_label_dedup(
         run_tag: &prepared.run_tag,
         plan_hash: &plan.plan_hash,
     };
-    let members = unit_members(&plan);
+    let members = unit_members(plan);
     let mut results = Vec::with_capacity(units.len());
     let mut applied: Vec<AppliedLabelChange> = Vec::new();
     let mut applied_marks: Vec<Value> = Vec::new();
@@ -1185,7 +1302,7 @@ pub async fn apply_label_dedup(
         "applied_units": serde_json::to_value(&applied).map_err(internal_error)?,
         "applied_marks": applied_marks,
         "review": review,
-        "coverage": plan_json(&plan, at, prepared.max)?["coverage"].clone(),
+        "coverage": plan_json(&planned, prepared.max)?["coverage"].clone(),
         "max_claims": prepared.max.json(),
     }))
 }
@@ -1287,6 +1404,19 @@ async fn apply_unit(
                      Nothing of the unit was written",
                     unit.unit
                 ),
+            )
+            .into());
+        }
+    }
+
+    let mut canonicals: Vec<Uuid> = unit.marks.iter().map(|m| m.canonical).collect();
+    canonicals.sort();
+    canonicals.dedup();
+    for canonical in canonicals {
+        if let Some(why) = canonical_refusal(&mut tx, viewer, canonical).await? {
+            return Err(refusal(
+                codes::MARK_REFUSED,
+                format!("{}: {why}. Nothing of the unit was written", unit.unit),
             )
             .into());
         }
@@ -1459,10 +1589,11 @@ pub async fn probe_label_dedup(
     let specs = profile
         .probe_reads(params.include_closed_signals)
         .map_err(|e| engine_refusal(&e))?;
-    let (snaps, at) = read_family(server, viewer, &specs, max.effective).await?;
+    let read = read_family(server, viewer, &specs, max.effective).await?;
+    let at = read.at;
     let mut index = Snapshot::default();
     let mut closed: Option<Snapshot> = None;
-    for (purpose, snap) in snaps {
+    for (purpose, snap) in read.snapshots {
         match purpose {
             ReadPurpose::ClosedSignals => closed = Some(snap),
             _ => index = snap,
@@ -1542,23 +1673,30 @@ async fn review_foreign_matches(
 
 // ── Revert and the index view ───────────────────────────────────────────────
 
+/// The most label changes, and the most marks, one revert takes.
+pub const REVERT_MAX_ITEMS: usize = 2 * DEFAULT_MAX_CLAIMS;
+
 /// Undo one apply from its own response (A6): the label writes first, each
 /// inverse through `update_labels`' per-claim path, newest first
 /// ([`engine::revert_writes`]); then every mark, newest first
 /// ([`engine::revert_marks`]), each through `unmark_duplicate` with the
-/// canonical the apply recorded (a claim now marked onto another claim is
-/// refused). Every step takes the gates the single-claim tool takes, so a
-/// revert grants nothing `update_labels` and `unmark_duplicate` would not.
+/// canonical and identity edge the apply recorded (a claim marked since onto
+/// another claim, or marked again, is refused). Every step takes the gates
+/// the single-claim tool takes, so a revert grants nothing `update_labels`
+/// and `unmark_duplicate` would not.
 ///
-/// An un-mark has no deferred form, so a revert with marks on a server
-/// without the administrative connection is refused BEFORE anything is
-/// written (`ADMIN_CONNECTION_REQUIRED`): the label half alone would leave the
-/// marks without the labels they were applied with. Each step is reported;
-/// a failed step does not stop the others (`status` is then `partial`).
+/// Nothing is written until every un-mark is proved admissible: the server's
+/// administrative connection (an un-mark has no deferred form;
+/// `ADMIN_CONNECTION_REQUIRED`) and each un-mark's own gate, read-only, in
+/// order, a canonical still marked a duplicate itself being admissible only
+/// when this revert un-marks it first (`UNMARK_REFUSED`). Otherwise the label
+/// half alone would leave the marks without the labels they were applied
+/// with. After that, each step is reported; a step that still fails (a race)
+/// does not stop the others, and `status` is then `partial`.
 ///
 /// # Errors
-/// The read-only refusal, a malformed id, `ADMIN_CONNECTION_REQUIRED`, or a
-/// missing write identity.
+/// The read-only refusal, a malformed or oversized input,
+/// `ADMIN_CONNECTION_REQUIRED`, `UNMARK_REFUSED`, or a missing write identity.
 pub async fn revert_label_dedup(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1566,6 +1704,14 @@ pub async fn revert_label_dedup(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
+    if params.applied_units.len() > REVERT_MAX_ITEMS
+        || params.applied_marks.len() > REVERT_MAX_ITEMS
+    {
+        return Err(refusal(
+            codes::INVALID_ARGUMENT,
+            format!("a revert takes at most {REVERT_MAX_ITEMS} label changes and as many marks"),
+        ));
+    }
     let changes = params
         .applied_units
         .iter()
@@ -1581,9 +1727,25 @@ pub async fn revert_label_dedup(
     let marks = params
         .applied_marks
         .iter()
-        .map(|m| Ok((m.unit.clone(), parse_id(&m.dup)?, parse_id(&m.canonical)?)))
+        .map(|m| {
+            let rule: engine::Tier = serde_json::from_value(json!(m.rule)).map_err(|e| {
+                refusal(
+                    codes::INVALID_ARGUMENT,
+                    format!("{:?} is not a dedup tier: {e}", m.rule),
+                )
+            })?;
+            Ok(AppliedMark {
+                unit: m.unit.clone(),
+                dup: parse_id(&m.dup)?,
+                canonical: parse_id(&m.canonical)?,
+                rule,
+                matched_on: m.matched_on.clone(),
+                identity_edge: m.identity_edge.as_deref().map(parse_id).transpose()?,
+            })
+        })
         .collect::<Result<Vec<_>, McpError>>()?;
-    if !marks.is_empty() {
+    let unmarks = engine::revert_marks(&marks);
+    if !unmarks.is_empty() {
         // Proved usable, then released: each un-mark takes its own session.
         crate::maintenance::admin_cascade_session(server)
             .await
@@ -1594,10 +1756,11 @@ pub async fn revert_label_dedup(
                         "this revert un-marks {} duplicate(s), and an un-mark needs this \
                          server's administrative (maintenance) connection ({reason}); nothing \
                          was written",
-                        marks.len()
+                        unmarks.len()
                     ),
                 )
             })?;
+        preflight_unmarks(server, viewer, auth, &unmarks).await?;
     }
     let caller = server.write_identity(auth, viewer).await?;
 
@@ -1627,18 +1790,17 @@ pub async fn revert_label_dedup(
             "ok": done.is_ok(), "error": done.err().map(|e| e.message),
         }));
     }
-    // Newest first, as revert_marks orders them.
-    for (unit, dup, canonical) in marks.into_iter().rev() {
+    for m in &unmarks {
         let done = crate::tools::supersede::unmark_duplicate_expecting(
             server,
             viewer,
             auth,
-            dup,
-            Some(canonical),
+            m.dup,
+            expectation(m),
         )
         .await;
         steps.push(json!({
-            "step": "unmark", "unit": unit, "claim_id": dup, "canonical": canonical,
+            "step": "unmark", "unit": m.unit, "claim_id": m.dup, "canonical": m.canonical,
             "ok": done.is_ok(),
             "error": done.as_ref().err().map(|e| e.message.clone()),
             "result": done.ok(),
@@ -1649,6 +1811,65 @@ pub async fn revert_label_dedup(
         "status": if all_ok { "reverted" } else { "partial" },
         "steps": steps,
     }))
+}
+
+fn expectation(m: &AppliedMark) -> crate::tools::supersede::UnmarkExpectation {
+    crate::tools::supersede::UnmarkExpectation {
+        canonical: Some(m.canonical),
+        identity_edge: m.identity_edge,
+    }
+}
+
+/// Every un-mark of a revert, proved admissible before anything is written:
+/// its own gate (read-only), and its canonical current or un-marked earlier by
+/// this same revert (the un-mark act refuses a duplicate whose canonical is
+/// still retired). `UNMARK_REFUSED` names every one that is not.
+async fn preflight_unmarks(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    unmarks: &[AppliedMark],
+) -> Result<(), McpError> {
+    let scoped = server
+        .scoped
+        .as_ref()
+        .ok_or_else(|| internal_error("revert_label_dedup needs a ScopedPool"))?;
+    let mut refused = Vec::new();
+    let mut undone_first = std::collections::BTreeSet::new();
+    for m in unmarks {
+        match crate::tools::supersede::unmark_gate(server, viewer, auth, m.dup, expectation(m))
+            .await
+        {
+            Err(e) => refused.push(format!("{}: {}", m.dup, e.message)),
+            Ok(_) if undone_first.contains(&m.canonical) => {}
+            Ok(_) => {
+                let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
+                let current = ClaimRepository::are_all_current(&mut *read, viewer, &[m.canonical])
+                    .await
+                    .map_err(db_caller_error)?;
+                read.commit().await.map_err(db_caller_error)?;
+                if !current {
+                    refused.push(format!(
+                        "{}: its canonical {} is itself a marked duplicate; un-mark {} first",
+                        m.dup, m.canonical, m.canonical
+                    ));
+                }
+            }
+        }
+        undone_first.insert(m.dup);
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(refusal(
+        codes::UNMARK_REFUSED,
+        format!(
+            "{} of {} un-mark(s) would be refused; nothing was written: {}",
+            refused.len(),
+            unmarks.len(),
+            refused.join("; ")
+        ),
+    ))
 }
 
 /// The most canonicals one `label_dedup_index_view` call reads.
@@ -1722,7 +1943,7 @@ pub async fn label_dedup_index_view(
                 .filter(|d| d.canonical == id)
                 .map(|d| {
                     json!({"id": d.id, "content": d.content, "labels": d.labels,
-                           "created_at": d.created_at.to_rfc3339()})
+                           "agent_id": d.agent_id, "created_at": d.created_at.to_rfc3339()})
                 })
                 .collect();
             json!({
