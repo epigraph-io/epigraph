@@ -273,7 +273,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: `belief_cache` reads cache floats from their JSON text with
+# `str::parse::<f64>` (correctly rounded). serde_json's default float parse is
+# not round-trip exact, and a restore's compare-and-swap needs the exact bits.
+# Adds a type only; it changes no other parse. Already enabled in the build
+# graph through sqlx-core's `json` feature.
+serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true }
 csv = { workspace = true }
 reqwest = { workspace = true }

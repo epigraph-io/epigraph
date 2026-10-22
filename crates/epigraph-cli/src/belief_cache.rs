@@ -12,6 +12,45 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Bit-exact JSON for the cache floats.
+///
+/// A restore's compare-and-swap matches a claim only when its stored value
+/// equals the wave file's `written` value exactly, so the file must give back
+/// the bits it was given. Writing is serde_json's shortest round-trip form;
+/// READING is the problem: serde_json's default number parse multiplies a
+/// 64-bit significand by a power of ten, which double-rounds 17-digit values
+/// (measured: 2516 of 4000 random records lost a bit). Each value is therefore
+/// taken as its raw JSON text and parsed with `str::parse::<f64>`, which is
+/// correctly rounded. A non-finite value has no JSON number and serde_json
+/// would write it as `null`, which a restore would then write back as NULL, so
+/// it is refused instead.
+mod exact_f64 {
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_json::value::RawValue;
+
+    pub fn serialize<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            None => s.serialize_none(),
+            Some(x) if x.is_finite() => s.serialize_some(x),
+            Some(x) => Err(S::Error::custom(format!(
+                "non-finite cache value {x} has no exact JSON form"
+            ))),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        let raw: Option<Box<RawValue>> = Option::deserialize(d)?;
+        raw.map(|r| {
+            r.get()
+                .parse::<f64>()
+                .map_err(|e| D::Error::custom(format!("cache value {}: {e}", r.get())))
+        })
+        .transpose()
+    }
+}
+
 /// Claims per restore transaction (SPEC §10.8: one transaction per 1k claims).
 pub const DEFAULT_RESTORE_BATCH: usize = 1000;
 
@@ -19,12 +58,17 @@ pub const DEFAULT_RESTORE_BATCH: usize = 1000;
 pub const DEFAULT_SNAPSHOT_PAGE: i64 = 5000;
 
 /// The belief-cache columns of one `claims` row.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheColumns {
+    #[serde(with = "exact_f64")]
     pub belief: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub plausibility: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub pignistic_prob: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub mass_on_empty: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub mass_on_missing: Option<f64>,
     pub belief_frame_id: Option<Uuid>,
     pub classification: Option<String>,
@@ -34,10 +78,15 @@ pub struct CacheColumns {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRow {
     pub claim_id: Uuid,
+    #[serde(with = "exact_f64")]
     pub belief: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub plausibility: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub pignistic_prob: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub mass_on_empty: Option<f64>,
+    #[serde(with = "exact_f64")]
     pub mass_on_missing: Option<f64>,
     pub belief_frame_id: Option<Uuid>,
     pub classification: Option<String>,
