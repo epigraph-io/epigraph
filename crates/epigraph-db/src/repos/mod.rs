@@ -99,14 +99,16 @@ pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
-    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
-    ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration,
-    ConsolidateMode, ConsolidateResult, DedupRepair, EmbeddingSeedScope, EvolveStepResult,
-    FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
-    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SortDirection, SupersedeEdgeMigration, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    carries_dedup_identity_key, AdminClaimAction, AdminClaimWrite, AdminToken,
+    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
+    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
+    LabelQuery, LevelAndSourceType, LineageHead, MovedBba, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, SortDirection, SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

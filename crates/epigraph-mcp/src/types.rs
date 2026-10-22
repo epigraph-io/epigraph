@@ -2549,6 +2549,12 @@ pub struct MarkDuplicateParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnmarkDuplicateParams {
+    #[schemars(description = "UUID of the claim to un-mark (a claim mark_duplicate retired)")]
+    pub claim_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SupersedeClaimParams {
     #[schemars(description = "UUID of the claim being superseded")]
     pub claim_id: String,

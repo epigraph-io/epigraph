@@ -173,6 +173,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
+- **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
 
@@ -199,7 +200,9 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 
 Outside the repo layer, `scripts/fuzzy_dedup_claims.py` matches
-`mark_duplicate_act` column for column. On the re-embed side,
+`mark_duplicate_act`'s `claims` UPDATE column for column, but writes no
+`same_as` identity edge, so a duplicate it marks has no dedup record and
+cannot be un-marked (`unmark_duplicate` refuses it). On the re-embed side,
 `crates/epigraph-cli/src/reembed.rs::fetch_batch` selects only current claims
 (`ReembedTarget::eligible_predicate`), so `epigraph-cli reembed` never writes a
 3072 vector back onto a retired claim.
