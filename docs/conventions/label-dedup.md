@@ -1,11 +1,30 @@
-# Label-family dedup: `plan_label_dedup`, `apply_label_dedup`, `probe_label_dedup`
+# Label-family dedup: `plan_label_dedup`, `apply_label_dedup`, `probe_label_dedup`, `revert_label_dedup`, `label_dedup_index_view`
 
-Some claim families are kept as an index: every live member carries one family
-label, and readers query that label. These three MCP tools keep such an index
-clean (duplicates, partial retirements, past-due items, signals that
-materialized) by **label writes only**. Claim content is never rewritten, no
-claim is superseded, and every change is reversible by patching the labels
-back.
+Some claim families are kept as an **index**: every live member carries one
+family label, and readers query that label (a lead list, a tracker). These
+tools keep such an index clean: duplicates, partial retirements, past-due
+items, and signals that materialized.
+
+- A duplicate is **marked**, through `mark_duplicate`'s own act. It becomes
+  non-current, so it leaves the index read. It keeps its labels, evidence and
+  fields, and it gains a `same_as` identity edge to its survivor that records
+  why.
+- Everything else (hygiene, close-out, lifecycle, the survivor's carried ids)
+  is a **label write**.
+- Claim content is never rewritten, and one call undoes a whole apply
+  (`revert_label_dedup`).
+
+Label dedup is index bookkeeping. It is never a merge of knowledge claims: a
+duplicate knowledge claim is marked on its own with `mark_duplicate`. To keep
+it that way:
+
+- every family a profile names must be declared `family_kind: "index"`
+  (`FAMILY_NOT_INDEX` otherwise);
+- the family must be on this server's allowlist,
+  `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` (comma-separated, read once at startup;
+  empty refuses every family, `FAMILY_NOT_ALLOWED`).
+
+Both checks are decided from the profile alone, before any read.
 
 The planner is the pure engine `epigraph_engine::label_dedup`; the tools are
 `crates/epigraph-mcp/src/tools/label_dedup.rs`.
@@ -13,7 +32,8 @@ The planner is the pure engine `epigraph_engine::label_dedup`; the tools are
 ## The profile
 
 Every family rule (labels, parser layout, id rules, aliases, precedence, write
-templates) lives in a `label-dedup-profile/v1` JSON document. Nothing
+templates) lives in a `label-dedup-profile/v2` JSON document. Every pass
+declares its `family_kind`, and so does a lifecycle's signal family. Nothing
 deployment-specific is built in: every list defaults to empty.
 
 `profile_hash` is REQUIRED on every call: the BLAKE3 hex digest of the exact
@@ -62,42 +82,54 @@ read: its own group-private rows included, other groups' private rows never.
 is clamped, and the response reports `max_claims: {requested, effective,
 clamped}`. A read that hits the cap sets `coverage.truncated`.
 
+The reads are of **current** claims only, so a marked duplicate is not a
+member. Each claim read carries its marked duplicates (the index view below):
+the engine reads their fields where the claim's own are read. For example, a
+duplicate's later deadline holds off the canonical's close-out. A duplicate
+read that hits the cap truncates the read too.
+
 Every claim the caller can read that carries the family label is a member.
 That includes another author's public claim, so membership is not ownership.
 Apply and probe therefore check ownership themselves (next section).
 
-## Ownership of a cluster
+Row security applies to the duplicates read as well: a duplicate the caller
+cannot read is invisible to its plan and to the index view. A caller that must
+see every duplicate (a digest of the whole index) needs a viewer that reads
+them all.
 
-The engine has no owner field, and a revision label on either claim of a pair
-links them, so another author can make a claim of theirs a member of the
-caller's cluster, and, if it is newer, its survivor. A cluster unit retires its
-losers toward its survivor, so:
+## Ownership
 
-- every member of a cluster unit, the survivor included and whether or not
-  that member is itself written, must be the write identity's own: its
-  author, an agent of the author's operator, or, over HTTP, a `claims:admin`
-  caller (the same decided grants as `require_owner_or_admin`);
-- a stdio server with no declared signer cannot decide this for another
-  agent's claim, and undecided is not owned;
-- a cluster with any other member fails as a unit with `CROSS_OWNER_MEMBER`
-  and writes nothing. Membership comes from the plan's cluster records, not
-  from the unit's writes: a survivor with nothing to write is still checked;
-- a revision label is one owner's assertion, and it overrides the strong-id
-  veto, so it never decides a merge across owners, whatever the caller's
-  grant. A cluster in which a revision label links two members of different
-  owners fails with `CROSS_OWNER_MEMBER` even for a `claims:admin` caller, who
-  otherwise owns every member. Two authors are one owner when they are the
-  same agent, when one is the other's operator, or when both are agents of
-  the same operator. A cluster joined across owners by a shared id keeps the
-  `claims:admin` grant.
+The engine has no owner field. Another author can make a claim of theirs a
+member of the caller's cluster, and its survivor if it is newer: a shared id
+does it, and so does a revision label on either claim. A cluster unit marks
+its losers onto its survivor, so:
 
-Probe applies the same check: a `match` or `match_only` on a claim the caller
-does not own becomes `review`, with `matched_id` kept for the human.
+- **Every member of a cluster unit, and every target of any other unit, must
+  be the write identity's own.** That means its author, an agent of the
+  author's operator, or, over HTTP, a `claims:admin` caller (the same decided
+  grants as `require_owner_or_admin`).
+  - A stdio server with no declared signer cannot decide this for another
+    agent's claim, and undecided is not owned.
+  - A member not owned fails the unit with `CROSS_OWNER_MEMBER`; any other
+    target fails it with `TARGET_NOT_OWNED`. Nothing of the unit is written.
+  - Membership comes from the plan's cluster records, not from the unit's
+    writes, so a survivor with nothing to write is still checked.
+- **A cluster of more than one owner is never marked, whatever the caller's
+  grant (A7), however it was joined.** It fails with `CROSS_OWNER_MEMBER` and
+  is listed in apply's `review` for a human.
+  - A claim's owner is its author's operator, or the author when it has none.
+  - So the same agent, an operator and its agents, and two agents of one
+    operator are each one owner.
+  - A `claims:admin` caller owns every member and is still refused.
+- **A mark is the caller's own act**, on its own stamped transaction. It must
+  write the duplicate, and write the canonical or the canonical must be
+  public: the dedup act's row security and FA04 rule. A `claims:admin` caller
+  therefore cannot mark inside a group it cannot write, even where it could
+  relabel through the audited admin path.
 
-Hygiene, close-out and lifecycle units involve one claim each and keep
-`update_labels`' per-claim gates (below). A lifecycle `graduated` close and a
-signal supersession name a target member as the reason; that target is not
-ownership-checked today.
+Probe applies the same ownership check: a `match` or `match_only` on a claim
+the caller does not own becomes `review`, with `matched_id` kept for the
+human.
 
 ## `plan_label_dedup` (claims:read)
 
@@ -110,25 +142,33 @@ It returns:
 - `write_units`: exactly the writes apply would make, one transaction each, in
   apply order;
 - `write_check`, per write target;
-- `unit_check`, per unit: `{unit, applies, members,
-  cross_owner_revision_link}`, where `members` lists every member of a
-  cluster unit with `owned` and a `reason` when not, and
-  `cross_owner_revision_link` is the reason a revision label links members of
-  different owners, or null.
+- `unit_check`, per unit: `{unit, applies, members, marks, cross_owner,
+  review}`:
+  - `members` lists every member of a cluster unit, with `owned` and a
+    `reason` when not owned;
+  - `marks` lists each duplicate the unit marks, with `may_mark`;
+  - `cross_owner` is the reason the cluster spans owners, or null;
+  - `review` is true exactly when `cross_owner` is set.
 
 `plan_hash` covers `profile_hash`, `run_tag`, `as_of`, the normalized sections
-and the write units, and nothing else. A new review pair therefore never causes
-drift.
+and the write units (marks included), and nothing else. A new review pair
+therefore never causes drift.
 
 `write_check` is a **prediction** made under the caller's write identity, per
-write target. It uses the same non-writing gates `update_labels` runs:
-ownership over HTTP, the retirement-label gate, and whether the owner group is
-writable (or reachable through the admin path). It never writes. Row-security
-refusals that only the database decides are reported by apply, per unit.
-`unit_check.applies` is false when any write target is predicted unwritable,
-any cluster member is not the write identity's own, or a revision label links
-members of different owners; apply's `CROSS_OWNER_MEMBER` comes from the same
-checks.
+write target. It uses:
+
+- the ownership check every target takes;
+- the gates `update_labels` runs: the retirement-label gate, and whether the
+  owner group is writable or reachable through the admin path.
+
+`may_mark` is asked of the dedup act's own write predicates
+(`ClaimRepository::session_may_mark_conn`), on a transaction stamped as the
+write identity and then rolled back. Nothing is written. Refusals that only
+the act or the database decides (FA07, a concurrent change) are reported by
+apply, per unit.
+
+`unit_check.applies` is false when any of these predictions fails. Apply's
+refusals come from the same checks.
 
 ## `apply_label_dedup` (claims:write; refused on a read-only server)
 
@@ -144,25 +184,45 @@ checks.
    successful apply looks like this.
 5. Otherwise write each unit in **one transaction**, stamped from the write
    identity:
-   - a unit is a cluster (survivor carry labels plus every loser's retirement),
-     one hygiene claim, one close-out claim, or one lifecycle signal;
-   - a cluster unit first checks that no revision label links members of
-     different owners and that every member is the write identity's own
-     (`CROSS_OWNER_MEMBER` otherwise, nothing written);
-   - each claim goes through `update_labels`' own per-claim path
-     (`tools::claims::relabel_claim`): over HTTP, ownership or `claims:admin`
-     (the audited admin path for a group the caller cannot write); on every
-     transport, the ownership gate for `resolved` and for the profile's closed
-     label;
-   - a refused claim fails its whole unit, so no "looks merged but isn't"
-     state is left. Later units continue.
+   - A unit is one of: a cluster (its losers marked, then the survivor's
+     labels), one hygiene claim, one close-out claim, or one lifecycle signal.
+   - **Ownership first**, as above (`CROSS_OWNER_MEMBER`, `TARGET_NOT_OWNED`,
+     or `review`). Nothing is written before it passes.
+   - **Then each mark**, through `mark_duplicate`'s act on this transaction
+     (`ClaimRepository::mark_duplicate_act_attributed_conn`). The duplicate
+     becomes non-current, its embedding is cleared, and it gains a `same_as`
+     identity edge to the survivor. The edge's `properties.dedup` records:
+     - `tool: "label_dedup"`;
+     - the matching tier as `rule`, and what it matched on as `matched_on`;
+     - the `run_tag` and the `plan_hash`;
+     - the acting agent.
+
+     The repair (moving the duplicate's edges and evidence) is the dedup
+     cascade:
+     - it runs after the commit, on the administrative connection;
+     - on a server without that connection, it is deferred on the same
+       transaction and runs at the next replay.
+
+     The duplicate keeps its labels: no loser label is written.
+   - **Then each label write**, through `update_labels`' own per-claim path
+     (`tools::claims::relabel_claim`):
+     - over HTTP, ownership or `claims:admin` (the audited admin path for a
+       group the caller cannot write);
+     - on every transport, the ownership gate for `resolved` and for the
+       profile's closed label.
+   - A refused mark or write fails its whole unit, so no "looks merged but
+     isn't" state is left. Later units continue.
 
 The response contains:
 
 - `status`: `applied`, even when some units failed (see `results` and
   `counts.failed`);
 - `results`: one `{unit, ok, code?, error?, admin_path}` per unit;
-- `counts`;
+- `counts` (`units`, `ok`, `failed`, `marks`, `labels_added`,
+  `labels_removed`);
+- `review`: one `{unit, reason}` per cluster refused as cross-owner;
+- `applied_marks`: one `{unit, dup, canonical, rule, matched_on,
+  identity_edge, cascade, belief_cascade}` per committed mark, in apply order;
 - `applied_units`.
 
 `applied_units` lists one `{unit, claim_id, labels_added, labels_removed}` per
@@ -171,45 +231,81 @@ a label the write named that was already in the requested state is not listed,
 and neither is any label the write did not name (such as another writer's
 concurrent change to other labels). Rolled-back units are absent.
 
-## Revert procedure
+## `revert_label_dedup` (claims:write; refused on a read-only server)
 
 Use it to undo an apply, for example when an apply generation mis-merged. Its
-input is the `applied_units` of that apply, exactly as returned.
+input is that apply's `applied_units` and `applied_marks`, exactly as
+returned.
 
-1. Compute the inverse with `epigraph_engine::label_dedup::revert_writes(&applied_units)`.
-   It reverses the list (newest change first) and swaps added and removed
-   labels. It drops empty changes.
-2. Run each resulting write, in order, through `update_labels(claim_id, add,
-   remove)` under the same identity (or one with the same ownership) that ran
-   the apply.
-3. Re-plan with the original arguments. When nothing else changed the family
+1. With marks to undo, the server's administrative connection is proved
+   usable first. Without it, the call is refused with
+   `ADMIN_CONNECTION_REQUIRED` and nothing is written. An un-mark has no
+   deferred form, and the label half alone would leave the marks without the
+   labels they were applied with.
+2. Then the label writes are undone, newest first
+   (`epigraph_engine::label_dedup::revert_writes`: added and removed swapped,
+   empty changes dropped). Each runs through `update_labels`' per-claim path
+   under the caller's identity.
+3. Then the marks are undone, newest first
+   (`epigraph_engine::label_dedup::revert_marks`), each through
+   `unmark_duplicate` with the canonical the apply recorded. A claim that has
+   since been marked onto another claim is refused. An un-mark is refused
+   while the duplicate's canonical is itself a marked duplicate, which is why
+   the order matters.
+4. Re-plan with the original arguments. When nothing else changed the family
    meanwhile, the plan is the original one again: the same `plan_hash`.
 
-The order matters when two units touched the same claim and label: one adds
-it, a later one removes it. Only newest-first lands back on the original set.
+Each step is reported (`steps[]`, with `ok` and `error`). A failed step does
+not stop the others, and `status` is then `partial` instead of `reverted`.
+Every step takes the gates its single-claim tool takes, so a revert can do
+nothing `update_labels` and `unmark_duplicate` would not let the caller do.
+
+The order of the label writes matters when two units touched the same claim
+and label: one adds it, a later one removes it. Only newest-first lands back
+on the original set.
 
 What it restores, and what it does not:
 
+- **Index membership, currency and `supersedes`, exactly.** The un-mark puts
+  back what the dedup cascade moved, from the record that cascade kept. A
+  mark whose cascade was deferred and has not yet been replayed has no record,
+  and its un-mark is refused until the replay runs. The identity edge stays,
+  retracted (`valid_to` set), as the audit of the mark and its reversal.
 - **Label sets, exactly.** The write path stores a claim's labels sorted and
   distinct. A claim whose labels were stored in another order (or with
   duplicates) before the apply comes back with the same set, in sorted order.
   Restoring the stored order would need a direct row write, which no tool
   offers.
-- **Retirements.** Removing `resolved` (or the profile's closed label) takes the
-  same ownership gate as adding it. The identity that applied can revert. A
-  close-out made over HTTP through the audited admin path (`claims:admin` on a
-  group the admin cannot write) is reverted the same way, by the same admin
-  token. That writes a second `claims.admin_write` audit row. The tests cover
-  the stdio owner path only; the admin-path revert follows from
-  `update_labels` taking the same admin path in both directions.
+- **Retirements.** Removing `resolved` takes the same ownership gate as adding
+  it, so the identity that applied can revert. A close-out made over HTTP
+  through the audited admin path (`claims:admin` on a group the admin cannot
+  write) is reverted the same way, by the same admin token, which writes a
+  second `claims.admin_write` audit row.
 - **Concurrent edits.** A label that someone else added or removed after the
   apply, and that the apply had also changed, is changed back by the revert.
   Check the family's recent history before reverting a long-past apply.
 
-The procedure is tested end to end against an application-role database in
+The revert is tested end to end against an application-role database whose
+administrative connection runs as `epigraph_maintenance`, in
 `crates/epigraph-mcp/tests/label_dedup_tools.rs`
-(`apply_then_revert_from_applied_units_restores_every_label_set`), and the
-inverse itself in `crates/epigraph-engine/tests/label_dedup/revert.rs`.
+(`one_revert_after_apply_restores_labels_marks_and_the_index`). Its orders are
+tested in `crates/epigraph-engine/tests/label_dedup/revert.rs`.
+
+## `label_dedup_index_view` (claims:read)
+
+For up to 100 canonical claim ids, it returns each canonical with every claim
+marked a duplicate of it. It follows a chain: a duplicate of a duplicate is
+included.
+
+- The walk follows only **in-force** dedup identity edges (`same_as` carrying
+  `properties.dedup`). A plain `same_as` link is not followed, and neither is
+  the retracted edge of an un-marked duplicate.
+- Use it to read the fields a duplicate kept, such as a later deadline or an
+  extra id, where the canonical is.
+- It reads through the caller's viewer, as the plan does. An unreadable
+  canonical is listed in `missing`.
+- `max_claims` caps the duplicates read; `truncated` reports a read that hit
+  the cap.
 
 ## `probe_label_dedup` (claims:read)
 
@@ -248,7 +344,10 @@ Tool errors carry `data.code`:
   review-pair bounds; a family that reads in under `max_claims` can still be
   refused here)
 - `TRUNCATED` (probe)
+- `FAMILY_NOT_INDEX`, `FAMILY_NOT_ALLOWED` (every tool, before any read)
+- `ADMIN_CONNECTION_REQUIRED` (revert)
 
 Apply's `TRUNCATED`, `RESOURCE_CAP` and `PLAN_DRIFT` are a `refused` status, not
-an error. A failed unit carries its code in `results[].code`, for example
-`CROSS_OWNER_MEMBER`.
+an error. A failed unit carries its code in `results[].code`: one of
+`CROSS_OWNER_MEMBER`, `TARGET_NOT_OWNED`, or `MARK_REFUSED` (the dedup act
+refused the mark).
