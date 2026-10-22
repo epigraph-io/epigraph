@@ -1573,6 +1573,116 @@ async fn one_revert_after_apply_restores_labels_marks_and_the_index(pool: PgPool
     assert_eq!(replanned["plan_hash"], plan["plan_hash"]);
 }
 
+/// A revert un-marks only the dedup the apply made: a duplicate un-marked and
+/// then marked onto ANOTHER claim since the apply is refused at its un-mark
+/// step (the revert reports `partial`), and stays marked onto that claim.
+/// Control: the label half of the same revert still lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_never_unmarks_a_claim_marked_since_onto_another_claim(pool: PgPool) {
+    use epigraph_mcp::tools::supersede::{mark_duplicate, unmark_duplicate};
+    use epigraph_mcp::types::{MarkDuplicateParams, UnmarkDuplicateParams};
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server_with_maintenance(&pool, config(Some(&root), None, 5000)).await;
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let loser = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_B,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    // Outside the family: the claim the loser is later marked onto by hand.
+    let elsewhere = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station works register | Acme Water Authority",
+        &["other-index"],
+        "2026-09-10T00:00:00Z",
+    )
+    .await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert!(is_marked_onto(&pool, loser, survivor).await, "{out}");
+    let survivor_applied = labels_of(&pool, survivor).await;
+    assert_ne!(
+        survivor_applied,
+        s(&[FAMILY]),
+        "precondition: the survivor was relabelled"
+    );
+
+    unmark_duplicate(
+        &server,
+        &viewer,
+        UnmarkDuplicateParams {
+            claim_id: loser.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("un-mark by hand");
+    mark_duplicate(
+        &server,
+        &viewer,
+        MarkDuplicateParams {
+            claim_id: loser.to_string(),
+            canonical_id: elsewhere.to_string(),
+            reason: None,
+        },
+        None,
+    )
+    .await
+    .expect("re-mark by hand");
+    assert!(is_marked_onto(&pool, loser, elsewhere).await);
+
+    let reverted = first_text(
+        &revert_label_dedup(&server, &viewer, revert_params(&out), None)
+            .await
+            .expect("revert"),
+    );
+    assert_eq!(reverted["status"], "partial", "{reverted}");
+    let unmark = reverted["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|st| st["step"] == "unmark")
+        .cloned()
+        .expect("an un-mark step");
+    assert_eq!(unmark["ok"], false, "{reverted}");
+    assert!(
+        unmark["error"]
+            .as_str()
+            .is_some_and(|e| e.contains(&elsewhere.to_string())),
+        "{reverted}"
+    );
+    assert!(
+        is_marked_onto(&pool, loser, elsewhere).await,
+        "the later dedup is untouched"
+    );
+    assert_eq!(
+        labels_of(&pool, survivor).await,
+        s(&[FAMILY]),
+        "control: labels reverted"
+    );
+}
+
 /// A2 and A3 (decisions D2, D3), on an application-role server over stdio.
 /// A cluster's loser is MARKED: it keeps its labels, the family label
 /// included, yet leaves the index read (`current_only`), so the family
