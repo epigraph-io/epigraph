@@ -201,7 +201,9 @@ fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle
         (0..n).any(|p| digit(w, p) == 1 - lit_digit(&query[p]))
     });
     let any_holds = set_from(n, |w| (0..n).any(|p| digit(w, p) == lit_digit(&query[p])));
-    let first_two = set_from(n, |w| (0..n.min(2)).all(|p| digit(w, p) == lit_digit(&query[p])));
+    let first_two = set_from(n, |w| {
+        (0..n.min(2)).all(|p| digit(w, p) == lit_digit(&query[p]))
+    });
 
     let mut acc = Oracle::default();
     let mut dis = 0.0;
@@ -266,7 +268,9 @@ fn closed_world_oracle(
     let bit = |w: usize, p: usize| (w >> p) & 1; // 0 = T, 1 = F
     let worlds = 1usize << n;
     let mk = |pred: &dyn Fn(usize) -> bool| -> u64 {
-        (0..worlds).filter(|w| pred(*w)).fold(0u64, |s, w| s | (1 << w))
+        (0..worlds)
+            .filter(|w| pred(*w))
+            .fold(0u64, |s, w| s | (1 << w))
     };
     let mut bodies: Vec<Vec<(f64, u64)>> = Vec::new();
     for item in items {
@@ -301,7 +305,13 @@ fn closed_world_oracle(
     }
     let target = 1u64 << target_world;
     let (mut k, mut bel, mut pl, mut betp) = (0.0, 0.0, 0.0, 0.0);
-    fn walk(bodies: &[Vec<(f64, u64)>], i: usize, mass: f64, set: u64, f: &mut dyn FnMut(f64, u64)) {
+    fn walk(
+        bodies: &[Vec<(f64, u64)>],
+        i: usize,
+        mass: f64,
+        set: u64,
+        f: &mut dyn FnMut(f64, u64),
+    ) {
         if mass == 0.0 {
             return;
         }
@@ -313,7 +323,11 @@ fn closed_world_oracle(
             walk(bodies, i + 1, mass * m, set & s, f);
         }
     }
-    let full = if worlds == 64 { u64::MAX } else { (1u64 << worlds) - 1 };
+    let full = if worlds == 64 {
+        u64::MAX
+    } else {
+        (1u64 << worlds) - 1
+    };
     walk(&bodies, 0, 1.0, full, &mut |m, s| {
         if s == 0 {
             k += m;
@@ -381,18 +395,21 @@ fn arb_tfo(open_world: bool) -> impl Strategy<Value = (f64, f64, f64)> {
 }
 
 fn arb_raw(n: u32, open_world: bool) -> impl Strategy<Value = Raw> {
-    let coupled = proptest::collection::btree_set(0..n, 1..=n as usize).prop_flat_map(move |atoms| {
-        let len = atoms.len();
-        proptest::collection::vec((any::<bool>(), arb_wo(open_world)), len).prop_map(move |es| {
-            Raw::Coupled(
-                atoms
-                    .iter()
-                    .zip(es)
-                    .map(|(a, (pos, (w, o)))| (*a, pos, w, o))
-                    .collect(),
+    let coupled =
+        proptest::collection::btree_set(0..n, 1..=n as usize).prop_flat_map(move |atoms| {
+            let len = atoms.len();
+            proptest::collection::vec((any::<bool>(), arb_wo(open_world)), len).prop_map(
+                move |es| {
+                    Raw::Coupled(
+                        atoms
+                            .iter()
+                            .zip(es)
+                            .map(|(a, (pos, (w, o)))| (*a, pos, w, o))
+                            .collect(),
+                    )
+                },
             )
-        })
-    });
+        });
     let mixed = (0..n, arb_tfo(open_world)).prop_map(|(a, (t, f, o))| Raw::Mixed(a, t, f, o));
     prop_oneof![3 => coupled, 1 => mixed]
 }
@@ -467,7 +484,11 @@ fn single_leaf_open_world_fixture_equals_cdst_dempster() {
     assert!(close(r.betp, betp), "betp {} vs served {}", r.betp, betp);
     assert!(close(r.nr, nr), "nr {} vs served {}", r.nr, nr);
     assert!((r.bel - 0.897).abs() < 1e-3, "SPEC §3.3 value: {}", r.bel);
-    assert!((r.k - 0.3).abs() < 1e-12, "conflict from `~` meeting touched states: {}", r.k);
+    assert!(
+        (r.k - 0.3).abs() < 1e-12,
+        "conflict from `~` meeting touched states: {}",
+        r.k
+    );
 }
 
 proptest! {
@@ -618,11 +639,18 @@ fn reference_case_counts_a_shared_paper_once() {
     let items = vec![e, other];
     let r = conj_belief(&positives(4), &items, 0.0).unwrap();
     assert!((r.bel - 0.704).abs() < 1e-9, "R-DEP {}", r.bel);
-    assert!((r.frechet.lo - 0.244).abs() < 1e-9, "Fréchet lo {}", r.frechet.lo);
+    assert!(
+        (r.frechet.lo - 0.244).abs() < 1e-9,
+        "Fréchet lo {}",
+        r.frechet.lo
+    );
     let independent: f64 = (0..4)
         .map(|a| conj_belief(&[Lit::pos(a)], &items, 0.0).unwrap().bel)
         .product();
-    assert!(r.bel > independent + 0.2, "R-IND squares the shared paper: {independent}");
+    assert!(
+        r.bel > independent + 0.2,
+        "R-IND squares the shared paper: {independent}"
+    );
     assert!(r.exact);
 }
 
@@ -923,16 +951,36 @@ fn total_conflict_is_an_error_like_dempster() {
 
 #[test]
 fn malformed_inputs_are_rejected() {
-    assert!(Item::new(vec![(Lit::pos(0u32), 0.7, 0.4)]).is_err(), "w + o > 1");
+    assert!(
+        Item::new(vec![(Lit::pos(0u32), 0.7, 0.4)]).is_err(),
+        "w + o > 1"
+    );
     assert!(Item::new(vec![(Lit::pos(0u32), -0.1, 0.0)]).is_err());
     assert!(Item::new(vec![(Lit::pos(0u32), f64::NAN, 0.0)]).is_err());
-    assert!(Item::new(vec![(Lit::pos(0u32), 0.5, 0.0), (Lit::neg(0u32), 0.2, 0.0)]).is_err(), "one atom twice");
+    assert!(
+        Item::new(vec![(Lit::pos(0u32), 0.5, 0.0), (Lit::neg(0u32), 0.2, 0.0)]).is_err(),
+        "one atom twice"
+    );
     assert!(Item::<u32>::new(vec![]).is_err());
     assert!(Item::mixed(0u32, 0.5, 0.4, 0.2).is_err());
     let item = Item::new(vec![(Lit::pos(0u32), 0.5, 0.0)]).unwrap();
-    assert!(conj_belief::<u32>(&[], &[item.clone()], 0.0).is_err(), "empty query");
-    assert!(conj_belief(&[Lit::pos(0u32), Lit::neg(0)], &[item.clone()], 0.0).is_err(), "atom twice in query");
-    assert!(conj_belief(&[Lit::pos(0u32)], &[item], 1.5).is_err(), "not_all outside [0, 1]");
+    assert!(
+        conj_belief::<u32>(&[], std::slice::from_ref(&item), 0.0).is_err(),
+        "empty query"
+    );
+    assert!(
+        conj_belief(
+            &[Lit::pos(0u32), Lit::neg(0)],
+            std::slice::from_ref(&item),
+            0.0
+        )
+        .is_err(),
+        "atom twice in query"
+    );
+    assert!(
+        conj_belief(&[Lit::pos(0u32)], &[item], 1.5).is_err(),
+        "not_all outside [0, 1]"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -963,5 +1011,8 @@ fn profile_summarizes_leaves_without_a_conjunction() {
         .collect();
     let hi = single.iter().map(|s| s.pl).fold(1.0, f64::min);
     assert!(close(p.frechet.hi, hi));
-    assert!(close(p.frechet.lo, 0.0), "six leaves at ≤ .8 have no Fréchet floor");
+    assert!(
+        close(p.frechet.lo, 0.0),
+        "six leaves at ≤ .8 have no Fréchet floor"
+    );
 }
