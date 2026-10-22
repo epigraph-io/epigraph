@@ -71,6 +71,11 @@ pub struct ParsedRecord {
     pub created_at: Option<DateTime<Utc>>,
     pub facts: Facts,
     pub keys: MatchKeys,
+    /// The facts of the claims marked duplicates of this one
+    /// ([`DedupClaim::duplicates`](super::DedupClaim::duplicates)), ordered by
+    /// id. Read for a field's value (a later date) only: never for matching,
+    /// never written.
+    pub duplicate_facts: Vec<Facts>,
 }
 
 impl ParsedRecord {
@@ -115,14 +120,35 @@ pub fn parse_content(pass: &PassProfile, content: &str) -> Facts {
 /// and adding carried ids.
 #[must_use]
 pub fn parse_record(pass: &PassProfile, claim: &DedupClaim) -> ParsedRecord {
-    parse_parts(
+    let mut r = parse_parts(
         pass,
         Some(claim.id),
         &claim.content,
         &claim.labels,
         claim.created_at,
-    )
+    );
+    // Every duplicate down the chain (a duplicate's own duplicates included),
+    // each once, ordered by id; bounded so a malformed cyclic or huge input
+    // cannot run away.
+    let mut seen: std::collections::BTreeMap<uuid::Uuid, &DedupClaim> =
+        std::collections::BTreeMap::new();
+    let mut stack: Vec<&DedupClaim> = claim.duplicates.iter().collect();
+    while let Some(d) = stack.pop() {
+        if d.id == claim.id || seen.contains_key(&d.id) || seen.len() >= MAX_DUPLICATES {
+            continue;
+        }
+        seen.insert(d.id, d);
+        stack.extend(d.duplicates.iter());
+    }
+    r.duplicate_facts = seen
+        .into_values()
+        .map(|d| parse_parts(pass, Some(d.id), &d.content, &d.labels, d.created_at).facts)
+        .collect();
+    r
 }
+
+/// The most duplicates (down every chain) read for one claim.
+pub const MAX_DUPLICATES: usize = 1024;
 
 /// Parse a probe candidate.
 #[must_use]
@@ -184,6 +210,7 @@ fn parse_parts(
         created_at,
         facts,
         keys,
+        duplicate_facts: Vec::new(),
     }
 }
 

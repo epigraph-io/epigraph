@@ -6,15 +6,16 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDate;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::classify::{classify_pair, cluster_conflict, hygiene_reason, ConflictKind, PairVerdict};
 use super::classify::{is_non_member, is_partially_retired};
 use super::ids::{carried_id, is_iso_date, is_us_date};
 use super::profile::{
-    expand, label_problem, AgeKey, AgeKeyName, Bindings, CloseoutSpec, LabelDedupProfile,
-    LifecycleSpec, PassProfile, ReadPurpose, SupersedeMatch, SupersedeSpec, TieBreak, Tier,
+    expand, label_problem, AgeKey, AgeKeyName, Bindings, CloseoutSpec, FamilyKind,
+    LabelDedupProfile, LifecycleSpec, PassProfile, ReadPurpose, SupersedeMatch, SupersedeSpec,
+    TieBreak, Tier,
 };
 use super::record::entities_match;
 use super::record::{parse_record, unknown_count, ParsedRecord};
@@ -83,8 +84,21 @@ pub struct ClusterMember {
     /// The tier of the first accepted edge (in processing order) touching it.
     pub tier: Tier,
     pub reason: String,
-    pub add: Vec<String>,
-    pub remove: Vec<String>,
+}
+
+/// One loser marked a duplicate of its cluster's survivor. The apply tool
+/// performs it through the graph-native dedup act (`mark_duplicate`'s act:
+/// the duplicate becomes non-current and gains a `same_as` identity edge to
+/// the canonical carrying `rule` and `matched_on` as provenance), so the
+/// duplicate leaves the index without a label write and keeps what it knew.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DuplicateMark {
+    pub dup: Uuid,
+    pub canonical: Uuid,
+    /// The tier that matched the pair.
+    pub rule: Tier,
+    /// The matching edge's reason (what the tier matched on).
+    pub matched_on: String,
 }
 
 /// One item tracked by several members.
@@ -96,15 +110,26 @@ pub struct Cluster {
     pub members: Vec<ClusterMember>,
     /// Member disagreements a human should see.
     pub conflicts: Vec<String>,
-    /// Survivor writes: `survivor_add` plus carry labels; `remove` replaces an
-    /// older carried date.
+    /// Survivor writes: `survivor_add` plus the carried-id labels.
     pub survivor_add: Vec<String>,
-    pub survivor_remove: Vec<String>,
-    /// The carry labels alone (a subset of `survivor_add`).
+    /// The carried-id labels alone (a subset of `survivor_add`).
     pub carry_add: Vec<String>,
-    /// A loser has a later date than the survivor and that date is not
-    /// carried, so a later close-out would judge the survivor by its own date.
-    pub stranded_due: bool,
+}
+
+impl Cluster {
+    /// One [`DuplicateMark`] per loser, by loser id.
+    #[must_use]
+    pub fn marks(&self) -> Vec<DuplicateMark> {
+        self.members
+            .iter()
+            .map(|m| DuplicateMark {
+                dup: m.id,
+                canonical: self.survivor,
+                rule: m.tier,
+                matched_on: m.reason.clone(),
+            })
+            .collect()
+    }
 }
 
 /// A pair a human must decide.
@@ -167,6 +192,10 @@ pub struct SignalDedupPlan {
     pub clusters: Vec<Cluster>,
     pub review_pairs: Vec<ReviewPair>,
     pub vetoed_chains: Vec<VetoedChain>,
+    /// Survivors of signal clusters left unmarked because a member is also
+    /// read by the main pass (a claim in both families): a mark would retire
+    /// it from the main family too. For a human.
+    pub cross_family: Vec<Uuid>,
 }
 
 /// A signal that became a member.
@@ -195,6 +224,9 @@ pub struct WriteUnit {
     /// `signal_superseded:<id>`.
     pub unit: String,
     pub writes: Vec<LabelWrite>,
+    /// The duplicates this unit marks (cluster units only). The apply tool
+    /// performs the marks, then the label writes.
+    pub marks: Vec<DuplicateMark>,
 }
 
 /// A complete plan.
@@ -278,12 +310,25 @@ fn write(claim_id: Uuid, add: &[String], remove: &[String]) -> LabelWrite {
 }
 
 fn push_unit(units: &mut Vec<WriteUnit>, unit: String, writes: Vec<LabelWrite>) {
+    push_unit_with_marks(units, unit, writes, Vec::new());
+}
+
+fn push_unit_with_marks(
+    units: &mut Vec<WriteUnit>,
+    unit: String,
+    writes: Vec<LabelWrite>,
+    marks: Vec<DuplicateMark>,
+) {
     let writes: Vec<LabelWrite> = writes
         .into_iter()
         .filter(|w| !w.add.is_empty() || !w.remove.is_empty())
         .collect();
-    if !writes.is_empty() {
-        units.push(WriteUnit { unit, writes });
+    if !writes.is_empty() || !marks.is_empty() {
+        units.push(WriteUnit {
+            unit,
+            writes,
+            marks,
+        });
     }
 }
 
@@ -299,9 +344,12 @@ fn push_hygiene_units(units: &mut Vec<WriteUnit>, kind: &str, items: &[HygieneIt
 
 fn push_cluster_units(units: &mut Vec<WriteUnit>, kind: &str, clusters: &[Cluster]) {
     for c in clusters {
-        let mut writes = vec![write(c.survivor, &c.survivor_add, &c.survivor_remove)];
-        writes.extend(c.members.iter().map(|m| write(m.id, &m.add, &m.remove)));
-        push_unit(units, format!("{kind}:{}", c.survivor), writes);
+        push_unit_with_marks(
+            units,
+            format!("{kind}:{}", c.survivor),
+            vec![write(c.survivor, &c.survivor_add, &[])],
+            c.marks(),
+        );
     }
 }
 
@@ -330,7 +378,7 @@ pub fn compute_plan_hash(
     }
     let profile_hash = canonical_profile_hash(profile_hash);
     let doc = HashDoc {
-        schema: "label-dedup-plan-hash/v1",
+        schema: "label-dedup-plan-hash/v2",
         profile_hash: &profile_hash,
         run_tag,
         as_of: as_of.map(|d| d.format("%Y-%m-%d").to_string()),
@@ -363,6 +411,34 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
         profile.require_section(*s)?;
     }
     let has = |s: Section| sections.contains(&s);
+    // Only an index family is ever planned (the main pass always is; the
+    // signal pass when its section is).
+    let mut families: Vec<(&str, FamilyKind)> =
+        vec![(profile.pass.family_label.as_str(), profile.pass.family_kind)];
+    if has(Section::SignalDedup) {
+        families.extend(
+            profile
+                .signal_dedup
+                .iter()
+                .map(|sp| (sp.family_label.as_str(), sp.family_kind)),
+        );
+    }
+    if has(Section::Lifecycle) {
+        families.extend(
+            profile
+                .lifecycle
+                .iter()
+                .map(|lc| (lc.signal_family_label.as_str(), lc.signal_family_kind)),
+        );
+    }
+    for (family_label, kind) in families {
+        if kind != FamilyKind::Index {
+            return Err(LabelDedupError::FamilyNotIndex {
+                family_label: family_label.to_string(),
+                kind,
+            });
+        }
+    }
     for s in [Section::Closeout, Section::Lifecycle] {
         if has(s) && req.as_of.is_none() {
             return Err(LabelDedupError::AsOfRequired { section: s });
@@ -406,10 +482,6 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
         req.run_tag,
         has(Section::Hygiene),
         has(Section::Dedup),
-        profile
-            .closeout
-            .as_ref()
-            .map_or("deadline", |c| c.date_field.as_str()),
     )?;
 
     let mut coverage = Coverage {
@@ -450,23 +522,25 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
     ) {
         plan.past_due = plan_closeout(&profile.pass, cs, &main, as_of, req.run_tag)?;
     }
-    if let (Some(lc), Some((signals, targets)), Some(as_of)) =
-        (profile.lifecycle.as_ref(), lifecycle_inputs, req.as_of)
-    {
-        let closed_now: BTreeSet<Uuid> = plan.past_due.iter().map(|p| p.id).collect();
-        plan.lifecycle = plan_lifecycle(
-            &profile.pass,
-            lc,
-            signals,
-            targets,
-            &main,
-            &closed_now,
-            as_of,
-            req.run_tag,
-        )?;
-    }
+    // The signal pass runs before lifecycle, so lifecycle never writes onto a
+    // signal this plan marks a duplicate (the mark retires it).
+    let mut signal_losers: BTreeSet<Uuid> = BTreeSet::new();
     if let (Some(sp), Some(snap)) = (profile.signal_dedup.as_ref(), signal_input) {
-        let sig = run_pass(sp, &snap.claims, req.run_tag, true, true, "deadline")?;
+        let mut sig = run_pass(sp, &snap.claims, req.run_tag, true, true)?;
+        // A mark retires a claim from EVERY family, not just this one. A signal
+        // cluster that touches a claim the main pass also reads (a claim
+        // carrying both family labels) would retire, or hang a chain off, a
+        // main-family member: it is left for a human, never marked.
+        let main_ids: BTreeSet<Uuid> = main.records.iter().map(rid).collect();
+        let (kept, crossing): (Vec<Cluster>, Vec<Cluster>) =
+            sig.clusters.into_iter().partition(|c| {
+                !main_ids.contains(&c.survivor)
+                    && !c.members.iter().any(|m| main_ids.contains(&m.id))
+            });
+        sig.clusters = kept;
+        sig.loser_of
+            .retain(|_, survivor| sig.clusters.iter().any(|c| c.survivor == *survivor));
+        signal_losers = sig.loser_of.keys().copied().collect();
         if let Some(ss) = profile.signal_superseded_by_member.as_ref() {
             plan.signal_superseded =
                 plan_superseded(&profile.pass, sp, ss, &sig, &main, req.run_tag)?;
@@ -477,7 +551,25 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
             clusters: sig.clusters,
             review_pairs: sig.review_pairs,
             vetoed_chains: sig.vetoed_chains,
+            cross_family: crossing.iter().map(|c| c.survivor).collect(),
         });
+    }
+    if let (Some(lc), Some((signals, targets)), Some(as_of)) =
+        (profile.lifecycle.as_ref(), lifecycle_inputs, req.as_of)
+    {
+        let closed_now: BTreeSet<Uuid> = plan.past_due.iter().map(|p| p.id).collect();
+        let mut lifecycle = plan_lifecycle(
+            &profile.pass,
+            lc,
+            signals,
+            targets,
+            &main,
+            &closed_now,
+            as_of,
+            req.run_tag,
+        )?;
+        lifecycle.retain(|a| !signal_losers.contains(&a.id));
+        plan.lifecycle = lifecycle;
     }
     plan.plan_hash = compute_plan_hash(
         req.profile_hash,
@@ -552,15 +644,12 @@ struct Edge {
     reason: String,
 }
 
-/// `date_field` is the field close-out judges by; the stranded-date check
-/// watches it.
 pub(crate) fn run_pass(
     pass: &PassProfile,
     claims: &[DedupClaim],
     run_tag: &str,
     emit_hygiene: bool,
     dedup: bool,
-    date_field: &str,
 ) -> Result<PassResult, LabelDedupError> {
     let bind = Bindings {
         run_tag,
@@ -705,9 +794,7 @@ pub(crate) fn run_pass(
     }
     let mut clusters = Vec::new();
     for (root, idxs) in components.into_iter().filter(|(_, v)| v.len() >= 2) {
-        let cluster = build_cluster(
-            pass, recs, &edges, &dsu, &idxs, root, &holders, run_tag, date_field,
-        )?;
+        let cluster = build_cluster(pass, recs, &edges, &dsu, &idxs, root, &holders, run_tag)?;
         let survivor = cluster.survivor;
         for m in &cluster.members {
             out.loser_of.insert(m.id, survivor);
@@ -810,61 +897,18 @@ fn precedence_cmp(pass: &PassProfile, a: &ParsedRecord, b: &ParsedRecord) -> Ord
     ord.then_with(|| rid(a).cmp(&rid(b)))
 }
 
-/// Labels carrying `<stem>-carried:` dates on a record, as dates.
-fn carried_dates(r: &ParsedRecord, prefix: &str) -> Vec<(String, NaiveDate)> {
-    r.labels
-        .iter()
-        .filter_map(|l| {
-            l.strip_prefix(prefix)
-                .and_then(iso_prefix_date)
-                .map(|d| (l.clone(), d))
-        })
-        .collect()
-}
-
-fn carry_prefix(pass: &PassProfile, field: &str) -> String {
-    let spec = match field {
-        "entity" => Some(&pass.fields.entity),
-        "deadline" => Some(&pass.fields.deadline),
-        "value" => Some(&pass.fields.value),
-        "class" => Some(&pass.fields.class),
-        other => pass.fields.extra.get(other),
-    };
-    let stem = spec.and_then(|s| s.carry_label.as_deref()).unwrap_or(field);
-    format!("{stem}-carried:")
-}
-
-/// A record's own date for `field`, and the later of that and any carried
-/// date. `None` when the record has no date of its own and none carried.
-fn effective_date(
-    pass: &PassProfile,
-    r: &ParsedRecord,
-    field: &str,
-) -> (Option<NaiveDate>, Option<NaiveDate>) {
+/// A record's own date for `field`, and the later of that and the dates its
+/// marked duplicates hold for it (read through the canonical's identity
+/// edges). `None` when the record has no date of its own and its duplicates
+/// none either; callers never use a duplicate's date for a record without one.
+fn effective_date(r: &ParsedRecord, field: &str) -> (Option<NaiveDate>, Option<NaiveDate>) {
     let own = r.facts.field(field).and_then(iso_prefix_date);
-    let carried = carried_dates(r, &carry_prefix(pass, field))
-        .into_iter()
-        .map(|(_, d)| d)
+    let from_duplicates = r
+        .duplicate_facts
+        .iter()
+        .filter_map(|f| f.field(field).and_then(iso_prefix_date))
         .max();
-    (own, own.max(carried))
-}
-
-/// The most characters of a loser's value a carry label keeps.
-pub const MAX_CARRIED_VALUE_CHARS: usize = 96;
-
-/// A value made safe to carry in a label: `$` dropped (the write path
-/// refuses it), braces and control characters dropped, whitespace runs
-/// collapsed to `-`, and the result cut to [`MAX_CARRIED_VALUE_CHARS`] on a
-/// character boundary. The value is claim data, so one odd row must yield a
-/// writable label (or none), never an error that fails the whole plan.
-fn label_safe_value(v: &str) -> String {
-    let cleaned: String = v
-        .chars()
-        .filter(|c| !matches!(c, '$' | '{' | '}') && !c.is_control())
-        .collect();
-    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join("-");
-    let cut: String = joined.chars().take(MAX_CARRIED_VALUE_CHARS).collect();
-    cut.trim_end_matches('-').to_string()
+    (own, own.max(from_duplicates))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -877,7 +921,6 @@ fn build_cluster(
     root: usize,
     holders: &BTreeMap<&str, BTreeSet<usize>>,
     run_tag: &str,
-    date_field: &str,
 ) -> Result<Cluster, LabelDedupError> {
     let merge = pass.merge.clone().unwrap_or_default();
     let mut ranked: Vec<&ParsedRecord> = idxs.iter().map(|i| &recs[*i]).collect();
@@ -894,9 +937,8 @@ fn build_cluster(
     );
     let losers: Vec<&ParsedRecord> = ranked[1..].to_vec();
 
-    // ── carry labels ──
+    // ── carry labels: the loser ids the survivor lacks (the index keys) ──
     let mut carry_add: Vec<String> = Vec::new();
-    let mut survivor_remove: Vec<String> = Vec::new();
     if let (true, Some(prefix)) = (merge.carry_ids, pass.ids.carry_label_prefix.as_deref()) {
         let have = &survivor.keys.all_ids;
         let mut add: BTreeSet<String> = BTreeSet::new();
@@ -911,41 +953,6 @@ fn build_cluster(
             }
         }
         carry_add.extend(add);
-    }
-    for field in &merge.carry_later_dates {
-        let prefix = carry_prefix(pass, field);
-        let (own, eff) = effective_date(pass, survivor, field);
-        let Some(eff) = eff.filter(|_| own.is_some()) else {
-            continue; // never invent a date for a survivor without one
-        };
-        let later = losers
-            .iter()
-            .filter_map(|l| effective_date(pass, l, field).1)
-            .max();
-        if let Some(later) = later.filter(|d| *d > eff) {
-            carry_add.push(format!("{prefix}{}", later.format("%Y-%m-%d")));
-            survivor_remove.extend(carried_dates(survivor, &prefix).into_iter().map(|(l, _)| l));
-        }
-    }
-    for field in &merge.carry_missing {
-        let prefix = carry_prefix(pass, field);
-        let has_carried = survivor.labels.iter().any(|l| l.starts_with(&prefix));
-        if survivor.facts.field(field).is_some() || has_carried {
-            continue;
-        }
-        let from_loser = losers.iter().find_map(|l| {
-            l.facts.field(field).map(str::to_string).or_else(|| {
-                l.labels
-                    .iter()
-                    .find_map(|x| x.strip_prefix(&prefix).map(str::to_string))
-            })
-        });
-        if let Some(v) = from_loser
-            .map(|v| label_safe_value(&v))
-            .filter(|v| !v.is_empty())
-        {
-            carry_add.push(format!("{prefix}{v}"));
-        }
     }
     for l in &carry_add {
         if let Some(reason) = label_problem(l) {
@@ -969,29 +976,6 @@ fn build_cluster(
             ));
         }
     }
-    let mut stranded_due = false;
-    if !merge.carry_later_dates.iter().any(|f| f == date_field) {
-        let own = survivor.facts.field(date_field).and_then(iso_prefix_date);
-        let later = losers
-            .iter()
-            .filter_map(|l| {
-                l.facts
-                    .field(date_field)
-                    .and_then(iso_prefix_date)
-                    .map(|d| (d, rid(l)))
-            })
-            .max_by(|x, y| x.0.cmp(&y.0).then_with(|| y.1.cmp(&x.1)));
-        if let (Some(own), Some((later, loser))) = (own, later) {
-            if later > own {
-                stranded_due = true;
-                conflicts.push(format!(
-                    "stranded {date_field}: survivor has {own}, loser {loser} has {later}; \
-                     the date is not carried, so a later close-out judges the survivor by {own}"
-                ));
-            }
-        }
-    }
-
     // ── writes ──
     let bind = Bindings {
         run_tag,
@@ -1005,29 +989,40 @@ fn build_cluster(
             survivor_add.push(l.clone());
         }
     }
-    let loser_add = expand_all(&merge.loser_add, &bind)?;
-    let loser_remove = expand_all(&merge.loser_remove, &bind)?;
     let mut members: Vec<ClusterMember> = losers
         .iter()
         .map(|l| {
             let li = recs.iter().position(|r| r.id == l.id).unwrap_or_default();
-            let (tier, reason) = edges
+            let si = recs
                 .iter()
-                .find(|e| {
-                    (e.a == li || e.b == li)
-                        && dsu.find_const(e.a) == root
-                        && dsu.find_const(e.b) == root
-                })
-                .map_or(
-                    (Tier::TitleAndEntity, String::from("transitively clustered")),
-                    |e| (e.tier, e.reason.clone()),
-                );
+                .position(|r| r.id == survivor.id)
+                .unwrap_or_default();
+            let in_cluster = |e: &&Edge| dsu.find_const(e.a) == root && dsu.find_const(e.b) == root;
+            // The provenance a mark records is the match between THIS loser and
+            // the survivor when there is one; otherwise the loser's first match
+            // in the cluster, naming the claim it actually matched.
+            let direct = edges
+                .iter()
+                .filter(in_cluster)
+                .find(|e| (e.a == li && e.b == si) || (e.a == si && e.b == li));
+            let (tier, reason) = match direct {
+                Some(e) => (e.tier, e.reason.clone()),
+                None => edges
+                    .iter()
+                    .filter(in_cluster)
+                    .find(|e| e.a == li || e.b == li)
+                    .map_or(
+                        (Tier::TitleAndEntity, String::from("transitively clustered")),
+                        |e| {
+                            let other = if e.a == li { e.b } else { e.a };
+                            (e.tier, format!("via {}: {}", rid(&recs[other]), e.reason))
+                        },
+                    ),
+            };
             ClusterMember {
                 id: rid(l),
                 tier,
                 reason,
-                add: loser_add.clone(),
-                remove: loser_remove.clone(),
             }
         })
         .collect();
@@ -1039,9 +1034,7 @@ fn build_cluster(
         members,
         conflicts,
         survivor_add,
-        survivor_remove,
         carry_add,
-        stranded_due,
     })
 }
 
@@ -1072,7 +1065,7 @@ fn plan_closeout(
         if main.loser_of.contains_key(&id) {
             continue;
         }
-        let (own, eff) = effective_date(pass, r, field);
+        let (own, eff) = effective_date(r, field);
         let Some(eff) = eff.filter(|_| own.is_some()) else {
             continue;
         };
@@ -1081,7 +1074,7 @@ fn plan_closeout(
                 .iter()
                 .filter(|m| **m != id)
                 .filter_map(|m| by_id.get(m))
-                .filter_map(|l| effective_date(pass, l, field).1)
+                .filter_map(|l| effective_date(l, field).1)
                 .fold(eff, std::cmp::max)
         });
         if latest < as_of {

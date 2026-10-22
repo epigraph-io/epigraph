@@ -44,6 +44,7 @@ pub fn claim(tag: u32, content: &str, labels: &[&str], created: &str) -> DedupCl
         content: content.to_string(),
         labels: labels.iter().map(|s| (*s).to_string()).collect(),
         created_at: Some(ts(created)),
+        duplicates: Vec::new(),
     }
 }
 
@@ -54,8 +55,9 @@ pub const RUN_TAG: &str = "notice-dedup-2026-10-05";
 /// The full test profile: every feature on.
 pub fn profile_value() -> serde_json::Value {
     serde_json::json!({
-        "schema": "label-dedup-profile/v1",
+        "schema": "label-dedup-profile/v2",
         "family_label": "notice",
+        "family_kind": "index",
         "closed_label": "resolved",
         "retired_labels": ["notice-dropped", "notice-duplicate", "listed-final"],
         "content_retired_flags": ["DROPPED"],
@@ -78,8 +80,7 @@ pub fn profile_value() -> serde_json::Value {
             "entity": {"pipe_position": 1, "keys": ["agency:"]},
             "deadline": {
                 "keys": ["due:", "due "],
-                "prose_markers": ["due:", "due ", "open through ", "closes ", "deadline "],
-                "carry_label": "due"
+                "prose_markers": ["due:", "due ", "open through ", "closes ", "deadline "]
             },
             "value": {
                 "keys": ["est.", "value:"],
@@ -117,16 +118,13 @@ pub fn profile_value() -> serde_json::Value {
             "rank_label_groups": [["src-direct-a", "src-direct-b", "src-direct-c"], ["src-feed"]]
         },
         "merge": {
-            "loser_add": ["notice-duplicate", "duplicate-of:{survivor}", "{run_tag}"],
-            "loser_remove": ["{family}"],
             "survivor_add": ["notice-survivor", "{run_tag}"],
-            "carry_ids": true,
-            "carry_later_dates": ["deadline"],
-            "carry_missing": ["value"]
+            "carry_ids": true
         },
         "closeout": {"date_field": "deadline", "add": ["resolved", "closed-past-due", "{run_tag}"]},
         "lifecycle": {
             "signal_family_label": "lead",
+            "signal_family_kind": "index",
             "signal_exclude_labels": ["resolved"],
             "target_exclude_labels": ["notice-dropped", "notice-duplicate", "listed-final"],
             "umbrella": {
@@ -157,8 +155,6 @@ pub fn legacy_profile_value() -> serde_json::Value {
     ids.remove("carry_label_prefix");
     let merge = o["merge"].as_object_mut().expect("merge");
     merge.insert("carry_ids".into(), false.into());
-    merge.insert("carry_later_dates".into(), serde_json::json!([]));
-    merge.insert("carry_missing".into(), serde_json::json!([]));
     v
 }
 
@@ -269,10 +265,30 @@ pub fn plan_graph_as_given(
     plan(&req, &inputs).expect("plan")
 }
 
-/// Apply write units to an in-memory graph exactly as the label-write path
-/// does: set union for `add`, set difference for `remove`, content untouched.
+/// Apply write units to an in-memory graph as the apply tool does: each mark
+/// first (the duplicate becomes non-current, so it leaves every current-only
+/// read, and it is read through its canonical as `index_view` returns it:
+/// under the canonical's `duplicates`, with the duplicates it had itself),
+/// then the label writes (set union for `add`, set difference for `remove`,
+/// content untouched).
 pub fn apply_units(graph: &[DedupClaim], units: &[WriteUnit]) -> Vec<DedupClaim> {
     let mut out = graph.to_vec();
+    for unit in units {
+        for m in &unit.marks {
+            let pos = out
+                .iter()
+                .position(|c| c.id == m.dup)
+                .unwrap_or_else(|| panic!("a mark names a claim outside the graph: {m:?}"));
+            let mut dup = out.remove(pos);
+            let mut inherited = std::mem::take(&mut dup.duplicates);
+            let canonical = out
+                .iter_mut()
+                .find(|c| c.id == m.canonical)
+                .unwrap_or_else(|| panic!("a mark's canonical is outside the graph: {m:?}"));
+            canonical.duplicates.push(dup);
+            canonical.duplicates.append(&mut inherited);
+        }
+    }
     for unit in units {
         for w in &unit.writes {
             let c = out

@@ -5,7 +5,7 @@ use epigraph_engine::label_dedup::{DedupClaim, Section};
 
 use crate::fixtures::{
     self as f, all_sections, apply_units, claim, corpus, date, dedup_sections, id, plan_graph,
-    profile, t, RUN_TAG,
+    profile, t,
 };
 
 /// The corpus plus signals, so every section has work.
@@ -33,34 +33,24 @@ fn graph() -> Vec<DedupClaim> {
 }
 
 #[test]
-fn cluster_unit_retires_losers_by_label_and_never_touches_content() {
+fn cluster_unit_marks_losers_and_never_touches_content() {
     let p = plan_graph(&profile(), &corpus(), &dedup_sections(), None);
     let units = p.write_units();
     let unit = units
         .iter()
         .find(|u| u.unit == format!("cluster:{}", id(t::WING_DIRECT)))
         .expect("wing cluster unit");
-    let loser = unit
-        .writes
-        .iter()
-        .find(|w| w.claim_id == id(t::WING_FEED))
-        .expect("loser write");
-    assert_eq!(
-        loser.remove,
-        vec!["notice".to_string()],
-        "leaving the family is the index exit"
+    assert!(
+        unit.writes.iter().all(|w| w.claim_id != id(t::WING_FEED)),
+        "the loser leaves the index by its mark, not a label: {:?}",
+        unit.writes
     );
     assert!(
-        loser
-            .add
-            .contains(&format!("duplicate-of:{}", id(t::WING_DIRECT))),
+        unit.marks
+            .iter()
+            .any(|m| m.dup == id(t::WING_FEED) && m.canonical == id(t::WING_DIRECT)),
         "{:?}",
-        loser.add
-    );
-    assert!(loser.add.contains(&"notice-duplicate".to_string()));
-    assert!(
-        loser.add.contains(&RUN_TAG.to_string()),
-        "the run tag makes the pass auditable"
+        unit.marks
     );
     let survivor = unit
         .writes
@@ -74,7 +64,15 @@ fn cluster_unit_retires_losers_by_label_and_never_touches_content() {
     );
 
     let applied = apply_units(&corpus(), &units);
-    for (before, after) in corpus().iter().zip(&applied) {
+    let original = corpus();
+    for after in applied
+        .iter()
+        .chain(applied.iter().flat_map(|c| c.duplicates.iter()))
+    {
+        let before = original
+            .iter()
+            .find(|c| c.id == after.id)
+            .expect("same claims");
         assert_eq!(before.content, after.content, "content is never rewritten");
     }
 }

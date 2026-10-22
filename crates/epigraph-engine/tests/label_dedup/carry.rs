@@ -1,5 +1,7 @@
-//! Carry labels: what a loser knew moves onto the survivor as labels, because
-//! claim content is never rewritten.
+//! Carry labels: a loser's ids, the index's keys, move onto the survivor as
+//! labels. Nothing else does: a loser's later date or a value the survivor
+//! lacks stays on the loser, which is marked a duplicate of the survivor and
+//! read through it (`DedupClaim::duplicates`).
 
 use crate::fixtures::{
     self as f, apply_units, claim, cluster_shape, dedup_sections, id, legacy_profile, plan_graph,
@@ -70,7 +72,7 @@ fn an_also_id_label_matches_a_later_refiling() {
 }
 
 #[test]
-fn a_missing_value_is_carried_label_safe() {
+fn a_missing_value_stays_on_the_marked_duplicate() {
     let graph = vec![
         claim(
             1,
@@ -81,31 +83,34 @@ fn a_missing_value_is_carried_label_safe() {
         claim(2, f::FENDER_FEED, &["notice"], "2026-05-10T00:00:00Z"),
     ];
     let p = plan_graph(&profile(), &graph, &dedup_sections(), None);
+    assert_eq!(cluster_shape(&p), vec![(id(1), vec![id(2)])]);
     let c = &p.clusters[0];
-    let carried: Vec<_> = c
-        .carry_add
-        .iter()
-        .filter(|l| l.starts_with("value-carried:"))
-        .collect();
-    assert_eq!(carried.len(), 1, "{:?}", c.carry_add);
     assert!(
-        !carried[0].contains('$'),
-        "a `$` label is refused by the write path: {}",
-        carried[0]
+        !c.carry_add.iter().any(|l| l.contains("-carried:")),
+        "the value is not copied onto the survivor: {:?}",
+        c.carry_add
     );
-    assert!(carried[0].contains("1,600,000"), "{}", carried[0]);
-    epigraph_db::reject_unexpanded_labels(&c.carry_add).expect("valid labels");
+    // It stays on the loser, which the plan marks a duplicate of the survivor
+    // and the next read returns under it.
+    let applied = apply_units(&graph, &p.write_units());
+    assert_eq!(applied.len(), 1, "the marked duplicate left the index");
+    assert_eq!(applied[0].duplicates.len(), 1);
+    assert!(
+        applied[0].duplicates[0].content.contains("1,600,000"),
+        "{}",
+        applied[0].duplicates[0].content
+    );
 }
 
 #[test]
-fn a_later_carried_date_replaces_the_older_one() {
-    // The survivor already carries 07-15 from an earlier merge; a new loser
-    // carries 08-30. The old carry label is removed and the new one added in
-    // the same unit.
+fn a_later_date_stays_on_the_duplicate_and_counts_through_it() {
+    // The loser holds the later deadline. Nothing is copied onto the survivor;
+    // after the marks apply, close-out judges the survivor by the later date
+    // its duplicate holds.
     let survivor = claim(
         1,
         f::WEIR_EARLY,
-        &["notice", "src-direct-a", "due-carried:2026-07-15"],
+        &["notice", "src-direct-a"],
         "2026-04-27T00:00:00Z",
     );
     let loser = claim(
@@ -114,33 +119,31 @@ fn a_later_carried_date_replaces_the_older_one() {
         &["notice"],
         "2026-07-20T00:00:00Z",
     );
-    let p = plan_graph(
-        &profile(),
-        &[survivor.clone(), loser],
-        &dedup_sections(),
-        None,
-    );
+    let graph = vec![survivor.clone(), loser];
+    let p = plan_graph(&profile(), &graph, &dedup_sections(), None);
     let c = &p.clusters[0];
     assert_eq!(c.survivor, id(1));
-    assert!(
-        c.carry_add.contains(&"due-carried:2026-08-30".to_string()),
-        "{:?}",
-        c.carry_add
-    );
-    assert_eq!(
-        c.survivor_remove,
-        vec!["due-carried:2026-07-15".to_string()]
-    );
-    // Control: a loser EARLIER than the carried date carries nothing.
-    let older = claim(2, f::WEIR_LATE, &["notice"], "2026-07-20T00:00:00Z");
-    let p = plan_graph(&profile(), &[survivor, older], &dedup_sections(), None);
-    let c = &p.clusters[0];
     assert!(
         !c.carry_add.iter().any(|l| l.starts_with("due-carried:")),
         "{:?}",
         c.carry_add
     );
-    assert!(c.survivor_remove.is_empty());
+    let applied = apply_units(&graph, &p.write_units());
+    let closeout = [epigraph_engine::label_dedup::Section::Closeout];
+    let open = plan_graph(&profile(), &applied, &closeout, Some(f::date("2026-08-01")));
+    assert!(
+        open.past_due.is_empty(),
+        "08-30 via the duplicate: {:?}",
+        open.past_due
+    );
+    // Control: the survivor alone (06-17) is past due on that date.
+    let alone = plan_graph(
+        &profile(),
+        &[survivor],
+        &closeout,
+        Some(f::date("2026-08-01")),
+    );
+    assert_eq!(alone.past_due.len(), 1, "{:?}", alone.past_due);
 }
 
 #[test]
@@ -179,8 +182,8 @@ fn carry_is_idempotent_across_runs() {
         c.carry_add
     );
     assert!(
-        !c.carry_add.iter().any(|l| l.starts_with("due-carried:")),
-        "07-15 is already carried: {:?}",
+        !c.carry_add.iter().any(|l| l.contains("-carried:")),
+        "no value or date is carried: {:?}",
         c.carry_add
     );
 }
@@ -228,7 +231,7 @@ fn an_id_a_kept_apart_claim_carries_is_never_carried() {
 }
 
 #[test]
-fn a_carried_value_is_made_writable_and_bounded() {
+fn an_odd_loser_value_never_fails_the_plan_and_is_never_written() {
     let survivor = || {
         claim(
             1,
@@ -237,44 +240,33 @@ fn a_carried_value_is_made_writable_and_bounded() {
             "2026-05-01T00:00:00Z",
         )
     };
-    let carried = |loser_content: &str| -> Vec<String> {
-        let graph = vec![
-            survivor(),
-            claim(2, loser_content, &["notice"], "2026-05-10T00:00:00Z"),
-        ];
-        // One odd loser value must never fail the whole plan.
-        let p = f::try_plan_graph(&profile(), &graph, &dedup_sections(), None, 5000)
-            .expect("a loser's value never fails the plan");
-        assert_eq!(cluster_shape(&p), vec![(id(1), vec![id(2)])]);
-        p.clusters[0]
-            .carry_add
-            .iter()
-            .filter(|l| l.starts_with("value-carried:"))
-            .cloned()
-            .collect()
-    };
     let pipe = |est: &str| {
         format!(
             "[OPEN] Dock 4 Fender Rebuild TND 0000029912 | Acme Port Authority | sector:city | due unknown | est. {est} | Fender rebuild"
         )
     };
-    // A control character inside the value is dropped, not fatal.
-    let bell = carried(&pipe("2.4M\u{7}approx"));
-    assert_eq!(bell, vec!["value-carried:2.4Mapprox".to_string()]);
-    // A run-on value is cut to a bounded label on a character boundary.
     let long_tail = "ca ".repeat(80) + "é".repeat(80).as_str();
-    let long = carried(&pipe(&long_tail));
-    assert_eq!(long.len(), 1, "{long:?}");
-    let value = long[0].strip_prefix("value-carried:").expect("prefix");
-    assert!(
-        value.chars().count() <= epigraph_engine::label_dedup::plan::MAX_CARRIED_VALUE_CHARS,
-        "{} chars: {value}",
-        value.chars().count()
-    );
-    assert!(value.starts_with("ca-ca-"), "{value}");
-    assert!(!value.ends_with('-'), "{value}");
-    epigraph_db::reject_unexpanded_labels(&long).expect("valid label");
-    // Control: a clean value is carried whole.
-    let clean = carried(f::FENDER_FEED);
-    assert_eq!(clean, vec!["value-carried:1,600,000".to_string()]);
+    for value in [
+        pipe("2.4M\u{7}approx"),
+        pipe(&long_tail),
+        f::FENDER_FEED.to_string(),
+    ] {
+        let graph = vec![
+            survivor(),
+            claim(2, &value, &["notice"], "2026-05-10T00:00:00Z"),
+        ];
+        let p = f::try_plan_graph(&profile(), &graph, &dedup_sections(), None, 5000)
+            .expect("a loser's value never fails the plan");
+        assert_eq!(cluster_shape(&p), vec![(id(1), vec![id(2)])]);
+        let written: Vec<String> = p
+            .write_units()
+            .iter()
+            .flat_map(|u| u.writes.iter().flat_map(|w| w.add.clone()))
+            .collect();
+        assert!(
+            !written.iter().any(|l| l.contains("-carried:")),
+            "{written:?}"
+        );
+        epigraph_db::reject_unexpanded_labels(&written).expect("valid labels");
+    }
 }

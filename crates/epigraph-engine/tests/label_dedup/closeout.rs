@@ -189,10 +189,10 @@ fn survivor_without_a_deadline_never_borrows_one() {
 }
 
 #[test]
-fn an_uncarried_later_deadline_is_flagged_stranded() {
-    // Without date carry, only the survivor's 06-17 stays in the family after
-    // the merge, so a later close-out would close an item open until 07-15.
-    // The plan flags it.
+fn a_disagreeing_deadline_is_reported_and_never_stranded() {
+    // The loser holds the later deadline. It is reported as a disagreement,
+    // and nothing is "stranded": the loser is marked a duplicate, keeps its
+    // date, and the survivor is read with it.
     let graph = vec![
         claim(
             1,
@@ -203,61 +203,32 @@ fn an_uncarried_later_deadline_is_flagged_stranded() {
         claim(2, f::WEIR_LATE, &["notice"], "2026-06-20T00:00:00Z"),
     ];
     let p = plan_graph(
-        &legacy_profile(),
+        &profile(),
         &graph,
         &closeout_sections(),
         Some(date("2026-07-01")),
     );
     let c = &p.clusters[0];
-    assert!(c.stranded_due, "{c:?}");
-    let warn: Vec<_> = c
-        .conflicts
-        .iter()
-        .filter(|m| m.contains("stranded"))
-        .collect();
-    assert_eq!(warn.len(), 1, "{:?}", c.conflicts);
     assert!(
-        warn[0].contains("2026-06-17")
-            && warn[0].contains("2026-07-15")
-            && warn[0].contains(&id(2).to_string()),
-        "the warning names both dates and the loser: {}",
-        warn[0]
+        c.conflicts.iter().any(|m| m.contains("deadline")
+            && m.contains("2026-06-17")
+            && m.contains("2026-07-15")),
+        "{:?}",
+        c.conflicts
     );
-
-    // Here the survivor's own date is already the latest: the dates differ,
-    // but nothing is stranded.
-    let held = vec![
-        claim(
-            1,
-            f::FENDER_DIRECT_HELD,
-            &["notice", "src-direct-a"],
-            "2026-05-01T00:00:00Z",
-        ),
-        claim(2, f::FENDER_FEED, &["notice"], "2026-05-10T00:00:00Z"),
-    ];
-    let p = plan_graph(
-        &legacy_profile(),
-        &held,
-        &closeout_sections(),
-        Some(date("2026-06-15")),
-    );
-    assert_eq!(p.clusters[0].survivor, id(1));
     assert!(
-        p.clusters[0]
-            .conflicts
-            .iter()
-            .any(|m| m.contains("deadline")),
-        "precondition: {:?}",
-        p.clusters[0].conflicts
+        !c.conflicts.iter().any(|m| m.contains("stranded")),
+        "{:?}",
+        c.conflicts
     );
-    assert!(!p.clusters[0].stranded_due);
+    assert_eq!(c.marks().len(), 1, "the loser is marked, not dropped");
 }
 
 #[test]
-fn a_carried_deadline_defers_closeout_across_runs() {
-    // With carry on, the merge writes `due-carried:2026-07-15` onto the
-    // survivor and nothing is stranded. After the merge is applied the loser is
-    // gone, and the NEXT run still judges the survivor by 07-15.
+fn a_duplicates_deadline_defers_closeout_across_runs() {
+    // The merge writes no date onto the survivor. After the marks apply the
+    // loser is out of the index but read under the survivor, and the NEXT run
+    // still judges the survivor by the loser's 07-15.
     let graph = vec![
         claim(
             1,
@@ -274,13 +245,13 @@ fn a_carried_deadline_defers_closeout_across_runs() {
         Some(date("2026-07-01")),
     );
     let c = &first.clusters[0];
-    assert!(!c.stranded_due, "{c:?}");
     assert!(
-        c.carry_add.contains(&"due-carried:2026-07-15".to_string()),
+        !c.carry_add.iter().any(|l| l.contains("-carried:")),
         "{:?}",
         c.carry_add
     );
     let applied = f::apply_units(&graph, &first.write_units());
+    assert_eq!(applied.len(), 1, "the loser left the index");
 
     let second = plan_graph(
         &profile(),
@@ -290,7 +261,7 @@ fn a_carried_deadline_defers_closeout_across_runs() {
     );
     assert!(
         second.past_due.is_empty(),
-        "the carried 07-15 keeps it open on 07-10: {:?}",
+        "the duplicate's 07-15 keeps it open on 07-10: {:?}",
         second.past_due
     );
     let third = plan_graph(
@@ -308,26 +279,18 @@ fn a_carried_deadline_defers_closeout_across_runs() {
         vec![(id(1), date("2026-07-15"))]
     );
 
-    // Control: the legacy plan applied leaves only 06-17, and closes on 07-10.
-    let legacy_first = plan_graph(
-        &legacy_profile(),
-        &graph,
-        &closeout_sections(),
-        Some(date("2026-07-01")),
-    );
-    let legacy_applied = f::apply_units(&graph, &legacy_first.write_units());
-    let legacy_second = plan_graph(
-        &legacy_profile(),
-        &legacy_applied,
+    // Control: read WITHOUT its duplicate (an index read that does not follow
+    // the identity edges), the survivor closes on 07-10 by its own 06-17.
+    let mut bare = applied;
+    bare[0].duplicates.clear();
+    let blind = plan_graph(
+        &profile(),
+        &bare,
         &closeout_sections(),
         Some(date("2026-07-10")),
     );
     assert_eq!(
-        legacy_second
-            .past_due
-            .iter()
-            .map(|p| p.id)
-            .collect::<Vec<_>>(),
+        blind.past_due.iter().map(|p| p.id).collect::<Vec<_>>(),
         vec![id(1)]
     );
 }
@@ -376,29 +339,36 @@ fn closeout_writes_keep_the_family_label() {
 }
 
 #[test]
-fn a_carried_date_alone_never_closes_a_claim() {
+fn a_duplicates_date_alone_never_closes_a_claim() {
     // Close-out acts only on a claim whose own content carries a date; a
-    // carried date extends that date, it never stands in for it.
-    let hand_labelled = claim(
+    // duplicate's date extends that date, it never stands in for it.
+    let mut undated = claim(
         1,
         f::FENDER_DIRECT_NO_DUE,
-        &["notice", "src-direct-a", "due-carried:2026-06-01"],
+        &["notice", "src-direct-a"],
         "2026-05-01T00:00:00Z",
     );
+    undated.duplicates = vec![claim(2, f::WEIR_EARLY, &["notice"], "2026-04-01T00:00:00Z")];
     let p = plan_graph(
         &profile(),
-        &[hand_labelled],
+        &[undated],
         &closeout_sections(),
         Some(date("2026-10-05")),
     );
     assert!(p.past_due.is_empty(), "{:?}", p.past_due);
-    // Control: the same label on a claim WITH its own date is honoured.
-    let dated = claim(
+    // Control: a duplicate's later date on a claim WITH its own date counts.
+    let mut dated = claim(
         1,
         f::FENDER_DIRECT_HELD,
-        &["notice", "src-direct-a", "due-carried:2026-11-01"],
+        &["notice", "src-direct-a"],
         "2026-05-01T00:00:00Z",
     );
+    dated.duplicates = vec![claim(
+        2,
+        "Tender: Dock 4 Fender Rebuild TND 0000029912 — Acme Port Authority, due 2026-11-01.",
+        &["notice"],
+        "2026-05-10T00:00:00Z",
+    )];
     let p = plan_graph(
         &profile(),
         std::slice::from_ref(&dated),
@@ -407,7 +377,7 @@ fn a_carried_date_alone_never_closes_a_claim() {
     );
     assert!(
         p.past_due.is_empty(),
-        "the carried 11-01 keeps it open: {:?}",
+        "the duplicate's 11-01 keeps it open: {:?}",
         p.past_due
     );
     let p = plan_graph(

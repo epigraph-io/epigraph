@@ -59,7 +59,8 @@ fn unknown_keys_and_a_wrong_schema_are_refused() {
     v["fields"]["deadline"]["markers"] = serde_json::json!(["due "]);
     schema_error(&v);
     let mut v = profile_value();
-    v["schema"] = "label-dedup-profile/v2".into();
+    // The previous schema (loser relabelling, carried values) is refused.
+    v["schema"] = "label-dedup-profile/v1".into();
     schema_error(&v);
     let mut v = profile_value();
     v.as_object_mut().expect("object").remove("family_label");
@@ -73,7 +74,11 @@ fn unknown_keys_and_a_wrong_schema_are_refused() {
 
 #[test]
 fn a_minimal_profile_has_empty_defaults() {
-    let v = serde_json::json!({"schema": "label-dedup-profile/v1", "family_label": "notice"});
+    let v = serde_json::json!({
+        "schema": "label-dedup-profile/v2",
+        "family_label": "notice",
+        "family_kind": "index"
+    });
     let p = LabelDedupProfile::from_json_bytes(&bytes(&v)).expect("minimal profile");
     assert!(p.pass.retired_labels.is_empty());
     assert!(p.pass.entity_match.aliases.is_empty());
@@ -101,9 +106,6 @@ fn a_retirement_that_does_not_leave_the_family_is_refused() {
     v["hygiene_write"] = serde_json::json!({"add": ["{run_tag}"], "remove": []});
     assert!(schema_error(&v).contains("hygiene_write"));
     let mut v = profile_value();
-    v["merge"]["loser_remove"] = serde_json::json!([]);
-    assert!(schema_error(&v).contains("loser_remove"));
-    let mut v = profile_value();
     v["closeout"]["add"] = serde_json::json!(["closed-past-due", "{run_tag}"]);
     assert!(schema_error(&v).contains("closeout"));
     let mut v = profile_value();
@@ -117,8 +119,9 @@ fn a_retirement_that_does_not_leave_the_family_is_refused() {
 
 #[test]
 fn placeholders_are_bound_only_where_they_have_a_value() {
-    // `{survivor}` exists only in loser writes; anywhere else it would reach
-    // the graph unexpanded or expanded to a wrong id.
+    // `{survivor}` is bound in no write a profile declares (losers are marked,
+    // not relabelled); in a survivor write it would expand to the claim's own
+    // id, so it is refused.
     let mut v = profile_value();
     v["merge"]["survivor_add"] = serde_json::json!(["dup-of:{survivor}"]);
     assert!(schema_error(&v).contains("{survivor}"));
@@ -126,7 +129,7 @@ fn placeholders_are_bound_only_where_they_have_a_value() {
     v["hygiene_write"]["add"] = serde_json::json!(["{target}"]);
     schema_error(&v);
     let mut v = profile_value();
-    v["merge"]["loser_add"] = serde_json::json!(["{oops}", "{run_tag}"]);
+    v["merge"]["survivor_add"] = serde_json::json!(["{oops}", "{run_tag}"]);
     schema_error(&v);
     // A literal that the write path refuses is refused at load time.
     let mut v = profile_value();

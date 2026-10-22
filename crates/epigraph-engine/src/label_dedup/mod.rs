@@ -8,14 +8,23 @@
 //! text layouts, so the index accumulates duplicates, retired items that kept
 //! the family label, and bookkeeping claims that wear it by accident.
 //!
+//! Only a family the profile declares an INDEX ([`FamilyKind::Index`]) is
+//! planned; a family of knowledge claims is refused
+//! ([`LabelDedupError::FamilyNotIndex`]).
+//!
 //! This module plans the clean-up. It reads a snapshot of the family (plus,
 //! optionally, a signal family and a graduation index), classifies every claim,
-//! clusters duplicates, picks a survivor per cluster, and emits label writes:
+//! clusters duplicates, picks a survivor per cluster, and emits duplicate
+//! marks and label writes:
 //!
 //! - **hygiene**: retired or bookkeeping claims leave the family;
-//! - **dedup**: losers leave the family and point at their survivor; the
-//!   survivor receives carry labels (`<prefix><ID>`, `<field>-carried:<value>`)
-//!   so nothing a loser knew is lost, without rewriting claim content;
+//! - **dedup**: each loser is marked a duplicate of its survivor (a
+//!   [`DuplicateMark`], which the apply tool performs through the graph-native
+//!   dedup act: the loser leaves the index by becoming non-current and stays
+//!   reachable through the survivor's identity edge); the survivor receives
+//!   the loser ids it lacks as carry labels (`<prefix><ID>`), the index's keys.
+//!   A loser's later date or extra field stays on the loser and is read
+//!   through [`DedupClaim::duplicates`];
 //! - **close-out**: members whose deadline has passed gain the closed label;
 //! - **lifecycle**: signals that materialized as a member, or aged out, close;
 //! - **signal passes**: a second family is deduplicated on its own and its
@@ -24,9 +33,12 @@
 //! # Purity
 //!
 //! No I/O, no clock. `as_of` is an input, never `now()`. The caller (the MCP
-//! tools) performs the reads named by [`LabelDedupProfile::reads`], applies the
-//! returned [`WriteUnit`]s through the ordinary stamped label-write path, and
-//! recomputes the plan before applying so a stale plan is refused.
+//! tools) performs the reads named by [`LabelDedupProfile::reads`] (and, for
+//! each member read, the claims already marked duplicates of each member:
+//! [`DedupClaim::duplicates`]), performs each returned [`WriteUnit`]'s marks
+//! through the graph-native dedup act and then its label writes through the
+//! ordinary stamped label-write path, and recomputes the plan before applying
+//! so a stale plan is refused.
 //!
 //! # No deployment data in code
 //!
@@ -56,12 +68,14 @@ use uuid::Uuid;
 pub use classify::{classify_pair, hygiene_reason, PairVerdict};
 pub use ids::{extract_ids, IdToken};
 pub use plan::{
-    compute_plan_hash, plan, Cluster, ClusterMember, Coverage, HygieneItem, LabelWrite,
-    LifecycleAction, LifecycleKind, PastDue, Plan, PlanInputs, PlanRequest, ReviewPair,
+    compute_plan_hash, plan, Cluster, ClusterMember, Coverage, DuplicateMark, HygieneItem,
+    LabelWrite, LifecycleAction, LifecycleKind, PastDue, Plan, PlanInputs, PlanRequest, ReviewPair,
     SignalDedupPlan, SignalSuperseded, VetoedChain, WriteUnit, MAX_DEDUP_FAMILY_MEMBERS,
 };
 pub use probe::{probe, ProbeCandidate, ProbeVerdict, ProbeVerdictKind, PROBE_MAX_CANDIDATES};
-pub use profile::{profile_hash, LabelDedupProfile, PassProfile, ReadPurpose, ReadSpec};
+pub use profile::{
+    profile_hash, FamilyKind, LabelDedupProfile, PassProfile, ReadPurpose, ReadSpec, Tier,
+};
 pub use record::{parse_record, Facts, MatchKeys, ParsedRecord};
 pub use revert::{revert_writes, AppliedLabelChange};
 
@@ -75,6 +89,16 @@ pub struct DedupClaim {
     pub labels: Vec<String>,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// The claims already marked duplicates of this one (the apply tool's
+    /// `index_view`: its in-force dedup identity edges, followed down a
+    /// chain; nested or flattened, the engine reads every level, each claim
+    /// once, at most `record::MAX_DUPLICATES`). Not members and never
+    /// clustered or written: their fields are read where a member's own are
+    /// (a later deadline), because a marked duplicate keeps what it knew. A
+    /// caller that could not read every duplicate of a member must report
+    /// the member read as truncated.
+    #[serde(default)]
+    pub duplicates: Vec<DedupClaim>,
 }
 
 /// One family read, already capped by the caller.
@@ -158,6 +182,14 @@ pub enum LabelDedupError {
     Truncated,
     #[error("TOO_MANY_CANDIDATES: {got} candidates, at most {max} per call")]
     TooManyCandidates { got: usize, max: usize },
+    #[error(
+        "FAMILY_NOT_INDEX: the {family_label:?} family is declared {kind:?}; label dedup runs \
+         only on an index family"
+    )]
+    FamilyNotIndex {
+        family_label: String,
+        kind: FamilyKind,
+    },
     #[error("RESOURCE_CAP: {got} {what}, at most {max}; narrow the pass")]
     ResourceCap {
         what: &'static str,
@@ -181,6 +213,7 @@ impl LabelDedupError {
             Self::Truncated => "TRUNCATED",
             Self::TooManyCandidates { .. } => "TOO_MANY_CANDIDATES",
             Self::ResourceCap { .. } => "RESOURCE_CAP",
+            Self::FamilyNotIndex { .. } => "FAMILY_NOT_INDEX",
         }
     }
 }
