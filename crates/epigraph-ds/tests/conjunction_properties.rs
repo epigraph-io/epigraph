@@ -528,7 +528,7 @@ fn single_leaf_open_world_fixture_equals_cdst_dempster() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// D11 on one atom: any list of single-atom BBAs with T, F and `~` gives
+    /// Single-leaf marginal consistency: any list of single-atom BBAs with T, F and `~` gives
     /// the served fold's Bel, Pl, BetP and 1 − Bel(F).
     #[test]
     fn single_atom_equals_served_cdst_fold(
@@ -554,7 +554,8 @@ proptest! {
     }
 
     /// A `whole` item {T s, `~` o} copied onto n atoms reproduces the
-    /// compound BBA it came from (G-RT, §3.2 point 1), `~` included.
+    /// compound BBA it came from (round trip of a whole item, §3.2 point 1),
+    /// `~` included.
     #[test]
     fn whole_item_round_trips_to_the_compound_value(
         n in 1u32..=8, (s, o) in arb_wo(true),
@@ -1064,13 +1065,11 @@ fn profile_summarizes_leaves_without_a_conjunction() {
     assert!(p.betp.min <= p.betp.median && p.betp.median <= p.betp.max);
     assert!(close(p.bel.max, 0.8), "strongest leaf {}", p.bel.max);
     assert!(close(p.bel.min, 0.0));
-    // The envelope agrees with the leaf-alone marginals R-FRE is built from.
-    let single: Vec<ConjResult> = leaves
-        .iter()
-        .map(|a| conj_belief(&[Lit::pos(*a)], &items, 0.0).unwrap())
-        .collect();
-    let hi = single.iter().map(|s| s.pl).fold(1.0, f64::min);
-    assert!(close(p.frechet.hi, hi));
+    // The weakest leaf caps the envelope: the refuted leaf (F .7) has
+    // Pl .3, every other leaf has Pl 1. Its floor is 0 (Σ Bel = 2 over six
+    // leaves); its NR cap is the refuted leaf's 1 − .7.
+    assert!(close(p.frechet.hi, 0.3), "hi {}", p.frechet.hi);
+    assert!(close(p.frechet.hi_nr, 0.3), "hi_nr {}", p.frechet.hi_nr);
     assert!(
         close(p.frechet.lo, 0.0),
         "six leaves at ≤ .8 have no Fréchet floor"
