@@ -27,8 +27,9 @@ An un-mark (`unmark_duplicate`, HTTP `POST /api/v1/claims/:id/undedup`, and
 the server's administrative (maintenance) connection. It has no deferred form.
 
 Request-serving MCP and HTTP servers hold no maintenance connection, so there
-these calls are refused with nothing written. Until an operator runs the
-reversal where that connection is held, treat a mark as one-way.
+these calls are refused with nothing written. No shipped surface runs the
+reversal anywhere else either: unlike the sweep, there is no operator CLI for
+an un-mark. Treat a mark as one-way.
 
 Where an un-mark does run, it puts back only rows that are still where the
 dedup left them. A row a later write has changed is left alone and reported
