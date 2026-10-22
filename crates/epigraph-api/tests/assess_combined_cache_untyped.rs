@@ -128,18 +128,19 @@ async fn assess_leaves_only_its_untyped_input_row(
     assert_eq!(rows[0].2, None, "the input BBA must stay untyped: {rows:?}");
 
     // Ruling Q-U027F-2: the row is the caller's OWNER's one assessment slot,
-    // keyed (claim, frame, owner, NULL perspective); an unlinked agent is its
-    // own owner.
-    let (source, perspective): (Option<Uuid>, Option<Uuid>) =
-        sqlx::query_as("SELECT source_agent_id, perspective_id FROM mass_functions WHERE id = $1")
-            .bind(mf_id)
-            .fetch_one(&pool)
-            .await
-            .expect("the input row");
+    // keyed (claim, frame, owner, the owner's assessment perspective); an
+    // unlinked agent is its own owner, and the slot perspective records it.
+    let (source, slot_owner): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT m.source_agent_id, p.owner_agent_id FROM mass_functions m \
+           JOIN perspectives p ON p.id = m.perspective_id WHERE m.id = $1",
+    )
+    .bind(mf_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the input row and its slot perspective");
     assert_eq!(
-        (source, perspective),
-        (Some(agent), None),
-        "the input row must be keyed by the calling agent (its own owner), with no \
-         per-call perspective"
+        (source, slot_owner),
+        (Some(agent), Some(agent)),
+        "the input row must sit in the calling agent's own assessment slot"
     );
 }

@@ -410,6 +410,53 @@ async fn agents_of_one_human_replace_each_other_and_never_aggregate(pool: PgPool
     assert!((by_human.pignistic_prob.expect("BetP") - baseline).abs() < 1e-9);
 }
 
+/// The assessment slot is assess's own: a BBA another writer stored for the
+/// same agent on the same (claim, frame) with no perspective (the shape
+/// `/frames/:id/evidence` writes) is neither overwritten nor reported as
+/// replaced, and both still combine.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_assessment_slot_never_overwrites_another_writers_row(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess own slot").await;
+    let first = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    let other = epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim,
+        first.frame_id,
+        Some(caller),
+        None,
+        &serde_json::json!({"0": 0.5, "0,1,2": 0.5}),
+        None,
+        Some("discount"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("another writer's agent-keyed row");
+    let again = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    assert!(
+        again
+            .replaced_assessments
+            .iter()
+            .all(|r| r.mass_function_id != other),
+        "{:?}",
+        again.replaced_assessments
+    );
+    assert_eq!(
+        again.replaced_assessments.len(),
+        1,
+        "only assess's own slot"
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE id = $1")
+        .bind(other)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 1, "the other writer's row survives");
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 2);
+}
+
 /// Ruling Q-U027F-2, the other half: assessments by DIFFERENT owners are
 /// independent evidence and still combine. Two unrelated agents' supporting
 /// rows both stay and raise the BetP strictly. (Under a mutant that combines
