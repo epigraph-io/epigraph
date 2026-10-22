@@ -248,9 +248,11 @@ pub struct RecallWithContextParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// When `true`, REPLACE the flat `results` array with an
     /// `epistemic_partition` object grouping the same hits into `confirmed`
-    /// (`truth_value >= 0.75` and not contested), `open_question`
+    /// (`belief_score >= 0.75` and not contested), `open_question`
     /// (`is_contested` — any live `contradicts`/`refutes`), and `uncertain`
-    /// (everything else). Contest is checked FIRST, so a high-truth paragraph
+    /// (everything else). The score is each hit's `belief_score`, the same
+    /// value `min_truth` gates on, not its authored `truth_value`. Contest is
+    /// checked FIRST, so a high-scoring paragraph
     /// carrying a live refutation is reported as an open question rather than
     /// as confirmed.
     ///
@@ -626,6 +628,16 @@ pub struct RecallHit {
     /// even when it did not ask for a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl crate::types::RecallGatedSignals for RecallHit {
+    /// `belief_score`: the value `min_truth` compared against for this hit.
+    fn gated_score(&self) -> f64 {
+        self.belief_score
+    }
+    fn is_contested(&self) -> bool {
+        self.is_contested
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1112,11 +1124,8 @@ async fn recall_with_context_post_embed(
         // asked for the bucketed shape must get three empty buckets, not a
         // silently different shape on the zero-hit path. Getting `results: []`
         // back from a partitioned request would look like the flag was ignored.
-        let (results, epistemic_partition) = crate::types::split_epistemic(
-            Vec::new(),
-            params.epistemic_partition,
-            |_: &RecallHit| (0.0, false),
-        );
+        let (results, epistemic_partition) =
+            crate::types::split_epistemic(Vec::<RecallHit>::new(), params.epistemic_partition);
         return success_json(&RecallWithContextResponse {
             results,
             epistemic_partition,
@@ -1621,13 +1630,13 @@ async fn recall_with_context_post_embed(
     // and after the audit spawn, which derives `returned_claim_ids` from
     // `results` and must name exactly the hits that were served.
     //
-    // The score is the SAME `truth_value` `min_truth` gates on, read back off
-    // the built hit rather than recomputed, so the bucket threshold and the
-    // gate cannot drift apart.
+    // The score is `belief_score`, the value `min_truth` gated on above, read
+    // back off the built hit through `RecallGatedSignals` rather than chosen
+    // here: this site used to pass `truth_value`, which the gate stopped
+    // reading when it moved to the DS cache, and the two disagree on every
+    // claim whose evidence has moved it.
     let (results, epistemic_partition) =
-        crate::types::split_epistemic(results, params.epistemic_partition, |h: &RecallHit| {
-            (h.truth_value, h.is_contested)
-        });
+        crate::types::split_epistemic(results, params.epistemic_partition);
 
     success_json(&RecallWithContextResponse {
         results,
