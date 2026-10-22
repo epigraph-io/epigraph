@@ -284,21 +284,116 @@ pub struct ItemEvidence {
     pub source_url: Option<String>,
 }
 
-/// Normalize a DOI (bare, `doi:`-prefixed or a doi.org link). Skeleton.
-#[must_use]
-pub fn normalize_doi(_raw: &str) -> Option<String> {
-    None
+/// Prefixes that turn a link into a bare DOI, longest first; matched
+/// case-insensitively. Ingest writes `https://doi.org/<doi>` for a `10.`
+/// identifier and `doi:<id>` for any other one.
+const DOI_PREFIXES: [&str; 7] = [
+    "https://www.doi.org/",
+    "http://www.doi.org/",
+    "https://dx.doi.org/",
+    "http://dx.doi.org/",
+    "https://doi.org/",
+    "http://doi.org/",
+    "doi:",
+];
+
+/// Strip one [`DOI_PREFIXES`] entry, if `t` starts with one.
+fn strip_doi_prefix(t: &str) -> Option<&str> {
+    DOI_PREFIXES.iter().find_map(|p| {
+        t.get(..p.len())
+            .filter(|head| head.eq_ignore_ascii_case(p))
+            .map(|_| &t[p.len()..])
+    })
 }
 
-/// The canonical [`ItemKey`] of one BBA row. Skeleton: every row is its own
-/// item.
+/// Normalize a DOI as evidence stores it (`properties.doi`, usually bare)
+/// or links to it (`doi:<id>`, `https://doi.org/<doi>`, `dx.` / `www.`
+/// variants): prefix removed, trimmed, trailing `/` removed, ASCII-lowercased
+/// (DOIs are case-insensitive). `None` for a blank result or anything that is
+/// still a URL after the prefix is removed (a web page is not a DOI).
+/// Percent-encoded DOIs are not decoded, so one DOI written both ways counts
+/// as two sources, which errs toward the pre-key behaviour.
+#[must_use]
+pub fn normalize_doi(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = strip_doi_prefix(t)
+        .unwrap_or(t)
+        .trim()
+        .trim_end_matches('/');
+    if t.is_empty() || t.contains("://") {
+        None
+    } else {
+        Some(t.to_ascii_lowercase())
+    }
+}
+
+/// The DOI a `source_url` names: a doi.org link, a `doi:` label or a bare
+/// `10.` DOI. Any other URL names no DOI.
+fn doi_in_url(url: &str) -> Option<String> {
+    let t = url.trim();
+    if strip_doi_prefix(t).is_some() || t.starts_with("10.") {
+        normalize_doi(t)
+    } else {
+        None
+    }
+}
+
+/// The canonical [`ItemKey`] of one BBA row (SPEC §3.3). The first rule that
+/// matches wins:
+///
+/// 1. `doi:` — `evidence` carries a DOI in `properties.doi`, or its
+///    `source_url` is a DOI link ([`normalize_doi`]);
+/// 2. `url:` — `evidence` carries any other `source_url`
+///    ([`normalize_source_url`]);
+/// 3. `ev:` — `evidence` carries neither;
+/// 4. `attr:` — an [`ATTRIBUTED_METHOD`] row citing no evidence (a textless
+///    attribution; its perspective is the original BBA's id), or `edge:` — an
+///    [`EDGE_FACTOR_METHOD`] row (its perspective is the edge id);
+/// 5. `paper:` — an [`INGEST_ASSERTION_METHOD`] row with neither perspective
+///    nor evidence, when the caller resolved its `asserting_paper`;
+/// 6. `row:` — anything else is its own item.
+///
+/// `doi:`, `url:` and `paper:` ignore the row's agent: one paper read by two
+/// agents is one source. The agent never enters a key.
+///
+/// `evidence` is the row's cited evidence **as the caller's viewer sees it**:
+/// the row's `evidence_id`, or its `perspective_id` when that perspective is
+/// an evidence perspective. A row whose evidence is hidden from the viewer
+/// gets `None` and, citing evidence it cannot key on, falls to `row:`: it
+/// folds as independent, as hidden evidence does under the legacy key.
+///
+/// A real lens perspective (an analytical or empirical lens, say) is never a
+/// key: keying on it would make every row of one lens a single comonotone
+/// item. Only the row's shape (method plus perspective) selects rules 4–5.
 #[must_use]
 pub fn item_key(
     row: &MassFunctionRow,
-    _evidence: Option<&ItemEvidence>,
-    _asserting_paper: Option<Uuid>,
+    evidence: Option<&ItemEvidence>,
+    asserting_paper: Option<Uuid>,
 ) -> ItemKey {
-    ItemKey::Row(row.id)
+    if let Some(ev) = evidence {
+        if let Some(doi) = ev.doi.as_deref().and_then(normalize_doi) {
+            return ItemKey::Doi(doi);
+        }
+        if let Some(url) = ev.source_url.as_deref() {
+            if let Some(doi) = doi_in_url(url) {
+                return ItemKey::Doi(doi);
+            }
+            if let Some(url) = normalize_source_url(url) {
+                return ItemKey::Url(url);
+            }
+        }
+        return ItemKey::Evidence(ev.id);
+    }
+    let method = row.combination_method.as_deref();
+    match (method, row.perspective_id, row.evidence_id) {
+        (Some(ATTRIBUTED_METHOD), Some(original), None) => ItemKey::Attribution(original),
+        (Some(EDGE_FACTOR_METHOD), Some(edge), _) => ItemKey::Edge(edge),
+        (Some(INGEST_ASSERTION_METHOD), None, None) => {
+            asserting_paper.map_or(ItemKey::Row(row.id), ItemKey::Paper)
+        }
+        _ => ItemKey::Row(row.id),
+    }
 }
 
 /// Which part of a key's evidence an item carries.
