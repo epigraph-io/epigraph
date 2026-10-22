@@ -4,6 +4,31 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::repos::edge::EDGE_IN_FORCE;
+
+// ── BP under atom-level belief (SPEC §6.2, D3/D4) ──────────────────────────
+//
+// A COMPOUND is a claim with an in-force `decomposes_to` out-edge to a claim:
+// a query over its atoms, with no belief cache of its own for BP to write.
+
+/// SQL: of the claim ids bound as `$1` (`uuid[]`), the COMPOUNDS — those with
+/// an in-force `decomposes_to` out-edge to a claim.
+///
+/// Run it on the transaction the caller's write is stamped on, so the role is
+/// decided over the edges that caller can see (SPEC §2.1: a leaf is a visible
+/// node with no VISIBLE outgoing `decomposes_to`). Used by BP apply, which
+/// writes atoms only (D4).
+#[must_use]
+pub fn compound_ids_among_sql() -> String {
+    format!(
+        "SELECT DISTINCT e.source_id FROM edges e \
+          WHERE e.source_id = ANY($1) \
+            AND e.source_type = 'claim' AND e.target_type = 'claim' \
+            AND e.relationship = 'decomposes_to' \
+            AND {EDGE_IN_FORCE}"
+    )
+}
+
 /// A factor row from the database.
 #[derive(Debug, Clone)]
 pub struct FactorRow {

@@ -587,13 +587,23 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// written. A claim the caller can see but not WRITE is still refused (403),
 /// and the whole apply is rolled back.
 ///
-/// Returns `(written, skipped_not_visible)`.
+/// # A COMPOUND is never written (SPEC §1.3 D4)
+///
+/// Under atom-level belief a compound (a claim with an in-force
+/// `decomposes_to` out-edge, `compound_ids_among_sql`) is a query over its
+/// atoms and has no cache of its own; BP may still compute a value for one
+/// (read-only diagnostics keep the `evidential_support` / `mutual_exclusion`
+/// factors that name compounds), but apply skips it and counts it in
+/// `skipped_compounds`. The role is read on the same stamped transaction, so
+/// it is decided over the edges the caller can see.
+///
+/// Returns `(written, skipped_not_visible, skipped_compounds)`.
 #[cfg(feature = "db")]
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     updates: &[BpUpdate],
-) -> Result<(usize, usize), ApiError> {
+) -> Result<(usize, usize, usize), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
     let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
     let visible: std::collections::HashSet<Uuid> =
@@ -606,11 +616,26 @@ async fn apply_bp_updates(
             })?
             .into_iter()
             .collect();
+    let compounds: std::collections::HashSet<Uuid> =
+        sqlx::query_scalar::<_, Uuid>(&epigraph_db::repos::factor::compound_ids_among_sql())
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to read the BP variables' roles: {e}"),
+            })?
+            .into_iter()
+            .collect();
     let mut written = 0_usize;
     let mut skipped = 0_usize;
+    let mut skipped_compounds = 0_usize;
     for (claim_id, betp, interval) in updates {
         if !visible.contains(claim_id) {
             skipped += 1;
+            continue;
+        }
+        if compounds.contains(claim_id) {
+            skipped_compounds += 1;
             continue;
         }
         let result = match interval {
@@ -663,7 +688,7 @@ async fn apply_bp_updates(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the belief updates: {e}"),
     })?;
-    Ok((written, skipped))
+    Ok((written, skipped, skipped_compounds))
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
@@ -675,7 +700,8 @@ async fn apply_bp_updates(
 /// the caller can see but not write fails the request (403) and nothing is
 /// written. A BP variable that is not a claim the caller can see (a stale
 /// factor id, or another group's private claim) is skipped. `applied_count` is
-/// the number of claims written and `skipped_not_visible` the number skipped;
+/// the number of claims written, `skipped_not_visible` the number skipped as
+/// not visible and `skipped_compounds` the number skipped as compounds (D4);
 /// `updated_beliefs` lists what BP computed, which is not the same list.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
@@ -864,7 +890,7 @@ pub async fn propagate_beliefs(
         // its existing readers and is now always 0: a failed apply is an error
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
-        let (mut written, mut skipped) = (0_usize, 0_usize);
+        let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
         if apply {
             let updates: Vec<BpUpdate> = result
                 .updated_betps
@@ -879,7 +905,8 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
-            (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
+            (written, skipped, skipped_compounds) =
+                apply_bp_updates(&state, &viewer, &updates).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -894,6 +921,7 @@ pub async fn propagate_beliefs(
             "applied": apply,
             "applied_count": written,
             "skipped_not_visible": skipped,
+            "skipped_compounds": skipped_compounds,
             "apply_failures": apply_failures,
             "updated_beliefs": result.updated_betps.iter()
                 .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
@@ -904,14 +932,14 @@ pub async fn propagate_beliefs(
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
-    let (mut written, mut skipped) = (0_usize, 0_usize);
+    let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
     if apply && !result.updated_beliefs.is_empty() {
         let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
             .collect();
-        (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
+        (written, skipped, skipped_compounds) = apply_bp_updates(&state, &viewer, &updates).await?;
     }
 
     let updated: Vec<serde_json::Value> = result
@@ -931,6 +959,7 @@ pub async fn propagate_beliefs(
         "applied": apply,
         "applied_count": written,
         "skipped_not_visible": skipped,
+            "skipped_compounds": skipped_compounds,
         "updated_beliefs": updated,
     })))
 }

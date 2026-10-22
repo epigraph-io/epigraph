@@ -550,6 +550,11 @@ async fn bp_apply_skips_compounds(pool: PgPool) {
         k_before,
         "BP apply wrote the compound {k}: atoms only (D4)"
     );
+    assert_eq!(
+        body["skipped_compounds"].as_u64(),
+        Some(1),
+        "the response counts the compound it did not write: {body}"
+    );
 
     // Positive control: the atom in the same run IS written, with BP's value.
     let a_after = stored(&pool, a).await.2.expect("the atom was written");
