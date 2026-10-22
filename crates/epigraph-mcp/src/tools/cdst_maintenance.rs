@@ -51,8 +51,8 @@ struct RecomputeBeliefsResult {
     /// Claims that had at least one (claim, frame) belief recomputed.
     claims_recomputed: usize,
     /// Candidate claims with no recomputable input, so nothing was written:
-    /// no BBA at all, or only ingest template rows (see
-    /// `MassFunctionRepository::cache_owner_frame_for_claim`).
+    /// no BBA at all, only ingest template rows, or a non-procedural compound
+    /// (see `MassFunctionRepository::cache_owner_frame_for_claim`).
     claims_skipped_no_bba: usize,
     /// Total (claim, frame) belief writes performed.
     frame_writes: usize,
@@ -173,8 +173,8 @@ pub async fn recompute_beliefs(
                 .await
             {
                 Ok(Some(owner)) => owner,
-                // No recomputable input (none, or only ingest templates):
-                // nothing to write. Dropping `tx` rolls it back.
+                // No recomputable input (none, only ingest templates, or a
+                // compound): nothing to write. Dropping `tx` rolls it back.
                 Ok(None) => {
                     claims_skipped_no_bba += 1;
                     continue;

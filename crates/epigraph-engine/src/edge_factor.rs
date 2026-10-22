@@ -1135,8 +1135,11 @@ async fn recompute_combined_belief(
 /// left exactly as it was (`Ok(false)`): that covers a claim whose only inputs
 /// are ingest template rows (`epigraph_db::repos::mass_function::ingest_template_predicate`),
 /// whose cache a bulk recompute would otherwise replace with the template's
-/// near-vacuous fold. So this function never makes a claim's cache emptier
-/// than it was.
+/// near-vacuous fold, and a non-procedural compound (an in-force
+/// `decomposes_to` out-edge, not under a workflow root), whose belief is a
+/// query over its leaves rather than a fold of its own BBAs. So this function
+/// never makes a claim's cache emptier than it was. Every caller inherits
+/// both, including the per-write `routes::assess` refresh.
 ///
 /// Resolving the owner is a read: this function creates no frame. (It used to
 /// get-or-create `binary_truth` here only to compare ids.)
