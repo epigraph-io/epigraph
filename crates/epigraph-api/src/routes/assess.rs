@@ -77,6 +77,22 @@ pub struct AssessClaimResponse {
     pub mass_on_conflict: Option<f64>,
     pub embedded: bool,
     pub combination_reports: Vec<serde_json::Value>,
+    /// The assessments this call replaced (ruling Q-U027F-2): the caller's own
+    /// earlier one, or one by another agent of the same human. Empty when the
+    /// owner had none on this frame.
+    pub replaced_assessments: Vec<ReplacedAssessment>,
+}
+
+/// One assessment a call replaced.
+#[derive(Debug, Serialize)]
+pub struct ReplacedAssessment {
+    pub mass_function_id: Uuid,
+    /// The owner it was recorded under (the caller's human operator, or the
+    /// caller itself when it has none).
+    pub source_agent_id: Option<Uuid>,
+    /// Whether it reached the opposite verdict on the claim's hypothesis
+    /// (BetP on the other side of 0.5): the new assessment contests it.
+    pub contested: bool,
 }
 
 // =============================================================================
@@ -231,27 +247,54 @@ pub async fn assess_claim(
     let bba_map: BTreeMap<String, f64> =
         serde_json::from_value(bba_json.clone()).unwrap_or_default();
 
-    // ── 8. Submit evidence through the combination pipeline ──────────────
+    // ── 8. Store under the owner's ONE assessment slot ───────────────────
     //
-    // Each call gets its OWN row, keyed by a fresh synthetic perspective (the
-    // ds_auto C-1 pattern). With agent and perspective both NULL every call
-    // shared one `UNIQUE NULLS NOT DISTINCT` key, so a call overwrote the
-    // previous one and repeated assessments never accumulated. The perspective
-    // records the calling agent as `owner_agent_id` (attribution, like the DS
-    // auto-wire's evidence perspectives); a principal-less viewer leaves it NULL.
-    let call_perspective = Uuid::new_v4();
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(
-        pool,
-        call_perspective,
-        viewer.principal(),
-    )
-    .await?;
+    // Ruling Q-U027F-2 (operator, 2026-10-22): one assessment per (claim,
+    // frame, owner). The owner is the calling agent's human operator, or the
+    // agent itself when it has none. A repeat by ANY agent of that owner
+    // REPLACES the owner's earlier assessment (reported, and flagged when it
+    // reverses the verdict: a contest), and only different owners' assessments
+    // combine as independent evidence. U027F's per-call perspective let one
+    // caller stack: ten identical calls took BetP 0.61 -> 0.997.
+    //
+    // The row is keyed (claim, frame, OWNER, NULL perspective), so the slot is
+    // the table's own `UNIQUE NULLS NOT DISTINCT` key: every agent of one human
+    // upserts the same row, atomically, with no delete authority needed over a
+    // sibling's row and no race between two siblings. `source_agent_id` thus
+    // names the owner, the identity whose one assessment this is. A
+    // principal-less viewer keeps the shared anonymous slot (agent and
+    // perspective NULL), which a repeat overwrites.
+    let owner = match viewer.principal() {
+        Some(agent) => {
+            let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+                message: format!("acquire connection: {e}"),
+            })?;
+            Some(
+                epigraph_db::AgentRepository::operator_of_author(&mut conn, agent)
+                    .await?
+                    .map_or(agent, |o| o.operator_id),
+            )
+        }
+        None => None,
+    };
+    // The owner's assessment this call replaces, read before the upsert.
+    let replaced_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> =
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.source_agent_id == owner
+                    && row.perspective_id.is_none()
+                    && row.combination_method.as_deref() == Some("discount")
+            })
+            .map(|row| (row.id, row.source_agent_id, row.masses))
+            .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         pool,
         claim_id,
         frame_id,
-        None, // no agent_id for assess endpoint
-        Some(call_perspective),
+        owner,
+        None,
         &bba_json,
         None,
         Some("discount"),
@@ -359,6 +402,26 @@ pub async fn assess_claim(
 
     let (final_bel, final_pl, final_betp, m_missing) =
         super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
+
+    // Each replaced assessment, and whether this call reverses its verdict.
+    let new_betp = super::belief::compute_hypothesis_belief(&mass_function, &ds_frame, h_idx).2;
+    let replaced_assessments: Vec<ReplacedAssessment> = replaced_rows
+        .iter()
+        .map(|(id, source, masses)| {
+            let contested = MassFunction::from_json_masses(ds_frame.clone(), masses)
+                .ok()
+                .is_some_and(|old| {
+                    let old_betp =
+                        super::belief::compute_hypothesis_belief(&old, &ds_frame, h_idx).2;
+                    (old_betp - 0.5) * (new_betp - 0.5) < 0.0
+                });
+            ReplacedAssessment {
+                mass_function_id: *id,
+                source_agent_id: *source,
+                contested,
+            }
+        })
+        .collect();
     // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
     let m_empty = combination::fold_conflict(&combined, &reports);
 
@@ -506,6 +569,7 @@ pub async fn assess_claim(
         mass_on_conflict: Some(m_empty),
         embedded,
         combination_reports,
+        replaced_assessments,
     }))
 }
 

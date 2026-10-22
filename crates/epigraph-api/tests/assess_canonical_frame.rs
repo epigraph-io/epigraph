@@ -378,7 +378,11 @@ async fn agents_of_one_human_replace_each_other_and_never_aggregate(pool: PgPool
     let second = assess(&pool, two, claim, request(true, 0.9, None)).await;
     assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
     assert_eq!(second.replaced_assessments.len(), 1);
-    assert_eq!(second.replaced_assessments[0].source_agent_id, Some(one));
+    assert_eq!(
+        second.replaced_assessments[0].source_agent_id,
+        Some(human),
+        "the slot is the owner's"
+    );
     assert!(!second.replaced_assessments[0].contested);
     assert!(
         (second.pignistic_prob.expect("BetP") - first.pignistic_prob.expect("BetP")).abs() < 1e-9,
@@ -387,7 +391,10 @@ async fn agents_of_one_human_replace_each_other_and_never_aggregate(pool: PgPool
 
     let reversal = assess(&pool, one, claim, request(false, 0.6, None)).await;
     assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
-    assert_eq!(reversal.replaced_assessments[0].source_agent_id, Some(two));
+    assert_eq!(
+        reversal.replaced_assessments[0].source_agent_id,
+        Some(human)
+    );
     assert!(
         reversal.replaced_assessments[0].contested,
         "a sibling's reversal is a contest"
@@ -395,7 +402,10 @@ async fn agents_of_one_human_replace_each_other_and_never_aggregate(pool: PgPool
 
     let by_human = assess(&pool, human, claim, request(true, 0.7, None)).await;
     assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
-    assert_eq!(by_human.replaced_assessments[0].source_agent_id, Some(one));
+    assert_eq!(
+        by_human.replaced_assessments[0].source_agent_id,
+        Some(human)
+    );
     let baseline = single_call_betp(&pool, request(true, 0.7, None)).await;
     assert!((by_human.pignistic_prob.expect("BetP") - baseline).abs() < 1e-9);
 }

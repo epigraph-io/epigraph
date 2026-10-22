@@ -106,8 +106,8 @@ async fn assess_leaves_only_its_untyped_input_row(
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("mass_function_id in {body}"));
 
-    // One call stores exactly one row: its own input BBA, keyed by a fresh
-    // evidence perspective. No combined row is stored beside or over it.
+    // One call stores exactly one row: its own input BBA, in its owner's
+    // assessment slot. No combined row is stored beside or over it.
     let rows: Vec<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT id, combination_method, evidence_type FROM mass_functions WHERE claim_id = $1",
     )
@@ -127,18 +127,19 @@ async fn assess_leaves_only_its_untyped_input_row(
     );
     assert_eq!(rows[0].2, None, "the input BBA must stay untyped: {rows:?}");
 
-    let owner: Option<Option<Uuid>> = sqlx::query_scalar(
-        "SELECT p.owner_agent_id FROM mass_functions m \
-         JOIN perspectives p ON p.id = m.perspective_id WHERE m.id = $1",
-    )
-    .bind(mf_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("the input row's perspective");
+    // Ruling Q-U027F-2: the row is the caller's OWNER's one assessment slot,
+    // keyed (claim, frame, owner, NULL perspective); an unlinked agent is its
+    // own owner.
+    let (source, perspective): (Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("SELECT source_agent_id, perspective_id FROM mass_functions WHERE id = $1")
+            .bind(mf_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the input row");
     assert_eq!(
-        owner,
-        Some(Some(agent)),
-        "the call's evidence perspective must record the calling agent \
-         (None: no perspective row; Some(None): unattributed)"
+        (source, perspective),
+        (Some(agent), None),
+        "the input row must be keyed by the calling agent (its own owner), with no \
+         per-call perspective"
     );
 }
