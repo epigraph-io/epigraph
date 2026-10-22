@@ -1,5 +1,5 @@
-//! The revert input: what an apply records per write, and the writes that
-//! undo it.
+//! The revert input: what an apply records per write and per mark, and the
+//! writes and un-marks that undo it.
 //!
 //! The database write path (`update_labels`) is modelled by [`db_write`]: it
 //! unions the added labels in, drops the removed ones, and stores the result
@@ -11,7 +11,8 @@
 use std::collections::BTreeSet;
 
 use epigraph_engine::label_dedup::{
-    revert_writes, AppliedLabelChange, DedupClaim, LabelWrite, WriteUnit,
+    revert_marks, revert_writes, AppliedLabelChange, AppliedMark, DedupClaim, DuplicateMark,
+    LabelWrite, Tier, WriteUnit,
 };
 use uuid::Uuid;
 
@@ -65,11 +66,26 @@ fn canonical(labels: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Apply `units` to `graph` the way apply does: one write at a time, the
-/// change recorded from the labels before and after each write.
-fn apply_recording(graph: &mut [DedupClaim], units: &[WriteUnit]) -> Vec<AppliedLabelChange> {
+/// Apply `units` to `graph` the way apply does: per unit, its marks (the
+/// marked duplicate leaves the index: `marked`, duplicate → canonical), then
+/// one write at a time, the change recorded from the labels before and after
+/// each write.
+fn apply_recording(
+    graph: &mut [DedupClaim],
+    marked: &mut Vec<(Uuid, Uuid)>,
+    units: &[WriteUnit],
+) -> (Vec<AppliedLabelChange>, Vec<AppliedMark>) {
     let mut changes = Vec::new();
+    let mut marks = Vec::new();
     for unit in units {
+        for m in &unit.marks {
+            assert!(
+                !marked.iter().any(|(d, _)| *d == m.dup),
+                "a claim is marked once: {m:?}"
+            );
+            marked.push((m.dup, m.canonical));
+            marks.push(AppliedMark::from_mark(&unit.unit, m, None));
+        }
         for w in &unit.writes {
             let c = graph
                 .iter_mut()
@@ -83,7 +99,24 @@ fn apply_recording(graph: &mut [DedupClaim], units: &[WriteUnit]) -> Vec<Applied
             c.labels = after;
         }
     }
-    changes
+    (changes, marks)
+}
+
+/// `unmark_duplicate`: refused unless `m` is the claim's live mark and its
+/// canonical is not itself marked (a chain is un-marked from its newest
+/// link), as the database act refuses.
+fn unmark(marked: &mut Vec<(Uuid, Uuid)>, m: &AppliedMark) {
+    assert!(
+        !marked.iter().any(|(dup, _)| *dup == m.canonical),
+        "un-mark {} first: {} is marked onto it",
+        m.canonical,
+        m.dup
+    );
+    let pos = marked
+        .iter()
+        .position(|pair| *pair == (m.dup, m.canonical))
+        .unwrap_or_else(|| panic!("{} is not marked onto {}", m.dup, m.canonical));
+    marked.remove(pos);
 }
 
 fn run_writes(graph: &mut [DedupClaim], writes: &[LabelWrite]) {
@@ -107,7 +140,8 @@ fn revert_restores_every_label_set_after_a_full_apply() {
     );
     let units = plan.write_units();
     let mut g = original.clone();
-    let changes = apply_recording(&mut g, &units);
+    let mut marked = Vec::new();
+    let (changes, marks) = apply_recording(&mut g, &mut marked, &units);
 
     // Controls: the apply really changed label sets, removed labels, and
     // added the closed label, so a revert that does nothing cannot pass.
@@ -117,9 +151,10 @@ fn revert_restores_every_label_set_after_a_full_apply() {
         .filter(|(a, b)| canonical(&a.labels) != canonical(&b.labels))
         .count();
     assert!(
-        changed >= 5,
-        "the apply must touch many claims, touched {changed}"
+        changed >= 3,
+        "the apply must relabel several claims, relabelled {changed}"
     );
+    assert!(!marks.is_empty(), "the apply must mark a duplicate");
     assert!(
         changes.iter().any(|c| !c.labels_removed.is_empty()),
         "some write must have removed a label: {changes:?}"
@@ -132,6 +167,10 @@ fn revert_restores_every_label_set_after_a_full_apply() {
     );
 
     run_writes(&mut g, &revert_writes(&changes));
+    for m in revert_marks(&marks) {
+        unmark(&mut marked, &m);
+    }
+    assert!(marked.is_empty(), "every mark is undone: {marked:?}");
     for (a, b) in original.iter().zip(&g) {
         assert_eq!(
             canonical(&a.labels),
@@ -140,6 +179,43 @@ fn revert_restores_every_label_set_after_a_full_apply() {
             a.id
         );
     }
+}
+
+/// Marks are undone newest first, so a chain (`b` marked onto `a`, then `a`
+/// marked onto `c` by a later unit) un-marks from its newest link: `a` comes
+/// back first, so `b`'s canonical is current again when `b` is un-marked, the
+/// order the un-mark act requires. Each record keeps its unit, both ends and the
+/// identity edge the act returned.
+#[test]
+fn marks_are_undone_newest_first() {
+    let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+    let edge = Uuid::from_u128(99);
+    let mark = |dup, canonical| DuplicateMark {
+        dup,
+        canonical,
+        rule: Tier::StrongId,
+        matched_on: "shared id".into(),
+    };
+    let applied = vec![
+        AppliedMark::from_mark("cluster:a", &mark(b, a), Some(edge)),
+        AppliedMark::from_mark("cluster:c", &mark(a, c), None),
+    ];
+    assert_eq!(applied[0].unit, "cluster:a");
+    assert_eq!((applied[0].dup, applied[0].canonical), (b, a));
+    assert_eq!(applied[0].identity_edge, Some(edge));
+    assert_eq!(applied[0].rule, Tier::StrongId);
+
+    let undo = revert_marks(&applied);
+    assert_eq!(
+        undo.iter().map(|m| m.dup).collect::<Vec<_>>(),
+        vec![a, b],
+        "the newest mark (a onto c) is undone first: {undo:?}"
+    );
+    let mut marked = vec![(b, a), (a, c)];
+    for m in &undo {
+        unmark(&mut marked, m);
+    }
+    assert!(marked.is_empty());
 }
 
 #[test]

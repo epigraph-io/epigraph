@@ -28,15 +28,16 @@ use std::path::{Path, PathBuf};
 
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
-use epigraph_engine::label_dedup::{profile_hash, revert_writes, AppliedLabelChange};
+use epigraph_engine::label_dedup::{profile_hash, AppliedLabelChange};
 use epigraph_mcp::errors::McpError;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::label_dedup::{
-    apply_label_dedup, plan_label_dedup, probe_label_dedup, LabelDedupConfig,
+    apply_label_dedup, label_dedup_index_view, plan_label_dedup, probe_label_dedup,
+    revert_label_dedup, LabelDedupConfig,
 };
 use epigraph_mcp::types::{
-    ApplyLabelDedupParams, LabelDedupCandidateParam, PlanLabelDedupParams, ProbeLabelDedupParams,
-    UpdateLabelsParams,
+    ApplyLabelDedupParams, LabelDedupCandidateParam, LabelDedupIndexViewParams,
+    PlanLabelDedupParams, ProbeLabelDedupParams, RevertLabelDedupParams,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -169,7 +170,32 @@ async fn seed(
     labels: &[&str],
     created: &str,
 ) -> Uuid {
-    let id = Uuid::new_v4();
+    seed_id(
+        pool,
+        Uuid::new_v4(),
+        agent,
+        group,
+        visibility,
+        content,
+        labels,
+        created,
+    )
+    .await
+}
+
+/// [`seed`] under a chosen id (for an arm that needs one member's mark to
+/// come before another's: a unit marks its losers in id order).
+#[allow(clippy::too_many_arguments)]
+async fn seed_id(
+    pool: &PgPool,
+    id: Uuid,
+    agent: Uuid,
+    group: Uuid,
+    visibility: &str,
+    content: &str,
+    labels: &[&str],
+    created: &str,
+) -> Uuid {
     let hash: Vec<u8> = blake3::hash(format!("{id}{content}").as_bytes())
         .as_bytes()
         .to_vec();
@@ -200,12 +226,61 @@ async fn labels_of(pool: &PgPool, id: Uuid) -> Vec<String> {
         .expect("labels")
 }
 
-async fn snapshot(pool: &PgPool, ids: &[Uuid]) -> BTreeMap<Uuid, Vec<String>> {
+/// What an apply can change on a claim: its labels, and (a mark) whether it
+/// is current and which claim it supersedes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimState {
+    labels: Vec<String>,
+    is_current: bool,
+    supersedes: Option<Uuid>,
+}
+
+async fn snapshot(pool: &PgPool, ids: &[Uuid]) -> BTreeMap<Uuid, ClaimState> {
     let mut out = BTreeMap::new();
     for id in ids {
-        out.insert(*id, labels_of(pool, *id).await);
+        let (labels, is_current, supersedes): (Vec<String>, bool, Option<Uuid>) = sqlx::query_as(
+            "SELECT COALESCE(labels, ARRAY[]::text[]), is_current, supersedes \
+               FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("claim state");
+        out.insert(
+            *id,
+            ClaimState {
+                labels,
+                is_current,
+                supersedes,
+            },
+        );
     }
     out
+}
+
+/// Whether `dup` is marked a duplicate of `canonical`: retired, superseding
+/// it, with exactly one in-force dedup identity edge to it.
+async fn is_marked_onto(pool: &PgPool, dup: Uuid, canonical: Uuid) -> bool {
+    let (is_current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(pool)
+            .await
+            .expect("claim");
+    !is_current && supersedes == Some(canonical) && identity_edges(pool, dup).await == 1
+}
+
+/// The in-force dedup identity edges (`same_as` carrying `properties.dedup`)
+/// out of `dup`.
+async fn identity_edges(pool: &PgPool, dup: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'same_as' \
+            AND valid_to IS NULL AND properties ? 'dedup'",
+    )
+    .bind(dup)
+    .fetch_one(pool)
+    .await
+    .expect("identity edges")
 }
 
 fn code(e: &McpError) -> String {
@@ -273,6 +348,30 @@ fn names_foreign_member(check: &Value, id: Uuid) -> bool {
     })
 }
 
+/// The plan's predicted authority for the mark of `dup` in `check`.
+fn mark_check(check: &Value, dup: Uuid) -> &Value {
+    check["marks"]
+        .as_array()
+        .and_then(|ms| ms.iter().find(|m| m["dup"] == dup.to_string()))
+        .unwrap_or_else(|| panic!("no mark of {dup} in {check}"))
+}
+
+/// The duplicates `unit` of the plan marks, in the order apply performs them.
+fn unit_marks(plan: &Value, unit: &str) -> Vec<Value> {
+    unit_writes(plan)
+        .into_iter()
+        .find(|u| u["unit"] == unit)
+        .and_then(|u| u["marks"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Whether the apply lists `unit` for a human to review.
+fn in_review(apply: &Value, unit: &str) -> bool {
+    apply["review"]
+        .as_array()
+        .is_some_and(|r| r.iter().any(|u| u["unit"] == unit))
+}
+
 fn result_for<'a>(apply: &'a Value, unit: &str) -> &'a Value {
     apply["results"]
         .as_array()
@@ -318,6 +417,29 @@ async fn app_role_server_with_signer(
         Signer::Generated => build_scoped_test_server_generated_signer(plain, scoped),
     }
     .with_label_dedup_config(cfg);
+    let agent = server.server_agent_id().await.expect("server agent");
+    let group = personal_group_of(pool, agent).await;
+    let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
+    (server, agent, group, viewer)
+}
+
+/// [`app_role_server`] whose administrative connection runs as
+/// `epigraph_maintenance` (not a superuser), as a production server's does:
+/// a mark's cascade runs (and records what an un-mark reverses) instead of
+/// being deferred, and an un-mark can run at all. The same server agent as
+/// [`app_role_server`] (the same fixed key).
+async fn app_role_server_with_maintenance(
+    pool: &PgPool,
+    cfg: LabelDedupConfig,
+) -> (EpiGraphMcpFull, Uuid, Uuid, Viewer) {
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool")
+            .with_maintenance_pool(fixture::downgraded_pool(pool, "epigraph_maintenance").await);
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let server = build_scoped_test_server(plain, scoped).with_label_dedup_config(cfg);
     let agent = server.server_agent_id().await.expect("server agent");
     let group = personal_group_of(pool, agent).await;
     let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
@@ -1101,18 +1223,27 @@ async fn a_cluster_with_one_unwritable_loser_writes_nothing_and_later_units_cont
         survivor.to_string(),
         "{plan}"
     );
-    let check = |id: Uuid| {
-        plan["write_check"]
-            .as_array()
-            .expect("write_check")
-            .iter()
-            .find(|c| c["claim_id"] == id.to_string())
-            .cloned()
-            .unwrap_or_else(|| panic!("no write_check for {id}: {plan}"))
-    };
-    assert_eq!(check(foreign_loser)["writable"], false, "predicted: {plan}");
-    assert_eq!(check(owned_loser)["writable"], true, "{plan}");
-    assert_eq!(check(fence)["writable"], true, "{plan}");
+    let unit = format!("cluster:{survivor}");
+    let marked: Vec<String> = unit_marks(&plan, &unit)
+        .iter()
+        .map(|m| m["dup"].as_str().expect("dup").to_string())
+        .collect();
+    assert_eq!(
+        sorted(marked),
+        sorted(vec![owned_loser.to_string(), foreign_loser.to_string()]),
+        "precondition: the unit marks both losers: {plan}"
+    );
+    let check = unit_check(&plan, &unit);
+    assert_eq!(check["applies"], false, "predicted: {plan}");
+    assert!(names_foreign_member(check, foreign_loser), "{plan}");
+    let fence_check = plan["write_check"]
+        .as_array()
+        .expect("write_check")
+        .iter()
+        .find(|c| c["claim_id"] == fence.to_string())
+        .cloned()
+        .unwrap_or_else(|| panic!("no write_check for {fence}: {plan}"));
+    assert_eq!(fence_check["writable"], true, "{plan}");
 
     let out = apply_ok(
         &server,
@@ -1122,23 +1253,24 @@ async fn a_cluster_with_one_unwritable_loser_writes_nothing_and_later_units_cont
     )
     .await;
     assert_eq!(out["status"], "applied", "{out}");
-    let cluster = result_for(&out, &format!("cluster:{survivor}"));
+    let cluster = result_for(&out, &unit);
     assert_eq!(cluster["ok"], false, "{out}");
+    assert_eq!(cluster["code"], "CROSS_OWNER_MEMBER", "{out}");
     assert!(
-        cluster["error"].as_str().is_some_and(|e| !e.is_empty()),
-        "{out}"
+        in_review(&out, &unit),
+        "a cross-owner cluster is for review: {out}"
     );
     assert_eq!(
         snapshot(&pool, &cluster_ids).await,
         before,
-        "the whole cluster unit rolled back"
+        "nothing of the cluster unit landed, the owned loser's mark included"
     );
-    assert!(
-        !out["applied_units"]
-            .to_string()
-            .contains(&survivor.to_string()),
-        "a rolled-back unit is not in applied_units: {out}"
-    );
+    for (field, id) in [("applied_units", survivor), ("applied_marks", owned_loser)] {
+        assert!(
+            !out[field].to_string().contains(&id.to_string()),
+            "a refused unit is not in {field}: {out}"
+        );
+    }
 
     assert_eq!(
         result_for(&out, &format!("closeout:{fence}"))["ok"],
@@ -1154,13 +1286,19 @@ async fn a_cluster_with_one_unwritable_loser_writes_nothing_and_later_units_cont
     assert_eq!(out["counts"]["failed"], 1, "{out}");
 }
 
-/// On an application-role server over stdio: a stranger's past-due claim in
-/// the stranger's own group. Its close-out adds `resolved`, so the retirement
-/// gate refuses it (the author arm) before the database is reached; that unit
-/// fails alone and the agent's own close-out commits. The database-only
-/// refusal is `a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio`.
+/// On an application-role server over stdio, every write target takes the
+/// ownership check a cluster member takes (A4), not only the retirement gate:
+///
+/// * a stranger's past-due claim in the stranger's own group (its close-out
+///   would add `resolved`);
+/// * a stranger's retired claim filed in the server agent's OWN group, so row
+///   security admits the write and no label of it is gated: only the
+///   ownership check can refuse its hygiene write.
+///
+/// Each fails alone with `TARGET_NOT_OWNED` and stays byte-identical, and the
+/// agent's own close-out and hygiene in the same apply commit.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_unwritable_closeout_target_fails_only_its_own_unit(pool: PgPool) {
+async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
     let bytes = profile_bytes();
     let root = profile_root(&bytes);
     let (server, agent, group, viewer) =
@@ -1186,48 +1324,99 @@ async fn an_unwritable_closeout_target_fails_only_its_own_unit(pool: PgPool) {
         "2026-07-02T00:00:00Z",
     )
     .await;
-    let theirs_before = labels_of(&pool, theirs).await;
+    let my_retired = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-05T00:00:00Z",
+    )
+    .await;
+    let their_retired = seed(
+        &pool,
+        stranger,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-06T00:00:00Z",
+    )
+    .await;
+    let foreign = [theirs, their_retired];
+    let foreign_before = snapshot(&pool, &foreign).await;
 
-    let p = plan_params_path("profile.json", &profile_hash(&bytes), &["closeout"]);
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), ALL);
     let plan = plan_ok(&server, &viewer, p.clone(), None).await;
     assert_eq!(plan["past_due"].as_array().map(Vec::len), Some(2), "{plan}");
+    for id in foreign {
+        let unit = unit_writes(&plan)
+            .into_iter()
+            .find(|u| u["writes"][0]["claim_id"] == id.to_string())
+            .unwrap_or_else(|| panic!("no unit writes {id}: {plan}"));
+        let name = unit["unit"].as_str().expect("unit").to_string();
+        assert_eq!(
+            unit_check(&plan, &name)["applies"],
+            false,
+            "predicted: {plan}"
+        );
+    }
     let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
-    assert_eq!(
-        result_for(&out, &format!("closeout:{mine}"))["ok"],
-        true,
-        "{out}"
-    );
-    let failed = result_for(&out, &format!("closeout:{theirs}"));
-    assert_eq!(failed["ok"], false, "{out}");
-    assert!(
-        failed["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("cannot retire")),
-        "refused by the retirement gate: {out}"
-    );
+    for unit in [
+        format!("closeout:{theirs}"),
+        format!("hygiene:{their_retired}"),
+    ] {
+        let failed = result_for(&out, &unit);
+        assert_eq!(failed["ok"], false, "{out}");
+        assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{out}");
+    }
+    assert_eq!(snapshot(&pool, &foreign).await, foreign_before);
+    for unit in [format!("closeout:{mine}"), format!("hygiene:{my_retired}")] {
+        assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
+    }
     assert!(labels_of(&pool, mine)
         .await
         .contains(&"resolved".to_string()));
-    assert_eq!(labels_of(&pool, theirs).await, theirs_before);
+    assert!(!labels_of(&pool, my_retired)
+        .await
+        .contains(&FAMILY.to_string()));
 }
 
 // ── Apply, idempotency and revert ───────────────────────────────────────────
 
-/// On an application-role server over stdio, every claim the server agent's
-/// own: apply hygiene, a cluster (with a replaced carried date) and a
-/// close-out (the retirement label, gated), check the re-plan is empty, then
-/// revert from `applied_units` through `update_labels`, newest first.
+/// The revert input an apply response carries, verbatim.
+fn revert_params(apply: &Value) -> RevertLabelDedupParams {
+    serde_json::from_value(json!({
+        "applied_units": apply["applied_units"],
+        "applied_marks": apply["applied_marks"],
+    }))
+    .expect("revert params")
+}
+
+/// A6. On an application-role server over stdio whose administrative
+/// connection runs as `epigraph_maintenance`, every claim the server agent's
+/// own: apply hygiene, a cluster (one loser MARKED, the survivor relabelled)
+/// and a close-out (the retirement label, gated); check the re-plan is empty;
+/// then ONE `revert_label_dedup` of the apply's own response undoes the label
+/// writes and then the mark. Every claim's labels, currency and `supersedes`
+/// come back, no dedup identity edge stays in force, and the family plans
+/// exactly as before. The same revert on a server WITHOUT the administrative
+/// connection is refused before anything is written.
 ///
-/// Byte-for-byte for every claim whose stored labels were already sorted and
-/// distinct. The write path stores labels sorted and distinct, so a claim
-/// stored in another order comes back with the same SET in sorted order: that
-/// limit is pinned on `fence` below, not hidden by pre-sorted fixtures.
+/// Byte-for-byte labels for every claim whose stored labels were already
+/// sorted and distinct. The write path stores labels sorted and distinct, so a
+/// claim stored in another order comes back with the same SET in sorted order:
+/// that limit is pinned on `fence` below, not hidden by pre-sorted fixtures.
 #[sqlx::test(migrations = "../../migrations")]
-async fn apply_then_revert_from_applied_units_restores_every_label_set(pool: PgPool) {
+async fn one_revert_after_apply_restores_labels_marks_and_the_index(pool: PgPool) {
     let bytes = profile_bytes();
     let root = profile_root(&bytes);
     let (server, agent, group, viewer) =
+        app_role_server_with_maintenance(&pool, config(Some(&root), None, 5000)).await;
+    let (no_admin, no_admin_agent, _, _) =
         app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    assert_eq!(no_admin_agent, agent, "precondition: one server agent");
 
     let survivor = seed(
         &pool,
@@ -1235,7 +1424,7 @@ async fn apply_then_revert_from_applied_units_restores_every_label_set(pool: PgP
         group,
         "public",
         PUMP_A,
-        &["due-carried:2026-11-01", FAMILY],
+        &[FAMILY],
         "2026-10-01T00:00:00Z",
     )
     .await;
@@ -1279,19 +1468,32 @@ async fn apply_then_revert_from_applied_units_restores_every_label_set(pool: PgP
     assert_eq!(out["status"], "applied", "{out}");
     assert_eq!(out["counts"]["failed"], 0, "{out}");
     assert_eq!(out["applied_plan_hash"], plan["plan_hash"], "{out}");
+
+    // The loser is marked, not relabelled (D2): it keeps every label, and a
+    // dedup identity edge carries the plan's provenance.
+    assert!(is_marked_onto(&pool, loser, survivor).await, "{out}");
+    let after = snapshot(&pool, &ids).await;
+    assert_eq!(after[&loser].labels, before[&loser].labels, "{out}");
+    let marks = out["applied_marks"].as_array().expect("applied_marks");
+    assert_eq!(marks.len(), 1, "{out}");
+    assert_eq!(marks[0]["dup"], loser.to_string(), "{out}");
+    assert_eq!(marks[0]["canonical"], survivor.to_string(), "{out}");
+    let provenance: Value = sqlx::query_scalar(
+        "SELECT properties->'dedup' FROM edges WHERE source_id = $1 AND relationship = 'same_as' \
+            AND valid_to IS NULL",
+    )
+    .bind(loser)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert_eq!(provenance["tool"], "label_dedup", "{provenance}");
+    assert_eq!(provenance["run_tag"], RUN_TAG, "{provenance}");
+    assert_eq!(provenance["plan_hash"], plan["plan_hash"], "{provenance}");
+    assert_eq!(provenance["rule"], marks[0]["rule"], "{provenance}");
+
+    // Each applied_units record is exactly the change on the stored labels.
     let applied: Vec<AppliedLabelChange> =
         serde_json::from_value(out["applied_units"].clone()).expect("applied_units");
-
-    // Preconditions: the apply replaced a carried date (a removal the revert
-    // must add back) and retired a claim with the gated label.
-    assert!(
-        applied.iter().any(|c| c.claim_id == survivor
-            && c.labels_removed
-                .contains(&"due-carried:2026-11-01".to_string())
-            && c.labels_added
-                .contains(&"due-carried:2026-12-05".to_string())),
-        "{applied:?}"
-    );
     assert!(
         applied
             .iter()
@@ -1304,17 +1506,15 @@ async fn apply_then_revert_from_applied_units_restores_every_label_set(pool: PgP
             .any(|c| c.claim_id == partial && c.labels_removed == s(&[FAMILY])),
         "{applied:?}"
     );
-    // Each record is exactly the change on the stored row.
-    let after = snapshot(&pool, &ids).await;
     for id in ids {
-        let mut expect: Vec<String> = sorted(before[&id].clone());
+        let mut expect: Vec<String> = sorted(before[&id].labels.clone());
         for c in applied.iter().filter(|c| c.claim_id == id) {
             expect.retain(|l| !c.labels_removed.contains(l));
             expect.extend(c.labels_added.iter().cloned());
         }
         assert_eq!(
             sorted(expect),
-            after[&id],
+            after[&id].labels,
             "applied_units is exact for {id}"
         );
     }
@@ -1326,39 +1526,180 @@ async fn apply_then_revert_from_applied_units_restores_every_label_set(pool: PgP
     let out2 = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&again)), None).await;
     assert_eq!(out2["status"], "nothing_to_do", "{out2}");
 
-    // THE REVERT PROCEDURE: the inverse of applied_units, newest first, each
-    // through update_labels under the same identity.
-    for w in revert_writes(&applied) {
-        epigraph_mcp::tools::claims::update_labels(
-            &server,
-            &viewer,
-            UpdateLabelsParams {
-                claim_id: w.claim_id.to_string(),
-                add: w.add,
-                remove: w.remove,
-            },
-            None,
-        )
+    // No administrative connection: refused, nothing written (not even the
+    // label half, which alone would leave the mark without its labels).
+    let err = revert_label_dedup(&no_admin, &viewer, revert_params(&out), None)
         .await
-        .expect("revert write");
-    }
+        .expect_err("an un-mark needs the administrative connection");
+    assert_eq!(code(&err), "ADMIN_CONNECTION_REQUIRED", "{err:?}");
+    assert_eq!(snapshot(&pool, &ids).await, after, "nothing written");
+
+    // THE REVERT: one call, the label writes newest first, then the mark.
+    let reverted = first_text(
+        &revert_label_dedup(&server, &viewer, revert_params(&out), None)
+            .await
+            .expect("revert"),
+    );
+    assert_eq!(reverted["status"], "reverted", "{reverted}");
+    let steps = reverted["steps"].as_array().expect("steps");
+    assert!(steps.iter().all(|st| st["ok"] == true), "{reverted}");
+    let last = steps.last().expect("a step");
+    assert_eq!(
+        last["step"], "unmark",
+        "the mark is undone last: {reverted}"
+    );
+
     let restored = snapshot(&pool, &ids).await;
     for id in [survivor, loser, partial] {
         assert_eq!(restored[&id], before[&id], "byte-for-byte for {id}");
     }
     assert_eq!(
-        restored[&fence],
-        sorted(before[&fence].clone()),
+        restored[&fence].labels,
+        sorted(before[&fence].labels.clone()),
         "the set comes back..."
     );
     assert_ne!(
-        restored[&fence], before[&fence],
+        restored[&fence].labels, before[&fence].labels,
         "...in sorted order, not the stored order"
+    );
+    assert_eq!(
+        identity_edges(&pool, loser).await,
+        0,
+        "the identity edge is retracted"
     );
 
     // And the restored family plans exactly as before.
     let replanned = plan_ok(&server, &viewer, p, None).await;
     assert_eq!(replanned["plan_hash"], plan["plan_hash"]);
+}
+
+/// A2 and A3 (decisions D2, D3), on an application-role server over stdio.
+/// A cluster's loser is MARKED: it keeps its labels, the family label
+/// included, yet leaves the index read (`current_only`), so the family
+/// re-plans with nothing to do. Its later deadline stays on its own claim: no
+/// `-carried:` value label is written anywhere, `label_dedup_index_view`
+/// returns it under the canonical, and the close-out pass reads it there. The
+/// canonical is past its OWN deadline, yet is not closed while its
+/// duplicate's deadline is still ahead. Control: an unrelated past-due claim
+/// is closed by the same plan.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_marked_duplicate_leaves_the_index_and_its_deadline_is_read_through_the_canonical(
+    pool: PgPool,
+) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    // The survivor (newer) is due BEFORE the plan's as_of; its duplicate is
+    // due after it.
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station rehab | Acme Water Authority | due: 2026-10-01 | ref ACME-123456",
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let loser = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_B,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let fence = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        FENCE,
+        &[FAMILY],
+        "2026-07-01T00:00:00Z",
+    )
+    .await;
+    let loser_before = labels_of(&pool, loser).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(out["counts"]["failed"], 0, "{out}");
+    assert!(is_marked_onto(&pool, loser, survivor).await, "{out}");
+    assert_eq!(
+        labels_of(&pool, loser).await,
+        loser_before,
+        "no loser label write"
+    );
+    for id in [survivor, loser] {
+        assert!(
+            !labels_of(&pool, id)
+                .await
+                .iter()
+                .any(|l| l.contains("carried")),
+            "no carried value label on {id}"
+        );
+    }
+
+    // The index read drops the duplicate: nothing left to dedup.
+    let again = plan_ok(&server, &viewer, p, None).await;
+    assert!(unit_writes(&again).is_empty(), "{again}");
+    assert_eq!(again["coverage"]["members"], 2, "{again}");
+
+    // The duplicate is read through its canonical.
+    let view = first_text(
+        &label_dedup_index_view(
+            &server,
+            &viewer,
+            serde_json::from_value::<LabelDedupIndexViewParams>(
+                json!({"claim_ids": [survivor.to_string()]}),
+            )
+            .expect("params"),
+            None,
+        )
+        .await
+        .expect("index view"),
+    );
+    let dups = view["views"][0]["duplicates"]
+        .as_array()
+        .expect("duplicates");
+    assert_eq!(
+        view["views"][0]["canonical"]["id"],
+        survivor.to_string(),
+        "{view}"
+    );
+    assert_eq!(dups.len(), 1, "{view}");
+    assert_eq!(dups[0]["id"], loser.to_string(), "{view}");
+    assert!(
+        dups[0]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("due: 2026-12-05")),
+        "{view}"
+    );
+    assert_eq!(view["truncated"], false, "{view}");
+
+    // Close-out reads the duplicate's later deadline.
+    let closeout = plan_ok(
+        &server,
+        &viewer,
+        plan_params_path("profile.json", &profile_hash(&bytes), &["closeout"]),
+        None,
+    )
+    .await;
+    let past_due: Vec<String> = closeout["past_due"]
+        .as_array()
+        .expect("past_due")
+        .iter()
+        .map(|d| d["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(past_due.contains(&fence.to_string()), "control: {closeout}");
+    assert!(
+        !past_due.contains(&survivor.to_string()),
+        "the canonical's duplicate is still due: {closeout}"
+    );
 }
 
 // ── Probe ───────────────────────────────────────────────────────────────────
@@ -1736,13 +2077,13 @@ async fn a_cross_author_cluster_is_refused_on_stdio(pool: PgPool, signer: Signer
     assert_eq!(check["applies"], false, "predicted: {plan}");
     assert!(names_foreign_member(check, foreign), "{plan}");
 
+    assert!(in_review(&out, &unit), "{out}");
+
     // Control: the self-authored cluster in the same apply commits.
     let control = format!("cluster:{roof_new}");
     assert_eq!(result_for(&out, &control)["ok"], true, "{out}");
     assert!(
-        labels_of(&pool, roof_old)
-            .await
-            .contains(&format!("duplicate-of:{roof_new}")),
+        is_marked_onto(&pool, roof_old, roof_new).await,
         "the control cluster applied"
     );
     assert_eq!(unit_check(&plan, &control)["applies"], true, "{plan}");
@@ -1789,7 +2130,6 @@ async fn a_foreign_survivor_never_absorbs_the_callers_claims(pool: PgPool, join:
         // The stranger's claim carries none of the caller's ids, so nothing
         // may be carried onto it either.
         v["merge"]["carry_ids"] = json!(false);
-        v["merge"]["carry_later_dates"] = json!([]);
     }
     let bytes = serde_json::to_vec(&v).expect("profile");
     let server = superuser_server(&pool, config(None, None, 5000)).await;
@@ -1854,8 +2194,8 @@ async fn a_foreign_survivor_never_absorbs_the_callers_claims(pool: PgPool, join:
 
     let p = plan_params_json(&bytes, DEDUP);
     let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
-    // Preconditions: the stranger's claim is the survivor, and the unit writes
-    // only the caller's claims.
+    // Preconditions: the stranger's claim is the survivor, the unit writes no
+    // label at all, and it would mark the caller's claims onto the stranger's.
     assert_eq!(
         plan["clusters"][0]["survivor"],
         theirs.to_string(),
@@ -1866,14 +2206,13 @@ async fn a_foreign_survivor_never_absorbs_the_callers_claims(pool: PgPool, join:
         .into_iter()
         .find(|u| u["unit"] == unit)
         .unwrap_or_else(|| panic!("no write unit {unit}: {plan}"));
-    let targets: Vec<String> = writes["writes"]
-        .as_array()
-        .expect("writes")
-        .iter()
-        .map(|w| w["claim_id"].as_str().expect("claim_id").to_string())
-        .collect();
-    assert!(!targets.contains(&theirs.to_string()), "{plan}");
-    assert!(targets.contains(&a.to_string()), "{plan}");
+    assert_eq!(writes["writes"], json!([]), "{plan}");
+    assert!(
+        unit_marks(&plan, &unit)
+            .iter()
+            .any(|m| m["dup"] == a.to_string() && m["canonical"] == theirs.to_string()),
+        "{plan}"
+    );
 
     let out = apply_ok(
         &server,
@@ -1890,8 +2229,9 @@ async fn a_foreign_survivor_never_absorbs_the_callers_claims(pool: PgPool, join:
     assert_eq!(
         snapshot(&pool, &mine).await,
         before,
-        "the caller's labels are byte-identical"
+        "the caller's claims are unmarked and byte-identical"
     );
+    assert!(in_review(&out, &unit), "{out}");
     assert!(
         refused["error"]
             .as_str()
@@ -1915,10 +2255,11 @@ async fn a_one_sided_revision_label_cannot_make_a_stranger_the_survivor(pool: Pg
 
 /// On an application-role server over stdio, every member the agent's own:
 /// the survivor and one loser in the agent's group, the other loser in a
-/// stranger's group the agent can read (public) but not write. The survivor
-/// is written FIRST, so the database's refusal of the last write must roll
-/// back writes that already landed in the unit. No ownership check refuses
-/// anything here; a later close-out unit still commits.
+/// stranger's group the agent can read (public) but not write. The owned
+/// loser is marked FIRST, so the database's refusal of the second mark must
+/// roll back the mark that already landed in the unit. No ownership check
+/// refuses anything here (`unit_check` predicts the database's refusal from
+/// the act's own write predicates); a later close-out unit still commits.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: PgPool) {
     let bytes = profile_bytes();
@@ -1926,6 +2267,10 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
     let (server, agent, group, viewer) =
         app_role_server(&pool, config(Some(&root), None, 5000)).await;
     let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-host").await;
+    // The owned loser's mark comes first (a unit marks in loser id order), so
+    // the database's refusal of the second must roll back one that landed.
+    let mut loser_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    loser_ids.sort();
     let survivor = seed(
         &pool,
         agent,
@@ -1936,8 +2281,9 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
         "2026-10-01T00:00:00Z",
     )
     .await;
-    let owned_loser = seed(
+    let owned_loser = seed_id(
         &pool,
+        loser_ids[0],
         agent,
         group,
         "public",
@@ -1946,8 +2292,9 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
         "2026-09-01T00:00:00Z",
     )
     .await;
-    let elsewhere = seed(
+    let elsewhere = seed_id(
         &pool,
+        loser_ids[1],
         agent,
         stranger_group,
         "public",
@@ -1972,26 +2319,21 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
     let p = plan_params_path("profile.json", &profile_hash(&bytes), ALL);
     let plan = plan_ok(&server, &viewer, p.clone(), None).await;
     let unit = format!("cluster:{survivor}");
-    let writes = unit_writes(&plan)
-        .into_iter()
-        .find(|u| u["unit"] == unit)
-        .unwrap_or_else(|| panic!("no write unit {unit}: {plan}"));
+    let marks: Vec<Value> = unit_marks(&plan, &unit);
     assert_eq!(
-        writes["writes"][0]["claim_id"],
-        survivor.to_string(),
-        "precondition: the survivor is written before the refused loser: {plan}"
+        marks.iter().map(|m| m["dup"].clone()).collect::<Vec<_>>(),
+        vec![json!(owned_loser.to_string()), json!(elsewhere.to_string())],
+        "precondition: the owned loser is marked before the refused one: {plan}"
     );
-    let target = |id: Uuid| {
-        plan["write_check"]
-            .as_array()
-            .expect("write_check")
-            .iter()
-            .find(|c| c["claim_id"] == id.to_string())
-            .cloned()
-            .unwrap_or_else(|| panic!("no write_check for {id}: {plan}"))
-    };
-    assert_eq!(target(elsewhere)["writable"], false, "predicted: {plan}");
-    assert_eq!(target(survivor)["writable"], true, "{plan}");
+    let check = unit_check(&plan, &unit);
+    assert_eq!(
+        mark_check(check, elsewhere)["may_mark"],
+        false,
+        "predicted: {plan}"
+    );
+    assert_eq!(mark_check(check, owned_loser)["may_mark"], true, "{plan}");
+    assert_eq!(check["applies"], false, "{plan}");
+    assert_eq!(check["cross_owner"], Value::Null, "one owner: {plan}");
 
     let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
     let refused = result_for(&out, &unit);
@@ -1999,12 +2341,14 @@ async fn a_row_security_refusal_mid_unit_rolls_back_the_survivor_on_stdio(pool: 
     assert_eq!(
         snapshot(&pool, &cluster_ids).await,
         before,
-        "the survivor's landed write rolled back with the refused one"
+        "the owned loser's landed mark rolled back with the refused one"
     );
+    assert_eq!(identity_edges(&pool, owned_loser).await, 0);
     let error = refused["error"].as_str().unwrap_or_default();
     assert!(
         !error.is_empty()
             && !error.contains("CROSS_OWNER_MEMBER")
+            && !error.contains("TARGET_NOT_OWNED")
             && !error.contains("cannot retire"),
         "refused by the database, not by an ownership check: {out}"
     );
@@ -2184,14 +2528,14 @@ async fn a_revision_label_never_steers_an_admin_apply_across_owners(pool: PgPool
     assert_eq!(refused["ok"], false, "{out}");
     assert_eq!(refused["code"], "CROSS_OWNER_MEMBER", "{out}");
     assert_eq!(check["applies"], false, "predicted: {plan}");
+    assert!(check["cross_owner"].is_string(), "predicted: {plan}");
+    assert!(in_review(&out, &unit), "{out}");
 
     // Control: the caller's own revision-label cluster commits.
     let control = format!("cluster:{roof_revised}");
     assert_eq!(result_for(&out, &control)["ok"], true, "{out}");
     assert!(
-        labels_of(&pool, roof)
-            .await
-            .contains(&format!("duplicate-of:{roof_revised}")),
+        is_marked_onto(&pool, roof, roof_revised).await,
         "the control cluster applied"
     );
     assert_eq!(unit_check(&plan, &control)["applies"], true, "{plan}");
@@ -2205,6 +2549,188 @@ async fn an_admin_apply_never_retires_another_owners_claim_through_a_revision_la
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_admin_apply_never_makes_another_owners_claim_a_revision_survivor(pool: PgPool) {
     a_revision_label_never_steers_an_admin_apply_across_owners(pool, false).await;
+}
+
+/// B5 (A7), the shared-id half. Over HTTP with `claims:admin` and a live
+/// grant, on an application-role server: the caller's claim and another
+/// owner's claim share a strong id, so they cluster. The admin grant owns
+/// every member, yet a cluster of two owners is never marked, whatever the
+/// caller's grant: the unit fails `CROSS_OWNER_MEMBER`, is listed in
+/// `review`, was predicted by `unit_check`, and neither claim changes.
+/// Control: a cluster of the caller's own claims is marked in the same apply.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_id_never_marks_across_owners_even_for_an_admin(pool: PgPool) {
+    let bytes = profile_bytes();
+    let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    seed_admin_grant(&pool, &auth).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "item-shared-id").await;
+    let theirs = seed(
+        &pool,
+        other,
+        other_group,
+        "public",
+        PUMP_B,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let mine = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let roof_old = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let roof_new = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF_B,
+        &[FAMILY],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[mine, theirs]).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    let unit = format!("cluster:{theirs}");
+    assert!(
+        unit_marks(&plan, &unit)
+            .iter()
+            .any(|m| m["dup"] == mine.to_string() && m["rule"] == "strong_id"),
+        "precondition: a shared strong id clusters the two owners' claims: {plan}"
+    );
+    let check = unit_check(&plan, &unit);
+    assert!(
+        check["members"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().all(|m| m["owned"] == true)),
+        "precondition: the admin grant owns every member: {plan}"
+    );
+    assert!(check["cross_owner"].is_string(), "predicted: {plan}");
+    assert_eq!(check["applies"], false, "predicted: {plan}");
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    let refused = result_for(&out, &unit);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert_eq!(refused["code"], "CROSS_OWNER_MEMBER", "{out}");
+    assert!(in_review(&out, &unit), "{out}");
+    assert_eq!(snapshot(&pool, &[mine, theirs]).await, before);
+
+    let control = format!("cluster:{roof_new}");
+    assert_eq!(result_for(&out, &control)["ok"], true, "{out}");
+    assert!(is_marked_onto(&pool, roof_old, roof_new).await, "{out}");
+    assert!(!in_review(&out, &control), "{out}");
+}
+
+/// A mark is the CALLER's act, on its own stamped transaction: a
+/// `claims:admin` caller (live grant) planning a same-owner cluster inside a
+/// group it cannot write owns every member and passes the cross-owner rule,
+/// yet `unit_check` predicts from the act's own write predicates that it may
+/// not mark, and apply writes nothing. Control: the caller's own cluster is
+/// marked in the same apply.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_never_marks_inside_a_group_it_cannot_write(pool: PgPool) {
+    let bytes = profile_bytes();
+    let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    seed_admin_grant(&pool, &auth).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let (z, z_group) = fixture::seed_agent_with_group(&pool, "item-other-group").await;
+    let z_new = seed(
+        &pool,
+        z,
+        z_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let z_old = seed(
+        &pool,
+        z,
+        z_group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let roof_old = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let roof_new = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        ROOF_B,
+        &[FAMILY],
+        "2026-09-03T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[z_new, z_old]).await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    let unit = format!("cluster:{z_new}");
+    let check = unit_check(&plan, &unit);
+    assert_eq!(check["cross_owner"], Value::Null, "one owner: {plan}");
+    assert!(
+        check["members"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().all(|m| m["owned"] == true)),
+        "the admin grant owns every member: {plan}"
+    );
+    assert_eq!(mark_check(check, z_old)["may_mark"], false, "{plan}");
+    assert_eq!(check["applies"], false, "{plan}");
+    assert_eq!(
+        mark_check(unit_check(&plan, &format!("cluster:{roof_new}")), roof_old)["may_mark"],
+        true,
+        "{plan}"
+    );
+
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(result_for(&out, &unit)["ok"], false, "{out}");
+    assert_eq!(snapshot(&pool, &[z_new, z_old]).await, before);
+    assert!(is_marked_onto(&pool, roof_old, roof_new).await, "{out}");
 }
 
 // ── One owner across an operator link ──────────────────────────────────────
@@ -2234,17 +2760,19 @@ fn revision_member(plan: &Value, survivor: Uuid, loser: Uuid) -> bool {
 }
 
 /// Two agents of ONE operator are one owner: a revision label between their
-/// claims applies for a `claims:admin` caller, while, in the same apply, a
-/// revision label from one of them to an unlinked agent's claim is refused.
+/// claims (filed in a group the `claims:admin` caller writes, so the mark is
+/// the caller's own act) applies, while, in the same apply, a revision label
+/// from one of them to an unlinked agent's claim is refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admin(pool: PgPool) {
     let bytes = serde_json::to_vec(&profile_for(Join::RevisionLabel)).expect("profile");
     let (server, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
-    let (_, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write", "claims:admin"]).await;
     seed_admin_grant(&pool, &auth).await;
+    let caller_group = personal_group_of(&pool, caller).await;
     let (operator, _) = fixture::seed_human_operator(&pool, "item-operator").await;
     let (y1, y1_group) = fixture::seed_agent_with_group(&pool, "item-agent-one").await;
-    let (y2, y2_group) = fixture::seed_agent_with_group(&pool, "item-agent-two").await;
+    let (y2, _) = fixture::seed_agent_with_group(&pool, "item-agent-two").await;
     let (z, z_group) = fixture::seed_agent_with_group(&pool, "item-unlinked").await;
     link_to_operator(&pool, y1, operator).await;
     link_to_operator(&pool, y2, operator).await;
@@ -2252,7 +2780,7 @@ async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admi
     let original = seed(
         &pool,
         y2,
-        y2_group,
+        caller_group,
         "public",
         PUMP_A,
         &[FAMILY],
@@ -2262,7 +2790,7 @@ async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admi
     let revision = seed(
         &pool,
         y1,
-        y1_group,
+        caller_group,
         "public",
         PUMP_REVISED,
         &[FAMILY, &format!("revises:{original}")],
@@ -2299,7 +2827,7 @@ async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admi
     let control = format!("cluster:{foreign_revision}");
     assert_eq!(unit_check(&plan, &unit)["applies"], true, "{plan}");
     assert_eq!(
-        unit_check(&plan, &unit)["cross_owner_revision_link"],
+        unit_check(&plan, &unit)["cross_owner"],
         Value::Null,
         "{plan}"
     );
@@ -2314,9 +2842,7 @@ async fn a_revision_label_between_two_agents_of_one_operator_applies_for_an_admi
     .await;
     assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
     assert!(
-        labels_of(&pool, original)
-            .await
-            .contains(&format!("duplicate-of:{revision}")),
+        is_marked_onto(&pool, original, revision).await,
         "the operator's two agents' claims merged: {out}"
     );
     let refused = result_for(&out, &control);
@@ -2423,9 +2949,7 @@ async fn an_operator_merges_its_own_claim_with_its_agents_through_a_revision_lab
     .await;
     assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
     assert!(
-        labels_of(&pool, agents)
-            .await
-            .contains(&format!("duplicate-of:{operators}")),
+        is_marked_onto(&pool, agents, operators).await,
         "the operator's claim and its agent's merged: {out}"
     );
     let refused = result_for(&out, &control);
