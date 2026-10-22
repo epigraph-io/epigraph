@@ -77,7 +77,7 @@ pub use profile::{
     profile_hash, FamilyKind, LabelDedupProfile, PassProfile, ReadPurpose, ReadSpec, Tier,
 };
 pub use record::{parse_record, Facts, MatchKeys, ParsedRecord};
-pub use revert::{revert_writes, AppliedLabelChange};
+pub use revert::{revert_marks, revert_writes, AppliedLabelChange, AppliedMark};
 
 /// The claim view the engine needs, and nothing else: no truth value, no
 /// evidence, no owner. Built by the caller from a viewer-scoped read.

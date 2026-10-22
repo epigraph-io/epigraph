@@ -1,4 +1,5 @@
-//! The revert input an apply returns, and the label writes that undo it.
+//! The revert input an apply returns, and the label writes and un-marks that
+//! undo it.
 //!
 //! Apply records, per claim write, the labels the write ACTUALLY changed: the
 //! labels it named that were absent before and present after (added), and the
@@ -12,11 +13,52 @@
 //! matters when two units of one apply touch the same claim and the same
 //! label (one adds it, a later one removes it): only the reverse order lands
 //! back on the original set.
+//!
+//! Apply also records every duplicate it marked ([`AppliedMark`]). A revert
+//! undoes the label writes first, then the marks ([`revert_marks`]), newest
+//! first: an un-mark is refused while the duplicate's canonical is itself a
+//! marked duplicate, so a chain comes apart from its newest link.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::plan::LabelWrite;
+use super::plan::{DuplicateMark, LabelWrite};
+use super::profile::Tier;
+
+/// One duplicate a committed unit marked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedMark {
+    /// The write unit the mark belongs to (`cluster:<survivor>`, ...).
+    pub unit: String,
+    pub dup: Uuid,
+    pub canonical: Uuid,
+    pub rule: Tier,
+    pub matched_on: String,
+    /// The dedup identity edge the act wrote, when the caller knows it.
+    #[serde(default)]
+    pub identity_edge: Option<Uuid>,
+}
+
+impl AppliedMark {
+    /// The record of `mark`, performed by `unit`.
+    #[must_use]
+    pub fn from_mark(unit: &str, mark: &DuplicateMark, identity_edge: Option<Uuid>) -> Self {
+        Self {
+            unit: unit.to_string(),
+            dup: mark.dup,
+            canonical: mark.canonical,
+            rule: mark.rule,
+            matched_on: mark.matched_on.clone(),
+            identity_edge,
+        }
+    }
+}
+
+/// The marks of `applied` in the order to un-mark them: newest first.
+#[must_use]
+pub fn revert_marks(applied: &[AppliedMark]) -> Vec<AppliedMark> {
+    applied.iter().rev().cloned().collect()
+}
 
 /// The exact label change one committed write made to one claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -8179,6 +8179,23 @@ impl ClaimRepository {
         .await?)
     }
 
+    /// Whether THIS session's [`Self::mark_duplicate_act_attributed_conn`]
+    /// would pass the act's authority checks for `dup` onto `canonical`: the
+    /// same predicate as [`Self::session_may_unmark_conn`] (row security on
+    /// the duplicate, and FA04's attach rule for the canonical). A prediction
+    /// that writes nothing, for a planner showing which marks will apply;
+    /// FA07 and a concurrent change are left to the act.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn session_may_mark_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<bool, DbError> {
+        Self::session_may_unmark_conn(conn, dup, canonical).await
+    }
+
     /// Put back what a dedup repair did, from its [`DedupRevert`] record:
     /// re-source and re-target its edges onto `dup`, return its moved BBAs
     /// with their old tenancy, re-insert the BBAs it deleted, put its
