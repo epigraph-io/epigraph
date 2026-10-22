@@ -3435,3 +3435,44 @@ pub struct ProbeLabelDedupParams {
     #[schemars(description = "As plan_label_dedup")]
     pub max_claims: Option<i64>,
 }
+
+/// One label change an apply committed, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedLabelChangeParam {
+    pub unit: String,
+    pub claim_id: String,
+    #[serde(default)]
+    pub labels_added: Vec<String>,
+    #[serde(default)]
+    pub labels_removed: Vec<String>,
+}
+
+/// One duplicate an apply marked, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedMarkParam {
+    pub unit: String,
+    #[schemars(description = "The marked duplicate")]
+    pub dup: String,
+    #[schemars(description = "The claim it was marked a duplicate of")]
+    pub canonical: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertLabelDedupParams {
+    #[schemars(description = "applied_units from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_units: Vec<AppliedLabelChangeParam>,
+    #[schemars(description = "applied_marks from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_marks: Vec<AppliedMarkParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupIndexViewParams {
+    #[schemars(description = "Canonical claim ids (at most 100)")]
+    pub claim_ids: Vec<String>,
+    #[schemars(
+        description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
+    )]
+    pub max_claims: Option<i64>,
+}

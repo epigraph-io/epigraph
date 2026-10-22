@@ -1411,7 +1411,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Plan a label-family dedup pass. READ-ONLY. The family and its rules come from a dedup profile (schema label-dedup-profile/v1) pinned by profile_hash: on stdio a profile_path under this server's profile root (EPIGRAPH_MCP_PROFILE_ROOT), and profile_hash must equal the server's pin (EPIGRAPH_MCP_PROFILE_PIN) when one is set; over HTTP inline profile_json. Reads every family claim YOU can read (rows you cannot read are invisible), in id order, up to max_claims (default and server cap 5000; a larger request is clamped and reported). Returns plan_hash, coverage (members, truncated, snapshot_at), hygiene, clusters (survivor, losers, carry labels), review_pairs, vetoed_chains, past_due, lifecycle, signal sections, the write units apply would run, and write_check: a prediction, per write target, of whether your identity may write it. plan_hash covers profile_hash, run_tag, as_of, sections and the writes only."
+        description = "Plan a label-family dedup pass over an operational INDEX family (label dedup is index bookkeeping, never a merge of knowledge claims: mark those one by one with mark_duplicate). READ-ONLY. The family and its rules come from a dedup profile (schema label-dedup-profile/v2, every family declared family_kind 'index') pinned by profile_hash, and every family it names must be on this server's index-family allowlist (EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES; empty refuses all, FAMILY_NOT_ALLOWED / FAMILY_NOT_INDEX before any read): on stdio a profile_path under this server's profile root (EPIGRAPH_MCP_PROFILE_ROOT), and profile_hash must equal the server's pin (EPIGRAPH_MCP_PROFILE_PIN) when one is set; over HTTP inline profile_json. Reads every CURRENT family claim YOU can read (rows you cannot read are invisible), in id order, up to max_claims (default and server cap 5000; a larger request is clamped and reported), each with the duplicates already marked onto it (their fields, such as a later deadline, count where the claim's own do). Returns plan_hash, coverage (members, truncated, snapshot_at), hygiene, clusters (survivor, losers, carried ids), review_pairs, vetoed_chains, past_due, lifecycle, signal sections, the write units apply would run (label writes, and per cluster the losers it marks duplicates of the survivor), write_check (per write target, whether your identity may write it) and unit_check (per unit, whether it is predicted to apply: every member owned, ONE owner across the cluster, else review, and per mark whether your own write authority admits the dedup act). plan_hash covers profile_hash, run_tag, as_of, sections and the units (marks included) only."
     )]
     async fn plan_label_dedup(
         &self,
@@ -1424,7 +1424,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Apply a label-family dedup plan you reviewed. Takes the plan_label_dedup arguments plus plan_hash. Re-plans from live state first and writes nothing when the family read was truncated (refused TRUNCATED) or the fresh plan_hash differs (refused PLAN_DRIFT, with the fresh plan to review). Otherwise writes each unit (a cluster: survivor carry labels plus every loser's retirement; a hygiene, close-out or lifecycle claim) in ONE transaction through the update_labels path: over HTTP every claim needs ownership or claims:admin (the audited admin path for a group you cannot write), and the 'resolved' label and the profile's closed label need ownership on every transport. A refused write fails its whole unit (nothing of it lands) and later units continue. Returns status applied | nothing_to_do | refused, per-unit results, counts, and applied_units: every label each committed write actually added or removed, the input of the revert procedure (apply the inverse newest first through update_labels)."
+        description = "Apply a label-family dedup plan you reviewed. Takes the plan_label_dedup arguments plus plan_hash. Re-plans from live state first and writes nothing when the family read was truncated (refused TRUNCATED) or the fresh plan_hash differs (refused PLAN_DRIFT, with the fresh plan to review). Otherwise runs each unit in ONE transaction as your write identity: a cluster MARKS every loser a duplicate of its survivor through mark_duplicate's act (the loser becomes non-current, keeps its labels and evidence, and gains a same_as identity edge whose properties.dedup records this tool, the matching tier, run_tag and plan_hash; the cascade runs on the administrative connection or is deferred), then writes the survivor's labels; a hygiene, close-out or lifecycle unit writes labels through the update_labels path. A cluster of more than one owner is never marked, whatever your grant: it fails CROSS_OWNER_MEMBER and is listed in review. Every member and every write target must be yours (CROSS_OWNER_MEMBER / TARGET_NOT_OWNED); over HTTP claims:admin passes ownership, but a mark still needs your own write authority. A refused unit writes nothing and later units continue. Returns status applied | nothing_to_do | refused, per-unit results, counts, review, applied_marks and applied_units (every label each committed write actually changed): pass both to revert_label_dedup to undo the apply."
     )]
     async fn apply_label_dedup(
         &self,
@@ -1448,6 +1448,33 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::label_dedup::probe_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Undo one apply_label_dedup from its own response: pass its applied_units and applied_marks verbatim. Reverses the label writes first (newest first, each through the update_labels path), then un-marks each duplicate (newest first, each through unmark_duplicate, refused if the claim is now a duplicate of another claim). Needs this server's administrative connection when there are marks: without it the call is refused (ADMIN_CONNECTION_REQUIRED) before anything is written. Every step takes the gates its single-claim tool takes. Returns status reverted | partial and every step with its outcome."
+    )]
+    async fn revert_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::RevertLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::revert_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "The label-dedup index view. READ-ONLY. For up to 100 canonical claim ids, each canonical with every claim marked a duplicate of it (followed down a chain of marks): a marked duplicate leaves the index family yet keeps its own fields, so read a cluster's latest deadline or extra ids here. Only claims you can read are returned; an unreadable canonical is listed in missing. max_claims caps the duplicates read (default and server cap 5000; truncated when hit)."
+    )]
+    async fn label_dedup_index_view(
+        &self,
+        Parameters(params): Parameters<crate::types::LabelDedupIndexViewParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::label_dedup_index_view(self, viewer, params, auth).await
     }
 
     #[tool(

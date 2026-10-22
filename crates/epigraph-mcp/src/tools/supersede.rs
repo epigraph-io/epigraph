@@ -358,7 +358,23 @@ pub async fn unmark_duplicate(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let dup = parse_uuid(&params.claim_id)?;
+    let out = unmark_duplicate_expecting(server, viewer, auth, dup, None).await?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&out).map_err(internal_error)?,
+    )]))
+}
 
+/// [`unmark_duplicate`]'s body, for a caller that knows which dedup it means
+/// to undo (`revert_label_dedup`): with `expected_canonical`, a claim that is
+/// now a duplicate of ANOTHER claim is refused, nothing written. Returns the
+/// tool's response object.
+pub(crate) async fn unmark_duplicate_expecting(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dup: uuid::Uuid,
+    expected_canonical: Option<uuid::Uuid>,
+) -> Result<serde_json::Value, McpError> {
     // The canonical, the author and the text, read through the CALLER: a claim
     // it cannot read is "not found", like a missing one.
     let (canonical, author, content) = {
@@ -378,6 +394,12 @@ pub async fn unmark_duplicate(
             .into();
         (canonical, claim.agent_id.into(), claim.content.clone())
     };
+    if let Some(expected) = expected_canonical.filter(|e| *e != canonical) {
+        return Err(invalid_params(format!(
+            "claim {dup} is now a duplicate of {canonical}, not of {expected}; nothing was \
+             written"
+        )));
+    }
 
     // No administrative connection: refuse before anything is written.
     let mut session = crate::maintenance::admin_cascade_session(server)
@@ -446,15 +468,12 @@ pub async fn unmark_duplicate(
     )
     .await;
 
-    Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&serde_json::json!({
-            "duplicate_id": dup,
-            "canonical_id": outcome.canonical_id,
-            "mode": "unmark_duplicate",
-            "embedded": embedded,
-            "cascade": outcome.cascade,
-            "belief_cascade": belief_cascade,
-        }))
-        .map_err(internal_error)?,
-    )]))
+    Ok(serde_json::json!({
+        "duplicate_id": dup,
+        "canonical_id": outcome.canonical_id,
+        "mode": "unmark_duplicate",
+        "embedded": embedded,
+        "cascade": outcome.cascade,
+        "belief_cascade": belief_cascade,
+    }))
 }

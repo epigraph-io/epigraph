@@ -171,10 +171,11 @@ fn revert_restores_every_label_set_after_a_full_apply() {
         unmark(&mut marked, &m);
     }
     assert!(marked.is_empty(), "every mark is undone: {marked:?}");
+    // Sets on both sides: a claim no write touched keeps its stored order.
     for (a, b) in original.iter().zip(&g) {
         assert_eq!(
             canonical(&a.labels),
-            b.labels,
+            canonical(&b.labels),
             "claim {} must be back on its original label set",
             a.id
         );
