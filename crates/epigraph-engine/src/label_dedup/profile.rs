@@ -1,4 +1,4 @@
-//! The `label-dedup-profile/v1` schema: every piece of deployment data the
+//! The `label-dedup-profile/v2` schema: every piece of deployment data the
 //! engine uses, passed by reference and pinned by hash.
 //!
 //! Every list defaults to empty. The defaults that do exist are generic
@@ -9,7 +9,8 @@
 //!
 //! Write templates may use these placeholders, each only where it has a value:
 //! `{run_tag}`, `{family}` (the family label of the pass the write belongs to),
-//! `{survivor}` (loser writes) and `{target}` (graduation and supersession).
+//! and `{target}` (graduation and supersession). `{survivor}` is bound in no
+//! write a profile declares (losers are marked, not relabelled) and is refused.
 
 use std::collections::BTreeMap;
 
@@ -114,8 +115,8 @@ pub enum FamilyKind {
     /// bookkeeping, and label hygiene on it is allowed.
     Index,
     /// A family of knowledge claims. Refused: duplicates there are marked
-    /// one by one through `mark_duplicate`, never by a label pass. The
-    /// default, so a pass that forgets to declare nothing is planned.
+    /// one by one through `mark_duplicate`, never by a label pass. It is the
+    /// default, so an undeclared kind is never planned.
     #[default]
     Knowledge,
 }
@@ -581,6 +582,9 @@ pub struct CloseoutSpec {
 #[serde(deny_unknown_fields)]
 pub struct LifecycleSpec {
     pub signal_family_label: String,
+    /// (required) What the signal family is; lifecycle writes onto it, so it
+    /// must be an index family like every family a plan writes.
+    pub signal_family_kind: FamilyKind,
     #[serde(default)]
     pub signal_exclude_labels: Vec<String>,
     /// The graduation index read excludes these, but keeps closed members.

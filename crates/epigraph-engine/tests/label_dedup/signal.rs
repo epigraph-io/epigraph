@@ -188,7 +188,9 @@ fn a_knowledge_signal_family_is_refused_only_when_its_pass_is_planned() {
         serde_json::json!({
             "family_label": "lead",
             "family_kind": "knowledge",
-            "fields": {"entity": {"pipe_position": 1}}
+            "hygiene_write": {"add": ["lead-dropped", "{run_tag}"], "remove": ["{family}"]},
+            "fields": {"entity": {"pipe_position": 1}},
+            "merge": {"survivor_add": ["{run_tag}"]}
         }),
     );
     let p = f::load(&v);
@@ -271,6 +273,7 @@ fn lifecycle_skips_a_signal_this_plan_marks_a_duplicate() {
             "family_label": "lead",
             "family_kind": "index",
             "closed_label": "resolved",
+            "hygiene_write": {"add": ["lead-dropped", "{run_tag}"], "remove": ["{family}"]},
             "fields": {"entity": {"pipe_position": 1}},
             "merge": {"survivor_add": ["{run_tag}"]}
         }),

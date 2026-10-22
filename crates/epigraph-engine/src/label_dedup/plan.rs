@@ -192,6 +192,10 @@ pub struct SignalDedupPlan {
     pub clusters: Vec<Cluster>,
     pub review_pairs: Vec<ReviewPair>,
     pub vetoed_chains: Vec<VetoedChain>,
+    /// Survivors of signal clusters left unmarked because a member is also
+    /// read by the main pass (a claim in both families): a mark would retire
+    /// it from the main family too. For a human.
+    pub cross_family: Vec<Uuid>,
 }
 
 /// A signal that became a member.
@@ -409,15 +413,29 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
     let has = |s: Section| sections.contains(&s);
     // Only an index family is ever planned (the main pass always is; the
     // signal pass when its section is).
-    let mut passes = vec![&profile.pass];
+    let mut families: Vec<(&str, FamilyKind)> =
+        vec![(profile.pass.family_label.as_str(), profile.pass.family_kind)];
     if has(Section::SignalDedup) {
-        passes.extend(profile.signal_dedup.as_ref());
+        families.extend(
+            profile
+                .signal_dedup
+                .iter()
+                .map(|sp| (sp.family_label.as_str(), sp.family_kind)),
+        );
     }
-    for pass in passes {
-        if pass.family_kind != FamilyKind::Index {
+    if has(Section::Lifecycle) {
+        families.extend(
+            profile
+                .lifecycle
+                .iter()
+                .map(|lc| (lc.signal_family_label.as_str(), lc.signal_family_kind)),
+        );
+    }
+    for (family_label, kind) in families {
+        if kind != FamilyKind::Index {
             return Err(LabelDedupError::FamilyNotIndex {
-                family_label: pass.family_label.clone(),
-                kind: pass.family_kind,
+                family_label: family_label.to_string(),
+                kind,
             });
         }
     }
@@ -504,23 +522,25 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
     ) {
         plan.past_due = plan_closeout(&profile.pass, cs, &main, as_of, req.run_tag)?;
     }
-    if let (Some(lc), Some((signals, targets)), Some(as_of)) =
-        (profile.lifecycle.as_ref(), lifecycle_inputs, req.as_of)
-    {
-        let closed_now: BTreeSet<Uuid> = plan.past_due.iter().map(|p| p.id).collect();
-        plan.lifecycle = plan_lifecycle(
-            &profile.pass,
-            lc,
-            signals,
-            targets,
-            &main,
-            &closed_now,
-            as_of,
-            req.run_tag,
-        )?;
-    }
+    // The signal pass runs before lifecycle, so lifecycle never writes onto a
+    // signal this plan marks a duplicate (the mark retires it).
+    let mut signal_losers: BTreeSet<Uuid> = BTreeSet::new();
     if let (Some(sp), Some(snap)) = (profile.signal_dedup.as_ref(), signal_input) {
-        let sig = run_pass(sp, &snap.claims, req.run_tag, true, true)?;
+        let mut sig = run_pass(sp, &snap.claims, req.run_tag, true, true)?;
+        // A mark retires a claim from EVERY family, not just this one. A signal
+        // cluster that touches a claim the main pass also reads (a claim
+        // carrying both family labels) would retire, or hang a chain off, a
+        // main-family member: it is left for a human, never marked.
+        let main_ids: BTreeSet<Uuid> = main.records.iter().map(rid).collect();
+        let (kept, crossing): (Vec<Cluster>, Vec<Cluster>) =
+            sig.clusters.into_iter().partition(|c| {
+                !main_ids.contains(&c.survivor)
+                    && !c.members.iter().any(|m| main_ids.contains(&m.id))
+            });
+        sig.clusters = kept;
+        sig.loser_of
+            .retain(|_, survivor| sig.clusters.iter().any(|c| c.survivor == *survivor));
+        signal_losers = sig.loser_of.keys().copied().collect();
         if let Some(ss) = profile.signal_superseded_by_member.as_ref() {
             plan.signal_superseded =
                 plan_superseded(&profile.pass, sp, ss, &sig, &main, req.run_tag)?;
@@ -531,7 +551,25 @@ pub fn plan(req: &PlanRequest<'_>, inputs: &PlanInputs) -> Result<Plan, LabelDed
             clusters: sig.clusters,
             review_pairs: sig.review_pairs,
             vetoed_chains: sig.vetoed_chains,
+            cross_family: crossing.iter().map(|c| c.survivor).collect(),
         });
+    }
+    if let (Some(lc), Some((signals, targets)), Some(as_of)) =
+        (profile.lifecycle.as_ref(), lifecycle_inputs, req.as_of)
+    {
+        let closed_now: BTreeSet<Uuid> = plan.past_due.iter().map(|p| p.id).collect();
+        let mut lifecycle = plan_lifecycle(
+            &profile.pass,
+            lc,
+            signals,
+            targets,
+            &main,
+            &closed_now,
+            as_of,
+            req.run_tag,
+        )?;
+        lifecycle.retain(|a| !signal_losers.contains(&a.id));
+        plan.lifecycle = lifecycle;
     }
     plan.plan_hash = compute_plan_hash(
         req.profile_hash,
@@ -859,7 +897,6 @@ fn precedence_cmp(pass: &PassProfile, a: &ParsedRecord, b: &ParsedRecord) -> Ord
     ord.then_with(|| rid(a).cmp(&rid(b)))
 }
 
-/// Labels carrying `<stem>-carried:` dates on a record, as dates.
 /// A record's own date for `field`, and the later of that and the dates its
 /// marked duplicates hold for it (read through the canonical's identity
 /// edges). `None` when the record has no date of its own and its duplicates
@@ -956,17 +993,32 @@ fn build_cluster(
         .iter()
         .map(|l| {
             let li = recs.iter().position(|r| r.id == l.id).unwrap_or_default();
-            let (tier, reason) = edges
+            let si = recs
                 .iter()
-                .find(|e| {
-                    (e.a == li || e.b == li)
-                        && dsu.find_const(e.a) == root
-                        && dsu.find_const(e.b) == root
-                })
-                .map_or(
-                    (Tier::TitleAndEntity, String::from("transitively clustered")),
-                    |e| (e.tier, e.reason.clone()),
-                );
+                .position(|r| r.id == survivor.id)
+                .unwrap_or_default();
+            let in_cluster = |e: &&Edge| dsu.find_const(e.a) == root && dsu.find_const(e.b) == root;
+            // The provenance a mark records is the match between THIS loser and
+            // the survivor when there is one; otherwise the loser's first match
+            // in the cluster, naming the claim it actually matched.
+            let direct = edges
+                .iter()
+                .filter(in_cluster)
+                .find(|e| (e.a == li && e.b == si) || (e.a == si && e.b == li));
+            let (tier, reason) = match direct {
+                Some(e) => (e.tier, e.reason.clone()),
+                None => edges
+                    .iter()
+                    .filter(in_cluster)
+                    .find(|e| e.a == li || e.b == li)
+                    .map_or(
+                        (Tier::TitleAndEntity, String::from("transitively clustered")),
+                        |e| {
+                            let other = if e.a == li { e.b } else { e.a };
+                            (e.tier, format!("via {}: {}", rid(&recs[other]), e.reason))
+                        },
+                    ),
+            };
             ClusterMember {
                 id: rid(l),
                 tier,

@@ -14,7 +14,8 @@
 //!
 //! This module plans the clean-up. It reads a snapshot of the family (plus,
 //! optionally, a signal family and a graduation index), classifies every claim,
-//! clusters duplicates, picks a survivor per cluster, and emits label writes:
+//! clusters duplicates, picks a survivor per cluster, and emits duplicate
+//! marks and label writes:
 //!
 //! - **hygiene**: retired or bookkeeping claims leave the family;
 //! - **dedup**: each loser is marked a duplicate of its survivor (a
@@ -32,9 +33,12 @@
 //! # Purity
 //!
 //! No I/O, no clock. `as_of` is an input, never `now()`. The caller (the MCP
-//! tools) performs the reads named by [`LabelDedupProfile::reads`], applies the
-//! returned [`WriteUnit`]s through the ordinary stamped label-write path, and
-//! recomputes the plan before applying so a stale plan is refused.
+//! tools) performs the reads named by [`LabelDedupProfile::reads`] (and, for
+//! each member read, the claims already marked duplicates of each member:
+//! [`DedupClaim::duplicates`]), performs each returned [`WriteUnit`]'s marks
+//! through the graph-native dedup act and then its label writes through the
+//! ordinary stamped label-write path, and recomputes the plan before applying
+//! so a stale plan is refused.
 //!
 //! # No deployment data in code
 //!
@@ -85,9 +89,12 @@ pub struct DedupClaim {
     pub created_at: Option<DateTime<Utc>>,
     /// The claims already marked duplicates of this one (the apply tool's
     /// `index_view`: its in-force dedup identity edges, followed down a
-    /// chain). Not members and never clustered or written: their fields are
-    /// read where a member's own are (a later deadline), because a marked
-    /// duplicate keeps what it knew.
+    /// chain; nested or flattened, the engine reads every level, each claim
+    /// once, at most `record::MAX_DUPLICATES`). Not members and never
+    /// clustered or written: their fields are read where a member's own are
+    /// (a later deadline), because a marked duplicate keeps what it knew. A
+    /// caller that could not read every duplicate of a member must report
+    /// the member read as truncated.
     #[serde(default)]
     pub duplicates: Vec<DedupClaim>,
 }

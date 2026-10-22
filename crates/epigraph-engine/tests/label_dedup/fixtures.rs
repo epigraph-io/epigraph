@@ -124,6 +124,7 @@ pub fn profile_value() -> serde_json::Value {
         "closeout": {"date_field": "deadline", "add": ["resolved", "closed-past-due", "{run_tag}"]},
         "lifecycle": {
             "signal_family_label": "lead",
+            "signal_family_kind": "index",
             "signal_exclude_labels": ["resolved"],
             "target_exclude_labels": ["notice-dropped", "notice-duplicate", "listed-final"],
             "umbrella": {
