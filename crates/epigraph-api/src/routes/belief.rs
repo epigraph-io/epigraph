@@ -1095,7 +1095,12 @@ pub async fn submit_evidence(
     //    itself (or no one): naming another agent would attribute evidence to
     //    it and, where row security lets the caller write that agent's row,
     //    overwrite its BBA. MCP `submit_ds_evidence` takes the author from the
-    //    authenticated identity for the same reason.
+    //    authenticated identity for the same reason. An OMITTED `agent_id` is
+    //    still accepted, and every agent-less BBA on one (claim, frame,
+    //    perspective) shares a single row under the `NULLS NOT DISTINCT` key,
+    //    so one caller's agent-less submission replaces another's. Closing that
+    //    changes attribution and combination for agent-less callers; it is a
+    //    separate decision.
     if let Some(named) = request.agent_id {
         if viewer.principal() != Some(named) {
             return Err(ApiError::Forbidden {

@@ -33,6 +33,11 @@
 //!   group, not HG and not NULL. (Their OWNER is the edges trigger's call,
 //!   not this handler's: migration 120 keeps a claim -> frame or perspective
 //!   -> claim edge between public endpoints world-owned.)
+//!   The operator's own submission on that public claim lands its
+//!   perspective-scoped belief and divergence record.
+//! * `a_community_scoped_belief_lands_in_the_operators_group`: step 17's
+//!   community scope, on a group claim: the member BBAs are read as the
+//!   caller and the community-scoped belief lands in HG.
 //! * `a_caller_who_cannot_read_the_claim_writes_nothing`: the control. The
 //!   stranger on H's GROUP claim gets the 404 and leaves no edge and no
 //!   derived row behind.
@@ -405,6 +410,92 @@ async fn attribution_follows_the_caller_not_the_claims_owner(pool: PgPool) {
             "{relationship}: the writer is the caller's group, not H's and not none: {rows:?}"
         );
     }
+    // The derived rows, refused on the raw pool, now land too, for the claim's
+    // operator. (The stranger's own derived-row writes are the derived tables'
+    // row security's call, not this handler's, so they are not asserted.)
+    submit(&w, &t, w.human)
+        .await
+        .expect("H submits on its own public claim");
+    assert!(
+        perspective_belief_owner(&w, &t).await.is_some(),
+        "the perspective-scoped belief lands on a public claim"
+    );
+    assert!(
+        !divergence_owners(&w, &t).await.is_empty(),
+        "a divergence record lands on a public claim"
+    );
+}
+
+/// A public community holding the target's perspective, seeded as the
+/// harness superuser. Its membership row inherits the community's tenancy.
+async fn community_of(w: &World, perspective: Uuid) -> Uuid {
+    let community: Uuid = sqlx::query_scalar(
+        "INSERT INTO communities (name, visibility, owner_group_id) \
+         VALUES ($1, 'public', $2) RETURNING id",
+    )
+    .bind(format!("fb9-community-{}", Uuid::new_v4()))
+    .bind(WORLD)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed community");
+    sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
+        .bind(community)
+        .bind(perspective)
+        .execute(&w.pool)
+        .await
+        .expect("seed community membership");
+    community
+}
+
+/// Step 17's community scope: the member perspectives' BBAs on a GROUP claim
+/// are read as the caller (on the raw pool they are invisible, so no community
+/// belief is computed), and the community-scoped belief is written on the
+/// stamped transaction, in H's group. The community and its membership are
+/// public, so only the BBA read and the write are under test here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_community_scoped_belief_lands_in_the_operators_group(pool: PgPool) {
+    let w = armed_world(pool).await;
+    let t = target(&w, "group").await;
+    let community = community_of(&w, t.perspective).await;
+
+    submit(&w, &t, w.agent)
+        .await
+        .expect("H's agent may submit on H's group claim");
+
+    let scoped = |scope_type: &'static str, scope_id: Uuid| {
+        let pool = w.pool.clone();
+        let (frame, claim) = (t.frame, t.claim);
+        async move {
+            sqlx::query_as::<_, (Uuid, f64)>(
+                "SELECT owner_group_id, belief FROM ds_combined_beliefs \
+                  WHERE frame_id = $1 AND claim_id = $2 AND scope_type = $3 \
+                    AND scope_id = $4",
+            )
+            .bind(frame)
+            .bind(claim)
+            .bind(scope_type)
+            .bind(scope_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read ds_combined_beliefs")
+        }
+    };
+    let rows = scoped("community", community).await;
+    assert_eq!(rows.len(), 1, "one community-scoped belief: {rows:?}");
+    assert_eq!(
+        rows[0].0, w.hg,
+        "the community-scoped belief is H's group's"
+    );
+    // The community's one member perspective holds the one BBA, so the
+    // community belief is that perspective's belief.
+    let perspective = scoped("perspective", t.perspective).await;
+    assert_eq!(perspective.len(), 1, "{perspective:?}");
+    assert!(
+        (rows[0].1 - perspective[0].1).abs() < 1e-9,
+        "one member BBA: the community belief equals its perspective's, {} vs {}",
+        rows[0].1,
+        perspective[0].1
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
