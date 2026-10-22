@@ -151,6 +151,10 @@ struct Oracle {
     bel: f64,
     /// Bel of the conjunction of the first two query literals, in the same joint.
     bel_first_two: f64,
+    /// Per query literal, in the same joint: Bel, Pl and NR of that literal.
+    leaf_bel: Vec<f64>,
+    leaf_pl: Vec<f64>,
+    leaf_nr: Vec<f64>,
     pl: f64,
     nr: f64,
     bel_or: f64,
@@ -205,7 +209,19 @@ fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle
         (0..n.min(2)).all(|p| digit(w, p) == lit_digit(&query[p]))
     });
 
-    let mut acc = Oracle::default();
+    let leaf_holds: Vec<Worlds> = (0..n)
+        .map(|p| set_from(n, |w| digit(w, p) == lit_digit(&query[p])))
+        .collect();
+    let leaf_fails: Vec<Worlds> = (0..n)
+        .map(|p| set_from(n, |w| digit(w, p) == 1 - lit_digit(&query[p])))
+        .collect();
+    let mut acc = Oracle {
+        leaf_bel: vec![0.0; n],
+        leaf_pl: vec![0.0; n],
+        leaf_nr: vec![0.0; n],
+        ..Oracle::default()
+    };
+    let mut leaf_dis = vec![0.0; n];
     let mut dis = 0.0;
     let full = set_from(n, |_| true);
     fn walk(
@@ -246,6 +262,17 @@ fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle
         if subset(s, &any_holds) {
             acc.bel_or += m;
         }
+        for p in 0..n {
+            if subset(s, &leaf_holds[p]) {
+                acc.leaf_bel[p] += m;
+            }
+            if !is_empty(&and(s, &leaf_holds[p])) {
+                acc.leaf_pl[p] += m;
+            }
+            if subset(s, &leaf_fails[p]) {
+                leaf_dis[p] += m;
+            }
+        }
     });
     let z = 1.0 - acc.k;
     acc.bel /= z;
@@ -253,6 +280,13 @@ fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle
     acc.pl /= z;
     acc.bel_or /= z;
     acc.nr = 1.0 - dis / z;
+    for b in &mut acc.leaf_bel {
+        *b /= z;
+    }
+    for x in &mut acc.leaf_pl {
+        *x /= z;
+    }
+    acc.leaf_nr = leaf_dis.iter().map(|d| 1.0 - d / z).collect();
     acc
 }
 
@@ -698,6 +732,32 @@ proptest! {
         prop_assert!((r.nr - o.nr).abs() < 1e-9, "nr {} vs {}", r.nr, o.nr);
         prop_assert!((r.bel_or - o.bel_or).abs() < 1e-9, "bel_or {} vs {}", r.bel_or, o.bel_or);
         prop_assert!((r.k - o.k).abs() < 1e-9, "k {} vs {}", r.k, o.k);
+    }
+
+    /// The exact-case Fréchet envelope is built from each leaf's marginal in
+    /// the same joint (not from the leaf queried alone), so it bounds the
+    /// joint under conflict too: lo = max(0, Σ Belᵢ − (n − 1)), hi = min Plᵢ,
+    /// hi_NR = min NRᵢ with the marginals read off the world-set oracle.
+    #[test]
+    fn frechet_envelope_uses_in_joint_leaf_marginals(
+        (query, raws) in arb_case(5, 4, true),
+        m_milli in prop_oneof![Just(0u32), 1u32..=1000],
+    ) {
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let m = f64::from(m_milli) / 1000.0;
+        let clauses = if m > 0.0 {
+            vec![Clause { m, positions: (0..query.len()).collect() }]
+        } else { vec![] };
+        let o = oracle(&query, &items, &clauses);
+        prop_assume!(o.k < NEAR_TOTAL);
+        let r = conj(&query, &items, m).expect("oracle says not total conflict");
+        let n = o.leaf_bel.len() as f64;
+        let lo = (o.leaf_bel.iter().sum::<f64>() - (n - 1.0)).max(0.0);
+        let hi = o.leaf_pl.iter().copied().fold(1.0, f64::min);
+        let hi_nr = o.leaf_nr.iter().copied().fold(1.0, f64::min);
+        prop_assert!((r.frechet.lo - lo).abs() < 1e-9, "lo {} vs {}", r.frechet.lo, lo);
+        prop_assert!((r.frechet.hi - hi).abs() < 1e-9, "hi {} vs {}", r.frechet.hi, hi);
+        prop_assert!((r.frechet.hi_nr - hi_nr).abs() < 1e-9, "hi_nr {} vs {}", r.frechet.hi_nr, hi_nr);
     }
 
     /// Without `~`, up to n = 6: Bel, Pl and the product-frame BetP equal the
