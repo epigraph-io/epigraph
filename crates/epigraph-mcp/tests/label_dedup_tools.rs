@@ -730,6 +730,7 @@ async fn the_plan_reads_the_callers_private_rows_and_never_a_strangers(pool: PgP
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
     let theirs_plan = plan_ok(
         &server,
@@ -2342,6 +2343,7 @@ async fn an_operator_merges_its_own_claim_with_its_agents_through_a_revision_lab
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
 
     // The agent's claim sits in the operator's group, which both may write.

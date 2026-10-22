@@ -82,7 +82,7 @@ use epigraph_engine::label_dedup::{
     PlanRequest, ProbeCandidate, ProbeVerdict, ProbeVerdictKind, ReadPurpose, ReadSpec, Section,
     Snapshot, WriteUnit,
 };
-use rmcp::model::{CallToolResult, Content, ErrorCode};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -193,7 +193,7 @@ fn refusal_code(e: &McpError) -> Option<&str> {
 }
 
 fn success_json(value: &Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -517,6 +517,7 @@ async fn read_family(
                 content: r.content,
                 labels: r.labels,
                 created_at: Some(r.created_at),
+                duplicates: Vec::new(),
             })
             .collect();
         out.push((spec.purpose, Snapshot::from_capped(claims, cap)));

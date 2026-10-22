@@ -163,6 +163,7 @@ fn a_label_the_claim_already_carried_is_not_recorded_and_survives_revert() {
         content: String::new(),
         labels: after,
         created_at: None,
+        duplicates: Vec::new(),
     }];
     run_writes(&mut g, &revert_writes(&[change]));
     assert_eq!(
@@ -227,6 +228,7 @@ fn revert_runs_newest_first() {
         content: String::new(),
         labels: after2,
         created_at: None,
+        duplicates: Vec::new(),
     }];
     run_writes(&mut g, &writes);
     assert_eq!(g[0].labels, original);
