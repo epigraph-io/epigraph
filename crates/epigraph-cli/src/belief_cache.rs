@@ -283,21 +283,63 @@ pub fn read_snapshot<R: BufRead>(input: R) -> anyhow::Result<Vec<SnapshotRow>> {
 }
 
 /// Turn wave records into a restore plan.
+///
+/// `only` is the `--claims` filter: records for other claims are skipped, and
+/// a requested id the wave never wrote is listed in `not_in_wave` rather than
+/// silently ignored.
+///
+/// # A claim recorded more than once
+///
+/// A wave re-run against the same file appends a second record for a claim.
+/// The records CHAIN when each one's `before` is the previous one's `written`:
+/// nothing else wrote the claim between them, so the plan restores the FIRST
+/// `before` and compares against the LAST `written`, and `at` is the earliest
+/// record's (the downstream list must cover every edge that could have frozen
+/// any of the wave's values). When they do not chain, another writer landed
+/// between two wave writes; restoring the first `before` would erase it, so
+/// the claim goes to `broken_chain` and is reported `superseded_since_wave`
+/// without a write.
 #[must_use]
 pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> RestorePlan {
-    let _ = only;
-    RestorePlan {
-        entries: records
-            .iter()
-            .map(|r| RestoreEntry {
-                claim_id: r.claim_id,
-                before: r.before.clone(),
-                written: r.written.clone(),
-                at: r.at,
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut groups: HashMap<Uuid, Vec<&WaveRecord>> = HashMap::new();
+    for r in records {
+        if only.is_some_and(|o| !o.contains(&r.claim_id)) {
+            continue;
+        }
+        groups
+            .entry(r.claim_id)
+            .or_insert_with(|| {
+                order.push(r.claim_id);
+                Vec::new()
             })
-            .collect(),
-        ..RestorePlan::default()
+            .push(r);
     }
+
+    let mut plan = RestorePlan::default();
+    for id in order {
+        let group = &groups[&id];
+        let chains = group.windows(2).all(|w| w[0].written == w[1].before);
+        match (chains, group.first(), group.last()) {
+            (true, Some(first), Some(last)) => plan.entries.push(RestoreEntry {
+                claim_id: id,
+                before: first.before.clone(),
+                written: last.written.clone(),
+                at: group.iter().map(|r| r.at).min().unwrap_or(first.at),
+            }),
+            _ => plan.broken_chain.push(id),
+        }
+    }
+    if let Some(only) = only {
+        let mut absent: Vec<Uuid> = only
+            .iter()
+            .filter(|id| !groups.contains_key(id))
+            .copied()
+            .collect();
+        absent.sort_unstable();
+        plan.not_in_wave = absent;
+    }
+    plan
 }
 
 /// Put every planned claim back to its `before` value.
