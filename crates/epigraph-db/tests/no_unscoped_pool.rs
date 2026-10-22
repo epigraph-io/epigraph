@@ -673,7 +673,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 ///
 /// Nightly staging 2026-10-21 merged both: 252 - 3 (entities, backlog 850dcc61)
 /// and then 1 more (`routes/workflows.rs` 9 -> 8) is 248; the two touch disjoint files.
-const HIGH_WATER: usize = 248;
+///
+/// 248 -> 247 (atom-level belief, BP retirement): `create_edge`'s route-level
+/// BP factor INSERT was deleted, not converted (`routes/edges.rs` 5 -> 4,
+/// keeping sites), read off `the_unconverted_register_is_exactly_what_was_measured`'s
+/// own failure (`recorded 5, measured 4`).
+const HIGH_WATER: usize = 247;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -853,12 +858,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
-    // `entity_exists`) onto `AppState::write_as`. The five that remain are the
-    // post-commit side effects of those handlers (the DS recomputation and
+    // `entity_exists`) onto `AppState::write_as`. The five that remained were
+    // the post-commit side effects of those handlers (the DS recomputation and
     // provenance of `create_edge`, its factor INSERT, and the provenance rows of
     // `delete_edge`, `patch_edge` and `relate_claims`), which run after the
-    // commit on the raw pool exactly as before.
-    ("routes/edges.rs", 5),
+    // commit on the raw pool exactly as before. 5 -> 4 when atom-level belief
+    // DELETED the factor INSERT (it fed only BP; SPEC §4.1 W10): removed, not
+    // converted.
+    ("routes/edges.rs", 4),
     ("routes/embeddings.rs", 2),
     // `routes/entities.rs` was 8 and is GONE, not zeroed. Conversion shard 7
     // took 5 (`entity_neighborhood` 2, category A; `query_triples` 3, filed C by
