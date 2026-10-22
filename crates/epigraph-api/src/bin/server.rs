@@ -99,6 +99,13 @@ async fn main() {
         }
     }
 
+    // Belief modes (SPEC §10.2): read once, here, and journalled, so the log
+    // shows which modes this process booted with; `/health` reports the same.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,
     // so the refusal is the first and only thing a misconfigured unit reports.

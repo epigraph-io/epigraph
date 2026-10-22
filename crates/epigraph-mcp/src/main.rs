@@ -407,6 +407,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    // Belief modes (SPEC §10.2): read once, here, and journalled under this
+    // crate's target (the default filter keeps it), so the log shows which
+    // modes this process booted with; `system_stats` reports the same.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN, and this binary is one on every transport (`--listen`
     // for the HTTP units, stdio for agent containers and operator configs).
