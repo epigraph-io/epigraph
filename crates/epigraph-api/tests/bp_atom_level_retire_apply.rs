@@ -73,7 +73,9 @@ async fn state_default(pool: &PgPool) -> AppState {
 /// [`state_default`] with BP apply switched ON, as a process started with
 /// `EPIGRAPH_BP_APPLY=on` is.
 async fn state_bp_apply_on(pool: &PgPool) -> AppState {
-    state_default(pool).await
+    state_default(pool)
+        .await
+        .with_bp_apply(epigraph_api::state::BpApply::On)
 }
 
 /// A binary frame for the seeded BBAs (`mass_functions.frame_id` is a FK).

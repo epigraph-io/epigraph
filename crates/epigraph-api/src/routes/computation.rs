@@ -668,7 +668,9 @@ async fn apply_bp_updates(
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 ///
-/// With `apply_updates: true` the results are written all-or-nothing on a
+/// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
+/// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
+/// When it is on, the results are written all-or-nothing on a
 /// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
 /// the caller can see but not write fails the request (403) and nothing is
 /// written. A BP variable that is not a claim the caller can see (a stale
@@ -687,6 +689,20 @@ pub async fn propagate_beliefs(
         damping: request.damping.unwrap_or(0.5),
     };
     let apply = request.apply_updates.unwrap_or(false);
+
+    // BP apply is retired (SPEC §6.2, hazard H4): refused before anything is
+    // loaded or computed, so no path below (the empty-factor early return, the
+    // scalar branch's empty-result skip) can answer a write request with a 200.
+    // Read-only runs are unaffected.
+    if apply && state.bp_apply != crate::state::BpApply::On {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "BP apply is retired: apply_updates:true is refused unless the server runs with \
+                 {}=on. Run with apply_updates:false for a read-only BP diagnostic",
+                crate::state::BP_APPLY_ENV
+            ),
+        });
+    }
 
     // Load factors from DB
     let factors: Vec<FactorRow> = sqlx::query_as(
