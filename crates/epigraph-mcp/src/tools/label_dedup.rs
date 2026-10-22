@@ -102,6 +102,10 @@ pub const MAX_PROFILE_BYTES: usize = 1 << 20;
 pub const PROFILE_ROOT_ENV: &str = "EPIGRAPH_MCP_PROFILE_ROOT";
 /// The environment variable carrying the profile hash a stdio caller must pin.
 pub const PROFILE_PIN_ENV: &str = "EPIGRAPH_MCP_PROFILE_PIN";
+/// The environment variable listing (comma-separated) the family labels this
+/// server lets label dedup run on: the operator's index families. Read once at
+/// startup. Empty or unset refuses every family.
+pub const INDEX_FAMILIES_ENV: &str = "EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES";
 
 /// Refusal codes this module adds to the engine's (`LabelDedupError::code`).
 pub mod codes {
@@ -115,6 +119,8 @@ pub mod codes {
     pub const INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
     pub const PLAN_DRIFT: &str = "PLAN_DRIFT";
     pub const CROSS_OWNER_MEMBER: &str = "CROSS_OWNER_MEMBER";
+    pub const FAMILY_NOT_ALLOWED: &str = "FAMILY_NOT_ALLOWED";
+    pub const FAMILY_NOT_INDEX: &str = "FAMILY_NOT_INDEX";
 }
 
 /// Per-process label-dedup settings, read once at startup.
@@ -126,6 +132,9 @@ pub struct LabelDedupConfig {
     pub profile_pin: Option<String>,
     /// The server cap on `max_claims`.
     pub max_claims_cap: usize,
+    /// The family labels label dedup may run on ([`INDEX_FAMILIES_ENV`]).
+    /// Empty: every family is refused.
+    pub index_families: std::collections::BTreeSet<String>,
 }
 
 impl Default for LabelDedupConfig {
@@ -134,6 +143,7 @@ impl Default for LabelDedupConfig {
             profile_root: None,
             profile_pin: None,
             max_claims_cap: DEFAULT_MAX_CLAIMS,
+            index_families: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -158,6 +168,15 @@ impl LabelDedupConfig {
             profile_root: var(PROFILE_ROOT_ENV).map(PathBuf::from),
             profile_pin: var(PROFILE_PIN_ENV),
             max_claims_cap: DEFAULT_MAX_CLAIMS,
+            index_families: var(INDEX_FAMILIES_ENV)
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -470,6 +489,7 @@ fn prepare(
     let sections = parse_sections(sections)?;
     let as_of = parse_as_of(as_of)?;
     let (profile, profile_hash) = load_profile(server, auth, profile)?;
+    check_families(&profile, &server.label_dedup.index_families)?;
     Ok(Prepared {
         profile,
         profile_hash,
@@ -478,6 +498,51 @@ fn prepare(
         sections,
         max,
     })
+}
+
+/// Every family the profile names must be declared an index and be on this
+/// server's allowlist, decided from the profile alone, before any read: label
+/// dedup is bookkeeping on an operational index and must never be pointed at
+/// a family of knowledge claims.
+fn check_families(
+    profile: &LabelDedupProfile,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Result<(), McpError> {
+    let mut families = vec![(profile.pass.family_label.as_str(), profile.pass.family_kind)];
+    families.extend(
+        profile
+            .signal_dedup
+            .iter()
+            .map(|p| (p.family_label.as_str(), p.family_kind)),
+    );
+    families.extend(
+        profile
+            .lifecycle
+            .iter()
+            .map(|l| (l.signal_family_label.as_str(), l.signal_family_kind)),
+    );
+    for (label, kind) in families {
+        if kind != engine::FamilyKind::Index {
+            return Err(refusal(
+                codes::FAMILY_NOT_INDEX,
+                format!(
+                    "the profile declares the {label:?} family {kind:?}; label dedup runs only \
+                     on an index family (duplicates of knowledge claims are marked one by one \
+                     with mark_duplicate)"
+                ),
+            ));
+        }
+        if !allowed.contains(label) {
+            return Err(refusal(
+                codes::FAMILY_NOT_ALLOWED,
+                format!(
+                    "the {label:?} family is not on this server's index-family allowlist \
+                     ({INDEX_FAMILIES_ENV}); an empty allowlist refuses every family"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── Reads ───────────────────────────────────────────────────────────────────
@@ -1201,6 +1266,7 @@ pub async fn probe_label_dedup(
             hash: &params.profile_hash,
         },
     )?;
+    check_families(&profile, &server.label_dedup.index_families)?;
     let specs = profile
         .probe_reads(params.include_closed_signals)
         .map_err(|e| engine_refusal(&e))?;
@@ -1315,6 +1381,24 @@ mod tests {
         assert_eq!(cfg.profile_root, Some(PathBuf::from("/profiles")));
         assert_eq!(cfg.profile_pin.as_deref(), Some("abc123"));
         assert_eq!(cfg.max_claims_cap, DEFAULT_MAX_CLAIMS);
+    }
+
+    /// The allowlist is read from its exact name, comma-separated and trimmed;
+    /// unset or blank is the empty list, which refuses every family.
+    #[test]
+    fn the_index_family_allowlist_is_read_comma_separated() {
+        assert_eq!(INDEX_FAMILIES_ENV, "EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES");
+        let cfg = config_from(&[(INDEX_FAMILIES_ENV, " a-list , b-list,, ")]);
+        assert_eq!(
+            cfg.index_families.into_iter().collect::<Vec<_>>(),
+            vec!["a-list".to_string(), "b-list".to_string()]
+        );
+        for blank in ["", " , ", "\t"] {
+            assert!(config_from(&[(INDEX_FAMILIES_ENV, blank)])
+                .index_families
+                .is_empty());
+        }
+        assert!(config_from(&[]).index_families.is_empty());
     }
 
     #[test]

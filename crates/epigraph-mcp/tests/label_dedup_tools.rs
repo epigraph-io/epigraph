@@ -2446,17 +2446,23 @@ async fn an_operator_merges_its_own_claim_with_its_agents_through_a_revision_lab
 /// server gets past the check and fails at the read instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    // Inline profiles are an HTTP caller's.
+    let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read", "claims:write"]).await;
     let bytes = profile_bytes();
     for allowed in [&[][..], &["some-other-index"][..]] {
         let server = build_test_server(pool.clone())
             .with_label_dedup_config(config_allowing(None, None, 5000, allowed));
         let p = plan_params_json(&bytes, DEDUP);
-        let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
-            .await
-            .expect_err("plan refused");
+        let e = plan_label_dedup(
+            &server,
+            &viewer,
+            plan_params_json(&bytes, DEDUP),
+            Some(&auth),
+        )
+        .await
+        .expect_err("plan refused");
         assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{allowed:?}: {}", e.message);
-        let e = apply_label_dedup(&server, &viewer, apply_params(&p, "00"), None)
+        let e = apply_label_dedup(&server, &viewer, apply_params(&p, "00"), Some(&auth))
             .await
             .expect_err("apply refused");
         assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
@@ -2472,7 +2478,7 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
                 include_closed_signals: false,
                 max_claims: None,
             },
-            None,
+            Some(&auth),
         )
         .await
         .expect_err("probe refused");
@@ -2480,9 +2486,14 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
     }
     // Calibration: allowlisted, the same unscoped server reaches the read.
     let server = build_test_server(pool.clone()).with_label_dedup_config(config(None, None, 5000));
-    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
-        .await
-        .expect_err("no ScopedPool");
+    let e = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("no ScopedPool");
     assert_ne!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
 }
 
@@ -2491,14 +2502,19 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
 /// not allowlisted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
+    let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read"]).await;
     let server = superuser_server(&pool, config(None, None, 5000)).await;
     let mut knowledge = profile_value();
     knowledge["family_kind"] = json!("knowledge");
     let bytes = serde_json::to_vec(&knowledge).expect("json");
-    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
-        .await
-        .expect_err("knowledge");
+    let e = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("knowledge");
     assert_eq!(code(&e), "FAMILY_NOT_INDEX", "{}", e.message);
 
     let mut with_signal = profile_value();
@@ -2509,9 +2525,14 @@ async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool)
         "merge": {"survivor_add": ["{run_tag}"]}
     });
     let bytes = serde_json::to_vec(&with_signal).expect("json");
-    let e = plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
-        .await
-        .expect_err("signal family not allowlisted");
+    let e = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("signal family not allowlisted");
     assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
     assert!(e.message.contains("tracked-lead"), "{}", e.message);
     // Control: allowlisting it too admits the profile.
@@ -2520,7 +2541,12 @@ async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool)
         config_allowing(None, None, 5000, &[FAMILY, "tracked-lead"]),
     )
     .await;
-    plan_label_dedup(&server, &viewer, plan_params_json(&bytes, DEDUP), None)
-        .await
-        .expect("both families allowlisted");
+    plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect("both families allowlisted");
 }
