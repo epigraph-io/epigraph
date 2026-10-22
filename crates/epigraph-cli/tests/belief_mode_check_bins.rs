@@ -375,6 +375,65 @@ async fn a_writing_run_refuses_a_server_that_does_not_report_belief_modes(pool: 
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
 }
 
+/// `--target-fold` names the fold a REVIEW is for; a writing run under it
+/// would write that fold while the server serves another, so clap refuses it
+/// without `--dry-run`, before anything runs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_target_fold_without_dry_run_is_refused_and_writes_nothing(pool: PgPool) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+
+    let r = run(
+        RECOMPUTE_BETP,
+        &["--target-fold", "legacy"],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert!(
+        r.code.is_some_and(|c| c != 0),
+        "--target-fold needs --dry-run; got {:?}\nstderr: {}",
+        r.code,
+        r.stderr
+    );
+    assert!(r.stderr.contains("--dry-run"), "stderr: {}", r.stderr);
+    assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
+}
+
+/// The override: the same skewed writing run as the refusal test, with
+/// `--allow-mode-skew`, proceeds and writes, and says so on stderr.
+#[sqlx::test(migrations = "../../migrations")]
+async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) {
+    let hub = seed_stale_hub(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+
+    let r = run(
+        RECOMPUTE_BETP,
+        &["--allow-mode-skew"],
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
+    );
+
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("--allow-mode-skew") && r.stderr.contains("atom_fold"),
+        "the override must name what it overrode\nstderr: {}",
+        r.stderr
+    );
+    let after = cached_betp(&pool, hub).await.expect("a cache");
+    assert!((after - 0.5).abs() > 0.05, "the run wrote; got {after}");
+}
+
 // ── backfill_factors and decompose_claims --retarget ───────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
