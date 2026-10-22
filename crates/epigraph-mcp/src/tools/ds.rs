@@ -330,6 +330,15 @@ pub async fn submit_ds_evidence(
         ));
     }
 
+    // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
+    // addressable only through assess: a row keyed (agent, the agent's slot
+    // perspective) would overwrite or forge it.
+    if epigraph_db::repos::mass_function::is_assessment_slot(Some(agent_id), perspective_id) {
+        return Err(invalid_params(
+            "perspective_id is this agent's assessment slot, written only by \
+             POST /api/v1/claims/:id/assess; choose another perspective",
+        ));
+    }
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;

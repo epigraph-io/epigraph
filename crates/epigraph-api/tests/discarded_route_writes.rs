@@ -69,7 +69,9 @@ const WRITE_CALLEES: &[&str] = &[
 /// Lower a row when a conversion propagates an error; delete it at zero. Never
 /// raise one: convert the write instead.
 const REGISTER: &[(&str, usize)] = &[
-    ("assess.rs", 6),
+    // 6 before U027 deleted assess's discarded "combined result" store, which
+    // sat on the input BBA's key and overwrote it.
+    ("assess.rs", 5),
     // 16 before U024 moved `submit_evidence`'s writes onto its stamped
     // transaction. Of the four gone, the combined system BBA (`store`) was
     // deleted outright; the `claim_frames` INSERT, the Beta UPDATE and the

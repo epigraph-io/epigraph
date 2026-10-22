@@ -1560,6 +1560,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "human_of",
+        "READ through migration 149's `epigraph_human_of` SECURITY DEFINER function; same \
+         reason as `operator_actor`. It returns one id (the human the NAMED agent acts for) \
+         or NULL.",
+    ),
+    (
+        "agent.rs",
         "operates_agents",
         "READ through migration 107's `epigraph_operates_agents` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns one boolean for the NAMED agent (does any \
