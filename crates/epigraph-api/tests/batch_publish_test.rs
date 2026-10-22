@@ -105,6 +105,7 @@ async fn a_batch_import_creates_its_claims_and_publishes_no_event() {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     };
     let request: epigraph_api::routes::batch::BatchClaimRequest =
         serde_json::from_value(two_valid_and_one_invalid()).expect("request body parses");

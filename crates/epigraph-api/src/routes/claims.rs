@@ -2887,6 +2887,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 
@@ -3292,6 +3293,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         };
 
         let state = AppState::with_db(
@@ -3490,6 +3492,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         };
 
         let state = AppState::with_db(

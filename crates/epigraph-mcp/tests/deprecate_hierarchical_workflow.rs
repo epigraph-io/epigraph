@@ -90,7 +90,11 @@ async fn ingest_extraction(
     tools::workflow_ingest::ingest_workflow(
         server,
         viewer,
-        IngestWorkflowParams { extraction },
+        IngestWorkflowParams {
+            extraction,
+            tenancy: None,
+            embed: None,
+        },
         token,
     )
     .await

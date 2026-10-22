@@ -80,7 +80,7 @@ pub async fn batch_submit_claims(
         }
     }
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "submitted": submitted,
             "errors": errors.len(),
@@ -154,7 +154,7 @@ pub async fn stage_claims(
         .filter(|r| r["valid"].as_bool().unwrap_or(false))
         .count();
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "total": params.claims.len(),
             "valid": valid_count,
@@ -222,7 +222,7 @@ pub async fn system_stats(
         stats["entity_mentions"] = serde_json::json!(index.entity_mentions);
     }
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         stats.to_string(),
     )]))
 }

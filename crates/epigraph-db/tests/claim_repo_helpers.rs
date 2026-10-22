@@ -784,19 +784,11 @@ enum Racer {
     OnBareConnection,
 }
 
-async fn run_racer(pool: PgPool, claim: Claim, how: Racer) -> (Uuid, bool) {
-    let viewer = fixture::public_viewer(&pool).await;
-    let (returned, was_created) = match how {
+async fn run_racer(pool: PgPool, claim: Claim, how: Racer, writer: PairWriter) -> (Uuid, bool) {
+    match how {
         Racer::InCallerTransaction => {
             let mut tx = pool.begin().await.expect("begin the racer's transaction");
-            let out = ClaimRepository::create_or_get(
-                &mut tx,
-                &viewer,
-                &claim,
-                epigraph_core::TenancyDecl::Inherited,
-            )
-            .await
-            .expect("create_or_get inside a transaction");
+            let out = write_pair(&mut tx, &pool, writer, &claim, &[]).await;
             tx.commit().await.expect("commit the racer's transaction");
             out
         }
@@ -805,17 +797,9 @@ async fn run_racer(pool: PgPool, claim: Claim, how: Racer) -> (Uuid, bool) {
                 .acquire()
                 .await
                 .expect("acquire the racer's connection");
-            ClaimRepository::create_or_get(
-                &mut conn,
-                &viewer,
-                &claim,
-                epigraph_core::TenancyDecl::Inherited,
-            )
-            .await
-            .expect("create_or_get on a bare connection")
+            write_pair(&mut conn, &pool, writer, &claim, &[]).await
         }
-    };
-    (returned.id.into(), was_created)
+    }
 }
 
 /// Two FIRST creates of one `(content_hash, agent_id)`, interleaved the way
@@ -844,6 +828,15 @@ async fn run_racer(pool: PgPool, claim: Claim, how: Racer) -> (Uuid, bool) {
 /// Returns the number of rows for the pair and each caller's
 /// `(returned id, was_created)`.
 async fn race_two_first_creates(pool: &PgPool, how: Racer) -> (i64, [(Uuid, bool); 2]) {
+    race_two_first_creates_with(pool, how, PairWriter::CreateOrGet).await
+}
+
+/// [`race_two_first_creates`] with both callers running `writer`.
+async fn race_two_first_creates_with(
+    pool: &PgPool,
+    how: Racer,
+    writer: PairWriter,
+) -> (i64, [(Uuid, bool); 2]) {
     // The production shape. Explicit, so the arm cannot pass on the constraint.
     drop_unique_constraint(pool).await;
 
@@ -862,9 +855,9 @@ async fn race_two_first_creates(pool: &PgPool, how: Racer) -> (i64, [(Uuid, bool
         .await
         .expect("take the barrier");
 
-    let caller_1 = tokio::spawn(run_racer(pool.clone(), first, how));
+    let caller_1 = tokio::spawn(run_racer(pool.clone(), first, how, writer));
     wait_until_blocked_on_the_barrier(pool).await;
-    let caller_2 = tokio::spawn(run_racer(pool.clone(), second, how));
+    let caller_2 = tokio::spawn(run_racer(pool.clone(), second, how, writer));
 
     let mut settled = false;
     for _ in 0..600 {
@@ -996,7 +989,12 @@ async fn the_dedup_lock_is_held_until_the_callers_transaction_commits(pool: PgPo
     let id_1: Uuid = created_1.id.into();
 
     // tx_1 stays OPEN: create_or_get has returned, the row is uncommitted.
-    let caller_2 = tokio::spawn(run_racer(pool.clone(), second, Racer::InCallerTransaction));
+    let caller_2 = tokio::spawn(run_racer(
+        pool.clone(),
+        second,
+        Racer::InCallerTransaction,
+        PairWriter::CreateOrGet,
+    ));
 
     let mut blocked = false;
     for _ in 0..600 {
@@ -1049,6 +1047,420 @@ async fn the_dedup_lock_is_held_until_the_callers_transaction_commits(pool: PgPo
         "caller 2 ran after caller 1 committed, so it must report the existing row"
     );
     assert_eq!(id_2, id_1, "caller 2 must answer with caller 1's row");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Every OTHER find-then-insert writer of one (content_hash, agent_id) takes the
+// same dedup lock (backlog 00f1a517, the writers #582 listed as unserialized)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A writer that looks for an existing row of the pair and inserts on a miss.
+///
+/// `create_or_get` is the reference (#582). The others each run their OWN find
+/// before their INSERT, so a lock taken only inside `create_or_get` does not
+/// serialize them, against each other or against `create_or_get`:
+///
+/// * `CreateConn` — `ClaimRepository::create_conn`, the legacy content-hash
+///   dedup (`create(pool)` delegates to it). Production callers:
+///   `ingest_document`'s level-3 atoms and the conventions routes.
+/// * `CreateWithTx` — `ClaimRepository::create_with_tx`, the same legacy
+///   contract on a caller's connection.
+/// * `Consolidate` — `ClaimRepository::consolidate_act_conn`, whose
+///   "identical merged claim by this agent already exists" probe is a find on
+///   `(content_hash, acting agent)`. Production caller: MCP
+///   `consolidate_claims`.
+#[derive(Clone, Copy, Debug)]
+enum PairWriter {
+    CreateOrGet,
+    CreateConn,
+    CreateWithTx,
+    Consolidate,
+}
+
+/// Two committed, current, public source claims for one consolidation. Each
+/// call seeds fresh content, so two consolidations never contend on a source
+/// row lock — the only lock they can share is the pair's.
+async fn seed_consolidation_sources(pool: &PgPool, author: Uuid) -> Vec<Uuid> {
+    let mut ids = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let content = format!("consolidation source {}", Uuid::new_v4());
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current) \
+             VALUES ($1, $2, 0.5, $3, true) RETURNING id",
+        )
+        .bind(&content)
+        .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(author)
+        .fetch_one(pool)
+        .await
+        .expect("seed a consolidation source");
+        ids.push(id);
+    }
+    ids
+}
+
+/// Run `writer` for `claim`'s `(content, agent_id)` on `conn` (a transaction
+/// or a bare connection). Returns the row the writer answered with and whether
+/// THIS call inserted it. `sources` is used by `Consolidate` only, which
+/// writes `claim.content` as its merged content and ignores `claim.id`.
+async fn write_pair(
+    conn: &mut sqlx::PgConnection,
+    pool: &PgPool,
+    writer: PairWriter,
+    claim: &Claim,
+    sources: &[Uuid],
+) -> (Uuid, bool) {
+    let own_id: Uuid = claim.id.into();
+    let agent_id: Uuid = claim.agent_id.into();
+    let decl = epigraph_core::TenancyDecl::Inherited;
+    match writer {
+        PairWriter::CreateOrGet => {
+            let viewer = fixture::public_viewer(pool).await;
+            let (row, created) = ClaimRepository::create_or_get(conn, &viewer, claim, decl)
+                .await
+                .expect("create_or_get");
+            (row.id.into(), created)
+        }
+        PairWriter::CreateConn => {
+            let row = ClaimRepository::create_conn(conn, claim, decl)
+                .await
+                .expect("create_conn");
+            let id: Uuid = row.id.into();
+            (id, id == own_id)
+        }
+        PairWriter::CreateWithTx => {
+            let row = ClaimRepository::create_with_tx(conn, claim, decl)
+                .await
+                .expect("create_with_tx");
+            let id: Uuid = row.id.into();
+            (id, id == own_id)
+        }
+        PairWriter::Consolidate => {
+            let res = ClaimRepository::consolidate_act_conn(
+                conn,
+                sources,
+                &claim.content,
+                0.6,
+                epigraph_db::ConsolidateMode::Merge,
+                "dedup-lock race",
+                agent_id,
+            )
+            .await
+            .expect("consolidate_act_conn");
+            (res.merged_id, !res.already_existed)
+        }
+    }
+}
+
+/// Wait until `task` has FINISHED or some backend in THIS database is BLOCKED
+/// on a two-key advisory lock (`objsubid = 2`, the dedup lock's shape; the race
+/// barrier is a one-key lock and is never counted). Returns whether it blocked.
+/// Either observation is final; the caller's assertions decide which one was
+/// correct. Panics if neither happens, so a fixture that waits on something
+/// else (a row lock, a group upsert) cannot pass as "serialized".
+async fn settle_on_the_dedup_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+    for _ in 0..600 {
+        if task.is_finished() {
+            return false;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "caller 2 neither finished nor blocked on a dedup lock while caller 1's transaction was \
+         open; it is waiting on something else, so the arm cannot tell serialized from not"
+    );
+}
+
+/// Caller 1 runs `first` in a transaction and keeps it OPEN (its row exists,
+/// uncommitted, invisible to every other snapshot). Caller 2 then runs
+/// `second` on the same `(content_hash, agent_id)` in its own transaction. The
+/// arm waits until caller 2 finished (nothing made it wait: its find missed
+/// caller 1's row and it inserted a second one) or blocked on the dedup lock,
+/// then commits caller 1 and counts the pair's rows.
+///
+/// With `first != second` this is also the KEY test: a writer that locks a
+/// different key (another namespace, another encoding of the hash) passes its
+/// own self-race and fails here.
+async fn race_held_open(pool: &PgPool, first: PairWriter, second: PairWriter) {
+    // The production shape. Explicit, so no arm can pass on the constraint.
+    drop_unique_constraint(pool).await;
+
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(pool, agent_id).await;
+    // Mint the author's personal group NOW, committed: a consolidation of
+    // public sources resolves it, and a first resolution WRITES. Left to the
+    // racers, caller 2 would wait on caller 1's uncommitted group upsert — a
+    // row lock, not the dedup lock — and the arm would observe the wrong wait.
+    {
+        let mut conn = pool.acquire().await.expect("acquire for the group mint");
+        ClaimRepository::default_decl_for_author(&mut conn, agent_id)
+            .await
+            .expect("mint the author's personal group");
+    }
+    let content = format!("held-open {first:?} then {second:?} {}", Uuid::new_v4());
+    let sources_1 = seed_consolidation_sources(pool, agent_id).await;
+    let sources_2 = seed_consolidation_sources(pool, agent_id).await;
+
+    let mut tx_1 = pool.begin().await.expect("begin caller 1's transaction");
+    let r1 = write_pair(
+        &mut tx_1,
+        pool,
+        first,
+        &make_claim(&content, agent_id),
+        &sources_1,
+    )
+    .await;
+    assert!(r1.1, "caller 1 is the first write of the pair: {r1:?}");
+
+    let caller_2 = {
+        let pool = pool.clone();
+        let content = content.clone();
+        let sources_2 = sources_2.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.expect("begin caller 2's transaction");
+            let claim = make_claim(&content, agent_id);
+            let out = write_pair(&mut tx, &pool, second, &claim, &sources_2).await;
+            tx.commit().await.expect("commit caller 2's transaction");
+            out
+        })
+    };
+    let blocked = settle_on_the_dedup_lock(pool, &caller_2).await;
+
+    tx_1.commit().await.expect("commit caller 1's transaction");
+    let r2 = caller_2.await.expect("caller 2 must not panic");
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("count rows for the pair");
+    assert_eq!(
+        rows, 1,
+        "{second:?} racing an open {first:?} of one (content_hash, agent_id) left {rows} rows: \
+         its find could not see caller 1's uncommitted row and nothing made it wait. \
+         Outcomes: {r1:?} then {r2:?}"
+    );
+    assert!(
+        blocked,
+        "caller 2 finished while caller 1's transaction was open: nothing made it wait"
+    );
+    assert!(
+        !r2.1,
+        "caller 2 ran after caller 1 committed, so it must report the existing row: {r2:?}"
+    );
+    assert_eq!(r2.0, r1.0, "caller 2 must answer with caller 1's row");
+
+    // A consolidation's sources: the merge that inserted retires its own
+    // sources into the merged row; a merge that answered with an existing row
+    // retires nothing, so its sources stay current and unsuperseded (the
+    // semantics a sequential retry already had).
+    if matches!(first, PairWriter::Consolidate) {
+        assert_sources(
+            pool,
+            &sources_1,
+            Some(r1.0),
+            "caller 1 (the merge that inserted)",
+        )
+        .await;
+    }
+    if matches!(second, PairWriter::Consolidate) {
+        assert_sources(
+            pool,
+            &sources_2,
+            None,
+            "caller 2 (the merge that found the row)",
+        )
+        .await;
+    }
+}
+
+/// Assert every claim in `sources` is retired into `merged` (`Some`), or is
+/// still current and supersedes nothing (`None`).
+async fn assert_sources(pool: &PgPool, sources: &[Uuid], merged: Option<Uuid>, who: &str) {
+    for id in sources {
+        let (is_current, supersedes): (bool, Option<Uuid>) =
+            sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read a consolidation source");
+        match merged {
+            Some(m) => {
+                assert!(!is_current, "{who}: source {id} must be retired");
+                assert_eq!(
+                    supersedes,
+                    Some(m),
+                    "{who}: source {id} must point at the merged row"
+                );
+            }
+            None => {
+                assert!(is_current, "{who}: source {id} must stay current");
+                assert_eq!(
+                    supersedes, None,
+                    "{who}: source {id} must supersede nothing"
+                );
+            }
+        }
+    }
+}
+
+/// Two legacy content-hash creates of one pair (`ingest_document` atoms, the
+/// conventions routes).
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_conn_races_create_conn_into_one_row(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateConn, PairWriter::CreateConn).await;
+}
+
+/// `create_conn` waits on the SAME lock `create_or_get` holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_conn_waits_on_create_or_gets_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateOrGet, PairWriter::CreateConn).await;
+}
+
+/// `create_with_tx` (the legacy contract on a caller's connection) waits on
+/// the same lock.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_with_tx_waits_on_create_or_gets_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateOrGet, PairWriter::CreateWithTx).await;
+}
+
+/// Two consolidations by one agent into identical merged content, over
+/// disjoint sources: the second answers with the first's merged claim, which
+/// is what a sequential retry already gets.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_races_consolidate_into_one_merged_row(pool: PgPool) {
+    race_held_open(&pool, PairWriter::Consolidate, PairWriter::Consolidate).await;
+}
+
+/// A consolidation waits on the SAME lock `create_or_get` holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_waits_on_create_or_gets_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateOrGet, PairWriter::Consolidate).await;
+}
+
+/// The reverse order: `create_or_get` waits on a held-open legacy create of
+/// the pair, then dedups against its committed row. Proves `create_or_get`'s
+/// find (viewer-filtered) answers with a row the legacy create wrote, not only
+/// that the two share a key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_waits_on_create_conns_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::CreateConn, PairWriter::CreateOrGet).await;
+}
+
+/// The reverse order for a consolidation: `create_or_get` of the merged
+/// content waits on the held-open merge, then returns the merged row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_waits_on_consolidates_dedup_lock(pool: PgPool) {
+    race_held_open(&pool, PairWriter::Consolidate, PairWriter::CreateOrGet).await;
+}
+
+/// The legacy create on BARE (autocommit) connections — the `create(pool)`
+/// shape the conventions routes use — with caller 1 parked inside its INSERT.
+///
+/// A transaction-scoped lock taken in autocommit is released at the end of its
+/// own statement, so an implementation that locks without opening a scope
+/// passes every held-open arm above (those run in transactions) and still
+/// mints duplicates here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_conn_race_is_serialized_on_a_bare_connection(pool: PgPool) {
+    let (rows, outcomes) =
+        race_two_first_creates_with(&pool, Racer::OnBareConnection, PairWriter::CreateConn).await;
+    assert_one_row_one_creator(rows, outcomes);
+}
+
+/// A dedup HIT on an already-committed row takes no dedup lock.
+///
+/// `ingest_document` writes every atom through `create_conn` inside one
+/// document transaction, so a lock taken on a hit would be held until the
+/// whole document commits. Two same-author ingests that share PRE-EXISTING
+/// atoms would then serialize on them, and deadlock (40P01) when they meet
+/// them in opposite orders, where before a hit was a plain read that waited
+/// on nothing. Only a MISS may take the lock; the find that decides the
+/// insert re-runs under it.
+///
+/// Caller 1 hits the committed row inside a transaction it keeps open.
+/// Caller 2 then writes the same pair on its own connection: it must finish
+/// without waiting, and answer with the committed row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_conn_hit_on_a_committed_row_takes_no_dedup_lock(pool: PgPool) {
+    drop_unique_constraint(&pool).await;
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+    let decl = epigraph_core::TenancyDecl::Inherited;
+    let content = format!("committed before both callers {}", Uuid::new_v4());
+    let seeded: Uuid = ClaimRepository::create(&pool, &make_claim(&content, agent_id), decl)
+        .await
+        .expect("seed the committed row")
+        .id
+        .into();
+
+    let mut tx_1 = pool.begin().await.expect("begin caller 1's transaction");
+    let hit_1: Uuid =
+        ClaimRepository::create_conn(&mut tx_1, &make_claim(&content, agent_id), decl)
+            .await
+            .expect("caller 1 create_conn")
+            .id
+            .into();
+    assert_eq!(hit_1, seeded, "caller 1 must answer with the committed row");
+
+    let caller_2 = {
+        let pool = pool.clone();
+        let content = content.clone();
+        tokio::spawn(async move {
+            let mut conn = pool.acquire().await.expect("acquire caller 2's connection");
+            let id: Uuid =
+                ClaimRepository::create_conn(&mut conn, &make_claim(&content, agent_id), decl)
+                    .await
+                    .expect("caller 2 create_conn")
+                    .id
+                    .into();
+            id
+        })
+    };
+    let blocked = settle_on_the_dedup_lock(&pool, &caller_2).await;
+    let held_by_caller_1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_locks \
+          WHERE locktype = 'advisory' AND objsubid = 2 AND granted \
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pg_locks");
+
+    tx_1.commit().await.expect("commit caller 1's transaction");
+    let id_2 = caller_2.await.expect("caller 2 must not panic");
+
+    assert!(
+        !blocked,
+        "caller 2 waited on the dedup lock for a pair whose row was already committed: \
+         caller 1's dedup HIT took the lock and holds it until its transaction ends"
+    );
+    assert_eq!(
+        held_by_caller_1, 0,
+        "caller 1's open transaction holds a dedup lock after a dedup HIT"
+    );
+    assert_eq!(id_2, seeded, "caller 2 must answer with the committed row");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows for the pair");
+    assert_eq!(rows, 1, "a dedup hit must not insert");
 }
 
 /// Migration 150 leaves no `uq_claims_content_hash_agent` on a database

@@ -203,6 +203,14 @@ pub struct QueryUndecomposedClaimsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowPlanParams {
+    #[schemars(
+        description = "The hierarchical workflow's id: the `workflows`-table id that ingest_workflow returns (deterministic from canonical_name and generation)."
+    )]
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
@@ -808,7 +816,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
     )]
     pub step_index: usize,
 
@@ -886,6 +894,18 @@ pub struct IngestWorkflowParams {
     )]
     #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+
+    #[schemars(
+        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public."
+    )]
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Whether to embed the created claims and the workflow goal (default true). false sends no text to the embedding provider and stores no vector, so the claims stay out of semantic recall and semantic dedup."
+    )]
+    #[serde(default)]
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -926,7 +946,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -2526,6 +2546,12 @@ pub struct MarkDuplicateParams {
     pub canonical_id: String,
     #[schemars(description = "Reason for marking duplicate")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnmarkDuplicateParams {
+    #[schemars(description = "UUID of the claim to un-mark (a claim mark_duplicate retired)")]
+    pub claim_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

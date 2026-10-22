@@ -62,7 +62,7 @@ async fn insert_workflow(pool: &PgPool, canonical_name: &str, truth_value: f64) 
 }
 
 /// One hierarchical outcome report: `steps` rows sharing one `created_at`
-/// and one goal embedding, exactly as `do_report_hierarchical_outcome_via_pool`
+/// and one goal embedding, exactly as `do_report_hierarchical_outcome_as`
 /// writes them.
 async fn insert_report(
     pool: &PgPool,

@@ -27,7 +27,7 @@ use crate::routes::submit::{
     MethodologySubmission, ReasoningTraceSubmission, SubmitPacketResponse, TraceInputSubmission,
 };
 use crate::routes::versioning::{
-    DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse,
+    DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse, UndedupResponse,
 };
 #[cfg(feature = "db")]
 use crate::routes::workflows::{
@@ -91,6 +91,7 @@ use workflow_schema_stubs::{
         list_challenges,
         supersede_claim_doc,
         mark_duplicate_doc,
+        unmark_duplicate_doc,
         patch_claim_doc,
         update_labels_doc,
         evolve_step_doc,
@@ -129,6 +130,7 @@ use workflow_schema_stubs::{
             SupersessionResponse,
             DedupRequest,
             DedupResponse,
+            UndedupResponse,
             PatchClaimRequest,
             ClaimResponse,
             UpdateLabelsRequest,
@@ -373,6 +375,24 @@ async fn supersede_claim_doc() {}
 )]
 async fn mark_duplicate_doc() {}
 
+/// Un-mark a duplicate (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/undedup",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the marked duplicate")),
+    responses(
+        (status = 200, body = UndedupResponse),
+        (status = 400),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+        (status = 409),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn unmark_duplicate_doc() {}
+
 /// Partial update of a claim (doc stub)
 #[utoipa::path(
     patch,
@@ -420,6 +440,7 @@ async fn update_labels_doc() {}
         (status = 200, body = EvolveStepResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
     ),
     security(("ed25519_signature" = []))

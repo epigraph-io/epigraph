@@ -41,6 +41,11 @@ const CROSS_SOURCE_SWEEP: Option<&str> = None;
 /// relative to the crate root)`.
 const BINS: &[(&str, Option<&str>, &str)] = &[
     (
+        "backfill_evidence_type",
+        Some(env!("CARGO_BIN_EXE_backfill_evidence_type")),
+        "src/bin/backfill_evidence_type.rs",
+    ),
+    (
         "bootstrap_clients",
         Some(env!("CARGO_BIN_EXE_bootstrap_clients")),
         "src/bin/bootstrap_clients.rs",

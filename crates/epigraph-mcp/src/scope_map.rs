@@ -55,6 +55,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("get_workflow_executions", "claims:read"),
+    ("get_workflow_plan", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),
@@ -137,6 +138,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // administrative: it runs on the maintenance connection and is deferred to
     // the replay timer, never with the caller's authority.
     ("mark_duplicate", "claims:write"),
+    // Its reversal: the same per-claim rule over the duplicate and the
+    // canonical it was marked onto; the reversal itself is administrative.
+    ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
@@ -292,6 +296,7 @@ mod tests {
         assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
         assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
         assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
+        assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply

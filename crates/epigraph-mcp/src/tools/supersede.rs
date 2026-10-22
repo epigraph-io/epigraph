@@ -1,10 +1,10 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
-use crate::types::{MarkDuplicateParams, SupersedeClaimParams};
+use crate::types::{MarkDuplicateParams, SupersedeClaimParams, UnmarkDuplicateParams};
 use epigraph_core::{ClaimId, TruthValue};
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, DuplicateProvenance};
 use epigraph_engine::admin_cascade::{
     self, CascadeCause, CascadeStatus, CascadeTrigger, OauthPrincipal,
 };
@@ -90,7 +90,7 @@ pub async fn supersede_claim(
         (None, status) => (status, CascadeReport::default()),
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
@@ -294,9 +294,18 @@ pub async fn mark_duplicate(
     )
     .await?;
 
-    ClaimRepository::mark_duplicate_act_conn(&mut tx, dup_claim_id, ClaimId::from_uuid(canon))
-        .await
-        .map_err(internal_error)?;
+    let provenance =
+        DuplicateProvenance::new("mark_duplicate", DuplicateProvenance::RULE_CALLER_ASSERTED)
+            .marked_by(Some(actor))
+            .reason(params.reason.as_deref());
+    ClaimRepository::mark_duplicate_act_attributed_conn(
+        &mut tx,
+        dup_claim_id,
+        ClaimId::from_uuid(canon),
+        &provenance,
+    )
+    .await
+    .map_err(internal_error)?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Dedup,
@@ -322,12 +331,128 @@ pub async fn mark_duplicate(
         (None, status) => (status, CascadeReport::default()),
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "duplicate_id": dup,
             "canonical_id": canon,
             "mode": "mark_duplicate",
             "cascade": cascade,
+            "belief_cascade": belief_cascade,
+        }))
+        .map_err(internal_error)?,
+    )]))
+}
+
+/// The refusal an un-mark gets on a server without the administrative
+/// connection: unlike a mark, an un-mark has no deferred form (migration 117's
+/// deferral definer accepts no such cause), so nothing is written.
+pub const UNMARK_NEEDS_ADMIN_CONNECTION: &str =
+    "unmark_duplicate needs this server's administrative (maintenance) connection: an \
+     un-mark is the dedup's act and its reversal together and cannot be deferred to the \
+     replay; nothing was written";
+
+pub async fn unmark_duplicate(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: UnmarkDuplicateParams,
+    auth: Option<&epigraph_auth::AuthContext>,
+) -> Result<CallToolResult, McpError> {
+    let dup = parse_uuid(&params.claim_id)?;
+
+    // The canonical, the author and the text, read through the CALLER: a claim
+    // it cannot read is "not found", like a missing one.
+    let (canonical, author, content) = {
+        let mut tx = crate::claim_helper::begin_author_stamped_tx(
+            server,
+            server.write_identity(auth, viewer).await?,
+            "unmark_duplicate",
+        )
+        .await?;
+        let claim = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(dup))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("claim {dup} not found")))?;
+        let canonical: uuid::Uuid = claim
+            .supersedes
+            .ok_or_else(|| invalid_params(format!("claim {dup} is not a marked duplicate")))?
+            .into();
+        (canonical, claim.agent_id.into(), claim.content.clone())
+    };
+
+    // No administrative connection: refuse before anything is written.
+    let mut session = crate::maintenance::admin_cascade_session(server)
+        .await
+        .map_err(|reason| McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: format!("{UNMARK_NEEDS_ADMIN_CONNECTION} ({reason})").into(),
+            data: None,
+        })?;
+
+    // THE CALLER'S AUTHORITY: the same gate as mark_duplicate, then the
+    // database's own write predicate on the caller's stamped transaction. Not
+    // a rehearsal of the act: once operator binding is armed, an application
+    // session may not clear a `supersedes` at all (migration 153), and the act
+    // that commits runs with the reversal on the administrative connection.
+    let (mut tx, actor) = begin_claim_act(
+        server,
+        viewer,
+        auth,
+        dup,
+        Some(canonical),
+        "unmark_duplicate",
+        "un-mark as a duplicate",
+    )
+    .await?;
+    let may = ClaimRepository::session_may_unmark_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.rollback().await.map_err(internal_error)?;
+    if !may {
+        return Err(crate::errors::claim_not_writer(
+            dup,
+            "un-mark as a duplicate",
+        ));
+    }
+
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Undedup,
+        Some(actor),
+        oauth_principal(auth),
+        dup,
+        Some(canonical),
+    );
+    let (conn, admin_viewer) = session.split();
+    let (outcome, belief_cascade) =
+        admin_cascade::apply_unmark(conn, admin_viewer, viewer, &trigger, dup, canonical)
+            .await
+            .map_err(|e| match e {
+                admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
+                other => invalid_params(other.to_string()),
+            })?;
+
+    // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
+    // rule), through the claim's author like every other write path.
+    let embedded = crate::claim_helper::embed_claim_author_stamped(
+        server,
+        author,
+        dup,
+        &content,
+        None,
+        "unmark_duplicate",
+    )
+    .await;
+
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "duplicate_id": dup,
+            "canonical_id": outcome.canonical_id,
+            "mode": "unmark_duplicate",
+            "embedded": embedded,
+            "cascade": outcome.cascade,
             "belief_cascade": belief_cascade,
         }))
         .map_err(internal_error)?,

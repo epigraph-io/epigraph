@@ -494,6 +494,27 @@ impl EdgeRepository {
         .await?)
     }
 
+    /// The group an edge INSERTed on this connection now would record as its
+    /// writer: `public.epigraph_writer_group()` (migration 114), the function
+    /// migration 120's trigger stamps `writer_group_id` from. `None` means the
+    /// edge would land with no writer group.
+    ///
+    /// Run it on a connection stamped exactly like the write (the same
+    /// viewer, `ScopedPool::begin_as`). It reads only the session's own
+    /// identity, so it discloses nothing the session could not already see.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn session_writer_group<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT public.epigraph_writer_group()")
+                .fetch_one(executor)
+                .await?,
+        )
+    }
+
     /// The one dedup probe + INSERT behind [`Self::create_if_not_exists_conn`]
     /// and [`Self::create_if_absent_including_retracted_conn`].
     #[allow(clippy::too_many_arguments)]

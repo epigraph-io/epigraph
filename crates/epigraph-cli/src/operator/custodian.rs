@@ -23,7 +23,8 @@
 //! (`ClaimRepository::supersede_act_conn`: retire, restate under the inherited
 //! author and owner, the `supersedes` edge), the edge migration
 //! (`migrate_superseded_edges_conn`: strengthening edges follow the
-//! successor; `contradicts` / `refutes` stay), and
+//! successor; `contradicts` / `refutes` stay, and so does `executes` when the
+//! old claim is not public), and
 //! `epigraph_record_custodial_act` against a NAMED live custodian assignment
 //! of a NAMED human actor (CUS04 otherwise, which rolls the act back). So no
 //! revision lands unrecorded and no record names an authority that did not
