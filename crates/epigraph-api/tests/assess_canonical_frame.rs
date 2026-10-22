@@ -16,7 +16,11 @@
 //!    exists to prevent).
 //! 4. The input BBA (agent NULL, perspective NULL) and the "combined result"
 //!    row it stored afterwards share one `UNIQUE NULLS NOT DISTINCT` key, so
-//!    the second overwrote the first and repeated calls never accumulated.
+//!    the second overwrote the first. Ruling Q-U027F-2 (operator, 2026-10-22):
+//!    ONE assessment per (claim, frame, owner), where the owner is the calling
+//!    agent's operator or the agent itself. A repeat by any agent of the same
+//!    human REPLACES that owner's row (a reversal is reported as a contest),
+//!    and only different owners' assessments combine.
 //!
 //! # Harness
 //!
@@ -277,48 +281,146 @@ async fn assess_does_not_repoint_or_lower_a_binary_truth_cache(pool: PgPool) {
     );
 }
 
-/// Each assess call is its own BBA row, so repeated calls accumulate instead of
-/// the last one overwriting the first, and no combined row is stored beside
-/// them. The stored rows are on the 3-way frame's key space: the 2-way BBA's
-/// ignorance `{0,1}` is remapped onto Theta `{0,1,2}`, never left on
-/// `{supported, refuted}`.
-///
-/// Main: ONE row, because the input BBA and the combined row share the
-/// `(claim, frame, NULL agent, NULL perspective)` key.
+/// The response BetP one `req` gives on a fresh claim assessed by a fresh agent:
+/// what a call that REPLACES every earlier row of its owner must equal.
+async fn single_call_betp(pool: &PgPool, req: AssessClaimRequest) -> f64 {
+    let (claim, _viewer, caller) = seed_claim(pool, "assess single-call baseline").await;
+    assess(pool, caller, claim, req)
+        .await
+        .pignistic_prob
+        .expect("baseline BetP")
+}
+
+/// Link `agent` to human operator `operator` (migration 107), on the harness
+/// connection.
+async fn link_to_operator(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the agent to its operator");
+    assert!(out.membership_live && out.link_live, "{out:?}");
+}
+
+/// Ruling Q-U027F-2: ONE assessment per (claim, frame, owner). A caller's
+/// repeat REPLACES its own row instead of folding as independent evidence:
+/// ten identical calls used to drive BetP towards 1. An identical repeat
+/// leaves the BetP unchanged; a reversal leaves exactly the reversal's single
+/// -call BetP. The stored row is on the 3-way frame's key space: the 2-way
+/// BBA's ignorance `{0,1}` is remapped onto Theta `{0,1,2}`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn repeated_assess_calls_accumulate(pool: PgPool) {
-    let (claim, _viewer, caller) = seed_claim(&pool, "assess accumulates").await;
+async fn a_callers_repeat_assessment_replaces_its_own(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess replaces per caller").await;
 
     let first = assess(&pool, caller, claim, request(true, 0.9, None)).await;
-    let second = assess(&pool, caller, claim, request(true, 0.9, None)).await;
-    assert_eq!(first.frame_id, second.frame_id);
-
-    let rows = rows_on(&pool, claim, second.frame_id).await;
-    assert_eq!(
-        rows.len(),
-        2,
-        "two assess calls must leave exactly two BBA rows on the frame, got {rows:?}"
-    );
-    for masses in &rows {
-        let keys: Vec<&String> = masses.as_object().expect("masses object").keys().collect();
+    let mut last = first.pignistic_prob.expect("first BetP");
+    for _ in 0..4 {
+        let again = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+        let p = again.pignistic_prob.expect("BetP");
         assert!(
-            !keys.iter().any(|k| k.as_str() == "0,1"),
-            "the 2-way ignorance key `0,1` was stored on the 3-way frame: {masses}"
+            (p - last).abs() < 1e-9,
+            "an identical repeat must not move the BetP: {last} -> {p}"
         );
-        assert!(
-            keys.iter().any(|k| k.as_str() == "0,1,2"),
-            "the BBA's ignorance must land on Theta `0,1,2`: {masses}"
+        last = p;
+        assert_eq!(
+            again.replaced_assessments.len(),
+            1,
+            "{:?}",
+            again.replaced_assessments
         );
+        assert!(!again.replaced_assessments[0].contested);
     }
+    let rows = rows_on(&pool, claim, first.frame_id).await;
+    assert_eq!(rows.len(), 1, "one row per caller, got {rows:?}");
+    let keys: Vec<&String> = rows[0].as_object().expect("masses object").keys().collect();
+    assert!(!keys.iter().any(|k| k.as_str() == "0,1"), "{rows:?}");
+    assert!(keys.iter().any(|k| k.as_str() == "0,1,2"), "{rows:?}");
 
-    // Both rows must be COMBINED, not merely stored: two independent supporting
-    // BBAs raise the response BetP strictly. (Under a mutant that combines only
-    // the current call's row, both rows exist and p2 == p1.)
+    // A reversal by the same caller replaces, and is flagged as contesting
+    // the caller's own earlier verdict.
+    let reversed = assess(&pool, caller, claim, request(false, 0.6, None)).await;
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
+    let baseline = single_call_betp(&pool, request(false, 0.6, None)).await;
+    let p = reversed.pignistic_prob.expect("reversed BetP");
+    assert!(
+        (p - baseline).abs() < 1e-9,
+        "the reversal must replace, not fold: {p} vs single-call {baseline}"
+    );
+    assert_eq!(reversed.replaced_assessments.len(), 1);
+    assert!(
+        reversed.replaced_assessments[0].contested,
+        "{:?}",
+        reversed.replaced_assessments
+    );
+    assert_eq!(
+        reversed.replaced_assessments[0].source_agent_id,
+        Some(caller)
+    );
+}
+
+/// Ruling Q-U027F-2, the owner half: different agents of the SAME human
+/// replace each other (and a reversal is a contest), never aggregate. The
+/// human's own assessment shares the slot too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn agents_of_one_human_replace_each_other_and_never_aggregate(pool: PgPool) {
+    let (claim, _viewer, _author) = seed_claim(&pool, "assess one human").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "assess-human").await;
+    let (one, _) = seed_agent_with_group(&pool, "assess-agent-one").await;
+    let (two, _) = seed_agent_with_group(&pool, "assess-agent-two").await;
+    link_to_operator(&pool, one, human).await;
+    link_to_operator(&pool, two, human).await;
+
+    let first = assess(&pool, one, claim, request(true, 0.9, None)).await;
+    assert!(
+        first.replaced_assessments.is_empty(),
+        "{:?}",
+        first.replaced_assessments
+    );
+    let second = assess(&pool, two, claim, request(true, 0.9, None)).await;
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
+    assert_eq!(second.replaced_assessments.len(), 1);
+    assert_eq!(second.replaced_assessments[0].source_agent_id, Some(one));
+    assert!(!second.replaced_assessments[0].contested);
+    assert!(
+        (second.pignistic_prob.expect("BetP") - first.pignistic_prob.expect("BetP")).abs() < 1e-9,
+        "a sibling's agreeing assessment must not add up"
+    );
+
+    let reversal = assess(&pool, one, claim, request(false, 0.6, None)).await;
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
+    assert_eq!(reversal.replaced_assessments[0].source_agent_id, Some(two));
+    assert!(
+        reversal.replaced_assessments[0].contested,
+        "a sibling's reversal is a contest"
+    );
+
+    let by_human = assess(&pool, human, claim, request(true, 0.7, None)).await;
+    assert_eq!(rows_on(&pool, claim, first.frame_id).await.len(), 1);
+    assert_eq!(by_human.replaced_assessments[0].source_agent_id, Some(one));
+    let baseline = single_call_betp(&pool, request(true, 0.7, None)).await;
+    assert!((by_human.pignistic_prob.expect("BetP") - baseline).abs() < 1e-9);
+}
+
+/// Ruling Q-U027F-2, the other half: assessments by DIFFERENT owners are
+/// independent evidence and still combine. Two unrelated agents' supporting
+/// rows both stay and raise the BetP strictly. (Under a mutant that combines
+/// only the current call's row, both rows exist and p2 == p1.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn assessments_by_different_owners_accumulate(pool: PgPool) {
+    let (claim, _viewer, a) = seed_claim(&pool, "assess two owners").await;
+    let (b, _) = seed_agent_with_group(&pool, "assess-other-owner").await;
+    let first = assess(&pool, a, claim, request(true, 0.9, None)).await;
+    let second = assess(&pool, b, claim, request(true, 0.9, None)).await;
+    assert!(
+        second.replaced_assessments.is_empty(),
+        "{:?}",
+        second.replaced_assessments
+    );
+    assert_eq!(rows_on(&pool, claim, second.frame_id).await.len(), 2);
     let p1 = first.pignistic_prob.expect("first BetP");
     let p2 = second.pignistic_prob.expect("second BetP");
     assert!(
         p2 > p1 + 1e-6,
-        "a second supporting assess must raise the response BetP: {p1} -> {p2}"
+        "two owners' supporting BBAs combine: {p1} -> {p2}"
     );
 }
 
