@@ -7,6 +7,7 @@ pub mod embed;
 pub mod errors;
 pub mod federation;
 pub mod host_guard;
+pub mod http_listener;
 pub mod maintenance;
 pub mod operator;
 pub mod scope_map;

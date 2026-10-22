@@ -32,9 +32,15 @@ impl EntityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, embedding, properties))]
-    pub async fn upsert(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `routes/entities.rs::create_entity` can
+    /// write on the caller's viewer-stamped transaction rather than the raw
+    /// pool. It takes NO `&Viewer`: `entities` is an instance-wide dictionary
+    /// with no tenancy columns; the reason is recorded in
+    /// `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    #[instrument(skip(executor, embedding, properties))]
+    pub async fn upsert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
         type_top: &str,
         type_sub: Option<&str>,
@@ -66,7 +72,7 @@ impl EntityRepository {
                 emb as &str,
                 properties
             )
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await
             .map(|r| EntityRow {
                 id: r.id,
@@ -95,7 +101,7 @@ impl EntityRepository {
                 type_sub,
                 properties
             )
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await
             .map(|r| EntityRow {
                 id: r.id,

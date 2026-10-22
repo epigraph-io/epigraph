@@ -1,0 +1,180 @@
+{
+  "schema": "wfd1-vectors/v1",
+  "about": "Frozen expected values for the frozen-plan digest wfd1 and the ids and stored hashes a workflow ingest writes. Computed by an implementation independent of the Rust crates (gen_wfd1_vectors.py, beside this file, run by hand); the Rust tests compare, they never regenerate. The server's digest_echo must equal these values.",
+  "definitions": {
+    "wfd1": "\"wfd1:\" + lowercase hex BLAKE3-256 of: \"epigraph-wf-v1\\n\" || canonical_name || \"\\n\" || decimal(generation) || \"\\n\" || for each item in plan_index order 0..n-1: decimal(level) || \"\\t\" || claim_id || \"\\t\" || decimal(byte_len(content)) || \"\\n\" || content || \"\\n\"",
+    "claim_id_text": "lowercase hyphenated UUID (8-4-4-4-12)",
+    "byte_len": "number of UTF-8 bytes of content, not characters",
+    "strings": "UTF-8, no normalization, no trimming",
+    "workflow_root_id": "uuid5(workflow, blake3(canonical_name || ':' || decimal(generation)))",
+    "compound_claim_id": "uuid5(compound, blake3(content) || canonical_name), levels 0-2",
+    "compound_content_hash": "blake3(blake3(content) || canonical_name), the stored hash of levels 0-2",
+    "atom_id": "uuid5(atom, blake3(content)), level 3",
+    "atom_content_hash": "blake3(content), the stored hash of level 3",
+    "plan_order": "the thesis; then per phase its node (summary, or title when the summary is blank); then per step its node followed by its operation atoms"
+  },
+  "ingest": {
+    "canonical_name": "acme-frozen-plan",
+    "generation": 0,
+    "workflow_id": "17fab6a1-5fd7-59ce-8643-b4bc282a0553",
+    "extraction": {
+      "source": {
+        "canonical_name": "acme-frozen-plan",
+        "generation": 0,
+        "goal": "Read the ACME-123456 queue once and summarise it.",
+        "metadata": {}
+      },
+      "thesis": "acme-frozen-plan — thesis: read the ACME-123456 queue once",
+      "thesis_derivation": "TopDown",
+      "phases": [
+        {
+          "title": "Collect",
+          "summary": "acme-frozen-plan — phase 1: collect the rows",
+          "steps": [
+            {
+              "compound": "acme-frozen-plan — step 1.1: read the queue",
+              "rationale": "ordered",
+              "confidence": 0.8,
+              "operations": [
+                "open the ACME-123456 queue",
+                "prüfe jede Zeile — höchstens 40"
+              ],
+              "generality": [
+                1,
+                2
+              ]
+            },
+            {
+              "compound": "acme-frozen-plan — step 1.2: keep the new rows",
+              "rationale": "ordered",
+              "confidence": 0.8,
+              "operations": [],
+              "generality": []
+            }
+          ]
+        },
+        {
+          "title": "acme-frozen-plan — phase 2: report",
+          "summary": "",
+          "steps": [
+            {
+              "compound": "acme-frozen-plan — step 2.1: write the summary ✓",
+              "rationale": "ordered",
+              "confidence": 0.8,
+              "operations": [
+                "write one line per new row"
+              ],
+              "generality": [
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "relationships": []
+    },
+    "plan": [
+      {
+        "plan_index": 0,
+        "level": 0,
+        "content": "acme-frozen-plan — thesis: read the ACME-123456 queue once",
+        "claim_id": "f44ebf83-0142-58b5-bb76-01f781ed43b8",
+        "content_hash": "805198c8ad19fdc49cd65a7c4a3ad8be08eea3f982d93a6006d3ab3448c20d49"
+      },
+      {
+        "plan_index": 1,
+        "level": 1,
+        "content": "acme-frozen-plan — phase 1: collect the rows",
+        "claim_id": "2c919728-026b-5028-9326-5fe6031dec29",
+        "content_hash": "30dd04ce4c4aeba410ff1d15f86cea64f7255a15307e55de9d8c513e0c6a70c7"
+      },
+      {
+        "plan_index": 2,
+        "level": 2,
+        "content": "acme-frozen-plan — step 1.1: read the queue",
+        "claim_id": "3b367a6e-4daa-53c1-a80d-530f558e497b",
+        "content_hash": "6a1dc4ecae9bc8f78ed3d41a75401e5d78af4c9bbc72d7190e19b3850a630d45"
+      },
+      {
+        "plan_index": 3,
+        "level": 3,
+        "content": "open the ACME-123456 queue",
+        "claim_id": "d3de37c2-e4f1-5de9-8a0a-8928a7786b66",
+        "content_hash": "43eea384d5527b7767945a22387382685a7cb7d6c61f5efedb530969e6472f19"
+      },
+      {
+        "plan_index": 4,
+        "level": 3,
+        "content": "prüfe jede Zeile — höchstens 40",
+        "claim_id": "3d87e3d2-655e-5222-a6f1-730c54344f5e",
+        "content_hash": "c129b08f015b712aaaa0eb9e7ceafe52816937b0b5ba81fd3bbc56488bfd4341"
+      },
+      {
+        "plan_index": 5,
+        "level": 2,
+        "content": "acme-frozen-plan — step 1.2: keep the new rows",
+        "claim_id": "570ebda9-6f32-5758-97a1-b61962cf678c",
+        "content_hash": "0dad71b7e3e3627743645e5373d55a3e021832cb3e114c4be66f5b9216ebb56b"
+      },
+      {
+        "plan_index": 6,
+        "level": 1,
+        "content": "acme-frozen-plan — phase 2: report",
+        "claim_id": "0e11704b-9e59-525d-851c-70a80f2dd928",
+        "content_hash": "bb24a811e52ae19b58fafcf38ab012e7d6e3fe593a0f99c082864a77c1d8a4f6"
+      },
+      {
+        "plan_index": 7,
+        "level": 2,
+        "content": "acme-frozen-plan — step 2.1: write the summary ✓",
+        "claim_id": "80b379ad-27c9-56ae-a87d-7dae7253d7eb",
+        "content_hash": "cb67c4f2b04d328ddc49966562b9c120131aa7e20240861436671510f51a54ad"
+      },
+      {
+        "plan_index": 8,
+        "level": 3,
+        "content": "write one line per new row",
+        "claim_id": "c8257a76-433c-5faa-bda5-035b5ca33570",
+        "content_hash": "9e5e843f138bcd0986f8c8880dc24ca8f13d87986f8436a2f01f0a6036e162d9"
+      }
+    ],
+    "wfd1": "wfd1:db32d03bf8ff088d9124dc10e4398df7b3a738947370b3ef0cb86bde897197d8",
+    "wfd1_with_plan_index_1_and_2_swapped": "wfd1:1609877a612cd8d0475a68df28deadf9f589c31b5c67dd3ebbfe31cf45234ed1"
+  },
+  "resolver_child": {
+    "canonical_name": "acme-ops-sched-a-rules",
+    "generation": 0,
+    "workflow_id": "02eb2746-dc9e-554d-a53a-6918356bcc04",
+    "items": [
+      {
+        "plan_index": 0,
+        "level": 0,
+        "content": "acme-ops-sched-a-rules — thesis",
+        "claim_id": "87ec4efc-c084-5d6c-8ccb-d89ee661e6f6",
+        "content_hash": "4a7fac04956d4adee8151f0a9d461198cc56ef8263085ab0d7618f848fe431ed"
+      },
+      {
+        "plan_index": 1,
+        "level": 1,
+        "content": "acme-ops-sched-a-rules — phase 1: RULES",
+        "claim_id": "890f373a-240b-577d-9785-36cf7b82f11e",
+        "content_hash": "2dbe33a24192537de873f3cbd6021ab535f9d136cd98a73700048b73890c48ca"
+      },
+      {
+        "plan_index": 2,
+        "level": 2,
+        "content": "⟦wfs1 RULES⟧\n# RULES\n\nEvery ACME-123456 row is read once.\n",
+        "claim_id": "ee8a6280-2336-52f8-85d8-4313d626f9ca",
+        "content_hash": "6725d999e28d7762efa54259dbf5ae16f0061fc5ede4bb2fc122656af4612726"
+      },
+      {
+        "plan_index": 3,
+        "level": 2,
+        "content": "⟦wfs1 RULES/LIMITS⟧\n## LIMITS\n\nPrüfe die Eingabeliste — höchstens 40 Zeilen.\n",
+        "claim_id": "6196e6a9-9ae0-50f6-b927-14e5b1413879",
+        "content_hash": "e2373827dd85ee544230f04724786af37dedf002b043d3f233f6849986f4639a"
+      }
+    ],
+    "wfd1": "wfd1:e465455ccb06e550dfee9b882b125031a5da5822ee52b73716b7f4f2e8e31c9a"
+  }
+}

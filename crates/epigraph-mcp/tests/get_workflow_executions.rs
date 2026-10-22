@@ -7,7 +7,7 @@ use epigraph_crypto::AgentSigner;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow};
 use epigraph_mcp::types::GetWorkflowExecutionsParams;
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -19,8 +19,8 @@ fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 
 fn result_json(out: rmcp::model::CallToolResult) -> serde_json::Value {
     let first = out.content.first().cloned().expect("first content");
-    match first.raw {
-        RawContent::Text(t) => serde_json::from_str(&t.text).expect("result is JSON"),
+    match first {
+        ContentBlock::Text(t) => serde_json::from_str(&t.text).expect("result is JSON"),
         other => panic!("expected text content, got {other:?}"),
     }
 }

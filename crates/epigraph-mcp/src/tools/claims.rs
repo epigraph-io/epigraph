@@ -201,7 +201,7 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -1756,8 +1756,13 @@ pub(crate) async fn require_owner_or_admin(
         // failed operator lookup (e.g. a database without migration 107) now
         // returns an internal error instead of the ownership denial text — the
         // gate does not decide on an answer it did not get.
-        // `allow_actor = false`: operated agents are stdio-only.
-        if operator_arm_allows(server, caller_agent, target_agent_id, false).await? {
+        // `allow_actor = false`: operated agents are stdio-only, except
+        // through a delegated run token whose delegation is live NOW, which
+        // gets the stdio actor arm (re-checked here, on the deny path only).
+        let allow_actor = crate::tools::viewer::live_delegation(server, Some(auth), caller_agent)
+            .await?
+            .is_some();
+        if operator_arm_allows(server, caller_agent, target_agent_id, allow_actor).await? {
             return Ok(OwnershipGrant::Operator);
         }
         return Err(McpError {
@@ -1852,7 +1857,8 @@ pub(crate) enum OwnershipGrant {
 /// asked for.
 ///
 /// `allow_actor` is `false` on the HTTP transport: there only `caller ==
-/// author_op(target)` (the operator itself) is admitted, never the actor arm.
+/// author_op(target)` (the operator itself) is admitted, never the actor arm,
+/// except for a delegated run token whose delegation is live.
 pub(crate) async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,

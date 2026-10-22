@@ -708,6 +708,7 @@ fn token(
         epigraph_auth::AccessTokenBinding {
             family_id: Some(family),
             elevation_id: elv,
+            delegated_by: None,
         },
     )
     .expect("mint")

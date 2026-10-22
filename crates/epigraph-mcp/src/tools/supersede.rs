@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -90,7 +90,7 @@ pub async fn supersede_claim(
         (None, status) => (status, CascadeReport::default()),
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
@@ -322,7 +322,7 @@ pub async fn mark_duplicate(
         (None, status) => (status, CascadeReport::default()),
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "duplicate_id": dup,
             "canonical_id": canon,

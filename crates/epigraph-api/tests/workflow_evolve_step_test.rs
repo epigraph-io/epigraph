@@ -271,12 +271,18 @@ async fn evolve_step_supersedes_runs_the_supersede_cascade() {
     let agent_id = common::seed_system_agent(&pool).await;
     let step = common::seed_claim(&pool, "a step with structure").await;
     let decomposer = common::seed_claim(&pool, "the step's decomposition parent").await;
+    // The workflow records the token's principal as its submitter: an HTTP
+    // evolve of a step a workflow executes needs workflow authority over it,
+    // and a workflow with no recorded submitter admits only the audited admin
+    // path.
     let workflow = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO workflows (id, canonical_name, goal) VALUES ($1, $2, 'evolve cascade http')",
+        "INSERT INTO workflows (id, canonical_name, goal, metadata) \
+         VALUES ($1, $2, 'evolve cascade http', jsonb_build_object('epigraph_submitted_by', $3::text))",
     )
     .bind(workflow)
     .bind(format!("evolve-cascade-http-{workflow}"))
+    .bind(agent_id.to_string())
     .execute(&pool)
     .await
     .unwrap();
