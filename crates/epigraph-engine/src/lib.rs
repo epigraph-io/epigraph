@@ -42,6 +42,7 @@ pub mod errors;
 pub mod evidence;
 pub mod export;
 pub mod interval_bp;
+pub mod label_dedup;
 pub mod lifecycle;
 pub mod matching;
 pub mod promotion;
