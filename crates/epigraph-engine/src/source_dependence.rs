@@ -223,6 +223,175 @@ pub fn combine_with_source_dependence(
     }
 }
 
+// ── Canonical item key (atom-level belief, SPEC §3.3) ──────────────────────
+//
+// Skeleton: the API the atom fold, the compound conjunction and the framed
+// reads will share. The bodies below reproduce today's default for a row
+// with no source identity (every row its own independent item, plain
+// Dempster) so the property tests in `tests/source_dependence_item_key.rs`
+// fail on numbers, not on missing symbols. Nothing calls this yet.
+
+/// `combination_method` of an attribution row: an original BBA's evidence
+/// re-cited onto an atom (`perspective_id` = the original evidence id for a
+/// text-bearing item, the original `mass_functions.id` for a textless one).
+pub const ATTRIBUTED_METHOD: &str = "attributed_v1";
+/// `combination_method` of an edge-factor row (`perspective_id` = edge id).
+pub const EDGE_FACTOR_METHOD: &str = "edge_factor";
+/// `combination_method` of an ingest self-assertion ("paper P asserts this
+/// claim"), written by the ingest batch with no perspective and no evidence.
+pub const INGEST_ASSERTION_METHOD: &str = "auto_wire";
+
+/// The one canonical identity of a BBA row's evidential source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ItemKey {
+    /// `doi:<normalized doi>`. Agent-free.
+    Doi(String),
+    /// `url:<normalized source_url>`. Agent-free.
+    Url(String),
+    /// `ev:<evidence id>`: cited evidence with neither doi nor url.
+    Evidence(Uuid),
+    /// `attr:<original mf id>`: a textless attribution row.
+    Attribution(Uuid),
+    /// `edge:<edge id>`: an edge-factor row.
+    Edge(Uuid),
+    /// `paper:<asserting paper>`: a legacy ingest self-assertion. Agent-free.
+    Paper(Uuid),
+    /// `row:<mf id>`: no shared identity; the row is its own item.
+    Row(Uuid),
+}
+
+impl std::fmt::Display for ItemKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Doi(d) => write!(f, "doi:{d}"),
+            Self::Url(u) => write!(f, "url:{u}"),
+            Self::Evidence(id) => write!(f, "ev:{id}"),
+            Self::Attribution(id) => write!(f, "attr:{id}"),
+            Self::Edge(id) => write!(f, "edge:{id}"),
+            Self::Paper(id) => write!(f, "paper:{id}"),
+            Self::Row(id) => write!(f, "row:{id}"),
+        }
+    }
+}
+
+/// The evidence row a BBA cites, as the caller's viewer sees it: the row's
+/// `evidence_id`, or its `perspective_id` when that perspective is an
+/// evidence perspective. `doi` is `properties->>'doi'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemEvidence {
+    pub id: Uuid,
+    pub doi: Option<String>,
+    pub source_url: Option<String>,
+}
+
+/// Normalize a DOI (bare, `doi:`-prefixed or a doi.org link). Skeleton.
+#[must_use]
+pub fn normalize_doi(_raw: &str) -> Option<String> {
+    None
+}
+
+/// The canonical [`ItemKey`] of one BBA row. Skeleton: every row is its own
+/// item.
+#[must_use]
+pub fn item_key(
+    row: &MassFunctionRow,
+    _evidence: Option<&ItemEvidence>,
+    _asserting_paper: Option<Uuid>,
+) -> ItemKey {
+    ItemKey::Row(row.id)
+}
+
+/// Which part of a key's evidence an item carries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ItemSide {
+    /// The key's pure-support rows.
+    Support,
+    /// The key's pure-refutation rows (`<key>#neg`).
+    Refute,
+    /// One row kept as its own single-atom item.
+    Own(Uuid),
+}
+
+/// Identity of one item of an [`item_partition`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ItemId {
+    pub key: ItemKey,
+    pub side: ItemSide,
+}
+
+/// A discounted BBA row with its canonical key, ready to partition.
+#[derive(Debug, Clone)]
+pub struct KeyedBba {
+    pub row_id: Uuid,
+    pub atom_id: Uuid,
+    pub key: ItemKey,
+    pub bba: MassFunction,
+}
+
+/// One item: the BBA it contributes on each atom it touches.
+#[derive(Debug, Clone)]
+pub struct KeyedItem {
+    pub id: ItemId,
+    pub atoms: Vec<(Uuid, MassFunction)>,
+}
+
+impl KeyedItem {
+    /// The item's BBA on `atom`, if it touches it.
+    #[must_use]
+    pub fn on(&self, atom: Uuid) -> Option<&MassFunction> {
+        self.atoms.iter().find(|(a, _)| *a == atom).map(|(_, m)| m)
+    }
+}
+
+/// Partition keyed rows into items. Skeleton: one item per row.
+#[must_use]
+pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
+    rows.into_iter()
+        .map(|r| KeyedItem {
+            id: ItemId {
+                key: r.key,
+                side: ItemSide::Own(r.row_id),
+            },
+            atoms: vec![(r.atom_id, r.bba)],
+        })
+        .collect()
+}
+
+/// Fold one atom's keyed, discounted BBAs by item. Skeleton: plain Dempster.
+///
+/// # Errors
+/// Propagates `DsError` from the Dempster fold, including
+/// `combine_multiple`'s error when `rows` is empty.
+pub fn combine_by_item(
+    rows: Vec<(Uuid, ItemKey, MassFunction)>,
+    conflict_threshold: f64,
+) -> Result<(MassFunction, f64), DsError> {
+    let atom = Uuid::nil();
+    let items = item_partition(
+        rows.into_iter()
+            .map(|(row_id, key, bba)| KeyedBba {
+                row_id,
+                atom_id: atom,
+                key,
+                bba,
+            })
+            .collect(),
+    );
+    let mut for_fold: Vec<MassFunction> = items
+        .into_iter()
+        .filter_map(|it| it.atoms.into_iter().next().map(|(_, m)| m))
+        .collect();
+    if for_fold.len() == 1 {
+        let only = for_fold.pop().expect("len == 1");
+        let k = only.mass_of_conflict();
+        Ok((only, k))
+    } else {
+        let (combined, reports) = combination::combine_multiple(&for_fold, conflict_threshold)?;
+        let k = combination::fold_conflict(&combined, &reports);
+        Ok((combined, k))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
