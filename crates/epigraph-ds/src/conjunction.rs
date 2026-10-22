@@ -820,3 +820,44 @@ fn apply_negative_valuation(
         exact: base.exact,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Closed forms for negative valuations (ow = 0)
+// ---------------------------------------------------------------------------
+
+/// The `not_all` closed form of SPEC §3.6: `base` (an R-DEP result without
+/// the valuation) combined with mass `m` on ¬(∧L).
+///
+/// It equals [`conj_belief`] with `not_all = m` whenever no leaf carries
+/// open-world mass; with `~` present, use the DP, which lets the CDST meet
+/// table decide how O states meet the valuation.
+///
+/// # Errors
+/// `InvalidProbability` if `m` is outside [0, 1]; `TotalConflict` if
+/// m = 1 and Bel = 1.
+pub fn not_all_closed_form(base: &ConjResult, m: f64) -> Result<ConjResult, DsError> {
+    apply_negative_valuation(base, base.bel, m)
+}
+
+/// The single-negative-sibling closed form of SPEC §3.3: one contradicts or
+/// refutes edge of strength `m` between two leaves aᵢ, aⱼ of the compound.
+///
+/// `base` is R-DEP over the compound with that edge's own BBA dropped from
+/// the target atom's items, and `pair_bel` is Bel(aᵢ ∧ aⱼ) **in the same
+/// joint** ([`joint_bel`] with the two positions). With K' = m·`pair_bel`,
+/// Bel and Pl scale by (1 − m)/(1 − K'); NR, `BetP`, Bel(∨L) and K follow
+/// the same valuation. Two or more negative siblings have no closed form
+/// here (the SPEC serves R-FRE with `internally_contested`).
+///
+/// # Errors
+/// `InvalidProbability` for `m` or `pair_bel` outside [0, 1];
+/// `InvalidConjunction` if `pair_bel` < `base.bel` (a pair cannot be less
+/// believed than a conjunction that contains it); `TotalConflict` if
+/// K' = 1.
+pub fn single_negative_sibling(
+    base: &ConjResult,
+    pair_bel: f64,
+    m: f64,
+) -> Result<ConjResult, DsError> {
+    apply_negative_valuation(base, pair_bel, m)
+}
