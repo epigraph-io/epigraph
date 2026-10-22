@@ -396,15 +396,17 @@ fn a_bridging_row_never_merges_two_other_papers() {
 
 // ── (4) query independence ─────────────────────────────────────────────────
 
-/// One random row: (atom index, key index, t, f, o).
-fn arb_row() -> impl Strategy<Value = (usize, usize, f64, f64, f64)> {
-    (
-        0usize..3,
-        0usize..4,
-        0.0f64..0.5,
-        0.0f64..0.4,
-        prop_oneof![Just(0.0), 0.0f64..0.1],
-    )
+/// One random row: (atom index, key index, (t, f, o)). A third of the rows
+/// are pure support, a third pure refutation and a third mixed, so the
+/// grouped sides are exercised as often as the own-item side.
+fn arb_row() -> impl Strategy<Value = (usize, usize, (f64, f64, f64))> {
+    let o = || prop_oneof![Just(0.0), 0.0f64..0.1];
+    let masses = prop_oneof![
+        (0.01f64..0.9, o()).prop_map(|(w, o)| (w, 0.0, o)),
+        (0.01f64..0.9, o()).prop_map(|(w, o)| (0.0, w, o)),
+        (0.01f64..0.5, 0.01f64..0.4, o()).prop_map(|(t, f, o)| (t, f, o)),
+    ];
+    (0usize..3, 0usize..4, masses)
 }
 
 /// The items an atom sees: (id, its BBA's masses on that atom), sorted.
@@ -435,7 +437,7 @@ proptest! {
         let rows: Vec<KeyedBba> = spec
             .iter()
             .enumerate()
-            .map(|(i, &(a, k, t, f, o))| KeyedBba {
+            .map(|(i, &(a, k, (t, f, o)))| KeyedBba {
                 row_id: uuid_of(1000 + i as u128),
                 atom_id: atoms[a],
                 key: keys[k].clone(),
