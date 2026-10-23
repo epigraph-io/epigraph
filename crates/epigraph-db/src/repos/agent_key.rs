@@ -116,6 +116,32 @@ impl AgentKeyRepository {
         })
     }
 
+    /// Every `agent_keys` row carrying `public_key`, of any type and status,
+    /// oldest first.
+    ///
+    /// `epigraph-mcp`'s separate-signing-key boot check reads this, once at
+    /// start-up on its own pool, to say precisely why a signing key does not
+    /// admit (registered nowhere, to another agent, under another type, or no
+    /// longer active). A pool, like this repository's other key reads, not a
+    /// connection: it is not a request-path read, and `agent_keys` carries no
+    /// tenancy to filter (no row security, and a public key is public).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn rows_with_public_key(
+        pool: &PgPool,
+        public_key: &[u8; 32],
+    ) -> Result<Vec<AgentKeyRow>, DbError> {
+        Ok(sqlx::query_as::<_, AgentKeyRow>(
+            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
+                    revocation_reason, revoked_by, created_at \
+               FROM agent_keys WHERE public_key = $1 ORDER BY created_at, id",
+        )
+        .bind(public_key.as_slice())
+        .fetch_all(pool)
+        .await?)
+    }
+
     /// Get a key by its UUID.
     ///
     /// # Errors

@@ -13,6 +13,7 @@ pub mod operator;
 pub mod scope_map;
 pub mod server;
 pub mod session_status;
+pub mod signing_identity;
 pub mod tools;
 pub mod types;
 pub mod write_identity;
