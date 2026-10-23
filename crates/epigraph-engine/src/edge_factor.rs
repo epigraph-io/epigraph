@@ -1539,6 +1539,85 @@ pub async fn recompute_atom_cache_with(
     Ok(AtomCacheOutcome::Folded { interval, written })
 }
 
+/// What [`vacate_atom_cache`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacateOutcome {
+    /// The explicit vacuous cache was offered; `written` is whether the
+    /// cache took it (as for [`AtomCacheOutcome::Folded`]).
+    Vacated { written: bool },
+    /// The claim is not visible to the viewer: nothing was written.
+    NotVisible,
+    /// The claim is a compound: nothing was written, and
+    /// [`compound_cache_write_skipped`] counts it.
+    Compound,
+    /// A procedural or rule claim, whose cache is not an atom's: nothing
+    /// was written.
+    NotAnAtom,
+    /// The atom has AEF input, so it is not residue: vacating it would
+    /// erase an evidence-backed value. Nothing was written.
+    HasAefInput,
+}
+
+/// The accepted-vacate write (SPEC §10.5): give a RESIDUE atom (a standalone
+/// or leaf with no AEF input) the explicit vacuous cache (Bel 0, Pl 1, BetP
+/// .5, stamped `binary_truth`), which reads back as `unproven`. Never NULL.
+///
+/// The caller decides WHICH atoms (only ids on an operator-accepted list);
+/// this function refuses every claim the vacate is not for, whatever the
+/// list says: a compound, a procedural or rule claim, and an atom with AEF
+/// input (read as the single atom-cache writer reads it, under
+/// `compound_source_edges`). The PR-0 guard keeps every bulk recompute from
+/// writing this value, so this is the one bulk path to it.
+///
+/// # Errors
+/// A database read or write.
+pub async fn vacate_atom_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    compound_source_edges: crate::atom_items::CompoundSourceEdges,
+) -> Result<VacateOutcome, String> {
+    use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
+
+    let roles = roles_batch(&mut *conn, viewer, &[claim_id])
+        .await
+        .map_err(|e| format!("roles_batch: {e}"))?;
+    match roles.get(&claim_id).copied() {
+        None => return Ok(VacateOutcome::NotVisible),
+        Some(ClaimRole::Compound { .. }) => {
+            COMPOUND_CACHE_WRITE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(VacateOutcome::Compound);
+        }
+        Some(ClaimRole::Procedural | ClaimRole::Rule) => return Ok(VacateOutcome::NotAnAtom),
+        Some(ClaimRole::Standalone | ClaimRole::Atom) => {}
+    }
+    let ctx = crate::belief_query::FramedBeliefContext::global();
+    let has_input = crate::atom_items::atom_axiom_rows_under(
+        &mut *conn,
+        viewer,
+        &[claim_id],
+        crate::atom_items::AxiomMode::Display,
+        &ctx,
+        compound_source_edges,
+    )
+    .await?
+    .get(&claim_id)
+    .is_some_and(|rows| !rows.is_empty());
+    if has_input {
+        return Ok(VacateOutcome::HasAefInput);
+    }
+    let written = write_atom_cache(
+        conn,
+        viewer,
+        claim_id,
+        &crate::atom_items::EvidencedInterval::unproven(),
+        false,
+        &ctx.calibration,
+    )
+    .await?;
+    Ok(VacateOutcome::Vacated { written })
+}
+
 /// Write an AEF value to the claim's cache, stamped `binary_truth`, and its
 /// classification when the cache took it. Returns whether it did.
 async fn write_atom_cache(
