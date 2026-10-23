@@ -972,6 +972,58 @@ async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
 
 // ── DOI key canonicalization: a resolver-URL DOI keys the bare-DOI row ─────
 
+/// `check_already_ingested(doi, pipeline_version)`'s JSON answer.
+async fn gate_json(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    pipeline_version: Option<&str>,
+) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::ingestion::check_already_ingested(
+        server,
+        &viewer,
+        epigraph_mcp::types::CheckAlreadyIngestedParams {
+            doi: doi.to_string(),
+            pipeline_version: pipeline_version.map(str::to_string),
+        },
+    )
+    .await
+    .expect("check_already_ingested answers");
+    serde_json::from_str(&result_text(&result)).expect("check_already_ingested JSON")
+}
+
+/// Seed a paper row keyed VERBATIM on `key` (as the writer stored a
+/// resolver-URL DOI before keys were canonicalized), stamped `processed_by`
+/// the hierarchical pipeline by the server's agent. Returns the paper id.
+async fn seed_processed_paper(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    key: &str,
+    title: &str,
+) -> uuid::Uuid {
+    let paper_id = epigraph_db::PaperRepository::get_or_create(pool, key, Some(title), None)
+        .await
+        .expect("seed a paper row");
+    let agent = server.server_agent_id().await.expect("server agent");
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(
+        &mut conn,
+        paper_id,
+        agent,
+        "hierarchical_extraction_v2",
+        "ingest_document",
+    )
+    .await
+    .expect("stamp the seeded paper processed_by");
+    assert_eq!(
+        processed_by_edges(pool, key).await,
+        1,
+        "CALIBRATION: the seeded row carries one processed_by stamp"
+    );
+    paper_id
+}
+
 async fn query_paper_json(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> serde_json::Value {
     let viewer = fixture::public_viewer(pool).await;
     let result = tools::paper_queries::query_paper(
@@ -1013,22 +1065,28 @@ async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
         "the claims carry the bare-DOI label, not `doi:https://doi.org/...`"
     );
 
-    let gate = tools::ingestion::check_already_ingested(
-        &server,
-        &viewer,
-        epigraph_mcp::types::CheckAlreadyIngestedParams {
-            doi: SMOKE_DOI.to_string(),
-            pipeline_version: None,
-        },
-    )
-    .await
-    .expect("check_already_ingested answers");
-    let gate: serde_json::Value = serde_json::from_str(&result_text(&gate)).expect("JSON");
+    let gate = gate_json(&server, &pool, SMOKE_DOI, None).await;
     assert_eq!(gate["already_ingested"], serde_json::json!(true), "{gate}");
+    let stamp = gate["matched_pipeline_versions"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the walk wrote a processed_by stamp: {gate}"))
+        .to_string();
 
-    // The URL spelling, asked later, names the same paper.
-    let by_url = query_paper_json(&server, &pool, &format!("https://doi.org/{SMOKE_DOI}")).await;
+    // The URL spelling, asked later, names the same paper: through query_paper
+    // and through BOTH arms of the dedup gate (the family arm, and the exact
+    // arm that runs through `paper_already_ingested`). A probe that asks with
+    // the URL form must not read "not ingested" and re-extract the paper.
+    let url = format!("https://doi.org/{SMOKE_DOI}");
+    let by_url = query_paper_json(&server, &pool, &url).await;
     assert_eq!(by_url["claim_count"], serde_json::json!(5), "{by_url}");
+    for pipeline_version in [None, Some(stamp.as_str())] {
+        let gate = gate_json(&server, &pool, &url, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({url:?}, {pipeline_version:?}): {gate}"
+        );
+    }
 }
 
 /// A row written under a resolver-URL key BEFORE keys were canonicalized is
@@ -1038,12 +1096,20 @@ async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
 async fn query_paper_still_finds_a_legacy_url_form_row(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let legacy = "https://doi.org/10.5555/legacy-url-key";
-    epigraph_db::PaperRepository::get_or_create(&pool, legacy, Some("Legacy URL-keyed"), None)
-        .await
-        .expect("seed a legacy URL-keyed paper");
+    let paper_id = seed_processed_paper(&server, &pool, legacy, "Legacy URL-keyed").await;
 
     let paper = query_paper_json(&server, &pool, legacy).await;
     assert_eq!(paper["title"], "Legacy URL-keyed", "{paper}");
+    // The dedup gate falls back to the as-given spelling too, on both arms.
+    for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+        let gate = gate_json(&server, &pool, legacy, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({legacy:?}, {pipeline_version:?}): {gate}"
+        );
+        assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+    }
 
     let unknown = query_paper_json(&server, &pool, "https://doi.org/10.5555/never-ingested").await;
     assert_eq!(unknown["title"], "", "{unknown}");
