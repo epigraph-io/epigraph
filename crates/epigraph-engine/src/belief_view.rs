@@ -17,20 +17,26 @@
 //! use epigraph_engine::belief_view::DerivedBelief;
 //!
 //! fn machinery(_input: &EvidencedInterval) {}
-//! fn feed_back(derived: &DerivedBelief) {
+//! #[allow(unused_variables)]
+//! fn feed_back(derived: &DerivedBelief, folded: &EvidencedInterval) {
 //!     machinery(derived);
 //! }
 //! ```
 //!
-//! The same call with the type the machinery takes compiles, so the failure
-//! above is the type split and nothing else:
+//! The twin below is the same text with the other argument, and it compiles:
+//! both types and both import paths resolve, so the failure above is the
+//! type split and nothing else. (Rustdoc checks the `E0308` code only on
+//! nightly; on stable this twin is what rules out any other compile error.)
 //!
 //! ```
-//! use epigraph_engine::atom_items::{atom_fold, EvidencedInterval};
+//! use epigraph_engine::atom_items::EvidencedInterval;
+//! use epigraph_engine::belief_view::DerivedBelief;
 //!
 //! fn machinery(_input: &EvidencedInterval) {}
-//! let folded = atom_fold(&[]).expect("the fold of nothing");
-//! machinery(&folded);
+//! #[allow(unused_variables)]
+//! fn feed_back(derived: &DerivedBelief, folded: &EvidencedInterval) {
+//!     machinery(folded);
+//! }
 //! ```
 //!
 //! # Wire shape
