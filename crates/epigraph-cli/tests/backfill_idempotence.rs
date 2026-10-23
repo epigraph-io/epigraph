@@ -1623,6 +1623,22 @@ async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPo
              world fragment on a seed claim (2): not the world one alone, and not the seed \
              fragment on a seed claim, which has nothing to move; got: {line}"
         );
+        if args.len() == 1 {
+            // Strict verify lists offenders: the ids must be the rows it counted.
+            for (id, what) in [
+                (repairable, "seed-on-group"),
+                (world_on_seed, "world-on-seed"),
+            ] {
+                assert!(
+                    stderr.contains(&format!("harvester_fragments.id = {id}")),
+                    "strict verify must list the counted {what} fragment {id}: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains(&format!("harvester_fragments.id = {seed_on_seed}")),
+                "strict verify must not list the uncounted seed-on-seed fragment: {stderr}"
+            );
+        }
     }
 
     let (code, stderr) = run_backfill(

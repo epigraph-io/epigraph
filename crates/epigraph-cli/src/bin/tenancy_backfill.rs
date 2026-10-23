@@ -2619,17 +2619,7 @@ async fn harvester_fragment_residual(
     pool: &PgPool,
     mode: Option<LegacyOwner>,
 ) -> anyhow::Result<i64> {
-    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
-                                JOIN claims c ON c.id = p.claim_id \
-                               WHERE p.fragment_id = t.id \
-                                 AND c.owner_group_id <> $1 \
-                                 AND (t.owner_group_id, t.visibility) \
-                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
-    let filter = if mode == Some(LegacyOwner::Platform) {
-        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
-    } else {
-        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
-    };
+    let filter = harvester_fragment_residual_filter(mode);
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM harvester_fragments t WHERE {filter}"
     ))
@@ -2637,6 +2627,24 @@ async fn harvester_fragment_residual(
     .bind(SEED)
     .fetch_one(pool)
     .await?)
+}
+
+/// The `WHERE` clause (over `harvester_fragments t`, binding `$1` = [`WORLD`],
+/// `$2` = [`SEED`]) shared by [`harvester_fragment_residual`]'s count and
+/// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
+/// rows it counted.
+fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
+    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
+                                JOIN claims c ON c.id = p.claim_id \
+                               WHERE p.fragment_id = t.id \
+                                 AND c.owner_group_id <> $1 \
+                                 AND (t.owner_group_id, t.visibility) \
+                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
+    if mode == Some(LegacyOwner::Platform) {
+        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
+    } else {
+        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
+    }
 }
 
 /// The deploy pre-flight. Returns the number of FAILING checks.
@@ -2972,6 +2980,23 @@ async fn linked_author_personal_residue(
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
 /// acceptance line implies.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
+    if table == "harvester_fragments" {
+        // Strict mode only (the caller skips this under `platform`): list the
+        // rows `harvester_fragment_residual` counted, seed-owned repairable
+        // ones included, not just the world-owned ones.
+        let filter = harvester_fragment_residual_filter(None);
+        let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT t.id FROM harvester_fragments t WHERE {filter} ORDER BY t.id LIMIT 20"
+        ))
+        .bind(WORLD)
+        .bind(SEED)
+        .fetch_all(pool)
+        .await?;
+        for id in ids {
+            eprintln!("    {table}.id = {id}");
+        }
+        return Ok(());
+    }
     let key = match table {
         "claim_frames" | "claim_cluster_membership" | "claim_neighborhood_membership" => "claim_id",
         _ => "id",
