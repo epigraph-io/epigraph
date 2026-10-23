@@ -1169,9 +1169,70 @@ pub async fn recompute_claim_cached_belief(
 pub enum CacheWriteCause {
     /// An ordinary write or recompute.
     Organic,
-    /// A lifecycle act removed some of the atom's own evidence: a hide, a
-    /// retraction, an edge withdrawal or a dedup cascade.
-    EvidenceRemoved,
+    /// A lifecycle act (a hide, a retraction, an edge withdrawal or a dedup
+    /// cascade) removed rows of the atom. The argument is what the atom's AEF
+    /// input was BEFORE the act ([`aef_input_before`]): only an atom that had
+    /// AEF input and lost all of it is vacated. Removing rows that were never
+    /// AEF input (the ingest template, a cached combination, a row of a frame
+    /// the fold does not read) vacates nothing.
+    EvidenceRemoved(AefInputBefore),
+}
+
+/// Whether an atom had AEF input before a lifecycle act, as read by
+/// [`aef_input_before`], the only way to build one. The writer's empty-fold
+/// rule turns on it: once the rows are gone, the database cannot tell "lost
+/// its AEF input" (vacated, ruling O24) from "never had any" (the residue,
+/// left untouched, SPEC §4.2 and §10.5), so the caller reads it first, in the
+/// same transaction, with the reader the writer folds with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AefInputBefore {
+    claim_id: Uuid,
+    had_input: bool,
+}
+
+impl AefInputBefore {
+    /// The atom this was read for.
+    #[must_use]
+    pub const fn claim_id(&self) -> Uuid {
+        self.claim_id
+    }
+
+    /// The atom had at least one AEF input row (in [`AxiomMode::Display`],
+    /// as the writer folds it).
+    ///
+    /// [`AxiomMode::Display`]: crate::atom_items::AxiomMode::Display
+    #[must_use]
+    pub const fn had_input(&self) -> bool {
+        self.had_input
+    }
+}
+
+/// Read, BEFORE a lifecycle act, whether `claim_id` has AEF input as
+/// [`recompute_atom_cache_with`] would fold it under `settings`: the
+/// [`crate::atom_items::AxiomMode::Display`] rows `viewer` can see. Pass the
+/// result as [`CacheWriteCause::EvidenceRemoved`] to the write after the act.
+///
+/// # Errors
+/// A database read.
+pub async fn aef_input_before(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    settings: AtomCacheSettings,
+) -> Result<AefInputBefore, String> {
+    let rows = crate::atom_items::atom_axiom_rows_under(
+        &mut *conn,
+        viewer,
+        &[claim_id],
+        crate::atom_items::AxiomMode::Display,
+        &crate::belief_query::FramedBeliefContext::global(),
+        settings.compound_source_edges,
+    )
+    .await?;
+    Ok(AefInputBefore {
+        claim_id,
+        had_input: rows.get(&claim_id).is_some_and(|r| !r.is_empty()),
+    })
 }
 
 /// The fold a call site used before the single atom-cache writer, which it
@@ -1289,15 +1350,18 @@ pub async fn recompute_atom_cache(
 ///   `aef_standalone`, a procedural or rule claim): the `legacy` fold,
 ///   exactly as the call site ran it before.
 ///
-/// **Empty fold** under the AEF: after [`CacheWriteCause::EvidenceRemoved`],
-/// and when ruling O24 is on, the cache is set to an explicit vacuous value
-/// (Bel 0, Pl 1, BetP .5, `binary_truth`) and the atom is logged on the
+/// **Empty fold** under the AEF: after [`CacheWriteCause::EvidenceRemoved`]
+/// whose [`AefInputBefore`] says the atom HAD AEF input, and when ruling O24
+/// is on, the cache is set to an explicit vacuous value (Bel 0, Pl 1, BetP
+/// .5, `binary_truth`); when the cache took it, the atom is logged on the
 /// evidence-removal vacate list (target `epigraph::atom_cache::vacate`).
-/// Otherwise the cache is left as it is (an atom that never had AEF input is
-/// served from its old cache). **No arm ever NULLs a cache.**
+/// Otherwise the cache is left as it is: an atom that never had AEF input
+/// (the residue) is served from its old cache, and is vacated only through
+/// the operator accept list (SPEC §10.5). **No arm ever NULLs a cache.**
 ///
 /// # Errors
-/// A database read or write, or a fold that fails.
+/// A database read or write, a fold that fails, or a
+/// [`CacheWriteCause::EvidenceRemoved`] read for another claim.
 pub async fn recompute_atom_cache_with(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1309,6 +1373,15 @@ pub async fn recompute_atom_cache_with(
     use crate::atom_items::{atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
+    if let CacheWriteCause::EvidenceRemoved(before) = cause {
+        if before.claim_id != claim_id {
+            return Err(format!(
+                "recompute_atom_cache: the AEF input read before the act is for claim {}, \
+                 not {claim_id}",
+                before.claim_id
+            ));
+        }
+    }
     let roles = roles_batch(&mut *conn, viewer, &[claim_id])
         .await
         .map_err(|e| format!("roles_batch: {e}"))?;
@@ -1358,7 +1431,8 @@ pub async fn recompute_atom_cache_with(
     .unwrap_or_default();
 
     if rows.is_empty() {
-        if cause == CacheWriteCause::EvidenceRemoved && settings.vacate_on_evidence_removal {
+        let lost_input = matches!(cause, CacheWriteCause::EvidenceRemoved(b) if b.had_input);
+        if lost_input && settings.vacate_on_evidence_removal {
             let written = write_atom_cache(
                 conn,
                 viewer,
@@ -1368,12 +1442,20 @@ pub async fn recompute_atom_cache_with(
                 &ctx.calibration,
             )
             .await?;
-            tracing::warn!(
-                target: "epigraph::atom_cache::vacate",
-                claim = %claim_id,
-                written,
-                "evidence-removal vacate: a lifecycle act emptied the atom's AEF input;                  explicit vacuous cache (basis unproven)"
-            );
+            if written {
+                tracing::warn!(
+                    target: "epigraph::atom_cache::vacate",
+                    claim = %claim_id,
+                    "evidence-removal vacate: a lifecycle act emptied the atom's AEF input; \
+                     explicit vacuous cache (basis unproven)"
+                );
+            } else {
+                tracing::info!(
+                    claim = %claim_id,
+                    "evidence-removal vacate not taken by the cache (non-owner write on \
+                     another recorded frame); the cache is unchanged"
+                );
+            }
             return Ok(AtomCacheOutcome::Vacated { written });
         }
         return Ok(AtomCacheOutcome::KeptEmpty);

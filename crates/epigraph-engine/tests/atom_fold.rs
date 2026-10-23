@@ -35,8 +35,9 @@ use epigraph_engine::atom_items::{
 use epigraph_engine::belief_query::FramedBeliefContext;
 use epigraph_engine::calibration::CalibrationConfig;
 use epigraph_engine::edge_factor::{
-    compound_cache_write_skipped, recompute_atom_cache_with, AtomCacheOutcome, AtomCacheSettings,
-    CacheWriteCause, LegacyFold, PerspectiveReliability, CLAIM_VALIDITY_FRAME_ID,
+    aef_input_before, compound_cache_write_skipped, recompute_atom_cache_with, AefInputBefore,
+    AtomCacheOutcome, AtomCacheSettings, CacheWriteCause, LegacyFold, PerspectiveReliability,
+    CLAIM_VALIDITY_FRAME_ID,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -355,6 +356,16 @@ async fn write(
     recompute_atom_cache_with(&mut conn, &viewer, id, cause, legacy, s)
         .await
         .expect("recompute_atom_cache")
+}
+
+/// What the atom's AEF input is before a lifecycle act, read as the public
+/// viewer the test writes with.
+async fn before_act(pool: &PgPool, id: Uuid, s: AtomCacheSettings) -> AefInputBefore {
+    let viewer = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    aef_input_before(&mut conn, &viewer, id, s)
+        .await
+        .expect("aef_input_before")
 }
 
 fn close(a: f64, b: f64) -> bool {
@@ -970,19 +981,21 @@ async fn an_atom_that_lost_its_only_input_is_vacated_never_nulled(pool: PgPool) 
             before.belief.is_some_and(|v| close(v, 0.7)),
             "{what}: the AEF wrote the fold first, got {before:?}"
         );
+        let input = before_act(&pool, a, aef(true)).await;
+        assert!(input.had_input(), "{what}: the atom had AEF input");
         sqlx::query("DELETE FROM mass_functions WHERE id = $1")
             .bind(row)
             .execute(&pool)
             .await
             .expect("remove the atom's only row");
-        atoms.push((a, before));
+        atoms.push((a, before, input));
     }
 
-    let (on, _) = &atoms[0];
+    let (on, _, input) = &atoms[0];
     let outcome = write(
         &pool,
         *on,
-        CacheWriteCause::EvidenceRemoved,
+        CacheWriteCause::EvidenceRemoved(*input),
         LegacyFold::OwnerFrame,
         aef(true),
     )
@@ -998,11 +1011,11 @@ async fn an_atom_that_lost_its_only_input_is_vacated_never_nulled(pool: PgPool) 
         "O24 on: explicit vacuous cache on binary_truth"
     );
 
-    let (off, before_off) = &atoms[1];
+    let (off, before_off, input) = &atoms[1];
     write(
         &pool,
         *off,
-        CacheWriteCause::EvidenceRemoved,
+        CacheWriteCause::EvidenceRemoved(*input),
         LegacyFold::OwnerFrame,
         aef(false),
     )
@@ -1013,7 +1026,7 @@ async fn an_atom_that_lost_its_only_input_is_vacated_never_nulled(pool: PgPool) 
         "O24 off: the old cache is kept"
     );
 
-    let (organic, before_organic) = &atoms[2];
+    let (organic, before_organic, _) = &atoms[2];
     let outcome = write(
         &pool,
         *organic,
@@ -1223,7 +1236,9 @@ async fn a_residue_atom_is_never_vacated_by_an_evidence_removal_write(pool: PgPo
     let residue = claim(&pool, author, "template-only residue").await;
     let template = store_template(&pool, residue, agent(&pool).await).await;
     let sentinel = set_sentinel(&pool, residue).await;
+    let s = settings(AtomFoldMode::Aef, true);
 
+    let input = before_act(&pool, residue, s).await;
     sqlx::query("DELETE FROM mass_functions WHERE id = $1")
         .bind(template)
         .execute(&pool)
@@ -1232,9 +1247,9 @@ async fn a_residue_atom_is_never_vacated_by_an_evidence_removal_write(pool: PgPo
     let outcome = write(
         &pool,
         residue,
-        CacheWriteCause::EvidenceRemoved,
+        CacheWriteCause::EvidenceRemoved(input),
         LegacyFold::OwnerFrame,
-        settings(AtomFoldMode::Aef, true),
+        s,
     )
     .await;
     assert_eq!(
@@ -1246,6 +1261,24 @@ async fn a_residue_atom_is_never_vacated_by_an_evidence_removal_write(pool: PgPo
         cache(&pool, residue).await,
         sentinel,
         "the residue's cache must not move"
+    );
+
+    // What was read before one act never stands in for another atom.
+    let other = claim(&pool, author, "another atom").await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let refused = recompute_atom_cache_with(
+        &mut conn,
+        &viewer,
+        other,
+        CacheWriteCause::EvidenceRemoved(input),
+        LegacyFold::OwnerFrame,
+        s,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a pre-act read for another claim is refused, got {refused:?}"
     );
 }
 
