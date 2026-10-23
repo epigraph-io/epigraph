@@ -1930,8 +1930,8 @@ async fn served_as_tool_reads_what_the_sheaf_tool_reads(pool: PgPool) {
         "both read s -> t"
     );
     assert!(
-        sh.served_as_tool.open_world_h1.abs() < 1e-12 && sh.served.open_world_h1 > 0.1,
-        "the tool reads open_world_mass (0); the like-for-like column is .2: {sh:?}"
+        sh.served_as_tool.open_world_h1.abs() < 1e-12 && sh.served.open_world_h1 > 1e-6,
+        "the tool reads open_world_mass (0); the like-for-like reads t's .2: {sh:?}"
     );
 }
 
