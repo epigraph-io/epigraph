@@ -360,12 +360,19 @@ pub async fn revoke_agent_key(
         });
     }
 
+    // `revoked_by` names the agent only when the agent itself revoked. An
+    // admin override records no one: `revoked_by` references `agents(id)` and
+    // an admin principal need not have an agents row, so recording it could
+    // fail the emergency revoke path; recording the target would be false.
+    let caller_is_agent = auth_ctx
+        .as_ref()
+        .is_some_and(|axum::Extension(auth)| auth.agent_id == Some(id));
     let updated = AgentKeyRepository::update_status(
         &state.db_pool,
         key_id,
         "revoked",
         Some(request.reason.as_str()),
-        Some(id), // revoked_by = the agent themselves (or admin acting on their behalf)
+        caller_is_agent.then_some(id),
     )
     .await?;
 
