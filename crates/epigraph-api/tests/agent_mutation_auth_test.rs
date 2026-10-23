@@ -646,3 +646,167 @@ async fn rotate_agent_key_admin_override_rotates() {
     );
     assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
 }
+
+// ===========================================================================
+// Key validity windows — a key taken out of service stops being valid
+// ===========================================================================
+//
+// A key's validity window is [valid_from, valid_until). A verifier that binds
+// a signature to "the key that was valid when the claim was made" can only do
+// so if retiring a key closes its window. An open window (valid_until NULL)
+// on a rotated or revoked key keeps binding signatures made after it was
+// retired, including by whoever recomputed a derived key.
+
+/// (valid_from, valid_until, status) of one key row.
+async fn key_window(
+    pool: &sqlx::PgPool,
+    pk: &[u8],
+) -> (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    String,
+) {
+    sqlx::query_as(
+        "SELECT valid_from, valid_until, status::text FROM agent_keys WHERE public_key = $1",
+    )
+    .bind(pk)
+    .fetch_one(pool)
+    .await
+    .expect("read key window")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotate_agent_key_closes_the_old_keys_window_where_the_new_one_opens() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let (_, old_until_before, _) = key_window(&pool, &agent.signer.public_key()).await;
+    assert_eq!(
+        old_until_before, None,
+        "fixture: the seeded key is open-ended"
+    );
+
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let token = token_as_agent(agent.id, &["agents:write"]);
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(
+        status, 200,
+        "self-rotation must succeed; got {status} — {text}"
+    );
+
+    let (_, old_until, old_status) = key_window(&pool, &agent.signer.public_key()).await;
+    let (new_from, new_until, new_status) = key_window(&pool, &new_key.public_key()).await;
+    assert_eq!(old_status, "rotated");
+    assert_eq!(new_status, "active");
+    assert_eq!(new_until, None, "the new key is open-ended");
+    let old_until = old_until.expect(
+        "a rotated key's window must be closed (valid_until set), or it keeps binding \
+         signatures made after the rotation",
+    );
+    assert!(
+        old_until <= new_from,
+        "the windows must not overlap: old key valid until {old_until}, new key valid from {new_from}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_agent_key_closes_the_keys_window() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let pk = agent.signer.public_key();
+    let key_id: Uuid = sqlx::query_scalar("SELECT id FROM agent_keys WHERE public_key = $1")
+        .bind(pk.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (from, until_before, _) = key_window(&pool, &pk).await;
+    assert_eq!(until_before, None, "fixture: the seeded key is open-ended");
+
+    let token = token_as_agent(agent.id, &["agents:write"]);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/agents/{}/keys/{key_id}/revoke",
+            agent.id
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"reason": "window test"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(status, 200, "{}", resp.text().await.unwrap_or_default());
+
+    let (from_after, until, status) = key_window(&pool, &pk).await;
+    assert_eq!(status, "revoked");
+    assert_eq!(from_after, from, "revocation must not move valid_from");
+    let until = until.expect("a revoked key's window must be closed (valid_until set)");
+    assert!(
+        until >= from,
+        "valid_until {until} precedes valid_from {from}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_agent_key_never_reopens_or_extends_a_closed_window() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    // An agent whose one key already expired an hour ago, still marked active.
+    let agent = seed_derived_llm_agent(&pool).await;
+    let pk = agent.signer.public_key();
+    let expired_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE agent_keys SET valid_from = now() - interval '2 hours', \
+                valid_until = now() - interval '1 hour' \
+          WHERE public_key = $1 RETURNING valid_until",
+    )
+    .bind(pk.as_slice())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let key_id: Uuid = sqlx::query_scalar("SELECT id FROM agent_keys WHERE public_key = $1")
+        .bind(pk.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let token = token_as_agent(agent.id, &["agents:write"]);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/agents/{}/keys/{key_id}/revoke",
+            agent.id
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"reason": "expired-key test"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(status, 200, "{}", resp.text().await.unwrap_or_default());
+
+    let (_, until, status) = key_window(&pool, &pk).await;
+    assert_eq!(status, "revoked");
+    assert_eq!(
+        until,
+        Some(expired_at),
+        "retiring a key may only shorten its window, never move an earlier end later"
+    );
+}
