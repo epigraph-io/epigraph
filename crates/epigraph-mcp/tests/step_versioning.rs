@@ -819,3 +819,170 @@ async fn resolve_to_latest_discloses_a_deprecated_head(pool: PgPool) {
         "the head's truth is below min_truth, and every entry says so"
     );
 }
+
+// ── A retired step head must be flagged, and name-mode must not hit it ──
+//
+// Bridge 00132b1d: `evolve_step(canonical_name, step_index, 'supersedes')`
+// failed with the opaque "cannot supersede a non-current step" on a step that
+// `find_workflow_hierarchical(resolve_to_latest=true)` had just reported as
+// its head. A lineage head is defined structurally (no incoming `supersedes`
+// edge) while the guard reads `claims.is_current`; a claim retired without a
+// supersedes edge (deprecate_workflow's retirement, reused by a later
+// generation with identical text; mark_duplicate) is both. Seeded directly in
+// that shape: a sole lineage member with is_current=false and no edge.
+async fn seed_retired_step_workflow(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+    let agent = insert_seed_agent(pool).await;
+    let healthy = seed_versioned_step(pool, agent, Uuid::new_v4(), "healthy step").await;
+    let retired = seed_versioned_step(pool, agent, Uuid::new_v4(), "retired step").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired)
+        .execute(pool)
+        .await
+        .unwrap();
+    // Step 2: a lineage whose NEWEST head is retired while an older head (a
+    // concurrent branch, no supersedes edge between them) is current.
+    let branch_lineage = Uuid::new_v4();
+    let branch_current = seed_versioned_step(pool, agent, branch_lineage, "branch v1").await;
+    let branch_retired = seed_versioned_step(pool, agent, branch_lineage, "branch v2").await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, created_at = NOW() + INTERVAL '1 minute' WHERE id = $1",
+    )
+    .bind(branch_retired)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, metadata) \
+         VALUES ($1, 'retired-step-wf', 0, 'retired step probe', '{}'::jsonb)",
+    )
+    .bind(wf)
+    .execute(pool)
+    .await
+    .unwrap();
+    for (i, s) in [healthy, retired, branch_current].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', NOW() + make_interval(secs => $3::int))",
+        )
+        .bind(wf)
+        .bind(*s)
+        .bind(i as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    (healthy, retired, branch_current, branch_retired)
+}
+
+fn name_mode(idx: usize, content: &str) -> EvolveStepParams {
+    EvolveStepParams {
+        canonical_name: Some("retired-step-wf".to_string()),
+        step_index: Some(idx),
+        step_lineage_id: String::new(),
+        parent_id: String::new(),
+        content: content.to_string(),
+        edge_type: "supersedes".to_string(),
+        rationale: None,
+        level: Some(2),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let (healthy, retired, branch_current, branch_retired) =
+        seed_retired_step_workflow(&pool).await;
+
+    let body = search(&server, &viewer, "retired step probe", Some(true), None).await;
+    let steps = body["workflows"][0]["resolved_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resolved_steps expected; got {body}"));
+    assert_eq!(steps.len(), 3);
+    assert_eq!(
+        steps[0]["heads"][0]["id"].as_str(),
+        Some(healthy.to_string().as_str())
+    );
+    assert_eq!(
+        steps[0]["heads"][0]["is_current"],
+        serde_json::json!(true),
+        "a healthy head reports is_current=true, so the flag is not a constant"
+    );
+    assert_eq!(
+        steps[1]["heads"][0]["id"].as_str(),
+        Some(retired.to_string().as_str())
+    );
+    assert_eq!(
+        steps[1]["heads"][0]["is_current"],
+        serde_json::json!(false),
+        "the retired head is still listed (a sole member must not vanish) but flagged: {body}"
+    );
+
+    // Name-mode on the retired step: refused with a message that names the
+    // retired head and the retirement, as a caller error.
+    let err = evolve_step(&server, &viewer, name_mode(1, "retired step v2"), None)
+        .await
+        .expect_err("a retired head cannot be superseded");
+    let msg = err.message.to_string();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{msg}");
+    assert!(
+        msg.contains(&retired.to_string()) && msg.contains("retired"),
+        "the error must name the retired head and the retirement; got {msg}"
+    );
+    assert!(
+        !msg.contains("cannot supersede a non-current step"),
+        "the opaque guard message must not be what the caller sees; got {msg}"
+    );
+
+    // Same resolution for update_with_evidence's name mode.
+    let params: epigraph_mcp::types::UpdateWithEvidenceParams =
+        serde_json::from_value(serde_json::json!({
+            "claim_id": "",
+            "canonical_name": "retired-step-wf",
+            "step_index": 1,
+            "evidence_data": "observed",
+            "evidence_type": "observation",
+            "supports": true,
+            "strength": 0.5
+        }))
+        .expect("params");
+    let err = epigraph_mcp::tools::claims::update_with_evidence(&server, &viewer, params, None)
+        .await
+        .expect_err("evidence must not silently land on a retired head");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains(&retired.to_string()) && msg.contains("retired"),
+        "update_with_evidence must name the retired head; got {msg}"
+    );
+
+    // A lineage whose newest head is retired but an older head is current:
+    // name-mode branches from the CURRENT head and succeeds.
+    evolve_step(&server, &viewer, name_mode(2, "branch v3"), None)
+        .await
+        .expect("name-mode must pick the current head of a lineage");
+    let (branch_current_now,): (bool,) =
+        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+            .bind(branch_current)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !branch_current_now,
+        "the current head was the one superseded"
+    );
+    let (retired_untouched,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(branch_retired)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retired_untouched, 0, "the retired head was not the parent");
+
+    // Control: the healthy step evolves normally.
+    evolve_step(&server, &viewer, name_mode(0, "healthy step v2"), None)
+        .await
+        .expect("a healthy head evolves");
+}

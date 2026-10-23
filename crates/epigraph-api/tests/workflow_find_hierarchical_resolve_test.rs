@@ -157,3 +157,119 @@ async fn find_workflow_hierarchical_resolve_to_latest_returns_true_lineage_head(
     assert_eq!(workflows.len(), 3);
     assert!(workflows.iter().all(|w| w.get("is_lineage_head").is_none()));
 }
+
+/// HTTP twin of the MCP `retired_step_head_is_flagged_and_evolve_step_names_the_retirement`
+/// (bridge 00132b1d): a step lineage head is defined by "no incoming
+/// supersedes edge", while `evolve_step`'s guard reads `claims.is_current`. A
+/// head retired without a supersedes edge was presented here as an ordinary
+/// head, so a caller could not tell that superseding it would be refused. It
+/// stays listed (a sole lineage member must not vanish) and is flagged.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_flags_a_retired_step_head() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let agent = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, created_at, updated_at) \
+         VALUES ($1, sha256($1::text::bytea), NOW(), NOW())",
+    )
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("seed agent");
+
+    let workflow_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal, generation, metadata) \
+         VALUES ($1, $2, $3, 0, '{}'::jsonb)",
+    )
+    .bind(workflow_id)
+    .bind(format!("retired-head-http-{tag}"))
+    .bind(format!("retired head probe qq{tag}"))
+    .execute(&pool)
+    .await
+    .expect("seed workflow");
+
+    let mut steps = Vec::new();
+    for (i, current) in [true, false].into_iter().enumerate() {
+        let id = Uuid::new_v4();
+        let mut hash: Vec<u8> = id.as_bytes().to_vec();
+        hash.resize(32, 0);
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, step_lineage_id) \
+             VALUES ($1, $2, $3, $4, 0.5, jsonb_build_object('level', 2), gen_random_uuid())",
+        )
+        .bind(id)
+        .bind(format!("step {i} {tag}"))
+        .bind(hash)
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("seed step");
+        if !current {
+            sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("retire step");
+        }
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', $3::int))",
+        )
+        .bind(workflow_id)
+        .bind(id)
+        .bind(i as i32)
+        .execute(&pool)
+        .await
+        .expect("seed executes edge");
+        steps.push(id);
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/workflows/hierarchical/search?q=qq{tag}&resolve_to_latest=true"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wf = body["workflows"]
+        .as_array()
+        .expect("workflows array")
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&workflow_id.to_string()))
+        .unwrap_or_else(|| panic!("seeded workflow returned; got {body}"));
+    let resolved = wf["resolved_steps"].as_array().expect("resolved_steps");
+    assert_eq!(resolved.len(), 2, "{wf}");
+    assert_eq!(
+        resolved[0]["heads"][0]["id"].as_str(),
+        Some(steps[0].to_string().as_str())
+    );
+    assert_eq!(
+        resolved[0]["heads"][0]["is_current"],
+        serde_json::json!(true),
+        "a healthy head reports true: {wf}"
+    );
+    assert_eq!(
+        resolved[1]["heads"][0]["id"].as_str(),
+        Some(steps[1].to_string().as_str()),
+        "the retired sole member is still listed: {wf}"
+    );
+    assert_eq!(
+        resolved[1]["heads"][0]["is_current"],
+        serde_json::json!(false),
+        "the retired head is flagged: {wf}"
+    );
+}

@@ -259,6 +259,9 @@ pub struct LineageHeadResult {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `false` for a head retired without a `supersedes` edge: it is still the
+    /// lineage's head, but `evolve_step` refuses to supersede it.
+    pub is_current: bool,
 }
 
 // ── Handlers ──
@@ -1277,6 +1280,7 @@ pub async fn find_workflow_hierarchical(
                                 content: h.content,
                                 truth_value: h.truth_value,
                                 created_at: h.created_at,
+                                is_current: h.is_current,
                             })
                             .collect(),
                         pending_resolution: s.pending_resolution,

@@ -1021,8 +1021,17 @@ impl WorkflowRepository {
     /// Returns `Ok(None)` when the workflow name is unknown or `step_index` is
     /// out of range.
     ///
+    /// "Current head" means a head with `is_current` (newest first): a head
+    /// is structural (no incoming `supersedes` edge), so a claim retired
+    /// without one is still listed as a head, and superseding it is refused
+    /// by `evolve_step_conn` with an opaque guard error (bridge 00132b1d).
+    /// When the lineage has heads and NONE is current, this refuses with
+    /// [`DbError::InvalidData`] naming the retired head, rather than handing
+    /// back a claim the caller cannot evolve or should not attach evidence to.
+    ///
     /// # Errors
-    /// Returns `DbError` if a database query fails.
+    /// Returns `DbError` if a database query fails, and
+    /// `DbError::InvalidData` when every head of the step's lineage is retired.
     pub async fn resolve_step_claim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -1047,10 +1056,17 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let target = if prefer_head {
-            step.heads
-                .first()
-                .map(|h| h.id)
-                .unwrap_or(step.frozen_claim_id)
+            let current = step.heads.iter().find(|h| h.is_current);
+            if let (None, Some(retired)) = (current, step.heads.first()) {
+                let reason = format!(
+                    "step {step_index} of workflow '{canonical_name}': its lineage head {} is \
+                     retired (is_current=false, with no supersedes edge), so it cannot be \
+                     evolved or take evidence; revive or re-ingest the step first",
+                    retired.id
+                );
+                return Err(DbError::InvalidData { reason });
+            }
+            current.map_or(step.frozen_claim_id, |h| h.id)
         } else {
             step.frozen_claim_id
         };
@@ -1184,12 +1200,14 @@ impl WorkflowRepository {
                 content: String,
                 truth_value: f64,
                 created_at: chrono::DateTime<chrono::Utc>,
+                is_current: bool,
             }
 
             // The `NOT EXISTS` over `edges` is an exclusion test, left
             // unfiltered for the same reason as `latest_in_lineage`'s.
             let head_sql = viewer.splice(
-                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at \
+                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at, \
+                        COALESCE(c.is_current, true) AS is_current \
                  FROM claims c \
                  WHERE c.step_lineage_id = ANY($1) \
                    AND NOT EXISTS ( \
@@ -1216,6 +1234,7 @@ impl WorkflowRepository {
                         content: row.content,
                         truth_value: row.truth_value,
                         created_at: row.created_at,
+                        is_current: row.is_current,
                     });
             }
         }
