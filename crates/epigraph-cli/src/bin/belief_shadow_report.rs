@@ -5,7 +5,8 @@
 //!
 //! It writes nothing to the database: every read runs on one session set
 //! `default_transaction_read_only`. It writes files only, under
-//! `--out/<UTC stamp>/<viewer>/` (directories mode 0700):
+//! `--out/<UTC stamp, to the microsecond>/<viewer>/` (directories mode 0700;
+//! a run never writes into an existing stamped directory):
 //!
 //! * `claims.jsonl`: one line per claim the viewer can read;
 //! * `summary.json`: the corpus statistics;
@@ -147,6 +148,15 @@ fn private_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Create `path` (mode 0700), failing if it exists.
+fn new_private_dir(path: &Path) -> Result<(), String> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn writer(path: &Path) -> Result<BufWriter<std::fs::File>, String> {
     std::fs::File::create(path)
         .map(BufWriter::new)
@@ -249,9 +259,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         opts.graph_view_exposure = Some(m);
     }
 
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    // A fresh directory per run: microseconds in the stamp, and created
+    // without `recursive`, so an existing one is refused rather than written
+    // into.
+    private_dir(&cli.out)?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ").to_string();
     let root = cli.out.join(stamp);
-    private_dir(&root)?;
+    new_private_dir(&root)?;
 
     // Built after clap has parsed, so an argv error reads as one. The
     // maintenance session is held for the whole run, and every read runs on
