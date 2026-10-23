@@ -773,6 +773,13 @@ impl DuplicateProvenance {
     }
 }
 
+/// Labels a supersession does NOT carry from the retired claim onto its
+/// replacement ([`ClaimRepository::supersede_act_conn`] carries every other
+/// one). `near-duplicate` is the novelty gate's flag on one submission (its
+/// content was near another claim's); on the replacement, whose content is
+/// new, it would read as pointing at its own predecessor.
+pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -6114,10 +6121,13 @@ impl ClaimRepository {
         .fetch_optional(&mut *conn)
         .await?;
 
-        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
+        let (agent_id, is_current, mut old_labels) = old_row.ok_or(DbError::NotFound {
             entity: "Claim".to_string(),
             id: old_uuid,
         })?;
+        // Per-submission review flags describe the OLD content, not the
+        // replacement's, so they do not carry (see `NON_CARRIED_LABELS`).
+        old_labels.retain(|l| !NON_CARRIED_LABELS.contains(&l.as_str()));
 
         if !is_current {
             return Err(DbError::QueryFailed {
