@@ -39,12 +39,15 @@ const ATTESTOR: &str = "epigraph_identity_attestor";
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
 const MODEL: &str = "test-model-1";
 
-/// A synthetic identity: a random 32-byte public key and a prompt hash that is
-/// a function of it (the real one is the BLAKE3 of the prompt files; nothing
-/// here depends on how it was computed, only that it is 64 hex chars).
+/// A synthetic identity: a random 32-byte public key, a prompt hash that is a
+/// function of it (the real one is the BLAKE3 of the prompt files; nothing
+/// here depends on how it was computed, only that it is 64 hex chars), and the
+/// signing key the host generated for it ONCE (D2): every registration of the
+/// same identity presents the same signing key, as the host does.
 struct Identity {
     pubkey: Vec<u8>,
     prompt_hash: String,
+    signing: Vec<u8>,
 }
 
 fn random32() -> Vec<u8> {
@@ -56,9 +59,13 @@ fn random32() -> Vec<u8> {
 fn new_identity() -> Identity {
     let pubkey = random32();
     let prompt_hash = blake3::hash(&pubkey).to_hex().to_string();
+    let signing = blake3::hash(&[b"signing:".as_slice(), &pubkey].concat())
+        .as_bytes()
+        .to_vec();
     Identity {
         pubkey,
         prompt_hash,
+        signing,
     }
 }
 
@@ -166,7 +173,7 @@ async fn try_register(
         id,
         parent,
         group,
-        Some(random32()),
+        Some(id.signing.clone()),
         snap,
         None,
     )
@@ -987,6 +994,7 @@ async fn a_registered_identity_records_its_model_and_refuses_a_mismatch(pool: Pg
     let wrong = Identity {
         pubkey: id.pubkey.clone(),
         prompt_hash: blake3::hash(b"other").to_hex().to_string(),
+        signing: id.signing.clone(),
     };
     let before = footprint(&pool).await;
     let err = try_register(&pool, &wrong, None, "g-m", snapshot("g", "l"))
