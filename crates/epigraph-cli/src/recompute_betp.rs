@@ -13,11 +13,28 @@
 //! logic — see `crates/epigraph-cli/src/bin/recompute_claim_belief.rs` for
 //! the established per-claim, per-frame pattern this module mirrors.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Write as _;
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_engine::atom_items::AtomFoldMode;
-use epigraph_engine::edge_factor::{AtomCacheOutcome, CacheWriteCause, LegacyFold};
+use epigraph_db::repos::claim_role::{claim_role_sql, ClaimRole};
+use epigraph_db::repos::mass_function::ingest_template_predicate;
+use epigraph_engine::atom_items::{
+    atom_drift_rows, drift_atom_fold, drift_legacy_grouping_betp, drift_scope_fold,
+    AtomFoldMode, AxiomMode, CompoundSourceEdges, EvidencedInterval,
+};
+use epigraph_engine::edge_factor::{
+    AtomCacheOutcome, AtomCacheSettings, CacheWriteCause, LegacyFold, VacateOutcome,
+};
+
+use crate::belief_cache::{
+    read_cache_columns, scoped_sidecar_path, write_scoped_record, write_wave_record, CacheColumns,
+    ScopedColumns, ScopedWaveRecord, WaveRecord,
+};
 
 /// Cohort SQL: claims whose cached BetP is due for a refresh under the
 /// current (dynamic reliability) combine pipeline.
@@ -214,6 +231,9 @@ pub const fn outcome_written(outcome: &AtomCacheOutcome) -> bool {
     }
 }
 
+/// BetP of the vacuous interval (Bel 0, Pl 1).
+const VACUOUS_BETP: f64 = 0.5;
+
 /// The CLI spelling of a fold mode (as `EPIGRAPH_ATOM_FOLD` takes it).
 #[must_use]
 pub const fn fold_str(fold: AtomFoldMode) -> &'static str {
@@ -222,5 +242,114 @@ pub const fn fold_str(fold: AtomFoldMode) -> &'static str {
         AtomFoldMode::AefStandalone => "aef_standalone",
         AtomFoldMode::Aef => "aef",
     }
+}
+
+// ── cohort v2: waves over evidenced atoms (SPEC §10.3, §10.7) ──────────────
+
+/// Which atoms a wave covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveRole {
+    /// Claims with no in-force `decomposes_to` in either direction (W0).
+    Standalone,
+    /// Decomposition leaves: a `decomposes_to` in-edge and none out (W1).
+    Leaf,
+}
+
+impl WaveRole {
+    /// Parse `standalone` / `leaf`.
+    #[must_use]
+    pub fn parse_value(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "standalone" => Some(Self::Standalone),
+            "leaf" => Some(Self::Leaf),
+            _ => None,
+        }
+    }
+
+    /// The CLI spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Leaf => "leaf",
+        }
+    }
+
+    /// The [`ClaimRole`] this wave covers.
+    #[must_use]
+    pub const fn claim_role(self) -> ClaimRole {
+        match self {
+            Self::Standalone => ClaimRole::Standalone,
+            Self::Leaf => ClaimRole::Atom,
+        }
+    }
+
+    /// Whether `fold` folds this role's caches with the AEF (SPEC §10.2):
+    /// standalones under `aef_standalone` and `aef`, leaves under `aef` only.
+    #[must_use]
+    pub const fn folded_by(self, fold: AtomFoldMode) -> bool {
+        match self {
+            Self::Standalone => matches!(fold, AtomFoldMode::AefStandalone | AtomFoldMode::Aef),
+            Self::Leaf => matches!(fold, AtomFoldMode::Aef),
+        }
+    }
+}
+
+/// How many claims one AEF-input probe reads at a time.
+const COHORT_PROBE_CHUNK: usize = 500;
+
+/// The wave cohort (SPEC §10.7): current claims of `role` (never a compound,
+/// a procedural or a rule claim) whose AEF input is non-empty, as the single
+/// atom-cache writer reads it under `compound_source_edges` (P1). A claim
+/// whose only input is the ingest template, a cached combination or nothing
+/// is not in it. Ordered by id.
+///
+/// # Errors
+/// A database read.
+pub async fn select_wave_cohort(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    role: WaveRole,
+    compound_source_edges: CompoundSourceEdges,
+) -> Result<Vec<Uuid>, String> {
+    // Candidates: current claims of the role that carry at least one BBA (a
+    // claim with none has no AEF input; the EXISTS keeps the role expression
+    // off claims that cannot qualify). The role is CLAIM_ROLE_SQL, the one
+    // spelling (`epigraph_db::repos::claim_role`).
+    let sql = format!(
+        "SELECT c.id FROM claims c \
+          WHERE c.is_current \
+            AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.claim_id = c.id) \
+            AND {role_sql} = $1 \
+          ORDER BY c.id",
+        role_sql = claim_role_sql("c"),
+    );
+    let candidates: Vec<Uuid> = sqlx::query_scalar(&sql)
+        .bind(role.claim_role().as_sql())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("wave cohort candidates: {e}"))?;
+
+    let ctx = epigraph_engine::belief_query::FramedBeliefContext::global();
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let mut cohort = Vec::new();
+    for chunk in candidates.chunks(COHORT_PROBE_CHUNK) {
+        let inputs = epigraph_engine::atom_items::atom_axiom_rows_under(
+            &mut conn,
+            viewer,
+            chunk,
+            AxiomMode::Display,
+            &ctx,
+            compound_source_edges,
+        )
+        .await?;
+        cohort.extend(
+            chunk
+                .iter()
+                .copied()
+                .filter(|id| inputs.get(id).is_some_and(|rows| !rows.is_empty())),
+        );
+    }
+    Ok(cohort)
 }
 
