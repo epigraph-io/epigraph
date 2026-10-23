@@ -1105,8 +1105,14 @@ fn component(line: &serde_json::Value, key: &str) -> Option<f64> {
 /// * (0b) organic: a cache rewritten after S0;
 /// * (0c) clamp residue: a BetP held up by `ds_auto`'s monotonicity clamp;
 /// * (2) the template drop: an ingest template beside real evidence;
-/// * (3c) paper-key grouping: two agents' rows citing one DOI;
+/// * (3c) paper-key grouping: two agents' rows citing one DOI (and not two
+///   agents' rows citing two DOIs, the negative control);
 /// * (4) attribution: an `attributed_v1` row.
+///
+/// Two stages are also pinned to independent writers, through TWIN claims:
+/// (2) of the templated atom is what the legacy writer caches for a twin
+/// holding only its evidence row, and (3c) of the one-paper atom is what the
+/// wave caches for a twin holding one of its two rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
     let dir = scratch_dir();
@@ -1180,6 +1186,55 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
     .await;
     set_sentinel(&pool, one_paper, bin, 0.02).await;
 
+    // The negative control: two agents' rows citing two DOIs.
+    let two_papers = claim(&pool, owner, "two papers, two agents").await;
+    let ev_c = evidence(&pool, two_papers, Some("10.1000/paper-c")).await;
+    let ev_d = evidence(&pool, two_papers, Some("10.1000/paper-d")).await;
+    insert_row(
+        &pool,
+        two_papers,
+        &evidence_row(bin, source, 0.7, Some(ev_c)),
+    )
+    .await;
+    insert_row(
+        &pool,
+        two_papers,
+        &evidence_row(bin, other_source, 0.7, Some(ev_d)),
+    )
+    .await;
+    set_sentinel(&pool, two_papers, bin, 0.04).await;
+
+    // The twins. The template twin's legacy value is read now, before the
+    // wave rewrites it, with explicit legacy settings.
+    let template_twin = claim(&pool, owner, "twin: the evidence row alone").await;
+    insert_row(&pool, template_twin, &evidence_row(rv, source, 0.6, None)).await;
+    epigraph_engine::edge_factor::recompute_atom_cache_with(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        template_twin,
+        epigraph_engine::edge_factor::CacheWriteCause::Organic,
+        epigraph_engine::edge_factor::LegacyFold::OwnerFrame,
+        epigraph_engine::edge_factor::AtomCacheSettings {
+            fold: epigraph_engine::atom_items::AtomFoldMode::Legacy,
+            compound_source_edges: epigraph_engine::atom_items::CompoundSourceEdges::Frozen,
+            vacate_on_evidence_removal: true,
+        },
+    )
+    .await
+    .expect("the legacy writer");
+    let template_twin_legacy = cache(&pool, template_twin)
+        .await
+        .pignistic_prob
+        .expect("the legacy writer cached the twin");
+    let paper_twin = claim(&pool, owner, "twin: one row of the paper").await;
+    let ev_twin = evidence(&pool, paper_twin, Some("10.1000/one-paper")).await;
+    insert_row(
+        &pool,
+        paper_twin,
+        &evidence_row(bin, source, 0.7, Some(ev_twin)),
+    )
+    .await;
+
     // (4) an attributed_v1 row beside ordinary evidence.
     let attributed = claim(&pool, owner, "attributed").await;
     insert_row(&pool, attributed, &evidence_row(bin, source, 0.6, None)).await;
@@ -1227,7 +1282,9 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
     )
     .ok("the real wave");
 
-    let seeded = [organic, clamped, templated, one_paper, attributed];
+    let seeded = [
+        organic, clamped, templated, one_paper, two_papers, attributed,
+    ];
     let mut seen = HashSet::new();
     for line in &lines {
         let id: Uuid = line["claim_id"].as_str().unwrap().parse().unwrap();
@@ -1281,6 +1338,29 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
             }
         }
     }
+
+    // The stage pins.
+    let stage = |id: Uuid, key: &str| {
+        by_id[&id]["stages"][key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("stage ({key}) of {id}: {}", by_id[&id]))
+    };
+    assert!(
+        (stage(templated, "2") - template_twin_legacy).abs() < 1e-12,
+        "(2) is the legacy owner fold without the template: {} vs the twin's {}",
+        stage(templated, "2"),
+        template_twin_legacy
+    );
+    let paper_twin_aef = cache(&pool, paper_twin)
+        .await
+        .pignistic_prob
+        .expect("the wave wrote the twin");
+    assert!(
+        (stage(one_paper, "3c") - paper_twin_aef).abs() < 1e-12,
+        "(3c) folds the two rows of one paper as ONE item: {} vs the one-row twin's {}",
+        stage(one_paper, "3c"),
+        paper_twin_aef
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
