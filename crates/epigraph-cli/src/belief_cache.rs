@@ -229,6 +229,27 @@ impl RestoreReport {
             ("not_in_wave", &self.not_in_wave),
         ]
     }
+
+    /// Add `other`'s outcomes to this report's.
+    pub fn append(&mut self, other: RestoreReport) {
+        // Destructured, so a new bucket cannot be forgotten here.
+        let RestoreReport {
+            restored,
+            restored_partial,
+            already_restored,
+            superseded_since_wave,
+            missing,
+            frame_gone,
+            not_in_wave,
+        } = other;
+        self.restored.extend(restored);
+        self.restored_partial.extend(restored_partial);
+        self.already_restored.extend(already_restored);
+        self.superseded_since_wave.extend(superseded_since_wave);
+        self.missing.extend(missing);
+        self.frame_gone.extend(frame_gone);
+        self.not_in_wave.extend(not_in_wave);
+    }
 }
 
 /// An edge whose source is a wave claim and which was created, or had its
@@ -549,12 +570,44 @@ fn bind_wave_rows<'q>(
 /// batch back.
 ///
 /// # Errors
-/// Any database error; batches already committed stay committed.
+/// Any database error; batches already committed stay committed, and their
+/// outcomes are lost to the caller. Use [`restore_wave_with`] to record each
+/// batch as it commits.
 pub async fn restore_wave(
     pool: &PgPool,
     plan: &RestorePlan,
     opts: &RestoreOptions,
 ) -> anyhow::Result<RestoreReport> {
+    let mut report = RestoreReport {
+        not_in_wave: plan.not_in_wave.clone(),
+        ..RestoreReport::default()
+    };
+    restore_wave_with(pool, plan, opts, |batch| {
+        report.append(batch.clone());
+        Ok(())
+    })
+    .await?;
+    Ok(report)
+}
+
+/// [`restore_wave`], handing each batch's outcomes to `on_batch` right after
+/// that batch commits (or, with `dry_run`, rolls back), so a later batch's
+/// failure cannot lose the record of what earlier batches did. The batch
+/// reports cover `plan.entries` only; `plan.not_in_wave` is the caller's.
+///
+/// # Errors
+/// Any database error, or `on_batch`'s; batches already committed stay
+/// committed and have been handed to `on_batch`, except the one whose
+/// `on_batch` failed.
+pub async fn restore_wave_with<F>(
+    pool: &PgPool,
+    plan: &RestorePlan,
+    opts: &RestoreOptions,
+    mut on_batch: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&RestoreReport) -> anyhow::Result<()>,
+{
     let restore_sql = format!(
         "{WAVE_ROWS_CTE} \
          UPDATE claims c \
@@ -580,11 +633,8 @@ pub async fn restore_wave(
         before = cache_equals("b"),
     );
 
-    let mut report = RestoreReport {
-        not_in_wave: plan.not_in_wave.clone(),
-        ..RestoreReport::default()
-    };
     for chunk in plan.entries.chunks(opts.batch_size.max(1)) {
+        let mut report = RestoreReport::default();
         let mut tx = pool.begin().await?;
         let restored: HashSet<Uuid> = bind_wave_rows(sqlx::query(&restore_sql), chunk)
             .fetch_all(&mut *tx)
@@ -631,8 +681,9 @@ pub async fn restore_wave(
         } else {
             tx.commit().await?;
         }
+        on_batch(&report)?;
     }
-    Ok(report)
+    Ok(())
 }
 
 /// The edges a wave claim in scope sourced whose edge-factor BBA may have

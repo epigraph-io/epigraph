@@ -23,6 +23,11 @@
 //!   wave's value; re-wire exactly those targets afterwards (SPEC §10.8), then
 //!   run the floor job.
 //!
+//! Outcomes are written and flushed batch by batch, as each commits. If a
+//! batch fails, the batches before it stay committed: the run still writes
+//! the downstream list, prints the counts so far, and exits non-zero, and the
+//! outcomes file lists exactly the committed claims (plus `not_in_wave`).
+//!
 //! Only counts are printed; ids stay in the files. `--dry-run` runs the same
 //! statements and rolls every batch back.
 
@@ -35,8 +40,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use epigraph_cli::belief_cache::{
-    downstream_edges, plan_restore, read_claim_ids, read_wave, restore_wave, RestoreOptions,
-    DEFAULT_RESTORE_BATCH,
+    downstream_edges, plan_restore, read_claim_ids, read_wave, restore_wave_with, RestoreOptions,
+    RestoreReport, DEFAULT_RESTORE_BATCH,
 };
 
 #[derive(Parser, Debug)]
@@ -135,31 +140,46 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let maint = epigraph_cli::MaintenancePool::connect("restore_belief_cache")
         .await
         .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    let report = restore_wave(
+
+    // Outcomes are written and flushed per batch, right after it commits, so a
+    // later batch's failure still leaves the record of what committed.
+    let mut report = RestoreReport {
+        not_in_wave: plan.not_in_wave.clone(),
+        ..RestoreReport::default()
+    };
+    write_outcomes(&mut outcomes_w, &report)?;
+    let restore = restore_wave_with(
         maint.pool(),
         &plan,
         &RestoreOptions {
             batch_size: cli.batch_size,
             dry_run: cli.dry_run,
         },
+        |batch| {
+            write_outcomes(&mut outcomes_w, batch)?;
+            report.append(batch.clone());
+            Ok(())
+        },
     )
-    .await?;
-    let downstream = downstream_edges(maint.pool(), &plan).await?;
+    .await;
 
-    let buckets = report.buckets();
-    for (outcome, ids) in buckets {
-        for &claim_id in ids {
-            serde_json::to_writer(&mut outcomes_w, &Outcome { claim_id, outcome })?;
-            outcomes_w.write_all(b"\n")?;
+    // Listed even when a batch failed: the committed ones need the re-wire.
+    let downstream = match downstream_edges(maint.pool(), &plan).await {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(match restore {
+                Err(r) => r.context(format!("and listing the downstream edges failed: {e:#}")),
+                Ok(()) => e,
+            })
         }
-    }
-    outcomes_w.flush()?;
+    };
     for e in &downstream {
         serde_json::to_writer(&mut downstream_w, e)?;
         downstream_w.write_all(b"\n")?;
     }
     downstream_w.flush()?;
 
+    let buckets = report.buckets();
     if cli.dry_run {
         println!("DRY RUN: every batch rolled back");
     }
@@ -170,5 +190,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     println!("downstream_edges: {}", downstream.len());
     println!("outcomes: {}", outcomes_path.display());
     println!("downstream: {}", downstream_path.display());
+    restore.map_err(|e| e.context("restore stopped; the outcomes file lists every committed batch"))
+}
+
+fn write_outcomes(out: &mut BufWriter<File>, report: &RestoreReport) -> anyhow::Result<()> {
+    for (outcome, ids) in report.buckets() {
+        for &claim_id in ids {
+            serde_json::to_writer(&mut *out, &Outcome { claim_id, outcome })?;
+            out.write_all(b"\n")?;
+        }
+    }
+    out.flush()?;
     Ok(())
 }
