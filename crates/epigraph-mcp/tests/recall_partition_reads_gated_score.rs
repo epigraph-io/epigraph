@@ -184,7 +184,8 @@ fn recall_params(query: &str) -> RecallParams {
 
 // ── recall ───────────────────────────────────────────────────────────────
 
-/// SPEC §7.2 (recall row): `confirmed` is decided on the gated score.
+/// `recall`: `confirmed` is decided on the gated score, the value `min_truth`
+/// compares against.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_partitions_on_the_gated_score_not_truth_value(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -418,7 +419,7 @@ async fn recall_with_context_partitions_on_the_gated_score_not_truth_value(pool:
     assert_cut_is_monotone_in_gated_score(&env);
 }
 
-/// SPEC §7.2 (recall_with_context): context atoms carry the atom's effective
+/// `recall_with_context`: context atoms carry the atom's effective
 /// belief next to its authored value. The atom with a DS cache must report the
 /// cached BetP, which differs from its `truth_value`; the atom without one must
 /// report the fall-back, equal to its `truth_value` — the same "equality means

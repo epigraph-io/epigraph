@@ -1,4 +1,5 @@
-//! Engine twin of the MCP recall partition fix (SPEC §7.2, recall row).
+//! Engine twin of the MCP recall partition fix (see
+//! `epigraph-mcp/tests/recall_partition_reads_gated_score.rs`).
 //!
 //! `epigraph_engine::recall::recall` (the library path other crates seed
 //! from) has no epistemic partition, so the property it must hold is the one
