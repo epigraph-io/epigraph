@@ -67,7 +67,12 @@ where
     let env_filter = rust_log
         .and_then(|directives| EnvFilter::try_new(directives).ok())
         .unwrap_or_else(|| EnvFilter::new(DEFAULT_DIRECTIVES));
-    let cap = Targets::new().with_default(LevelFilter::TRACE);
+    // The cap's default is the EnvFilter's own ceiling, not TRACE: the
+    // subscriber's max-level hint (hence `LevelFilter::current()` and the
+    // `log` bridge's max level) is the max over both layers, and the cap must
+    // only narrow `RUST_LOG`, never widen what callsites are evaluated.
+    let hint = env_filter.max_level_hint().unwrap_or(LevelFilter::TRACE);
+    let cap = Targets::new().with_default(hint);
     let cap = if log_payloads {
         cap
     } else {

@@ -144,3 +144,28 @@ fn payload_opt_in_requires_an_explicit_value() {
     }
     assert!(!log_filter::payload_logging_opted_in(None));
 }
+
+/// The cap must not raise the process-wide max level above what `RUST_LOG`
+/// asks for. `LevelFilter::current()` (and the `log`-crate bridge's max level,
+/// set from it at init) is the subscriber's `max_level_hint`, and a layered
+/// filter's hint is the max of its layers' hints. A cap whose default is TRACE
+/// would make every disabled `debug!` / `trace!` callsite in every dependency
+/// build its record before being rejected.
+#[test]
+fn cap_does_not_raise_the_max_level_hint() {
+    use tracing::level_filters::LevelFilter;
+    use tracing::Subscriber;
+
+    for (rust_log, ceiling) in [
+        (None, LevelFilter::INFO),
+        (Some("warn"), LevelFilter::INFO),
+        (Some("debug"), LevelFilter::DEBUG),
+        (Some("[serve_inner]=debug"), LevelFilter::DEBUG),
+    ] {
+        let hint = log_filter::subscriber(rust_log, false, io::sink).max_level_hint();
+        assert!(
+            hint.is_some_and(|h| h <= ceiling),
+            "RUST_LOG={rust_log:?}: max_level_hint {hint:?} exceeds {ceiling:?}"
+        );
+    }
+}
