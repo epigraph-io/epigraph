@@ -4,8 +4,10 @@
 //! The table below was recorded by folding every fixture in
 //! `support/belief_fixtures.rs` with the calibration-taking reliability
 //! functions and the literal conflict threshold, on the commit this branch
-//! starts from, before any belief-profile code existed. It covers the loaded
-//! `calibration.toml` AND `CalibrationConfig::default_for_phase2_fallback()`
+//! starts from, before any belief-profile code existed. It covers that
+//! commit's `calibration.toml` (snapshotted as
+//! `support/golden_calibration.toml`, so a later calibration tune cannot turn
+//! a code-equivalence test red) AND `CalibrationConfig::default_for_phase2_fallback()`
 //! (the configuration a process runs on when `calibration.toml` cannot be
 //! found), across every tier of the per-BBA reliability chain.
 //!
@@ -64,7 +66,7 @@ const GOLDEN: &[Golden] = &[
 
 fn config(name: &str) -> CalibrationConfig {
     match name {
-        "toml" => fixtures::workspace_calibration(),
+        "toml" => fixtures::golden_calibration(),
         "fallback" => CalibrationConfig::default_for_phase2_fallback(),
         other => panic!("unknown golden config {other}"),
     }
@@ -165,20 +167,22 @@ fn calibration_taking_reliability_functions_still_reproduce_the_golden_fold() {
 #[test]
 fn a_named_global_profile_restating_todays_values_changes_nothing() {
     // The calibration.toml tier: a `[belief_profiles.<default name>]` table
-    // that restates today's values must be a no-op, value for value.
-    let text = std::fs::read_to_string(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml"),
-    )
-    .unwrap();
-    let restated = format!(
-        "{text}\n[belief_profiles.\"{name}\".reliability]\n\
-         unknown_evidence_type_weight = 0.5\ncross_locality_factor = 1.0\n\
-         intra_evidence_locality_factor = 0.3\n\
-         [belief_profiles.\"{name}\".combination]\nconflict_threshold = 0.9\n",
-        name = epigraph_engine::belief_profile::DEFAULT_PROFILE_NAME
+    // that restates today's values must be a no-op, value for value. Inserted
+    // into the parsed map (the shape the TOML table deserializes to), so the
+    // test does not depend on the text of any calibration file.
+    let mut cal = fixtures::golden_calibration();
+    cal.belief_profiles.insert(
+        epigraph_engine::belief_profile::DEFAULT_PROFILE_NAME.to_string(),
+        serde_json::json!({
+            "reliability": {
+                "unknown_evidence_type_weight": 0.5,
+                "cross_locality_factor": 1.0,
+                "intra_evidence_locality_factor": 0.3
+            },
+            "combination": { "conflict_threshold": 0.9 }
+        }),
     );
-    let cal: CalibrationConfig = toml::from_str(&restated).expect("restated toml parses");
-    let base = fixtures::workspace_calibration();
+    let base = fixtures::golden_calibration();
     assert_eq!(
         BeliefProfile::from_calibration(&cal).profile_hash(),
         BeliefProfile::from_calibration(&base).profile_hash(),
@@ -198,17 +202,17 @@ fn a_named_global_profile_restating_todays_values_changes_nothing() {
 fn the_named_global_profile_in_calibration_toml_is_honoured_by_the_fold() {
     // The same tier, moving a value: the unknown-type weight is what a row
     // with neither an evidence type nor a stored strength is discounted by.
-    let text = std::fs::read_to_string(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml"),
-    )
-    .unwrap();
+    // Written as TOML so the file-to-profile path is exercised end to end; it
+    // is appended to the frozen snapshot, which carries no active
+    // `[belief_profiles]` table to collide with.
     let moved = format!(
-        "{text}\n[belief_profiles.\"{}\".reliability]\nunknown_evidence_type_weight = 0.25\n",
+        "{}\n[belief_profiles.\"{}\".reliability]\nunknown_evidence_type_weight = 0.25\n",
+        fixtures::golden_calibration_text(),
         epigraph_engine::belief_profile::DEFAULT_PROFILE_NAME
     );
     let cal: CalibrationConfig = toml::from_str(&moved).expect("toml parses");
     let c = case("tier_mix_global");
-    let base = fixtures::workspace_calibration();
+    let base = fixtures::golden_calibration();
     let before = profile_fold(&c, &base);
     let after = profile_fold(&c, &cal);
     // Row 4 (index) is the NULL-type, NULL-strength row; row 6 is the

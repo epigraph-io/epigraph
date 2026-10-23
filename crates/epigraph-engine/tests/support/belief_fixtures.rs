@@ -383,8 +383,22 @@ pub fn legacy_fold(case: &Case, cal: &CalibrationConfig) -> FoldBits {
     bits_of(&alphas, &combined, conflict)
 }
 
-/// The calibration loaded from the workspace `calibration.toml`, uncached.
-pub fn workspace_calibration() -> CalibrationConfig {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml");
-    CalibrationConfig::load(&path).expect("calibration.toml loads")
+/// `calibration.toml` as it stood on the commit the belief-profile work
+/// started from, snapshotted beside this file. The golden fold values were
+/// recorded under it, so they pin the CODE, not whatever the workspace
+/// calibration holds today: a later calibration tune, or an active
+/// `[belief_profiles]` table in the workspace file, cannot turn them red.
+pub fn golden_calibration() -> CalibrationConfig {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/support/golden_calibration.toml");
+    CalibrationConfig::load(&path).expect("the golden calibration snapshot loads")
+}
+
+/// The golden calibration snapshot's text, for tests that append a TOML table.
+pub fn golden_calibration_text() -> String {
+    std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/support/golden_calibration.toml"),
+    )
+    .expect("the golden calibration snapshot reads")
 }

@@ -37,7 +37,7 @@ fn populated(order_reversed: bool) -> BeliefProfile {
         source_reliability: src.into_iter().map(|(k, v)| (k.into(), v)).collect(),
         locality_reliability: loc.into_iter().map(|(k, v)| (k.into(), v)).collect(),
     };
-    BeliefProfile::from_calibration(&fixtures::workspace_calibration()).resolve(
+    BeliefProfile::from_calibration(&fixtures::golden_calibration()).resolve(
         FrameTier {
             overrides: None,
             intra_evidence_locality_factor: Some(0.45),
