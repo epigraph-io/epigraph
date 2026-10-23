@@ -43,8 +43,17 @@ const TAG: &str = "partition-gated-score-fixture";
 const DIM: usize = 1536;
 
 /// Gate low enough that every fixture claim is admitted on either reading, so
-/// the gate itself never decides an assertion below — only the partition does.
+/// the gate itself never decides the open-gate assertions — only the partition
+/// does. It is also the retrievability control for the biting-gate pass: a
+/// claim present here and absent there was dropped by the gate.
 const OPEN_GATE: f64 = 0.3;
+
+/// Gate strictly between the fixtures' low reading (0.4) and their high one
+/// (0.9), so it admits a claim on exactly one of its two numbers. Under it the
+/// SAME response must show the gate and the partition reading the same score:
+/// the claim whose BetP is below the gate is gone from every bucket, and the
+/// claims whose gated score clears it are present and `confirmed`.
+const BITING_GATE: f64 = 0.5;
 
 fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
@@ -134,38 +143,32 @@ fn ids(env: &Value, bucket: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The confirmed / uncertain split among UNCONTESTED hits must be a cut on the
-/// score each row reports as `belief_score` (what `min_truth` compared
-/// against): no uncertain hit may report a higher gated score than a confirmed
-/// one. This does not restate the threshold; it says the partition and the
-/// gate rank claims the same way. A partition that reads any other number
-/// breaks it as soon as the two numbers disagree in order.
-fn assert_cut_is_monotone_in_gated_score(env: &Value) {
-    let score = |r: &Value| {
-        r["belief_score"]
-            .as_f64()
-            .expect("belief_score on every row")
-    };
-    let lowest_confirmed = rows(env, "confirmed")
-        .iter()
-        .map(score)
-        .fold(f64::INFINITY, f64::min);
-    let highest_uncertain = rows(env, "uncertain")
-        .iter()
-        .map(score)
-        .fold(f64::NEG_INFINITY, f64::max);
-    assert!(
-        highest_uncertain < lowest_confirmed,
-        "an `uncertain` hit reports a higher gated belief_score ({highest_uncertain}) than a \
-         `confirmed` hit ({lowest_confirmed}): the partition is not reading the score the \
-         gate reads. envelope={env:#?}"
+/// Every id the partition returned, across all three buckets. Asserts the
+/// bucket set is exactly the documented one first, so a renamed or added
+/// bucket cannot make an absence check pass by looking in the wrong place.
+fn all_ids(env: &Value, key: &str) -> Vec<String> {
+    let mut buckets: Vec<&str> = env["epistemic_partition"]
+        .as_object()
+        .unwrap_or_else(|| panic!("epistemic_partition object missing from {env:#?}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    buckets.sort_unstable();
+    assert_eq!(
+        buckets,
+        ["confirmed", "open_question", "uncertain"],
+        "unexpected partition buckets"
     );
+    ["confirmed", "uncertain", "open_question"]
+        .iter()
+        .flat_map(|b| ids(env, b, key))
+        .collect()
 }
 
-fn recall_params(query: &str) -> RecallParams {
+fn recall_params(query: &str, min_truth: f64) -> RecallParams {
     RecallParams {
         query: query.to_string(),
-        min_truth: Some(OPEN_GATE),
+        min_truth: Some(min_truth),
         limit: Some(10),
         tags: vec![TAG.to_string()],
         agent_id: None,
@@ -199,9 +202,13 @@ async fn recall_partitions_on_the_gated_score_not_truth_value(pool: PgPool) {
 
     let server = build_test_server(pool);
     let env = envelope(
-        recall(&server, &viewer, recall_params("quorvane anneal finding"))
-            .await
-            .expect("recall ok"),
+        recall(
+            &server,
+            &viewer,
+            recall_params("quorvane anneal finding", OPEN_GATE),
+        )
+        .await
+        .expect("recall ok"),
     );
     let confirmed = ids(&env, "confirmed", "claim_id");
     let uncertain = ids(&env, "uncertain", "claim_id");
@@ -218,7 +225,7 @@ async fn recall_partitions_on_the_gated_score_not_truth_value(pool: PgPool) {
     );
     assert!(
         confirmed.contains(&understated.to_string()),
-        "a claim the gate admitted on BetP 0.9 was partitioned on its truth_value 0.4. \
+        "a claim with BetP 0.9 was partitioned on its truth_value 0.4. \
          confirmed={confirmed:?} uncertain={uncertain:?}"
     );
     assert!(
@@ -227,7 +234,36 @@ async fn recall_partitions_on_the_gated_score_not_truth_value(pool: PgPool) {
          reading 'no cache' as 'not believed' would demote the whole un-assessed corpus. \
          confirmed={confirmed:?}"
     );
-    assert_cut_is_monotone_in_gated_score(&env);
+
+    // Same fixtures, gate between the two readings: gate and partition must
+    // agree inside ONE response.
+    let env = envelope(
+        recall(
+            &server,
+            &viewer,
+            recall_params("quorvane anneal finding", BITING_GATE),
+        )
+        .await
+        .expect("recall ok"),
+    );
+    let returned = all_ids(&env, "claim_id");
+    let confirmed = ids(&env, "confirmed", "claim_id");
+    assert!(
+        !returned.contains(&inflated.to_string()),
+        "a claim with BetP 0.4 cleared a {BITING_GATE} gate on its truth_value 0.9; the gate \
+         is not reading the score the partition reads. returned={returned:?}"
+    );
+    assert!(
+        confirmed.contains(&understated.to_string()),
+        "a claim with BetP 0.9 and truth_value 0.4 must be admitted by a {BITING_GATE} gate \
+         and reported `confirmed`, both on its BetP. confirmed={confirmed:?} \
+         returned={returned:?}"
+    );
+    assert!(
+        confirmed.contains(&uncached.to_string()),
+        "with no DS state both gate and partition fall back to truth_value 0.9. \
+         confirmed={confirmed:?}"
+    );
 }
 
 // ── recall_with_context ──────────────────────────────────────────────────
@@ -322,11 +358,11 @@ async fn seed_atom(pool: &PgPool, agent: Uuid, paragraph: Uuid, content: &str, t
     id
 }
 
-fn ctx_params(epistemic_partition: bool) -> RecallWithContextParams {
+fn ctx_params(epistemic_partition: bool, min_truth: f64) -> RecallWithContextParams {
     RecallWithContextParams {
         query: "gated score probe".to_string(),
         limit: Some(10),
-        min_truth: Some(OPEN_GATE),
+        min_truth: Some(min_truth),
         centroid_dim: Some(1536),
         paper_doi_filter: None,
         siblings_limit: None,
@@ -390,9 +426,15 @@ async fn recall_with_context_partitions_on_the_gated_score_not_truth_value(pool:
 
     let server = build_test_server(pool);
     let env = envelope(
-        recall_with_context_with_pgvec(&server, &viewer, ctx_params(true), 1536, &query_vec)
-            .await
-            .expect("recall_with_context ok"),
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            ctx_params(true, OPEN_GATE),
+            1536,
+            &query_vec,
+        )
+        .await
+        .expect("recall_with_context ok"),
     );
     let confirmed = ids(&env, "confirmed", "paragraph_id");
     let uncertain = ids(&env, "uncertain", "paragraph_id");
@@ -408,7 +450,7 @@ async fn recall_with_context_partitions_on_the_gated_score_not_truth_value(pool:
     );
     assert!(
         confirmed.contains(&understated.to_string()),
-        "a paragraph the gate admitted on BetP 0.9 was partitioned on its truth_value 0.4. \
+        "a paragraph with BetP 0.9 was partitioned on its truth_value 0.4. \
          confirmed={confirmed:?} uncertain={uncertain:?}"
     );
     assert!(
@@ -416,7 +458,39 @@ async fn recall_with_context_partitions_on_the_gated_score_not_truth_value(pool:
         "with no DS state the partition must fall back to truth_value 0.9, as the gate does. \
          confirmed={confirmed:?}"
     );
-    assert_cut_is_monotone_in_gated_score(&env);
+
+    // Same fixtures, gate between the two readings: on this surface the gate
+    // runs in `recall_with_context_post_embed` and the partition after it, so
+    // only one response can show they read the same number.
+    let env = envelope(
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            ctx_params(true, BITING_GATE),
+            1536,
+            &query_vec,
+        )
+        .await
+        .expect("recall_with_context ok"),
+    );
+    let returned = all_ids(&env, "paragraph_id");
+    let confirmed = ids(&env, "confirmed", "paragraph_id");
+    assert!(
+        !returned.contains(&inflated.to_string()),
+        "a paragraph with BetP 0.4 cleared a {BITING_GATE} gate on its truth_value 0.9; the \
+         gate is not reading the score the partition reads. returned={returned:?}"
+    );
+    assert!(
+        confirmed.contains(&understated.to_string()),
+        "a paragraph with BetP 0.9 and truth_value 0.4 must be admitted by a {BITING_GATE} \
+         gate and reported `confirmed`, both on its BetP. confirmed={confirmed:?} \
+         returned={returned:?}"
+    );
+    assert!(
+        confirmed.contains(&uncached.to_string()),
+        "with no DS state both gate and partition fall back to truth_value 0.9. \
+         confirmed={confirmed:?}"
+    );
 }
 
 /// `recall_with_context`: context atoms carry the atom's effective
@@ -460,9 +534,15 @@ async fn recall_with_context_atoms_carry_effective_belief(pool: PgPool) {
 
     let server = build_test_server(pool);
     let env = envelope(
-        recall_with_context_with_pgvec(&server, &viewer, ctx_params(false), 1536, &query_vec)
-            .await
-            .expect("recall_with_context ok"),
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            ctx_params(false, OPEN_GATE),
+            1536,
+            &query_vec,
+        )
+        .await
+        .expect("recall_with_context ok"),
     );
     let hit = env["results"]
         .as_array()
