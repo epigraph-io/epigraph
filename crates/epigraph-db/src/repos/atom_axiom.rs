@@ -60,6 +60,10 @@ pub struct AtomInputRow {
     /// compound ([`super::claim_role::IS_COMPOUND_SQL`]); `false` on every
     /// other row.
     pub edge_source_is_compound: bool,
+    /// The row's `perspective_id` names an evidence perspective
+    /// (`perspective_type = 'evidence'`, which shares its evidence row's id),
+    /// so the row cites that evidence row even when `evidence_id` is NULL.
+    pub perspective_is_evidence: bool,
 }
 
 /// The candidate AEF input rows of each requested claim, as `viewer` sees
@@ -94,7 +98,11 @@ pub async fn atom_input_rows<'e, E: sqlx::PgExecutor<'e>>(
                        AS hypothesis_promoted,
                    ae.relationship AS edge_relationship,
                    ae.source_id AS edge_source_id,
-                   COALESCE(ae.source_is_compound, false) AS edge_source_is_compound
+                   COALESCE(ae.source_is_compound, false) AS edge_source_is_compound,
+                   EXISTS (SELECT 1 FROM perspectives p
+                            WHERE p.id = mf.perspective_id
+                              AND p.perspective_type = 'evidence'
+                              /* {{VISIBILITY:p}} */) AS perspective_is_evidence
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             JOIN claims c ON c.id = mf.claim_id

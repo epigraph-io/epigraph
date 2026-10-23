@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use epigraph_db::repos::atom_axiom::{atom_input_rows, AtomInputRow};
 use epigraph_db::repos::claim_role::leaf_closure_batch;
-use epigraph_db::{EvidenceRepository, FrameRepository, MassFunctionRow};
+use epigraph_db::{EvidenceRepository, FrameRepository};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 use crate::belief_query::FramedBeliefContext;
@@ -431,7 +431,7 @@ pub async fn atom_axiom_rows_under(
     // The cited evidence each row's key reads, as the viewer sees it.
     let cited: Vec<Uuid> = kept
         .iter()
-        .filter_map(|(r, _, _)| cited_evidence(&r.row))
+        .filter_map(|(r, _, _)| cited_evidence(r))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -462,14 +462,24 @@ pub async fn atom_axiom_rows_under(
             ctx.perspective.as_ref().unwrap_or(&no_lens),
         );
         let bba = combination::discount(&coarse, alpha).map_err(|e| format!("discount: {e}"))?;
-        let evidence = cited_evidence(&r.row).and_then(|id| {
+        let cited = cited_evidence(&r);
+        let evidence = cited.and_then(|id| {
             identities.get(&id).map(|i| ItemEvidence {
                 id,
                 doi: i.doi.clone(),
                 source_url: i.source_url.clone(),
             })
         });
-        let key = item_key(&r.row, evidence.as_ref(), None);
+        let key = match (evidence, cited) {
+            (Some(ev), _) => item_key(&r.row, Some(&ev), None),
+            // Evidence cited only through the row's evidence perspective,
+            // hidden from this viewer: PR-4's rule 3 (`ev:<id>`), exactly as
+            // `item_key` keys a hidden `evidence_id`. The id is already on the
+            // visible row, and rows citing that one evidence row stay one
+            // source for this viewer too.
+            (None, Some(id)) if r.row.evidence_id.is_none() => ItemKey::Evidence(id),
+            (None, _) => item_key(&r.row, None, None),
+        };
         out.entry(r.row.claim_id).or_default().push(AxiomRow {
             row_id: r.row.id,
             atom_id: r.row.claim_id,
@@ -534,10 +544,14 @@ fn classify(r: &AtomInputRow) -> AxiomClass {
 }
 
 /// The evidence row a BBA cites: its `evidence_id`, else its
-/// `perspective_id` (an evidence perspective shares its evidence row's id; a
-/// perspective that is not one names no evidence row and reads as none).
-fn cited_evidence(row: &MassFunctionRow) -> Option<Uuid> {
-    row.evidence_id.or(row.perspective_id)
+/// `perspective_id` when that is an evidence perspective (which shares its
+/// evidence row's id). Any other perspective names no evidence row.
+fn cited_evidence(r: &AtomInputRow) -> Option<Uuid> {
+    r.row.evidence_id.or(if r.perspective_is_evidence {
+        r.row.perspective_id
+    } else {
+        None
+    })
 }
 
 /// A positive-transfer relationship (supports, corroborates, ...), by the
