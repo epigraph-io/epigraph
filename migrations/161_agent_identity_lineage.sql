@@ -169,9 +169,18 @@
 --
 -- Every agent that exists when this runs gets one active `agent_keys` row,
 -- `key_type 'identity-legacy'`, carrying its current public key, valid from
--- the agent's creation and open-ended (`valid_until` is set at cut-over), so
--- claims signed before signing keys exist stay bound to a key. An agent created
--- after this migration gets no such row from it.
+-- the agent's creation and open-ended, so claims signed before signing keys
+-- exist stay bound to a key. The fleet keeps minting unkeyed identities until
+-- the cut-over, so the backfill is a maintenance-only, idempotent function,
+-- `epigraph_backfill_legacy_agent_keys()` (returns the rows added), which this
+-- migration calls once and the cut-over (S5) calls again. It skips an agent
+-- that already has a legacy row and a host-registered identity (one with a
+-- snapshot), whose identity key never signs.
+--
+-- `valid_until` is set at cut-over (S5), and only on the legacy rows of
+-- DERIVED keys, whose private half is computable from public inputs: the
+-- unkeyed LLM identities (`key_kind 'derived'` with `llm_model`). A real
+-- `ed25519` signer's key stays open-ended: it is still that signer's key.
 --
 -- ===================================================================
 -- 7a. ATTESTED KEYS (D2: "Agents cannot self-register it")
@@ -208,6 +217,7 @@
 --   DROP TRIGGER agent_keys_attested_guard ON public.agent_keys;
 --   DROP FUNCTION public.epigraph_agent_keys_attested_guard();
 --   -- re-run 118's CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status(...), then
+--   DROP FUNCTION public.epigraph_backfill_legacy_agent_keys();
 --   DELETE FROM public.agent_keys WHERE key_type = 'identity-legacy';
 --   DROP ROLE epigraph_identity_attestor;   -- cluster-wide: only once no database uses it
 -- Linked agents keep their links (operator_links rows are permanent by 107's rule).
@@ -1173,11 +1183,40 @@ END $$;
 -- ===================================================================
 -- LEGACY KEYS (section 7)
 -- ===================================================================
-INSERT INTO public.agent_keys (agent_id, public_key, key_type, status, valid_from)
-SELECT a.id, a.public_key, 'identity-legacy', 'active', a.created_at
-  FROM public.agents a
- WHERE NOT EXISTS (SELECT 1 FROM public.agent_keys k
-                    WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy');
+CREATE OR REPLACE FUNCTION public.epigraph_backfill_legacy_agent_keys()
+RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    n integer;
+BEGIN
+    INSERT INTO public.agent_keys (agent_id, public_key, key_type, status, valid_from)
+    SELECT a.id, a.public_key, 'identity-legacy', 'active', a.created_at
+      FROM public.agents a
+     WHERE NOT EXISTS (SELECT 1 FROM public.agent_keys k
+                        WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')
+       -- A host-registered identity's key never signs (D1): its signatures
+       -- bind through its `signing` key, so it gets no legacy row.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                        WHERE s.agent_id = a.id);
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_backfill_legacy_agent_keys() FROM PUBLIC;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_backfill_legacy_agent_keys() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_backfill_legacy_agent_keys() '
+                'TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_backfill_legacy_agent_keys() '
+                'FROM epigraph_app';
+    END IF;
+END $$;
+
+SELECT public.epigraph_backfill_legacy_agent_keys();
 
 -- The attested-key guard (section 7a), after the backfill above.
 DROP TRIGGER IF EXISTS agent_keys_attested_guard ON public.agent_keys;
