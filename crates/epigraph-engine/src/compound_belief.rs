@@ -24,7 +24,8 @@
 //! A spine compound (level 0/1, or more than 16 visible leaves) gets a
 //! profile of its leaves, never a conjunction. Exactly one refuting edge
 //! between two visible leaves uses the single-negative-sibling closed form;
-//! two or more serve the Fréchet envelope, labelled `internally_contested`.
+//! two or more serve the Fréchet envelope, labelled `internally_contested`,
+//! met by the compound's `not_all` valuation.
 //!
 //! Nothing here writes. The derived value is never stored and never fed to a
 //! fold: it is a [`DerivedBelief`], not an
@@ -437,6 +438,60 @@ fn one_sibling(
     }))
 }
 
+/// The Fréchet envelope of the leaves' marginals (SPEC §3.3, R-FRE), met by
+/// the compound's `not_all` valuation of mass `m` (SPEC §3.6).
+///
+/// For any coupling of the marginals, the valuation's closed form (ow = 0)
+/// gives Bel' = Bel·s(Bel), Pl' = Pl·s(Bel) and NR' = NR·s(Bel), with
+/// s(b) = (1 − m)/(1 − m·b). Bel' grows with Bel, so the floor is `lo` met by
+/// the valuation at Bel = `lo`. s grows with Bel, and Bel(∧L) ≤ min Belᵢ, so
+/// the ceilings are `hi` and `hi_nr` scaled by s(min Belᵢ). The result still
+/// contains every coupling's value; without the valuation (m = 0) it is the
+/// plain envelope. Taking the envelope of the joint WITH the valuation instead
+/// would lose it: each leaf's own marginal reads a `not_all` state as
+/// unflagged, so `hi` and `hi_nr` stay where they were.
+fn envelope_with_not_all(
+    leaves: &[Uuid],
+    items: &[Item<Uuid>],
+    m: f64,
+) -> Result<ConjResult, String> {
+    let base = conj(leaves, items, 0.0)?;
+    let Frechet { lo, hi, hi_nr } = base.frechet;
+    let (lo, hi, hi_nr) = if m > 0.0 {
+        let query: Vec<Lit<Uuid>> = leaves.iter().copied().map(Lit::pos).collect();
+        // The largest Bel the conjunction can have: min Belᵢ (and never above
+        // `hi`), each Belᵢ taken in the same joint as the envelope, or alone
+        // when the joint cannot be evaluated.
+        let mut bel_max = hi;
+        for (i, &leaf) in leaves.iter().enumerate() {
+            let bel_i = match joint_bel(&query, items, 0.0, &[i]) {
+                Ok(b) => b,
+                Err(_) => conj(&[leaf], items, 0.0)?.bel,
+            };
+            bel_max = bel_max.min(bel_i);
+        }
+        let s = |b: f64| {
+            if m >= 1.0 {
+                0.0
+            } else {
+                (1.0 - m) / (1.0 - m * b)
+            }
+        };
+        (lo * s(lo), hi * s(bel_max), hi_nr * s(bel_max))
+    } else {
+        (lo, hi, hi_nr)
+    };
+    Ok(ConjResult {
+        bel: lo,
+        pl: hi,
+        nr: hi_nr,
+        betp: 0.5 * (lo + hi),
+        frechet: Frechet { lo, hi, hi_nr },
+        exact: false,
+        ..base
+    })
+}
+
 fn serve(
     leaves: &[Uuid],
     batch: &[BatchItem],
@@ -450,21 +505,13 @@ fn serve(
         }
     }
     let q = query_items(leaves, batch, inputs, None)?;
-    let r = conj(leaves, &q.items, m)?;
     let contested = !siblings.is_empty();
     let r = if contested {
         // Two or more negative siblings (or one the closed form cannot meet):
-        // the Fréchet envelope only (SPEC §3.3).
-        ConjResult {
-            bel: r.frechet.lo,
-            pl: r.frechet.hi,
-            nr: r.frechet.hi_nr,
-            betp: 0.5 * (r.frechet.lo + r.frechet.hi),
-            exact: false,
-            ..r
-        }
+        // the Fréchet envelope only (SPEC §3.3), met by `not_all`.
+        envelope_with_not_all(leaves, &q.items, m)?
     } else {
-        r
+        conj(leaves, &q.items, m)?
     };
     Ok(Served {
         r,
