@@ -25,11 +25,17 @@
 //!
 //! Not converted, and NOT merely deferred:
 //!
-//! * `propagate_beliefs` (7 sites) writes through two of them. Converting only
+//! * `propagate_beliefs` (4 sites, all reads; its apply writes on a
+//!   `write_as` transaction since the batch H-a review). Converting only
 //!   its reads is the shape no shard in this series has reviewed — every prior
 //!   shard converted whole handlers — and a half-converted handler here would
 //!   change its own output silently and with a 200, so it is whole-handler work
-//!   or none. Converting the writes too is worse — `read_as` is
+//!   or none. ONE statement is the deliberate exception: the factor load runs
+//!   on [`AppState::read_as`] because atom-level belief's `decomposes_to`
+//!   exclusion (SPEC §6.2) decides its legacy arm by reading `edges`, and that
+//!   read must see the caller's own private edges. `factors` has no row
+//!   security and the load splices no viewer, so the stamp changes nothing
+//!   else it returns. Converting the writes too is worse — `read_as` is
 //!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
 //!   under `SessionGucMode::Transaction` a write routed through it is rolled
 //!   back while still type-checking, because `ScopedRead` is
@@ -733,6 +739,24 @@ pub async fn propagate_beliefs(
     // Load factors from DB. This is the one loader that feeds the BP engines
     // (`run_cdst_bp`, `run_bp`; interval mode runs the scalar track here), so
     // the `decomposes_to` exclusion (SPEC §6.2, D3) is applied here, once.
+    //
+    // On the caller's viewer-stamped connection, not the raw pool: the
+    // exclusion's legacy arm matches a factor to its `decomposes_to` edge by
+    // reading `edges`, which row security filters. Unstamped, that read sees
+    // only public edges, so a legacy factor on a decomposition private to the
+    // caller's own group would be loaded. `factors` itself has no row security.
+    // The rest of this handler's reads stay where they were.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "propagate_beliefs",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
     let factors: Vec<FactorRow> = sqlx::query_as(&format!(
         "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description \
          FROM factors f \
@@ -742,11 +766,12 @@ pub async fn propagate_beliefs(
         epigraph_db::repos::factor::bp_readable_factor_sql()
     ))
     .bind(request.frame_id)
-    .fetch_all(&state.db_pool)
+    .fetch_all(&mut *read)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to load factors: {e}"),
     })?;
+    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
 
     if factors.is_empty() {
         return Ok(Json(serde_json::json!({

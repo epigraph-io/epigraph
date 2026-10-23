@@ -26,8 +26,21 @@ use crate::repos::edge::EDGE_IN_FORCE;
 ///
 /// Every other factor stays readable, including `evidential_support` and
 /// `mutual_exclusion` rows that name a compound: read-only BP keeps them as a
-/// diagnostic (D4 is stated for BP APPLY). The legacy arm reads `edges`, so
-/// it sees the edges visible to the session it runs on.
+/// diagnostic (D4 is stated for BP APPLY).
+///
+/// # The legacy arm reads `edges`, under the session's row security
+///
+/// Run it on a connection stamped with the caller's viewer
+/// (`AppState::read_as`), never on an unstamped application connection: that
+/// one sees only public edges, so a legacy row whose decomposition is private
+/// to the caller's own group would be read. Stamped, the arm still cannot see
+/// a decomposition the CALLER cannot see (another group's, or one co-owned
+/// with a group the caller is not in), and such a legacy row stays readable
+/// for that caller. Deciding the match structurally needs a read past row
+/// security, which a request-serving process does not hold; the structural
+/// close is removing the rows themselves (SPEC §6.2's export-and-delete of
+/// `decomposes_to` factors and its sweep job, which run on the maintenance
+/// connection). A KEYED row needs no edge read and is excluded for everyone.
 #[must_use]
 pub fn bp_readable_factor_sql() -> String {
     format!(

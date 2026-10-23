@@ -678,7 +678,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// BP factor INSERT was deleted, not converted (`routes/edges.rs` 5 -> 4,
 /// keeping sites), read off `the_unconverted_register_is_exactly_what_was_measured`'s
 /// own failure (`recorded 5, measured 4`).
-const HIGH_WATER: usize = 247;
+///
+/// 247 -> 246 (atom-level belief, the same change): `propagate_beliefs`' factor
+/// load moved onto `AppState::read_as` (`routes/computation.rs` 8 -> 7, keeping
+/// sites).
+const HIGH_WATER: usize = 246;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -807,7 +811,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the shard declined to produce one. Of the ten that remain, seven are
     // `propagate_beliefs`, which writes through two of them, and three are
     // `compose_subgraphs`. Both are named in that file's module doc.
-    ("routes/computation.rs", 8),
+    // 8 -> 7 (atom-level belief): `propagate_beliefs`' factor load moved onto
+    // `AppState::read_as`, because the `decomposes_to` exclusion's legacy arm
+    // reads `edges` and must see the caller's own private edges.
+    ("routes/computation.rs", 7),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
