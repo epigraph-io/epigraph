@@ -164,6 +164,8 @@ fn real_run_args<'a>(role: &'a str, wave_file: &'a str, dir: &'a str) -> Vec<&'a
         dir,
         "--min-free-gb",
         "0",
+        "--disk-check-cmd",
+        "true",
     ]
 }
 
@@ -604,6 +606,8 @@ fn vacate_args<'a>(list: &'a str, wave_file: &'a str, dir: &'a str) -> Vec<&'a s
         dir,
         "--min-free-gb",
         "0",
+        "--disk-check-cmd",
+        "true",
     ]
 }
 
@@ -815,6 +819,8 @@ async fn a_real_run_without_snapshot_refuses(pool: PgPool) {
             s(&dir),
             "--min-free-gb",
             "0",
+            "--disk-check-cmd",
+            "true",
         ],
         &env.vars(),
     );
@@ -1171,9 +1177,25 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
 
 // ── (7) the disk gate ───────────────────────────────────────────────────────
 
+/// The real-run flags of a standalone wave with everything but the disk gate:
+/// the caller adds the gate's flags.
+fn gate_args<'a>(wave_file: &'a str, dir: &'a str) -> Vec<&'a str> {
+    vec![
+        "--role",
+        "standalone",
+        "--snapshot",
+        wave_file,
+        "--wave",
+        "test-wave",
+        "--disk-path",
+        dir,
+    ]
+}
+
 /// SPEC §10.4 disk gate: checked before every batch, a failure aborts before
-/// the batch writes. A run whose first check fails writes nothing and records
-/// nothing; the same run with a passing check writes (the control).
+/// the batch writes (exit 4). A run whose first check fails, on free space or
+/// on the check command, writes nothing and records nothing; the same run
+/// with a passing check writes (the control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
     let dir = scratch_dir();
@@ -1190,29 +1212,23 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
     let failing = run(
         RECOMPUTE_BETP,
         &dir,
-        &[
-            "--role",
-            "standalone",
-            "--snapshot",
-            s(&wave_file),
-            "--wave",
-            "test-wave",
-            "--disk-path",
-            s(&dir),
+        &{
+            let mut a = gate_args(s(&wave_file), s(&dir));
             // No volume has this much free space.
-            "--min-free-gb",
-            "1000000000",
-        ],
+            a.extend(["--min-free-gb", "1000000000", "--disk-check-cmd", "true"]);
+            a
+        },
         &env.vars(),
     );
-    assert!(
-        failing.code.is_some_and(|c| c != 0),
-        "a failed disk check must stop the run with a non-zero exit; got {:?}\nstdout: {}",
+    assert_eq!(
         failing.code,
-        failing.stdout
+        Some(4),
+        "a failed disk check must abort the run (exit 4)\nstdout: {}\nstderr: {}",
+        failing.stdout,
+        failing.stderr
     );
     assert!(
-        failing.stderr.contains("disk"),
+        failing.stderr.contains("disk check failed"),
         "the abort must say the disk check failed\nstderr: {}",
         failing.stderr
     );
@@ -1231,16 +1247,22 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
         RECOMPUTE_BETP,
         &dir,
         &{
-            let mut a = real_run_args("standalone", s(&wave_file), s(&dir));
-            a.extend(["--disk-check-cmd", "exit 7"]);
+            let mut a = gate_args(s(&wave_file), s(&dir));
+            a.extend(["--min-free-gb", "0", "--disk-check-cmd", "exit 7"]);
             a
         },
         &env.vars(),
     );
-    assert!(
-        failing_cmd.code.is_some_and(|c| c != 0) && failing_cmd.stderr.contains("disk"),
-        "a failing --disk-check-cmd stops the run; got {:?}\nstderr: {}",
+    assert_eq!(
         failing_cmd.code,
+        Some(4),
+        "a failing --disk-check-cmd aborts the run (exit 4)\nstdout: {}\nstderr: {}",
+        failing_cmd.stdout,
+        failing_cmd.stderr
+    );
+    assert!(
+        failing_cmd.stderr.contains("disk check command"),
+        "the abort must name the failed check command\nstderr: {}",
         failing_cmd.stderr
     );
     assert_eq!(
@@ -1256,6 +1278,68 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
         &env.vars(),
     )
     .ok("control: a passing disk check");
+    assert_ne!(cache(&pool, atom).await, sentinel, "control: the run wrote");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SPEC §10.4: the disk gate is free space AND backup health (`pgbackrest
+/// check` green, a full backup recent enough for expire to run). Free space
+/// is measured by the tool; backup health only by the operator's check
+/// command. So a real run without `--disk-check-cmd` refuses (exit 2), names
+/// the flag, and writes and records nothing, unless the operator opts out
+/// explicitly. The same run with a check command writes (the control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_real_run_without_a_backup_check_refuses(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "backup-owner").await;
+    let source = agent(&pool, "backup-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let atom = claim(&pool, owner, "evidenced standalone").await;
+    insert_row(&pool, atom, &evidence_row(bin, source, 0.8, None)).await;
+    let sentinel = set_sentinel(&pool, atom, bin, 0.0).await;
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+    let state = belief_state(&pool).await;
+
+    let wave_file = dir.join("wave.jsonl");
+    let unchecked = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &{
+            let mut a = gate_args(s(&wave_file), s(&dir));
+            a.extend(["--min-free-gb", "0"]);
+            a
+        },
+        &env.vars(),
+    );
+    assert_eq!(
+        unchecked.code,
+        Some(2),
+        "a real run with no backup check must refuse (exit 2)\nstdout: {}\nstderr: {}",
+        unchecked.stdout,
+        unchecked.stderr
+    );
+    assert!(
+        unchecked.stderr.contains("--disk-check-cmd"),
+        "the refusal must name --disk-check-cmd\nstderr: {}",
+        unchecked.stderr
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a refused run writes nothing"
+    );
+    assert!(
+        std::fs::read(&wave_file).unwrap_or_default().is_empty(),
+        "a refused run records nothing"
+    );
+
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("control: the same run with a check command");
     assert_ne!(cache(&pool, atom).await, sentinel, "control: the run wrote");
     let _ = std::fs::remove_dir_all(&dir);
 }

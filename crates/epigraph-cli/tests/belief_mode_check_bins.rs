@@ -272,6 +272,8 @@ impl WaveArgs {
             d,
             "--min-free-gb".into(),
             "0".into(),
+            "--disk-check-cmd".into(),
+            "true".into(),
         ];
         Self { dir, args }
     }
