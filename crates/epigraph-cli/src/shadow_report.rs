@@ -51,6 +51,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use epigraph_db::repos::claim_role::{self, ClaimRole};
+use epigraph_db::repos::recall_event::RecallEventRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, MassFunctionRepository};
 use epigraph_engine::atom_items::{atom_axiom_rows, atom_fold, AtomFoldMode, AxiomMode, AxiomRow};
@@ -916,12 +917,162 @@ fn quantiles(mut v: Vec<f64>) -> Quantiles {
     }
 }
 
+/// What the corpus passes keep per claim.
+#[derive(Debug, Clone, Copy)]
+struct Rec {
+    today: Cand,
+    progressive: Cand,
+    strict: Cand,
+}
+
+/// One recall event, as the replay reads it.
+#[derive(Debug, Clone)]
+struct Event {
+    id: Uuid,
+    min_truth: f64,
+    /// In the order the recall returned them.
+    returned: Vec<Uuid>,
+}
+
+/// Every recall event created in `[since, until]`, as `viewer` reads them.
+/// `until` is fixed at the run's start, so events logged during the run do
+/// not shift the pages.
+async fn read_events(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Result<Vec<Event>, String> {
+    const PAGE: i64 = 500;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut offset = 0i64;
+    loop {
+        let rows = RecallEventRepository::list(
+            &mut *conn,
+            viewer,
+            None,
+            None,
+            Some(since),
+            Some(until),
+            PAGE,
+            offset,
+        )
+        .await
+        .map_err(|e| format!("recall_events: {e}"))?;
+        let n = rows.len();
+        for r in rows {
+            if seen.insert(r.id) {
+                let min_truth = r
+                    .params
+                    .get("min_truth")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(DEFAULT_MIN_TRUTH);
+                out.push(Event {
+                    id: r.id,
+                    min_truth,
+                    returned: r.returned_claim_ids,
+                });
+            }
+        }
+        if i64::try_from(n).unwrap_or(0) < PAGE {
+            break;
+        }
+        offset += PAGE;
+    }
+    Ok(out)
+}
+
+/// How many events returned each claim (once per event).
+fn recall_exposure(events: &[Event]) -> HashMap<Uuid, u64> {
+    let mut out: HashMap<Uuid, u64> = HashMap::new();
+    for e in events {
+        for id in e.returned.iter().collect::<HashSet<_>>() {
+            *out.entry(*id).or_default() += 1;
+        }
+    }
+    out
+}
+
+/// Count a two-way status change from `before` to `after`.
+fn flip(f: &mut Flips, before: bool, after: bool, weight: u64) {
+    match (before, after) {
+        (false, true) => f.to += weight,
+        (true, false) => f.from += weight,
+        _ => {}
+    }
+}
+
+/// The recall replay under one candidate mode (SPEC §10.4, extended): per
+/// event, a returned claim is **lost** when it passes the event's
+/// `min_truth` today and fails it under the candidate; one that fails today
+/// is `already_failing` (no loss of the cutover's). `confirmed` and
+/// `contested` flips are counted per returned occurrence. A returned id with
+/// no record (hidden from the report viewer, deleted, or outside the run's
+/// scope) is `unresolved`. The share lost is over resolved ids, and the mean
+/// is over events that resolved any.
+fn replay(events: &[Event], recs: &HashMap<Uuid, Rec>, pick: fn(&Rec) -> &Cand) -> ReplaySummary {
+    let mut s = ReplaySummary {
+        events: events.len(),
+        ..ReplaySummary::default()
+    };
+    let mut shares = Vec::new();
+    for e in events {
+        let mut ev = EventReplay {
+            event_id: e.id,
+            min_truth: e.min_truth,
+            returned: e.returned.len(),
+            ..EventReplay::default()
+        };
+        for (pos, id) in e.returned.iter().enumerate() {
+            let Some(r) = recs.get(id) else {
+                ev.unresolved += 1;
+                continue;
+            };
+            ev.resolved += 1;
+            let cand = pick(r);
+            if r.today.gate < e.min_truth {
+                ev.already_failing += 1;
+            } else if cand.gate < e.min_truth {
+                ev.lost += 1;
+                if pos < 10 {
+                    ev.lost_in_first_10 += 1;
+                }
+            }
+            flip(&mut s.confirmed, r.today.confirmed, cand.confirmed, 1);
+            flip(&mut s.contested, r.today.contested, cand.contested, 1);
+        }
+        s.returned += ev.returned;
+        s.resolved += ev.resolved;
+        s.unresolved += ev.unresolved;
+        s.lost += ev.lost;
+        s.already_failing += ev.already_failing;
+        s.max_lost_in_first_10 = s.max_lost_in_first_10.max(ev.lost_in_first_10);
+        if ev.lost_in_first_10 > 1 {
+            s.events_losing_more_than_one_in_first_10 += 1;
+        }
+        if ev.resolved > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            shares.push(ev.lost as f64 / ev.resolved as f64);
+        }
+        s.per_event.push(ev);
+    }
+    if !shares.is_empty() {
+        #[allow(clippy::cast_precision_loss)]
+        let mean = shares.iter().sum::<f64>() / shares.len() as f64;
+        s.mean_share_lost = mean;
+        s.max_share_lost = shares.iter().copied().fold(0.0, f64::max);
+    }
+    s
+}
+
 /// The running totals of the per-claim pass.
 #[derive(Default)]
 struct Totals {
     summary: Summary,
     deltas: BTreeMap<&'static str, Vec<f64>>,
     movers: Vec<Mover>,
+    recs: HashMap<Uuid, Rec>,
 }
 
 impl Totals {
@@ -963,6 +1114,14 @@ impl Totals {
                 weight,
             });
         }
+        self.recs.insert(
+            id,
+            Rec {
+                today: Cand::today(base),
+                progressive: e.progressive,
+                strict: e.strict,
+            },
+        );
     }
 
     fn finish_claims(&mut self, top: usize) {
@@ -1017,7 +1176,7 @@ where
 async fn run_on<F>(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
-    _events_viewer: &Viewer,
+    events_viewer: &Viewer,
     opts: &ReportOptions,
     mut sink: F,
 ) -> Result<Summary, String>
@@ -1025,7 +1184,8 @@ where
     F: FnMut(&ClaimLine) -> Result<(), String>,
 {
     let ctx = FramedBeliefContext::global();
-    let exposure: HashMap<Uuid, u64> = HashMap::new();
+    let events = read_events(conn, events_viewer, opts.since, Utc::now()).await?;
+    let exposure = recall_exposure(&events);
     let page_size = opts.page_size.max(1);
     let mut totals = Totals::default();
 
@@ -1119,5 +1279,9 @@ where
         }
     }
     totals.finish_claims(opts.top);
+    totals.summary.replay = ByMode {
+        progressive: replay(&events, &totals.recs, |r| &r.progressive),
+        strict: replay(&events, &totals.recs, |r| &r.strict),
+    };
     Ok(totals.summary)
 }
