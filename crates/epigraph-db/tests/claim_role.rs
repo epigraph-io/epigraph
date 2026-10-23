@@ -183,10 +183,11 @@ async fn sql_role(pool: &PgPool, id: Uuid) -> (bool, bool, String) {
         .expect("evaluate the role SQL")
 }
 
-/// The ONE-spelling property: for every claim, the SQL predicates agree with
-/// the SQL role, and the Rust role agrees with both.
-async fn assert_one_spelling(pool: &PgPool, viewer: &Viewer, ids: &[Uuid]) {
-    let rust = roles(pool, viewer, ids).await;
+/// The ONE-spelling property: for every claim, the boolean SQL predicates
+/// agree with the SQL role. (`roles_batch` is not a leg of this check: it
+/// splices `CLAIM_ROLE_SQL` itself, so agreement would be a tautology. Each
+/// test asserts `roles_batch` against roles chosen by the fixture's shape.)
+async fn assert_one_spelling(pool: &PgPool, ids: &[Uuid]) {
     for id in ids {
         let (is_compound, is_procedural, role) = sql_role(pool, *id).await;
         assert_eq!(
@@ -198,18 +199,6 @@ async fn assert_one_spelling(pool: &PgPool, viewer: &Viewer, ids: &[Uuid]) {
             is_procedural,
             role == "procedural",
             "IS_PROCEDURAL_SQL and CLAIM_ROLE_SQL disagree on {id}: role {role}"
-        );
-        let r = rust.get(id).unwrap_or_else(|| panic!("{id} has a role"));
-        let rust_name = match r {
-            ClaimRole::Atom => "atom",
-            ClaimRole::Standalone => "standalone",
-            ClaimRole::Compound { .. } => "compound",
-            ClaimRole::Procedural => "procedural",
-            ClaimRole::Rule => "rule",
-        };
-        assert_eq!(
-            rust_name, role,
-            "roles_batch and CLAIM_ROLE_SQL disagree on {id}"
         );
     }
 }
@@ -291,7 +280,7 @@ async fn a_mid_node_is_a_compound_and_its_leaves_are_its_flattened_leaves(pool: 
         );
     }
 
-    assert_one_spelling(&pool, &viewer, &all).await;
+    assert_one_spelling(&pool, &all).await;
 }
 
 /// The edges that make a claim a compound or an atom are in force and point
@@ -361,7 +350,7 @@ async fn only_in_force_edges_between_current_claims_assign_a_role(pool: PgPool) 
         "a superseded child is not a leaf"
     );
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 // ── (2) a manual cycle terminates and yields no duplicates ─────────────────
@@ -783,7 +772,7 @@ async fn a_workflow_rooted_tree_is_procedural(pool: PgPool) {
 
     let mut all = tree.to_vec();
     all.extend(control);
-    assert_one_spelling(&pool, &viewer, &all).await;
+    assert_one_spelling(&pool, &all).await;
 }
 
 /// A git-history tree as `ingest_git` writes it (repository root stamped
@@ -844,7 +833,7 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     assert!(matches!(got[&stamped], ClaimRole::Compound { .. }));
     assert_eq!(got[&below], ClaimRole::Atom);
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 /// `ingest_git` stamps `source: git-history` on EVERY claim it writes, commits
@@ -883,7 +872,7 @@ async fn a_decomposed_lone_commit_is_a_compound_over_its_atoms(pool: PgPool) {
     assert_eq!(got[&a1], ClaimRole::Atom);
     assert_eq!(got[&a2], ClaimRole::Atom);
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 /// Decomposition is a DAG, not a tree: a claim can sit under a stamped root
@@ -971,7 +960,7 @@ async fn a_node_under_an_ordinary_root_is_not_procedural_whatever_else_is_above_
     assert_eq!(got[&thesis], ClaimRole::Procedural);
     assert_eq!(got[&foreign], ClaimRole::Procedural);
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 /// The procedural root search is over in-force edges between CURRENT claims,
@@ -1044,7 +1033,7 @@ async fn a_superseded_parent_neither_hides_nor_lends_a_procedural_root(pool: PgP
     );
     assert_eq!(got[&l], ClaimRole::Atom);
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 // ── rules ──────────────────────────────────────────────────────────────────
@@ -1132,7 +1121,7 @@ async fn a_rule_needs_its_label_and_its_conclusion_edge_and_outranks_compound(po
         "a conclusion is not decomposed"
     );
 
-    assert_one_spelling(&pool, &viewer, &ids).await;
+    assert_one_spelling(&pool, &ids).await;
 }
 
 // ── (5) spine = level 0/1, or more than 16 visible leaves ──────────────────
