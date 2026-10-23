@@ -841,3 +841,250 @@ pub async fn vacate_listed_claim(
     Ok(outcome)
 }
 
+// ── the drift decomposition (SPEC §10.4) ───────────────────────────────────
+
+/// The decomposition's component keys, in telescoping order.
+pub const DRIFT_COMPONENTS: [&str; 10] =
+    ["0b", "0c", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
+
+/// One atom's drift decomposition from S0 (SPEC §10.4), in BetP(TRUE).
+///
+/// The stages, each a value the atom's cache could hold:
+///
+/// * (0) `s0`: the cache in snapshot S0;
+/// * (0b) the served cache now (organic writes since S0);
+/// * (0c) the served BetP without the part held up by `ds_auto`'s
+///   monotonicity clamp: where the recorded frame's fold of the current rows
+///   reproduces the served Bel, Pl and open-world mass but not the served
+///   BetP, the BetP no mass function produced is the clamp's;
+/// * (1) the owner-rule recompute (what the held apply would write; the
+///   served value when it would write nothing), with the `evidence_type` of
+///   the rows in the α manifest reset to NULL (before the backfill typed
+///   them);
+/// * (1') the same with the stored `evidence_type` (the α change);
+///   `None` when no manifest was given, since it is then not separable;
+/// * (2) the owner frame's fold without the ingest template's rows;
+/// * (3) the AEF row set (every 2-hypothesis frame and `claim_validity`,
+///   coarsened) under the legacy agent-bound source grouping, reading a
+///   compound-source edge row two-sided;
+/// * (3a) the same, read one-sided (the `frozen` read);
+/// * (3b) the same without compound-source edge rows, when the target setting
+///   excludes them (else equal to (3a));
+/// * (3c) the canonical item-key grouping, without `attributed_v1` rows;
+/// * (4) the AEF with `attributed_v1` rows: what the single atom-cache writer
+///   stores.
+///
+/// When the target fold does not cover the atom's role, the wave writes the
+/// legacy owner fold, and the decomposition stops at (1').
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DriftLine {
+    pub claim_id: Uuid,
+    pub role: &'static str,
+    pub target_fold: &'static str,
+    /// The S0 value; `None` when the claim is not in S0 (the components then
+    /// start from the served value, and `s0_missing` says so).
+    pub s0: Option<f64>,
+    pub s0_missing: bool,
+    pub served: Option<f64>,
+    /// Stage values by component key (the value AFTER that component).
+    pub stages: BTreeMap<&'static str, f64>,
+    /// Component deltas by key; a key not separable in this run is `null`.
+    pub components: BTreeMap<&'static str, Option<f64>>,
+    /// What the wave writes: the last stage.
+    #[serde(rename = "final")]
+    pub final_value: f64,
+    /// `final` less the starting value (S0, or served when S0 is missing).
+    pub total: f64,
+}
+
+/// The rows of `claim_id` that are the ingest template (one predicate:
+/// `epigraph_db::repos::mass_function::ingest_template_predicate`).
+async fn template_row_ids(
+    conn: &mut sqlx::PgConnection,
+    claim_id: Uuid,
+) -> Result<HashSet<Uuid>, String> {
+    let sql = format!(
+        "SELECT mf.id FROM mass_functions mf JOIN frames f ON f.id = mf.frame_id \
+          WHERE mf.claim_id = $1 AND {}",
+        ingest_template_predicate("mf.", "f.")
+    );
+    let ids: Vec<Uuid> = sqlx::query_scalar(&sql)
+        .bind(claim_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| format!("template rows: {e}"))?;
+    Ok(ids.into_iter().collect())
+}
+
+/// The drift decomposition of one atom (see [`DriftLine`]). Writes nothing:
+/// every stage is a read and an in-memory fold.
+///
+/// `alpha_manifest` is `Some(row ids)` of `mass_functions` rows whose
+/// `evidence_type` a backfill set after S0; `None` when no manifest was given.
+///
+/// # Errors
+/// A database read or a fold.
+#[allow(clippy::too_many_arguments)]
+pub async fn drift_decomposition(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    role: WaveRole,
+    target: AtomFoldMode,
+    compound_source_edges: CompoundSourceEdges,
+    s0: Option<f64>,
+    alpha_manifest: Option<&HashSet<Uuid>>,
+) -> Result<DriftLine, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let served = read_cache_columns(&mut *conn, &[claim_id])
+        .await
+        .map_err(|e| format!("read cache: {e}"))?
+        .remove(&claim_id)
+        .ok_or_else(|| format!("claim {claim_id} not found"))?;
+
+    // (0b): the served value. A claim with no served BetP starts from S0, or
+    // from the first stage that has a value.
+    let owner = epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(
+        &mut *conn, viewer, claim_id,
+    )
+    .await
+    .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
+    let owner_fold = match owner {
+        Some(f) => {
+            epigraph_engine::edge_factor::preview_claim_belief_on_frame(&mut conn, viewer, claim_id, f)
+                .await?
+                .map(|p| p.pignistic_prob)
+        }
+        None => None,
+    };
+    let v0b = served
+        .pignistic_prob
+        .or(s0)
+        .or(owner_fold)
+        .unwrap_or(VACUOUS_BETP);
+
+    // (0c): the clamp residue.
+    let v0c = match (served.belief_frame_id, served.belief, served.plausibility) {
+        (Some(frame), Some(bel), Some(pl)) => {
+            let fold = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+                &mut conn, viewer, claim_id, frame,
+            )
+            .await?;
+            match fold {
+                Some(p)
+                    if (p.belief - bel).abs() <= 1e-9
+                        && (p.plausibility - pl).abs() <= 1e-9
+                        && (p.missing_mass - served.mass_on_missing.unwrap_or(0.0)).abs()
+                            <= 1e-9 =>
+                {
+                    p.pignistic_prob
+                }
+                _ => v0b,
+            }
+        }
+        _ => v0b,
+    };
+
+    // (1), (1'), (2): the owner frame, counterfactually.
+    let (v1, v1p, v2) = match owner {
+        None => (v0b, v0b, v0b),
+        Some(frame) => {
+            let v1p = owner_fold.unwrap_or(v0b);
+            let v1 = match alpha_manifest {
+                Some(manifest) if !manifest.is_empty() => {
+                    epigraph_engine::edge_factor::preview_claim_belief_on_frame_adjusted(
+                        &mut conn,
+                        viewer,
+                        claim_id,
+                        frame,
+                        |rows| {
+                            rows.into_iter()
+                                .map(|mut r| {
+                                    if manifest.contains(&r.id) {
+                                        r.evidence_type = None;
+                                    }
+                                    r
+                                })
+                                .collect()
+                        },
+                    )
+                    .await?
+                    .map_or(v1p, |p| p.pignistic_prob)
+                }
+                _ => v1p,
+            };
+            let templates = template_row_ids(&mut conn, claim_id).await?;
+            let v2 = if templates.is_empty() {
+                v1p
+            } else {
+                epigraph_engine::edge_factor::preview_claim_belief_on_frame_adjusted(
+                    &mut conn,
+                    viewer,
+                    claim_id,
+                    frame,
+                    |rows| rows.into_iter().filter(|r| !templates.contains(&r.id)).collect(),
+                )
+                .await?
+                .map_or(v1p, |p| p.pignistic_prob)
+            };
+            (v1, v1p, v2)
+        }
+    };
+
+    let mut stages: Vec<(&'static str, f64)> = vec![("0b", v0b), ("0c", v0c), ("1", v1), ("1'", v1p)];
+    if role.folded_by(target) {
+        let frozen = atom_drift_rows(&mut conn, viewer, &[claim_id], CompoundSourceEdges::Frozen)
+            .await?
+            .remove(&claim_id)
+            .unwrap_or_default();
+        let target_rows = if compound_source_edges == CompoundSourceEdges::Frozen {
+            frozen.clone()
+        } else {
+            atom_drift_rows(&mut conn, viewer, &[claim_id], compound_source_edges)
+                .await?
+                .remove(&claim_id)
+                .unwrap_or_default()
+        };
+        let v3 = drift_legacy_grouping_betp(&frozen, true, true)?;
+        let v3a = drift_legacy_grouping_betp(&frozen, false, true)?;
+        let v3b = if compound_source_edges == CompoundSourceEdges::Excluded {
+            drift_legacy_grouping_betp(&target_rows, false, false)?
+        } else {
+            v3a
+        };
+        let v3c = drift_atom_fold(&target_rows, false)?.pignistic_prob();
+        let v4 = drift_atom_fold(&target_rows, true)?.pignistic_prob();
+        stages.extend([
+            ("2", v2),
+            ("3", v3),
+            ("3a", v3a),
+            ("3b", v3b),
+            ("3c", v3c),
+            ("4", v4),
+        ]);
+    }
+
+    let start = s0.unwrap_or(v0b);
+    let mut components = BTreeMap::new();
+    let mut prev = start;
+    for &(key, value) in &stages {
+        let delta = value - prev;
+        let separable = key != "1'" || alpha_manifest.is_some();
+        components.insert(key, separable.then_some(delta));
+        prev = value;
+    }
+    // A non-separable (1') is zero by construction ((1) used the stored α).
+    let final_value = prev;
+    Ok(DriftLine {
+        claim_id,
+        role: role.as_str(),
+        target_fold: fold_str(target),
+        s0,
+        s0_missing: s0.is_none(),
+        served: served.pignistic_prob,
+        stages: stages.into_iter().collect(),
+        components,
+        final_value,
+        total: final_value - start,
+    })
+}
