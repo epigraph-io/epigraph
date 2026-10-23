@@ -487,6 +487,17 @@ async fn a_near_miss_of_the_template_signature_is_recomputed(pool: PgPool) {
 
 // ── (3) a compound with BBAs is untouched ───────────────────────────────────
 
+/// A non-workflow tree `root -> mid -> leaf`, every node carrying the same
+/// real row. "Compound" is the SOURCE end of an in-force `decomposes_to`, at
+/// any depth:
+///
+/// * the root (source only) and the mid node (source AND target) keep their
+///   caches;
+/// * the leaf (target only) is an atom and is recomputed exactly as a
+///   standalone twin carrying the same row.
+///
+/// The leaf arm fails a compound test that matches either edge end; the mid
+/// arm fails one that freezes only roots.
 #[sqlx::test(migrations = "../../migrations")]
 async fn compound_with_bbas_is_untouched(pool: PgPool) {
     let owner = agent(&pool, "guard-owner").await;
@@ -495,19 +506,42 @@ async fn compound_with_bbas_is_untouched(pool: PgPool) {
 
     for caller in CALLERS {
         let compound = claim(&pool, owner, "compound with BBAs").await;
+        let mid = claim(&pool, owner, "mid compound with BBAs").await;
         let leaf = claim(&pool, owner, "its leaf").await;
-        decomposes_to(&pool, compound, leaf, false).await;
-        insert_row(&pool, compound, &evidence_row(bt, source, "auto_wire")).await;
-        let before = set_sentinel_cache(&pool, compound, bt).await;
+        decomposes_to(&pool, compound, mid, false).await;
+        decomposes_to(&pool, mid, leaf, false).await;
+        let twin = claim(&pool, owner, "standalone twin").await;
+        for c in [compound, mid, leaf, twin] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
 
+        for (what, c) in [("root compound", compound), ("mid compound", mid)] {
+            let before = set_sentinel_cache(&pool, c, bt).await;
+            assert!(
+                !recompute_via(&pool, caller, c).await,
+                "{caller:?} reported a cache write on a {what}"
+            );
+            assert_eq!(
+                cache(&pool, c).await,
+                before,
+                "{caller:?} rewrote a {what}'s cache"
+            );
+        }
+
+        set_sentinel_cache(&pool, twin, bt).await;
+        assert!(recompute_via(&pool, caller, twin).await, "{caller:?} twin");
+        let expected = cache(&pool, twin).await;
+        assert_ne!(expected.pignistic_prob, Some(0.741), "twin recomputed");
+
+        set_sentinel_cache(&pool, leaf, bt).await;
         assert!(
-            !recompute_via(&pool, caller, compound).await,
-            "{caller:?} reported a cache write on a compound"
+            recompute_via(&pool, caller, leaf).await,
+            "{caller:?}: an evidenced leaf of a compound is an atom and must be recomputed"
         );
         assert_eq!(
-            cache(&pool, compound).await,
-            before,
-            "{caller:?} rewrote a compound's cache"
+            cache(&pool, leaf).await,
+            expected,
+            "{caller:?}: the leaf must fold its own row exactly as a standalone does"
         );
     }
 }
