@@ -68,11 +68,12 @@
 //!
 //! `viewer_route_table_lint.rs::TEST_ONLY_INLINE_READS` still carries
 //! `("claims.rs", 3)` and `ROUTE_LAYER_WRITES` `("claims.rs", 4)`; no inline
-//! statement was relocated by this shard. Two open entries brush this file and
-//! are neither discharged nor worsened by an executor swap —
-//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`) and
-//! `F-get-by-id-conn-duplicates-get-by-id`. Analysis held outside this
-//! repository.
+//! statement was relocated by this shard. One open entry brushes this file and
+//! is neither discharged nor worsened by an executor swap —
+//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`).
+//! Analysis held outside this repository. A second,
+//! `F-get-by-id-conn-duplicates-get-by-id`, is closed: `get_by_id_conn` now
+//! delegates to `get_by_id`, so the reads below that use it run one SQL text.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 

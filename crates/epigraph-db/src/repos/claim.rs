@@ -1087,9 +1087,10 @@ pub struct PatchClaimDiff {
 /// tampered body verified clean.
 ///
 /// Callers that expose or verify crypto state MUST extend their `SELECT` and
-/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly three
-/// do: [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
-/// [`ClaimRepository::get_by_id_with_labels`].
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly two
+/// do: [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`];
+/// [`ClaimRepository::get_by_id_conn`] delegates to the first.
 ///
 /// # The residual set is NOT just the bulk readers
 ///
@@ -4218,95 +4219,35 @@ impl ClaimRepository {
     /// Get a claim by ID on a caller-supplied connection.
     ///
     /// The connection-taking twin of [`Self::get_by_id`], and — since PR-23 —
-    /// the shape a request handler reaches through `AppState::read_as`. It
-    /// takes the `Viewer` and splices `/* {VISIBILITY:c} */`, so it is
-    /// visibility-equivalent to its pool-taking sibling.
+    /// the shape a request handler reaches through `AppState::read_as`.
     ///
-    /// # It is now FIELD-equivalent too, and it was not before
+    /// Delegates to the generic form, which accepts any executor — `&mut
+    /// PgConnection` included — so the visibility predicate, the projection
+    /// and the retirement / crypto post-fix exist in exactly one SQL text and
+    /// one decode. The same shape as [`Self::list_conn`] and
+    /// [`Self::count_conn`].
     ///
-    /// This function used to select seven columns where `get_by_id` selects
-    /// nine, leaving `claim_from_row`'s defaults (`is_current = true`,
-    /// `supersedes = None`) in place. That is a *widening* default rather than
-    /// a visibility defect — a superseded claim read as current — and it is
-    /// invisible to every gate, because the dropped fields default to plausible
-    /// values instead of erroring. The projection and the post-fix below are
-    /// now the same as `get_by_id`'s, per the `claim_from_row` rule in
-    /// `CLAUDE.md`: extend the caller's `SELECT` and post-fix the `Claim`.
+    /// # Why this is a delegator and not a copy
     ///
-    /// **A `*_conn` sibling is not automatically a drop-in for its pool-taking
-    /// twin.** A conversion shard must diff the projected columns as well as
-    /// the visibility marker.
-    ///
-    /// # …and CRYPTO-equivalent, which is the same argument one column further
-    ///
-    /// Backlog `49c17386` added `content_hash` / `signature` /
-    /// `signer_public_key` to `get_by_id` because `claim_from_row` fabricates
-    /// the first (recomputing it from `content`, so `computed == stored`
-    /// compared a value against itself) and blanks the second. That is the
-    /// identical *widening-default* class the section above names, and leaving
-    /// it here would have made this function a drop-in that silently verifies
-    /// clean. The `LEFT JOIN agents` is why this is a spliced runtime query
-    /// rather than a macro site — see [`Self::get_by_id`].
+    /// It used to be a hand-written second copy of `get_by_id`'s SQL, and that
+    /// copy drifted once already: it projected seven columns where its twin
+    /// projected nine, so a superseded claim read back as current. No gate
+    /// sees that class — `visibility_lint.rs` checks that each SQL text carries
+    /// a marker, never that two texts agree — so the copy is gone rather than
+    /// re-synchronised (backlog `fd47651c`). The reason it was once left as a
+    /// copy (`get_by_id` being a `sqlx::query!` macro site with a fixed bind
+    /// arity) stopped holding when `get_by_id` moved to a spliced runtime
+    /// `query_as`. `tests/get_by_id_conn_delegates_to_get_by_id.rs` pins both
+    /// the delegation and the field-for-field equivalence.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
-    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// As [`Self::get_by_id`].
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<Claim>, DbError> {
-        let uuid: Uuid = id.into();
-
-        use sqlx::Row;
-        let sql = viewer.splice(
-            r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                      c.created_at, c.updated_at, c.is_current, c.supersedes,
-                      c.content_hash, c.signature,
-                      s.public_key AS signer_public_key
-            FROM claims c
-            LEFT JOIN agents s ON s.id = c.signer_id
-            WHERE c.id = $1 /* {VISIBILITY:c} */"#,
-            2,
-        );
-        let mut q = sqlx::query(&sql).bind(uuid);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let row = q.fetch_optional(&mut *conn).await?;
-
-        match row {
-            Some(row) => {
-                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    tv,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state, exactly as `get_by_id` does.
-                // `claims.is_current` is NOT NULL in the schema, so the plain
-                // `bool` decode is safe; `supersedes` is nullable.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, also exactly as `get_by_id` does.
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        Self::get_by_id(&mut *conn, viewer, id).await
     }
 
     /// List claims with pagination

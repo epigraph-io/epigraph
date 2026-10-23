@@ -2467,17 +2467,6 @@
       "disposition_date": "2026-09-13"
     },
     {
-      "id": "F-get-by-id-conn-duplicates-get-by-id",
-      "where": "crates/epigraph-db/src/repos/claim.rs::ClaimRepository::get_by_id_conn",
-      "what": "get_by_id_conn is a hand-written second form of get_by_id rather than a delegator, so one visibility predicate exists in two SQL texts that must stay in sync by hand.",
-      "detail": "FOUND BY tenancy/fix-test-integrity's inventory while collapsing list_conn, and NOT fixed there: it is the same class but not the same change. get_by_id is a sqlx::query! MACRO site carrying the static three-bind form AND ($N::bool OR visibility = 'public' OR owner_group_id = ANY($M::uuid[])), while get_by_id_conn uses viewer.splice with /* {VISIBILITY:c} */. Fixed arity means the macro form cannot be spliced, so collapsing them is a decision about which spelling survives -- a separate commit, not a sweep-in. NO LIVE DEFECT IS CLAIMED: the two are consistent today. What is missing is any control that they stay so; visibility_lint.rs checks that each text carries a marker, never that two texts agree. no_unscoped_pool.rs's own prose already names this pair as the site of a past projection drift.",
-      "status": "open",
-      "assigned": "unassigned; the next shard that touches ClaimRepository::get_by_id or its _conn sibling",
-      "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Same class as the list_conn duplication this batch collapsed, but NOT the same change: get_by_id is a sqlx::query! MACRO site, so the delegation that worked for list_conn does not transfer. Belongs to the unnumbered conversion tail: real work with no owner today, and a candidate for scheduling rather than a decision to leave it undone.",
-      "disposition_date": "2026-09-12"
-    },
-    {
       "id": "F-shared-cargo-target-serves-a-binary-built-in-another-worktree",
       "where": "crates/epigraph-tools/tests/table_graph_{discover,dossier}_tests.rs, and any target whose source expands CARGO_MANIFEST_DIR",
       "what": "The shared CARGO_TARGET_DIR can hand a worktree a test binary compiled in a DIFFERENT worktree, because the value of CARGO_MANIFEST_DIR is baked in at compile time and is not part of cargo's rebuild fingerprint.",
@@ -3070,6 +3059,21 @@
       "closing_measurement": "Re-measured before changing anything: the two bodies were semantically identical -- same seven projected columns, same two query shapes, same marker, same bind indices 4/3, same claim_from_row construction -- differing only in line wrapping. So this was latent duplication, not a live predicate mismatch, exactly as filed. || SINGLE-COPY PROOF: list()'s exact projection-plus-ORDER BY-plus-LIMIT $1 OFFSET $2 tail now occurs twice in crates/epigraph-db/src/repos/, both inside `list`. || EQUIVALENCE ASSERTED rather than each side asserted separately, per the finding: crates/epigraph-db/tests/list_conn_delegates_to_list.rs drives BOTH entry points over one corpus for an owner and a stranger on BOTH query shapes and requires identical output. || MUTATION PROOF, and the first attempt was UNDER-POWERED, which is recorded because it is the same class this batch exists for: OR-ing away list()'s no-search predicate left the equality arm GREEN -- both entry points now run one body, so they leak together and stay equal. The test was strengthened to pin the exact row sets on BOTH shapes through BOTH entry points; the same mutation then failed on 'neither entry point may return another group's claim on the None shape'. Restored byte-identical. || NO REGISTER MOVED. visibility_lint.rs skips a body containing neither sqlx::query nor sqlx::raw_sql ('the callee is subject to this same lint'), verified by running it, and CONN_WITHOUT_VIEWER keys on _conn fns that lack a &Viewer -- list_conn keeps its viewer. no_unscoped_pool.rs's prose mention of list_conn is a historical pre-PR-27 census and is still true as written, so it is left alone. || REPORTED, NOT FIXED: ClaimRepository::get_by_id_conn is the same class and is unlisted by this finding. It is not collapsible the same way -- get_by_id is a sqlx::query! MACRO site carrying the static three-bind form, while get_by_id_conn uses viewer.splice -- so it is a separate decision and a separate commit. Filed as F-get-by-id-conn-duplicates-get-by-id.",
       "closed_date": "2026-09-12",
       "closed_by": "tenancy/fix-test-integrity"
+    },
+    {
+      "id": "F-get-by-id-conn-duplicates-get-by-id",
+      "where": "crates/epigraph-db/src/repos/claim.rs::ClaimRepository::get_by_id_conn",
+      "what": "get_by_id_conn is a hand-written second form of get_by_id rather than a delegator, so one visibility predicate exists in two SQL texts that must stay in sync by hand.",
+      "detail": "FOUND BY tenancy/fix-test-integrity's inventory while collapsing list_conn, and NOT fixed there: it is the same class but not the same change. get_by_id is a sqlx::query! MACRO site carrying the static three-bind form AND ($N::bool OR visibility = 'public' OR owner_group_id = ANY($M::uuid[])), while get_by_id_conn uses viewer.splice with /* {VISIBILITY:c} */. Fixed arity means the macro form cannot be spliced, so collapsing them is a decision about which spelling survives -- a separate commit, not a sweep-in. NO LIVE DEFECT IS CLAIMED: the two are consistent today. What is missing is any control that they stay so; visibility_lint.rs checks that each text carries a marker, never that two texts agree. no_unscoped_pool.rs's own prose already names this pair as the site of a past projection drift.",
+      "status": "CLOSED 2026-10-23 by fix/bugwave-w3-claim-repo. get_by_id_conn is now Self::get_by_id(&mut *conn, viewer, id), the shape list_conn and count_conn were collapsed to.",
+      "assigned": "unassigned; the next shard that touches ClaimRepository::get_by_id or its _conn sibling",
+      "disposition": "CLOSED",
+      "disposition_note": "The premise that kept it open -- get_by_id being a sqlx::query! macro site with a fixed bind arity, so the list_conn delegation could not transfer -- was invalidated when get_by_id moved to a runtime query_as + Viewer::splice generic over sqlx::PgExecutor. The delegation then applies directly.",
+      "disposition_date": "2026-10-23",
+      "fix_batch": "fix/bugwave-w3-claim-repo",
+      "closing_measurement": "Re-measured before changing anything: get_by_id is `pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>` using sqlx::query_as::<_, Row>(&sql) over viewer.splice, so it is no longer a macro site. The two bodies were semantically identical -- same twelve projected columns, same LEFT JOIN agents, same /* {VISIBILITY:c} */ marker, same retirement and crypto post-fix -- differing only in COALESCE(c.is_current, true) vs c.is_current (no effect: the column is NOT NULL) and in decoding with row.get vs FromRow. Latent duplication, not a live predicate mismatch, exactly as filed. || STRUCTURAL PIN: crates/epigraph-db/tests/get_by_id_conn_delegates_to_get_by_id.rs::get_by_id_conn_is_a_pure_delegation reads repos/claim.rs and fails if get_by_id_conn's body contains sqlx::query, .splice(, SELECT or row.get, or lacks Self::get_by_id(&mut *conn, viewer, id); red on the pre-fix tree. || EQUIVALENCE PLUS ABSOLUTE PINS: get_by_id_conn_returns_exactly_what_get_by_id_returns compares every Claim field through both entry points for an owner and a stranger over a signed, a retired and a group-private claim, and separately pins the stranger's None, the stored (sha256, not blake3) content_hash, the stored signature, the signer key and the retirement state -- equality alone is green for one shared body that is wrong twice, per F-PR28-list-conn-duplicates-list's recorded mutation.",
+      "closed_date": "2026-10-23",
+      "closed_by": "fix/bugwave-w3-claim-repo"
     },
     {
       "id": "F-PR28-route-error-text",
