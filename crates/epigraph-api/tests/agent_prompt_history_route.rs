@@ -402,8 +402,9 @@ async fn the_operator_reads_its_agents_snapshots_and_lineage(pool: PgPool) {
 
 /// A caller who neither operates the agent nor is an admin gets exactly the
 /// 404 that an agent which does not exist gets: same status, same body but
-/// for the id. So the route is not an oracle for which agent ids exist.
-/// CONTROL: the operator reads the same agent.
+/// for the id. (Agent ids are public; this pins a uniform refusal, not
+/// secrecy about which agents exist.) CONTROL: the operator reads the same
+/// agent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_stranger_gets_the_404_an_absent_agent_gets(pool: PgPool) {
     let operator = human(&pool).await;

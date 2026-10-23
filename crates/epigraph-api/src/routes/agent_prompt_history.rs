@@ -5,21 +5,27 @@
 //!
 //! # Who may read it
 //!
-//! The agent's operator (any link, retired ones included, so the history
-//! outlives a hand-over) and admins. The decision is the database's: migration
-//! 161's `epigraph_agent_prompt_history` reads the SESSION principal, so the
-//! call runs on the caller's viewer-stamped connection ([`AppState::read_as`]),
+//! Whoever `epigraph_human_of(agent, false)` (migration 149) names, and
+//! admins. That is: a human the agent is linked to, in ANY link state, a
+//! retired link included, so the history outlives a hand-over; for an agent
+//! with no link at all, the operator of its allowlisted client (149's
+//! `author_binding_clients` arm); and a registered human operator asking about
+//! itself. The decision is the database's: migration 161's
+//! `epigraph_agent_prompt_history` reads the SESSION principal, so the call
+//! runs on the caller's viewer-stamped connection ([`AppState::read_as`]),
 //! never on the raw pool, where the principal is unset and every caller is
 //! refused. Under armed admin scopes the definer's admin arm needs an ELEVATED
 //! session, which is why this takes [`ViewerExtractor`] and not
 //! `UnelevatedViewer`.
 //!
-//! A caller who is neither gets **404, exactly as for an agent that does not
-//! exist** (`AID06` is never surfaced), so the route does not tell a stranger
-//! which agent ids are real. An admin asking for an id with no agent behind it
-//! gets the same 404: the definer does not check existence (it would answer
-//! one empty `self` row), so the handler does, after the gate, on the same
-//! connection. Only callers the gate admitted ever reach that check.
+//! A caller who is neither gets **404, with the body an agent that does not
+//! exist gets** (`AID06` is never surfaced). That is uniformity, not secrecy:
+//! agent ids are not secret (`agents` is readable by every session, and
+//! `GET /api/v1/agents/:id` answers for any id), so the 404 protects the
+//! history, not the agent's existence. An admin asking for an id with no agent
+//! behind it gets the same 404: the definer does not check existence (it would
+//! answer one empty `self` row), so the handler does, after the gate, on the
+//! same connection. Only callers the gate admitted ever reach that check.
 //!
 //! # Shape
 //!
