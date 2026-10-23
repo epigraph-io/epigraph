@@ -155,24 +155,53 @@ async fn every_file_round_trips_byte_for_byte_under_its_raw_hash(pool: PgPool) {
 }
 
 /// A blob whose stored content no longer hashes to its key (tampered, or a
-/// hash collision the database cannot detect) is an `InvalidData` error from
-/// the history read, never someone else's text under this agent's name.
-/// CALIBRATION: the same read before the tamper succeeds.
+/// hash collision the database cannot detect) is WITHHELD from the history
+/// read, never returned as someone else's text under this agent's name. And
+/// because blobs are shared across agents (one group CLAUDE.md template, many
+/// identities), one bad blob must not fail every history that names it: the
+/// read still returns, with that file absent and the agent's other files
+/// intact (review CR7). CALIBRATION: the same read before the tamper returns
+/// the template.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_blob_that_no_longer_matches_its_hash_is_an_error(pool: PgPool) {
-    let reg = registration([
-        PromptFile::Absent,
-        PromptFile::Absent,
-        PromptFile::Absent,
-        PromptFile::Stored(b"the true lesson\n".to_vec()),
-    ]);
-    let out = register(&pool, reg).await;
-    let operator = operate(&pool, out.agent_id).await;
-    history_as(&pool, operator, out.agent_id)
+async fn a_blob_that_no_longer_matches_its_hash_is_withheld_not_fatal(pool: PgPool) {
+    let template = b"the shared group template\n".to_vec();
+    let lesson = b"the true lesson\n".to_vec();
+    let a = register(
+        &pool,
+        registration([
+            PromptFile::Absent,
+            PromptFile::Absent,
+            PromptFile::Stored(template.clone()),
+            PromptFile::Stored(lesson.clone()),
+        ]),
+    )
+    .await;
+    let b = register(
+        &pool,
+        registration([
+            PromptFile::Absent,
+            PromptFile::Absent,
+            PromptFile::Stored(template.clone()),
+            PromptFile::Stored(b"another agent's lesson\n".to_vec()),
+        ]),
+    )
+    .await;
+    let operator = operate(&pool, a.agent_id).await;
+    let before = history_as(&pool, operator, a.agent_id)
         .await
         .expect("an untampered history reads");
+    let snap = before
+        .iter()
+        .find(|e| e.relation == "self")
+        .and_then(|e| e.snapshot.as_ref())
+        .expect("self snapshot");
+    assert_eq!(
+        snap.group_claude_md.as_ref().map(|f| f.bytes.clone()),
+        Some(template.clone()),
+        "CALIBRATION: the template reads before the tamper"
+    );
 
-    let forged = zstd::bulk::compress(b"a forged lesson\n", 3).expect("compress");
+    let forged = zstd::bulk::compress(b"a forged template\n", 3).expect("compress");
     let mut tx = pool.begin().await.expect("begin");
     sqlx::query("ALTER TABLE agent_prompt_blobs DISABLE TRIGGER USER")
         .execute(&mut *tx)
@@ -180,11 +209,11 @@ async fn a_blob_that_no_longer_matches_its_hash_is_an_error(pool: PgPool) {
         .expect("disable the append-only guard (superuser, test only)");
     let n = sqlx::query(
         "UPDATE agent_prompt_blobs SET content = $1, raw_size = $2 \
-          WHERE blob_hash = (SELECT learned_md FROM agent_prompt_snapshots WHERE id = $3)",
+          WHERE blob_hash = (SELECT group_claude_md FROM agent_prompt_snapshots WHERE id = $3)",
     )
     .bind(&forged)
-    .bind(b"a forged lesson\n".len() as i32)
-    .bind(out.snapshot_id)
+    .bind(b"a forged template\n".len() as i32)
+    .bind(a.snapshot_id)
     .execute(&mut *tx)
     .await
     .expect("tamper")
@@ -196,13 +225,29 @@ async fn a_blob_that_no_longer_matches_its_hash_is_an_error(pool: PgPool) {
         .expect("re-enable");
     tx.commit().await.expect("commit");
 
-    let err = history_as(&pool, operator, out.agent_id)
-        .await
-        .expect_err("a blob that does not hash to its key must not be returned");
-    assert!(
-        matches!(err, DbError::InvalidData { .. }),
-        "expected InvalidData, got {err:?}"
-    );
+    let other_operator = operate(&pool, b.agent_id).await;
+    for (who, agent, own) in [
+        (operator, a.agent_id, lesson.clone()),
+        (other_operator, b.agent_id, b"another agent's lesson\n".to_vec()),
+    ] {
+        let entries = history_as(&pool, who, agent)
+            .await
+            .expect("one bad shared blob must not fail the whole history read");
+        let snap = entries
+            .iter()
+            .find(|e| e.relation == "self")
+            .and_then(|e| e.snapshot.as_ref())
+            .expect("self snapshot");
+        assert!(
+            snap.group_claude_md.is_none(),
+            "a blob that does not hash to its key must not be returned"
+        );
+        assert_eq!(
+            snap.learned_md.as_ref().map(|f| f.bytes.clone()),
+            Some(own),
+            "the agent's other files are intact"
+        );
+    }
 }
 
 /// A file the host refused to store is reported by name with no content, and
