@@ -1830,7 +1830,7 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
         .await
         .expect("seed scoped row");
     }
-    let scoped_before: Vec<(String, f64, f64, Option<f64>)> = scoped(&pool, atom).await;
+    let scoped_before = scoped_full(&pool, atom).await;
     let rows_before: i64 = sqlx::query_scalar("SELECT count(*) FROM ds_combined_beliefs")
         .fetch_one(&pool)
         .await
@@ -1901,11 +1901,250 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
         "the claim cache is restored"
     );
     assert_eq!(
-        scoped(&pool, atom).await,
+        scoped_full(&pool, atom).await,
         scoped_before,
-        "the scoped rows are restored"
+        "the scoped rows are restored, every value column"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `(scope_type, scope_id, every value column)` of the claim's scoped rows,
+/// in scope order.
+async fn scoped_full(pool: &PgPool, claim: Uuid) -> Vec<(String, Option<Uuid>, ScopedRow)> {
+    use sqlx::Row as _;
+    sqlx::query(
+        "SELECT scope_type, scope_id, belief, plausibility, mass_on_empty, mass_on_missing, \
+                conflict_k, strategy_used, pignistic_prob \
+           FROM ds_combined_beliefs WHERE claim_id = $1 ORDER BY scope_type, scope_id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read scoped rows")
+    .into_iter()
+    .map(|r| {
+        (
+            r.get("scope_type"),
+            r.get("scope_id"),
+            ScopedRow {
+                belief: r.get("belief"),
+                plausibility: r.get("plausibility"),
+                mass_on_empty: r.get("mass_on_empty"),
+                mass_on_missing: r.get("mass_on_missing"),
+                conflict_k: r.get("conflict_k"),
+                strategy_used: r.get("strategy_used"),
+                pignistic_prob: r.get("pignistic_prob"),
+            },
+        )
+    })
+    .collect()
+}
+
+/// SPEC §10.8's restore is compare-and-swap for the scoped rows too: a row
+/// written after the wave (a later `ScopedBeliefRepository::upsert`, say) is
+/// left as that later write and reported `scoped_superseded_since_wave`,
+/// while the wave's other rows go back. `--claims` limits the scoped restore
+/// as it does the claim restore: a row of an unlisted claim keeps the wave's
+/// value until a run that covers it, which then restores it and reports the
+/// earlier rows `already_restored` (or still superseded).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_scoped_restore_leaves_a_row_written_after_the_wave_and_honours_claims(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "cas-owner").await;
+    let source = agent(&pool, "cas-source").await;
+    let other_source = agent(&pool, "cas-other-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let p = perspective(&pool, owner, "cas").await;
+    let a = claim(&pool, owner, "listed atom").await;
+    insert_row(&pool, a, &evidence_row(bin, source, 0.8, None)).await;
+    insert_row(
+        &pool,
+        a,
+        &Row {
+            perspective_id: Some(p),
+            ..evidence_row(bin, other_source, 0.55, None)
+        },
+    )
+    .await;
+    let b = claim(&pool, owner, "unlisted atom").await;
+    insert_row(&pool, b, &evidence_row(bin, source, 0.6, None)).await;
+    seed_scoped_row(&pool, a, bin, ("global", None), 0.111, "seeded").await;
+    seed_scoped_row(&pool, a, bin, ("perspective", Some(p)), 0.222, "seeded").await;
+    seed_scoped_row(&pool, b, bin, ("global", None), 0.333, "seeded").await;
+    let a_global_before = scoped_row(&pool, a, bin, ("global", None)).await;
+    let b_global_before = scoped_row(&pool, b, bin, ("global", None)).await;
+
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+    let wave_file = dir.join("wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("the wave");
+    let b_global_wave = scoped_row(&pool, b, bin, ("global", None)).await;
+    assert_ne!(
+        b_global_wave, b_global_before,
+        "control: the wave resynced B's row"
+    );
+
+    // A later write to A's perspective row.
+    sqlx::query(
+        "UPDATE ds_combined_beliefs SET belief = 0.444, strategy_used = 'Dempster' \
+          WHERE claim_id = $1 AND scope_type = 'perspective'",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .expect("the later write");
+    let a_later = scoped_row(&pool, a, bin, ("perspective", Some(p))).await;
+
+    let claims_file = dir.join("claims.txt");
+    std::fs::write(&claims_file, format!("{a}\n")).expect("claims file");
+    let restore = |extra: Vec<String>, tag: &str| {
+        let mut args = vec![
+            "--from".to_string(),
+            s(&wave_file).to_string(),
+            "--outcomes-out".to_string(),
+            s(&dir.join(format!("outcomes-{tag}.jsonl"))).to_string(),
+            "--downstream-out".to_string(),
+            s(&dir.join(format!("downstream-{tag}.jsonl"))).to_string(),
+        ];
+        args.extend(extra);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = run(RESTORE, &dir, &args, &[("DATABASE_URL", env.db.as_str())]);
+        r.ok(&format!("restore {tag}"));
+        r.stdout
+    };
+
+    let out = restore(
+        vec!["--claims".into(), s(&claims_file).to_string()],
+        "listed",
+    );
+    for line in [
+        "scoped_restored: 1",
+        "scoped_superseded_since_wave: 1",
+        "scoped_already_restored: 0",
+    ] {
+        assert!(out.contains(line), "expected {line:?}\nstdout: {out}");
+    }
+    assert_eq!(
+        scoped_row(&pool, a, bin, ("global", None)).await,
+        a_global_before,
+        "the listed atom's untouched row is restored"
+    );
+    assert_eq!(
+        scoped_row(&pool, a, bin, ("perspective", Some(p))).await,
+        a_later,
+        "a row written after the wave keeps the later write"
+    );
+    assert_eq!(
+        scoped_row(&pool, b, bin, ("global", None)).await,
+        b_global_wave,
+        "--claims leaves an unlisted claim's scoped row alone"
+    );
+
+    let out = restore(Vec::new(), "all");
+    for line in [
+        "scoped_restored: 1",
+        "scoped_already_restored: 1",
+        "scoped_superseded_since_wave: 1",
+    ] {
+        assert!(out.contains(line), "expected {line:?}\nstdout: {out}");
+    }
+    assert_eq!(
+        scoped_row(&pool, b, bin, ("global", None)).await,
+        b_global_before,
+        "a run that covers B restores its row"
+    );
+    assert_eq!(
+        scoped_row(&pool, a, bin, ("perspective", Some(p))).await,
+        a_later,
+        "the later write still stands"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `restore_scoped` over a row recorded by more than one wave (records in
+/// any order): a CHAINED run of records (each `before` the previous
+/// `written`) restores to the chain's first `before`; where the chain is
+/// broken (a write landed between two waves), only the records after the
+/// break are undone, to that later write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_scoped_restore_follows_a_chain_of_waves_to_its_start(pool: PgPool) {
+    use epigraph_cli::belief_cache::{
+        restore_scoped, RestoreOptions, ScopedColumns, ScopedWaveRecord,
+    };
+
+    let owner = agent(&pool, "chain-owner").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let col = |b: f64| ScopedColumns {
+        belief: Some(b),
+        plausibility: Some(0.9),
+        mass_on_empty: Some(0.0),
+        mass_on_missing: Some(0.0),
+        conflict_k: None,
+        strategy_used: Some("atom_fold".into()),
+        pignistic_prob: Some(0.5),
+    };
+    let t0 = chrono::Utc::now();
+    let mut records = Vec::new();
+    let mut rows = Vec::new();
+    // (chained: A -> B, B -> C) restores to A; (broken: A -> B, D -> C) to D.
+    for (what, first_before, second_before, want) in
+        [("chained", 0.1, 0.2, 0.1), ("broken", 0.1, 0.4, 0.4)]
+    {
+        let c = claim(&pool, owner, what).await;
+        seed_scoped_row(&pool, c, bin, ("global", None), 0.3, "atom_fold").await;
+        sqlx::query(
+            "UPDATE ds_combined_beliefs SET plausibility = 0.9, mass_on_empty = 0.0, \
+                    mass_on_missing = 0.0, conflict_k = NULL, pignistic_prob = 0.5 \
+              WHERE claim_id = $1",
+        )
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("hold the second wave's written");
+        let row_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM ds_combined_beliefs WHERE claim_id = $1")
+                .bind(c)
+                .fetch_one(&pool)
+                .await
+                .expect("row id");
+        let rec = |before: f64, written: f64, secs: i64| ScopedWaveRecord {
+            row_id,
+            claim_id: c,
+            frame_id: bin,
+            scope_type: "global".into(),
+            scope_id: None,
+            before: col(before),
+            written: col(written),
+            wave: format!("wave-{secs}"),
+            at: t0 + chrono::Duration::seconds(secs),
+        };
+        // The later wave first: the restore orders by `at`, not file order.
+        records.push(rec(second_before, 0.3, 2));
+        records.push(rec(first_before, 0.2, 1));
+        rows.push((c, want));
+    }
+    let report = restore_scoped(&pool, &records, &RestoreOptions::default())
+        .await
+        .expect("restore_scoped");
+    assert_eq!(report.restored.len(), 2, "{report:?}");
+    for (c, want) in rows {
+        let got: Option<f64> =
+            sqlx::query_scalar("SELECT belief FROM ds_combined_beliefs WHERE claim_id = $1")
+                .bind(c)
+                .fetch_one(&pool)
+                .await
+                .expect("belief");
+        assert_eq!(
+            got,
+            Some(want),
+            "restored to the start of the trailing chain"
+        );
+    }
 }
 
 /// `(scope_type, belief, plausibility, pignistic_prob)` of the claim's scoped
