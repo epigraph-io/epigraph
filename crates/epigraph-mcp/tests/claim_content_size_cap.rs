@@ -11,8 +11,8 @@
 //! The limits are spelled as literals on purpose, not imported from the crate,
 //! so the file states the contract independently of the constant it tests.
 //!
-//! `memorize` is not covered here: its module is being changed by an open
-//! branch, and its guard is a follow-up.
+//! Covered: `submit_claim`, `batch_submit_claims`, `resolve_backlog_item`,
+//! `supersede_claim` and `memorize`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -207,5 +207,105 @@ async fn supersede_claim_rejects_content_over_64k_and_retires_nothing(pool: PgPo
         err.code,
         rmcp::model::ErrorCode::INVALID_PARAMS,
         "an oversized replacement is the caller's error; got {err:?}"
+    );
+}
+
+/// `memorize` with one byte over the cap: refused as the caller's error, and
+/// no memory claim is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn memorize_rejects_content_over_64k_and_writes_no_claim(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let content = content_of_len("memorize over", CAP + 1);
+
+    let res = epigraph_mcp::tools::memory::memorize(
+        &server,
+        &viewer,
+        epigraph_mcp::types::MemorizeParams {
+            content: content.clone(),
+            confidence: Some(0.7),
+            tags: None,
+            novelty_threshold: None,
+        },
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        claim_count_for_content(&pool, &content).await,
+        0,
+        "memorize over the cap must leave no claim row behind"
+    );
+    let err = res.expect_err("memorize content over 65,536 bytes must be refused");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "an oversized memory is the caller's error, not INTERNAL_ERROR; got {err:?}"
+    );
+}
+
+/// `resolve_backlog_item` with an oversized resolution: refused before the
+/// resolution claim is written AND before the backlog item is labelled
+/// `resolved`, so the item stays open.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_backlog_item_rejects_content_over_64k_and_leaves_the_item_open(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    // The backlog item is authored through the server itself, so the
+    // owner-or-admin check inside resolve_backlog_item passes and the size
+    // cap is the only thing that can refuse the call.
+    let mut params = submit_params(&format!(
+        "content size cap backlog item {}",
+        uuid::Uuid::new_v4()
+    ));
+    params.labels = vec!["backlog".into()];
+    let created = epigraph_mcp::tools::claims::submit_claim(&server, &viewer, params, None)
+        .await
+        .expect("seed backlog item");
+    let original: uuid::Uuid = first_text(&created)["claim_id"]
+        .as_str()
+        .expect("claim_id")
+        .parse()
+        .expect("uuid");
+    let prefix = format!("Resolves {original}: ");
+
+    let res = epigraph_mcp::tools::claims::resolve_backlog_item(
+        &server,
+        &viewer,
+        epigraph_mcp::types::ResolveBacklogItemParams {
+            original_id: original.to_string(),
+            resolution_content: content_of_len("resolve over", CAP + 1),
+            methodology: None,
+            basis_claim_ids: Vec::new(),
+        },
+        None,
+    )
+    .await;
+
+    let resolutions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE starts_with(content, $1)")
+            .bind(&prefix)
+            .fetch_one(&pool)
+            .await
+            .expect("count resolution claims");
+    assert_eq!(
+        resolutions, 0,
+        "an oversized resolution must leave no resolution claim behind"
+    );
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(original)
+        .fetch_one(&pool)
+        .await
+        .expect("original labels");
+    assert!(
+        labels.contains(&"backlog".to_string()) && !labels.contains(&"resolved".to_string()),
+        "a refused resolution must leave the item open (backlog, not resolved): {labels:?}"
+    );
+    let err = res.expect_err("resolution content over 65,536 bytes must be refused");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "an oversized resolution is the caller's error; got {err:?}"
     );
 }

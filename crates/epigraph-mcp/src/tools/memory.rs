@@ -30,6 +30,9 @@ pub async fn memorize(
     params: MemorizeParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // Same content cap as submit_claim and the HTTP twins, checked before the
+    // author is resolved, the content is embedded, or anything is written.
+    crate::tools::claims::check_claim_content_length(&params.content)?;
     // Author = the request's principal (batch H-b, D1); signer = this server.
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
