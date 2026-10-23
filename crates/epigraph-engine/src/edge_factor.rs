@@ -486,6 +486,40 @@ pub async fn preview_claim_belief_on_frame(
     compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await
 }
 
+/// [`preview_claim_belief_on_frame`] over the frame's stored rows as `adjust`
+/// leaves them: the same discount + combine pipeline, on rows the caller
+/// filtered or edited in memory. Writes nothing and changes no stored row.
+///
+/// Added for `recompute_betp`'s drift decomposition (SPEC §10.4), whose
+/// stages are counterfactual folds of the owner frame: without the ingest
+/// template's rows (2), or with the `evidence_type` a manifest names reset to
+/// its pre-backfill value (1'). `None` when no row is left.
+///
+/// # Errors
+/// Same failure modes as [`preview_claim_belief_on_frame`].
+pub async fn preview_claim_belief_on_frame_adjusted<F>(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    adjust: F,
+) -> Result<Option<CombinedBeliefPreview>, String>
+where
+    F: FnOnce(Vec<MassFunctionRow>) -> Vec<MassFunctionRow>,
+{
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {frame_id} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
+    let stored =
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    compute_combined_belief_over(conn, viewer, claim_id, frame_id, &frame, adjust(stored)).await
+}
+
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
 /// scalars [`recompute_combined_belief`] writes to `claims`, plus the CDST
 /// classification label when the frame is the canonical binary frame.
@@ -866,6 +900,19 @@ async fn compute_combined_belief(
         MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
             .await
             .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    compute_combined_belief_over(conn, viewer, claim_id, frame_id, frame, all_rows).await
+}
+
+/// [`compute_combined_belief`] over the given rows of (claim, frame) instead
+/// of the stored ones. `None` when `all_rows` is empty.
+async fn compute_combined_belief_over(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    all_rows: Vec<MassFunctionRow>,
+) -> Result<Option<CombinedBeliefPreview>, String> {
     if all_rows.is_empty() {
         return Ok(None);
     }
