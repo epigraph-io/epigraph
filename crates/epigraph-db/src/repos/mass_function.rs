@@ -276,8 +276,13 @@ const COMPOUND_ROOT_SEARCH_DEPTH: i32 = 6;
 const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 
 /// A boolean SQL expression over the claim bound as `$1`: TRUE when that claim
-/// is a **non-procedural compound**, whose cached belief no bulk recompute may
-/// rewrite.
+/// is a **non-procedural compound**, whose cached belief no recompute that
+/// resolves its owner through
+/// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite.
+/// Writers that fold a named frame directly (for example the post-removal
+/// recompute of `backfill_factors`' edge re-wire, or the per-write
+/// `recompute_claim_belief_on_frame` callers) do not pass through this check;
+/// they are moved onto the single atom-cache writer separately.
 ///
 /// * **Compound:** it has an in-force ([`super::edge::EDGE_IN_FORCE`])
 ///   `decomposes_to` out-edge to a current claim. Its belief is a query over
@@ -1336,16 +1341,18 @@ impl MassFunctionRepository {
     /// as [`Self::get_for_claim_frame`] excludes them, so the owner is always a
     /// frame the recompute can fold. **Ingest template rows
     /// ([`ingest_template_predicate`]) do not count either.** A claim whose
-    /// only inputs are templates has no owner, so no bulk recompute replaces
-    /// its cache with the template's near-vacuous fold; and a frame that holds
-    /// nothing but a template cannot own a claim that has real input
-    /// elsewhere. (The fold of the owner frame itself is unchanged: a template
+    /// only inputs are templates has no owner, so no recompute that resolves
+    /// its owner here replaces its cache with the template's near-vacuous
+    /// fold; and a frame that holds nothing but a template cannot own a claim
+    /// that has real input elsewhere. (The fold of the owner frame itself is unchanged: a template
     /// that shares the owner frame with a real input is still folded there.)
     ///
     /// **A non-procedural compound has no owner** ([`frozen_compound_predicate`]):
-    /// its belief is a query over its leaves, so no bulk recompute refolds the
-    /// BBAs that sit on it into its cache. A workflow-rooted (procedural) tree
-    /// keeps the rules below.
+    /// its belief is a query over its leaves, so no recompute that resolves its
+    /// owner here (the three bulk recomputers and the `routes::assess`
+    /// refresh) refolds the BBAs that sit on it into its cache. Writers that
+    /// fold a named frame directly are not covered. A workflow-rooted
+    /// (procedural) tree keeps the rules below.
     ///
     /// Among the frames holding the claim's remaining inputs:
     ///
