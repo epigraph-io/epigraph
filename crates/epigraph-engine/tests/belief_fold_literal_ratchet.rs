@@ -145,9 +145,7 @@ fn code_only(src: &str) -> String {
                 None
             };
             if let Some(end) = close {
-                for _ in i..=end {
-                    out.push(' ');
-                }
+                out.extend(std::iter::repeat_n(' ', end + 1 - i));
                 i = end + 1;
                 continue;
             }
@@ -238,8 +236,8 @@ fn scan(src: &str) -> Vec<Finding> {
         if in_table {
             continue;
         }
-        let marked = raw.contains(ALLOW_MARKER)
-            || (idx > 0 && raw_lines[idx - 1].contains(ALLOW_MARKER));
+        let marked =
+            raw.contains(ALLOW_MARKER) || (idx > 0 && raw_lines[idx - 1].contains(ALLOW_MARKER));
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -267,7 +265,7 @@ fn scan(src: &str) -> Vec<Finding> {
                 let exponent_sign = (ch == '+' || ch == '-')
                     && i > start
                     && matches!(chars[i - 1], 'e' | 'E')
-                    && !chars[start..i].iter().any(|c| *c == 'x');
+                    && !chars[start..i].contains(&'x');
                 if ch.is_ascii_alphanumeric() || ch == '_' || fractional_dot || exponent_sign {
                     i += 1;
                 } else {

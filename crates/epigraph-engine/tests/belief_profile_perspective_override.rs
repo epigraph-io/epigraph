@@ -21,7 +21,9 @@ mod fixture;
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
-use epigraph_engine::belief_query::{get_belief, get_perspective_belief, get_perspective_belief_batch};
+use epigraph_engine::belief_query::{
+    get_belief, get_perspective_belief, get_perspective_belief_batch,
+};
 use epigraph_engine::BeliefInterval;
 use uuid::Uuid;
 
@@ -91,9 +93,10 @@ async fn store_support(
 }
 
 async fn perspective_with_properties(pool: &PgPool, name: &str, props: serde_json::Value) -> Uuid {
-    let p = PerspectiveRepository::create(pool, name, None, None, Some("analytical"), &[], None, None)
-        .await
-        .expect("perspective");
+    let p =
+        PerspectiveRepository::create(pool, name, None, None, Some("analytical"), &[], None, None)
+            .await
+            .expect("perspective");
     sqlx::query("UPDATE perspectives SET properties = $2 WHERE id = $1")
         .bind(p.id)
         .bind(props)
@@ -131,9 +134,35 @@ async fn a_perspective_profile_override_moves_only_reads_under_that_perspective(
         FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
 
     // One intra-source row (discounted by the intra factor) and one
-    // cross-source row (untouched by it).
-    store_support(&pool, claim_id, frame_id, agent, &frame, "empirical", "intra_self_cite", 0.8).await;
-    store_support(&pool, claim_id, frame_id, agent, &frame, "logical", "cross", 0.5).await;
+    // cross-source row (untouched by it), from two agents so the BBA read
+    // returns both.
+    let second_agent = insert_agent(&pool).await;
+    store_support(
+        &pool,
+        claim_id,
+        frame_id,
+        agent,
+        &frame,
+        "empirical",
+        "intra_self_cite",
+        0.8,
+    )
+    .await;
+    store_support(
+        &pool,
+        claim_id,
+        frame_id,
+        second_agent,
+        &frame,
+        "logical",
+        "cross",
+        0.5,
+    )
+    .await;
+    let stored = MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim_id, frame_id)
+        .await
+        .expect("bbas");
+    assert_eq!(stored.len(), 2, "both rows must reach the fold");
 
     let p = perspective_with_properties(
         &pool,
@@ -189,5 +218,104 @@ async fn a_perspective_profile_override_moves_only_reads_under_that_perspective(
         bits(one.as_ref().expect("batch item")),
         bits(&under_p),
         "batch and single reads under P must agree"
+    );
+}
+
+/// The frame tier: a frame's `belief_profile` override applies to the framed
+/// read AND to the cached value the recompute writes, identically, so the
+/// framed read keeps reproducing the cache. A twin frame without the override
+/// over the same rows serves the un-overridden value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_frame_profile_override_moves_the_read_and_the_cache_together(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let first_agent = insert_agent(&pool).await;
+    let second_agent = insert_agent(&pool).await;
+
+    let mut results = Vec::new();
+    for (name, props) in [
+        ("frame_without_override", None),
+        (
+            "frame_with_override",
+            Some(serde_json::json!({
+                "belief_profile": { "reliability": { "intra_evidence_locality_factor": 0.9 } }
+            })),
+        ),
+    ] {
+        let claim_id = insert_claim(&pool, first_agent).await;
+        let frame_row =
+            FrameRepository::create(&pool, name, None, &["H0".to_string(), "H1".to_string()])
+                .await
+                .expect("frame");
+        if let Some(props) = props {
+            sqlx::query("UPDATE frames SET properties = properties || $2 WHERE id = $1")
+                .bind(frame_row.id)
+                .bind(props)
+                .execute(&pool)
+                .await
+                .expect("frame properties");
+        }
+        let frame =
+            FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone()).unwrap();
+        store_support(
+            &pool,
+            claim_id,
+            frame_row.id,
+            first_agent,
+            &frame,
+            "empirical",
+            "intra_self_cite",
+            0.8,
+        )
+        .await;
+        store_support(
+            &pool,
+            claim_id,
+            frame_row.id,
+            second_agent,
+            &frame,
+            "logical",
+            "cross",
+            0.5,
+        )
+        .await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+                &mut conn,
+                &viewer,
+                claim_id,
+                frame_row.id
+            )
+            .await
+            .expect("recompute")
+        );
+        drop(conn);
+        let (cached_bel, cached_betp): (f64, f64) =
+            sqlx::query_as("SELECT belief, pignistic_prob FROM claims WHERE id = $1")
+                .bind(claim_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let framed = get_belief(&pool, &viewer, claim_id, Some(frame_row.id))
+            .await
+            .expect("framed read");
+        assert_eq!(
+            framed.belief.to_bits(),
+            cached_bel.to_bits(),
+            "{name}: framed read and cache must agree"
+        );
+        assert_eq!(
+            framed.pignistic_prob.to_bits(),
+            cached_betp.to_bits(),
+            "{name}: framed read and cache must agree"
+        );
+        results.push(framed.belief);
+    }
+    assert!(
+        results[1] > results[0],
+        "the frame override raises the intra factor, so its belief ({}) must exceed the twin's ({})",
+        results[1],
+        results[0]
     );
 }

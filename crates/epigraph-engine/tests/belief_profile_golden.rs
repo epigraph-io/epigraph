@@ -185,7 +185,12 @@ fn a_named_global_profile_restating_todays_values_changes_nothing() {
         "restating today's values must resolve to the same profile"
     );
     for g in GOLDEN.iter().filter(|g| g.config == "toml") {
-        assert_eq!(profile_fold(&case(g.case), &cal), expected(g), "({})", g.case);
+        assert_eq!(
+            profile_fold(&case(g.case), &cal),
+            expected(g),
+            "({})",
+            g.case
+        );
     }
 }
 

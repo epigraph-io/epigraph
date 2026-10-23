@@ -70,6 +70,9 @@ const fn r(
     }
 }
 
+/// A perspective's `(source_reliability, locality_reliability)` entries.
+pub type ReliabilityMaps = (Vec<(&'static str, f64)>, Vec<(&'static str, f64)>);
+
 /// One fold fixture: rows plus the lens inputs.
 pub struct Case {
     pub name: &'static str,
@@ -78,19 +81,49 @@ pub struct Case {
     pub per_frame_weights: Option<Vec<(&'static str, f64)>>,
     /// `Some` = a lensed read under a perspective with these maps
     /// (`source_reliability`, `locality_reliability`).
-    pub perspective: Option<(Vec<(&'static str, f64)>, Vec<(&'static str, f64)>)>,
+    pub perspective: Option<ReliabilityMaps>,
 }
 
 fn tier_rows() -> Vec<RowSpec> {
     vec![
-        r(Some("empirical"), "intra_self_cite", Some(1.0), shape(0.8, 0.0, 0.0), None),
+        r(
+            Some("empirical"),
+            "intra_self_cite",
+            Some(1.0),
+            shape(0.8, 0.0, 0.0),
+            None,
+        ),
         r(Some("logical"), "cross", None, shape(0.6, 0.0, 0.0), None),
-        r(Some("testimony"), "unknown", Some(0.6), shape(0.0, 0.5, 0.0), None),
+        r(
+            Some("testimony"),
+            "unknown",
+            Some(0.6),
+            shape(0.0, 0.5, 0.0),
+            None,
+        ),
         r(None, "unknown", Some(0.7), shape(0.4, 0.0, 0.0), None),
         r(None, "unknown", None, shape(0.3, 0.0, 0.0), None),
-        r(Some("CORROBORATES"), "cross", Some(0.65), shape(0.5, 0.0, 0.0), None),
-        r(Some("mystery_type"), "unknown", None, shape(0.0, 0.2, 0.0), None),
-        r(Some("supports"), "intra_methodological_overlap", Some(0.7), shape(0.55, 0.05, 0.0), None),
+        r(
+            Some("CORROBORATES"),
+            "cross",
+            Some(0.65),
+            shape(0.5, 0.0, 0.0),
+            None,
+        ),
+        r(
+            Some("mystery_type"),
+            "unknown",
+            None,
+            shape(0.0, 0.2, 0.0),
+            None,
+        ),
+        r(
+            Some("supports"),
+            "intra_methodological_overlap",
+            Some(0.7),
+            shape(0.55, 0.05, 0.0),
+            None,
+        ),
     ]
 }
 
@@ -131,8 +164,20 @@ pub fn cases() -> Vec<Case> {
         Case {
             name: "upper_case_locality",
             rows: vec![
-                r(Some("empirical"), "INTRA_SELF_CITE", None, shape(0.7, 0.0, 0.0), None),
-                r(Some("logical"), "Intra_self_cite", None, shape(0.0, 0.4, 0.0), None),
+                r(
+                    Some("empirical"),
+                    "INTRA_SELF_CITE",
+                    None,
+                    shape(0.7, 0.0, 0.0),
+                    None,
+                ),
+                r(
+                    Some("logical"),
+                    "Intra_self_cite",
+                    None,
+                    shape(0.0, 0.4, 0.0),
+                    None,
+                ),
             ],
             per_frame_intra: None,
             per_frame_weights: None,
@@ -141,11 +186,35 @@ pub fn cases() -> Vec<Case> {
         Case {
             name: "same_source_repeats",
             rows: vec![
-                r(Some("empirical"), "cross", None, shape(0.6, 0.0, 0.0), Some((1, "https://example.org/a"))),
-                r(Some("empirical"), "cross", None, shape(0.7, 0.0, 0.0), Some((1, "https://example.org/a"))),
-                r(Some("empirical"), "cross", None, shape(0.0, 0.4, 0.0), Some((1, "https://example.org/a"))),
+                r(
+                    Some("empirical"),
+                    "cross",
+                    None,
+                    shape(0.6, 0.0, 0.0),
+                    Some((1, "https://example.org/a")),
+                ),
+                r(
+                    Some("empirical"),
+                    "cross",
+                    None,
+                    shape(0.7, 0.0, 0.0),
+                    Some((1, "https://example.org/a")),
+                ),
+                r(
+                    Some("empirical"),
+                    "cross",
+                    None,
+                    shape(0.0, 0.4, 0.0),
+                    Some((1, "https://example.org/a")),
+                ),
                 r(Some("logical"), "cross", None, shape(0.5, 0.0, 0.0), None),
-                r(Some("statistical"), "cross", None, shape(0.45, 0.0, 0.0), Some((2, "https://example.org/b"))),
+                r(
+                    Some("statistical"),
+                    "cross",
+                    None,
+                    shape(0.45, 0.0, 0.0),
+                    Some((2, "https://example.org/b")),
+                ),
             ],
             per_frame_intra: None,
             per_frame_weights: None,
@@ -155,7 +224,13 @@ pub fn cases() -> Vec<Case> {
             name: "open_world",
             rows: vec![
                 r(Some("empirical"), "cross", None, shape(0.5, 0.0, 0.3), None),
-                r(Some("logical"), "intra_self_cite", None, shape(0.0, 0.3, 0.1), None),
+                r(
+                    Some("logical"),
+                    "intra_self_cite",
+                    None,
+                    shape(0.0, 0.3, 0.1),
+                    None,
+                ),
                 r(None, "unknown", None, shape(0.2, 0.1, 0.2), None),
             ],
             per_frame_intra: None,
@@ -164,7 +239,13 @@ pub fn cases() -> Vec<Case> {
         },
         Case {
             name: "single_row",
-            rows: vec![r(Some("observation"), "cross", None, shape(0.5, 0.0, 0.0), None)],
+            rows: vec![r(
+                Some("observation"),
+                "cross",
+                None,
+                shape(0.5, 0.0, 0.0),
+                None,
+            )],
             per_frame_intra: None,
             per_frame_weights: None,
             perspective: None,
@@ -240,10 +321,12 @@ pub fn per_frame_weights(case: &Case) -> Option<HashMap<String, f64>> {
 }
 
 pub fn perspective(case: &Case) -> Option<PerspectiveReliability> {
-    case.perspective.as_ref().map(|(src, loc)| PerspectiveReliability {
-        source_reliability: src.iter().map(|(k, w)| ((*k).to_string(), *w)).collect(),
-        locality_reliability: loc.iter().map(|(k, w)| ((*k).to_string(), *w)).collect(),
-    })
+    case.perspective
+        .as_ref()
+        .map(|(src, loc)| PerspectiveReliability {
+            source_reliability: src.iter().map(|(k, w)| ((*k).to_string(), *w)).collect(),
+            locality_reliability: loc.iter().map(|(k, w)| ((*k).to_string(), *w)).collect(),
+        })
 }
 
 /// The observable outputs of one fold, as exact bit patterns.
@@ -302,7 +385,6 @@ pub fn legacy_fold(case: &Case, cal: &CalibrationConfig) -> FoldBits {
 
 /// The calibration loaded from the workspace `calibration.toml`, uncached.
 pub fn workspace_calibration() -> CalibrationConfig {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../calibration.toml");
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml");
     CalibrationConfig::load(&path).expect("calibration.toml loads")
 }

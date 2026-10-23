@@ -196,13 +196,19 @@ fn adding_or_removing_a_map_entry_changes_the_hash() {
             .insert("zz_added_key".into(), sample);
         let Some(h) = hash_of(&v) else { continue };
         maps_seen += 1;
-        assert_ne!(h, base_hash, "adding an entry to {path:?} must change the hash");
+        assert_ne!(
+            h, base_hash,
+            "adding an entry to {path:?} must change the hash"
+        );
 
         if let Some(first) = node.as_object().and_then(|m| m.keys().next().cloned()) {
             let mut v = base_value.clone();
             at(&mut v, path).as_object_mut().unwrap().remove(&first);
             let h = hash_of(&v).expect("a map minus an entry is still a profile");
-            assert_ne!(h, base_hash, "removing {first} from {path:?} must change the hash");
+            assert_ne!(
+                h, base_hash,
+                "removing {first} from {path:?} must change the hash"
+            );
         }
     }
     // evidence-type weights + aliases, journal table, methodology profiles +
@@ -218,8 +224,7 @@ fn the_hash_does_not_move_when_no_parameter_moves() {
     // Same inputs, HashMap insertion order reversed.
     assert_eq!(a.profile_hash(), populated(true).profile_hash());
     // Serialization round trip.
-    let round: BeliefProfile =
-        serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+    let round: BeliefProfile = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
     assert_eq!(a.profile_hash(), round.profile_hash());
     // An override object that restates current values.
     let restated = json!({
@@ -228,7 +233,7 @@ fn the_hash_does_not_move_when_no_parameter_moves() {
             "intra_evidence_locality_factor": a.reliability.intra_evidence_locality_factor,
         },
         "testimonial_ceiling": a.testimonial_ceiling,
-        "testimonial_grouping": serde_json::to_value(&a.testimonial_grouping).unwrap(),
+        "testimonial_grouping": serde_json::to_value(a.testimonial_grouping).unwrap(),
     });
     let same = a.resolve(
         FrameTier::default(),
@@ -250,7 +255,9 @@ fn the_hash_is_a_blake3_hex_digest_and_differs_between_distinct_profiles() {
     let builtin = BeliefProfile::builtin();
     let h = builtin.profile_hash();
     assert_eq!(h.len(), 64);
-    assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(h
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     // The built-in table carries no calibration tables; the calibrated
     // profile does, so their hashes must differ.
     assert_ne!(h, populated(false).profile_hash());
