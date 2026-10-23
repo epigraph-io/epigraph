@@ -8,7 +8,7 @@
 //!
 //! | role | predicate |
 //! |---|---|
-//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`) |
+//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`); and no root the walk reaches is unstamped |
 //! | [`ClaimRole::Rule`] | labelled `rule` AND an in-force `rule_conclusion` out-edge to a current claim |
 //! | [`ClaimRole::Compound`] | an in-force `decomposes_to` out-edge to a current claim |
 //! | [`ClaimRole::Atom`] | an in-force `decomposes_to` in-edge from a current claim, and none out |
@@ -128,23 +128,37 @@ macro_rules! is_decomposed_from {
     };
 }
 
-/// The procedural root stamp, over a `claims` row aliased `role_root`: a
+/// The procedural root stamp, over the `claims` row aliased `$root`: a
 /// workflow tree's root (the workflow builder stamps `source_type: workflow`
 /// on its thesis) or a git-history tree's root (`ingest_git` stamps
-/// `source: git-history` on its repository node).
+/// `source: git-history` on its repository node). Never NULL, so its negation
+/// is "unstamped" on a claim with neither property.
 macro_rules! procedural_root_stamp {
-    () => {
-        "(role_root.properties->>'source_type' = 'workflow' \
-          OR role_root.properties->>'source' = 'git-history')"
+    ($root:literal) => {
+        concat!(
+            "COALESCE(",
+            $root,
+            ".properties->>'source_type' = 'workflow' OR ",
+            $root,
+            ".properties->>'source' = 'git-history', false)"
+        )
     };
 }
 
 /// `$alias`, or an ancestor at most [`ROLE_MAX_DEPTH`] in-force
-/// `decomposes_to` hops above it, is a root carrying the procedural stamp. The
-/// walk climbs only to CURRENT parents, and "root" is the one root test
-/// (`decomposed_from!` negated), so a superseded parent neither hides a
-/// stamped root below it nor lends its own stamp to the claims under it. A
-/// cycle or a deeper tree finds no root, so the claim is not procedural.
+/// `decomposes_to` hops above it, is a root carrying the procedural stamp, AND
+/// no root the walk reaches is unstamped. The walk climbs only to CURRENT
+/// parents, and "root" is the one root test (`decomposed_from!` negated), so a
+/// superseded parent neither hides a stamped root below it nor lends its own
+/// stamp to the claims under it. A cycle or a deeper tree finds no root, so
+/// the claim is not procedural.
+///
+/// Every root above the claim must be stamped because decomposition is a
+/// DAG and the stamp is a caller-set property: were one stamped root enough,
+/// a single edge from a stamped claim onto a node of an ordinary tree would
+/// make that node and its subtree procedural for every reader. What this
+/// cannot tell apart is a stamped claim attached above an ordinary ROOT: that
+/// root then has an in-edge, and the stamped claim is the only root left.
 macro_rules! is_procedural {
     () => {
         concat!(
@@ -166,10 +180,16 @@ macro_rules! is_procedural {
              SELECT 1 FROM role_up \
                JOIN claims role_root ON role_root.id = role_up.id \
               WHERE ",
-            procedural_root_stamp!(),
+            procedural_root_stamp!("role_root"),
             " AND NOT ",
             decomposed_from!("role_up.id"),
-            ")"
+            " AND NOT EXISTS (SELECT 1 FROM role_up role_uo \
+                                JOIN claims role_oroot ON role_oroot.id = role_uo.id \
+                               WHERE NOT ",
+            procedural_root_stamp!("role_oroot"),
+            " AND NOT ",
+            decomposed_from!("role_uo.id"),
+            "))"
         )
     };
 }
