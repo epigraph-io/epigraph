@@ -7,8 +7,12 @@
 //! and never had an authorization code minted under it is revoked. Every
 //! look-alike survives: a DCR client with a (used) code, a young DCR client,
 //! the provisioned per-user client (`google:<sub>`, no redirect URIs, no code
-//! under its own `client_id`), a legacy secret-holding `epigraph_…` client and a
-//! DCR-shaped client with a principal. One audit row per revoked client; a dry
+//! under its own `client_id`), a legacy secret-holding `epigraph_…` client, a
+//! DCR-shaped client with a principal, and one look-alike per remaining clause
+//! of the shape: an `epigraph_…` client with an empty and one with a NULL
+//! `redirect_uris`, a `google:<sub>` client WITH a redirect URI (only the prefix
+//! clause excludes it), and an `epigraphX…` client with a redirect URI (only
+//! the literal `_` in the prefix excludes it: `LIKE 'epigraph_%'` would match). One audit row per revoked client; a dry
 //! run and the census write nothing; the revoked client id is then refused by
 //! `/oauth/authorize` (after a control showing it was accepted before); and the
 //! apply runs as a real NOSUPERUSER maintenance login.
@@ -192,6 +196,8 @@ struct Fixture {
     survivors: Vec<(Uuid, &'static str)>,
     /// 48 h old DCR client whose code was minted and redeemed.
     used: (Uuid, String),
+    /// `client_id`s that are not DCR-shaped, so the census must not list them.
+    not_dcr: Vec<(String, &'static str)>,
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
@@ -218,9 +224,34 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     let young = seed(pool, &dcr_id(), None, redirects(), None, 1).await;
     // A legacy `/oauth/register` human client (client_type given): it holds a
     // secret. Forced active for the test (registration makes it pending).
-    let legacy = seed(pool, &dcr_id(), Some(&[7u8; 32]), redirects(), None, 48).await;
+    let legacy_cid = dcr_id();
+    let legacy = seed(pool, &legacy_cid, Some(&[7u8; 32]), redirects(), None, 48).await;
     let agent = seed_agent(pool).await;
-    let with_principal = seed(pool, &dcr_id(), None, redirects(), Some(agent), 48).await;
+    let with_principal_cid = dcr_id();
+    let with_principal = seed(
+        pool,
+        &with_principal_cid,
+        None,
+        redirects(),
+        Some(agent),
+        48,
+    )
+    .await;
+
+    // One look-alike per clause that nothing above isolates. Each is old,
+    // public, agent-less, active and has no code: exactly one clause of the
+    // shape excludes it.
+    // `cardinality(redirect_uris) > 0`: an empty array, and NULL.
+    let no_redirect_cid = dcr_id();
+    let no_redirect = seed(pool, &no_redirect_cid, None, Some(vec![]), None, 48).await;
+    let null_redirect_cid = dcr_id();
+    let null_redirect = seed(pool, &null_redirect_cid, None, None, None, 48).await;
+    // `left(client_id, 9) = 'epigraph_'`: a provider id with a redirect URI.
+    let provider_cid = format!("google:{}", Uuid::new_v4().simple());
+    let provider = seed(pool, &provider_cid, None, redirects(), None, 48).await;
+    // The `_` is a literal: `LIKE 'epigraph_%'` would take this one.
+    let near_cid = format!("epigraphX{}", Uuid::new_v4().simple());
+    let near = seed(pool, &near_cid, None, redirects(), None, 48).await;
 
     Fixture {
         doomed: (doomed, doomed_cid),
@@ -230,8 +261,26 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
             (young, "DCR client younger than the floor"),
             (legacy, "legacy client with a secret"),
             (with_principal, "DCR-shaped client with a principal"),
+            (no_redirect, "epigraph_ client with an empty redirect_uris"),
+            (null_redirect, "epigraph_ client with a NULL redirect_uris"),
+            (provider, "provider client id with a redirect URI"),
+            (near, "epigraphX client id (the `_` is literal)"),
         ],
         used: (used, used_cid),
+        not_dcr: vec![
+            (legacy_cid, "legacy client with a secret"),
+            (with_principal_cid, "DCR-shaped client with a principal"),
+            (
+                no_redirect_cid,
+                "epigraph_ client with an empty redirect_uris",
+            ),
+            (
+                null_redirect_cid,
+                "epigraph_ client with a NULL redirect_uris",
+            ),
+            (provider_cid, "provider client id with a redirect URI"),
+            (near_cid, "epigraphX client id"),
+        ],
     }
 }
 
@@ -303,9 +352,10 @@ async fn the_sweep_revokes_only_old_dcr_clients_that_never_authorized(pool: PgPo
 }
 
 /// After the sweep, `/oauth/authorize` refuses the swept client id. The
-/// control shows the same request got past the client lookup before (it fails
-/// later, on the Google provider this test does not configure), so the
-/// `invalid_client` afterwards is the sweep's.
+/// control shows the same request got past the client lookup before: it fails
+/// later, with the 500 "google provider not configured" that only a request
+/// whose client, redirect URI and PKCE were all accepted can reach (this test
+/// configures no provider). So the `invalid_client` afterwards is the sweep's.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_swept_client_is_refused_by_authorize(pool: PgPool) {
     let fx = seed_fixture(&pool).await;
@@ -313,10 +363,7 @@ async fn a_swept_client_is_refused_by_authorize(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;
 
     let (before, body) = authorize(&pool, &doomed_cid).await;
-    assert!(
-        !(before == StatusCode::BAD_REQUEST && body.contains("invalid_client")),
-        "control: the client is accepted before the sweep ({before}: {body})"
-    );
+    assert_past_client_lookup(before, &body, "control: the client before the sweep");
 
     let r = run_dsn(&["sweep-dcr-clients", "--apply"], &url);
     assert_eq!(r.code, 0, "{}", r.show());
@@ -327,15 +374,27 @@ async fn a_swept_client_is_refused_by_authorize(pool: PgPool) {
 
     // A client that did authorize is still accepted.
     let (kept, body) = authorize(&pool, &fx.used.1).await;
+    assert_past_client_lookup(kept, &body, "a used DCR client after the sweep");
+}
+
+/// `/oauth/authorize` accepted the client and failed only at the (deliberately
+/// unconfigured) Google provider, the step after every client check.
+fn assert_past_client_lookup(status: StatusCode, body: &str, what: &str) {
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{what}: expected the provider step's 500, got {status}: {body}"
+    );
     assert!(
-        !(kept == StatusCode::BAD_REQUEST && body.contains("invalid_client")),
-        "a used DCR client is kept ({kept}: {body})"
+        body.contains("google provider not configured"),
+        "{what}: the 500 must be the provider step's: {body}"
     );
 }
 
 /// `list-dcr-clients` is read-only and marks exactly the doomed client
-/// sweepable; the used one shows its code; the per-user and legacy clients are
-/// not DCR clients and are not listed. A floor below one hour is refused before
+/// sweepable; the used one shows its code; the per-user client, the legacy and
+/// with-principal clients and every look-alike are not DCR clients and are not
+/// listed. A floor below one hour is refused before
 /// any connection.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_census_lists_dcr_clients_and_writes_nothing(pool: PgPool) {
@@ -363,6 +422,13 @@ async fn the_census_lists_dcr_clients_and_writes_nothing(pool: PgPool) {
         r.show()
     );
     assert!(!r.stdout.contains("google:"), "{}", r.show());
+    for (cid, what) in &fx.not_dcr {
+        assert!(
+            !r.stdout.contains(cid.as_str()),
+            "{what} is not a DCR client and is not listed: {}",
+            r.show()
+        );
+    }
     assert_eq!(
         status(&pool, doomed).await,
         "active",
