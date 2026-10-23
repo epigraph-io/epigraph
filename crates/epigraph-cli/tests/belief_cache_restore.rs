@@ -543,9 +543,13 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
 
     let a = seed_claim(&pool, agent).await;
     let b = seed_claim(&pool, agent).await;
+    // Written twice by the wave with another write in between: held back from
+    // the restore (broken chain), but still a wave claim whose value the wave
+    // wrote, so its post-wave edges froze a wave value too.
+    let c = seed_claim(&pool, agent).await;
     let outside = seed_claim(&pool, agent).await;
     let mut targets = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..7 {
         targets.push(seed_claim(&pool, agent).await);
     }
 
@@ -560,6 +564,17 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
     })
     .await;
     rec_a.append(&mut rec_b);
+    let mut rec_c1 = run_wave(&pool, &[c], t0, |_| {
+        random_cache(&mut rng, Some(frame), None)
+    })
+    .await;
+    set_cache(&pool, c, &random_cache(&mut rng, Some(frame), None)).await;
+    let mut rec_c2 = run_wave(&pool, &[c], t0 + h * 4, |_| {
+        random_cache(&mut rng, Some(frame), None)
+    })
+    .await;
+    rec_a.append(&mut rec_c1);
+    rec_a.append(&mut rec_c2);
 
     let after_a = seed_edge(&pool, a, targets[0], t0 + h).await;
     let _before_a = seed_edge(&pool, a, targets[1], t0 - h).await;
@@ -569,15 +584,17 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
     // yet the wave's when this edge froze it.
     let _before_b = seed_edge(&pool, b, targets[4], t0 + h).await;
     let after_b = seed_edge(&pool, b, targets[5], t0 + h * 3).await;
+    // After c's FIRST wave write, before its second.
+    let after_c = seed_edge(&pool, c, targets[6], t0 + h).await;
 
-    let listed = downstream_edges(&pool, &plan_restore(&rec_a, None))
-        .await
-        .expect("downstream");
+    let plan = plan_restore(&rec_a, None);
+    assert_eq!(plan.broken_chain, vec![c], "fixture: c is held back");
+    let listed = downstream_edges(&pool, &plan).await.expect("downstream");
     let got: HashSet<Uuid> = listed.iter().map(|e| e.edge_id).collect();
-    assert_eq!(got, set_of(&[after_a, after_b]));
+    assert_eq!(got, set_of(&[after_a, after_b, after_c]));
     assert_eq!(listed.len(), got.len(), "no edge listed twice");
     for e in &listed {
-        assert!(e.source_id == a || e.source_id == b);
+        assert!(e.source_id == a || e.source_id == b || e.source_id == c);
     }
 }
 
