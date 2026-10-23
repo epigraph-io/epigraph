@@ -1447,6 +1447,145 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A check command that passes the first time and fails every time after:
+/// it leaves a marker file the first time.
+fn passes_once(marker: &Path) -> String {
+    format!("test ! -e '{0}' && touch '{0}'", marker.display())
+}
+
+/// SPEC §10.4: the disk gate runs before EVERY batch, not once per run, on the
+/// wave path and on the vacate path. With one claim per batch and a check
+/// that passes once, the first batch is written and recorded, the second
+/// check aborts the run (exit 4), and the second claim keeps its cache with
+/// no record. A wave's cohort is in id order; a vacate list in list order.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_disk_gate_is_checked_before_every_batch(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "batches-owner").await;
+    let source = agent(&pool, "batches-source").await;
+    let ingest = agent(&pool, "batches-ingest").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let rv = frame(&pool, "research_validity").await;
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+
+    // The wave path.
+    let mut atoms = Vec::new();
+    for (i, support) in [0.8, 0.6].into_iter().enumerate() {
+        let atom = claim(&pool, owner, "evidenced standalone").await;
+        insert_row(&pool, atom, &evidence_row(bin, source, support, None)).await;
+        #[allow(clippy::cast_precision_loss)]
+        let before = set_sentinel(&pool, atom, bin, 0.01 * i as f64).await;
+        atoms.push((atom, before));
+    }
+    atoms.sort_by_key(|(id, _)| *id);
+    let wave_file = dir.join("wave.jsonl");
+    let check = passes_once(&dir.join("wave-gate-used"));
+    let mut args = gate_args(s(&wave_file), s(&dir));
+    args.extend([
+        "--min-free-gb",
+        "0",
+        "--disk-check-cmd",
+        &check,
+        "--batch-size",
+        "1",
+    ]);
+    let r = run(RECOMPUTE_BETP, &dir, &args, &env.vars());
+    assert_eq!(
+        r.code,
+        Some(4),
+        "the second batch's failed check aborts the wave (exit 4)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("before wave batch 2"),
+        "the abort names the batch\nstderr: {}",
+        r.stderr
+    );
+    let recorded = |path: &Path| -> HashSet<Uuid> {
+        read_wave(std::io::BufReader::new(
+            std::fs::File::open(path).expect("the wave file exists"),
+        ))
+        .expect("parse the wave file")
+        .into_iter()
+        .map(|r| r.claim_id)
+        .collect()
+    };
+    let (first, first_before) = &atoms[0];
+    let (second, second_before) = &atoms[1];
+    assert_ne!(
+        &cache(&pool, *first).await,
+        first_before,
+        "batch 1 was written"
+    );
+    assert_eq!(
+        &cache(&pool, *second).await,
+        second_before,
+        "batch 2 was written after its disk check failed"
+    );
+    assert_eq!(
+        recorded(&wave_file),
+        HashSet::from([*first]),
+        "only batch 1 is recorded"
+    );
+
+    // The vacate path, in list order.
+    let residue_a = claim(&pool, owner, "residue listed first").await;
+    insert_row(&pool, residue_a, &template_row(rv, ingest)).await;
+    let a_before = set_sentinel(&pool, residue_a, rv, 0.02).await;
+    let residue_b = claim(&pool, owner, "residue listed second").await;
+    insert_row(&pool, residue_b, &template_row(rv, ingest)).await;
+    let b_before = set_sentinel(&pool, residue_b, rv, 0.03).await;
+    let list = write_accept_list(&dir, &[residue_a, residue_b]);
+    let vacate_file = dir.join("vacate.jsonl");
+    let check = passes_once(&dir.join("vacate-gate-used"));
+    let args = vec![
+        "--accept-vacate",
+        s(&list),
+        "--snapshot",
+        s(&vacate_file),
+        "--wave",
+        "test-vacate",
+        "--disk-path",
+        s(&dir),
+        "--min-free-gb",
+        "0",
+        "--disk-check-cmd",
+        &check,
+        "--batch-size",
+        "1",
+    ];
+    let r = run(RECOMPUTE_BETP, &dir, &args, &env.vars());
+    assert_eq!(
+        r.code,
+        Some(4),
+        "the second batch's failed check aborts the vacate (exit 4)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("before vacate batch 2"),
+        "the abort names the batch\nstderr: {}",
+        r.stderr
+    );
+    assert_ne!(
+        cache(&pool, residue_a).await,
+        a_before,
+        "vacate batch 1 was written"
+    );
+    assert_eq!(
+        cache(&pool, residue_b).await,
+        b_before,
+        "vacate batch 2 was written after its disk check failed"
+    );
+    assert_eq!(
+        recorded(&vacate_file),
+        HashSet::from([residue_a]),
+        "only vacate batch 1 is recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// SPEC §10.4: the disk gate is free space AND backup health (`pgbackrest
 /// check` green, a full backup recent enough for expire to run). Free space
 /// is measured by the tool; backup health only by the operator's check
