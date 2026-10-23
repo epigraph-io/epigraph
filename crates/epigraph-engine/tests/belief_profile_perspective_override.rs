@@ -7,25 +7,85 @@
 //! `locality_reliability` map, so this exercises the profile tier itself.
 //!
 //! Asserted, over the same stored BBAs:
-//! - under the overriding perspective P the belief moves, in the direction the
-//!   override implies (a larger intra factor discounts the intra row less);
+//! - under the overriding perspective P the belief moves to exactly the value
+//!   the override implies: the intra row's α becomes `w(empirical) × 0.9`, the
+//!   cross row's α stays `w(logical) × cross`, and two simple supports on H0
+//!   combine to `1 − (1 − 0.8·α_intra)(1 − 0.5·α_cross)` (no conflict);
 //! - under a second perspective Q, whose profile override touches only a
 //!   parameter no fold consumes yet, the read is bit-identical to the
 //!   lens-less read;
 //! - the lens-less read is bit-identical before and after P's read (resolving
 //!   P must not leak into the served profile);
-//! - the batch read under P equals the single read under P.
+//! - the batch read under P equals the single read under P;
+//! - lens reads never write the cache: with the served cache seeded by a
+//!   recompute first, the claim's row, its `ds_combined_beliefs` rows and its
+//!   stored BBAs are byte-identical before and after every read under P and Q.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
+use epigraph_engine::belief_profile::BeliefProfile;
 use epigraph_engine::belief_query::{
     get_belief, get_perspective_belief, get_perspective_belief_batch,
 };
 use epigraph_engine::BeliefInterval;
 use uuid::Uuid;
+
+/// Bel(H0) of two independent simple supports on {H0}, masses `m1`, `m2`,
+/// discounted by α1, α2: Dempster's rule on a common singleton has no
+/// conflict, so the uncommitted masses multiply.
+fn two_simple_supports(m1: f64, a1: f64, m2: f64, a2: f64) -> f64 {
+    1.0 - (1.0 - m1 * a1) * (1.0 - m2 * a2)
+}
+
+/// Bel(H0) of the fixture's two rows (empirical/intra 0.8, logical/cross 0.5)
+/// under the served profile with the intra locality factor `intra`.
+fn expected_bel(intra: f64) -> f64 {
+    let p = BeliefProfile::served();
+    two_simple_supports(
+        0.8,
+        p.evidence_type_weight("empirical") * intra,
+        0.5,
+        p.evidence_type_weight("logical") * p.reliability.cross_locality_factor,
+    )
+}
+
+fn assert_close(got: f64, want: f64, what: &str) {
+    assert!(
+        (got - want).abs() < 1e-12,
+        "{what}: got {got}, the override implies {want}"
+    );
+}
+
+/// Everything a cache write could touch for this claim, as text: the claim
+/// row, its `ds_combined_beliefs` rows and its stored BBAs.
+async fn cache_snapshot(pool: &PgPool, claim_id: Uuid) -> (String, String, String) {
+    let claim: String =
+        sqlx::query_scalar("SELECT to_jsonb(c)::text FROM claims c WHERE c.id = $1")
+            .bind(claim_id)
+            .fetch_one(pool)
+            .await
+            .expect("claim snapshot");
+    let combined: String = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)::text \
+         FROM ds_combined_beliefs d WHERE d.claim_id = $1",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .expect("ds_combined_beliefs snapshot");
+    let bbas: String = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(m) ORDER BY m.id), '[]'::jsonb)::text \
+         FROM mass_functions m WHERE m.claim_id = $1",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .expect("mass_functions snapshot");
+    (claim, combined, bbas)
+}
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -179,6 +239,24 @@ async fn a_perspective_profile_override_moves_only_reads_under_that_perspective(
     )
     .await;
 
+    // Seed the served cache, so a lens read that wrote it would be visible.
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            &mut conn, &viewer, claim_id, frame_id
+        )
+        .await
+        .expect("seed the cache")
+    );
+    drop(conn);
+    let cache_before = cache_snapshot(&pool, claim_id).await;
+    let cached_bel: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(cached_bel.is_some(), "the recompute seeded the cache");
+
     let global_before = get_belief(&pool, &viewer, claim_id, Some(frame_id))
         .await
         .expect("global read");
@@ -192,12 +270,16 @@ async fn a_perspective_profile_override_moves_only_reads_under_that_perspective(
         .await
         .expect("global read again");
 
-    assert!(
-        under_p.belief > global_before.belief,
-        "P raises the intra factor, so its belief ({}) must exceed the global ({})",
-        under_p.belief,
-        global_before.belief
+    assert_close(
+        global_before.belief,
+        expected_bel(
+            BeliefProfile::served()
+                .reliability
+                .intra_evidence_locality_factor,
+        ),
+        "lens-less read",
     );
+    assert_close(under_p.belief, expected_bel(0.9), "read under P");
     assert_eq!(
         bits(&under_q),
         bits(&global_before),
@@ -218,6 +300,12 @@ async fn a_perspective_profile_override_moves_only_reads_under_that_perspective(
         bits(one.as_ref().expect("batch item")),
         bits(&under_p),
         "batch and single reads under P must agree"
+    );
+
+    assert_eq!(
+        cache_snapshot(&pool, claim_id).await,
+        cache_before,
+        "lens reads recompute; they must never write the cache (addendum §3.1)"
     );
 }
 
@@ -312,10 +400,14 @@ async fn a_frame_profile_override_moves_the_read_and_the_cache_together(pool: Pg
         );
         results.push(framed.belief);
     }
-    assert!(
-        results[1] > results[0],
-        "the frame override raises the intra factor, so its belief ({}) must exceed the twin's ({})",
-        results[1],
-        results[0]
+    assert_close(
+        results[0],
+        expected_bel(
+            BeliefProfile::served()
+                .reliability
+                .intra_evidence_locality_factor,
+        ),
+        "twin frame without the override",
     );
+    assert_close(results[1], expected_bel(0.9), "frame with the override");
 }
