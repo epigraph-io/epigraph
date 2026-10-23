@@ -2356,6 +2356,37 @@ pub struct FindWorkflowResult {
     /// when never evaluated. Advisory — callers may prefer promoted variants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotable: Option<bool>,
+    /// Hierarchical results only (absent for flat workflow claims). `steps` is
+    /// the FROZEN plan text: the claims the workflow's `executes` edges named
+    /// at ingest. `Some(true)` when at least one of those steps has since been
+    /// evolved (`evolve_step`), so its lineage head differs from the frozen
+    /// claim; the heads are in [`Self::evolved_steps`]. Absent when the
+    /// lineage lookup failed (best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_evolved_steps: Option<bool>,
+    /// The steps whose lineage head is not the frozen claim, indexed the way
+    /// `evolve_step` / `report_hierarchical_outcome` index steps. Absent when
+    /// nothing evolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evolved_steps: Option<Vec<EvolvedStep>>,
+    /// Hierarchical results only: the highest `generation` that exists for
+    /// this workflow's `canonical_name`. Greater than `generation` when a newer
+    /// generation of the same lineage exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_generation: Option<i64>,
+}
+
+/// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
+/// has moved on.
+#[derive(Debug, Serialize)]
+pub struct EvolvedStep {
+    pub step_index: usize,
+    pub frozen_claim_id: String,
+    pub head_claim_id: String,
+    pub head_content: String,
+    /// The lineage has more than one head (concurrent `revises`); the head
+    /// shown is the newest, and the caller must reconcile before relying on it.
+    pub pending_resolution: bool,
 }
 
 #[derive(Debug, Serialize)]

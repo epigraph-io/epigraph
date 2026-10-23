@@ -1938,7 +1938,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array."
+        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view."
     )]
     async fn find_workflow(
         &self,
