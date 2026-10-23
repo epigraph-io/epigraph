@@ -1243,6 +1243,74 @@ fn post_fix_crypto_columns(claim: &mut Claim, cols: RowCryptoColumns) -> Result<
     Ok(())
 }
 
+/// One claim row as the single-claim readers project it: the seven
+/// `claim_from_row` columns plus the retirement state and the crypto columns
+/// both post-fixes read. Shared by [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`] (and, through delegation,
+/// [`ClaimRepository::get_by_id_conn`]) so the mapping exists once.
+///
+/// Decoded through `query_as` + `FromRow`, never `sqlx::Row::get`: `Row::get`
+/// panics on a missing column or a type mismatch, where a `FromRow` decode
+/// returns `Err` for the same row.
+#[derive(sqlx::FromRow)]
+struct SingleClaimRow {
+    id: Uuid,
+    content: String,
+    truth_value: f64,
+    agent_id: Uuid,
+    trace_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    is_current: bool,
+    supersedes: Option<Uuid>,
+    content_hash: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<Vec<u8>>,
+}
+
+impl SingleClaimRow {
+    /// Build the `Claim` and post-fix it with the row's real retirement state
+    /// (instead of `claim_from_row`'s `is_current = true, supersedes = None`)
+    /// and its stored crypto columns (instead of the recomputed digest and
+    /// blank signature).
+    ///
+    /// # Errors
+    /// * [`DbError::CoreError`] if `truth_value` is outside `[0, 1]`.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    fn into_claim(self) -> Result<Claim, DbError> {
+        let truth_value = TruthValue::new(self.truth_value)?;
+        let mut claim = claim_from_row(
+            self.id,
+            self.content,
+            self.agent_id,
+            self.trace_id,
+            truth_value,
+            self.created_at,
+            self.updated_at,
+        );
+        claim.is_current = self.is_current;
+        claim.supersedes = self.supersedes.map(ClaimId::from_uuid);
+        post_fix_crypto_columns(
+            &mut claim,
+            RowCryptoColumns {
+                content_hash: self.content_hash,
+                signature: self.signature,
+                signer_public_key: self.signer_public_key,
+            },
+        )?;
+        Ok(claim)
+    }
+}
+
+/// [`SingleClaimRow`] plus `claims.labels`, for
+/// [`ClaimRepository::get_by_id_with_labels`].
+#[derive(sqlx::FromRow)]
+struct SingleClaimRowWithLabels {
+    #[sqlx(flatten)]
+    row: SingleClaimRow,
+    labels: Vec<String>,
+}
+
 impl ClaimRepository {
     /// The declaration a write path uses when its caller expressed no
     /// preference: **`('public', <the author's personal group>)`**.
@@ -2939,14 +3007,18 @@ impl ClaimRepository {
     /// body verified clean) and `signature = None` (so the signature check
     /// could never pass).
     ///
-    /// Uses a runtime `query_as` with a local `Row` rather than `sqlx::query!`,
-    /// mirroring [`Self::list`]: the `LEFT JOIN agents` needed to resolve
-    /// `signer_id → public_key` would otherwise require regenerating `.sqlx`,
-    /// which is a serialized, separately owned step in this repo.
+    /// Uses a runtime `query_as` over [`SingleClaimRow`] rather than
+    /// `sqlx::query!`, mirroring [`Self::list`]: the `LEFT JOIN agents` needed
+    /// to resolve `signer_id → public_key` would otherwise require regenerating
+    /// `.sqlx`, which is a serialized, separately owned step in this repo.
+    /// [`Self::get_by_id_with_labels`] decodes the same row type, so the
+    /// mapping and both post-fixes exist once.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
     /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     ///
     /// # Not a `sqlx::query!` macro site any more
     ///
@@ -2973,22 +3045,6 @@ impl ClaimRepository {
     ) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            content: String,
-            truth_value: f64,
-            agent_id: Uuid,
-            trace_id: Option<Uuid>,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-            is_current: bool,
-            supersedes: Option<Uuid>,
-            content_hash: Vec<u8>,
-            signature: Option<Vec<u8>>,
-            signer_public_key: Option<Vec<u8>>,
-        }
-
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -3003,45 +3059,21 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRow>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.truth_value)?;
-                let mut claim = claim_from_row(
-                    row.id,
-                    row.content,
-                    row.agent_id,
-                    row.trace_id,
-                    truth_value,
-                    row.created_at,
-                    row.updated_at,
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults (is_current=true,
-                // supersedes=None).
-                claim.is_current = row.is_current;
-                claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.content_hash,
-                        signature: row.signature,
-                        signer_public_key: row.signer_public_key,
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        row.map(SingleClaimRow::into_claim).transpose()
     }
 
-    /// Fetch only the labels for a single claim. Used by MCP `get_claim` to
-    /// surface labels without re-fetching the whole Claim.
+    /// Fetch only the labels for a single claim.
+    ///
+    /// No production caller remains: MCP and REST `get_claim` read the claim
+    /// and its labels in one statement through [`Self::get_by_id_with_labels`].
+    /// Kept as a test oracle (it answers `[]` for a row the viewer cannot see,
+    /// which several tests rely on).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -3072,8 +3104,15 @@ impl ClaimRepository {
     /// Postgres MVCC, so this is the atomic alternative for callers (e.g. MCP
     /// `get_claim`) that need both together.
     ///
+    /// Decodes through [`SingleClaimRowWithLabels`] (`query_as` + `FromRow`),
+    /// the same row type and post-fixes [`Self::get_by_id`] uses, so a
+    /// drifted column is an `Err` rather than a `sqlx::Row::get` panic.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     #[instrument(skip(executor, viewer))]
     pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -3082,7 +3121,6 @@ impl ClaimRepository {
     ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
         let uuid: Uuid = id.into();
 
-        use sqlx::Row;
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -3097,51 +3135,17 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    truth_value,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, for the same reason. MCP
-                // `get_claim` renders this `content_hash` to the caller as hex
-                // as the claim's stable identity; serving a digest recomputed
-                // from the body there is the same fabrication `verify_claim`
-                // was caught on. (It was also fed to `redact_content` until
-                // PR-14 deleted redaction — a non-visible row is now absent
-                // rather than blanked, so the hex rendering is the only
-                // surviving reader.)
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                let labels: Vec<String> = row.get("labels");
-                Ok(Some((claim, labels)))
-            }
-            None => Ok(None),
-        }
+        // The crypto post-fix matters here as much as in `get_by_id`: MCP
+        // `get_claim` renders this `content_hash` to the caller as hex as the
+        // claim's stable identity, and serving a digest recomputed from the
+        // body there is the same fabrication `verify_claim` was caught on.
+        row.map(|r| Ok((r.row.into_claim()?, r.labels))).transpose()
     }
 
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,

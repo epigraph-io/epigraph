@@ -145,3 +145,170 @@ async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
         vec!["atomic".to_string(), "backlog".to_string()]
     );
 }
+
+const CLAIM_RS: &str = include_str!("../src/repos/claim.rs");
+
+/// The body (outermost braces included) of the function whose signature starts
+/// with `signature`. Panics when the signature is absent or appears twice, so a
+/// rename cannot make the structural assertion pass vacuously.
+fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let hits: Vec<usize> = src.match_indices(signature).map(|(i, _)| i).collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one `{signature}` in repos/claim.rs, found {}",
+        hits.len()
+    );
+    let start = hits[0];
+    let open = start + src[start..].find('{').expect("function has a body");
+    let mut depth = 0usize;
+    for (off, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..=open + off];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after `{signature}`");
+}
+
+/// The single-claim readers decode through `FromRow`, never `sqlx::Row::get`.
+///
+/// `Row::get` PANICS on a missing column or a type mismatch; a `FromRow`
+/// decode through `query_as` returns `Err` for the same row. These are the
+/// read path of MCP and REST `get_claim`, so a schema drift must surface as a
+/// `DbError`, not a panicked request task. A behavioural red is not
+/// constructible (every projected column exists and `claims.labels` is
+/// `NOT NULL`), so the property is pinned on the source. Scoped to these three
+/// bodies: other readers in the file use `row.get` and are out of scope here.
+#[test]
+fn single_claim_readers_decode_fallibly() {
+    for sig in [
+        "pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(",
+        "pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(",
+        "pub async fn get_by_id_conn(",
+    ] {
+        let body = fn_body(CLAIM_RS, sig);
+        for forbidden in ["row.get(", "row.get::<", "use sqlx::Row"] {
+            assert!(
+                !body.contains(forbidden),
+                "`{sig}` decodes with a panicking `{forbidden}`; decode through \
+                 `query_as` + `#[derive(sqlx::FromRow)]` so a drifted column is an \
+                 Err, not a panic.\nbody:\n{body}"
+            );
+        }
+    }
+}
+
+/// `get_by_id_with_labels` returns the same `Claim` as `get_by_id`, field for
+/// field, including the crypto and retirement columns both post-fix — and
+/// those values are the STORED ones (absolute pins), so one shared decode that
+/// was wrong twice cannot pass on equality alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_id_with_labels_matches_get_by_id_on_every_field(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+    let agent_pk: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Signed, with a stored digest that is NOT blake3(content), and labelled.
+    let signed_text = format!("with-labels signed {}", Uuid::new_v4());
+    let signed_sig: Vec<u8> = (0u8..64).rev().collect();
+    let trace_id: Option<Uuid> = None;
+    let signed: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, \
+                             signature, signer_id, labels) \
+         VALUES ($1, sha256($1::bytea), 0.375, $2, $3, $2, ARRAY['sig','x']) RETURNING id",
+    )
+    .bind(&signed_text)
+    .bind(agent_id)
+    .bind(&signed_sig)
+    .fetch_one(&pool)
+    .await
+    .expect("seed signed claim");
+
+    // Retired, naming what it supersedes.
+    let retired_text = format!("with-labels retired {}", Uuid::new_v4());
+    let retired: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, \
+                             is_current, supersedes) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2, false, $3) RETURNING id",
+    )
+    .bind(&retired_text)
+    .bind(agent_id)
+    .bind(signed)
+    .fetch_one(&pool)
+    .await
+    .expect("seed retired claim");
+
+    for id in [signed, retired] {
+        let cid = epigraph_core::ClaimId::from_uuid(id);
+        let (with, _labels) = ClaimRepository::get_by_id_with_labels(&pool, &viewer, cid)
+            .await
+            .expect("get_by_id_with_labels")
+            .expect("claim exists");
+        let plain = ClaimRepository::get_by_id(&pool, &viewer, cid)
+            .await
+            .expect("get_by_id")
+            .expect("claim exists");
+        assert_eq!(with.id, plain.id);
+        assert_eq!(with.content, plain.content);
+        assert_eq!(with.agent_id, plain.agent_id);
+        assert_eq!(with.truth_value.value(), plain.truth_value.value());
+        assert_eq!(with.trace_id, plain.trace_id);
+        assert_eq!(with.created_at, plain.created_at);
+        assert_eq!(with.updated_at, plain.updated_at);
+        assert_eq!(
+            with.content_hash, plain.content_hash,
+            "content_hash for {id}"
+        );
+        assert_eq!(with.signature, plain.signature, "signature for {id}");
+        assert_eq!(with.public_key, plain.public_key, "public_key for {id}");
+        assert_eq!(with.is_current, plain.is_current, "is_current for {id}");
+        assert_eq!(with.supersedes, plain.supersedes, "supersedes for {id}");
+    }
+
+    let (s, s_labels) = ClaimRepository::get_by_id_with_labels(
+        &pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(signed),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stored_hash: Vec<u8> = sqlx::query_scalar("SELECT content_hash FROM claims WHERE id = $1")
+        .bind(signed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.content_hash.to_vec(),
+        stored_hash,
+        "the STORED digest, not blake3"
+    );
+    assert_eq!(s.signature.map(|x| x.to_vec()), Some(signed_sig));
+    assert_eq!(s.public_key.to_vec(), agent_pk, "the signer's key");
+    assert_eq!(s.truth_value.value(), 0.375);
+    assert_eq!(s.trace_id.map(Uuid::from), trace_id);
+    assert_eq!(s_labels, vec!["sig".to_string(), "x".to_string()]);
+
+    let (r, _) = ClaimRepository::get_by_id_with_labels(
+        &pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(retired),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!r.is_current, "a retired claim reads back as not current");
+    assert_eq!(r.supersedes.map(|c| c.as_uuid()), Some(signed));
+}
