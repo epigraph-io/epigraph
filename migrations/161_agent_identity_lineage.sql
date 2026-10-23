@@ -48,9 +48,12 @@
 --     display; this table is the record. Rows are never updated or deleted.
 --   * `agent_prompt_blobs`: content-addressed by the BLAKE3 of the RAW bytes,
 --     stored as a zstd frame. Immutable: no UPDATE or DELETE grant, no policy
---     for either, and a guard that refuses both even for a superuser
---     (content-addressing is only a guarantee if the content under a hash can
---     never change). The database cannot run BLAKE3 or zstd; the attestor's
+--     for either, and guards that refuse UPDATE, DELETE and TRUNCATE for
+--     every role, a superuser and the table owner included, short of
+--     disabling triggers (content-addressing is only a guarantee if the
+--     content under a hash can never change). Row triggers do not fire on
+--     TRUNCATE, so each lineage table also carries a statement-level
+--     BEFORE TRUNCATE guard. The database cannot run BLAKE3 or zstd; the attestor's
 --     client (`AgentIdentityRepository`) hashes and compresses, the definer
 --     checks the shape (32-byte hash, zstd magic, size bounds), and the history
 --     reader re-hashes after decompressing, so a wrong blob is an error on
@@ -316,7 +319,9 @@ CREATE TABLE IF NOT EXISTS public.agent_succession (
 CREATE INDEX IF NOT EXISTS idx_agent_succession_parent
     ON public.agent_succession (parent_agent_id);
 
--- Append-only, for every role including a superuser and the table owner.
+-- Append-only, for every role including a superuser and the table owner,
+-- short of disabling triggers: UPDATE and DELETE by row trigger, TRUNCATE by
+-- statement trigger (a row trigger never sees a TRUNCATE).
 CREATE OR REPLACE FUNCTION public.epigraph_agent_lineage_append_only()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -366,6 +371,20 @@ DROP TRIGGER IF EXISTS agent_prompt_snapshots_guard ON public.agent_prompt_snaps
 CREATE TRIGGER agent_prompt_snapshots_guard
     BEFORE UPDATE OR DELETE ON public.agent_prompt_snapshots
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_agent_prompt_snapshots_guard();
+
+-- TRUNCATE (CASCADE reaches all three at once).
+DROP TRIGGER IF EXISTS agent_prompt_blobs_no_truncate ON public.agent_prompt_blobs;
+CREATE TRIGGER agent_prompt_blobs_no_truncate
+    BEFORE TRUNCATE ON public.agent_prompt_blobs
+    FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_agent_lineage_append_only();
+DROP TRIGGER IF EXISTS agent_prompt_snapshots_no_truncate ON public.agent_prompt_snapshots;
+CREATE TRIGGER agent_prompt_snapshots_no_truncate
+    BEFORE TRUNCATE ON public.agent_prompt_snapshots
+    FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_agent_lineage_append_only();
+DROP TRIGGER IF EXISTS agent_succession_no_truncate ON public.agent_succession;
+CREATE TRIGGER agent_succession_no_truncate
+    BEFORE TRUNCATE ON public.agent_succession
+    FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_agent_lineage_append_only();
 
 -- Row security: a maintenance session and a maintenance-owned definer frame
 -- read and insert; the snapshot's `last_seen` is updated by the definer only;

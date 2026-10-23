@@ -278,37 +278,42 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
         "A prompt blob (161) is content-addressed by the BLAKE3 of its raw bytes, so the \
          content under a hash must never change. Under FORCE the absent UPDATE policy \
          default-denies every non-superuser role, 161 grants UPDATE to nobody, and its \
-         append-only guard refuses even a superuser.",
+         append-only guards refuse UPDATE, DELETE and TRUNCATE for every role, \
+         a superuser included, short of disabling triggers.",
     ),
     (
         "agent_prompt_blobs",
         "DELETE",
         "A prompt blob (161) is referenced by the snapshots that ran it and is never \
          deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
-         role, 161 grants DELETE to nobody, and its append-only guard refuses even a \
-         superuser.",
+         role, 161 grants DELETE to nobody, and its append-only guards refuse UPDATE, \
+         DELETE and TRUNCATE for every role, a superuser included, short of disabling \
+         triggers.",
     ),
     (
         "agent_prompt_snapshots",
         "DELETE",
         "A prompt snapshot (161) is the record of what an agent ran and when; it is never \
          deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
-         role, 161 grants DELETE to nobody, and its guard refuses even a superuser.",
+         role, 161 grants DELETE to nobody, and its guards refuse DELETE and TRUNCATE for \
+         every role, a superuser included, short of disabling triggers.",
     ),
     (
         "agent_succession",
         "UPDATE",
         "A succession row (161) is a host attestation recorded once; nothing edits it. Under \
          FORCE the absent UPDATE policy default-denies every non-superuser role, 161 grants \
-         UPDATE to nobody, and its append-only guard refuses even a superuser.",
+         UPDATE to nobody, and its append-only guards refuse UPDATE, DELETE and TRUNCATE \
+         for every role, a superuser included, short of disabling triggers.",
     ),
     (
         "agent_succession",
         "DELETE",
         "A succession row (161) is the lineage record the history read walks; it is never \
          deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
-         role, 161 grants DELETE to nobody, and its append-only guard refuses even a \
-         superuser.",
+         role, 161 grants DELETE to nobody, and its append-only guards refuse UPDATE, \
+         DELETE and TRUNCATE for every role, a superuser included, short of disabling \
+         triggers.",
     ),
 ];
 

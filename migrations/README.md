@@ -1409,9 +1409,10 @@ restart.
   D2-D4, slice S1). Creates the role `epigraph_identity_attestor` NOLOGIN and
   a member of nothing (operations grants LOGIN and a password out of band; no
   migration carries one); the FORCE-RLS tables `agent_prompt_blobs`
-  (content-addressed zstd, append-only even for a superuser),
-  `agent_prompt_snapshots` (only `last_seen` moves) and `agent_succession`
-  (append-only), each readable and writable by a maintenance-owned definer
+  (content-addressed zstd; UPDATE, DELETE and TRUNCATE refused for every
+  role, a superuser included, short of disabling triggers),
+  `agent_prompt_snapshots` (only `last_seen` moves, forward; no TRUNCATE) and
+  `agent_succession` (append-only, no TRUNCATE), each readable and writable by a maintenance-owned definer
   frame only; moves `epigraph_link_operator`'s body unchanged into the
   maintenance-only invoker `epigraph_link_operator_body(uuid, uuid, jsonb)`
   (the entry point keeps its owner, ACL and edge properties); adds the
