@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, ValueEnum};
 use uuid::Uuid;
 
-use epigraph_cli::shadow_report::{run_report, ClaimLine, ReportOptions, Scope, Summary};
+use epigraph_cli::shadow_report::{run_report_on, ClaimLine, ReportOptions, Scope, Summary};
 use epigraph_db::visibility::{SystemReason, Viewer};
 use epigraph_engine::atom_items::AtomFoldMode;
 
@@ -159,7 +159,7 @@ fn write_json_line<T: serde::Serialize>(w: &mut impl Write, v: &T) -> Result<(),
 }
 
 async fn run_one(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
     events: &Viewer,
     opts: &ReportOptions,
@@ -167,7 +167,7 @@ async fn run_one(
 ) -> Result<Summary, String> {
     private_dir(dir)?;
     let mut claims = writer(&dir.join("claims.jsonl"))?;
-    let summary = run_report(pool, viewer, events, opts, |line: &ClaimLine| {
+    let summary = run_report_on(conn, viewer, events, opts, |line: &ClaimLine| {
         write_json_line(&mut claims, line)
     })
     .await?;
@@ -254,20 +254,20 @@ async fn run(cli: Cli) -> Result<(), String> {
     private_dir(&root)?;
 
     // Built after clap has parsed, so an argv error reads as one. The
-    // maintenance session is held for the whole run.
+    // maintenance session is held for the whole run, and every read runs on
+    // its own connection: the bypass viewer is spent where it was issued.
     let maint = epigraph_cli::MaintenancePool::connect("belief_shadow_report")
         .await
         .map_err(|e| e.to_string())?;
-    let session = maint
+    let mut session = maint
         .viewer(SystemReason::BeliefRecomputation)
         .await
         .map_err(|e| e.to_string())?;
-    let maint_viewer = session.viewer();
-    let pool = maint.pool().clone();
+    let (conn, maint_viewer) = session.split();
 
     if matches!(cli.viewer, ViewerArg::Both | ViewerArg::Maintenance) {
         let s = run_one(
-            &pool,
+            conn,
             maint_viewer,
             maint_viewer,
             &opts,
@@ -279,11 +279,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     if matches!(cli.viewer, ViewerArg::Both | ViewerArg::Anonymous) {
         // The nil principal: a real viewer with no group, which reads the
         // public corpus only (SPEC §8 T2, the floor viewer of a public claim).
-        let anonymous = Viewer::resolve(&pool, Uuid::nil())
+        let anonymous = Viewer::resolve(maint.pool(), Uuid::nil())
             .await
             .map_err(|e| format!("anonymous viewer: {e}"))?;
         let s = run_one(
-            &pool,
+            conn,
             &anonymous,
             maint_viewer,
             &opts,

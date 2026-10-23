@@ -8,7 +8,9 @@
 //! Every read runs on ONE connection whose session is set
 //! `default_transaction_read_only`, so a write anywhere on the report's call
 //! graph is refused by the database rather than trusted to be absent. The
-//! connection is closed, not returned to the pool, when the run ends.
+//! binary runs on its maintenance session's own connection (the one its
+//! bypass viewer was issued with) and sets the session back when the run
+//! ends; [`run_report`] closes the connection it acquired instead.
 //!
 //! # Two viewers
 //!
@@ -1921,8 +1923,13 @@ impl Totals {
     }
 }
 
-/// Run the report: every claim in scope as `report_viewer` reads it, recall
-/// events as `events_viewer` reads them. Each claim's line goes to `sink`.
+/// Run the report on a connection acquired from `pool`: every claim in scope
+/// as `report_viewer` reads it, recall events as `events_viewer` reads them.
+/// Each claim's line goes to `sink`. The connection is closed afterwards,
+/// not returned to the pool.
+///
+/// A bypass viewer must be spent on the connection it was issued with; use
+/// [`run_report_on`] with a maintenance session's own connection for that.
 ///
 /// # Errors
 /// A database read, or a fold that fails.
@@ -1937,14 +1944,41 @@ where
     F: FnMut(&ClaimLine) -> Result<(), String>,
 {
     let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
+    let out = run_report_on(&mut conn, report_viewer, events_viewer, opts, sink).await;
+    // Close the session rather than hand it back to the pool.
+    drop(conn.detach());
+    out
+}
+
+/// [`run_report`] on `conn` (a maintenance session's own connection, so its
+/// bypass viewer is spent where it was issued). The session is set
+/// `default_transaction_read_only` for the run and set back afterwards,
+/// whether the run succeeded or not.
+///
+/// # Errors
+/// A database read, or a fold that fails.
+pub async fn run_report_on<F>(
+    conn: &mut sqlx::PgConnection,
+    report_viewer: &Viewer,
+    events_viewer: &Viewer,
+    opts: &ReportOptions,
+    sink: F,
+) -> Result<Summary, String>
+where
+    F: FnMut(&ClaimLine) -> Result<(), String>,
+{
     sqlx::query("SET SESSION default_transaction_read_only = on")
         .execute(&mut *conn)
         .await
         .map_err(|e| format!("read-only session: {e}"))?;
-    let out = run_on(&mut conn, report_viewer, events_viewer, opts, sink).await;
-    // Close the read-only session rather than hand it back to the pool.
-    drop(conn.detach());
-    out
+    let out = run_on(conn, report_viewer, events_viewer, opts, sink).await;
+    let reset = sqlx::query("SET SESSION default_transaction_read_only = off")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("reset read-only session: {e}"));
+    let summary = out?;
+    reset?;
+    Ok(summary)
 }
 
 async fn run_on<F>(
