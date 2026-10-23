@@ -34,6 +34,10 @@
 //!   refuting edge of its own. Strict serves the derivation (a profile for a
 //!   spine); progressive serves it only when the compound is ready (no
 //!   visible leaf served `Legacy`) and today's value otherwise.
+//! * A spine compound's profile Bel is a Fréchet floor, not a conjunction
+//!   (SPEC §2.2), so every compound tally (role counts and |Δ| quantiles,
+//!   vacates, the `confirmed` set, the strict-entry replay, top movers)
+//!   keeps spines (`compound_spine`) apart from conjunctions.
 //!
 //! # Where the SQL lives
 //!
@@ -1047,10 +1051,21 @@ fn quantiles(mut v: Vec<f64>) -> Quantiles {
     }
 }
 
+/// The key a claim is tallied under: its role, with spine compounds (served
+/// a profile, SPEC §2.2) apart from conjunctions.
+const fn role_key(role: ClaimRole) -> &'static str {
+    match role {
+        ClaimRole::Compound { spine: true } => "compound_spine",
+        r => r.as_sql(),
+    }
+}
+
 /// What the corpus passes keep per claim.
 #[derive(Debug, Clone, Copy)]
 struct Rec {
     compound: bool,
+    /// A spine compound.
+    spine: bool,
     today: Cand,
     progressive: Cand,
     strict: Cand,
@@ -1214,13 +1229,17 @@ fn places(recs: &HashMap<Uuid, Rec>, key: fn(&Rec) -> f64) -> HashMap<Uuid, usiz
         .collect()
 }
 
-/// What strict mode changes for compounds (SPEC §10.4, strict-entry
-/// replay): `confirmed` flips and moves of more than `threshold` places in
-/// the corpus ordering (today's gate score against strict's rank key: Bel
-/// for a compound, the fold's `BetP` for an atom), each also weighted by
-/// recall exposure and, when it was measured, by graph-view exposure.
+/// What strict mode changes for the conjunction compounds, or (`spine`) the
+/// spine compounds (SPEC §10.4, strict-entry replay): `confirmed` flips and
+/// moves of more than `threshold` places in the corpus ordering (`today`:
+/// today's gate score; `strict`: strict's rank key, Bel for a compound and
+/// the fold's `BetP` for an atom, the ordering SPEC §3.2 serves), each also
+/// weighted by recall exposure and, when it was measured, by graph-view
+/// exposure.
 fn strict_entry(
     recs: &HashMap<Uuid, Rec>,
+    (today, strict): (&HashMap<Uuid, usize>, &HashMap<Uuid, usize>),
+    spine: bool,
     threshold: usize,
     top: usize,
     graph_view: bool,
@@ -1231,10 +1250,8 @@ fn strict_entry(
         rank_moves_graph_view_weighted: graph_view.then_some(0),
         ..StrictEntry::default()
     };
-    let today = places(recs, |r| r.today.rank);
-    let strict = places(recs, |r| r.strict.rank);
     let mut moves = Vec::new();
-    for (id, r) in recs.iter().filter(|(_, r)| r.compound) {
+    for (id, r) in recs.iter().filter(|(_, r)| r.compound && r.spine == spine) {
         se.compounds += 1;
         let (before, after) = (r.today.confirmed, r.strict.confirmed);
         flip(&mut se.confirmed, before, after, 1);
@@ -1472,7 +1489,7 @@ impl Totals {
         graph_view_exposure: Option<u64>,
         conflict: (bool, bool),
     ) {
-        let role = base.role.as_sql();
+        let role = role_key(base.role);
         let s = &mut self.summary;
         s.claims += 1;
         *s.by_role.entry(role).or_default() += 1;
@@ -1482,8 +1499,11 @@ impl Totals {
         let served_vacuous =
             matches!((base.cache.bel, base.cache.pl), (Some(b), Some(p)) if vacuous(b, p));
         let compound = matches!(base.role, ClaimRole::Compound { .. });
+        let spine = matches!(base.role, ClaimRole::Compound { spine: true });
         if e.strict.computed() && vacuous(e.strict.iv.bel, e.strict.iv.pl) && !served_vacuous {
-            if compound {
+            if spine {
+                s.vacate.spines += 1;
+            } else if compound {
                 s.vacate.compounds += 1;
             } else {
                 s.vacate.atoms += 1;
@@ -1499,8 +1519,13 @@ impl Totals {
             }
         }
         if compound {
-            s.compound_confirmed_set.progressive += usize::from(e.progressive.confirmed);
-            s.compound_confirmed_set.strict += usize::from(e.strict.confirmed);
+            let set = if spine {
+                &mut s.spine_confirmed_set
+            } else {
+                &mut s.compound_confirmed_set
+            };
+            set.progressive += usize::from(e.progressive.confirmed);
+            set.strict += usize::from(e.strict.confirmed);
         }
         #[allow(clippy::cast_precision_loss)]
         let weight = delta.abs() * (1.0 + recall_exposure as f64);
@@ -1517,6 +1542,7 @@ impl Totals {
             id,
             Rec {
                 compound,
+                spine,
                 today: Cand::today(base),
                 progressive: e.progressive,
                 strict: e.strict,
@@ -1715,11 +1741,20 @@ where
         opts.conflict_min_k,
     );
     totals.summary.sheaf = sheaf_shadow(conn, viewer, &totals.recs, opts.sheaf_threshold).await?;
-    totals.summary.strict_entry = strict_entry(
-        &totals.recs,
-        opts.rank_threshold,
-        opts.top,
-        opts.graph_view_exposure.is_some(),
-    );
+    let today_places = places(&totals.recs, |r| r.today.rank);
+    let strict_places = places(&totals.recs, |r| r.strict.rank);
+    for (spine, slot) in [
+        (false, &mut totals.summary.strict_entry),
+        (true, &mut totals.summary.strict_entry_spine),
+    ] {
+        *slot = strict_entry(
+            &totals.recs,
+            (&today_places, &strict_places),
+            spine,
+            opts.rank_threshold,
+            opts.top,
+            opts.graph_view_exposure.is_some(),
+        );
+    }
     Ok(totals.summary)
 }
