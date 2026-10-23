@@ -142,7 +142,7 @@ async fn challenge_claim_on_an_unwritable_group_claim_is_a_clean_refusal(pool: P
     );
 
     // HTTP: a `claims:write` caller, the reported shape.
-    let (_caller, token, caller_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (caller, token, caller_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let e = challenge_claim(&server, &caller_viewer, params(foreign), Some(&token))
         .await
         .expect_err("the caller does not write the claim's group");
@@ -151,6 +151,33 @@ async fn challenge_claim_on_an_unwritable_group_claim_is_a_clean_refusal(pool: P
         challenges_on(&pool, foreign).await,
         0,
         "http: nothing written"
+    );
+
+    // HTTP control: a claim in the CALLER's own group is challenged. The same
+    // claim is first refused on stdio (the server agent does not write the
+    // caller's personal group), so the two identities are distinguishable:
+    // a preflight that resolved the wrong identity's writable groups, or none,
+    // refuses this call.
+    let caller_group = personal_group_of(&pool, caller).await;
+    let callers = public_claim_in(
+        &pool,
+        caller,
+        caller_group,
+        "a public claim, caller's group",
+    )
+    .await;
+    let e = challenge_claim(&server, &viewer, params(callers), None)
+        .await
+        .expect_err("the server agent does not write the caller's group");
+    assert_clean_refusal(&e, callers, caller_group, "stdio on the caller's claim");
+    assert_eq!(challenges_on(&pool, callers).await, 0);
+    challenge_claim(&server, &caller_viewer, params(callers), Some(&token))
+        .await
+        .expect("an HTTP caller challenges a claim in its own group");
+    assert_eq!(
+        challenges_on(&pool, callers).await,
+        1,
+        "http: the control lands"
     );
 
     // A claim the challenger cannot READ is not found: the refusal above is
