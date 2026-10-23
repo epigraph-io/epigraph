@@ -282,7 +282,8 @@ pub async fn atom_axiom_rows(
 ///
 /// The rows come from `epigraph_db::repos::atom_axiom::atom_input_rows`
 /// (every 2-hypothesis frame plus `claim_validity`; no cached combination, no
-/// ingest template, no row of a compound), and then, per claim:
+/// ingest template, no row of a compound, no `edge_factor` row whose edge the
+/// viewer cannot see), and then, per claim:
 ///
 /// 1. **Hypothesis promotion** (SPEC §11.4): a promoted hypothesis
 ///    (`properties.hypothesis_status = 'promoted'`) reads its

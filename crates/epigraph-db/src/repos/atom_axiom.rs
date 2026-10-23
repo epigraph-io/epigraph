@@ -11,6 +11,13 @@
 //! * cached combination rows
 //!   ([`super::mass_function::cached_combination_predicate`]);
 //! * ingest template rows ([`super::mass_function::ingest_template_predicate`]);
+//! * `edge_factor` rows whose edge the viewer cannot see (or that no longer
+//!   exists). The edge is read through the viewer's `EDGE_VISIBILITY` splice
+//!   (SPEC §6.3), so for such a row the viewer cannot tell whether its source
+//!   is a compound or which way its relationship points. Reading it as an
+//!   atom-source row would keep a compound's mass two-sided, and keep it
+//!   under `excluded`; it is not evidence this viewer can read, so it is not
+//!   in this viewer's fold;
 //! * every row of a **compound** ([`super::claim_role::is_compound_sql`]):
 //!   its belief is a query over its leaves, never a fold of its own rows. The
 //!   role test carries no splice (role is structure, as the
@@ -44,14 +51,14 @@ pub struct AtomInputRow {
     pub hypothesis_index: Option<i32>,
     /// `claims.properties->>'hypothesis_status' = 'promoted'`.
     pub hypothesis_promoted: bool,
-    /// For an `edge_factor` row whose edge the viewer can see: the edge's
-    /// relationship.
+    /// For an `edge_factor` row: the edge's relationship. Always `Some` on
+    /// such a row (a row whose edge the viewer cannot see is not returned).
     pub edge_relationship: Option<String>,
-    /// For an `edge_factor` row whose edge the viewer can see: the edge's
-    /// source claim.
+    /// For an `edge_factor` row: the edge's source claim.
     pub edge_source_id: Option<Uuid>,
-    /// For an `edge_factor` row whose edge the viewer can see: whether that
-    /// source claim is a compound ([`super::claim_role::IS_COMPOUND_SQL`]).
+    /// For an `edge_factor` row: whether the edge's source claim is a
+    /// compound ([`super::claim_role::IS_COMPOUND_SQL`]); `false` on every
+    /// other row.
     pub edge_source_is_compound: bool,
 }
 
@@ -111,6 +118,8 @@ pub async fn atom_input_rows<'e, E: sqlx::PgExecutor<'e>>(
               AND NOT {cached}
               AND NOT {template}
               AND NOT {claim_compound}
+              AND (mf.combination_method IS DISTINCT FROM 'edge_factor'
+                   OR ae.relationship IS NOT NULL)
               /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */ /* {{VISIBILITY:c}} */
             ORDER BY mf.claim_id, mf.created_at, mf.id
             "#,
