@@ -873,3 +873,77 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
     );
     assert_eq!(filtered.wave_at, Some(t));
 }
+
+/// Two runs appended to one file chain in TIME order, whatever order their
+/// lines are in: an operator who concatenates the second run's file before
+/// the first's has not created an intervening write.
+#[test]
+fn records_chain_in_time_order_not_file_order() {
+    let t: DateTime<Utc> = "2031-03-01T12:00:00Z".parse().unwrap();
+    let id = Uuid::new_v4();
+    let second_run = rec(id, 0.2, 0.3, t + Duration::hours(1));
+    let first_run = rec(id, 0.1, 0.2, t);
+    let plan = plan_restore(&[second_run, first_run], None);
+    assert!(
+        plan.broken_chain.is_empty(),
+        "two runs that chain in time were read as an intervening write"
+    );
+    assert_eq!(plan.entries.len(), 1);
+    assert_eq!(
+        plan.entries[0].before,
+        cache_at(0.1),
+        "the first run's before"
+    );
+    assert_eq!(
+        plan.entries[0].written,
+        cache_at(0.3),
+        "the last run's written"
+    );
+}
+
+/// A broken chain: run 1 wrote X1, an organic write set Y, run 2 found Y and
+/// wrote X2, and X2 is still current. The rollback target is Y, the newest
+/// value the wave did not write; leaving X2 in place and calling the claim
+/// superseded would keep the wave's value while telling the operator that a
+/// later write had replaced it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_broken_chain_is_restored_to_the_intervening_write(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let frame = seed_frame(&pool).await;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(88);
+
+    let k = seed_claim(&pool, agent).await;
+    let neighbour = seed_claim(&pool, agent).await;
+    set_cache(&pool, k, &random_cache(&mut rng, Some(frame), None)).await;
+    set_cache(&pool, neighbour, &random_cache(&mut rng, Some(frame), None)).await;
+    let neighbour_before = cache_of(&pool, neighbour).await;
+
+    let t: DateTime<Utc> = "2031-03-01T12:00:00Z".parse().unwrap();
+    let mut records = run_wave(&pool, &[k, neighbour], t, |_| {
+        random_cache(&mut rng, Some(frame), Some("supported"))
+    })
+    .await;
+    set_cache(&pool, k, &random_cache(&mut rng, Some(frame), None)).await;
+    let intervening = cache_of(&pool, k).await;
+    records.extend(
+        run_wave(&pool, &[k], t + Duration::hours(2), |_| {
+            random_cache(&mut rng, Some(frame), Some("supported"))
+        })
+        .await,
+    );
+
+    let report = restore_wave(&pool, &plan_restore(&records, None), &opts(10))
+        .await
+        .expect("restore");
+    assert_eq!(
+        cache_of(&pool, k).await,
+        intervening,
+        "the wave's last value was left in place (or the intervening write was erased)"
+    );
+    assert!(
+        !report.superseded_since_wave.contains(&k),
+        "a claim still holding the wave's value was reported superseded"
+    );
+    assert_eq!(cache_of(&pool, neighbour).await, neighbour_before);
+    assert_eq!(report.restored, vec![neighbour]);
+}
