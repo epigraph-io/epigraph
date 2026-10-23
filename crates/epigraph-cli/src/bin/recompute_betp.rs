@@ -55,8 +55,8 @@
 //! **`--accept-vacate <list.jsonl>`** writes the explicit vacuous cache (Bel
 //! 0, Pl 1, BetP .5, `binary_truth`, read back as `unproven`), in list order,
 //! ONLY for listed ids, and only for those that are residue: a listed
-//! compound, procedural or rule claim, or atom with AEF input, is skipped and
-//! reported. List lines are `{"claim_id": ...}`, plus `{"rule": ...}` lines
+//! compound, procedural or rule claim, superseded claim, or atom with AEF
+//! input, is skipped and reported. List lines are `{"claim_id": ...}`, plus `{"rule": ...}` lines
 //! naming the accepted class rule; the run copies the list next to the wave
 //! file (`<wave file>.accept-vacate.<sha256>.jsonl`) and names its records'
 //! wave after its hash.
@@ -762,6 +762,7 @@ const fn vacate_key(outcome: VacateOutcome) -> &'static str {
         VacateOutcome::NotVisible => "skipped_not_found",
         VacateOutcome::Compound => "skipped_compound",
         VacateOutcome::NotAnAtom => "skipped_not_an_atom",
+        VacateOutcome::NotCurrent => "skipped_not_current",
         VacateOutcome::HasAefInput => "skipped_has_aef_input",
     }
 }

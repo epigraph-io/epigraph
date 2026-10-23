@@ -881,7 +881,8 @@ pub fn parse_accept_list(bytes: &[u8]) -> Result<AcceptList, String> {
 
 /// One accepted vacate (SPEC §10.5), in one transaction: lock the claim,
 /// read its cache, `vacate_atom_cache` (which refuses a compound, a
-/// procedural or rule claim and an atom with AEF input), read back, record
+/// procedural or rule claim, a claim that is not current and an atom with
+/// AEF input), read back, record
 /// `before`/`written` when it changed, commit.
 ///
 /// # Errors

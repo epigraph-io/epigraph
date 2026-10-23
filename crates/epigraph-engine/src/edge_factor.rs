@@ -1553,6 +1553,9 @@ pub enum VacateOutcome {
     /// A procedural or rule claim, whose cache is not an atom's: nothing
     /// was written.
     NotAnAtom,
+    /// The claim is not current (superseded or marked a duplicate): it is
+    /// no atom of the corpus, so nothing was written.
+    NotCurrent,
     /// The atom has AEF input, so it is not residue: vacating it would
     /// erase an evidence-backed value. Nothing was written.
     HasAefInput,
@@ -1601,9 +1604,9 @@ pub async fn vacate_atom_cache(
 /// ONE refusal ladder: the vacate and its dry run both read it. Writes
 /// nothing.
 ///
-/// Refused: a claim the viewer cannot see, a compound, a procedural or rule
-/// claim, and an atom with AEF input (read as the single atom-cache writer
-/// reads it, under `compound_source_edges`).
+/// Refused: a claim the viewer cannot see, a claim that is not current, a
+/// compound, a procedural or rule claim, and an atom with AEF input (read as
+/// the single atom-cache writer reads it, under `compound_source_edges`).
 ///
 /// # Errors
 /// A database read.
@@ -1618,11 +1621,23 @@ pub async fn vacate_refusal(
     let roles = roles_batch(&mut *conn, viewer, &[claim_id])
         .await
         .map_err(|e| format!("roles_batch: {e}"))?;
-    match roles.get(&claim_id).copied() {
+    let Some(role) = roles.get(&claim_id).copied() else {
+        return Ok(Some(VacateOutcome::NotVisible));
+    };
+    let current: Option<bool> = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| format!("is_current: {e}"))?;
+    match current {
         None => return Ok(Some(VacateOutcome::NotVisible)),
-        Some(ClaimRole::Compound { .. }) => return Ok(Some(VacateOutcome::Compound)),
-        Some(ClaimRole::Procedural | ClaimRole::Rule) => return Ok(Some(VacateOutcome::NotAnAtom)),
-        Some(ClaimRole::Standalone | ClaimRole::Atom) => {}
+        Some(false) => return Ok(Some(VacateOutcome::NotCurrent)),
+        Some(true) => {}
+    }
+    match role {
+        ClaimRole::Compound { .. } => return Ok(Some(VacateOutcome::Compound)),
+        ClaimRole::Procedural | ClaimRole::Rule => return Ok(Some(VacateOutcome::NotAnAtom)),
+        ClaimRole::Standalone | ClaimRole::Atom => {}
     }
     let ctx = crate::belief_query::FramedBeliefContext::global();
     let has_input = crate::atom_items::atom_axiom_rows_under(
