@@ -128,7 +128,10 @@ impl AtomFoldMode {
 }
 
 /// Read one switch from the environment ([`flag_value`]).
-fn read_flag<T: Default + std::fmt::Debug>(env: &str, parse: fn(&str) -> Option<T>) -> T {
+pub(crate) fn read_flag<T: Default + std::fmt::Debug>(
+    env: &str,
+    parse: fn(&str) -> Option<T>,
+) -> T {
     flag_value(env, std::env::var(env).ok().as_deref(), parse)
 }
 
@@ -401,26 +404,12 @@ pub async fn atom_axiom_rows_under(
     // Step 1, the class of each row, and its coarsening. A row that cannot be
     // read is skipped (and logged) here, before the seed rule, so it is no
     // input and never fails another row or another atom of the batch.
-    let binary = binary_frame()?;
-    let mut kept: Vec<(AtomInputRow, AxiomClass, MassFunction)> = inputs
-        .into_iter()
-        .filter(reads_this_side_of_promotion)
-        .filter_map(|r| match coarsen_to_binary(&r, &binary) {
-            Ok(coarse) => {
-                let class = classify(&r);
-                Some((r, class, coarse))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    row = %r.row.id,
-                    claim = %r.row.claim_id,
-                    error = %e,
-                    "atom fold: skipping a stored BBA it cannot read"
-                );
-                None
-            }
-        })
-        .collect();
+    let mut kept: Vec<ReadRow> = read_rows(
+        inputs
+            .into_iter()
+            .filter(reads_this_side_of_promotion)
+            .collect(),
+    )?;
 
     // Step 2: compound-source edge rows. Under `Excluded` none is read.
     if compound_source_edges == CompoundSourceEdges::Excluded {
@@ -469,6 +458,61 @@ pub async fn atom_axiom_rows_under(
         return Ok(HashMap::new());
     }
 
+    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
+    for row in key_and_discount(conn, viewer, kept, ctx).await? {
+        out.entry(row.atom_id).or_default().push(row);
+    }
+    Ok(out)
+}
+
+/// A stored row read for a fold: the row, its class, and its BBA coarsened to
+/// `binary_truth`.
+pub(crate) type ReadRow = (AtomInputRow, AxiomClass, MassFunction);
+
+/// Classify each row and coarsen it to `binary_truth`. A row that cannot be
+/// read is skipped and logged (with its row id): it is no input, so it never
+/// fails another row or another claim of the batch.
+///
+/// # Errors
+/// Only when the `binary_truth` frame itself cannot be built.
+pub(crate) fn read_rows(inputs: Vec<AtomInputRow>) -> Result<Vec<ReadRow>, String> {
+    let binary = binary_frame()?;
+    Ok(inputs
+        .into_iter()
+        .filter_map(|r| match coarsen_to_binary(&r, &binary) {
+            Ok(coarse) => {
+                let class = classify(&r);
+                Some((r, class, coarse))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    row = %r.row.id,
+                    claim = %r.row.claim_id,
+                    error = %e,
+                    "atom fold: skipping a stored BBA it cannot read"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+/// Discount each read row by α under the lens of `ctx` (each row's own
+/// frame's overrides) and key it by its canonical source, as `viewer` sees
+/// the evidence it cites. A positive compound-source edge row is read
+/// one-sided first. Rows come back in input order.
+///
+/// # Errors
+/// A database read, or a discount that errors.
+pub(crate) async fn key_and_discount(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    kept: Vec<ReadRow>,
+    ctx: &FramedBeliefContext,
+) -> Result<Vec<AxiomRow>, String> {
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
     // Per-frame reliability overrides, once per frame.
     let mut overrides: HashMap<Uuid, FrameOverrides> = HashMap::new();
     for frame_id in kept
@@ -499,7 +543,7 @@ pub async fn atom_axiom_rows_under(
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
     let no_lens = PerspectiveReliability::default();
-    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
+    let mut out: Vec<AxiomRow> = Vec::with_capacity(kept.len());
     for (r, class, mut coarse) in kept {
         if let AxiomClass::EdgeFactor {
             compound_source: true,
@@ -539,7 +583,7 @@ pub async fn atom_axiom_rows_under(
             (None, Some(id)) if r.row.evidence_id.is_none() => ItemKey::Evidence(id),
             (None, _) => item_key(&r.row, None, None),
         };
-        out.entry(r.row.claim_id).or_default().push(AxiomRow {
+        out.push(AxiomRow {
             row_id: r.row.id,
             atom_id: r.row.claim_id,
             key,
