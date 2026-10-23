@@ -25,6 +25,9 @@
 mod common;
 mod viewer_fixture;
 
+#[path = "../../epigraph-passkey/tests/support/soft_authenticator.rs"]
+mod support;
+
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use epigraph_api::create_router;
@@ -39,6 +42,15 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 use viewer_fixture::{as_role, database_url_for, downgraded_pool};
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use epigraph_auth::{AccessTokenBinding, JwtConfig};
+use epigraph_db::ScopedPoolOptions;
+use epigraph_passkey::{AttestationPolicy, PasskeyConfig, Passkeys};
+use support::{ClientUv, SoftAuthenticator, ORIGIN, RP_ID};
+use tokio::sync::oneshot;
 
 const ATTESTOR: &str = "epigraph_identity_attestor";
 
@@ -437,11 +449,11 @@ async fn an_admin_reads_any_agents_history_and_only_as_admin(pool: PgPool) {
     let f = family(&pool, operator).await;
     let state = app_role_state(&pool).await;
 
-    let (before, body) = get_history(&state, custodian, &["claims:read"], f.child).await;
+    let (before, refused) = get_history(&state, custodian, &["claims:read"], f.child).await;
     assert_eq!(
         before,
         StatusCode::NOT_FOUND,
-        "CONTROL: not yet an admin, so refused: {body}"
+        "CONTROL: not yet an admin, so refused: {refused}"
     );
 
     viewer_fixture::make_custodian(&pool, custodian).await;
@@ -466,6 +478,13 @@ async fn an_admin_reads_any_agents_history_and_only_as_admin(pool: PgPool) {
         status,
         StatusCode::NOT_FOUND,
         "an admin asking for an agent that does not exist gets 404, not an empty history: {body}"
+    );
+    // The admin's 404 comes from the existence check after the gate, the
+    // stranger's from the gate's refusal: two code paths, one body.
+    assert_eq!(
+        body.to_string().replace(&absent.to_string(), "<id>"),
+        refused.to_string().replace(&f.child.to_string(), "<id>"),
+        "the existence check's 404 is the refusal's 404"
     );
 }
 
@@ -826,4 +845,478 @@ async fn the_listing_says_when_the_lineage_walk_reached_its_depth_limit(pool: Pg
     assert_eq!(down.len(), 64, "65 descendants exist; the walk lists 64");
     assert_eq!(oldest["lineage"]["descendants_at_limit"], json!(true));
     assert_eq!(oldest["lineage"]["ancestors_at_limit"], json!(false));
+}
+
+/// From any member of a three-generation chain, the lineage is nearest first
+/// in both directions, with each member's true distance: from the youngest,
+/// ancestors are [parent (1), grandparent (2)], although the definer returns
+/// the grandparent first; from the oldest, descendants are [child (1),
+/// grandchild (2)]; from the middle, one of each at distance 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_is_listed_nearest_first_both_ways(pool: PgPool) {
+    let operator = human(&pool).await;
+    let ids = chain(&pool, operator, 3).await;
+    let state = app_role_state(&pool).await;
+    let order = |v: &Value| -> Vec<(Value, Value)> {
+        arr(v, "members")
+            .iter()
+            .map(|m| (m["agent_id"].clone(), m["distance"].clone()))
+            .collect()
+    };
+
+    let youngest = read_ok(&state, operator, ids[2]).await;
+    assert_eq!(
+        order(&youngest["lineage"]["ancestors"]),
+        [(json!(ids[1]), json!(1)), (json!(ids[0]), json!(2))],
+        "{youngest}"
+    );
+    assert_eq!(youngest["lineage"]["descendants"], json!([]));
+
+    let oldest = read_ok(&state, operator, ids[0]).await;
+    assert_eq!(
+        order(&oldest["lineage"]["descendants"]),
+        [(json!(ids[1]), json!(1)), (json!(ids[2]), json!(2))],
+        "{oldest}"
+    );
+    assert_eq!(oldest["lineage"]["ancestors"], json!([]));
+
+    let middle = read_ok(&state, operator, ids[1]).await;
+    assert_eq!(
+        order(&middle["lineage"]["ancestors"]),
+        [(json!(ids[0]), json!(1))]
+    );
+    assert_eq!(
+        order(&middle["lineage"]["descendants"]),
+        [(json!(ids[2]), json!(1))]
+    );
+}
+
+/// A lineage member the caller does not operate is listed by id, at its
+/// distance, `readable: false`, with no snapshots, in both directions: the
+/// child's operator sees the parent so, and the parent's operator sees the
+/// child so. CONTROL: an admin reads both members, and each operator reads
+/// its own agent's snapshot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lineage_member_the_caller_does_not_operate_is_listed_by_id_only(pool: PgPool) {
+    let operator = human(&pool).await;
+    let other = human(&pool).await;
+    let custodian = human(&pool).await;
+    let (parent, child) = split_family(&pool, operator, other).await;
+    viewer_fixture::make_custodian(&pool, custodian).await;
+    let state = app_role_state(&pool).await;
+
+    let mine = read_ok(&state, operator, child).await;
+    assert_eq!(arr(&mine["snapshots"], "snapshots").len(), 1, "{mine}");
+    assert_eq!(
+        mine["lineage"]["ancestors"],
+        json!([{"agent_id": parent, "distance": 1, "readable": false, "snapshots": []}])
+    );
+
+    let theirs = read_ok(&state, other, parent).await;
+    assert_eq!(arr(&theirs["snapshots"], "snapshots").len(), 1, "{theirs}");
+    assert_eq!(
+        theirs["lineage"]["descendants"],
+        json!([{"agent_id": child, "distance": 1, "readable": false, "snapshots": []}])
+    );
+
+    let admin = read_ok(&state, custodian, child).await;
+    let up = arr(&admin["lineage"]["ancestors"], "ancestors");
+    assert_eq!(up[0]["agent_id"], json!(parent));
+    assert_eq!(up[0]["readable"], json!(true), "{admin}");
+    assert_eq!(arr(&up[0]["snapshots"], "snapshots").len(), 1);
+}
+
+/// The history outlives a hand-over: an operator whose link to the agent is
+/// RETIRED still reads the agent's history (its snapshot and the file's
+/// content), and still reads it as a readable ancestor through a successor it
+/// operates live. CONTROL: a stranger is still refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_whose_link_is_retired_still_reads_the_history(pool: PgPool) {
+    let operator = human(&pool).await;
+    let stranger = human(&pool).await;
+    let before = "written before the hand-over\n";
+    let r = register(
+        &pool,
+        &identity(
+            "g-retired",
+            None,
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored(before),
+            ],
+        ),
+    )
+    .await;
+    let out = as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let res = AgentRepository::link_retired_agent(&mut conn, r.agent_id, operator).await;
+        (conn, res)
+    })
+    .await
+    .expect("the maintenance role retire-links the agent");
+    assert!(out.link_retired, "CALIBRATION: the link is retired");
+    let retired: bool =
+        sqlx::query_scalar("SELECT retired FROM operator_links WHERE agent_id = $1")
+            .bind(r.agent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the link row");
+    assert!(retired, "CALIBRATION: the link record says retired");
+    let c = register(
+        &pool,
+        &identity(
+            "g-retired",
+            Some(r.agent_id),
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored("after the hand-over\n"),
+            ],
+        ),
+    )
+    .await;
+    assert!(
+        !c.link_live,
+        "CALIBRATION: a retired-linked parent passes on nothing ({c:?})"
+    );
+    link(&pool, c.agent_id, operator).await;
+    let state = app_role_state(&pool).await;
+
+    let body = read_ok(&state, operator, r.agent_id).await;
+    let snaps = arr(&body["snapshots"], "snapshots");
+    assert_eq!(snaps.len(), 1, "{body}");
+    let hash = file_hash(&snaps[0]["files"]["learned_md"]);
+    assert_eq!(
+        read_blob_ok(&state, operator, r.agent_id, hash).await["text"],
+        json!(before)
+    );
+
+    let through = read_ok(&state, operator, c.agent_id).await;
+    let up = arr(&through["lineage"]["ancestors"], "ancestors");
+    assert_eq!(up[0]["agent_id"], json!(r.agent_id));
+    assert_eq!(
+        up[0]["readable"],
+        json!(true),
+        "a retired link still reads the ancestor: {through}"
+    );
+    assert_eq!(arr(&up[0]["snapshots"], "snapshots").len(), 1);
+
+    let (status, refused) = get_history(&state, stranger, &["claims:read"], r.agent_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+}
+
+// =====================================================================
+// Armed admin scopes: the admin arm needs an ELEVATED session
+// =====================================================================
+
+/// The authenticator model the test authenticator claims (synthetic).
+const MODEL: Uuid = Uuid::from_u128(0x6a1e_7e57_0000_4a11_8c0d_000000000161);
+
+fn software() -> Passkeys {
+    Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().expect("origin"),
+        policy: AttestationPolicy::SoftwareAllowed,
+    })
+    .expect("relying party")
+}
+
+/// The REST router on an application-role pool that declares the per-access
+/// recorder (an elevated request on any other pool is refused before it is
+/// served), with the passkey relying party, on a real listener.
+struct Recording {
+    addr: SocketAddr,
+    jwt: Arc<JwtConfig>,
+    http: reqwest::Client,
+    _stop: oneshot::Sender<()>,
+}
+
+impl Recording {
+    async fn start(pool: &PgPool) -> Self {
+        let scoped = ScopedPool::connect_with_access_recorder_for_tests(
+            &database_url_for(pool).await,
+            SessionGucMode::Session,
+            ScopedPoolOptions::default(),
+            Some("epigraph_app"),
+        )
+        .await
+        .expect("app-role recording pool");
+        let state = AppState::with_scoped_pool(scoped, ApiConfig::default())
+            .with_passkeys(Some(Arc::new(software())));
+        let jwt = state.jwt_config.clone();
+        let app = create_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve");
+        });
+        Self {
+            addr,
+            jwt,
+            http: reqwest::Client::new(),
+            _stop: tx,
+        }
+    }
+
+    async fn post(&self, path: &str, token: Option<&str>, body: &Value) -> (u16, Value) {
+        let mut req = self
+            .http
+            .post(format!("http://{}{path}", self.addr))
+            .json(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.expect("POST");
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn get(&self, path: &str, token: &str) -> (u16, Value) {
+        let resp = self
+            .http
+            .get(format!("http://{}{path}", self.addr))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET");
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// A token for `principal` on `client` and `family` (each as given),
+    /// naming `elv`, with `claims:read`.
+    fn token(
+        &self,
+        principal: Uuid,
+        client: Uuid,
+        family: Option<Uuid>,
+        elv: Option<Uuid>,
+    ) -> String {
+        self.jwt
+            .issue_access_token(
+                client,
+                vec!["claims:read".to_string()],
+                "human",
+                None,
+                Some(principal),
+                chrono::Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: family,
+                    elevation_id: elv,
+                    delegated_by: None,
+                },
+            )
+            .expect("mint")
+            .0
+    }
+}
+
+/// A platform custodian: a registered human with its human client (holding
+/// `claims:read`), a live refresh family, the custodian role and a passkey
+/// on `auth`, enrolled through the real enrollment ceremony.
+struct Custodian {
+    person: Uuid,
+    client: Uuid,
+    client_id: String,
+    family: Uuid,
+}
+
+async fn custodian_with_passkey(
+    pool: &PgPool,
+    s: &Recording,
+    auth: &mut SoftAuthenticator,
+) -> Custodian {
+    let (person, _group) =
+        viewer_fixture::seed_human_operator(pool, "prompt-history-custodian").await;
+    let (client, client_id): (Uuid, String) = sqlx::query_as(
+        "SELECT id, client_id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    sqlx::query(
+        "UPDATE oauth_clients SET granted_scopes = ARRAY['claims:read'], \
+                allowed_scopes = ARRAY['claims:read'] WHERE id = $1",
+    )
+    .bind(client)
+    .execute(pool)
+    .await
+    .expect("scopes");
+    let family: Uuid = sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(random32().to_vec())
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a refresh family");
+    viewer_fixture::make_custodian(pool, person).await;
+
+    let enrollment = as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'prompt history', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("open the enrollment");
+        (conn, id)
+    })
+    .await;
+    let base = format!("/elevate/enroll/{enrollment}");
+    let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
+    assert_eq!(status, 200, "enrollment challenge: {options}");
+    let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let (status, body) = s.post(&format!("{base}/finish"), None, &response).await;
+    assert_eq!(status, 200, "enrollment finish: {body}");
+    Custodian {
+        person,
+        client,
+        client_id,
+        family,
+    }
+}
+
+/// Elevate `c` the CLI way (a grant-mode ticket, the passkey ceremony, the
+/// elevate grant): `(the elevation session, the elevated token)`.
+async fn sudo(
+    pool: &PgPool,
+    s: &Recording,
+    c: &Custodian,
+    auth: &mut SoftAuthenticator,
+) -> (Uuid, String) {
+    let plain = s.token(c.person, c.client, Some(c.family), None);
+    let (status, body) = s
+        .post(
+            "/api/v1/elevation/tickets",
+            Some(&plain),
+            &json!({"reason": "audit an agent's prompt history"}),
+        )
+        .await;
+    assert_eq!(status, 201, "ticket: {body}");
+    let ticket: Uuid = body["ticket_id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
+    let secret = body["redeem_secret"].as_str().expect("secret").to_string();
+    let (status, options) = s
+        .post(&format!("/elevate/{ticket}/challenge"), None, &json!({}))
+        .await;
+    assert_eq!(status, 200, "challenge: {options}");
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s
+        .post(&format!("/elevate/{ticket}/assert"), None, &response)
+        .await;
+    assert_eq!(status, 200, "ceremony: {body}");
+    assert_eq!(body["outcome"], "confirmed", "{body}");
+    let (status, body) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": "urn:epigraph:grant:elevate", "ticket_id": ticket,
+                    "redeem_secret": secret, "client_id": c.client_id}),
+        )
+        .await;
+    assert_eq!(status, 200, "elevate grant: {body}");
+    let session: Uuid =
+        sqlx::query_scalar("SELECT session_id FROM elevation_tickets WHERE id = $1")
+            .bind(ticket)
+            .fetch_one(pool)
+            .await
+            .expect("the session");
+    (
+        session,
+        body["access_token"].as_str().expect("token").to_string(),
+    )
+}
+
+/// With the admin-scope switch ARMED, the definer's admin arm needs an
+/// ELEVATED session. The operator still reads (its arm does not depend on
+/// the switch); the custodian's ordinary token, which reads while the switch
+/// is off (CONTROL), is refused once it is armed, the listing and the file
+/// alike; the same custodian ELEVATED reads both, and each elevated read is
+/// recorded against the elevation session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_only_an_elevated_custodian_reads_and_each_read_is_recorded(pool: PgPool) {
+    let operator = human(&pool).await;
+    let f = family(&pool, operator).await;
+    let s = Recording::start(&pool).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let c = custodian_with_passkey(&pool, &s, &mut auth).await;
+    let listing = format!("/api/v1/agents/{}/prompt-history", f.child);
+    let hash = blake3_hex(&f.child_learned);
+    let file = format!("{listing}/blobs/{hash}");
+    let plain = s.token(c.person, c.client, Some(c.family), None);
+
+    let (status, body) = s.get(&listing, &plain).await;
+    assert_eq!(
+        status, 200,
+        "CONTROL: unarmed, the custodian's ordinary token reads: {body}"
+    );
+
+    sqlx::query(
+        "SELECT * FROM public.epigraph_set_admin_scope_enforcement(true, 'prompt history')",
+    )
+    .execute(&pool)
+    .await
+    .expect("arm");
+    let armed: bool = sqlx::query_scalar("SELECT public.epigraph_admin_scopes_armed()")
+        .fetch_one(&pool)
+        .await
+        .expect("armed read");
+    assert!(armed, "CALIBRATION: the switch is armed");
+
+    let op = s.token(operator, Uuid::new_v4(), None, None);
+    let (status, body) = s.get(&listing, &op).await;
+    assert_eq!(status, 200, "armed, the operator still reads: {body}");
+
+    let (status, body) = s.get(&listing, &plain).await;
+    assert_eq!(
+        status, 404,
+        "armed, an unelevated custodian is refused: {body}"
+    );
+    let (status, body) = s.get(&file, &plain).await;
+    assert_eq!(status, 404, "and refused the file too: {body}");
+
+    let (session, elevated) = sudo(&pool, &s, &c, &mut auth).await;
+    let (status, body) = s.get(&listing, &elevated).await;
+    assert_eq!(status, 200, "elevated, the custodian reads: {body}");
+    assert_eq!(arr(&body["snapshots"], "snapshots").len(), 1, "{body}");
+    assert_eq!(
+        body["lineage"]["ancestors"][0]["readable"],
+        json!(true),
+        "elevated, every lineage member is readable: {body}"
+    );
+    let (status, body) = s.get(&file, &elevated).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["text"].as_str(), Some(f.child_learned.as_str()));
+
+    let mut surfaces: Vec<String> =
+        sqlx::query_scalar("SELECT surface FROM elevated_access WHERE elevation_id = $1")
+            .bind(session)
+            .fetch_all(&pool)
+            .await
+            .expect("the access log");
+    surfaces.sort();
+    assert_eq!(
+        surfaces,
+        [
+            "GET /api/v1/agents/:id/prompt-history",
+            "GET /api/v1/agents/:id/prompt-history/blobs/:hash",
+        ],
+        "each elevated read is recorded against the session"
+    );
 }

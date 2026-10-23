@@ -427,3 +427,61 @@ pub async fn get_prompt_history_blob(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(agent_id: Uuid, depth: i32) -> PromptHistoryIndexEntry {
+        PromptHistoryIndexEntry {
+            agent_id,
+            relation: if depth < 0 { "ancestor" } else { "descendant" }.to_string(),
+            depth,
+            readable: false,
+            snapshot: None,
+        }
+    }
+
+    fn ids_and_distances(members: &[LineageMember]) -> Vec<(Uuid, u32)> {
+        members.iter().map(|m| (m.agent_id, m.distance)).collect()
+    }
+
+    /// Whatever order the rows arrive in, each direction comes out nearest
+    /// first with its unsigned distance, and a direction whose farthest
+    /// member sits at the depth limit says so.
+    #[test]
+    fn grouping_orders_each_direction_nearest_first_whatever_the_row_order() {
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        // The definer's order is by signed depth (farthest ancestor first);
+        // the descendants here arrive farthest first as well.
+        let rows = vec![
+            member(ids[0], -3),
+            member(ids[1], -1),
+            member(ids[2], -2),
+            member(ids[3], 3),
+            member(ids[4], 1),
+            member(ids[5], 2),
+        ];
+        let out = group_history(Uuid::new_v4(), rows);
+        assert_eq!(
+            ids_and_distances(&out.lineage.ancestors),
+            [(ids[1], 1), (ids[2], 2), (ids[0], 3)]
+        );
+        assert_eq!(
+            ids_and_distances(&out.lineage.descendants),
+            [(ids[4], 1), (ids[5], 2), (ids[3], 3)]
+        );
+        assert!(!out.lineage.ancestors_at_limit && !out.lineage.descendants_at_limit);
+
+        let limit = i32::try_from(LINEAGE_DEPTH_LIMIT).expect("small");
+        let out = group_history(
+            Uuid::new_v4(),
+            vec![member(ids[0], -limit), member(ids[1], limit - 1)],
+        );
+        assert!(out.lineage.ancestors_at_limit, "an ancestor at the limit");
+        assert!(
+            !out.lineage.descendants_at_limit,
+            "a descendant one short of it"
+        );
+    }
+}
