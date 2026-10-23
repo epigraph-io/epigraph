@@ -937,16 +937,20 @@ async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) 
 }
 
 /// A manual `decomposes_to` cycle `A -> B -> A` has no root, so neither node
-/// is procedural, and the owner lookup must terminate. The lookup is run first
-/// under a statement timeout, so an unbounded walk fails here with a timeout
-/// instead of hanging the run.
+/// is procedural even though A carries the workflow stamp, and the owner
+/// lookup must terminate. The lookup is run first under a statement timeout,
+/// so an unbounded walk fails here with a timeout instead of hanging the run.
+///
+/// A is stamped on purpose: with no workflow-stamped claim in the database
+/// at all, the server can answer the root search from an empty candidate set
+/// without walking the cycle, and an uncapped walk would go unnoticed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
     let owner = agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
-    let a = claim(&pool, owner, "cycle node A").await;
+    let a = workflow_claim(&pool, owner, "cycle node A").await;
     let b = claim(&pool, owner, "cycle node B").await;
     decomposes_to(&pool, a, b, false).await;
     decomposes_to(&pool, b, a, false).await;
