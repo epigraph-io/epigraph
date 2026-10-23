@@ -270,6 +270,10 @@ async fn a_restore_never_undoes_a_later_write_in_any_cache_column(pool: PgPool) 
 // (2) idempotence
 // ---------------------------------------------------------------------------
 
+/// Idempotence, and its edge case: claim 0's wave write left its cache exactly
+/// as it was (`written` == `before`), which happens whenever a recompute lands
+/// on the value already cached. A restore must not rewrite such a row on ANY
+/// run: there is nothing to undo.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_second_restore_writes_no_row_and_reports_already_restored(pool: PgPool) {
     let agent = seed_agent(&pool).await;
@@ -284,18 +288,34 @@ async fn a_second_restore_writes_no_row_and_reports_already_restored(pool: PgPoo
         befores.insert(id, cache_of(&pool, id).await);
         ids.push(id);
     }
+    let unchanged = ids[0];
     let at = db_now(&pool).await;
-    let records = run_wave(&pool, &ids, at, |_| {
-        random_cache(&mut rng, Some(frame), Some("supported"))
+    let records = run_wave(&pool, &ids, at, |i| {
+        if i == 0 {
+            befores[&unchanged].clone()
+        } else {
+            random_cache(&mut rng, Some(frame), Some("supported"))
+        }
     })
     .await;
+    assert_eq!(
+        records[0].before, records[0].written,
+        "fixture: a no-op write"
+    );
     let plan = plan_restore(&records, None);
+    let unchanged_version = xmin(&pool, unchanged).await;
 
     let first = restore_wave(&pool, &plan, &opts(2)).await.expect("first");
     assert_eq!(
         set_of(&first.restored),
-        set_of(&ids),
-        "first run restores all"
+        set_of(&ids[1..]),
+        "first run restores every claim the wave changed"
+    );
+    assert_eq!(first.already_restored, vec![unchanged]);
+    assert_eq!(
+        xmin(&pool, unchanged).await,
+        unchanged_version,
+        "a claim the wave did not change was rewritten"
     );
 
     let mut versions = HashMap::new();
