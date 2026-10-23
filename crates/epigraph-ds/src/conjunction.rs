@@ -321,8 +321,16 @@ pub struct ConjResult {
     /// which remain upper bounds because a negative valuation only shrinks
     /// Pl and NR.
     pub frechet: Frechet,
-    /// `false` when the cap was hit and the result is R-IND + R-FRE.
+    /// `false` when the cap was hit and the result is R-IND + R-FRE, or when
+    /// a closed form was applied to a base with [`open_world`] set.
+    ///
+    /// [`open_world`]: ConjResult::open_world
     pub exact: bool,
+    /// Some item gives `~` mass on a query atom. The closed forms
+    /// ([`not_all_closed_form`], [`single_negative_sibling`]) are exact only
+    /// when this is `false`; with `~`, only [`conj_belief`]'s own `not_all`
+    /// is exact CDST.
+    pub open_world: bool,
 }
 
 /// Letter codes inside a DP state (3 bits per query position).
@@ -640,6 +648,7 @@ fn evaluate(p: &Prepared, joint: &Joint) -> ConjResult {
         k: unit(joint.k),
         frechet,
         exact: true,
+        open_world: p.open.iter().any(|o| *o),
     }
 }
 
@@ -724,6 +733,7 @@ fn independent_fallback<A: Ord + Clone>(
             singles.iter().map(|s| s.nr),
         ),
         exact: false,
+        open_world: singles.iter().any(|s| s.open_world),
     };
     if not_all > 0.0 {
         apply_negative_valuation(&base, base.bel, not_all)
@@ -829,7 +839,11 @@ fn apply_negative_valuation(
             lo: unit((base.frechet.lo - k_prime) / z),
             ..base.frechet
         },
-        exact: base.exact,
+        // The closed form is the ow = 0 case: with `~` on a query atom it is
+        // not what exact CDST gives (the valuation's frame part would meet
+        // the O states as conflict), so it is labelled inexact.
+        exact: base.exact && !base.open_world,
+        open_world: base.open_world,
     })
 }
 
@@ -841,8 +855,10 @@ fn apply_negative_valuation(
 /// the valuation) combined with mass `m` on ¬(∧L).
 ///
 /// It equals [`conj_belief`] with `not_all = m` whenever no leaf carries
-/// open-world mass; with `~` present, use the DP, which lets the CDST meet
-/// table decide how O states meet the valuation.
+/// open-world mass. With `~` present (`base.open_world`), the result is
+/// returned with `exact: false`; use the DP ([`conj_belief`] with
+/// `not_all = m`), which lets the CDST meet table decide how O states meet
+/// the valuation.
 ///
 /// # Errors
 /// `InvalidProbability` if `m` is outside [0, 1]; `TotalConflict` if
@@ -860,6 +876,11 @@ pub fn not_all_closed_form(base: &ConjResult, m: f64) -> Result<ConjResult, DsEr
 /// Bel and Pl scale by (1 − m)/(1 − K'); NR, `BetP`, Bel(∨L) and K follow
 /// the same valuation. Two or more negative siblings have no closed form
 /// here (the SPEC serves R-FRE with `internally_contested`).
+///
+/// **Precondition: no `~` on the query's atoms** (ow = 0). When
+/// `base.open_world` is set the value is not exact CDST and is returned with
+/// `exact: false`. This module has no exact path for a valuation over a
+/// subset of the query; a caller that needs one under `~` must add it.
 ///
 /// # Errors
 /// `InvalidProbability` for `m` or `pair_bel` outside [0, 1];
