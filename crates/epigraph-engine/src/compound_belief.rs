@@ -16,7 +16,10 @@
 //! 3. for a leaf with no AEF input but a kept cache, one `legacy:<atom>`
 //!    pseudo-item built from the cache interval;
 //! 4. the compound's `not_all` valuation (SPEC §3.6): its own unmoved
-//!    refutation rows and the live refuting edges into it.
+//!    refutation rows and the live refuting edges into it, minus an edge
+//!    whose source shares a visible leaf with the compound and an edge whose
+//!    source already refutes one of its visible leaves through a wired edge
+//!    (a retargeted parent), each counted.
 //!
 //! A spine compound (level 0/1, or more than 16 visible leaves) gets a
 //! profile of its leaves, never a conjunction. Exactly one refuting edge
@@ -717,6 +720,16 @@ pub async fn derive_compound_belief_batch(
         x_bel.insert(x, bel);
     }
 
+    // The refuting edges whose frozen BBA is one of the batch's items: their
+    // refutation is already in a leaf's fold.
+    let wired: BTreeSet<Uuid> = batch
+        .iter()
+        .filter_map(|b| match &b.id.key {
+            ItemKey::Edge(e) => Some(*e),
+            _ => None,
+        })
+        .collect();
+
     let mut out = HashMap::with_capacity(compounds.len());
     for (&id, &spine) in &compounds {
         let leaves = closures.get(&id).cloned().unwrap_or_default();
@@ -729,10 +742,22 @@ pub async fn derive_compound_belief_batch(
                 .get(&id)
                 .map(|keys| keys.values().copied().collect())
                 .unwrap_or_default();
-            let mut shared_leaf_skipped = 0;
+            let (mut shared_leaf_skipped, mut leaf_edge_skipped) = (0, 0);
             for e in edges.iter().filter(|e| e.target_id == id) {
                 if x_leaves(e.source_id).iter().any(|l| leaf_set.contains(l)) {
                     shared_leaf_skipped += 1;
+                    continue;
+                }
+                // The same source already refutes one of K's visible leaves
+                // through a wired edge (a retargeted parent edge stays in
+                // force beside its atom edges): counting the parent as well
+                // would refute K twice with one source.
+                if edges.iter().any(|a| {
+                    a.source_id == e.source_id
+                        && leaf_set.contains(&a.target_id)
+                        && wired.contains(&a.id)
+                }) {
+                    leaf_edge_skipped += 1;
                     continue;
                 }
                 let m = negative_strength(&e.relationship) * x_bel[&e.source_id];
@@ -744,6 +769,7 @@ pub async fn derive_compound_belief_batch(
                 m: 1.0 - masses.iter().map(|m| 1.0 - m).product::<f64>(),
                 sources: masses.len(),
                 shared_leaf_skipped,
+                leaf_edge_skipped,
             };
             derived_view(id, &leaves, &batch, &inputs, &edges, not_all)?
         };

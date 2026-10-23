@@ -141,6 +141,11 @@ pub struct NotAll {
     /// Refuting edges into the compound that were skipped because their
     /// source shares a visible leaf with it.
     pub shared_leaf_skipped: usize,
+    /// Refuting edges into the compound that were skipped because the same
+    /// source's refuting edge into one of its visible leaves already carries
+    /// a frozen BBA the conjunction reads (a parent edge retargeted onto its
+    /// atoms): that refutation is counted once, on the leaf.
+    pub leaf_edge_skipped: usize,
 }
 
 impl NotAll {
@@ -149,6 +154,7 @@ impl NotAll {
         m: 0.0,
         sources: 0,
         shared_leaf_skipped: 0,
+        leaf_edge_skipped: 0,
     };
 }
 

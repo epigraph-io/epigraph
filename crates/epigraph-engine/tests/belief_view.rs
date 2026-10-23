@@ -1743,6 +1743,10 @@ async fn a_retargeted_refutation_is_counted_once_on_the_atom(pool: PgPool) {
 
     let v = derive(&pool, k).await;
     let not_all = v.derived.as_ref().expect("derived").not_all;
+    assert_eq!(
+        not_all.leaf_edge_skipped, 1,
+        "the parent edge is skipped and counted"
+    );
     assert!(
         near(not_all.m, 0.0, 1e-12) && not_all.sources == 0,
         "the parent's refutation already sits on a1: not_all must be empty, got m {} from {} \
@@ -1765,6 +1769,7 @@ async fn a_retargeted_refutation_is_counted_once_on_the_atom(pool: PgPool) {
     edge(&pool, x, k2, "refutes").await;
     edge(&pool, x, leaves2[0], "refutes").await;
     let v2 = derive(&pool, k2).await;
+    assert_eq!(v2.derived.as_ref().unwrap().not_all.leaf_edge_skipped, 0);
     assert!(
         near(v2.derived.as_ref().unwrap().not_all.m, 0.64, 1e-9),
         "an unwired atom edge leaves the parent's refutation on the whole: m .64, got {}",
