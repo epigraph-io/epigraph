@@ -224,6 +224,10 @@ fn oracle(query: &[Lit<u32>], raws: &[Raw], clauses: &[Clause]) -> Oracle {
     };
     let mut leaf_dis = vec![0.0; n];
     let mut dis = 0.0;
+    // Normalize by the summed mass of non-empty intersections, not by 1 − K:
+    // near total conflict, 1 − K by subtraction loses the digits the
+    // comparison tolerance needs.
+    let mut surviving = 0.0;
     let full = set_from(n, |_| true);
     fn walk(
         bodies: &[Vec<(f64, Worlds)>],
@@ -248,6 +252,7 @@ fn oracle(query: &[Lit<u32>], raws: &[Raw], clauses: &[Clause]) -> Oracle {
             acc.k += m;
             return;
         }
+        surviving += m;
         if subset(s, &target) {
             acc.bel += m;
         }
@@ -275,7 +280,7 @@ fn oracle(query: &[Lit<u32>], raws: &[Raw], clauses: &[Clause]) -> Oracle {
             }
         }
     });
-    let z = 1.0 - acc.k;
+    let z = surviving;
     acc.bel /= z;
     acc.bel_first_two /= z;
     acc.pl /= z;
@@ -338,7 +343,7 @@ fn closed_world_oracle(
         bodies.push(vec![(1.0 - c.m, mk(&|_| true)), (c.m, not_all)]);
     }
     let target = 1u64 << target_world;
-    let (mut k, mut bel, mut pl, mut betp) = (0.0, 0.0, 0.0, 0.0);
+    let (mut k, mut surviving, mut bel, mut pl, mut betp) = (0.0, 0.0, 0.0, 0.0, 0.0);
     fn walk(
         bodies: &[Vec<(f64, u64)>],
         i: usize,
@@ -367,6 +372,7 @@ fn closed_world_oracle(
             k += m;
             return;
         }
+        surviving += m;
         if s == target {
             bel += m;
         }
@@ -375,8 +381,7 @@ fn closed_world_oracle(
             betp += m / f64::from(s.count_ones());
         }
     });
-    let z = 1.0 - k;
-    (bel / z, pl / z, betp / z, k)
+    (bel / surviving, pl / surviving, betp / surviving, k)
 }
 
 // ---------------------------------------------------------------------------
