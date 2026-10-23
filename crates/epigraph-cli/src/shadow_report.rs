@@ -487,7 +487,10 @@ pub struct Summary {
     /// Spine compounds in the `confirmed` set (on their profile's floor).
     pub spine_confirmed_set: ByMode<usize>,
     /// Whether the compound statistics read the leaf values the candidate
-    /// serves: only under the `aef` target fold.
+    /// serves: only under the `aef` target fold. Under another fold every
+    /// compound number (lines, the confirmed sets, vacates, the replay's
+    /// compound flips, the strict-entry replay) reads leaf folds the run does
+    /// not serve, and belongs to a later wave than the one being reviewed.
     pub compound_statistics_valid: bool,
     pub replay: ByMode<ReplaySummary>,
     /// The strict-entry replay over conjunction compounds.
@@ -1634,6 +1637,10 @@ where
     // viewer's (a scoped viewer in no group) under the `aef` fold.
     totals.summary.fold_mismatch.measures_floor = matches!(opts.target_fold, AtomFoldMode::Aef)
         && viewer.group_bind().is_some_and(<[Uuid]>::is_empty);
+    // The compound derivation reads every evidenced leaf through its AEF
+    // fold, whatever the target fold; only under `aef` is that the leaf
+    // value the run serves.
+    totals.summary.compound_statistics_valid = matches!(opts.target_fold, AtomFoldMode::Aef);
 
     let mut after: Option<Uuid> = None;
     let mut listed = match &opts.scope {

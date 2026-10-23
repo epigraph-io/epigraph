@@ -212,6 +212,12 @@ fn headline(label: &str, s: &Summary) {
         s.replay.strict.lost,
         s.replay.strict.events,
     );
+    if !s.compound_statistics_valid {
+        println!(
+            "{label}: the compound statistics read leaf folds this target fold does not serve; \
+             they do not describe this wave"
+        );
+    }
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
