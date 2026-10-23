@@ -578,12 +578,18 @@ async fn a_node_whose_whole_decomposition_is_hidden_is_a_leaf_for_that_viewer(po
     }
 }
 
-/// A public compound whose ONLY child is private (edge and claim both
-/// group-owned, as the trigger stamps them) is still a compound for the
-/// anonymous viewer, with no visible leaves. Role is not spliced; the closure
-/// is.
+/// The role SQL carries no viewer splice while the closure does: a public
+/// compound whose ONLY child is private (edge and claim both group-owned, as
+/// the trigger stamps them) reads as a compound with no visible leaves for
+/// the anonymous viewer.
+///
+/// This pins the SQL, NOT the end-to-end "role is structure" property: the
+/// test harness connects as a superuser, where row security does not apply.
+/// On an application session it does, and the same read finds no compound;
+/// `on_an_app_session_row_security_hides_a_wholly_private_decomposition`
+/// pins that.
 #[sqlx::test(migrations = "../../migrations")]
-async fn role_is_structural_while_the_closure_is_spliced(pool: PgPool) {
+async fn the_role_sql_is_unspliced_while_the_closure_is_spliced(pool: PgPool) {
     let s = seed(&pool).await;
     let (member, group) = fixture::seed_agent_with_group(&pool, "claim-role-owner").await;
     let anonymous = fixture::public_viewer(&pool).await;
@@ -608,6 +614,94 @@ async fn role_is_structural_while_the_closure_is_spliced(pool: PgPool) {
     );
     assert!(closure(&pool, &anonymous, &[k]).await[&k].is_empty());
     assert_eq!(closure(&pool, &owner, &[k]).await[&k], vec![child]);
+}
+
+/// `roles_batch` on an `epigraph_app` session stamped with the read set
+/// `groups`: the regime the per-viewer API reads run in, where row security
+/// filters `edges` and `claims` whatever the query splices. The viewer is
+/// resolved on the superuser pool beforehand.
+async fn app_session_roles(
+    pool: &PgPool,
+    viewer: &Viewer,
+    groups: &[Uuid],
+    ids: &[Uuid],
+) -> HashMap<Uuid, ClaimRole> {
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ids = ids.to_vec();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let got = {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+            sqlx::query(
+                "SELECT set_config('epigraph.group_ids', $1, true), \
+                        set_config('epigraph.writable_group_ids', '', true), \
+                        set_config('epigraph.principal_id', '', true)",
+            )
+            .bind(&set)
+            .execute(&mut *tx)
+            .await
+            .expect("stamp the app session");
+            let got = claim_role::roles_batch(&mut *tx, viewer, &ids)
+                .await
+                .expect("roles_batch on an app session");
+            tx.rollback().await.expect("rollback");
+            got
+        };
+        (conn, got)
+    })
+    .await
+}
+
+/// The documented limit of "role is structure" (module doc of `claim_role`):
+/// on an application session, row security hides a compound's decomposition
+/// from a viewer who can read none of it, so the role read finds no compound.
+/// A public compound whose only child is private reads `Standalone` for the
+/// anonymous app session, and `Compound` for an app session stamped with the
+/// owner group. Closing this needs a definer-rights role read, which this
+/// code-only module does not add; per-viewer API callers of `roles_batch`
+/// inherit the gap.
+///
+/// CALIBRATION: in the same anonymous session a fully public compound still
+/// reads `Compound` over an `Atom`, so `Standalone` is row security hiding
+/// the private decomposition, not a session that can read nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_an_app_session_row_security_hides_a_wholly_private_decomposition(pool: PgPool) {
+    let s = seed(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "claim-role-owner").await;
+    let anonymous = fixture::public_viewer(&pool).await;
+    let owner = Viewer::resolve(&pool, member).await.expect("resolve owner");
+
+    let k = claim(&pool, &s, "public compound, private child").await;
+    let child = claim_full(
+        &pool,
+        &s,
+        "private only child",
+        serde_json::json!({}),
+        &[],
+        Some(group),
+        true,
+    )
+    .await;
+    decomposes_to(&pool, k, child).await;
+    let open = claim(&pool, &s, "public compound, public child").await;
+    let open_child = claim(&pool, &s, "public child").await;
+    decomposes_to(&pool, open, open_child).await;
+
+    let anon = app_session_roles(&pool, &anonymous, &[], &[k, open, open_child]).await;
+    assert_eq!(
+        anon[&k],
+        ClaimRole::Standalone,
+        "row security hides the private decomposition from the anonymous app session"
+    );
+    assert_eq!(anon[&open], ClaimRole::Compound { spine: false });
+    assert_eq!(anon[&open_child], ClaimRole::Atom);
+
+    let own = app_session_roles(&pool, &owner, &[group], &[k, child]).await;
+    assert_eq!(own[&k], ClaimRole::Compound { spine: false });
+    assert_eq!(own[&child], ClaimRole::Atom);
 }
 
 // ── (4) a workflow-rooted tree is procedural ───────────────────────────────
