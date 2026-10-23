@@ -920,9 +920,12 @@ fn quantiles(mut v: Vec<f64>) -> Quantiles {
 /// What the corpus passes keep per claim.
 #[derive(Debug, Clone, Copy)]
 struct Rec {
+    compound: bool,
     today: Cand,
     progressive: Cand,
     strict: Cand,
+    recall_exposure: u64,
+    graph_view_exposure: Option<u64>,
 }
 
 /// One recall event, as the replay reads it.
@@ -1066,6 +1069,87 @@ fn replay(events: &[Event], recs: &HashMap<Uuid, Rec>, pick: fn(&Rec) -> &Cand) 
     s
 }
 
+/// Each claim's 1-based place in the corpus ordered by `key`, highest
+/// first (ties by id, so the order is total).
+fn places(recs: &HashMap<Uuid, Rec>, key: fn(&Rec) -> f64) -> HashMap<Uuid, usize> {
+    let mut v: Vec<(&Uuid, f64)> = recs.iter().map(|(id, r)| (id, key(r))).collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    v.into_iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i + 1))
+        .collect()
+}
+
+/// What strict mode changes for compounds (SPEC §10.4, strict-entry
+/// replay): `confirmed` flips and moves of more than `threshold` places in
+/// the corpus ordering (today's gate score against strict's rank key: Bel
+/// for a compound, the fold's `BetP` for an atom), each also weighted by
+/// recall exposure and, when it was measured, by graph-view exposure.
+fn strict_entry(
+    recs: &HashMap<Uuid, Rec>,
+    threshold: usize,
+    top: usize,
+    graph_view: bool,
+) -> StrictEntry {
+    let mut se = StrictEntry {
+        rank_threshold: threshold,
+        confirmed_graph_view_weighted: graph_view.then(Flips::default),
+        rank_moves_graph_view_weighted: graph_view.then_some(0),
+        ..StrictEntry::default()
+    };
+    let today = places(recs, |r| r.today.rank);
+    let strict = places(recs, |r| r.strict.rank);
+    let mut moves = Vec::new();
+    for (id, r) in recs.iter().filter(|(_, r)| r.compound) {
+        se.compounds += 1;
+        let (before, after) = (r.today.confirmed, r.strict.confirmed);
+        flip(&mut se.confirmed, before, after, 1);
+        flip(
+            &mut se.confirmed_recall_weighted,
+            before,
+            after,
+            r.recall_exposure,
+        );
+        if let (Some(f), Some(g)) = (
+            se.confirmed_graph_view_weighted.as_mut(),
+            r.graph_view_exposure,
+        ) {
+            flip(f, before, after, g);
+        }
+        let (from, to) = (today[id], strict[id]);
+        let moved = from.abs_diff(to);
+        if moved > threshold {
+            se.rank_moves_over_threshold += 1;
+            se.rank_moves_recall_weighted += r.recall_exposure;
+            if let (Some(w), Some(g)) = (
+                se.rank_moves_graph_view_weighted.as_mut(),
+                r.graph_view_exposure,
+            ) {
+                *w += g;
+            }
+        }
+        moves.push(RankMove {
+            claim_id: *id,
+            from,
+            to,
+            moved,
+            recall_exposure: r.recall_exposure,
+        });
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let dist = moves.iter().map(|m| m.moved as f64).collect();
+    se.rank_move_quantiles = quantiles(dist);
+    moves.sort_by(|a, b| {
+        b.moved
+            .cmp(&a.moved)
+            .then(b.recall_exposure.cmp(&a.recall_exposure))
+            .then(a.claim_id.cmp(&b.claim_id))
+    });
+    moves.truncate(top);
+    se.top_rank_moves = moves;
+    se
+}
+
 /// The running totals of the per-claim pass.
 #[derive(Default)]
 struct Totals {
@@ -1076,7 +1160,14 @@ struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, id: Uuid, base: &Base, e: &Eval, recall_exposure: u64) {
+    fn add(
+        &mut self,
+        id: Uuid,
+        base: &Base,
+        e: &Eval,
+        recall_exposure: u64,
+        graph_view_exposure: Option<u64>,
+    ) {
         let role = base.role.as_sql();
         let s = &mut self.summary;
         s.claims += 1;
@@ -1117,9 +1208,12 @@ impl Totals {
         self.recs.insert(
             id,
             Rec {
+                compound,
                 today: Cand::today(base),
                 progressive: e.progressive,
                 strict: e.strict,
+                recall_exposure,
+                graph_view_exposure,
             },
         );
     }
@@ -1275,7 +1369,7 @@ where
                 served_vs_fold: eval.served_vs_fold,
             };
             sink(&line)?;
-            totals.add(*id, base, &eval, recall_exposure);
+            totals.add(*id, base, &eval, recall_exposure, line.graph_view_exposure);
         }
     }
     totals.finish_claims(opts.top);
@@ -1283,5 +1377,11 @@ where
         progressive: replay(&events, &totals.recs, |r| &r.progressive),
         strict: replay(&events, &totals.recs, |r| &r.strict),
     };
+    totals.summary.strict_entry = strict_entry(
+        &totals.recs,
+        opts.rank_threshold,
+        opts.top,
+        opts.graph_view_exposure.is_some(),
+    );
     Ok(totals.summary)
 }
