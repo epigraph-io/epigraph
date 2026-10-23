@@ -988,7 +988,7 @@ pub async fn propagate_beliefs(
         "applied": apply,
         "applied_count": written,
         "skipped_not_visible": skipped,
-            "skipped_compounds": skipped_compounds,
+        "skipped_compounds": skipped_compounds,
         "updated_beliefs": updated,
     })))
 }
