@@ -14,8 +14,9 @@
 //! 3. NULL → value → restore is exact, bit for bit, through the wave FILE
 //!    (the format the writing run and the restore share), including a column
 //!    that is NULL in what the wave wrote.
-//! 4. The downstream list is exactly the edges whose SOURCE is a wave claim
-//!    and which were created after THAT claim's wave write.
+//! 4. The downstream list holds every edge whose SOURCE is a wave claim and
+//!    which was created, or had its edge-factor BBA written, after the wave
+//!    started (reaching back a slack for transactions open across the stamp).
 //!
 //! plus the snapshot: every current claim exactly once across page
 //! boundaries, bit-exact, and the chaining rule for a claim a wave file
@@ -535,6 +536,58 @@ async fn seed_edge(pool: &PgPool, src: Uuid, tgt: Uuid, at: DateTime<Utc>) -> Uu
     .expect("seed edge")
 }
 
+/// An edge-factor BBA on `edge`'s target, keyed on the edge (the shape
+/// `auto_wire_ds_for_edge` stores: `perspective_id = edge`, `claim_id =
+/// target`), written at `at`. This is the moment an edge freezes its source's
+/// value, and it need not be the edge's own `created_at`: an edge written while
+/// its source was factorless is wired later, on a dedup re-hit or by
+/// `backfill_factors`.
+async fn seed_edge_factor(
+    pool: &PgPool,
+    edge: Uuid,
+    target: Uuid,
+    agent: Uuid,
+    frame: Uuid,
+    at: DateTime<Utc>,
+) {
+    epigraph_db::PerspectiveRepository::ensure_edge_perspective(pool, edge, Some(agent))
+        .await
+        .expect("edge perspective");
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        target,
+        frame,
+        Some(agent),
+        Some(edge),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("edge_factor"),
+        Some(0.7),
+        None,
+        "cross",
+        None,
+    )
+    .await
+    .expect("edge-factor BBA");
+    sqlx::query("UPDATE mass_functions SET created_at = $2 WHERE perspective_id = $1")
+        .bind(edge)
+        .bind(at)
+        .execute(pool)
+        .await
+        .expect("date the BBA");
+}
+
+/// The downstream list must cover EVERY edge-factor BBA that may have frozen a
+/// wave value, and over-listing only costs an idempotent re-wire, so it errs
+/// wide:
+///
+/// * the cutoff is the WAVE's earliest record time, not each claim's own, and
+///   reaches back a slack before it: `edges.created_at` (and
+///   `mass_functions.created_at`) are the writing transaction's START time,
+///   so an edge whose transaction began just before the stamp can still have
+///   read the wave's value;
+/// * an edge older than the wave is listed when its edge-factor BBA was
+///   written after the wave (the factorless wake-up path).
 #[sqlx::test(migrations = "../../migrations")]
 async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write(pool: PgPool) {
     let agent = seed_agent(&pool).await;
@@ -549,12 +602,13 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
     let c = seed_claim(&pool, agent).await;
     let outside = seed_claim(&pool, agent).await;
     let mut targets = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..12 {
         targets.push(seed_claim(&pool, agent).await);
     }
 
     let t0: DateTime<Utc> = "2031-03-01T12:00:00Z".parse().unwrap();
     let h = Duration::hours(1);
+    let long_before = t0 - Duration::days(30);
     let mut rec_a = run_wave(&pool, &[a], t0, |_| {
         random_cache(&mut rng, Some(frame), None)
     })
@@ -576,22 +630,63 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
     rec_a.append(&mut rec_c1);
     rec_a.append(&mut rec_c2);
 
+    // Listed.
     let after_a = seed_edge(&pool, a, targets[0], t0 + h).await;
-    let _before_a = seed_edge(&pool, a, targets[1], t0 - h).await;
-    let _not_in_wave = seed_edge(&pool, outside, targets[2], t0 + h).await;
-    let _into_a = seed_edge(&pool, targets[3], a, t0 + h).await;
-    // After the wave's first write (a's) but before b's own: b's value was not
-    // yet the wave's when this edge froze it.
-    let _before_b = seed_edge(&pool, b, targets[4], t0 + h).await;
+    let at_the_stamp = seed_edge(&pool, a, targets[7], t0).await;
+    // Its transaction began a second before the wave's stamp.
+    let just_before_the_stamp = seed_edge(&pool, a, targets[8], t0 - Duration::seconds(1)).await;
+    // After the wave started, before b's own record: with one wave-level cutoff
+    // this is inside the wave, and b's value may already have been the wave's
+    // when the edge was wired after its commit.
+    let between_a_and_b = seed_edge(&pool, b, targets[4], t0 + h).await;
     let after_b = seed_edge(&pool, b, targets[5], t0 + h * 3).await;
     // After c's FIRST wave write, before its second.
     let after_c = seed_edge(&pool, c, targets[6], t0 + h).await;
+    // Created long before the wave while `a` had no value, wired after it.
+    let woken_after_the_wave = seed_edge(&pool, a, targets[9], long_before).await;
+    seed_edge_factor(
+        &pool,
+        woken_after_the_wave,
+        targets[9],
+        agent,
+        frame,
+        t0 + h,
+    )
+    .await;
+
+    // Not listed.
+    let _before_the_wave = seed_edge(&pool, a, targets[1], long_before).await;
+    let wired_before_the_wave = seed_edge(&pool, a, targets[10], long_before).await;
+    seed_edge_factor(
+        &pool,
+        wired_before_the_wave,
+        targets[10],
+        agent,
+        frame,
+        long_before,
+    )
+    .await;
+    let _not_in_wave = seed_edge(&pool, outside, targets[2], t0 + h).await;
+    let outside_woken = seed_edge(&pool, outside, targets[11], long_before).await;
+    seed_edge_factor(&pool, outside_woken, targets[11], agent, frame, t0 + h).await;
+    let _into_a = seed_edge(&pool, targets[3], a, t0 + h).await;
 
     let plan = plan_restore(&rec_a, None);
     assert_eq!(plan.broken_chain, vec![c], "fixture: c is held back");
     let listed = downstream_edges(&pool, &plan).await.expect("downstream");
     let got: HashSet<Uuid> = listed.iter().map(|e| e.edge_id).collect();
-    assert_eq!(got, set_of(&[after_a, after_b, after_c]));
+    assert_eq!(
+        got,
+        set_of(&[
+            after_a,
+            at_the_stamp,
+            just_before_the_stamp,
+            between_a_and_b,
+            after_b,
+            after_c,
+            woken_after_the_wave,
+        ])
+    );
     assert_eq!(listed.len(), got.len(), "no edge listed twice");
     for e in &listed {
         assert!(e.source_id == a || e.source_id == b || e.source_id == c);
