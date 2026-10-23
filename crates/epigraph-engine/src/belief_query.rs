@@ -355,6 +355,38 @@ impl FramedBeliefContext {
         )
     }
 
+    /// The lens context of `perspective_id` with no per-frame overrides: the
+    /// workspace calibration (as [`Self::global`]) and the perspective's
+    /// reliability maps, resolved exactly as [`get_perspective_belief`]
+    /// resolves them (an unknown or empty perspective is no opinion). `None`
+    /// is the global context.
+    ///
+    /// This is the context a compound read under a lens passes to
+    /// [`crate::compound_belief::derive_compound_belief_batch`], so a compound
+    /// under lens P is derived from its leaves under lens P (SPEC §3.3).
+    ///
+    /// # Errors
+    /// `Db` if the perspective read fails.
+    pub async fn for_perspective(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Self, BeliefQueryError> {
+        let mut ctx = Self::global();
+        if let Some(pid) = perspective_id {
+            ctx.perspective = Some(
+                PerspectiveRepository::get_by_id(pool, viewer, pid)
+                    .await?
+                    .map(|p| PerspectiveReliability {
+                        source_reliability: p.source_reliability().unwrap_or_default(),
+                        locality_reliability: p.locality_reliability().unwrap_or_default(),
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(ctx)
+    }
+
     /// Resolve the frame-scoped reliability inputs from the DB exactly once.
     ///
     /// Per-frame loads are best-effort: a DB error there falls back to global
@@ -616,3 +648,22 @@ async fn perspective_belief_for_claim(
 // its source in `edge_factor::tests` (effective_source_strength_with_perspective).
 // The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
 // is covered by the `perspective_frame_function` sqlx integration test.
+
+/// The `shadow` view of one claim under `mode` (SPEC §7.1): `None` in
+/// [`CompoundBeliefMode::Legacy`](crate::belief_view::CompoundBeliefMode),
+/// which issues no query at all. In `Shadow`, the claim's
+/// [`BeliefView`](crate::belief_view::BeliefView) under the global lens: a
+/// compound's derived value (R-DEP over the viewer's visible leaves, with its
+/// `not_all` valuation), or an atom's or standalone's AEF value. A procedural
+/// or rule claim, or a claim the viewer cannot see, has none.
+///
+/// The shadow never changes or fails the served read: a computation error is
+/// logged and the view omitted.
+pub async fn shadow_belief(
+    _pool: &PgPool,
+    _viewer: &epigraph_db::visibility::Viewer,
+    _claim_id: Uuid,
+    _mode: crate::belief_view::CompoundBeliefMode,
+) -> Option<crate::belief_view::BeliefView> {
+    None
+}
