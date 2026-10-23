@@ -39,6 +39,15 @@ fn redacted_internal_error_detail_reaches_the_server_log() {
 #[traced_test]
 #[test]
 fn internal_error_static_is_not_logged_as_a_withheld_detail() {
+    // The capture works in THIS span: a redacted variant rendered here is seen,
+    // so the absence below is not a capture that never fired.
+    let redacted = ApiError::InternalError {
+        message: "redacted-control-a8d4".to_string(),
+    }
+    .into_response();
+    assert_eq!(redacted.status(), 500);
+    assert!(logs_contain("redacted-control-a8d4"));
+
     let response = ApiError::InternalErrorStatic {
         message: "static-literal-5be0",
     }
