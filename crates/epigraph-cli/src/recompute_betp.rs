@@ -465,23 +465,36 @@ pub struct WaveLog {
 }
 
 impl WaveLog {
-    /// Open (append, create) `wave_file` and its sidecar for the wave named
-    /// `wave` whose run started at `at` (the database clock, before the first
-    /// write; see [`WaveRecord::at`]).
+    /// Open `wave_file` and its sidecar for the wave named `wave` whose run
+    /// started at `at` (the database clock, before the first write; see
+    /// [`WaveRecord::at`]). One wave file holds one run (SPEC §10.8: a
+    /// restore undoes exactly that run), so a file that already holds
+    /// records is refused; an absent one is created.
     ///
     /// # Errors
-    /// Either file cannot be opened.
+    /// Either file cannot be opened, or already holds records.
     pub fn open(
         wave_file: &std::path::Path,
         wave: &str,
         at: DateTime<Utc>,
     ) -> Result<Self, String> {
         let open = |p: &std::path::Path| {
-            std::fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(p)
-                .map_err(|e| format!("{}: {e}", p.display()))
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+            let len = f
+                .metadata()
+                .map_err(|e| format!("{}: {e}", p.display()))?
+                .len();
+            if len > 0 {
+                return Err(format!(
+                    "{} already holds records: one wave file holds one run",
+                    p.display()
+                ));
+            }
+            Ok(f)
         };
         Ok(Self {
             wave: wave.to_string(),

@@ -11,8 +11,8 @@
 //!     [--target-fold legacy|aef_standalone|aef] --s0 <snapshot> \
 //!     [--alpha-manifest <row ids>] [--report <file>] [--accept-vacate <list>]
 //!
-//! # apply a wave and/or an accepted vacate list
-//! recompute_betp [--role standalone|leaf] [--accept-vacate <list>] \
+//! # apply a wave, or an accepted vacate list (one per run)
+//! recompute_betp (--role standalone|leaf | --accept-vacate <list>) \
 //!     --snapshot <wave file> --wave <name> --disk-path <path> \
 //!     [--min-free-gb N] [--projected-bytes-per-claim N] [--disk-check-cmd <cmd>] \
 //!     [--batch-size N] [--pace-ms N] [--concurrency N]
@@ -29,13 +29,15 @@
 //! existing per-scope `ds_combined_beliefs` rows from the fold).
 //!
 //! **A writing run** needs all of:
-//! * `--role` and/or `--accept-vacate`: a writing run with neither (the
-//!   cohort-v1 apply) is refused;
-//! * `--snapshot <wave file>`: before each commit the run appends what it
-//!   found and what it wrote (`belief_cache::WaveRecord`, one `wave_at` per
-//!   run from the database clock), and per-scope rows to
-//!   `<wave file>.scoped.jsonl`, so `restore_belief_cache --from <wave file>`
-//!   can undo it by compare-and-swap;
+//! * `--role` or `--accept-vacate`, not both: a writing run with neither (the
+//!   cohort-v1 apply) is refused, and a wave and a vacate batch are separate
+//!   runs, each restored from its own wave file;
+//! * `--snapshot <wave file>`, fresh (absent or empty, and so is its
+//!   sidecar): before each commit the run appends what it found and what it
+//!   wrote (`belief_cache::WaveRecord`, one `wave_at` per run from the
+//!   database clock), and per-scope rows to `<wave file>.scoped.jsonl`, so
+//!   `restore_belief_cache --from <wave file>` can undo exactly that run by
+//!   compare-and-swap;
 //! * `--wave <name>` and the disk gate (`--disk-path`, headroom
 //!   `--min-free-gb`, provisional default 20, and optional `--disk-check-cmd`),
 //!   checked before EVERY batch; a failure aborts before that batch writes
@@ -189,9 +191,17 @@ fn validate(cli: &Cli) -> Result<(), String> {
     }
     if cli.role.is_none() && cli.accept_vacate.is_none() {
         return Err(
-            "a writing run needs --role <standalone|leaf> (a wave) and/or --accept-vacate \
-             <list>; the cohort-v1 apply is removed (SPEC §10.7). Use --dry-run for the \
-             cohort-v1 report"
+            "a writing run needs --role <standalone|leaf> (a wave) or --accept-vacate \
+             <list> (a vacate batch); the cohort-v1 apply is removed (SPEC §10.7). Use \
+             --dry-run for the cohort-v1 report"
+                .into(),
+        );
+    }
+    if cli.role.is_some() && cli.accept_vacate.is_some() {
+        return Err(
+            "a writing run is a wave (--role) or a vacate batch (--accept-vacate), not both: \
+             each is restored from its own wave file (SPEC §10.5, §10.8). Run them \
+             separately, each with its own --snapshot"
                 .into(),
         );
     }
@@ -211,6 +221,9 @@ fn validate(cli: &Cli) -> Result<(), String> {
             missing.join(", ")
         ));
     }
+    if let Some(wave_file) = &cli.snapshot {
+        wave_file_is_fresh(wave_file)?;
+    }
     for (flag, set) in [
         ("--s0", cli.s0.is_some()),
         ("--alpha-manifest", cli.alpha_manifest.is_some()),
@@ -218,6 +231,28 @@ fn validate(cli: &Cli) -> Result<(), String> {
     ] {
         if set {
             return Err(format!("{flag} is for a wave dry run (--dry-run --role)"));
+        }
+    }
+    Ok(())
+}
+
+/// One wave file holds one run (SPEC §10.8): a run's records are restored
+/// together, so a wave file, or its scoped sidecar, that already holds
+/// records is refused. An empty or absent file is fresh.
+fn wave_file_is_fresh(wave_file: &std::path::Path) -> Result<(), String> {
+    for path in [
+        wave_file.to_path_buf(),
+        epigraph_cli::belief_cache::scoped_sidecar_path(wave_file),
+    ] {
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() > 0 => {
+                return Err(format!(
+                    "{} already holds records: one wave file holds one run, so a restore \
+                     undoes exactly that run (SPEC §10.8). Give this run a new --snapshot",
+                    path.display()
+                ))
+            }
+            _ => {}
         }
     }
     Ok(())
