@@ -1340,6 +1340,265 @@ async fn a_drift_report_names_the_compound_source_edges_setting_it_read(pool: Pg
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A wave dry run into a report file, with `extra` flags.
+fn dry_report(
+    db: &str,
+    dir: &Path,
+    role: &str,
+    target: &str,
+    s0: &Path,
+    extra: &[&str],
+) -> Vec<serde_json::Value> {
+    let report = dir.join(format!("report-{role}-{}.jsonl", Uuid::new_v4()));
+    let mut args = vec![
+        "--dry-run",
+        "--role",
+        role,
+        "--target-fold",
+        target,
+        "--s0",
+        s(s0),
+        "--report",
+        s(&report),
+    ];
+    args.extend_from_slice(extra);
+    run(RECOMPUTE_BETP, dir, &args, &[("DATABASE_URL", db)]).ok(&format!("dry run {args:?}"));
+    report_lines(&report)
+}
+
+fn line_for(lines: &[serde_json::Value], id: Uuid) -> &serde_json::Value {
+    lines
+        .iter()
+        .find(|l| l["claim_id"].as_str() == Some(id.to_string().as_str()))
+        .unwrap_or_else(|| panic!("{id} is not reported: {lines:?}"))
+}
+
+/// S0 plus a line's components equals what the wave wrote (read back).
+async fn assert_sums_to_written(pool: &PgPool, line: &serde_json::Value, s0: f64, id: Uuid) {
+    let sum: f64 = line["components"]
+        .as_object()
+        .expect("components")
+        .values()
+        .filter_map(serde_json::Value::as_f64)
+        .sum();
+    let written = cache(pool, id).await.pignistic_prob.expect("written");
+    assert!(
+        (s0 + sum - written).abs() < 1e-9,
+        "{id}: S0 {s0} + components {sum} != written {written}\n{line}"
+    );
+}
+
+/// SPEC §10.4, the components the first drift test does not seed:
+///
+/// * (1') the α change: nonzero exactly on the atom whose row is in the
+///   `--alpha-manifest` (its `evidence_type` set after S0), `null` (not
+///   separable) on every line of a run without a manifest;
+/// * (3a) the one-sided read of a compound-source positive edge-factor row
+///   with m(F): positive (m(F) moves to Theta) exactly on the standalone that
+///   is that edge's target, already in the standalone wave;
+/// * (3b) compound-source rows excluded: zero under `frozen`, nonzero on that
+///   standalone under `excluded`;
+/// * a leaf wave under `aef` decomposes to what the real leaf wave writes;
+///   under a target that does not fold leaves (`aef_standalone`) it stops at
+///   (1').
+///
+/// Sums are checked against what real waves then write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_drift_decomposition_separates_alpha_and_compound_source_reads(pool: PgPool) {
+    let dir = scratch_dir();
+    let db = fixture::database_url_for(&pool).await;
+    let owner = agent(&pool, "drift2-owner").await;
+    let source = agent(&pool, "drift2-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+
+    // A compound and its evidenced leaf.
+    let compound = claim(&pool, owner, "compound").await;
+    let leaf = claim(&pool, owner, "evidenced leaf").await;
+    decomposes_to(&pool, compound, leaf).await;
+    insert_row(&pool, leaf, &evidence_row(bin, source, 0.7, None)).await;
+    set_sentinel(&pool, leaf, bin, 0.0).await;
+
+    // A standalone the compound supports, through an edge-factor row with
+    // disbelief mass (stored, as the edge auto-wire stores it, keyed by the
+    // edge's own perspective).
+    let target = claim(&pool, owner, "target of a compound-source edge").await;
+    insert_row(&pool, target, &evidence_row(bin, source, 0.6, None)).await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            valid_from) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'supports', \
+                 now() - interval '2 days') RETURNING id",
+    )
+    .bind(compound)
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the supports edge");
+    sqlx::query(
+        "INSERT INTO perspectives (id, name, owner_agent_id, perspective_type) \
+         VALUES ($1, 'edge_factor', $2, 'edge')",
+    )
+    .bind(edge)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("the edge's perspective");
+    insert_row(
+        &pool,
+        target,
+        &Row {
+            frame: bin,
+            source: Some(owner),
+            masses: serde_json::json!({ "0": 0.5, "1": 0.2, "0,1": 0.3 }),
+            method: Some("edge_factor"),
+            source_strength: Some(0.8),
+            evidence_type: None,
+            evidence_id: None,
+            perspective_id: Some(edge),
+        },
+    )
+    .await;
+    set_sentinel(&pool, target, bin, 0.01).await;
+
+    // A standalone whose row a type backfill set after S0: in the manifest.
+    let typed = claim(&pool, owner, "typed after S0").await;
+    let typed_row = insert_row(
+        &pool,
+        typed,
+        &Row {
+            source_strength: Some(0.4),
+            ..evidence_row(bin, source, 0.7, None)
+        },
+    )
+    .await;
+    set_sentinel(&pool, typed, bin, 0.02).await;
+    let manifest = dir.join("alpha-manifest.txt");
+    std::fs::write(&manifest, format!("{typed_row}\n")).expect("manifest");
+
+    let s0_path = take_snapshot(&db, &dir, "s0.jsonl");
+    let s0: HashMap<Uuid, f64> = read_snapshot(std::io::BufReader::new(
+        std::fs::File::open(&s0_path).expect("open S0"),
+    ))
+    .expect("parse S0")
+    .into_iter()
+    .filter_map(|r| r.pignistic_prob.map(|p| (r.claim_id, p)))
+    .collect();
+
+    let c = |line: &serde_json::Value, key: &str| component(line, key);
+    let with_manifest = ["--alpha-manifest", s(&manifest)];
+    let frozen = dry_report(
+        &db,
+        &dir,
+        "standalone",
+        "aef_standalone",
+        &s0_path,
+        &with_manifest,
+    );
+    let excluded = dry_report(
+        &db,
+        &dir,
+        "standalone",
+        "aef_standalone",
+        &s0_path,
+        &[
+            "--alpha-manifest",
+            s(&manifest),
+            "--target-compound-source-edges",
+            "excluded",
+        ],
+    );
+    let no_manifest = dry_report(&db, &dir, "standalone", "aef_standalone", &s0_path, &[]);
+
+    // (1'): only with a manifest, and only where it names a row.
+    let alpha = c(line_for(&frozen, typed), "1'").expect("(1') is separable with a manifest");
+    assert!(
+        alpha.abs() > 1e-9,
+        "(1') moves the typed atom: {}",
+        line_for(&frozen, typed)
+    );
+    assert_eq!(
+        c(line_for(&frozen, target), "1'"),
+        Some(0.0),
+        "(1') is zero where the manifest names no row"
+    );
+    for line in &no_manifest {
+        assert_eq!(
+            c(line, "1'"),
+            None,
+            "(1') is null without a manifest: {line}"
+        );
+    }
+    // (3a) and (3b).
+    for (lines, setting) in [(&frozen, "frozen"), (&excluded, "excluded")] {
+        let t = line_for(lines, target);
+        assert!(
+            c(t, "3a").unwrap() > 1e-9,
+            "(3a) RAISES the compound-source edge's target under {setting} (the one-sided \
+             read moves the row's m(F) to Theta): {t}"
+        );
+        assert!(
+            c(line_for(lines, typed), "3a").unwrap().abs() <= 1e-9,
+            "(3a) is zero without a compound-source row ({setting})"
+        );
+        assert!(
+            c(line_for(lines, typed), "3b").unwrap().abs() <= 1e-9,
+            "(3b) is zero without a compound-source row ({setting})"
+        );
+    }
+    assert!(
+        c(line_for(&frozen, target), "3b").unwrap().abs() <= 1e-9,
+        "(3b) is zero under frozen: {}",
+        line_for(&frozen, target)
+    );
+    assert!(
+        c(line_for(&excluded, target), "3b").unwrap().abs() > 1e-9,
+        "(3b) moves the target under excluded: {}",
+        line_for(&excluded, target)
+    );
+
+    // The leaf: under a target that does not fold leaves, the decomposition
+    // stops at (1').
+    let not_folded = dry_report(&db, &dir, "leaf", "aef_standalone", &s0_path, &[]);
+    let keys: HashSet<&str> = line_for(&not_folded, leaf)["components"]
+        .as_object()
+        .expect("components")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        HashSet::from(["0b", "0c", "1", "1'"]),
+        "a leaf under aef_standalone stops at (1')"
+    );
+    let leaf_aef = dry_report(&db, &dir, "leaf", "aef", &s0_path, &[]);
+
+    // The real waves: standalones under aef_standalone (frozen, as the
+    // fixture server), then leaves under aef.
+    let standalone_env = WaveEnv::new(&pool, "aef_standalone").await;
+    let wave_file = dir.join("standalone-wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &standalone_env.vars(),
+    )
+    .ok("the standalone wave");
+    for id in [target, typed] {
+        assert_sums_to_written(&pool, line_for(&frozen, id), s0[&id], id).await;
+    }
+    let leaf_env = WaveEnv::new(&pool, "aef").await;
+    let leaf_file = dir.join("leaf-wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("leaf", s(&leaf_file), s(&dir)),
+        &leaf_env.vars(),
+    )
+    .ok("the leaf wave");
+    assert_sums_to_written(&pool, line_for(&leaf_aef, leaf), s0[&leaf], leaf).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── (7) the disk gate ───────────────────────────────────────────────────────
 
 /// The real-run flags of a standalone wave with everything but the disk gate:

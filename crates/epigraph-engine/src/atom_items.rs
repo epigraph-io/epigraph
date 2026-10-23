@@ -1029,6 +1029,161 @@ mod tests {
         assert!(crate::edge_factor::AtomCacheSettings::current().vacate_on_evidence_removal);
     }
 
+    fn bba(masses: &serde_json::Value) -> MassFunction {
+        MassFunction::from_json_masses(binary_frame().expect("frame"), masses).expect("bba")
+    }
+
+    /// One drift row of atom `atom`, on `frame`, with no legacy source key
+    /// (each row its own legacy source) and its own item key.
+    fn drift_row(
+        atom: Uuid,
+        frame: Uuid,
+        class: AxiomClass,
+        two_sided: &serde_json::Value,
+        one_sided: &serde_json::Value,
+        perspective_id: Option<Uuid>,
+        attributed: bool,
+    ) -> DriftRow {
+        let row_id = Uuid::new_v4();
+        DriftRow {
+            axiom: AxiomRow {
+                row_id,
+                atom_id: atom,
+                key: crate::source_dependence::ItemKey::Row(row_id),
+                class,
+                coarse: bba(one_sided),
+                bba: bba(one_sided),
+            },
+            two_sided_bba: bba(two_sided),
+            legacy_key: None,
+            frame_id: frame,
+            perspective_id,
+            attributed,
+        }
+    }
+
+    /// SPEC §10.4 stages (3), (3a), (3b): a positive compound-source edge row
+    /// with disbelief mass lowers BetP(TRUE) when read two-sided (3) against
+    /// one-sided (3a); excluding compound-source rows (3b) is the value
+    /// without that row at all, whichever side is asked for; and an
+    /// `attributed_v1` row never enters these stages (it is stage (4)).
+    #[test]
+    fn the_legacy_grouping_stages_read_compound_source_rows_as_their_flags_say() {
+        let atom = Uuid::new_v4();
+        let frame = Uuid::new_v4();
+        let evidence = serde_json::json!({ "0": 0.6, "0,1": 0.4 });
+        let ev = drift_row(
+            atom,
+            frame,
+            AxiomClass::Evidence,
+            &evidence,
+            &evidence,
+            None,
+            false,
+        );
+        let cs = drift_row(
+            atom,
+            frame,
+            AxiomClass::EdgeFactor {
+                compound_source: true,
+            },
+            &serde_json::json!({ "0": 0.5, "1": 0.2, "0,1": 0.3 }),
+            &serde_json::json!({ "0": 0.5, "0,1": 0.5 }),
+            None,
+            false,
+        );
+        let attributed = drift_row(
+            atom,
+            frame,
+            AxiomClass::Evidence,
+            &serde_json::json!({ "1": 0.9, "0,1": 0.1 }),
+            &serde_json::json!({ "1": 0.9, "0,1": 0.1 }),
+            None,
+            true,
+        );
+        let v = |rows: &[DriftRow], two_sided, with_cs| {
+            drift_legacy_grouping_betp(rows, two_sided, with_cs).expect("fold")
+        };
+        let both = [ev.clone(), cs.clone()];
+        assert!(
+            v(&both, true, true) < v(&both, false, true) - 1e-6,
+            "two-sided keeps m(F), so it lowers BetP(TRUE): {} vs {}",
+            v(&both, true, true),
+            v(&both, false, true)
+        );
+        let alone = v(std::slice::from_ref(&ev), false, true);
+        for two_sided in [true, false] {
+            assert_eq!(v(&both, two_sided, false), alone, "excluded = absent");
+        }
+        let with_attr = [ev, cs, attributed];
+        for (two_sided, with_cs) in [(true, true), (false, true), (false, false)] {
+            assert_eq!(
+                v(&with_attr, two_sided, with_cs),
+                v(&both, two_sided, with_cs),
+                "an attributed_v1 row is not in stages (3) to (3b)"
+            );
+        }
+        assert_eq!(v(&[], true, true), 0.5, "no row is the vacuous .5");
+    }
+
+    /// The scoped resync's selection (SPEC §7.2 per-frame rows): the fold of
+    /// one frame's rows in one scope. Rows on another frame, and (for a
+    /// perspective) rows of another or no perspective, do not move it; no
+    /// matching row is `None`, never a vacuous fold.
+    #[test]
+    fn a_scope_fold_reads_one_frame_and_one_scope() {
+        let atom = Uuid::new_v4();
+        let (f1, f2) = (Uuid::new_v4(), Uuid::new_v4());
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let m = |t: f64| serde_json::json!({ "0": t, "0,1": 1.0 - t });
+        let row = |frame, t, persp| {
+            drift_row(
+                atom,
+                frame,
+                AxiomClass::Evidence,
+                &m(t),
+                &m(t),
+                persp,
+                false,
+            )
+        };
+        let on_f1 = [row(f1, 0.7, None), row(f1, 0.4, Some(p))];
+        let mut all = on_f1.to_vec();
+        all.extend([
+            row(f2, 0.9, None),
+            row(f2, 0.2, Some(p)),
+            row(f1, 0.3, Some(q)),
+        ]);
+        let global = |rows: &[DriftRow]| drift_scope_fold(rows, f1, None).expect("fold");
+        let mut f1_all = on_f1.to_vec();
+        f1_all.push(row(f1, 0.3, Some(q)));
+        assert_eq!(
+            global(&all).map(|i| i.pignistic_prob()),
+            global(&f1_all).map(|i| i.pignistic_prob()),
+            "rows on another frame do not move a frame's global fold"
+        );
+        let only_p = |rows: &[DriftRow]| {
+            drift_scope_fold(rows, f1, Some(&BTreeSet::from([p]))).expect("fold")
+        };
+        assert_eq!(
+            only_p(&all).map(|i| i.pignistic_prob()),
+            only_p(&[row(f1, 0.4, Some(p))]).map(|i| i.pignistic_prob()),
+            "a perspective's fold on a frame reads only its own rows there"
+        );
+        assert!(
+            drift_scope_fold(&all, Uuid::new_v4(), None)
+                .expect("fold")
+                .is_none(),
+            "no row on the frame is None"
+        );
+        assert!(
+            drift_scope_fold(&all, f2, Some(&BTreeSet::from([q])))
+                .expect("fold")
+                .is_none(),
+            "no row of the scope on the frame is None"
+        );
+    }
+
     #[test]
     fn every_default_is_todays_behaviour() {
         assert_eq!(AtomFoldMode::default(), AtomFoldMode::Legacy);
