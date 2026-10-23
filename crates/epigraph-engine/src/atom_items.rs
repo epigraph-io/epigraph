@@ -267,7 +267,7 @@ impl EvidencedInterval {
 /// explicitly.
 ///
 /// # Errors
-/// A database read or a stored BBA that cannot be parsed.
+/// A database read.
 pub async fn atom_axiom_rows(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -317,8 +317,13 @@ pub async fn atom_axiom_rows(
 /// A claim with no row left is absent from the map. The frame-scoped fields
 /// of `ctx` are not read: each row's own frame overrides apply.
 ///
+/// A stored row that cannot be parsed or coarsened is skipped and logged
+/// (with its row id): it is no input, so it neither fails the batch nor
+/// counts against a seed. The single atom-cache writer therefore folds an
+/// atom's readable rows and ignores an unreadable one.
+///
 /// # Errors
-/// A database read or a stored BBA that cannot be parsed.
+/// A database read.
 pub async fn atom_axiom_rows_under(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -334,26 +339,40 @@ pub async fn atom_axiom_rows_under(
         return Ok(HashMap::new());
     }
 
-    // Step 1, and the class of each row.
-    let mut kept: Vec<(AtomInputRow, AxiomClass)> = inputs
+    // Step 1, the class of each row, and its coarsening. A row that cannot be
+    // read is skipped (and logged) here, before the seed rule, so it is no
+    // input and never fails another row or another atom of the batch.
+    let binary = binary_frame()?;
+    let mut kept: Vec<(AtomInputRow, AxiomClass, MassFunction)> = inputs
         .into_iter()
         .filter(reads_this_side_of_promotion)
-        .map(|r| {
-            let class = classify(&r);
-            (r, class)
+        .filter_map(|r| match coarsen_to_binary(&r, &binary) {
+            Ok(coarse) => {
+                let class = classify(&r);
+                Some((r, class, coarse))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    row = %r.row.id,
+                    claim = %r.row.claim_id,
+                    error = %e,
+                    "atom fold: skipping a stored BBA it cannot read"
+                );
+                None
+            }
         })
         .collect();
 
     // Step 2: compound-source edge rows. Under `Excluded` none is read.
     if compound_source_edges == CompoundSourceEdges::Excluded {
-        kept.retain(|(_, class)| !is_compound_source(*class));
+        kept.retain(|(_, class, _)| !is_compound_source(*class));
     }
     // The self-reference guard: a compound-source edge row whose source
     // decomposes (through the viewer's closure) into the row's own claim.
     let sources: Vec<Uuid> = kept
         .iter()
-        .filter(|(_, c)| is_compound_source(*c))
-        .filter_map(|(r, _)| r.edge_source_id)
+        .filter(|(_, c, _)| is_compound_source(*c))
+        .filter_map(|(r, _, _)| r.edge_source_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -364,7 +383,7 @@ pub async fn atom_axiom_rows_under(
             .await
             .map_err(|e| format!("leaf_closure_batch: {e}"))?
     };
-    kept.retain(|(r, class)| {
+    kept.retain(|(r, class, _)| {
         !is_compound_source(*class)
             || !r.edge_source_id.is_some_and(|s| {
                 closures
@@ -376,16 +395,16 @@ pub async fn atom_axiom_rows_under(
     // Step 3: the seed, over the rows some fold still reads.
     let with_other_input: BTreeSet<Uuid> = kept
         .iter()
-        .filter(|(_, c)| *c != AxiomClass::Seed)
-        .map(|(r, _)| r.row.claim_id)
+        .filter(|(_, c, _)| *c != AxiomClass::Seed)
+        .map(|(r, _, _)| r.row.claim_id)
         .collect();
-    kept.retain(|(r, class)| {
+    kept.retain(|(r, class, _)| {
         *class != AxiomClass::Seed || !with_other_input.contains(&r.row.claim_id)
     });
 
     // Step 4: the mode.
     if mode == AxiomMode::Pure {
-        kept.retain(|(_, class)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
+        kept.retain(|(_, class, _)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
     }
     if kept.is_empty() {
         return Ok(HashMap::new());
@@ -395,7 +414,7 @@ pub async fn atom_axiom_rows_under(
     let mut overrides: HashMap<Uuid, FrameOverrides> = HashMap::new();
     for frame_id in kept
         .iter()
-        .map(|(r, _)| r.row.frame_id)
+        .map(|(r, _, _)| r.row.frame_id)
         .collect::<std::collections::BTreeSet<_>>()
     {
         let intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
@@ -412,7 +431,7 @@ pub async fn atom_axiom_rows_under(
     // The cited evidence each row's key reads, as the viewer sees it.
     let cited: Vec<Uuid> = kept
         .iter()
-        .filter_map(|(r, _)| cited_evidence(&r.row))
+        .filter_map(|(r, _, _)| cited_evidence(&r.row))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -420,11 +439,9 @@ pub async fn atom_axiom_rows_under(
         .await
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
-    let binary = binary_frame()?;
     let no_lens = PerspectiveReliability::default();
     let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
-    for (r, class) in kept {
-        let mut coarse = coarsen_to_binary(&r, &binary)?;
+    for (r, class, mut coarse) in kept {
         if let AxiomClass::EdgeFactor {
             compound_source: true,
         } = class
