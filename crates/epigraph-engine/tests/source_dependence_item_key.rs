@@ -532,7 +532,8 @@ fn structural_keys_follow_the_row_shape_and_rank_below_evidence() {
     );
     assert_eq!(item_key(&t2, None, None), ItemKey::Attribution(original_mf));
     // An attribution whose evidence the viewer cannot see is not keyed on
-    // its perspective: it cites evidence, so it falls through to its row.
+    // its perspective as a lens: it cites evidence, and the evidence id it
+    // cites (already on the visible row) is its key.
     let hidden = Uuid::new_v4();
     let t1_hidden = row(
         Some(ATTRIBUTED_METHOD),
@@ -540,7 +541,7 @@ fn structural_keys_follow_the_row_shape_and_rank_below_evidence() {
         Some(hidden),
         Some(hidden),
     );
-    assert_eq!(item_key(&t1_hidden, None, None), ItemKey::Row(t1_hidden.id));
+    assert_eq!(item_key(&t1_hidden, None, None), ItemKey::Evidence(hidden));
     // Evidence outranks the structural keys, url outranks the bare id and
     // a DOI outranks the url.
     let ev = evidence(None, None);
@@ -660,4 +661,315 @@ fn distinct_keys_on_one_atom_still_reinforce() {
         m_t(&alone),
         m_t(&two)
     );
+}
+
+// ── what a key must NOT merge ──────────────────────────────────────────────
+//
+// `doi:` and `url:` ignore the agent, so a string that names no document
+// would merge unrelated sources across agents. Writers do put such strings
+// in both slots: `properties.doi` can hold an ingest placeholder ("unknown",
+// "n/a", ...; the ingest fix for those only stops new ones), and
+// `evidence.source_url` holds whatever the caller passed (a witness name, a
+// note). Each of those rows must fall to its own evidence id.
+
+/// Placeholders a writer may leave in a DOI slot, in assorted spellings.
+const PLACEHOLDERS: [&str; 10] = [
+    "unknown", "UNKNOWN", " n/a ", "N/A", "na", "None", "null", "nil", "-", "TBD",
+];
+
+proptest! {
+    #[test]
+    fn a_placeholder_doi_names_no_paper(
+        p1 in 0usize..PLACEHOLDERS.len(),
+        p2 in 0usize..PLACEHOLDERS.len(),
+        as_link in any::<bool>(),
+    ) {
+        let spell = |p: &str| if as_link { format!("https://doi.org/{}", p.trim()) } else { p.to_owned() };
+        let e1 = evidence(Some(&spell(PLACEHOLDERS[p1])), None);
+        let e2 = evidence(Some(&spell(PLACEHOLDERS[p2])), None);
+        let r1 = row(Some(INGEST_ASSERTION_METHOD), Some(Uuid::new_v4()), Some(e1.id), Some(e1.id));
+        let r2 = row(Some(INGEST_ASSERTION_METHOD), Some(Uuid::new_v4()), Some(e2.id), Some(e2.id));
+        prop_assert_eq!(item_key(&r1, Some(&e1), None), ItemKey::Evidence(e1.id));
+        prop_assert_eq!(item_key(&r2, Some(&e2), None), ItemKey::Evidence(e2.id));
+        prop_assert_eq!(normalize_doi(PLACEHOLDERS[p1]), None);
+        prop_assert_eq!(normalize_doi(&format!("doi:{}", PLACEHOLDERS[p1].trim())), None);
+    }
+}
+
+#[test]
+fn two_papers_with_a_placeholder_doi_still_reinforce() {
+    // Two unrelated documents whose evidence both say doi "unknown" are two
+    // sources: Dempster gives 1 − .36·.36 = .8704, not the max .64.
+    let e1 = evidence(Some("unknown"), None);
+    let e2 = evidence(Some("Unknown"), None);
+    let r1 = row(
+        Some(INGEST_ASSERTION_METHOD),
+        Some(Uuid::new_v4()),
+        Some(e1.id),
+        Some(e1.id),
+    );
+    let r2 = row(
+        Some(INGEST_ASSERTION_METHOD),
+        Some(Uuid::new_v4()),
+        Some(e2.id),
+        Some(e2.id),
+    );
+    let (folded, _) = combine_by_item(
+        vec![
+            (r1.id, item_key(&r1, Some(&e1), None), bba(0.64, 0.0, 0.0)),
+            (r2.id, item_key(&r2, Some(&e2), None), bba(0.64, 0.0, 0.0)),
+        ],
+        0.9,
+    )
+    .unwrap();
+    assert!(
+        (m_t(&folded) - (1.0 - 0.36 * 0.36)).abs() < EPS,
+        "got m_T {}",
+        m_t(&folded)
+    );
+}
+
+/// `source_url` values that are not links: what callers put there when the
+/// source is a person, a conversation or a note, plus two strings that only
+/// look like a bare DOI.
+const FREE_TEXT_URLS: [&str; 6] = [
+    "unknown",
+    "press release",
+    "conversation with the lab lead",
+    "www.example.org/no-scheme",
+    "10.0.0.5/notes",
+    "10.5 mg dose",
+];
+
+proptest! {
+    #[test]
+    fn a_free_text_source_url_is_not_a_shared_key(
+        u in 0usize..FREE_TEXT_URLS.len(),
+        w1 in 0.05f64..0.95,
+        w2 in 0.05f64..0.95,
+    ) {
+        // Two agents, two unrelated testimonies with the same free text.
+        let e1 = evidence(None, Some(FREE_TEXT_URLS[u]));
+        let e2 = evidence(None, Some(FREE_TEXT_URLS[u]));
+        let r1 = row(Some("discount"), Some(Uuid::new_v4()), Some(e1.id), Some(e1.id));
+        let r2 = row(Some("discount"), Some(Uuid::new_v4()), Some(e2.id), Some(e2.id));
+        let k1 = item_key(&r1, Some(&e1), None);
+        let k2 = item_key(&r2, Some(&e2), None);
+        prop_assert_eq!(&k1, &ItemKey::Evidence(e1.id));
+        prop_assert_eq!(&k2, &ItemKey::Evidence(e2.id));
+        let (folded, _) = combine_by_item(
+            vec![(r1.id, k1, bba(w1, 0.0, 0.0)), (r2.id, k2, bba(w2, 0.0, 0.0))],
+            0.9,
+        ).unwrap();
+        let dempster = 1.0 - (1.0 - w1) * (1.0 - w2);
+        prop_assert!((m_t(&folded) - dempster).abs() < EPS, "{} vs {dempster}", m_t(&folded));
+    }
+}
+
+#[test]
+fn a_rejected_doi_link_names_nothing_not_a_url() {
+    // A DOI resolver link with no DOI behind it is not the web page
+    // "https://doi.org": every such row would share that one url: key.
+    for link in [
+        "https://doi.org/",
+        "https://doi.org",
+        "http://dx.doi.org",
+        "https://doi.org/unknown",
+        "https://doi.org/N/A",
+        "doi:",
+        "doi:none",
+    ] {
+        let in_url = evidence(None, Some(link));
+        let r = row(None, Some(Uuid::new_v4()), None, Some(in_url.id));
+        assert_eq!(
+            item_key(&r, Some(&in_url), None),
+            ItemKey::Evidence(in_url.id),
+            "source_url {link:?}"
+        );
+        let in_doi = evidence(Some(link), None);
+        let r = row(None, Some(Uuid::new_v4()), None, Some(in_doi.id));
+        assert_eq!(
+            item_key(&r, Some(&in_doi), None),
+            ItemKey::Evidence(in_doi.id),
+            "properties.doi {link:?}"
+        );
+    }
+}
+
+#[test]
+fn a_well_formed_bare_doi_in_source_url_is_still_a_doi() {
+    let e = evidence(None, Some("10.5555/Paper.One"));
+    let r = row(None, Some(Uuid::new_v4()), None, Some(e.id));
+    assert_eq!(
+        item_key(&r, Some(&e), None),
+        ItemKey::Doi("10.5555/paper.one".into())
+    );
+}
+
+// ── a document identified by a URI ─────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn a_uri_identified_paper_meets_its_citation_under_one_key(
+        w_ingest in 0.01f64..0.99,
+        w_attr in 0.01f64..0.99,
+        cite_as_label in any::<bool>(),
+    ) {
+        // Ingest identifies a document with no DOI and no arXiv id by its URI
+        // and stores that in `properties.doi`; a citation of the same
+        // document carries the URI as its source_url (or the `doi:<uri>`
+        // label ingest builds for a non-`10.` identifier).
+        let uri = "https://example.org/reports/Report-7.pdf";
+        let e_ingest = evidence(Some(uri), None);
+        let r_ingest = row(Some(INGEST_ASSERTION_METHOD), Some(Uuid::new_v4()), Some(e_ingest.id), Some(e_ingest.id));
+        let cited = if cite_as_label { format!("doi:{uri}") } else { uri.to_ascii_lowercase() };
+        let e_cite = evidence(None, Some(&cited));
+        let r_cite = row(Some(ATTRIBUTED_METHOD), Some(Uuid::new_v4()), Some(e_cite.id), Some(e_cite.id));
+        let k_ingest = item_key(&r_ingest, Some(&e_ingest), None);
+        let k_cite = item_key(&r_cite, Some(&e_cite), None);
+        prop_assert!(matches!(k_ingest, ItemKey::Url(_)), "{k_ingest}");
+        prop_assert_eq!(&k_ingest, &k_cite);
+        let (folded, _) = combine_by_item(
+            vec![
+                (r_ingest.id, k_ingest, bba(w_ingest, 0.0, 0.0)),
+                (r_cite.id, k_cite, bba(w_attr, 0.0, 0.0)),
+            ],
+            0.9,
+        ).unwrap();
+        prop_assert!((m_t(&folded) - w_ingest.max(w_attr)).abs() < EPS);
+    }
+}
+
+// ── evidence the viewer cannot see ─────────────────────────────────────────
+
+#[test]
+fn rows_citing_one_hidden_evidence_row_stay_one_item() {
+    // A `whole` attribution of evidence E copied onto two atoms, and an edge
+    // factor that also names E, as seen by a viewer who cannot read E: the
+    // evidence id is on every visible row, so they still share E's key.
+    let hidden = Uuid::new_v4();
+    let [a1, a2] = [Uuid::new_v4(), Uuid::new_v4()];
+    let mut on_a1 = row(
+        Some(ATTRIBUTED_METHOD),
+        Some(Uuid::new_v4()),
+        Some(hidden),
+        Some(hidden),
+    );
+    on_a1.claim_id = a1;
+    let mut on_a2 = row(
+        Some(ATTRIBUTED_METHOD),
+        Some(Uuid::new_v4()),
+        Some(hidden),
+        Some(hidden),
+    );
+    on_a2.claim_id = a2;
+    let edge_row = row(
+        Some(EDGE_FACTOR_METHOD),
+        Some(Uuid::new_v4()),
+        Some(Uuid::new_v4()),
+        Some(hidden),
+    );
+    let k1 = item_key(&on_a1, None, None);
+    assert_eq!(k1, ItemKey::Evidence(hidden));
+    assert_eq!(item_key(&on_a2, None, None), k1);
+    assert_eq!(item_key(&edge_row, None, None), k1);
+    // So the compound over both atoms keeps E's weight once (.8), not .8².
+    let items = item_partition(vec![
+        keyed(a1, &k1, bba(0.8, 0.0, 0.0)),
+        keyed(a2, &k1, bba(0.8, 0.0, 0.0)),
+    ]);
+    let bel = bel_all_true(&items, &[a1, a2]);
+    assert!((bel - 0.8).abs() < EPS, "Bel over both atoms = {bel}");
+}
+
+// ── ties ───────────────────────────────────────────────────────────────────
+
+/// Every item as (id, its atoms with their masses), all sorted: the partition
+/// with input order removed.
+fn canonical(items: &[KeyedItem]) -> Vec<(String, Vec<(Uuid, String)>)> {
+    let mut v: Vec<(String, Vec<(Uuid, String)>)> = items
+        .iter()
+        .map(|it| {
+            let mut atoms: Vec<(Uuid, String)> = it
+                .atoms
+                .iter()
+                .map(|(a, m)| (*a, format!("{:?}", m.masses())))
+                .collect();
+            atoms.sort();
+            (format!("{:?}", it.id), atoms)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn rows_that_tie_on_weight_partition_the_same_in_any_order() {
+    // Two support rows of one key with equal m(TRUE) but different `~` mass:
+    // which one the item keeps must not depend on the order of the read.
+    let atom = Uuid::new_v4();
+    let key = ItemKey::Doi("10.5555/tie".into());
+    let rows = vec![
+        KeyedBba {
+            row_id: uuid_of(2),
+            atom_id: atom,
+            key: key.clone(),
+            bba: bba(0.5, 0.0, 0.3),
+        },
+        KeyedBba {
+            row_id: uuid_of(1),
+            atom_id: atom,
+            key: key.clone(),
+            bba: bba(0.5, 0.0, 0.0),
+        },
+    ];
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    assert_eq!(
+        canonical(&item_partition(rows)),
+        canonical(&item_partition(reversed))
+    );
+}
+
+/// Masses drawn from a small set, so rows of one key often tie on weight.
+fn arb_tie_row() -> impl Strategy<Value = (usize, usize, (f64, f64, f64))> {
+    let masses = prop_oneof![
+        Just((0.5, 0.0, 0.3)),
+        Just((0.5, 0.0, 0.0)),
+        Just((0.5, 0.0, 0.1)),
+        Just((0.0, 0.4, 0.0)),
+        Just((0.0, 0.4, 0.2)),
+        Just((0.0, 0.0, 0.0)),
+        Just((0.0, 0.0, 0.2)),
+    ];
+    (0usize..2, 0usize..2, masses)
+}
+
+proptest! {
+    #[test]
+    fn the_partition_is_a_function_of_the_rows_not_their_order(
+        spec in prop::collection::vec(arb_tie_row(), 1..10),
+        rotate in 0usize..10,
+    ) {
+        let atoms = [uuid_of(1), uuid_of(2)];
+        let keys = [ItemKey::Doi("10.5555/x".into()), ItemKey::Evidence(uuid_of(7))];
+        let rows: Vec<KeyedBba> = spec
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, k, (t, f, o)))| KeyedBba {
+                row_id: uuid_of(1000 + i as u128),
+                atom_id: atoms[a],
+                key: keys[k].clone(),
+                bba: bba(t, f, o),
+            })
+            .collect();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let mut rotated = rows.clone();
+        let n = rotated.len();
+        rotated.rotate_left(rotate % n);
+        let want = canonical(&item_partition(rows));
+        prop_assert_eq!(&canonical(&item_partition(reversed)), &want);
+        prop_assert_eq!(&canonical(&item_partition(rotated)), &want);
+    }
 }
