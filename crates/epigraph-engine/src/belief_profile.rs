@@ -410,6 +410,16 @@ pub struct BeliefProfile {
     pub lens: LensReliability,
 }
 
+/// A belief read's profile identity (addendum §3.1, SPEC §3.5
+/// `BeliefView.profile`): the named global profile the lens was resolved over,
+/// and [`BeliefProfile::profile_hash`] of the RESOLVED parameters. The name is
+/// provenance, not a parameter, so it is not hashed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIdentity {
+    pub name: String,
+    pub hash: String,
+}
+
 /// Why an override object was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {

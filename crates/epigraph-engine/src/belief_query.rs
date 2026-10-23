@@ -16,7 +16,9 @@ use epigraph_db::{
 use epigraph_ds::{combination, FocalElement, FrameOfDiscernment, MassFunction};
 use thiserror::Error;
 
-use crate::belief_profile::{overrides_in, BeliefProfile, FrameTier, PerspectiveTier};
+use crate::belief_profile::{
+    overrides_in, BeliefProfile, FrameTier, PerspectiveTier, ProfileIdentity, DEFAULT_PROFILE_NAME,
+};
 use crate::edge_factor::{effective_source_strength_profiled, PerspectiveReliability};
 use epigraph_db::FrameRow;
 use uuid::Uuid;
@@ -313,13 +315,30 @@ pub async fn get_perspective_belief(
 #[derive(Debug, Clone)]
 pub struct FramedBeliefContext {
     profile: BeliefProfile,
+    /// The named global profile the lens was resolved over (provenance; not
+    /// part of the hash).
+    name: &'static str,
 }
 
 impl FramedBeliefContext {
-    /// A context over an already-resolved profile.
+    /// A context over an already-resolved profile, resolved over the default
+    /// named profile ([`DEFAULT_PROFILE_NAME`], the only one served today).
     #[must_use]
     pub fn new(profile: BeliefProfile) -> Self {
-        Self { profile }
+        Self {
+            profile,
+            name: DEFAULT_PROFILE_NAME,
+        }
+    }
+
+    /// The read's profile identity `{name, hash}`: what `BeliefView.profile`
+    /// reports (SPEC §3.5).
+    #[must_use]
+    pub fn profile_identity(&self) -> ProfileIdentity {
+        ProfileIdentity {
+            name: self.name.to_string(),
+            hash: self.profile_hash(),
+        }
     }
 
     /// The resolved profile every fold under this context reads.
@@ -385,7 +404,7 @@ impl FramedBeliefContext {
                 reliability: Some(&perspective),
             },
         );
-        Ok(Self { profile })
+        Ok(Self::new(profile))
     }
 }
 
