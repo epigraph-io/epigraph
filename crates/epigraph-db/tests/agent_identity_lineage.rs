@@ -122,18 +122,20 @@ async fn try_register_as(
     let hash = id.prompt_hash.clone();
     let group = group.to_string();
     fixture::as_role(pool, role, |mut conn| async move {
-        if let Some(p) = principal {
-            sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
-                .bind(&p)
-                .execute(&mut *conn)
-                .await
-                .expect("set principal");
-            sqlx::query("SELECT set_config('epigraph.writable_group_ids', $1, false)")
-                .bind(&p)
-                .execute(&mut *conn)
-                .await
-                .expect("set writable groups");
-        }
+        // ALWAYS set both, '' for "no principal": a session-level setting
+        // survives on a pooled connection, so leaving it unset would inherit
+        // whatever an earlier call on the same connection claimed.
+        let p = principal.unwrap_or_default();
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(&p)
+            .execute(&mut *conn)
+            .await
+            .expect("set principal");
+        sqlx::query("SELECT set_config('epigraph.writable_group_ids', $1, false)")
+            .bind(&p)
+            .execute(&mut *conn)
+            .await
+            .expect("set writable groups");
         let r = sqlx::query_as::<_, Registered>(
             "SELECT * FROM public.epigraph_register_agent_identity($1, $2, $3, $4, $5, $6, $7)",
         )
@@ -1263,13 +1265,14 @@ async fn history_as(
     agent: Uuid,
 ) -> Result<Vec<HistoryRow>, sqlx::Error> {
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
-        if let Some(p) = principal {
-            sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
-                .bind(p.to_string())
-                .execute(&mut *conn)
-                .await
-                .expect("set principal");
-        }
+        // ALWAYS set it, '' for "no principal": a session-level setting
+        // survives on a pooled connection, so leaving it unset would read as
+        // whichever principal an earlier call on the same connection set.
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(principal.map(|p| p.to_string()).unwrap_or_default())
+            .execute(&mut *conn)
+            .await
+            .expect("set principal");
         let r = sqlx::query_as::<_, HistoryRow>(
             "SELECT agent_id, relation, readable, snapshot_id, learned_md_hash, learned_md \
                FROM public.epigraph_agent_prompt_history($1)",
