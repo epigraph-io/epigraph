@@ -223,9 +223,7 @@ fn assert_refused_for_atom_fold(r: &Run, what: &str) {
         r.code, REFUSED,
         "{what}: a writing run whose modes differ from the server's must exit 3; \
          got {:?}\nstdout: {}\nstderr: {}",
-        r.code,
-        r.stdout,
-        r.stderr
+        r.code, r.stdout, r.stderr
     );
     for needle in ["atom_fold", "legacy", "aef_standalone"] {
         assert!(
@@ -374,7 +372,13 @@ async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_th
         ],
     );
 
-    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
@@ -385,7 +389,11 @@ async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_th
         "a legacy preview prints the hub's row\nstdout: {}",
         r.stdout
     );
-    assert_eq!(belief_state(&pool).await, before, "a dry run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a dry run writes nothing"
+    );
 }
 
 /// The check fails CLOSED: a writing run that cannot read the server's modes
@@ -407,8 +415,7 @@ async fn a_writing_run_refuses_when_the_server_modes_cannot_be_read(pool: PgPool
     assert_eq!(
         r.code, REFUSED,
         "an unreachable API must refuse a writing run with exit 3; got {:?}\nstderr: {}",
-        r.code,
-        r.stderr
+        r.code, r.stderr
     );
     assert!(
         r.stderr.contains("belief_modes"),
@@ -439,8 +446,7 @@ async fn a_writing_run_refuses_a_server_that_does_not_report_belief_modes(pool: 
     assert_eq!(
         r.code, REFUSED,
         "a server without belief_modes must refuse a writing run with exit 3; got {:?}\nstderr: {}",
-        r.code,
-        r.stderr
+        r.code, r.stderr
     );
     assert!(
         r.stderr.contains("belief_modes"),
@@ -551,7 +557,11 @@ async fn a_writing_run_under_a_fold_this_build_cannot_write_refuses_even_when_th
         );
     }
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
-    assert_eq!(belief_state(&pool).await, before, "a refused run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
 }
 
 // ── backfill_factors and decompose_claims --retarget ───────────────────────
@@ -639,7 +649,13 @@ async fn backfill_factors_with_matching_modes_wires_the_same_edge(pool: PgPool) 
         &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
-    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert_eq!(
         bba_rows(&pool, target).await,
         1,
@@ -652,9 +668,7 @@ async fn backfill_factors_with_matching_modes_wires_the_same_edge(pool: PgPool) 
 /// fold, so it too refuses a writing run under another fold, even when the
 /// server agrees.
 #[sqlx::test(migrations = "../../migrations")]
-async fn backfill_factors_refuses_a_writing_run_under_a_fold_this_build_cannot_write(
-    pool: PgPool,
-) {
+async fn backfill_factors_refuses_a_writing_run_under_a_fold_this_build_cannot_write(pool: PgPool) {
     let target = seed_unwired_edge(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
@@ -681,7 +695,11 @@ async fn backfill_factors_refuses_a_writing_run_under_a_fold_this_build_cannot_w
         r.stderr
     );
     assert_eq!(bba_rows(&pool, target).await, 0, "the edge was not wired");
-    assert_eq!(belief_state(&pool).await, before, "a refused run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
 }
 
 /// `backfill_factors --dry-run` writes nothing, so it is exempt: a skewed
@@ -703,7 +721,13 @@ async fn backfill_factors_dry_run_is_exempt_and_never_contacts_the_api(pool: PgP
         ],
     );
 
-    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
@@ -714,7 +738,11 @@ async fn backfill_factors_dry_run_is_exempt_and_never_contacts_the_api(pool: PgP
         "the dry run lists the edge it would wire\nstdout: {}",
         r.stdout
     );
-    assert_eq!(belief_state(&pool).await, before, "a dry run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a dry run writes nothing"
+    );
 }
 
 /// `--retarget --apply-plan` writes edges through the API: a writing run. It

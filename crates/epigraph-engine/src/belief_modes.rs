@@ -538,7 +538,11 @@ mod tests {
     #[test]
     fn every_spec_spelling_is_recognised_and_reported_as_spelled() {
         const TABLE: &[(&str, &str, &[&str])] = &[
-            ("EPIGRAPH_ATOM_FOLD", "atom_fold", &["legacy", "aef_standalone", "aef"]),
+            (
+                "EPIGRAPH_ATOM_FOLD",
+                "atom_fold",
+                &["legacy", "aef_standalone", "aef"],
+            ),
             (
                 "EPIGRAPH_COMPOUND_BELIEF",
                 "compound_belief",
@@ -554,7 +558,11 @@ mod tests {
                 "compound_source_edges",
                 &["frozen", "excluded"],
             ),
-            ("EPIGRAPH_ATOM_CACHE_MODE", "atom_cache_mode", &["display", "pure"]),
+            (
+                "EPIGRAPH_ATOM_CACHE_MODE",
+                "atom_cache_mode",
+                &["display", "pure"],
+            ),
             ("EPIGRAPH_INFERENCE", "inference", &["off", "shadow", "on"]),
             ("EPIGRAPH_BP_APPLY", "bp_apply", &["off", "on"]),
         ];
@@ -567,11 +575,19 @@ mod tests {
             }
         }
         let report = serde_json::to_value(BeliefModes::default()).unwrap();
-        let mut keys: Vec<&str> = report.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = report
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         let mut table_keys: Vec<&str> = TABLE.iter().map(|(_, key, _)| *key).collect();
         keys.sort_unstable();
         table_keys.sort_unstable();
-        assert_eq!(keys, table_keys, "the report carries exactly the SPEC's flags");
+        assert_eq!(
+            keys, table_keys,
+            "the report carries exactly the SPEC's flags"
+        );
     }
 
     /// Every spelling of every flag is read back as itself whatever its case

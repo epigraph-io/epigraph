@@ -314,8 +314,14 @@ mod tests {
             ..BeliefModes::default()
         };
         for refusal in [
-            check_writing_run("bin", &read.modes, &read.unrecognised, Ok(server), "http://api")
-                .unwrap_err(),
+            check_writing_run(
+                "bin",
+                &read.modes,
+                &read.unrecognised,
+                Ok(server),
+                "http://api",
+            )
+            .unwrap_err(),
             check_writing_run(
                 "bin",
                 &read.modes,
