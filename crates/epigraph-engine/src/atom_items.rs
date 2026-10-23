@@ -408,6 +408,7 @@ pub struct DriftRow {
     axiom: AxiomRow,
     two_sided_bba: MassFunction,
     legacy_key: Option<crate::source_dependence::SourceKey>,
+    frame_id: Uuid,
     perspective_id: Option<Uuid>,
     attributed: bool,
 }
@@ -417,6 +418,12 @@ impl DriftRow {
     #[must_use]
     pub const fn axiom(&self) -> &AxiomRow {
         &self.axiom
+    }
+
+    /// The stored row's own frame (before coarsening).
+    #[must_use]
+    pub const fn frame_id(&self) -> Uuid {
+        self.frame_id
     }
 
     /// The stored row's `perspective_id`.
@@ -467,6 +474,7 @@ pub async fn atom_drift_rows(
     let mut out: HashMap<Uuid, Vec<DriftRow>> = HashMap::new();
     for (r, legacy_key) in rows.into_iter().zip(keys) {
         out.entry(r.axiom.atom_id).or_default().push(DriftRow {
+            frame_id: r.stored.frame_id,
             perspective_id: r.stored.perspective_id,
             attributed: r.stored.combination_method.as_deref()
                 == Some(crate::source_dependence::ATTRIBUTED_METHOD),
@@ -533,20 +541,25 @@ pub fn drift_atom_fold(
     atom_fold(&axioms)
 }
 
-/// [`atom_fold`] of the rows whose stored `perspective_id` is in
-/// `perspectives`: the fold of one perspective's (or one community's)
-/// evidence, for resyncing an atom's per-scope `ds_combined_beliefs` rows
-/// (SPEC §7.2). `None` when no row matches.
+/// [`atom_fold`] of the rows stored on `frame_id` whose `perspective_id` is
+/// in `perspectives` (every row on the frame when `None`): the fold of one
+/// scope's evidence on one frame, for resyncing an atom's per-frame,
+/// per-scope `ds_combined_beliefs` row (SPEC §7.2), which holds the fold of
+/// exactly that frame's rows in that scope. `None` when no row matches.
 ///
 /// # Errors
 /// As [`atom_fold`].
 pub fn drift_scope_fold(
     rows: &[DriftRow],
-    perspectives: &BTreeSet<Uuid>,
+    frame_id: Uuid,
+    perspectives: Option<&BTreeSet<Uuid>>,
 ) -> Result<Option<EvidencedInterval>, String> {
     let axioms: Vec<AxiomRow> = rows
         .iter()
-        .filter(|r| r.perspective_id.is_some_and(|p| perspectives.contains(&p)))
+        .filter(|r| r.frame_id == frame_id)
+        .filter(|r| {
+            perspectives.is_none_or(|set| r.perspective_id.is_some_and(|p| set.contains(&p)))
+        })
         .map(|r| r.axiom.clone())
         .collect();
     if axioms.is_empty() {

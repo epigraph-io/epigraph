@@ -35,7 +35,7 @@ use epigraph_db::repos::claim_role::{claim_role_sql, ClaimRole};
 use epigraph_db::repos::mass_function::ingest_template_predicate;
 use epigraph_engine::atom_items::{
     atom_drift_rows, drift_atom_fold, drift_legacy_grouping_betp, drift_scope_fold, AtomFoldMode,
-    AxiomMode, CompoundSourceEdges, EvidencedInterval,
+    AxiomMode, CompoundSourceEdges,
 };
 use epigraph_engine::edge_factor::{
     AtomCacheOutcome, AtomCacheSettings, CacheWriteCause, LegacyFold, VacateOutcome,
@@ -628,15 +628,11 @@ pub async fn write_wave_claim(
         log.record(&log.wave, claim_id, before, after)?;
     }
     let (scoped_rewritten, scoped_kept) = match &outcome {
-        AtomCacheOutcome::Folded {
-            interval,
-            written: true,
-        } => {
+        AtomCacheOutcome::Folded { written: true, .. } => {
             resync_scoped_rows(
                 &mut tx,
                 viewer,
                 claim_id,
-                interval,
                 settings.compound_source_edges,
                 log,
             )
@@ -671,27 +667,35 @@ type ScopedRow = (
     Option<f64>,
     Option<String>,
     Option<f64>,
+    Option<i32>,
 );
 
 /// Resync an atom's EXISTING `ds_combined_beliefs` rows from the atom fold
-/// (SPEC §7.2), mirroring the selection `routes/belief.rs` folds per scope:
-/// a `global` row takes the atom's fold (`interval`, what the cache got); a
-/// `perspective` row the fold of the atom's AEF rows from that perspective;
-/// a `community` row the fold of the rows from its member perspectives. A
-/// scope with no AEF row, and a community override row, is left as it is.
-/// No row is created. Returns `(rewritten, kept)`.
+/// (SPEC §7.2). Each row is one (frame, scope), and `routes/belief.rs` folds
+/// it from that frame's rows in that scope, so the resync does too, with the
+/// AEF: a `global` row takes the fold of the atom's AEF rows on its frame; a
+/// `perspective` row the fold of that perspective's AEF rows on its frame; a
+/// `community` row the fold of its member perspectives' AEF rows on its
+/// frame.
+///
+/// Left as they are (counted `kept`): a row on a frame of more than two
+/// hypotheses (its Bel/Pl are of one hypothesis of that frame, which the
+/// AEF's coarsened TRUE is not, `claim_validity` included); a scope with no
+/// AEF row on the row's frame; a community `override` row. No row is created.
+/// Returns `(rewritten, kept)`.
 async fn resync_scoped_rows(
     tx: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
-    interval: &EvidencedInterval,
     compound_source_edges: CompoundSourceEdges,
     log: &WaveLog,
 ) -> Result<(usize, usize), String> {
     let rows: Vec<ScopedRow> = sqlx::query_as(
-        "SELECT id, frame_id, scope_type, scope_id, belief, plausibility, mass_on_empty, \
-                mass_on_missing, conflict_k, strategy_used, pignistic_prob \
-           FROM ds_combined_beliefs WHERE claim_id = $1 ORDER BY id FOR UPDATE",
+        "SELECT d.id, d.frame_id, d.scope_type, d.scope_id, d.belief, d.plausibility, \
+                d.mass_on_empty, d.mass_on_missing, d.conflict_k, d.strategy_used, \
+                d.pignistic_prob, array_length(f.hypotheses, 1) \
+           FROM ds_combined_beliefs d JOIN frames f ON f.id = d.frame_id \
+          WHERE d.claim_id = $1 ORDER BY d.id FOR UPDATE OF d",
     )
     .bind(claim_id)
     .fetch_all(&mut *tx)
@@ -700,21 +704,17 @@ async fn resync_scoped_rows(
     if rows.is_empty() {
         return Ok((0, 0));
     }
-    let drift_rows = if rows.iter().any(|r| r.2 != "global") {
-        epigraph_engine::atom_items::atom_drift_rows(
-            &mut *tx,
-            viewer,
-            &[claim_id],
-            compound_source_edges,
-        )
-        .await?
-        .remove(&claim_id)
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let drift_rows = epigraph_engine::atom_items::atom_drift_rows(
+        &mut *tx,
+        viewer,
+        &[claim_id],
+        compound_source_edges,
+    )
+    .await?
+    .remove(&claim_id)
+    .unwrap_or_default();
     let (mut rewritten, mut kept) = (0, 0);
-    for (id, frame_id, scope_type, scope_id, b, p, me, mm, k, strategy, betp) in rows {
+    for (id, frame_id, scope_type, scope_id, b, p, me, mm, k, strategy, betp, hypotheses) in rows {
         let before = ScopedColumns {
             belief: b,
             plausibility: p,
@@ -725,8 +725,11 @@ async fn resync_scoped_rows(
             pignistic_prob: betp,
         };
         let fold = match (scope_type.as_str(), scope_id) {
-            ("global", _) => Some(interval.clone()),
-            ("perspective", Some(pid)) => drift_scope_fold(&drift_rows, &BTreeSet::from([pid]))?,
+            _ if hypotheses != Some(2) => None,
+            ("global", _) => drift_scope_fold(&drift_rows, frame_id, None)?,
+            ("perspective", Some(pid)) => {
+                drift_scope_fold(&drift_rows, frame_id, Some(&BTreeSet::from([pid])))?
+            }
             ("community", Some(cid)) if strategy.as_deref() != Some(SCOPED_OVERRIDE_STRATEGY) => {
                 let members: BTreeSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
                     "SELECT perspective_id FROM community_members WHERE community_id = $1",
@@ -737,7 +740,7 @@ async fn resync_scoped_rows(
                 .map_err(|e| format!("community members: {e}"))?
                 .into_iter()
                 .collect();
-                drift_scope_fold(&drift_rows, &members)?
+                drift_scope_fold(&drift_rows, frame_id, Some(&members))?
             }
             _ => None,
         };
