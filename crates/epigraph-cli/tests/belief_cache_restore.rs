@@ -468,6 +468,65 @@ async fn a_deleted_before_frame_skips_only_its_claim(pool: PgPool) {
     assert_eq!(cache_of(&pool, neighbour).await, neighbour_before);
 }
 
+/// A wave claim that no longer exists (deleted since the wave), or never did
+/// (a record for an unknown id), is reported `missing` and nowhere else. The
+/// unknown id's `before` is all-NULL on purpose: against the LEFT JOIN's NULL
+/// row it compares equal, so a classifier that tested "already holds
+/// `before`" ahead of "exists" would call it `already_restored`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_wave_claim_that_no_longer_exists_is_reported_missing(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let frame = seed_frame(&pool).await;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(111);
+
+    let deleted = seed_claim(&pool, agent).await;
+    let kept = seed_claim(&pool, agent).await;
+    for id in [deleted, kept] {
+        set_cache(&pool, id, &random_cache(&mut rng, Some(frame), None)).await;
+    }
+    let kept_before = cache_of(&pool, kept).await;
+    let at = db_now(&pool).await;
+    let mut records = run_wave(&pool, &[deleted, kept], at, |_| {
+        random_cache(&mut rng, Some(frame), Some("supported"))
+    })
+    .await;
+    let ghost = Uuid::new_v4();
+    let mut file = Vec::new();
+    write_wave_record(
+        &mut file,
+        &WaveRecord {
+            claim_id: ghost,
+            before: CacheColumns {
+                belief: None,
+                plausibility: None,
+                pignistic_prob: None,
+                mass_on_empty: None,
+                mass_on_missing: None,
+                belief_frame_id: None,
+                classification: None,
+            },
+            written: random_cache(&mut rng, Some(frame), None),
+            wave: "test-wave".to_string(),
+            at,
+        },
+    )
+    .expect("write ghost record");
+    records.extend(read_wave(file.as_slice()).expect("read ghost record"));
+    sqlx::query("DELETE FROM claims WHERE id = $1")
+        .bind(deleted)
+        .execute(&pool)
+        .await
+        .expect("delete a wave claim");
+
+    let report = restore_wave(&pool, &plan_restore(&records, None), &opts(10))
+        .await
+        .expect("restore");
+    assert_eq!(set_of(&report.missing), set_of(&[deleted, ghost]));
+    assert_eq!(report.restored, vec![kept]);
+    assert_eq!(cache_of(&pool, kept).await, kept_before);
+    assert_partition(&report, &[deleted, kept, ghost]);
+}
+
 // ---------------------------------------------------------------------------
 // (3) NULL -> value -> restore is exact
 // ---------------------------------------------------------------------------
