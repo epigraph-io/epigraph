@@ -1831,6 +1831,107 @@ async fn a_strangers_duplicate_never_moves_a_members_dates(pool: PgPool) {
     assert_eq!(due["due"], "2026-10-01", "{plan}");
 }
 
+/// The index view applies the plan's owner rule by default: a duplicate a
+/// stranger (another owner) marked onto a member's public canonical, carrying
+/// a later deadline, is left out of `duplicates` and listed in
+/// `foreign_duplicates_ignored`, so a digest that takes dates from the view
+/// cannot be moved by it. The member's own duplicate is listed (control), and
+/// `same_owner_only: false` returns both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_duplicate_is_left_out_of_the_index_view(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-squatter").await;
+    let member = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station rehab | Acme Water Authority | due: 2026-10-01 | ref ACME-123456",
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let own = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station rehab works | Acme Water Authority | due: 2026-10-15 | ref ACME-123456",
+        &["elsewhere"],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "public",
+        "Pump station rehab | Acme Water Authority | due: 2027-12-31 | ref ACME-123456",
+        &["elsewhere"],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    for dup in [own, theirs] {
+        epigraph_db::ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(member),
+            &epigraph_db::DuplicateProvenance::new("mark_duplicate", "caller_asserted"),
+        )
+        .await
+        .expect("mark");
+    }
+    drop(conn);
+
+    let view = |params: Value| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            first_text(
+                &label_dedup_index_view(
+                    server,
+                    viewer,
+                    serde_json::from_value::<LabelDedupIndexViewParams>(params).expect("params"),
+                    None,
+                )
+                .await
+                .expect("index view"),
+            )
+        }
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        sorted(
+            v["views"][0]["duplicates"]
+                .as_array()
+                .expect("duplicates")
+                .iter()
+                .map(|d| d["id"].as_str().expect("id").to_string())
+                .collect(),
+        )
+    };
+
+    let default = view(json!({"claim_ids": [member.to_string()]})).await;
+    assert_eq!(ids(&default), vec![own.to_string()], "{default}");
+    assert_eq!(
+        default["foreign_duplicates_ignored"],
+        json!([{"canonical": member.to_string(), "id": theirs.to_string()}]),
+        "{default}"
+    );
+    assert_eq!(default["truncated"], false, "{default}");
+
+    let all = view(json!({"claim_ids": [member.to_string()], "same_owner_only": false})).await;
+    assert_eq!(
+        ids(&all),
+        sorted(vec![own.to_string(), theirs.to_string()]),
+        "{all}"
+    );
+    assert_eq!(all["foreign_duplicates_ignored"], json!([]), "{all}");
+}
+
 /// The duplicates read is capped like the family read: a family whose one
 /// member fits `max_claims` but whose marked duplicates do not is TRUNCATED
 /// (apply refuses, nothing written), so a plan never closes a canonical on a

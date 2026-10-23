@@ -625,9 +625,7 @@ async fn read_family(
             // Only the canonical's own owner's duplicates feed the plan: a
             // stranger who marked a claim onto a public member must not move
             // its dates (a far deadline would hold off its close-out).
-            if owners.owner_of(&mut read, d.agent_id).await?
-                != owners.owner_of(&mut read, d.canonical_agent_id).await?
-            {
+            if is_foreign_duplicate(&mut owners, &mut read, &d).await? {
                 foreign.push(json!({"canonical": d.canonical, "id": d.id}));
                 continue;
             }
@@ -849,6 +847,19 @@ impl OwnerCache {
         self.0.insert(author, owner);
         Ok(owner)
     }
+}
+
+/// Whether `d`'s author has another owner than its canonical's author. The
+/// ONE owner rule behind the plan's `coverage.foreign_duplicates_ignored` and
+/// the index view's, so the two cannot drift apart: a stranger who marked a
+/// claim onto a public member must not move its dates.
+async fn is_foreign_duplicate(
+    owners: &mut OwnerCache,
+    conn: &mut sqlx::PgConnection,
+    d: &epigraph_db::MarkedDuplicateRow,
+) -> Result<bool, McpError> {
+    Ok(owners.owner_of(&mut *conn, d.agent_id).await?
+        != owners.owner_of(&mut *conn, d.canonical_agent_id).await?)
 }
 
 /// Why the write identity does not own claim `id`, or `None` when it does:
@@ -1891,7 +1902,9 @@ pub const INDEX_VIEW_MAX_IDS: usize = 100;
 /// one connection stamped from the caller's viewer: a canonical or a duplicate
 /// the caller cannot read is not returned (a canonical is listed in
 /// `missing`), so a caller that must see every duplicate needs a viewer that
-/// reads them all. Read-only.
+/// reads them all. Like the plan, it leaves out (and lists in
+/// `foreign_duplicates_ignored`) a duplicate of another owner than its
+/// canonical's, unless `same_owner_only` is `false`. Read-only.
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` (no id, more than [`INDEX_VIEW_MAX_IDS`], a malformed
@@ -1942,15 +1955,25 @@ pub async fn label_dedup_index_view(
     )
     .await
     .map_err(db_caller_error)?;
-    read.commit().await.map_err(db_caller_error)?;
     let truncated = dups.rows.len() > max.effective || dups.chain_truncated;
+    // The plan's owner rule, after the cap (so `truncated` keeps its meaning).
+    let same_owner_only = params.same_owner_only.unwrap_or(true);
+    let mut owners = OwnerCache::default();
+    let mut kept = Vec::with_capacity(dups.rows.len().min(max.effective));
+    let mut foreign = Vec::new();
+    for d in dups.rows.iter().take(max.effective) {
+        if same_owner_only && is_foreign_duplicate(&mut owners, &mut read, d).await? {
+            foreign.push(json!({"canonical": d.canonical, "id": d.id}));
+        } else {
+            kept.push(d);
+        }
+    }
+    read.commit().await.map_err(db_caller_error)?;
     let views: Vec<Value> = found
         .into_iter()
         .map(|(id, content, labels)| {
-            let duplicates: Vec<Value> = dups
-                .rows
+            let duplicates: Vec<Value> = kept
                 .iter()
-                .take(max.effective)
                 .filter(|d| d.canonical == id)
                 .map(|d| {
                     json!({"id": d.id, "content": d.content, "labels": d.labels,
@@ -1967,6 +1990,7 @@ pub async fn label_dedup_index_view(
         "views": views,
         "missing": missing,
         "truncated": truncated,
+        "foreign_duplicates_ignored": foreign,
         "max_claims": max.json(),
     }))
 }
