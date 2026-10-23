@@ -839,13 +839,20 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
     let c = by_id[&chained];
     assert_eq!(c.before, cache_at(0.1));
     assert_eq!(c.written, cache_at(0.25));
-    assert_eq!(
-        c.at, t,
-        "the earliest write time bounds the downstream list"
-    );
     assert_eq!(by_id[&single].before, cache_at(0.6));
     assert!(!by_id.contains_key(&broken));
     assert_eq!(plan.broken_chain, vec![broken]);
+    assert_eq!(
+        set_of(&plan.sources),
+        set_of(&[chained, broken, single]),
+        "every wave claim is a downstream source, held back or not"
+    );
+    assert_eq!(plan.sources.len(), 3, "each source once");
+    assert_eq!(
+        plan.wave_at,
+        Some(t),
+        "the earliest record time bounds the downstream list"
+    );
 
     let only = set_of(&[single, wanted_absent]);
     let filtered = plan_restore(&records, Some(&only));
@@ -859,4 +866,10 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
     );
     assert_eq!(filtered.not_in_wave, vec![wanted_absent]);
     assert!(filtered.broken_chain.is_empty());
+    assert_eq!(
+        filtered.sources,
+        vec![single],
+        "only in-scope claims are sources"
+    );
+    assert_eq!(filtered.wave_at, Some(t));
 }

@@ -17,9 +17,11 @@
 //! file, named with the run's UTC time):
 //!
 //! * outcomes: `{claim_id, outcome}` for every claim considered;
-//! * downstream: the edges a wave claim sourced after its wave write. Their
-//!   edge-factor BBAs still carry the wave's value; re-wire exactly those
-//!   targets afterwards (SPEC §10.8), then run the floor job.
+//! * downstream: the edges a wave claim sourced that were created, or had
+//!   their edge-factor BBA written, after the wave started (less a slack; see
+//!   `epigraph_cli::belief_cache::downstream_edges`). Those BBAs may carry the
+//!   wave's value; re-wire exactly those targets afterwards (SPEC §10.8), then
+//!   run the floor job.
 //!
 //! Only counts are printed; ids stay in the files. `--dry-run` runs the same
 //! statements and rolls every batch back.

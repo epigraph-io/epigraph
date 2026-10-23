@@ -8,9 +8,8 @@
 //!   measured from.
 //! * **wave file** ([`WaveRecord`], appended by a writing run with
 //!   [`write_wave_record`]): per claim, the cache the run found (`before`),
-//!   what it wrote (`written`), the wave's name and when (`at`). A writer
-//!   should stamp `at` from the DATABASE clock after its write, because
-//!   [`downstream_edges`] compares it with `edges.created_at`.
+//!   what it wrote (`written`), the wave's name and when the run started
+//!   (`at`). See [`WaveRecord::at`] for how a writer must stamp it.
 //! * **restore outputs** (the `restore_belief_cache` binary): per-claim
 //!   outcomes, and the downstream edges to re-wire.
 //!
@@ -78,6 +77,12 @@ pub const DEFAULT_RESTORE_BATCH: usize = 1000;
 /// Rows per snapshot page.
 pub const DEFAULT_SNAPSHOT_PAGE: i64 = 5000;
 
+/// How far before the wave's start [`downstream_edges`] reaches: a
+/// transaction that began this long before the stamp and read a wave value
+/// after it is still listed. Over-listing costs one idempotent re-wire of an
+/// edge whose source is back on its pre-wave value, so the margin is wide.
+pub const DOWNSTREAM_SLACK_SECS: i64 = 3600;
+
 /// The belief-cache columns of one `claims` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheColumns {
@@ -137,6 +142,18 @@ pub struct WaveRecord {
     pub before: CacheColumns,
     pub written: CacheColumns,
     pub wave: String,
+    /// When the RUN started (SPEC §10.8 `wave_at`): one value for every record
+    /// of a run, taken from the DATABASE clock (`SELECT now()` in its own
+    /// statement) BEFORE the run's first write.
+    ///
+    /// [`downstream_edges`] lists the edges whose edge-factor BBA may have
+    /// frozen a wave value by comparing this with `edges.created_at` and
+    /// `mass_functions.created_at`. Both are `DEFAULT now()`, the writing
+    /// transaction's START time, so a transaction that began before a claim's
+    /// write can still read the written value. A stamp taken after the write
+    /// would therefore exclude edges that froze it; a stamp from before the
+    /// run cannot, short of a transaction open across it, which
+    /// [`DOWNSTREAM_SLACK_SECS`] covers.
     pub at: DateTime<Utc>,
 }
 
@@ -146,7 +163,6 @@ pub struct RestoreEntry {
     pub claim_id: Uuid,
     pub before: CacheColumns,
     pub written: CacheColumns,
-    pub at: DateTime<Utc>,
 }
 
 /// What a wave file asks a restore to do, after the `--claims` filter.
@@ -155,9 +171,12 @@ pub struct RestorePlan {
     pub entries: Vec<RestoreEntry>,
     pub broken_chain: Vec<Uuid>,
     pub not_in_wave: Vec<Uuid>,
-    /// Every in-scope wave claim, restorable or held back, with its earliest
-    /// record time: the sources [`downstream_edges`] lists edges for.
-    pub sources: Vec<(Uuid, DateTime<Utc>)>,
+    /// Every in-scope wave claim, restorable or held back: the sources
+    /// [`downstream_edges`] lists edges for.
+    pub sources: Vec<Uuid>,
+    /// The earliest `at` over the in-scope records: when the (earliest) wave
+    /// run started. `None` when nothing is in scope.
+    pub wave_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,8 +205,8 @@ pub struct RestoreReport {
     pub not_in_wave: Vec<Uuid>,
 }
 
-/// An edge whose source is a wave claim and which was created after that
-/// claim's wave write.
+/// An edge whose source is a wave claim and which was created, or had its
+/// edge-factor BBA written, after the wave started (see [`downstream_edges`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DownstreamEdge {
     pub edge_id: Uuid,
@@ -341,12 +360,12 @@ pub fn read_claim_ids<R: BufRead>(input: R) -> anyhow::Result<HashSet<Uuid>> {
 /// A wave re-run against the same file appends a second record for a claim.
 /// The records CHAIN when each one's `before` is the previous one's `written`:
 /// nothing else wrote the claim between them, so the plan restores the FIRST
-/// `before` and compares against the LAST `written`, and `at` is the earliest
-/// record's (the downstream list must cover every edge that could have frozen
-/// any of the wave's values). When they do not chain, another writer landed
-/// between two wave writes; restoring the first `before` would erase it, so
-/// the claim goes to `broken_chain` and is reported `superseded_since_wave`
-/// without a write.
+/// `before` and compares against the LAST `written`. `wave_at` is the earliest
+/// in-scope record's `at`, so the downstream list covers every edge that could
+/// have frozen any of the wave's values. When they do not chain, another
+/// writer landed between two wave writes; restoring the first `before` would
+/// erase it, so the claim goes to `broken_chain` and is reported
+/// `superseded_since_wave` without a write.
 #[must_use]
 pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> RestorePlan {
     let mut order: Vec<Uuid> = Vec::new();
@@ -364,19 +383,19 @@ pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> Res
             .push(r);
     }
 
-    let mut plan = RestorePlan::default();
+    let mut plan = RestorePlan {
+        wave_at: groups.values().flatten().map(|r| r.at).min(),
+        ..RestorePlan::default()
+    };
     for id in order {
         let group = &groups[&id];
-        if let Some(earliest) = group.iter().map(|r| r.at).min() {
-            plan.sources.push((id, earliest));
-        }
+        plan.sources.push(id);
         let chains = group.windows(2).all(|w| w[0].written == w[1].before);
         match (chains, group.first(), group.last()) {
             (true, Some(first), Some(last)) => plan.entries.push(RestoreEntry {
                 claim_id: id,
                 before: first.before.clone(),
                 written: last.written.clone(),
-                at: group.iter().map(|r| r.at).min().unwrap_or(first.at),
             }),
             _ => plan.broken_chain.push(id),
         }
@@ -573,21 +592,30 @@ pub async fn restore_wave(
     Ok(report)
 }
 
-/// Edges created after the wave whose source is a wave claim in scope.
+/// The edges a wave claim in scope sourced whose edge-factor BBA may have
+/// frozen a wave value: the targets of the follow-up targeted re-wire.
 ///
-/// SPEC §10.8: an edge a wave claim sourced after the wave wrote an
-/// edge-factor BBA from the wave's value, and a cache restore does not undo
-/// that BBA. These are the targets of the follow-up targeted re-wire.
+/// SPEC §10.8: an edge-factor BBA is computed from its source's cached value
+/// when it is wired, and a cache restore does not undo it. The BBA lands on the
+/// TARGET, so only edges whose SOURCE is a wave claim are listed, every
+/// in-scope one ([`RestorePlan::sources`]), including a claim held back from
+/// the restore: the wave still wrote its value.
 ///
-/// Every in-scope wave claim counts ([`RestorePlan::sources`]), including one
-/// held back from the restore as a broken chain: the wave still wrote its
-/// value.
+/// An edge is listed when, after `cutoff` = [`RestorePlan::wave_at`] less
+/// [`DOWNSTREAM_SLACK_SECS`]:
 ///
-/// "After" is per claim: `created_at > at` of THAT claim's (earliest) record, so an edge
-/// created after the wave started but before its source was written (which
-/// froze the pre-wave value) is not listed. Only edges whose SOURCE is the
-/// wave claim: the BBA lands on the target. Closed edges (`valid_to` set) are
-/// listed too, with `valid_to`, because their BBA may outlive the close.
+/// * it was created (`edges.created_at`), or
+/// * an edge-factor BBA keyed on it (`mass_functions.perspective_id = edge`,
+///   `claim_id = target`) was written (`mass_functions.created_at`, which the
+///   upsert resets on every re-store). An edge created while its source was
+///   factorless is wired later (a dedup re-hit, `backfill_factors`), so its
+///   `created_at` alone can predate the wave while its BBA does not.
+///
+/// One cutoff for the whole wave, not one per claim: an edge created after
+/// the wave began but before its own source's write is wired after the edge
+/// transaction commits, by which time the wave may have written the source.
+/// Over-listing costs one idempotent re-wire. Closed edges (`valid_to` set)
+/// are listed too, with `valid_to`, because their BBA may outlive the close.
 ///
 /// # Errors
 /// Any database error.
@@ -595,21 +623,27 @@ pub async fn downstream_edges(
     pool: &PgPool,
     plan: &RestorePlan,
 ) -> anyhow::Result<Vec<DownstreamEdge>> {
+    let Some(wave_at) = plan.wave_at else {
+        return Ok(Vec::new());
+    };
+    let cutoff = wave_at - chrono::Duration::seconds(DOWNSTREAM_SLACK_SECS);
     let mut out = Vec::new();
-    for chunk in plan.sources.chunks(DEFAULT_RESTORE_BATCH) {
-        let ids: Vec<Uuid> = chunk.iter().map(|(id, _)| *id).collect();
-        let ats: Vec<DateTime<Utc>> = chunk.iter().map(|(_, at)| *at).collect();
+    for ids in plan.sources.chunks(DEFAULT_RESTORE_BATCH) {
         let mut rows: Vec<DownstreamEdge> = sqlx::query_as(
             "SELECT e.id AS edge_id, e.source_id, e.target_id, \
                     e.target_type::text AS target_type, e.relationship::text AS relationship, \
                     e.created_at, e.valid_to \
-               FROM unnest($1::uuid[], $2::timestamptz[]) AS w(id, at) \
-               JOIN edges e ON e.source_id = w.id AND e.source_type = 'claim' \
-                           AND e.created_at > w.at \
+               FROM edges e \
+              WHERE e.source_type = 'claim' AND e.source_id = ANY($1) \
+                AND (e.created_at > $2 \
+                     OR EXISTS (SELECT 1 FROM mass_functions mf \
+                                 WHERE mf.perspective_id = e.id \
+                                   AND mf.claim_id = e.target_id \
+                                   AND mf.created_at > $2)) \
               ORDER BY e.created_at, e.id",
         )
-        .bind(&ids)
-        .bind(&ats)
+        .bind(ids)
+        .bind(cutoff)
         .fetch_all(pool)
         .await?;
         out.append(&mut rows);
