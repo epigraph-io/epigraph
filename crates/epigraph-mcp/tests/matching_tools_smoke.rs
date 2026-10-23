@@ -678,6 +678,50 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
         applied_counts["previous_status"], "promoted",
         "{applied_counts}"
     );
+    // The applied row is attributed to the triggering principal, who can read
+    // it: it carries COUNTS for the id lists, never the ids themselves.
+    let matcher_edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE properties->>'source' = 'cross_source_matcher' \
+           AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("the matcher edge");
+    assert_eq!(applied_counts["edges_retracted"], 1, "{applied_counts}");
+    assert!(
+        applied_counts["affected_claims"].is_u64(),
+        "affected_claims must be a count on the applied row: {applied_counts}"
+    );
+    let applied_text = applied_counts.to_string();
+    for id in [matcher_edge, a, b] {
+        assert!(
+            !applied_text.contains(&id.to_string()),
+            "the trigger-readable applied row must name no edge or claim id ({id}): {applied_counts}"
+        );
+    }
+    // The ids go to the agent-less companion row of the same replay.
+    let ids_touched: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' AND agent_id IS NULL \
+            AND details->>'subject_id' = $1::text",
+    )
+    .bind(cand)
+    .fetch_one(&pool)
+    .await
+    .expect("the replay's applied-ids companion row");
+    assert_eq!(
+        ids_touched["edges_retracted"],
+        serde_json::json!([matcher_edge]),
+        "{ids_touched}"
+    );
+    let affected: Vec<Uuid> = serde_json::from_value(ids_touched["affected_claims"].clone())
+        .expect("affected_claims is an id list on the companion row");
+    assert!(
+        !affected.is_empty() && affected.iter().all(|c| *c == a || *c == b),
+        "the companion row names the claims the retirement touched: {ids_touched}"
+    );
     let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
         .bind(cand)
         .fetch_one(&pool)
