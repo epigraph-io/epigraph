@@ -179,10 +179,15 @@ impl Subscriber for Router {
 fn install_router() {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
     let ok = *INSTALLED.get_or_init(|| {
-        tracing::subscriber::set_global_default(Router {
+        let ok = tracing::subscriber::set_global_default(Router {
             next_span: AtomicU64::new(1),
         })
-        .is_ok()
+        .is_ok();
+        // A callsite first reached by another thread between the dispatcher's
+        // registration and the global being marked set could have cached
+        // `never`; recompute every cached interest now that it is set.
+        tracing::callsite::rebuild_interest_cache();
+        ok
     });
     assert!(
         ok,
