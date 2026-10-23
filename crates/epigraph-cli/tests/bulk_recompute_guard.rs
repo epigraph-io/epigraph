@@ -1033,6 +1033,94 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
     }
 }
 
+// ── (7b) what the shared role spelling changed in the guard ────────────────
+
+/// An in-force `relationship` edge `source -> target` between claims.
+async fn claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            valid_from) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', $3, now() - interval '2 days')",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed claim edge");
+}
+
+/// The guard reads the one role spelling, where `rule` outranks `compound`
+/// (SPEC §2.1): a rule claim (label `rule` AND an in-force `rule_conclusion`
+/// edge) with a decomposition is NOT a compound, and its cache is refolded
+/// from its own rows, like a standalone twin's. Control: the same shape
+/// without the `rule` label is a compound and stays frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposed_rule_is_recomputed_and_a_decomposed_non_rule_is_not(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let conclusion = claim(&pool, owner, "rule conclusion").await;
+
+        let rule = claim(&pool, owner, "decomposed rule").await;
+        sqlx::query("UPDATE claims SET labels = ARRAY['rule'] WHERE id = $1")
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .expect("label the rule");
+        claim_edge(&pool, rule, conclusion, "rule_conclusion").await;
+        let premise = claim(&pool, owner, "rule part").await;
+        decomposes_to(&pool, rule, premise, false).await;
+
+        let unlabelled = claim(&pool, owner, "same shape, no rule label").await;
+        claim_edge(&pool, unlabelled, conclusion, "rule_conclusion").await;
+        let part = claim(&pool, owner, "its part").await;
+        decomposes_to(&pool, unlabelled, part, false).await;
+
+        let twin = claim(&pool, owner, "standalone twin").await;
+        for c in [rule, unlabelled, twin] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+
+        assert_recomputed_like_twin(&pool, caller, rule, twin, bt, "a decomposed rule").await;
+        assert_frozen(
+            &pool,
+            caller,
+            unlabelled,
+            bt,
+            "a decomposed claim with a conclusion edge but no rule label",
+        )
+        .await;
+    }
+}
+
+/// Only an `ingest_git` repository node (`source: git-history` AND
+/// `node: repo`) roots a procedural git tree. `ingest_git` stamps
+/// `source: git-history` on every commit too, so a flat commit that was later
+/// decomposed is an ordinary compound and stays frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposed_git_commit_is_a_frozen_compound(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let commit = claim_with_properties(
+            &pool,
+            owner,
+            "lone commit",
+            serde_json::json!({ "source": "git-history", "commit_type": "fix" }),
+        )
+        .await;
+        let atom = claim(&pool, owner, "commit atom").await;
+        decomposes_to(&pool, commit, atom, false).await;
+        insert_row(&pool, commit, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(&pool, caller, commit, bt, "a decomposed git commit").await;
+    }
+}
+
 // ── (8) the role is decided without a viewer splice ─────────────────────────
 
 /// A PUBLIC compound whose only decomposition edge points at a group-private
