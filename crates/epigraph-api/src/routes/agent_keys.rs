@@ -228,7 +228,7 @@ pub async fn rotate_agent_key(
     let agent_id = AgentId::from_uuid(id);
 
     // Look up the current active key
-    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id)
+    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id, "signing")
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "ActiveAgentKey".to_string(),
