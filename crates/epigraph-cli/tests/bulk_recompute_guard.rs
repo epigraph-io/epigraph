@@ -664,6 +664,55 @@ async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
     }
 }
 
+/// A git-history tree, shaped the way `ingest_git` writes one (a repository
+/// root stamped `source: git-history`, `node: repo`; a PR node under it; a
+/// commit under the PR), is procedural like a workflow tree (SPEC §2.1), so
+/// its compounds keep today's behaviour and are recomputed. Checked on the
+/// stamped root and on the PR node under it, each against a standalone twin
+/// carrying the same row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn git_history_rooted_compound_is_still_recomputed(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let repo = claim_with_properties(
+            &pool,
+            owner,
+            "repository root",
+            serde_json::json!({ "source": "git-history", "node": "repo", "repo": "o/r" }),
+        )
+        .await;
+        let pr = claim_with_properties(
+            &pool,
+            owner,
+            "pull request",
+            serde_json::json!({ "source": "git-history", "node": "pr", "pr_number": 1 }),
+        )
+        .await;
+        let commit = claim_with_properties(
+            &pool,
+            owner,
+            "commit",
+            serde_json::json!({ "source": "git-history", "commit_type": "fix" }),
+        )
+        .await;
+        decomposes_to(&pool, repo, pr, false).await;
+        decomposes_to(&pool, pr, commit, false).await;
+
+        let twin = claim(&pool, owner, "standalone twin").await;
+        for c in [repo, pr] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+        insert_row(&pool, twin, &evidence_row(bt, source, "auto_wire")).await;
+
+        for (what, c) in [("git repository root", repo), ("PR node under it", pr)] {
+            assert_recomputed_like_twin(&pool, caller, c, twin, bt, what).await;
+        }
+    }
+}
+
 // ── (5) template + update_with_evidence: recomputed, template excluded ─────
 
 /// A standalone carrying the ingest template AND an `update_with_evidence`

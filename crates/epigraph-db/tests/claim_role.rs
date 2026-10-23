@@ -522,6 +522,63 @@ async fn a_workflow_rooted_tree_is_procedural(pool: PgPool) {
     assert_one_spelling(&pool, &viewer, &all).await;
 }
 
+/// A git-history tree as `ingest_git` writes it (repository root stamped
+/// `source: git-history`, a PR node, a commit) is procedural at every node.
+/// The stamp exempts a tree only from its ROOT: a git-stamped claim under an
+/// ordinary compound stays a compound.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+
+    let repo = claim_with(
+        &pool,
+        &s,
+        "repository root",
+        serde_json::json!({"source": "git-history", "node": "repo", "repo": "o/r"}),
+    )
+    .await;
+    let pr = claim_with(
+        &pool,
+        &s,
+        "pull request",
+        serde_json::json!({"source": "git-history", "node": "pr", "pr_number": 1}),
+    )
+    .await;
+    let commit = claim_with(
+        &pool,
+        &s,
+        "commit",
+        serde_json::json!({"source": "git-history", "commit_type": "fix"}),
+    )
+    .await;
+    decomposes_to(&pool, repo, pr).await;
+    decomposes_to(&pool, pr, commit).await;
+
+    let ordinary = claim(&pool, &s, "ordinary compound").await;
+    let stamped = claim_with(
+        &pool,
+        &s,
+        "git-stamped, not a root",
+        serde_json::json!({"source": "git-history", "node": "pr"}),
+    )
+    .await;
+    let below = claim(&pool, &s, "below the stamped node").await;
+    decomposes_to(&pool, ordinary, stamped).await;
+    decomposes_to(&pool, stamped, below).await;
+
+    let ids = [repo, pr, commit, ordinary, stamped, below];
+    let got = roles(&pool, &viewer, &ids).await;
+    for id in [repo, pr, commit] {
+        assert_eq!(got[&id], ClaimRole::Procedural, "{id} of a git tree is procedural");
+    }
+    assert!(matches!(got[&ordinary], ClaimRole::Compound { .. }));
+    assert!(matches!(got[&stamped], ClaimRole::Compound { .. }));
+    assert_eq!(got[&below], ClaimRole::Atom);
+
+    assert_one_spelling(&pool, &viewer, &ids).await;
+}
+
 // ── rules ──────────────────────────────────────────────────────────────────
 
 /// A rule claim (label `rule` AND an in-force `rule_conclusion` out-edge) is
