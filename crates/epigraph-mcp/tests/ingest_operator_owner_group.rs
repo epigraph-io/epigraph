@@ -226,6 +226,7 @@ async fn inline(server: &EpiGraphMcpFull, doi: &str) -> Result<serde_json::Value
         server,
         &viewer,
         IngestDocumentInlineParams {
+            wait: None,
             extraction: doc(doi),
         },
         None,
@@ -603,6 +604,7 @@ async fn an_allowlist_only_author_is_refused_opl02_synchronously(pool: PgPool) {
         &server,
         &viewer,
         IngestDocumentInlineParams {
+            wait: None,
             extraction: doc(doi),
         },
         Some(&auth),

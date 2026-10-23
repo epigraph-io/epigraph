@@ -215,6 +215,9 @@ pub async fn ingest_document(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
+    if params.wait.unwrap_or(false) {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
@@ -305,6 +308,7 @@ pub async fn ingest_document_inline(
     params: IngestDocumentInlineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    let wait = params.wait.unwrap_or(false);
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
@@ -323,6 +327,9 @@ pub async fn ingest_document_inline(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
+    if wait {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
@@ -344,6 +351,43 @@ pub async fn ingest_document_inline(
         }
     });
     success_json(&queued_response(&doi, &title, paper_id))
+}
+
+/// The `wait: true` arm of the two detached ingest handlers: run the walk IN
+/// the request and hand its result, or its error, to the caller.
+///
+/// Detached, a walk that fails past [`preflight_write_authority`] (a constraint
+/// on one of the document's rows, a refused trace, a malformed axis) reaches
+/// only the server log, and the caller, already told `queued`, can infer it
+/// only from `query_paper`'s claim_count staying 0 (backlog b1924b39). Waiting
+/// is what `ingest_document_spine` already does.
+///
+/// Called AFTER the same `refuse_elevated` / `detach_scoped` / preflight the
+/// detached arm runs, so both modes author under exactly the same authority.
+/// It skips `ensure_paper_node`: `do_ingest_document` gets-or-creates the row
+/// itself, after its verbatim and axis guards, so a guard refusal here leaves
+/// no `papers` row at all. A failure later in the walk can still leave that
+/// row (it is written on the pool, outside the walk's transaction), and the
+/// error says so.
+async fn ingest_in_request(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    doi: &str,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_document(server, viewer, extraction, auth)
+        .await
+        .map_err(|e| McpError {
+            code: e.code,
+            message: std::borrow::Cow::from(format!(
+                "{}. The ingest walk is one transaction, so no claims or edges were written \
+                 for document_key {doi:?}; its papers row may exist with 0 claims. Fix the \
+                 cause and retry: a retry is safe and converges on existing nodes.",
+                e.message
+            )),
+            data: e.data,
+        })
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the

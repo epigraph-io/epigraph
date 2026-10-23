@@ -1861,6 +1861,12 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
@@ -1875,6 +1881,12 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the

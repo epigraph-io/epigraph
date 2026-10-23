@@ -11,8 +11,10 @@ use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
-use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
-use epigraph_mcp::types::{IngestDocumentInlineParams, RecomputeBeliefsParams};
+use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document, ingest_document_inline};
+use epigraph_mcp::types::{
+    IngestDocumentInlineParams, IngestDocumentParams, RecomputeBeliefsParams,
+};
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -695,7 +697,10 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
-    let params = IngestDocumentInlineParams { extraction };
+    let params = IngestDocumentInlineParams {
+        extraction,
+        wait: None,
+    };
 
     let result = ingest_document_inline(&server, &viewer, params, None)
         .await
@@ -728,6 +733,175 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
         atom_count.0, 2,
         "both atoms persisted as claim nodes via the inline path"
     );
+}
+
+// ── Backlog b1924b39 / 417ab1c2 / 189d6d8f: `wait` reports the walk's outcome ──
+//
+// Detached, a walk that fails past the synchronous write-authority preflight
+// reaches only the server log: the caller holds `status: queued` and can infer
+// the failure only from `query_paper`'s claim_count staying 0. `wait: true` runs
+// the same walk in-request and returns its result or its error.
+
+/// A refusal no preflight can see: every `reasoning_traces` INSERT raises
+/// 42501, so the walk fails on its FIRST claim's trace, past the verbatim and
+/// axis guards and past `preflight_write_authority` (which writes nothing).
+async fn refuse_every_trace_insert(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refuse_trace_for_test() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             RAISE EXCEPTION 'refused reasoning_traces insert (test trigger)'
+                 USING ERRCODE = '42501';
+         END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_trace_for_test BEFORE INSERT ON reasoning_traces
+         FOR EACH ROW EXECUTE FUNCTION refuse_trace_for_test()",
+    )
+    .execute(pool)
+    .await
+    .expect("install the refusing trigger");
+}
+
+const SMOKE_DOI: &str = "10.1234/hierarchy-smoke";
+
+async fn claims_labelled(pool: &PgPool, label: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE $1 = ANY(labels)")
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("count labelled claims")
+}
+
+/// `processed_by` edges from the paper keyed on `doi` (0 when no row exists).
+async fn processed_by_edges(pool: &PgPool, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges e JOIN papers p ON p.id = e.source_id
+         WHERE p.doi = $1 AND e.relationship = 'processed_by'",
+    )
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count processed_by edges")
+}
+
+/// Asserts the failed walk's error reached the caller and that it wrote nothing.
+async fn assert_failed_walk_reported(
+    pool: &PgPool,
+    outcome: Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>,
+) {
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the walk's error, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("refused reasoning_traces insert"),
+        "the walk's own cause must reach the caller, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(SMOKE_DOI) && err.message.contains("retry"),
+        "the error must name the document key and say a retry is safe, got: {}",
+        err.message
+    );
+    assert_eq!(
+        claims_labelled(pool, &format!("doi:{SMOKE_DOI}")).await,
+        0,
+        "the walk is one transaction: a failed walk leaves no claim behind"
+    );
+    assert_eq!(
+        processed_by_edges(pool, SMOKE_DOI).await,
+        0,
+        "a failed walk must not stamp the paper as processed"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    assert_failed_walk_reported(&pool, outcome).await;
+}
+
+/// The file-path entry point is the second detached handler; same contract.
+#[sqlx::test(migrations = "../../migrations")]
+async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+
+    // Under the current directory: the handler refuses a path outside it.
+    let path = std::env::current_dir()
+        .expect("current dir")
+        .join(format!("wait-mode-fixture-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, FIXTURE).expect("write fixture");
+    let outcome = ingest_document(
+        &server,
+        &viewer,
+        IngestDocumentParams {
+            file_path: path.display().to_string(),
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+    assert_failed_walk_reported(&pool, outcome).await;
+}
+
+/// Positive arm: with `wait: true` a walk that succeeds returns the walk's own
+/// counts (not a queue acknowledgement), and its claims exist the moment the
+/// call returns, with no sleep.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let result = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await
+    .expect("a valid document ingests in wait mode");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert!(
+        json.get("status").is_none(),
+        "wait mode returns the walk's result, not a queue acknowledgement: {json}"
+    );
+    assert_eq!(json["claims_ingested"], serde_json::json!(5), "{json}");
+    assert_eq!(json["doi"], SMOKE_DOI, "{json}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "every level is committed by the time the call returns"
+    );
+    assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
 }
 
 /// D9 writer-side guard: when an extraction carries `source_text`, every
