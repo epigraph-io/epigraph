@@ -157,12 +157,20 @@ async fn issue_tokens(pool: &PgPool, app: &axum::Router) -> (String, String, Uui
 
 /// POST `/oauth/revoke` with `content_type` and a raw `body`.
 async fn revoke(app: axum::Router, content_type: &str, body: String) -> (StatusCode, String) {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/oauth/revoke")
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(body))
-        .unwrap();
+    revoke_with(app, Some(content_type), body).await
+}
+
+/// POST `/oauth/revoke` with a raw `body` and, when given, a `Content-Type`.
+async fn revoke_with(
+    app: axum::Router,
+    content_type: Option<&str>,
+    body: String,
+) -> (StatusCode, String) {
+    let mut req = Request::builder().method(Method::POST).uri("/oauth/revoke");
+    if let Some(ct) = content_type {
+        req = req.header(header::CONTENT_TYPE, ct);
+    }
+    let req = req.body(Body::from(body)).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -288,8 +296,8 @@ async fn an_unknown_hint_still_revokes(pool: PgPool) {
 /// The JSON body with an explicit, correct hint keeps working (deployed
 /// clients send exactly this), and a token that is neither a JWT this server
 /// signed nor a hex refresh token is answered 200 (section 2.2). A body
-/// without `token` is still a 400 `invalid_request`, so the endpoint did not
-/// become "accept anything".
+/// without `token` is still a 400, so the endpoint did not become "accept
+/// anything".
 #[sqlx::test(migrations = "../../migrations")]
 async fn json_bodies_unrecognised_tokens_and_a_missing_token(pool: PgPool) {
     let app = app_router(&pool).await;
@@ -321,5 +329,48 @@ async fn json_bodies_unrecognised_tokens_and_a_missing_token(pool: PgPool) {
         status,
         StatusCode::BAD_REQUEST,
         "a request without `token` is invalid: {body}"
+    );
+}
+
+/// A request with NO `Content-Type` is parsed as a form (the section 2.1
+/// encoding), and the hint is ignored on a JSON body too: a refresh token sent
+/// as JSON under `token_type_hint=access_token` is revoked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bare_form_body_and_a_mis_hinted_json_body_both_revoke(pool: PgPool) {
+    let app = app_router(&pool).await;
+
+    let (_access, refresh, client) = issue_tokens(&pool, &app).await;
+    let (status, body) = revoke_with(app.clone(), None, form(&refresh, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "revoke without Content-Type: {body}"
+    );
+    assert_eq!(
+        revoked_reason(&pool, client).await.as_deref(),
+        Some("revoked"),
+        "a form body without Content-Type is parsed and the token revoked"
+    );
+    assert_eq!(
+        refresh_status(app.clone(), &refresh).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let (_access, refresh, client) = issue_tokens(&pool, &app).await;
+    let (status, body) = revoke(
+        app.clone(),
+        "application/json",
+        serde_json::json!({ "token": refresh, "token_type_hint": "access_token" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mis-hinted JSON revoke: {body}");
+    assert_eq!(
+        revoked_reason(&pool, client).await.as_deref(),
+        Some("revoked"),
+        "the JSON hint is ignored like the form one"
+    );
+    assert_eq!(
+        refresh_status(app, &refresh).await,
+        StatusCode::UNAUTHORIZED
     );
 }
