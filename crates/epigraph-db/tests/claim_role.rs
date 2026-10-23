@@ -6,7 +6,8 @@
 //! later derived over its FLATTENED leaves, never over its children, so the
 //! leaf closure is the input every derived reader will share; it must
 //!
-//! * flatten (a mid node is a compound, never a leaf of its parent),
+//! * flatten (a mid node is a compound, never a leaf of its parent, unless
+//!   its whole decomposition is hidden from the viewer),
 //! * terminate on a manual cycle and never list a leaf twice,
 //! * stop at 6 hops,
 //! * see only the edges AND the claims the viewer can read.
@@ -279,7 +280,9 @@ async fn a_mid_node_is_a_compound_and_its_leaves_are_its_flattened_leaves(pool: 
         );
     }
     assert_eq!(got[&lone], ClaimRole::Standalone);
-    // Every listed leaf is an atom, whatever the depth it was reached at.
+    // Every listed leaf is an atom, whatever the depth it was reached at (at
+    // full visibility; see
+    // `a_node_whose_whole_decomposition_is_hidden_is_a_leaf_for_that_viewer`).
     for leaf in &leaves[&r] {
         assert_eq!(
             got[leaf],
@@ -426,6 +429,11 @@ async fn the_leaf_closure_reaches_six_hops_and_no_further(pool: PgPool) {
 ///
 /// The anonymous viewer sees [open_leaf]; the owner group sees all three
 /// (over-suppression check). The role of K is the same for both.
+///
+/// Absent from the closure is not absent from the conjunction: SPEC §8 T1
+/// counts a claim the viewer cannot read behind an edge it can read as a
+/// VACUOUS conjunct. The closure carries no such count; whatever derives a
+/// value from it has to supply it (an open question on the PR).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_private_leaf_is_absent_for_the_anonymous_viewer_and_present_for_its_group(pool: PgPool) {
     let s = seed(&pool).await;
@@ -487,6 +495,87 @@ async fn a_private_leaf_is_absent_for_the_anonymous_viewer_and_present_for_its_g
         roles(&pool, &owner, &[private_leaf]).await[&private_leaf],
         ClaimRole::Atom
     );
+}
+
+/// The leaf test is spliced like the walk: a leaf is a visible node with no
+/// VISIBLE outgoing `decomposes_to` (SPEC §2.1), so a visible mid node whose
+/// whole decomposition is hidden from the viewer is a LEAF of its parent for
+/// that viewer. Each splice of the leaf test is load-bearing on its own, one
+/// level below the root:
+///
+/// * `K1 -> M1 -> private`: the M1 edge is forced public, so only the CLAIM
+///   splice of the leaf test (on the child) makes M1 a leaf.
+/// * `K2 -> M2 -> hidden_edge`: a public child behind an edge forced
+///   group-private, so only the EDGE splice of the leaf test makes M2 a leaf.
+///
+/// The owner group sees the grandchild as the leaf in both arms. The role of
+/// M1 and M2 stays `Compound` (it is not spliced), so for a partially
+/// sighted viewer the closure can list a structural compound as a leaf; this
+/// pins that as the behaviour, which the PR raises as an open question.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_node_whose_whole_decomposition_is_hidden_is_a_leaf_for_that_viewer(pool: PgPool) {
+    let s = seed(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "claim-role-owner").await;
+    let anonymous = fixture::public_viewer(&pool).await;
+    let owner = Viewer::resolve(&pool, member).await.expect("resolve owner");
+
+    // K1 -> M1 -(forced public)-> private claim
+    let k1 = claim(&pool, &s, "public root, claim-hidden arm").await;
+    let m1 = claim(&pool, &s, "public mid node over a private claim").await;
+    let private = claim_full(
+        &pool,
+        &s,
+        "private grandchild",
+        serde_json::json!({}),
+        &[],
+        Some(group),
+        true,
+    )
+    .await;
+    decomposes_to(&pool, k1, m1).await;
+    let e1 = decomposes_to(&pool, m1, private).await;
+    force_edge_tenancy(&pool, e1, "public", s.world).await;
+
+    // K2 -> M2 -(forced group-private)-> public claim
+    let k2 = claim(&pool, &s, "public root, edge-hidden arm").await;
+    let m2 = claim(&pool, &s, "public mid node behind a private edge").await;
+    let hidden_edge = claim(&pool, &s, "public grandchild behind a private edge").await;
+    decomposes_to(&pool, k2, m2).await;
+    let e2 = decomposes_to(&pool, m2, hidden_edge).await;
+    force_edge_tenancy(&pool, e2, "group", group).await;
+
+    let anon = closure(&pool, &anonymous, &[k1, k2, m1, m2]).await;
+    assert_eq!(
+        anon[&k1],
+        vec![m1],
+        "a child the viewer cannot read leaves M1 with no visible decomposition"
+    );
+    assert_eq!(
+        anon[&k2],
+        vec![m2],
+        "an edge the viewer cannot read leaves M2 with no visible decomposition"
+    );
+    assert!(anon[&m1].is_empty() && anon[&m2].is_empty());
+
+    let own = closure(&pool, &owner, &[k1, k2]).await;
+    assert_eq!(
+        own[&k1],
+        vec![private],
+        "the owner group sees the real leaf"
+    );
+    assert_eq!(
+        own[&k2],
+        vec![hidden_edge],
+        "the owner group sees the real leaf"
+    );
+
+    // The role is not spliced: M1 and M2 are compounds for both viewers,
+    // while the anonymous viewer's closure lists them as leaves.
+    for viewer in [&anonymous, &owner] {
+        let got = roles(&pool, viewer, &[m1, m2]).await;
+        assert_eq!(got[&m1], ClaimRole::Compound { spine: false });
+        assert_eq!(got[&m2], ClaimRole::Compound { spine: false });
+    }
 }
 
 /// A public compound whose ONLY child is private (edge and claim both
