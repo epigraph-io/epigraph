@@ -1180,25 +1180,40 @@ pub async fn verify_claim(
 
     // Authenticity: the stored Ed25519 signature over the stored digest,
     // checked against the SIGNER's public key (resolved by `get_by_id` through
-    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
-    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
-    // could never pass for any claim.
+    // `claims.signer_id -> agents.public_key`) and, since agent identity
+    // lineage design D2, against the attested `agent_keys` rows (`signing`,
+    // `identity-legacy`) of the claim's signer and author. In the
+    // separate-signing-key mode the signer's `agents.public_key` is its
+    // IDENTITY key, which signs nothing, so the signature verifies only under
+    // its registered signing key. `key_bound` then asks whether that key is
+    // the AUTHOR's and was valid at `created_at` (`bind_signature`).
     //
     // `signed` keeps "no signature to check" distinguishable from "signature
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
-    let signature_valid = match claim.signature {
-        Some(sig) => {
-            epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
-                .unwrap_or(false)
-        }
-        None => false,
+    let keys = if signed {
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&server.pool, viewer, id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
     };
+    let binding = crate::signing_identity::bind_signature(
+        &claim.content_hash,
+        claim.signature.as_ref(),
+        &claim.public_key,
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        &keys,
+    );
+    let signature_valid = binding.signature_valid;
 
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
         signed,
+        key_bound: binding.key_bound,
+        key_kind: binding.key_kind,
         hash_check,
         hash_matches: match hash_check {
             HashCheck::Match => Some(true),

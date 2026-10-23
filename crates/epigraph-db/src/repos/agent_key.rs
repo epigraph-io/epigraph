@@ -42,6 +42,23 @@ pub struct AgentKeyRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// One ATTESTED key (`signing` or `identity-legacy`) of a claim's author or
+/// signer, as [`AgentKeyRepository::attested_keys_for_claim`] returns it.
+///
+/// `key_type` and `status` are trimmed and lower-cased, the spelling migration
+/// 161's guard compares, so a caller matches on exact literals.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AttestedKeyRow {
+    /// The agent holding the key: the claim's author, its signer, or both.
+    pub agent_id: Uuid,
+    pub public_key: Vec<u8>,
+    /// `"signing"` or `"identity-legacy"`.
+    pub key_type: String,
+    pub status: String,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+}
+
 /// Repository for `agent_keys` table operations.
 ///
 /// All methods are async and take a `&PgPool` following the project pattern.
@@ -140,6 +157,45 @@ impl AgentKeyRepository {
         .bind(public_key.as_slice())
         .fetch_all(pool)
         .await?)
+    }
+
+    /// The attested keys (`signing`, `identity-legacy`; any status) of a
+    /// claim's AUTHOR (`claims.agent_id`) and of its SIGNER
+    /// (`claims.signer_id`), for `verify_claim`'s key binding (agent identity
+    /// lineage design D2). Empty when `viewer` cannot read the claim.
+    ///
+    /// Only the two attested types: migration 161's guard refuses a row of
+    /// either to the application role, while any other type (`encryption`,
+    /// `dual_purpose`) is application-insertable, so a key planted under one
+    /// of those must never make a signature verify.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn attested_keys_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<AttestedKeyRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT k.agent_id, k.public_key,
+                   lower(btrim(k.key_type)) AS key_type,
+                   lower(btrim(k.status)) AS status,
+                   k.valid_from, k.valid_until
+              FROM claims c
+              JOIN agent_keys k ON k.agent_id = c.agent_id OR k.agent_id = c.signer_id
+             WHERE c.id = $1
+               AND lower(btrim(k.key_type)) IN ('signing', 'identity-legacy')
+               /* {VISIBILITY:c} */
+             ORDER BY k.created_at, k.id
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, AttestedKeyRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Get a key by its UUID.
