@@ -1,5 +1,6 @@
 #[cfg(feature = "db")]
 pub mod backfill_factors;
+pub mod belief_mode_check;
 #[cfg(feature = "db")]
 pub mod belief_cache;
 #[cfg(feature = "db")]
