@@ -816,6 +816,20 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
             summary["claims"], 3,
             "{viewer}: the summary counts the scope"
         );
+        let settings = &summary["settings"];
+        assert_eq!(
+            (
+                &settings["target_fold"],
+                &settings["scope"],
+                &settings["scope_ids"]
+            ),
+            (
+                &serde_json::json!("aef"),
+                &serde_json::json!("ids"),
+                &serde_json::json!(3)
+            ),
+            "{viewer}: the summary records what it ran under"
+        );
         let replay = std::fs::read_to_string(dir.join("replay_strict.jsonl")).expect("replay");
         assert_eq!(replay.lines().count(), 1, "{viewer}: one line per event");
     }

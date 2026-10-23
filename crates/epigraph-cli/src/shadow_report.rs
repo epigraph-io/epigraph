@@ -54,7 +54,9 @@ use epigraph_db::repos::claim_role::{self, ClaimRole};
 use epigraph_db::repos::recall_event::RecallEventRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, MassFunctionRepository};
-use epigraph_engine::atom_items::{atom_axiom_rows, atom_fold, AtomFoldMode, AxiomMode, AxiomRow};
+use epigraph_engine::atom_items::{
+    atom_axiom_rows, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
+};
 use epigraph_engine::belief_query::FramedBeliefContext;
 use epigraph_engine::belief_view::{Basis, BeliefView};
 use epigraph_engine::compound_belief::derive_compound_belief_batch;
@@ -354,9 +356,67 @@ pub struct Vacate {
     pub compounds: usize,
 }
 
+/// What a report ran under, so two reports (before and after a wave) can be
+/// compared. `compound_source_edges` is this process's
+/// `EPIGRAPH_COMPOUND_SOURCE_EDGES`, which the atom reader applies.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct RunSettings {
+    pub target_fold: &'static str,
+    pub compound_source_edges: &'static str,
+    pub since: Option<DateTime<Utc>>,
+    /// `all` or `ids`.
+    pub scope: &'static str,
+    /// How many ids an `ids` scope listed.
+    pub scope_ids: Option<usize>,
+    pub page_size: usize,
+    pub top: usize,
+    pub rank_threshold: usize,
+    pub conflict_min_k: f64,
+    pub sheaf_threshold: f64,
+    pub owner_preview: bool,
+    pub s0_given: bool,
+    pub graph_view_exposure_given: bool,
+    pub confirmed_score: f64,
+    pub default_min_truth: f64,
+}
+
+impl RunSettings {
+    fn of(opts: &ReportOptions) -> Self {
+        let (scope, scope_ids) = match &opts.scope {
+            Scope::All => ("all", None),
+            Scope::Ids(ids) => ("ids", Some(ids.len())),
+        };
+        Self {
+            target_fold: match opts.target_fold {
+                AtomFoldMode::Legacy => "legacy",
+                AtomFoldMode::AefStandalone => "aef_standalone",
+                AtomFoldMode::Aef => "aef",
+            },
+            compound_source_edges: match CompoundSourceEdges::current() {
+                CompoundSourceEdges::Frozen => "frozen",
+                CompoundSourceEdges::Excluded => "excluded",
+            },
+            since: Some(opts.since),
+            scope,
+            scope_ids,
+            page_size: opts.page_size,
+            top: opts.top,
+            rank_threshold: opts.rank_threshold,
+            conflict_min_k: opts.conflict_min_k,
+            sheaf_threshold: opts.sheaf_threshold,
+            owner_preview: opts.owner_preview,
+            s0_given: opts.s0.is_some(),
+            graph_view_exposure_given: opts.graph_view_exposure.is_some(),
+            confirmed_score: CONFIRMED_SCORE,
+            default_min_truth: DEFAULT_MIN_TRUTH,
+        }
+    }
+}
+
 /// The report's summary.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Summary {
+    pub settings: RunSettings,
     pub claims: usize,
     pub by_role: BTreeMap<&'static str, usize>,
     pub abs_delta: BTreeMap<&'static str, Quantiles>,
@@ -1470,6 +1530,7 @@ where
     let exposure = recall_exposure(&events);
     let page_size = opts.page_size.max(1);
     let mut totals = Totals::default();
+    totals.summary.settings = RunSettings::of(opts);
 
     let mut after: Option<Uuid> = None;
     let mut listed = match &opts.scope {
