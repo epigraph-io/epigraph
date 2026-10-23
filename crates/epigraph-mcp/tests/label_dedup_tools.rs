@@ -1900,6 +1900,148 @@ async fn duplicates_over_the_cap_truncate_the_read(pool: PgPool) {
     );
 }
 
+/// apply's canonical check holds its answer to the unit's commit. A
+/// retirement of the canonical that is in flight (uncommitted) when apply
+/// checks it is waited for and read, so the unit refuses ("no longer
+/// current") instead of marking onto a claim that is retired a moment later,
+/// a chain the plan never showed. The other unit of the same apply, whose
+/// canonical nobody touches, applies (positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_canonical_retired_while_apply_checks_it_is_never_marked_onto(pool: PgPool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let pump = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let roof = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF_B,
+        &[FAMILY],
+        "2026-08-02T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let mark_of = |member: Uuid| -> (String, Uuid, Uuid) {
+        for u in unit_writes(&plan) {
+            for m in u["marks"].as_array().cloned().unwrap_or_default() {
+                if m["dup"] == member.to_string() || m["canonical"] == member.to_string() {
+                    let id = |k: &str| m[k].as_str().expect(k).parse::<Uuid>().expect(k);
+                    return (
+                        u["unit"].as_str().expect("unit").to_string(),
+                        id("dup"),
+                        id("canonical"),
+                    );
+                }
+            }
+        }
+        panic!("no mark for {member}: {plan}")
+    };
+    let (raced_unit, raced_dup, raced_canonical) = mark_of(pump);
+    let (calm_unit, calm_dup, calm_canonical) = mark_of(roof);
+    assert_ne!(raced_unit, calm_unit, "two units: {plan}");
+
+    // The retirement, in flight: the row is updated and the transaction open.
+    let mut retire = pool.begin().await.expect("begin");
+    let retire_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *retire)
+        .await
+        .expect("pid");
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(raced_canonical)
+    .execute(&mut *retire)
+    .await
+    .expect("retire the canonical");
+
+    let done = AtomicBool::new(false);
+    let apply = async {
+        let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+        done.store(true, Ordering::SeqCst);
+        out
+    };
+    // Commit the retirement once apply has finished, or is waiting on it.
+    let race = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(retire_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("blocked backends");
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "apply neither finished nor waited on the in-flight retirement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        retire.commit().await.expect("commit the retirement");
+    };
+    let (out, ()) = tokio::join!(apply, race);
+
+    let raced = result_for(&out, &raced_unit);
+    assert_eq!(raced["ok"], false, "{out}");
+    assert_eq!(raced["code"], "MARK_REFUSED", "{out}");
+    assert!(
+        raced["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no longer current")),
+        "{out}"
+    );
+    assert!(!is_marked_onto(&pool, raced_dup, raced_canonical).await);
+    assert_eq!(identity_edges(&pool, raced_dup).await, 0, "no chain built");
+    assert!(
+        snapshot(&pool, &[raced_dup]).await[&raced_dup].is_current,
+        "the raced duplicate stays current"
+    );
+
+    assert_eq!(result_for(&out, &calm_unit)["ok"], true, "{out}");
+    assert!(is_marked_onto(&pool, calm_dup, calm_canonical).await);
+}
+
 /// The index view reads through the caller's viewer: a stranger asking for a
 /// group-private canonical gets it in `missing`, and a public canonical's
 /// group-private duplicate is not returned to it (a member gets both).

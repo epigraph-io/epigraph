@@ -886,7 +886,7 @@ async fn member_not_owned(
 /// must be one the caller writes, since the cascade moves other writers'
 /// edges and mass functions onto it), and the canonical must still be
 /// current (a mark onto a retired claim would build a chain the plan never
-/// showed). Without it a label-dedup apply could make a mark that
+/// showed), checked under a `FOR SHARE` lock held to the unit's commit. Without it a label-dedup apply could make a mark that
 /// `mark_duplicate` refuses, and that `unmark_duplicate` (the revert) then
 /// refuses too.
 async fn canonical_refusal(
@@ -908,13 +908,21 @@ async fn canonical_refusal(
              mark_duplicate (and its un-mark) would refuse the mark"
         )));
     }
-    if !ClaimRepository::are_all_current(&mut *conn, viewer, &[canonical])
+    // Locked FOR SHARE on the unit's transaction, so the canonical cannot be
+    // retired (marked, superseded, deprecated) between this check and the
+    // mark: a retirement in flight is waited for and read, a later one waits
+    // for this unit's commit.
+    match ClaimRepository::current_state_locked(&mut *conn, viewer, &[canonical])
         .await
         .map_err(db_caller_error)?
+        .first()
     {
-        return Ok(Some(format!("canonical {canonical} is no longer current")));
+        Some((_, true)) => Ok(None),
+        Some((_, false)) => Ok(Some(format!("canonical {canonical} is no longer current"))),
+        None => Ok(Some(format!(
+            "canonical {canonical} could not be locked by this identity's write session"
+        ))),
     }
-    Ok(None)
 }
 
 // ── write_check: a prediction, never a write ────────────────────────────────

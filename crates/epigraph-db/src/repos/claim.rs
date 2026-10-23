@@ -4866,6 +4866,47 @@ impl ClaimRepository {
         Ok(live as usize == distinct.len())
     }
 
+    /// Each of `ids` the viewer reads, with whether it is current, LOCKED
+    /// `FOR SHARE` (in id order) until the caller's transaction ends.
+    ///
+    /// The locking twin of [`Self::are_all_current`], for a check that a later
+    /// write in the same transaction relies on (a dedup mark onto a canonical
+    /// that must stay current). `FOR SHARE`, not `FOR KEY SHARE`: supersede,
+    /// deprecate, consolidate and mark retire a claim with a plain `UPDATE`
+    /// (`FOR NO KEY UPDATE`), and only `FOR SHARE` conflicts with that, so a
+    /// retirement that has not committed when this runs is waited for and its
+    /// result read; one that starts afterwards waits for the caller's commit.
+    ///
+    /// `is_current` is returned, not filtered on: under READ COMMITTED a row
+    /// retired while this waited is re-read and comes back `false`, rather
+    /// than vanishing. An id absent from the result is missing, invisible, or
+    /// not lockable by the session (a locking read takes the UPDATE row
+    /// policy, which admits only rows in the session's writable groups).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn current_state_locked<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, COALESCE(is_current, true) FROM claims \
+             WHERE id = ANY($1) \
+             /* {VISIBILITY:claims} */ \
+             ORDER BY id FOR SHARE OF claims",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, bool)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Fetch `(id, content)` for a batch of claim ids, current rows only.
     ///
     /// Lightweight companion to the structural enrichment in
