@@ -5751,8 +5751,10 @@ impl ClaimRepository {
 
     /// Batch update truth values for multiple claims in a single query
     ///
-    /// Uses PostgreSQL UPDATE with CASE WHEN for efficient bulk updates.
-    /// Only updates claims that exist - non-existent IDs are silently skipped.
+    /// One static `UPDATE … FROM unnest($1::uuid[], $2::float8[])` statement,
+    /// so the SQL text and the bind count (two) do not depend on the batch
+    /// size. Only updates claims that exist - non-existent IDs are silently
+    /// skipped. An id listed twice is updated once, with one of its values.
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -5787,35 +5789,26 @@ impl ClaimRepository {
             return Ok(0);
         }
 
-        // Build UPDATE with CASE WHEN for efficiency
-        // UPDATE claims SET truth_value = CASE id
-        //   WHEN uuid1 THEN value1
-        //   WHEN uuid2 THEN value2
-        // END, updated_at = NOW()
-        // WHERE id IN (uuid1, uuid2, ...)
+        // One static statement over two parallel arrays. The previous form
+        // built `CASE id WHEN $1 THEN $2 …` plus `WHERE id IN ($1, $3, …)` with
+        // two placeholders per item, so its text varied with the batch size
+        // (one prepared statement per size) and a batch above 32767 items
+        // exceeded the protocol's 65535-bind limit. `unnest` binds two arrays
+        // whatever the size.
+        let (ids, values): (Vec<Uuid>, Vec<f64>) = updates
+            .iter()
+            .map(|(claim_id, truth_value)| (Uuid::from(*claim_id), truth_value.value()))
+            .unzip();
 
-        let mut case_builder = String::from("UPDATE claims SET truth_value = CASE id ");
-        let mut where_ids = Vec::with_capacity(updates.len());
-        let mut param_idx = 1;
-
-        for _ in updates {
-            case_builder.push_str(&format!("WHEN ${} THEN ${} ", param_idx, param_idx + 1));
-            where_ids.push(format!("${}", param_idx));
-            param_idx += 2;
-        }
-
-        case_builder.push_str("END, updated_at = NOW() WHERE id IN (");
-        case_builder.push_str(&where_ids.join(", "));
-        case_builder.push(')');
-
-        let mut query = sqlx::query(&case_builder);
-
-        for (claim_id, truth_value) in updates {
-            let uuid: Uuid = (*claim_id).into();
-            query = query.bind(uuid).bind(truth_value.value());
-        }
-
-        let result = query.execute(pool).await?;
+        let result = sqlx::query(
+            "UPDATE claims c SET truth_value = u.tv, updated_at = NOW() \
+             FROM unnest($1::uuid[], $2::float8[]) AS u(id, tv) \
+             WHERE c.id = u.id",
+        )
+        .bind(&ids)
+        .bind(&values)
+        .execute(pool)
+        .await?;
 
         Ok(result.rows_affected() as usize)
     }
