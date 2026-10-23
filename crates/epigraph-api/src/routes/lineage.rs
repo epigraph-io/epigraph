@@ -77,7 +77,8 @@ pub struct LineageResponse {
     pub edges: Vec<LineageEdge>,
     /// Maximum depth reached during traversal
     pub depth_reached: u32,
-    /// Whether traversal was truncated due to depth limit
+    /// Whether a claim the viewer can read lies past `max_depth` (in either
+    /// direction, for `both`), i.e. the lineage shown is not complete
     pub truncated: bool,
     /// Direction of traversal performed
     pub direction: LineageDirection,
@@ -205,8 +206,10 @@ pub struct TraceNode {
 /// This closes `F-PR26-lineage-holds-one-connection-for-n-round-trips` in
 /// `docs/tenancy/progress.json`. What remains is the walk's own cost: the
 /// recursive statement's runtime still grows with the lineage, and this
-/// handler passes `max_nodes: None`. A node cap here needs an exact truncation
-/// signal designed with it, or it would cut the response silently.
+/// handler passes `max_nodes: None`. The response's `truncated` is now the
+/// walks' own exact flag (a visible claim lies past `max_depth`), which is the
+/// signal a future node cap would need so it never cuts the response silently;
+/// no cap is added here.
 pub async fn get_lineage(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -257,7 +260,9 @@ pub async fn get_lineage(
             })?;
 
     // Get lineage based on direction
-    let (nodes, edges, max_depth_reached) = match direction {
+    // `truncated` comes from the walks themselves, which decide it exactly (a
+    // visible claim lies past `max_depth`), and is OR-ed across the `both` arm.
+    let (nodes, edges, max_depth_reached, truncated) = match direction {
         LineageDirection::Ancestors => {
             get_ancestor_lineage(
                 &mut read,
@@ -286,26 +291,28 @@ pub async fn get_lineage(
             // Get both ancestors and descendants, then merge. BOTH walks run on
             // the SAME connection: that is what makes the merged graph a single
             // consistent read rather than two.
-            let (ancestor_nodes, ancestor_edges, ancestor_depth) = get_ancestor_lineage(
-                &mut read,
-                &viewer,
-                &root_claim,
-                claim_id,
-                max_depth,
-                include_evidence,
-                include_traces,
-            )
-            .await?;
-            let (descendant_nodes, descendant_edges, descendant_depth) = get_descendant_lineage(
-                &mut read,
-                &viewer,
-                &root_claim,
-                claim_id,
-                max_depth,
-                include_evidence,
-                include_traces,
-            )
-            .await?;
+            let (ancestor_nodes, ancestor_edges, ancestor_depth, ancestor_truncated) =
+                get_ancestor_lineage(
+                    &mut read,
+                    &viewer,
+                    &root_claim,
+                    claim_id,
+                    max_depth,
+                    include_evidence,
+                    include_traces,
+                )
+                .await?;
+            let (descendant_nodes, descendant_edges, descendant_depth, descendant_truncated) =
+                get_descendant_lineage(
+                    &mut read,
+                    &viewer,
+                    &root_claim,
+                    claim_id,
+                    max_depth,
+                    include_evidence,
+                    include_traces,
+                )
+                .await?;
 
             // Merge nodes, avoiding duplicates using HashSet for O(1) lookup
             let existing_ids: HashSet<Uuid> = ancestor_nodes.iter().map(|n| n.claim_id).collect();
@@ -336,6 +343,7 @@ pub async fn get_lineage(
                 merged_nodes,
                 merged_edges,
                 ancestor_depth.max(descendant_depth),
+                ancestor_truncated || descendant_truncated,
             )
         }
     };
@@ -360,9 +368,6 @@ pub async fn get_lineage(
             message: "Failed to finish the scoped read".to_string(),
         }
     })?;
-
-    // Determine if truncated (there might be more nodes beyond max_depth)
-    let truncated = max_depth_reached >= max_depth as u32 && nodes.len() > 1;
 
     let response = LineageResponse {
         root_claim_id: claim_id,
@@ -395,7 +400,7 @@ async fn get_ancestor_lineage(
     max_depth: i32,
     include_evidence: bool,
     include_traces: bool,
-) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
+) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32, bool), ApiError> {
     // Use LineageRepository for ancestor traversal
     let lineage_result =
         LineageRepository::get_lineage_conn(&mut *conn, viewer, claim_id, Some(max_depth), None)
@@ -421,7 +426,7 @@ async fn get_ancestor_lineage(
             trace: None,
         };
 
-        return Ok((vec![node], vec![], 0));
+        return Ok((vec![node], vec![], 0, false));
     }
 
     // Build nodes from lineage claims
@@ -495,7 +500,7 @@ async fn get_ancestor_lineage(
     nodes.sort_by_key(|n| n.depth);
 
     let max_depth_reached = lineage_result.max_depth_reached as u32;
-    Ok((nodes, edges, max_depth_reached))
+    Ok((nodes, edges, max_depth_reached, lineage_result.truncated))
 }
 
 /// Get descendant lineage (claims that depend on this claim)
@@ -513,7 +518,7 @@ async fn get_descendant_lineage(
     max_depth: i32,
     include_evidence: bool,
     include_traces: bool,
-) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
+) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32, bool), ApiError> {
     // Use LineageRepository for descendant traversal
     let lineage_result =
         LineageRepository::get_descendants_conn(&mut *conn, viewer, claim_id, Some(max_depth))
@@ -539,7 +544,7 @@ async fn get_descendant_lineage(
             trace: None,
         };
 
-        return Ok((vec![node], vec![], 0));
+        return Ok((vec![node], vec![], 0, false));
     }
 
     // Build nodes from lineage claims
@@ -614,7 +619,7 @@ async fn get_descendant_lineage(
 
     let max_depth_reached = lineage_result.max_depth_reached as u32;
 
-    Ok((nodes, edges, max_depth_reached))
+    Ok((nodes, edges, max_depth_reached, lineage_result.truncated))
 }
 
 #[cfg(test)]

@@ -1143,9 +1143,8 @@ async fn test_lineage_max_nodes_larger_than_result_is_noop(pool: PgPool) {
 /// Test: depth-based truncation sets `truncated = true` even without `max_nodes`
 ///
 /// **Evidence**: Reusing the existing max_depth=2 scenario over a 5-claim
-/// chain, `max_depth_reached` lands exactly on the requested `max_depth`,
-/// which is the documented signal that further ancestors may exist beyond
-/// the cutoff.
+/// chain, two ancestors lie beyond the requested `max_depth`, so the walk's
+/// probe layer finds one and the result is cut.
 /// **Reasoning**: `truncated` must reflect depth-capping, not just node
 /// capping, per the spec.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1163,7 +1162,7 @@ async fn test_lineage_truncated_flag_set_by_max_depth(pool: PgPool) {
     assert_eq!(lineage.max_depth_reached, 2);
     assert!(
         lineage.truncated,
-        "truncated should be true when max_depth_reached == max_depth"
+        "truncated should be true when ancestors lie past max_depth"
     );
 }
 
@@ -1190,4 +1189,163 @@ async fn test_lineage_not_truncated_when_depth_cutoff_not_reached(pool: PgPool) 
         !lineage.truncated,
         "truncated should be false when the full chain fit within max_depth"
     );
+}
+
+// ============================================================================
+// `truncated` is exact: set iff a visible claim lies beyond `max_depth`
+// ============================================================================
+
+/// The depth cap every exact-truncation test below walks with.
+const CUT: i32 = 3;
+
+/// A chain whose last ancestor sits EXACTLY at `max_depth` is complete, so it
+/// must not be reported truncated, in either direction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_ending_exactly_at_max_depth_is_not_truncated(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // CUT + 1 claims: depths 0..=CUT from either end, nothing beyond.
+    let chain = create_claim_chain(&pool, CUT as usize + 1).await;
+
+    let up =
+        LineageRepository::get_lineage(&pool, &viewer, *chain.last().unwrap(), Some(CUT), None)
+            .await
+            .expect("ancestor walk");
+    assert_eq!(
+        up.claims.len(),
+        CUT as usize + 1,
+        "the whole chain is in range"
+    );
+    assert_eq!(up.max_depth_reached, CUT);
+    assert!(
+        !up.truncated,
+        "get_lineage: an ancestry that ends exactly at max_depth is complete and must \
+         not be flagged truncated"
+    );
+
+    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT))
+        .await
+        .expect("descendant walk");
+    assert_eq!(
+        down.claims.len(),
+        CUT as usize + 1,
+        "the whole chain is in range"
+    );
+    assert_eq!(down.max_depth_reached, CUT);
+    assert!(
+        !down.truncated,
+        "get_descendants: a descent that ends exactly at max_depth is complete and must \
+         not be flagged truncated"
+    );
+}
+
+/// One claim past `max_depth` makes the result truncated, in either direction,
+/// and the claim that proved it is not in the result.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_with_a_claim_past_max_depth_is_truncated_and_omits_it(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // CUT + 2 claims: one claim at depth CUT + 1 from either end.
+    let chain = create_claim_chain(&pool, CUT as usize + 2).await;
+    let leaf = *chain.last().unwrap();
+
+    let up = LineageRepository::get_lineage(&pool, &viewer, leaf, Some(CUT), None)
+        .await
+        .expect("ancestor walk");
+    assert!(up.truncated, "get_lineage: an ancestor lies past max_depth");
+    assert_eq!(up.max_depth_reached, CUT);
+    assert_eq!(
+        up.claims.len(),
+        CUT as usize + 1,
+        "{:?}",
+        up.topological_order
+    );
+    assert!(
+        !up.claims.contains_key(&chain[0]),
+        "get_lineage: the claim past max_depth must not be returned"
+    );
+    assert!(up.claims.values().all(|c| c.depth <= CUT));
+    assert_eq!(up.topological_order.len(), CUT as usize + 1);
+
+    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT))
+        .await
+        .expect("descendant walk");
+    assert!(
+        down.truncated,
+        "get_descendants: a descendant lies past max_depth, so the result is not \
+         complete and must say so"
+    );
+    assert_eq!(down.max_depth_reached, CUT);
+    assert_eq!(
+        down.claims.len(),
+        CUT as usize + 1,
+        "{:?}",
+        down.topological_order
+    );
+    assert!(
+        !down.claims.contains_key(&leaf),
+        "get_descendants: the claim past max_depth must not be returned"
+    );
+    assert!(down.claims.values().all(|c| c.depth <= CUT));
+    assert_eq!(down.topological_order.len(), CUT as usize + 1);
+}
+
+/// Truncation follows the viewer: a claim past `max_depth` that the viewer
+/// cannot read does not make its result truncated, while a member of that
+/// claim's group is told the result was cut.
+///
+/// The edge to the private claim is forced PUBLIC, so only the claim-level
+/// visibility predicate decides whether the walk may count it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_truncation_follows_the_viewer(pool: PgPool) {
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "trunc-owner").await;
+    let world = fixture::world_group(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve member");
+
+    // Public chain c0 -> ... -> c{CUT}: complete at depth CUT from either end.
+    let chain = create_claim_chain(&pool, CUT as usize + 1).await;
+    let leaf = *chain.last().unwrap();
+    // One private claim beyond each end, over a public edge.
+    let above =
+        fixture::seed_group_claim(&pool, stranger, stranger_group, "private ancestor").await;
+    fixture::seed_edge_owned_by(&pool, above, chain[0], "public", world).await;
+    let below =
+        fixture::seed_group_claim(&pool, stranger, stranger_group, "private descendant").await;
+    fixture::seed_edge_owned_by(&pool, leaf, below, "public", world).await;
+
+    let up_public = LineageRepository::get_lineage(&pool, &public, leaf, Some(CUT), None)
+        .await
+        .expect("ancestor walk, public");
+    let up_member = LineageRepository::get_lineage(&pool, &member, leaf, Some(CUT), None)
+        .await
+        .expect("ancestor walk, member");
+    assert!(
+        !up_public.truncated,
+        "get_lineage: the only claim past max_depth is one the viewer cannot read, so \
+         for this viewer the result is complete"
+    );
+    assert!(
+        up_member.truncated,
+        "get_lineage: a member of the private ancestor's group must be told the result \
+         was cut"
+    );
+    assert!(!up_member.claims.contains_key(&above));
+
+    let down_public = LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT))
+        .await
+        .expect("descendant walk, public");
+    let down_member = LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT))
+        .await
+        .expect("descendant walk, member");
+    assert!(
+        !down_public.truncated,
+        "get_descendants: the only claim past max_depth is one the viewer cannot read"
+    );
+    assert!(
+        down_member.truncated,
+        "get_descendants: a member of the private descendant's group must be told the \
+         result was cut"
+    );
+    assert!(!down_member.claims.contains_key(&below));
 }

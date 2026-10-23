@@ -269,7 +269,7 @@ async fn the_walk_does_not_serve_a_strangers_group_private_ancestor(pool: PgPool
 /// The shard converts both, and the register's own rule is that one function
 /// being correct does not cover its twin. The two are also deliberately NOT
 /// unified: the descendant walk sorts depth ASCENDING where the ancestor walk
-/// sorts DESCENDING, has no `max_nodes` cap and hardcodes `truncated: false`.
+/// sorts DESCENDING and has no `max_nodes` cap.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_descendant_walk_does_not_serve_a_strangers_group_private_descendant(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "lineage-desc-mine").await;
@@ -605,5 +605,99 @@ async fn the_lineage_statement_count_does_not_grow_with_the_lineage(pool: PgPool
         authors,
         [agent, other].into_iter().collect(),
         "CALIBRATION: the wide fan mixes two authors"
+    );
+}
+
+/// One lineage call with an explicit `max_depth`, for an already-seeded root.
+async fn walk_to_depth(
+    pool: &PgPool,
+    agent: Uuid,
+    root: Uuid,
+    max_depth: u32,
+    direction: LineageDirection,
+) -> LineageResponse {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve");
+    get_lineage(
+        ViewerExtractor(viewer),
+        State(split_state(pool).await),
+        Path(root),
+        Query(LineageParams {
+            max_depth: Some(max_depth),
+            direction: Some(direction),
+            include_evidence: None,
+            include_traces: None,
+        }),
+    )
+    .await
+    .expect("the viewer can read every claim in the chain, so the walk must serve")
+    .0
+}
+
+/// `truncated` on `GET /lineage/:claim_id` is EXACT, in every direction: a chain
+/// that ends exactly at `max_depth` is complete, and one with a claim beyond it
+/// is cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_truncated_flag_is_exact_at_max_depth(pool: PgPool) {
+    const CUT: u32 = 3;
+    let (agent, _group) = seed_agent_with_group(&pool, "lineage-trunc").await;
+
+    // c0 -> c1 -> ... -> c{CUT + 1}. Ascending, c{CUT}'s ancestry ends at
+    // exactly CUT and c{CUT + 1}'s runs one past it; descending, the same holds
+    // for c1 and c0.
+    let mut chain = Vec::new();
+    for i in 0..=(CUT + 1) {
+        let c = seed_public_claim(&pool, agent, &format!("trunc chain {i}")).await;
+        if let Some(prev) = chain.last() {
+            seed_edge(&pool, *prev, c).await;
+        }
+        chain.push(c);
+    }
+    let at_cut = chain[CUT as usize];
+    let past_cut = chain[CUT as usize + 1];
+
+    for (direction, complete_root, cut_root) in [
+        (LineageDirection::Ancestors, at_cut, past_cut),
+        (LineageDirection::Descendants, chain[1], chain[0]),
+    ] {
+        let complete = walk_to_depth(&pool, agent, complete_root, CUT, direction).await;
+        assert_eq!(
+            complete.depth_reached,
+            CUT,
+            "{direction:?}: {:?}",
+            node_ids(&complete)
+        );
+        assert!(
+            !complete.truncated,
+            "{direction:?}: a lineage ending exactly at max_depth is complete and must \
+             not be reported truncated"
+        );
+
+        let cut = walk_to_depth(&pool, agent, cut_root, CUT, direction).await;
+        assert!(
+            cut.truncated,
+            "{direction:?}: a claim lies past max_depth, so the response must say it was cut"
+        );
+        assert_eq!(
+            cut.nodes.len(),
+            CUT as usize + 1,
+            "{direction:?}: {:?}",
+            node_ids(&cut)
+        );
+    }
+
+    // `both`: complete only when NEITHER side is cut.
+    let both_complete = walk_to_depth(&pool, agent, at_cut, CUT, LineageDirection::Both).await;
+    assert!(
+        !both_complete.truncated,
+        "both: from c{CUT} the ancestors end exactly at max_depth and the descendants \
+         before it, so the merged response is complete"
+    );
+    let both_cut = walk_to_depth(&pool, agent, chain[0], CUT, LineageDirection::Both).await;
+    assert!(
+        both_cut.truncated,
+        "both: from c0 the descendants run past max_depth, so the merged response is cut \
+         even though the ancestor side is empty"
     );
 }
