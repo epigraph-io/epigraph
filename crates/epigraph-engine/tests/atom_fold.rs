@@ -30,6 +30,7 @@ mod fixture;
 
 use std::collections::{BTreeSet, HashMap};
 
+use epigraph_db::repos::claim_role::leaf_closure_batch;
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, Viewer};
 use epigraph_engine::atom_items::{
     atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
@@ -45,6 +46,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 const TOL: f64 = 1e-9;
+
+/// Held by every test that sends a compound through the writer, so the
+/// process-wide `compound_cache_write_skipped` counter moves only by that
+/// test's own writes while it measures them (sqlx tests in one binary run
+/// concurrently).
+static COMPOUND_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -677,6 +684,7 @@ async fn recompute_atom_cache_never_writes_a_compound(pool: PgPool) {
     )
     .await;
 
+    let _counter = COMPOUND_WRITES.lock().await;
     for fold in [
         AtomFoldMode::Legacy,
         AtomFoldMode::AefStandalone,
@@ -698,9 +706,10 @@ async fn recompute_atom_cache_never_writes_a_compound(pool: PgPool) {
             sentinel,
             "{fold:?}: compound cache moved"
         );
-        assert!(
-            compound_cache_write_skipped() > skipped_before,
-            "{fold:?}: the skip must be counted"
+        assert_eq!(
+            compound_cache_write_skipped(),
+            skipped_before + 1,
+            "{fold:?}: the skip must be counted, once"
         );
     }
 }
@@ -821,12 +830,87 @@ async fn compound_source_edge_rows_are_one_sided_while_frozen(pool: PgPool) {
         "an edge from an ancestor compound of the target is skipped"
     );
 
-    let ids = [supported, contradicted, own_leaf];
-    for (mode, edges) in [
-        (AxiomMode::Display, CompoundSourceEdges::Excluded),
-        (AxiomMode::Pure, CompoundSourceEdges::Frozen),
+    // The guard reaches every ancestor, not only a direct parent:
+    // grand → mid → deep, with a supports edge grand → deep.
+    let grand = claim(&pool, author, "grandparent compound").await;
+    let mid = claim(&pool, author, "mid compound").await;
+    let deep = claim(&pool, author, "leaf two levels down").await;
+    decompose(&pool, grand, mid).await;
+    decompose(&pool, mid, deep).await;
+    let e = edge(&pool, grand, deep, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        deep,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    assert!(
+        display(&pool, deep).await.is_empty(),
+        "an edge from a grandparent compound of the target is skipped"
+    );
+
+    // CONTROL for `excluded`: an atom carrying a compound-source row, an
+    // atom-source edge row and an evidence row keeps exactly the last two.
+    let mixed = claim(
+        &pool,
+        author,
+        "compound-source, atom-source and evidence rows",
+    )
+    .await;
+    let e = edge(&pool, compound, mixed, "supports").await;
+    let compound_row = store_edge_factor(
+        &pool,
+        e,
+        mixed,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    let atom_source = claim(&pool, author, "atom source").await;
+    let e = edge(&pool, atom_source, mixed, "supports").await;
+    let atom_row = store_edge_factor(
+        &pool,
+        e,
+        mixed,
+        writer,
+        serde_json::json!({"0": 0.4, "0,1": 0.6}),
+    )
+    .await;
+    let evidence_row = store(
+        &pool,
+        mixed,
+        binary(&pool).await,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.3, "0,1": 0.7}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&display(&pool, mixed).await),
+        set(&[compound_row, atom_row, evidence_row]),
+        "frozen reads all three"
+    );
+
+    let ids = [supported, contradicted, own_leaf, mixed];
+    for (mode, edges, keep_on_mixed) in [
+        (
+            AxiomMode::Display,
+            CompoundSourceEdges::Excluded,
+            set(&[atom_row, evidence_row]),
+        ),
+        (
+            AxiomMode::Pure,
+            CompoundSourceEdges::Frozen,
+            set(&[evidence_row]),
+        ),
     ] {
-        let got = rows(&pool, &ids, mode, edges).await;
+        let mut got = rows(&pool, &ids, mode, edges).await;
+        assert_eq!(
+            ids_of(&got.remove(&mixed).unwrap_or_default()),
+            keep_on_mixed,
+            "{mode:?}/{edges:?}: exactly the rows that are not compound-source"
+        );
         assert!(
             got.values().all(Vec::is_empty),
             "{mode:?}/{edges:?} must read no compound-source edge row"
@@ -846,7 +930,7 @@ async fn compound_source_edge_rows_are_one_sided_while_frozen(pool: PgPool) {
 async fn atom_fold_never_reads_compound_rows(pool: PgPool) {
     let author = agent(&pool).await;
     let b = binary(&pool).await;
-    let (_member, group) = fixture::seed_agent_with_group(&pool, "aef-d1").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "aef-d1").await;
 
     let visible = claim(&pool, author, "compound, visible decomposition").await;
     let leaf = claim(&pool, author, "visible leaf").await;
@@ -880,25 +964,48 @@ async fn atom_fold_never_reads_compound_rows(pool: PgPool) {
         }
     }
 
-    let got = rows(
-        &pool,
-        &[visible, leaf, hidden, hidden_leaf],
-        AxiomMode::Display,
-        CompoundSourceEdges::Frozen,
-    )
-    .await;
-    for c in [visible, hidden] {
-        assert!(
-            got.get(&c).is_none_or(Vec::is_empty),
-            "a compound's own rows must never be read (claim {c})"
-        );
-    }
-    for (c, r) in atom_rows {
+    // CONTROL: the public viewer really cannot see the hidden decomposition
+    // (for it, `hidden` has no leaves), while the owner group can.
+    let public = fixture::public_viewer(&pool).await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    {
+        let mut conn = pool.acquire().await.expect("conn");
+        let public_closure = leaf_closure_batch(&mut *conn, &public, &[hidden])
+            .await
+            .expect("public closure");
         assert_eq!(
-            ids_of(got.get(&c).map(Vec::as_slice).unwrap_or_default()),
-            set(&[r]),
-            "the atom's own row is read"
+            public_closure.get(&hidden),
+            Some(&Vec::new()),
+            "the public viewer sees no leaf of the hidden decomposition"
         );
+        let owner_closure = leaf_closure_batch(&mut *conn, &owner, &[hidden])
+            .await
+            .expect("owner closure");
+        assert_eq!(owner_closure.get(&hidden), Some(&vec![hidden_leaf]));
+    }
+
+    for (who, viewer) in [("public", &public), ("owner", &owner)] {
+        let got = rows_as(
+            &pool,
+            viewer,
+            &[visible, leaf, hidden, hidden_leaf],
+            AxiomMode::Display,
+            CompoundSourceEdges::Frozen,
+        )
+        .await;
+        for c in [visible, hidden] {
+            assert!(
+                got.get(&c).is_none_or(Vec::is_empty),
+                "{who}: a compound's own rows must never be read (claim {c})"
+            );
+        }
+        for (c, r) in &atom_rows {
+            assert_eq!(
+                ids_of(got.get(c).map(Vec::as_slice).unwrap_or_default()),
+                set(&[*r]),
+                "{who}: the atom's own row is read"
+            );
+        }
     }
 }
 
@@ -1338,7 +1445,11 @@ async fn an_edge_row_whose_edge_the_viewer_cannot_see_is_not_read(pool: PgPool) 
     .await
     .remove(&target)
     .unwrap_or_default();
-    assert_eq!(ids_of(&frozen), set(&[row]), "the owner group reads the row");
+    assert_eq!(
+        ids_of(&frozen),
+        set(&[row]),
+        "the owner group reads the row"
+    );
     let f = atom_fold(&frozen).expect("fold");
     assert!(
         close(f.belief(), 0.5) && close(f.plausibility(), 1.0),
@@ -1611,8 +1722,18 @@ async fn a_claim_validity_complement_keeps_its_open_world_share(pool: PgPool) {
     );
     let t = atom_fold(&display(&pool, twin).await).expect("fold");
     assert_eq!(
-        (f.belief(), f.plausibility(), f.pignistic_prob(), f.mass_on_missing()),
-        (t.belief(), t.plausibility(), t.pignistic_prob(), t.mass_on_missing()),
+        (
+            f.belief(),
+            f.plausibility(),
+            f.pignistic_prob(),
+            f.mass_on_missing()
+        ),
+        (
+            t.belief(),
+            t.plausibility(),
+            t.pignistic_prob(),
+            t.mass_on_missing()
+        ),
         "the coarsened row folds as its binary_truth twin"
     );
 }
@@ -1720,5 +1841,231 @@ async fn two_dogmatic_contradicting_items_fold_to_ignorance_not_an_error(pool: P
         close(f.mass_on_conflict(), 1.0),
         "the fold saw K = 1, got {}",
         f.mass_on_conflict()
+    );
+}
+
+// ── review: what an AEF write stores, and what it does not cover ────────────
+
+/// An AEF write stores the classification of the fold (a strongly supported
+/// atom reads `supported`, a strongly refuted one `contradicted`), and the
+/// fold's open-world mass in `mass_on_missing`. A procedural claim keeps its
+/// legacy fold under `aef`, and a claim the viewer cannot see is not written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_aef_write_stores_classification_and_open_world_mass_and_skips_what_it_does_not_cover(
+    pool: PgPool,
+) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let aef = settings(AtomFoldMode::Aef, true);
+
+    async fn classification(pool: &PgPool, id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT classification FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("classification")
+    }
+
+    for (what, masses, want) in [
+        (
+            "strongly supported",
+            serde_json::json!({"0": 0.9, "0,1": 0.1}),
+            "supported",
+        ),
+        (
+            "strongly refuted",
+            serde_json::json!({"1": 0.9, "0,1": 0.1}),
+            "contradicted",
+        ),
+    ] {
+        let c = claim(&pool, author, what).await;
+        store(&pool, c, b, Row::plain(agent(&pool).await), masses).await;
+        assert_eq!(classification(&pool, c).await, None, "{what}: no label yet");
+        let outcome = write(
+            &pool,
+            c,
+            CacheWriteCause::Organic,
+            LegacyFold::OwnerFrame,
+            aef,
+        )
+        .await;
+        assert!(
+            matches!(outcome, AtomCacheOutcome::Folded { written: true, .. }),
+            "{what}: {outcome:?}"
+        );
+        assert_eq!(
+            classification(&pool, c).await.as_deref(),
+            Some(want),
+            "{what}"
+        );
+    }
+
+    let open_world = claim(&pool, author, "open-world mass").await;
+    store(
+        &pool,
+        open_world,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.5, "~0,1": 0.3, "0,1": 0.2}),
+    )
+    .await;
+    write(
+        &pool,
+        open_world,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        aef,
+    )
+    .await;
+    let missing: Option<f64> =
+        sqlx::query_scalar("SELECT mass_on_missing FROM claims WHERE id = $1")
+            .bind(open_world)
+            .fetch_one(&pool)
+            .await
+            .expect("mass_on_missing");
+    assert!(
+        missing.is_some_and(|m| close(m, 0.3)),
+        "the fold's `~` mass is stored, got {missing:?}"
+    );
+
+    let procedural = claim(&pool, author, "workflow root").await;
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"source_type\": \"workflow\"}' \
+         WHERE id = $1",
+    )
+    .bind(procedural)
+    .execute(&pool)
+    .await
+    .expect("stamp a workflow root");
+    store(
+        &pool,
+        procedural,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let outcome = write(
+        &pool,
+        procedural,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        aef,
+    )
+    .await;
+    assert!(
+        matches!(outcome, AtomCacheOutcome::Legacy { .. }),
+        "a procedural claim keeps its legacy fold under aef, got {outcome:?}"
+    );
+
+    let (_member, group) = fixture::seed_agent_with_group(&pool, "aef-not-visible").await;
+    let private = fixture::seed_group_claim(
+        &pool,
+        author,
+        group,
+        &format!("aef private {}", Uuid::new_v4()),
+    )
+    .await;
+    let sentinel = set_sentinel(&pool, private).await;
+    let outcome = write(
+        &pool,
+        private,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        aef,
+    )
+    .await;
+    assert_eq!(outcome, AtomCacheOutcome::NotVisible);
+    assert_eq!(cache(&pool, private).await, sentinel, "nothing is written");
+}
+
+// ── review: open-world mass through claim_validity and the index-1 swap ─────
+
+/// `~` on `claim_validity` stays `~` (SPEC §3.3's worked example, on the
+/// three-hypothesis frame: K .3 and Bel .628/.7 beside {T .64}); and an
+/// index-1 axis row swaps its complement elements as well as its positive
+/// ones, so it folds exactly as its swapped twin on `binary_truth`, and not
+/// as the unswapped one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn open_world_mass_survives_claim_validity_and_the_index_one_swap(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let second_item = |pool: PgPool, c: Uuid| async move {
+        store(
+            &pool,
+            c,
+            b,
+            Row::plain(agent(&pool).await),
+            serde_json::json!({"0": 0.64, "0,1": 0.36}),
+        )
+        .await
+    };
+
+    let cv = claim(&pool, author, "claim_validity with open-world mass").await;
+    store(
+        &pool,
+        cv,
+        CLAIM_VALIDITY_FRAME_ID,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.5, "~0,1,2": 0.3, "0,1,2": 0.2}),
+    )
+    .await;
+    second_item(pool.clone(), cv).await;
+    let f = atom_fold(&display(&pool, cv).await).expect("fold");
+    assert!(
+        (f.belief() - 0.628 / 0.7).abs() < 1e-9 && close(f.mass_on_conflict(), 0.3),
+        "claim_validity `~` meets the second item as conflict: want Bel .628/.7, K .3; got Bel {} K {}",
+        f.belief(),
+        f.mass_on_conflict()
+    );
+
+    let axis = frame(&pool, "aef_axis_open_world", &["low", "high"]).await;
+    let row = serde_json::json!({"~1": 0.3, "~0,1": 0.1, "0,1": 0.6});
+    let high = claim(&pool, author, "index 1 with complement mass").await;
+    FrameRepository::assign_claim(&pool, high, axis, Some(1))
+        .await
+        .expect("assign index 1");
+    store(&pool, high, axis, Row::plain(agent(&pool).await), row).await;
+    second_item(pool.clone(), high).await;
+
+    let swapped = claim(&pool, author, "the swapped twin").await;
+    store(
+        &pool,
+        swapped,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"~0": 0.3, "~0,1": 0.1, "0,1": 0.6}),
+    )
+    .await;
+    second_item(pool.clone(), swapped).await;
+    let unswapped = claim(&pool, author, "the unswapped twin").await;
+    store(
+        &pool,
+        unswapped,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"~1": 0.3, "~0,1": 0.1, "0,1": 0.6}),
+    )
+    .await;
+    second_item(pool.clone(), unswapped).await;
+
+    let shape = |f: &epigraph_engine::atom_items::EvidencedInterval| {
+        (
+            f.belief(),
+            f.plausibility(),
+            f.mass_on_conflict(),
+            f.mass_on_missing(),
+        )
+    };
+    let got = shape(&atom_fold(&display(&pool, high).await).expect("fold"));
+    let want = shape(&atom_fold(&display(&pool, swapped).await).expect("fold"));
+    let other = shape(&atom_fold(&display(&pool, unswapped).await).expect("fold"));
+    assert_ne!(want, other, "control: the two twins must fold differently");
+    assert!(
+        (got.0 - want.0).abs() < TOL
+            && (got.1 - want.1).abs() < TOL
+            && (got.2 - want.2).abs() < TOL
+            && (got.3 - want.3).abs() < TOL,
+        "an index-1 row folds as its swapped twin: got {got:?}, want {want:?}"
     );
 }
