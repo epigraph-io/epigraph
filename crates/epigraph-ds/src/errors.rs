@@ -48,4 +48,13 @@ pub enum DsError {
     /// Frame has too many hypotheses for full power-set enumeration
     #[error("Frame too large for power-set enumeration (n={n}, max=20)")]
     FrameTooLarge { n: usize },
+
+    /// A conjunction query or item is malformed (an atom repeated, an empty
+    /// query, a position outside the query)
+    #[error("Invalid conjunction input: {reason}")]
+    InvalidConjunction { reason: String },
+
+    /// The exact conjunction DP would exceed its leaf or live-state cap
+    #[error("Conjunction over the exact cap ({leaves} leaves, {states} live states)")]
+    ConjunctionOverCap { leaves: usize, states: usize },
 }
