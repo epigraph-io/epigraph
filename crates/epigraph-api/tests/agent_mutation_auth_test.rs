@@ -967,3 +967,128 @@ async fn revoke_agent_key_records_the_agent_only_when_the_agent_revoked() {
         "an admin revocation must not be recorded as the agent's own"
     );
 }
+
+// ===========================================================================
+// rotate_agent_key — a body serde cannot decode is refused alike for all
+// ===========================================================================
+//
+// The `Json<RotateKeyRequest>` extractor runs BEFORE the handler, so a body
+// that does not deserialize is refused before the caller check. That is not
+// an oracle only because the refusal depends on the caller's own input and
+// is the same for the owner and a non-owner. This pins that sameness.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotate_agent_key_undecodable_body_is_422_for_owner_and_non_owner_alike() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let before = key_rows(&pool, agent.id).await;
+    let owner = token_as_agent(agent.id, &["agents:write"]);
+    let other = token_as_agent(Uuid::new_v4(), &["agents:write"]);
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"new_public_key": 1, "old_key_signature": "", "new_key_signature": ""}),
+    ] {
+        let (owner_status, owner_text) = post_rotate(addr, agent.id, &owner, &body).await;
+        let (other_status, other_text) = post_rotate(addr, agent.id, &other, &body).await;
+        assert_eq!(
+            owner_status, 422,
+            "owner, body {body}: {owner_status} — {owner_text}"
+        );
+        assert_eq!(
+            other_status, owner_status,
+            "non-owner must get exactly the owner's refusal for body {body}: {other_text}"
+        );
+    }
+    assert_eq!(
+        key_rows(&pool, agent.id).await,
+        before,
+        "nothing may change"
+    );
+}
+
+// ===========================================================================
+// rotate_agent_key — armed admin-scope switch: claims:admin needs elevation
+// ===========================================================================
+//
+// Once the admin-scope switch (migration 128) is armed, `claims:admin` on a
+// non-elevated token is not honoured, and an elevated token carries no
+// `agents:write`. The admin override on the key routes is then unreachable
+// over HTTP. These run on a per-test database so arming never touches the
+// shared one the unarmed admin tests above use.
+
+/// The per-test database's URL, on the same server as `DATABASE_URL`.
+async fn url_for(pool: &sqlx::PgPool) -> String {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    format!("{prefix}/{db}")
+}
+
+/// Arm the switch, as the harness (superuser) through 128's setter.
+async fn arm_admin_scopes(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "SELECT * FROM public.epigraph_set_admin_scope_enforcement(true, 'agent_mutation_auth_test')",
+    )
+    .execute(pool)
+    .await
+    .expect("arm the admin-scope switch");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_rotate_agent_key_refuses_a_non_elevated_admin(pool: sqlx::PgPool) {
+    arm_admin_scopes(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url_for(&pool).await).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let before = key_rows(&pool, agent.id).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let admin = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+
+    let (status, text) = post_rotate(addr, agent.id, &admin, &body).await;
+    assert_eq!(
+        status, 403,
+        "armed: claims:admin without elevation must not override; got {status} — {text}"
+    );
+    assert_eq!(
+        key_rows(&pool, agent.id).await,
+        before,
+        "nothing may change"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_rotate_agent_key_still_lets_the_agent_rotate(pool: sqlx::PgPool) {
+    arm_admin_scopes(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url_for(&pool).await).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let token = token_as_agent(agent.id, &["agents:write"]);
+
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(
+        status, 200,
+        "armed: self-rotation is unaffected; got {status} — {text}"
+    );
+    assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
+}
