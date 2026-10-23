@@ -139,3 +139,17 @@ fn a_rejected_perspective_tier_leaves_the_frames_dedicated_weight_in_force() {
     let alpha = effective_source_strength_profiled(&row("empirical", "cross"), &p);
     assert_eq!(alpha, FRAME_EMPIRICAL * p.reliability.cross_locality_factor);
 }
+
+#[test]
+fn a_mis_cased_perspective_key_displaces_nothing() {
+    // The fold looks weights up lowercased, so a perspective entry spelled
+    // `Empirical` is inert in the merged table, as a mis-cased key is
+    // everywhere else. It must not take the frame's `empirical` weight away
+    // either, or the row would fall to a tier nobody chose.
+    let over = serde_json::json!({
+        "reliability": { "evidence_type_weights": { "Empirical": PERSPECTIVE_EMPIRICAL } }
+    });
+    let p = resolve(Some(&over), None);
+    let alpha = effective_source_strength_profiled(&row("empirical", "cross"), &p);
+    assert_eq!(alpha, FRAME_EMPIRICAL * p.reliability.cross_locality_factor);
+}
