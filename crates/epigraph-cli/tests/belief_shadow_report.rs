@@ -726,3 +726,98 @@ async fn the_conflict_set_moves_from_stored_k_to_the_folds_and_drops_compounds(p
         "k_leaf's K shows on its leaf l; k_bare's shows nowhere"
     );
 }
+
+// ── the binary ──────────────────────────────────────────────────────────────
+
+/// The binary, driven as a process over a claims file: under a fresh
+/// UTC-stamped directory it writes, for each viewer, one JSON line per claim
+/// in scope, a summary and one replay line per event, every directory mode
+/// 0700; and the database is exactly as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: PgPool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let author = agent(&pool).await;
+    let (k, leaves) = compound(&pool, author, "bin", &[&[0.8], &[0.6]]).await;
+    set_cache(&pool, k, 0.5, 0.9, 0.7).await;
+    recall_event(&pool, Some(0.3), &[k]).await;
+
+    let tmp = std::env::temp_dir().join(format!("shadow-report-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let ids = tmp.join("claims.txt");
+    std::fs::write(
+        &ids,
+        [k, leaves[0], leaves[1]]
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("ids file");
+    let out = tmp.join("out");
+
+    let before = fingerprint(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_belief_shadow_report"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .arg("--out")
+        .arg(&out)
+        .arg("--claims")
+        .arg(&ids)
+        .current_dir(&tmp)
+        .output()
+        .expect("run the binary");
+    assert!(
+        run.status.success(),
+        "exit {:?}\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        fingerprint(&pool).await,
+        before,
+        "the binary wrote to the database"
+    );
+
+    let stamped: Vec<_> = std::fs::read_dir(&out)
+        .expect("out dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(stamped.len(), 1, "one stamped run directory");
+    for viewer in ["maintenance", "anonymous"] {
+        let dir = stamped[0].join(viewer);
+        let mode = std::fs::metadata(&dir)
+            .expect("viewer dir")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "{viewer}: the report directory is private"
+        );
+        let lines = std::fs::read_to_string(dir.join("claims.jsonl")).expect("claims.jsonl");
+        let seen: Vec<Uuid> = lines
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).expect("a JSON line");
+                Uuid::parse_str(v["claim_id"].as_str().expect("claim_id")).expect("uuid")
+            })
+            .collect();
+        assert_eq!(seen.len(), 3, "{viewer}: one line per claim in scope");
+        assert!(seen.contains(&k), "{viewer}: the compound has its line");
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("summary.json")).expect("summary.json"),
+        )
+        .expect("summary JSON");
+        assert_eq!(
+            summary["claims"], 3,
+            "{viewer}: the summary counts the scope"
+        );
+        let replay = std::fs::read_to_string(dir.join("replay_strict.jsonl")).expect("replay");
+        assert_eq!(replay.lines().count(), 1, "{viewer}: one line per event");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
