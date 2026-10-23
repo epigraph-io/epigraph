@@ -56,6 +56,11 @@ use viewer_fixture::{
 /// orders of magnitude larger (each control below asserts one).
 const SAME: f64 = 1e-9;
 
+/// Every `mode` `POST /api/v1/bp/propagate` accepts. `interval` runs the
+/// scalar track and `auto` picks cdst or scalar by BBA coverage, but each is
+/// its own branch of the handler's mode dispatch, so each is driven.
+const ENGINES: [&str; 4] = ["cdst", "scalar", "interval", "auto"];
+
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 /// A session-stamped `ScopedPool` state, so `write_as` can stamp the apply.
@@ -365,7 +370,7 @@ async fn bp_loaders_skip_decomposes_to(pool: PgPool) {
 
     // A fresh tree per engine: the other engine's tree stays in the graph, so
     // each comparison is between two runs over the same rows but one.
-    for mode in ["cdst", "scalar"] {
+    for mode in ENGINES {
         let t = tree(&pool).await;
         let (without, n_without) = diagnose(&pool, &state, t.agent, mode).await;
         assert!(
@@ -412,7 +417,7 @@ async fn bp_loaders_skip_decomposes_to(pool: PgPool) {
 async fn bp_loaders_skip_legacy_unkeyed_decomposes_to(pool: PgPool) {
     let state = state_default(&pool).await;
 
-    for mode in ["cdst", "scalar"] {
+    for mode in ENGINES {
         // Both orders of `variable_ids`, each pinned explicitly: the trigger
         // sorts them by uuid, so a row taken as minted would exercise only
         // whichever arm of the either-order edge match the random ids pick.
@@ -686,7 +691,11 @@ async fn edge_create_inserts_no_route_factor(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn bp_apply_skips_compounds(pool: PgPool) {
-    apply_skips_compounds_case(&pool, "cdst").await;
+    // Both engines' apply call sites (the cdst branch writes an interval, the
+    // scalar branch a BetP only) and their `skipped_compounds` keys.
+    for mode in ["cdst", "scalar"] {
+        apply_skips_compounds_case(&pool, mode).await;
+    }
 }
 
 /// One BP apply over a small decomposition, checked claim by claim:
