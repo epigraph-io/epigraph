@@ -584,11 +584,12 @@ async fn lock_cache(
         .remove(&claim_id))
 }
 
-/// One wave write (SPEC §10.7): in ONE transaction, lock the claim, read its
-/// cache, run the single atom-cache writer under `settings`, read the cache
-/// back, record `before` and `written` (only when it changed), resync the
-/// atom's existing per-scope rows from the fold (when the AEF wrote), and
-/// commit. Records are flushed before the commit.
+/// One wave write (SPEC §10.7) of a claim of the wave's `role`: in ONE
+/// transaction, lock the claim, read its cache, run the single atom-cache
+/// writer under `settings`, read the cache back, record `before` and
+/// `written` (only when it changed), resync the atom's existing per-scope
+/// rows from the fold (when the AEF wrote), and commit. Records are flushed
+/// before the commit.
 ///
 /// # Errors
 /// A database read or write, a fold, or a record write; the transaction is
@@ -597,6 +598,7 @@ pub async fn write_wave_claim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
+    _role: WaveRole,
     settings: AtomCacheSettings,
     log: &WaveLog,
 ) -> Result<WaveClaimOutcome, String> {

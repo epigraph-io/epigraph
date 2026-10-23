@@ -645,7 +645,7 @@ async fn run_real(
             role.as_str(),
             fold_str(settings.fold)
         );
-        run_wave_batches(cli, pool, viewer, settings, &gate, &log, &cohort).await?;
+        run_wave_batches(cli, pool, viewer, role, settings, &gate, &log, &cohort).await?;
     }
 
     if let Some((list, bytes)) = accepted {
@@ -701,10 +701,12 @@ async fn pace(cli: &Cli, batch: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_wave_batches(
     cli: &Cli,
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
+    role: WaveRole,
     settings: AtomCacheSettings,
     gate: &DiskGate,
     log: &WaveLog,
@@ -725,7 +727,7 @@ async fn run_wave_batches(
                 let (done, written, scoped, compound, errors) =
                     (&done, &written, &scoped, &compound, &errors);
                 async move {
-                    match write_wave_claim(pool, viewer, claim_id, settings, log).await {
+                    match write_wave_claim(pool, viewer, claim_id, role, settings, log).await {
                         Ok(o) => {
                             if o.changed {
                                 written.fetch_add(1, Ordering::Relaxed);
