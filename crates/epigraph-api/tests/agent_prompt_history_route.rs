@@ -762,3 +762,68 @@ async fn a_blob_that_fails_verification_is_withheld(pool: PgPool) {
         "CONTROL: the snapshot's other file is still served"
     );
 }
+
+/// Registers a chain of `n` generations in one group, each succeeding the
+/// last, the first live-linked to `operator` (so every later one inherits
+/// the link). Returns the agent ids, oldest first.
+async fn chain(pool: &PgPool, operator: Uuid, n: usize) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
+    for g in 0..n {
+        let r = register(
+            pool,
+            &identity(
+                "g-chain",
+                ids.last().copied(),
+                [
+                    PromptFile::Absent,
+                    PromptFile::Absent,
+                    PromptFile::Absent,
+                    stored(&format!("generation {g}\n")),
+                ],
+            ),
+        )
+        .await;
+        if g == 0 {
+            link(pool, r.agent_id, operator).await;
+        } else {
+            assert!(
+                r.link_live,
+                "CALIBRATION: generation {g} inherits the live link ({r:?})"
+            );
+        }
+        ids.push(r.agent_id);
+    }
+    ids
+}
+
+/// The lineage walk stops at the definer's 64 generations each way, and the
+/// listing SAYS when it reached that limit, so a cut lineage does not look
+/// complete. From the newest of 66 generations, 64 ancestors are listed (the
+/// farthest at distance 64) and `ancestors_at_limit` is true; from the
+/// oldest, the same holds down the succession. CONTROL: a lineage of one
+/// generation each way reaches neither limit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_listing_says_when_the_lineage_walk_reached_its_depth_limit(pool: PgPool) {
+    let operator = human(&pool).await;
+    let ids = chain(&pool, operator, 66).await;
+    let f = family(&pool, operator).await;
+    let state = app_role_state(&pool).await;
+
+    let control = read_ok(&state, operator, f.child).await;
+    assert_eq!(control["lineage"]["depth_limit"], json!(64), "{control}");
+    assert_eq!(control["lineage"]["ancestors_at_limit"], json!(false));
+    assert_eq!(control["lineage"]["descendants_at_limit"], json!(false));
+
+    let newest = read_ok(&state, operator, ids[65]).await;
+    let up = arr(&newest["lineage"]["ancestors"], "ancestors");
+    assert_eq!(up.len(), 64, "65 ancestors exist; the walk lists 64");
+    assert_eq!(up[63]["distance"], json!(64));
+    assert_eq!(newest["lineage"]["ancestors_at_limit"], json!(true));
+    assert_eq!(newest["lineage"]["descendants_at_limit"], json!(false));
+
+    let oldest = read_ok(&state, operator, ids[0]).await;
+    let down = arr(&oldest["lineage"]["descendants"], "descendants");
+    assert_eq!(down.len(), 64, "65 descendants exist; the walk lists 64");
+    assert_eq!(oldest["lineage"]["descendants_at_limit"], json!(true));
+    assert_eq!(oldest["lineage"]["ancestors_at_limit"], json!(false));
+}
