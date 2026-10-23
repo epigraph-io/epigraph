@@ -455,7 +455,9 @@ fn dry_wave(db: &str, dir: &Path, role: &str, target: &str, s0: &Path) -> PathBu
 /// SPEC §10.7: the wave cohort is current, non-compound, non-procedural
 /// claims with a non-empty AEF input (P1). A claim whose only input is the
 /// ingest template has no AEF input, so it is never in a wave, for either
-/// role; the evidenced claims of the same role are (the control).
+/// role; the evidenced claims of the same role are (the control). Each of
+/// the other predicates keeps out a claim that HAS AEF input: a superseded
+/// claim, a procedural root, a top-level and a mid-level compound.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
     let dir = scratch_dir();
@@ -488,6 +490,33 @@ async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
     // The compound carries its own BBA: it is not in any cohort either.
     insert_row(&pool, parent, &evidence_row(bin, source, 0.8, None)).await;
 
+    // Evidenced claims the cohort's other predicates keep out: a superseded
+    // claim, a procedural root (a workflow tree's thesis), and a MID-level
+    // compound (decomposed from a parent, and decomposing into a leaf).
+    let superseded = claim(&pool, owner, "evidenced but superseded").await;
+    insert_row(&pool, superseded, &evidence_row(bin, source, 0.7, None)).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(superseded)
+        .execute(&pool)
+        .await
+        .expect("supersede");
+    let procedural = claim(&pool, owner, "evidenced workflow thesis").await;
+    insert_row(&pool, procedural, &evidence_row(bin, source, 0.7, None)).await;
+    sqlx::query(
+        "UPDATE claims SET properties = '{\"source_type\": \"workflow\"}'::jsonb WHERE id = $1",
+    )
+    .bind(procedural)
+    .execute(&pool)
+    .await
+    .expect("stamp the workflow root");
+    let top = claim(&pool, owner, "top compound").await;
+    let mid = claim(&pool, owner, "evidenced mid-level compound").await;
+    let deep_leaf = claim(&pool, owner, "evidenced leaf under the mid compound").await;
+    decomposes_to(&pool, top, mid).await;
+    decomposes_to(&pool, mid, deep_leaf).await;
+    insert_row(&pool, mid, &evidence_row(bin, source, 0.7, None)).await;
+    insert_row(&pool, deep_leaf, &evidence_row(bin, source, 0.65, None)).await;
+
     let s0 = take_snapshot(&db, &dir, "s0.jsonl");
     let standalone = report_ids(&dry_wave(&db, &dir, "standalone", "aef_standalone", &s0));
     let leaf = report_ids(&dry_wave(&db, &dir, "leaf", "aef", &s0));
@@ -497,14 +526,17 @@ async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
         "the evidenced standalone is in the standalone wave: {standalone:?}"
     );
     assert!(
-        leaf.contains(&evidenced_leaf),
-        "the evidenced leaf is in the leaf wave: {leaf:?}"
+        leaf.contains(&evidenced_leaf) && leaf.contains(&deep_leaf),
+        "the evidenced leaves are in the leaf wave: {leaf:?}"
     );
     for (wave, ids) in [("standalone", &standalone), ("leaf", &leaf)] {
         for (what, id) in [
             ("template-only standalone", template_standalone),
             ("template-only leaf", template_leaf),
             ("compound", parent),
+            ("superseded claim", superseded),
+            ("procedural root", procedural),
+            ("mid-level compound", mid),
         ] {
             assert!(
                 !ids.contains(&id),
