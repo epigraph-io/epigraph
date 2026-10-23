@@ -229,3 +229,18 @@ alpha = 0.1
 supported        = 0.414726
 contradicted     = 0.367560
 not_enough_info  = 0.117009
+
+# ── Belief Profiles ─────────────────────────────────────────────────────────
+# Named overrides of the belief profile (crates/epigraph-engine/src/belief_profile.rs).
+# The served profile is built from the sections above, then the table named
+# "opinionated-v1" below (if present) overrides any parameter by name, e.g.
+#
+#   [belief_profiles."opinionated-v1".reliability]
+#   intra_evidence_locality_factor = 0.3
+#
+#   [belief_profiles."opinionated-v1"]
+#   testimonial_ceiling = 0.1
+#
+# A table that names an unknown parameter or carries an out-of-range value is
+# ignored as a whole (with a warning). Changing the default profile changes
+# served values: it is a cache event (recompute the cohort).
