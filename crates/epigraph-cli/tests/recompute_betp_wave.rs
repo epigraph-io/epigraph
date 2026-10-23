@@ -1284,6 +1284,57 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A wave's dry run is exempt from the mode check, so the setting it reads
+/// for compound-source edges (SPEC §6.3) can differ from the server's that
+/// the apply is checked against; stages (3b) to (4) and the cohort depend on
+/// it. So every report line names the setting it was computed under: the
+/// process's `EPIGRAPH_COMPOUND_SOURCE_EDGES`, `frozen` when unset.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drift_report_names_the_compound_source_edges_setting_it_read(pool: PgPool) {
+    let dir = scratch_dir();
+    let db = fixture::database_url_for(&pool).await;
+    let owner = agent(&pool, "cse-owner").await;
+    let source = agent(&pool, "cse-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let atom = claim(&pool, owner, "evidenced standalone").await;
+    insert_row(&pool, atom, &evidence_row(bin, source, 0.7, None)).await;
+    let s0 = take_snapshot(&db, &dir, "s0.jsonl");
+
+    for (env_value, want) in [(None, "frozen"), (Some("excluded"), "excluded")] {
+        let report = dir.join(format!("report-{want}.jsonl"));
+        let mut env = vec![("DATABASE_URL", db.as_str())];
+        if let Some(v) = env_value {
+            env.push(("EPIGRAPH_COMPOUND_SOURCE_EDGES", v));
+        }
+        run(
+            RECOMPUTE_BETP,
+            &dir,
+            &[
+                "--dry-run",
+                "--role",
+                "standalone",
+                "--target-fold",
+                "aef_standalone",
+                "--s0",
+                s(&s0),
+                "--report",
+                s(&report),
+            ],
+            &env,
+        )
+        .ok(&format!("dry run under {want}"));
+        let lines = report_lines(&report);
+        assert!(!lines.is_empty(), "control: the atom is reported");
+        for line in &lines {
+            assert_eq!(
+                line["compound_source_edges"], want,
+                "the line names the setting it was computed under: {line}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── (7) the disk gate ───────────────────────────────────────────────────────
 
 /// The real-run flags of a standalone wave with everything but the disk gate:
