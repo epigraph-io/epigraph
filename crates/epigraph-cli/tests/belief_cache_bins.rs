@@ -303,3 +303,148 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn outcome_pairs(path: &Path) -> HashSet<(String, String)> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (
+                v["claim_id"].as_str().unwrap().to_string(),
+                v["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A batch that fails after earlier batches committed: the committed claims
+/// ARE restored, so the operator must still get their outcomes and the
+/// downstream edges to re-wire, not two empty files and a non-zero exit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_batch_still_leaves_the_committed_batches_outcomes_and_downstream(pool: PgPool) {
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'belief-cache-bins-test', 'system', ARRAY['test']) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let id = seed_claim(&pool, agent).await;
+        set_cache(&pool, id, 0.1 + 0.1 * f64::from(i), None).await;
+        ids.push(id);
+    }
+    let target = seed_claim(&pool, agent).await;
+
+    let at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut befores = Vec::new();
+    let mut wave = Vec::new();
+    for &id in &ids {
+        let before = cache_of(&pool, id).await;
+        set_cache(&pool, id, 0.9, Some("supported")).await;
+        write_wave_record(
+            &mut wave,
+            &WaveRecord {
+                claim_id: id,
+                before: before.clone(),
+                written: cache_of(&pool, id).await,
+                wave: "bins-test".into(),
+                at,
+            },
+        )
+        .unwrap();
+        befores.push(before);
+    }
+    let wave_path = dir.join("wave.jsonl");
+    std::fs::write(&wave_path, &wave).unwrap();
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(ids[0])
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("post-wave edge");
+
+    // Batch 2 (ids[2], ids[3] at --batch-size 2) fails on ids[2].
+    sqlx::query(&format!(
+        "CREATE FUNCTION belief_cache_bins_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.id = '{}'::uuid THEN RAISE EXCEPTION 'injected restore failure'; END IF; \
+         RETURN NEW; END $$",
+        ids[2]
+    ))
+    .execute(&pool)
+    .await
+    .expect("failure trigger function");
+    sqlx::query(
+        "CREATE TRIGGER belief_cache_bins_fail BEFORE UPDATE ON claims \
+         FOR EACH ROW EXECUTE FUNCTION belief_cache_bins_fail()",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure trigger");
+
+    let outcomes = dir.join("outcomes.jsonl");
+    let downstream = dir.join("downstream.jsonl");
+    let o = run(
+        RESTORE,
+        &dir,
+        Some(&url),
+        &[
+            "--from",
+            wave_path.to_str().unwrap(),
+            "--batch-size",
+            "2",
+            "--outcomes-out",
+            outcomes.to_str().unwrap(),
+            "--downstream-out",
+            downstream.to_str().unwrap(),
+        ],
+    );
+    assert!(!o.status.success(), "a failed batch must fail the run");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("injected restore failure"),
+        "failed for the wrong reason"
+    );
+
+    // Batch 1 committed; batch 2 rolled back.
+    assert_eq!(cache_of(&pool, ids[0]).await, befores[0]);
+    assert_eq!(cache_of(&pool, ids[1]).await, befores[1]);
+    assert_eq!(cache_of(&pool, ids[3]).await.belief, Some(0.9));
+
+    let want: HashSet<(String, String)> = [
+        (ids[0].to_string(), "restored".to_string()),
+        (ids[1].to_string(), "restored".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        outcome_pairs(&outcomes),
+        want,
+        "the committed batch's outcomes, and only those, are on file"
+    );
+    let listed: Vec<Uuid> = std::fs::read_to_string(&downstream)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["edge_id"].as_str().unwrap().parse().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![edge],
+        "the downstream list is written even though the run failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
