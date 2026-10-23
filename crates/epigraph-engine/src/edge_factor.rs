@@ -191,9 +191,6 @@ pub async fn auto_wire_ds_for_edge(
         FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
             .await
             .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
-    // Calibration load for the Phase 2 canonical-key alias resolution below
-    // (the locality factor comes from the profile). Cheap: process-cached.
-    let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
     let intra_factor =
         per_frame_factor.unwrap_or(profile.reliability.intra_evidence_locality_factor);
     let locality_factor = if is_intra {
@@ -229,23 +226,13 @@ pub async fn auto_wire_ds_for_edge(
     let locality_tag = if is_intra { "intra_self_cite" } else { "cross" };
 
     // Phase 2 (issue #197) canonical-key write: resolve the raw
-    // relationship string (e.g. "supports") through
-    // `evidence_type_aliases` to the canonical SciFact-calibrated key
-    // (`"derived_support"`). This lets the Phase 2 helper's tier 2
-    // path resolve a real calibrated weight instead of falling
-    // through to the 0.5 unknown-key sentinel. Source-of-truth is
-    // `calibration.toml`'s `[evidence_type_aliases]` — adding a new
-    // relationship is a TOML edit, not a Rust edit. Calibration load
-    // failure (calibration.toml missing) is rare on production; the
-    // fallback below stores the raw relationship verbatim and the
-    // helper's path-3 source_strength bridge keeps the math correct.
-    let stored_evidence_type: String = calibration
-        .as_ref()
-        .and_then(|c| {
-            let lower = relationship.to_lowercase();
-            c.evidence_type_aliases.get(&lower).cloned()
-        })
-        .unwrap_or_else(|| relationship.to_string());
+    // relationship string (e.g. "supports") through the served profile's
+    // `evidence_type_aliases` (filled from `calibration.toml`) to the
+    // canonical SciFact-calibrated key (`"derived_support"`), so the fold
+    // resolves a real calibrated weight instead of the unknown-type weight,
+    // and a profile override of the alias reaches edge-written rows exactly
+    // as it reaches raw-typed ones. See [`edge_evidence_type`].
+    let stored_evidence_type = edge_evidence_type(relationship, profile);
 
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
@@ -266,6 +253,23 @@ pub async fn auto_wire_ds_for_edge(
 
     recompute_combined_belief(&mut *conn, viewer, target_id, frame_id, &frame).await?;
     Ok(EdgeFactorOutcome::Wired)
+}
+
+/// The evidence type an edge-factor BBA for `relationship` is stored under:
+/// the relationship's alias in `profile`'s alias table (matched
+/// case-insensitively), else the relationship verbatim.
+///
+/// Storing the alias the fold would resolve anyway keeps a relationship's
+/// weight the same whether its row carries the canonical key or the raw
+/// relationship, under any profile whose alias table this is.
+#[must_use]
+pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String {
+    profile
+        .reliability
+        .evidence_type_aliases
+        .get(&relationship.to_lowercase())
+        .cloned()
+        .unwrap_or_else(|| relationship.to_string())
 }
 
 /// Fire `auto_wire_ds_for_edge` from an edge-creation call site, gated on
