@@ -521,14 +521,42 @@ pub async fn restore_wave(
 
 /// Edges created after the wave whose source is a planned claim.
 ///
+/// SPEC §10.8: an edge a wave claim sourced after the wave wrote an
+/// edge-factor BBA from the wave's value, and a cache restore does not undo
+/// that BBA. These are the targets of the follow-up targeted re-wire.
+///
+/// "After" is per claim: `created_at > at` of THAT claim's record, so an edge
+/// created after the wave started but before its source was written (which
+/// froze the pre-wave value) is not listed. Only edges whose SOURCE is the
+/// wave claim: the BBA lands on the target. Closed edges (`valid_to` set) are
+/// listed too, with `valid_to`, because their BBA may outlive the close.
+///
 /// # Errors
 /// Any database error.
 pub async fn downstream_edges(
     pool: &PgPool,
     plan: &RestorePlan,
 ) -> anyhow::Result<Vec<DownstreamEdge>> {
-    let _ = (pool, plan);
-    Ok(Vec::new())
+    let mut out = Vec::new();
+    for chunk in plan.entries.chunks(DEFAULT_RESTORE_BATCH) {
+        let ids: Vec<Uuid> = chunk.iter().map(|e| e.claim_id).collect();
+        let ats: Vec<DateTime<Utc>> = chunk.iter().map(|e| e.at).collect();
+        let mut rows: Vec<DownstreamEdge> = sqlx::query_as(
+            "SELECT e.id AS edge_id, e.source_id, e.target_id, \
+                    e.target_type::text AS target_type, e.relationship::text AS relationship, \
+                    e.created_at, e.valid_to \
+               FROM unnest($1::uuid[], $2::timestamptz[]) AS w(id, at) \
+               JOIN edges e ON e.source_id = w.id AND e.source_type = 'claim' \
+                           AND e.created_at > w.at \
+              ORDER BY e.created_at, e.id",
+        )
+        .bind(&ids)
+        .bind(&ats)
+        .fetch_all(pool)
+        .await?;
+        out.append(&mut rows);
+    }
+    Ok(out)
 }
 
 /// Write every claim's cache columns as JSON lines.
