@@ -67,7 +67,7 @@ use crate::belief_cache::{
 ///     single-source discount was originally calibrated against. A key
 ///     present with zero mass does not qualify (cohort v2 narrowing).
 ///
-/// **Cohort v1 is a dry-run report only** (SPEC §10.7, §10.6 freeze F3): the
+/// **Cohort v1 is a dry-run report only** (SPEC §10.6, §10.7): the
 /// writing path is [`select_wave_cohort`]'s waves. Arms (a) and (b) skip an
 /// evidenced atom with one simple BBA, whose cache can still be stale, and
 /// admit claims the wave never writes.
@@ -205,8 +205,11 @@ pub async fn predict_cached_after(
 /// A compound is never written. Returns 1 when the cache was written, 0
 /// otherwise.
 ///
-/// Under the default `legacy` fold this is exactly the previous behaviour
-/// (`recompute_claim_cached_belief`, which carries the PR-0 guard).
+/// Under the default `legacy` fold the cache written is the previous
+/// behaviour's (`recompute_claim_cached_belief`): a compound is the one role
+/// the writer skips, and that function's PR-0 guard already left a compound
+/// alone (the same `IS_COMPOUND_SQL` predicate). The skip is now also
+/// counted (`compound_cache_write_skipped`).
 ///
 /// # Errors
 /// Propagates any error from the engine's recompute-and-write call.

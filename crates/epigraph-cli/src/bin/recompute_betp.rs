@@ -61,10 +61,11 @@
 //! 0, Pl 1, BetP .5, `binary_truth`, read back as `unproven`), in list order,
 //! ONLY for listed ids, and only for those that are residue: a listed
 //! compound, procedural or rule claim, superseded claim, or atom with AEF
-//! input, is skipped and reported. List lines are `{"claim_id": ...}`, plus `{"rule": ...}` lines
-//! naming the accepted class rule; the run copies the list next to the wave
-//! file (`<wave file>.accept-vacate.<sha256>.jsonl`) and names its records'
-//! wave after its hash.
+//! input, is skipped and reported. List lines are `{"claim_id": ...}`, plus
+//! `{"rule": ...}` lines naming the accepted class rule. The run copies the
+//! list next to the wave file, as `<wave file>.accept-vacate.<h>.jsonl`, and
+//! names its records' wave `<wave>:vacate:<h>`, where `<h>` is the first 16
+//! hex digits of the list's SHA-256.
 //!
 //! **`--dry-run`** writes nothing and is exempt from the mode check. With
 //! `--role` it prints (or writes to `--report`) one JSON line per cohort atom
