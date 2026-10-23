@@ -64,6 +64,9 @@ use epigraph_ds::{combination, DsError, FocalElement, MassFunction};
 /// Frames larger than this are folded without the cautious pass: the rule
 /// walks the power set twice (`O(4^n)`), and every BBA that can carry a
 /// [`SourceKey`] today is written on the two-hypothesis `binary_truth` frame.
+/// A computational guard, not a belief parameter: below it the result is the
+/// cautious fold, above it the cost bound applies.
+// belief-profile: allow-literal (O(4^n) complexity guard, never binds on keyed BBAs today)
 const MAX_CAUTIOUS_HYPOTHESES: usize = 8;
 
 /// Identity of an evidence source for the dependence test: the agent that

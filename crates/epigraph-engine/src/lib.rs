@@ -21,6 +21,7 @@ pub mod agent_assessment;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
+pub mod belief_profile;
 pub mod belief_query;
 pub mod bp;
 pub mod calibration;

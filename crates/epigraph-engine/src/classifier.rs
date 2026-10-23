@@ -38,12 +38,16 @@ impl fmt::Display for CdstClassification {
 
 impl Default for ClassifierThresholds {
     /// SciFact-calibrated defaults — holdout sweep (5-fold CV, 0.940 F1 on held-out test).
+    ///
+    /// The values live in the belief profile's defaults table
+    /// ([`crate::belief_profile::defaults`]), the single copy.
     fn default() -> Self {
+        use crate::belief_profile::defaults as d;
         Self {
-            nei_threshold: 0.85,
-            support_threshold: 0.15,
-            conflict_threshold: 0.05,
-            has_opposing_threshold: 0.1,
+            nei_threshold: d::CLASSIFIER_NEI_THRESHOLD,
+            support_threshold: d::CLASSIFIER_SUPPORT_THRESHOLD,
+            conflict_threshold: d::CLASSIFIER_CONFLICT_THRESHOLD,
+            has_opposing_threshold: d::CLASSIFIER_HAS_OPPOSING_THRESHOLD,
         }
     }
 }
