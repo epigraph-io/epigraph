@@ -659,11 +659,21 @@ async fn an_id_not_on_the_accept_list_is_never_vacated(pool: PgPool) {
 }
 
 /// SPEC §10.5: a vacated atom reads back as `unproven`: its cache is the
-/// explicit vacuous value (Bel 0, Pl 1, BetP .5) on `binary_truth`, never
-/// NULL, it is not in any wave cohort (not P1), and the wave file holds the
-/// record a compare-and-swap restore needs (`written` is the row as stored).
+/// explicit vacuous value (Bel 0, Pl 1, BetP .5, no conflict, no open-world
+/// mass) on `binary_truth`, never NULL, and re-classified, so no column of
+/// the sentinel survives. The accept list is stored with the batch, named by
+/// its SHA-256, and the batch's records name that hash, so a vacate batch
+/// traces back to the class rule it was accepted under. The wave file holds
+/// the record a compare-and-swap restore needs (`written` is the row as
+/// stored).
+///
+/// `basis: unproven` itself is read through `BeliefView`, which this stack
+/// does not have yet (PR-6); this test asserts what that basis is computed
+/// from.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) {
+    use sha2::Digest as _;
+
     let dir = scratch_dir();
     let f = seed_vacate_fixture(&pool).await;
     let env = WaveEnv::new(&pool, "legacy").await;
@@ -682,22 +692,33 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
     assert_eq!(after.belief, Some(0.0), "{after:?}");
     assert_eq!(after.plausibility, Some(1.0), "{after:?}");
     assert_eq!(after.pignistic_prob, Some(0.5), "{after:?}");
+    assert_eq!(after.mass_on_empty, Some(0.0), "no conflict: {after:?}");
+    assert_eq!(
+        after.mass_on_missing,
+        Some(0.0),
+        "no open-world mass: {after:?}"
+    );
+    assert!(
+        after.classification.is_some() && after.classification.as_deref() != Some("sentinel"),
+        "the vacuous cache is re-classified: {after:?}"
+    );
     assert!(
         after.belief_frame_id.is_some() && after.belief_frame_id == binary_truth_id(&pool).await,
         "the vacuous cache is stamped binary_truth: {after:?}"
     );
 
-    let s0 = take_snapshot(&env.db, &dir, "after-vacate.jsonl");
-    let cohort = report_ids(&dry_wave(
-        &env.db,
-        &dir,
-        "standalone",
-        "aef_standalone",
-        &s0,
-    ));
-    assert!(
-        !cohort.contains(&f.listed_residue),
-        "a vacated atom has no AEF input, so it is not in a wave: {cohort:?}"
+    let list_bytes = std::fs::read(&list).expect("the accept list");
+    let h = hex::encode(sha2::Sha256::digest(&list_bytes));
+    let h = &h[..16];
+    let stored = {
+        let mut p = wave_file.as_os_str().to_owned();
+        p.push(format!(".accept-vacate.{h}.jsonl"));
+        PathBuf::from(p)
+    };
+    assert_eq!(
+        std::fs::read(&stored).unwrap_or_else(|e| panic!("{}: {e}", stored.display())),
+        list_bytes,
+        "the accept list is stored with the batch, byte for byte"
     );
 
     let records = read_wave(std::io::BufReader::new(
@@ -723,6 +744,11 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
     assert_eq!(
         mine[0].before.pignistic_prob, f.before[&f.listed_residue].pignistic_prob,
         "the record's `before` is the sentinel"
+    );
+    assert!(
+        mine[0].wave.ends_with(&format!(":vacate:{h}")),
+        "the record names the accept list's hash: {}",
+        mine[0].wave
     );
     assert_eq!(records.len(), 1, "nothing else was written: {records:?}");
     let _ = std::fs::remove_dir_all(&dir);
