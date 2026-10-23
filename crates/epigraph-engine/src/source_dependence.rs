@@ -58,6 +58,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use epigraph_core::domain::evidence::is_placeholder_id;
 use epigraph_db::{EvidenceRepository, MassFunctionRow};
 use epigraph_ds::{combination, DsError, FocalElement, MassFunction};
 
@@ -306,35 +307,70 @@ fn strip_doi_prefix(t: &str) -> Option<&str> {
     })
 }
 
+/// A DOI resolver root with nothing behind it (`https://doi.org`, with or
+/// without the trailing `/`).
+fn is_doi_resolver_root(t: &str) -> bool {
+    let t = t.trim().trim_end_matches('/');
+    DOI_PREFIXES
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .any(|p| t.eq_ignore_ascii_case(p.trim_end_matches('/')))
+}
+
+/// What is behind the DOI prefixes of `t`, all of them peeled
+/// (`doi:https://doi.org/10.x` names `10.x`); `""` for a resolver root with
+/// nothing behind it. `None` when `t` carries no DOI prefix.
+fn peel_doi_prefixes(t: &str) -> Option<&str> {
+    let mut rest = match strip_doi_prefix(t) {
+        Some(r) => r,
+        None if is_doi_resolver_root(t) => "",
+        None => return None,
+    };
+    loop {
+        rest = rest.trim();
+        if is_doi_resolver_root(rest) {
+            return Some("");
+        }
+        match strip_doi_prefix(rest) {
+            Some(r) => rest = r,
+            None => return Some(rest),
+        }
+    }
+}
+
 /// Normalize a DOI as evidence stores it (`properties.doi`, usually bare)
 /// or links to it (`doi:<id>`, `https://doi.org/<doi>`, `dx.` / `www.`
-/// variants): prefix removed, trimmed, trailing `/` removed, ASCII-lowercased
-/// (DOIs are case-insensitive). `None` for a blank result or anything that is
-/// still a URL after the prefix is removed (a web page is not a DOI).
+/// variants): prefixes removed, trimmed, trailing `/` removed,
+/// ASCII-lowercased (DOIs are case-insensitive). `None` for a blank result,
+/// a placeholder ([`is_placeholder_id`]: "unknown", "n/a", ...; a document
+/// key built on one would merge every DOI-less document) or anything that is
+/// still a URL after the prefixes are removed (a web page is not a DOI).
 /// Percent-encoded DOIs are not decoded, so one DOI written both ways counts
 /// as two sources, which errs toward the pre-key behaviour.
 #[must_use]
 pub fn normalize_doi(raw: &str) -> Option<String> {
     let t = raw.trim();
-    let t = strip_doi_prefix(t)
+    let t = peel_doi_prefixes(t)
         .unwrap_or(t)
         .trim()
         .trim_end_matches('/');
-    if t.is_empty() || t.contains("://") {
+    if t.is_empty() || t.contains("://") || is_placeholder_id(t) {
         None
     } else {
         Some(t.to_ascii_lowercase())
     }
 }
 
-/// The DOI a `source_url` names: a doi.org link, a `doi:` label or a bare
-/// `10.` DOI. Any other URL names no DOI.
-fn doi_in_url(url: &str) -> Option<String> {
+/// The source a `source_url` names, if any: a DOI link or a `doi:` label
+/// names its DOI or nothing (a resolver link with no DOI behind it is not a
+/// web page that rows could share), a bare `10.` DOI names that DOI, and any
+/// other value names its URL.
+fn source_url_key(url: &str) -> Option<ItemKey> {
     let t = url.trim();
-    if strip_doi_prefix(t).is_some() || t.starts_with("10.") {
-        normalize_doi(t)
+    if peel_doi_prefixes(t).is_some() || t.starts_with("10.") {
+        normalize_doi(t).map(ItemKey::Doi)
     } else {
-        None
+        normalize_source_url(t).map(ItemKey::Url)
     }
 }
 
@@ -375,15 +411,11 @@ pub fn item_key(
         if let Some(doi) = ev.doi.as_deref().and_then(normalize_doi) {
             return ItemKey::Doi(doi);
         }
-        if let Some(url) = ev.source_url.as_deref() {
-            if let Some(doi) = doi_in_url(url) {
-                return ItemKey::Doi(doi);
-            }
-            if let Some(url) = normalize_source_url(url) {
-                return ItemKey::Url(url);
-            }
-        }
-        return ItemKey::Evidence(ev.id);
+        return ev
+            .source_url
+            .as_deref()
+            .and_then(source_url_key)
+            .unwrap_or(ItemKey::Evidence(ev.id));
     }
     let method = row.combination_method.as_deref();
     match (method, row.perspective_id, row.evidence_id) {
