@@ -619,7 +619,8 @@ pub struct RecallParams {
 
     #[schemars(
         description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
-                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       object grouping the same hits into `confirmed` (truth_value at or above the \
+                       served belief profile's gates.confirmed_score, default 0.75, and \
                        not contested), `open_question` (is_contested — any live \
                        contradicts/refutes), and `uncertain` (everything else). Contest is \
                        checked FIRST, so a high-truth claim carrying a live refutation is \
