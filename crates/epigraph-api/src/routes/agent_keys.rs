@@ -131,7 +131,16 @@ pub async fn list_agent_keys(
 /// 3. Marking the old key as `rotated`
 /// 4. Storing and activating the new key
 ///
-/// Requires `agents:write` scope.
+/// Requires `agents:write` scope. Caller must be the target agent
+/// (auth.agent_id == :id) or have `claims:admin`, checked before any read,
+/// decode or signature check. The old-key signature alone is not an
+/// ownership proof: a derived LLM-agent key is computable from public inputs.
+///
+/// # Errors
+///
+/// - 401 Unauthorized: Missing or invalid Bearer token
+/// - 403 Forbidden: Missing scope or caller is not the target agent
+/// - 404 Not Found: The agent has no active key
 #[cfg(feature = "db")]
 pub async fn rotate_agent_key(
     State(state): State<AppState>,
@@ -142,6 +151,12 @@ pub async fn rotate_agent_key(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+        // Caller must be the target agent OR have claims:admin
+        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
+            return Err(ApiError::Forbidden {
+                reason: "can only mutate your own agent record".into(),
+            });
+        }
     }
 
     // Decode the new public key from hex
