@@ -607,6 +607,11 @@ async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
 /// row, with a cache recorded on the template's frame. A bulk recompute
 /// rewrites it, and the value equals that of a twin that carries the evidence
 /// row alone: the template contributes nothing to the recomputed cache.
+///
+/// An over-breadth arm: the evidence row lands on `binary_truth`, which owns
+/// the cache by rule 1 whatever the template does, so this passes without the
+/// template exclusion too. The ownership move off a template-only frame is
+/// pinned by `a_template_only_frame_cannot_own_a_claim_with_real_input_elsewhere`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn standalone_with_template_and_evidence_recomputes_without_the_template(pool: PgPool) {
     let owner = agent(&pool, "guard-owner").await;
@@ -623,7 +628,7 @@ async fn standalone_with_template_and_evidence_recomputes_without_the_template(p
         update_with_evidence_row(&pool, twin, source).await;
 
         // Both caches start from the same sentinel, recorded on the template's
-        // frame, so the recompute must also move ownership off it.
+        // frame.
         let before = set_sentinel_cache(&pool, standalone, rv).await;
         set_sentinel_cache(&pool, twin, rv).await;
 
@@ -644,5 +649,81 @@ async fn standalone_with_template_and_evidence_recomputes_without_the_template(p
             cache(&pool, twin).await,
             "{caller:?}: the template must not contribute to the recomputed value"
         );
+    }
+}
+
+// ── (6) a template-only frame cannot own a claim with real input elsewhere ──
+
+/// Backdate every row `claim` has on `frame`, so it is the claim's earliest
+/// input (owner rule 4 is "the frame holding the earliest input").
+async fn backdate_rows(pool: &PgPool, claim: Uuid, frame: Uuid) {
+    sqlx::query(
+        "UPDATE mass_functions SET created_at = now() - interval '1 hour' \
+          WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(claim)
+    .bind(frame)
+    .execute(pool)
+    .await
+    .expect("backdate rows");
+}
+
+/// The ingest template on `research_validity` (inserted first, so it is the
+/// earliest input) and ONE real input on a frame that is neither
+/// `binary_truth` nor `claim_validity`, so owner rules 1 and 2 do not apply
+/// and ownership is decided by rule 3 (the recorded frame) or rule 4 (the
+/// first writer). Either way the template's frame must not win: the cache
+/// must be the real frame's fold, exactly as on a twin that carries only the
+/// real row.
+///
+/// * rule 3: the sentinel is recorded on `research_validity`, which holds
+///   nothing but the template;
+/// * rule 4: the sentinel is recorded on a frame the claim has no row on, so
+///   the earliest input (the template) would otherwise decide.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_template_only_frame_cannot_own_a_claim_with_real_input_elsewhere(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let ingest = agent(&pool, "guard-ingest").await;
+    let assessor = agent(&pool, "guard-assessor").await;
+    let rv = frame(&pool, "research_validity").await;
+    let paper = frame(&pool, "paper_validity_guard").await;
+    let elsewhere = frame(&pool, "guard_unrelated_frame").await;
+
+    for caller in CALLERS {
+        for (rule, recorded) in [("rule 3", rv), ("rule 4", elsewhere)] {
+            let c = claim(&pool, owner, "template + real input on another frame").await;
+            insert_row(&pool, c, &template_row(rv, ingest, 0.9)).await;
+            backdate_rows(&pool, c, rv).await;
+            insert_row(&pool, c, &evidence_row(paper, assessor, "discount")).await;
+            let before = set_sentinel_cache(&pool, c, recorded).await;
+
+            let twin = claim(&pool, owner, "real input alone").await;
+            insert_row(&pool, twin, &evidence_row(paper, assessor, "discount")).await;
+            set_sentinel_cache(&pool, twin, recorded).await;
+
+            assert!(recompute_via(&pool, caller, twin).await, "{caller:?} {rule}: twin");
+            let expected = cache(&pool, twin).await;
+            assert_eq!(
+                expected.belief_frame_id,
+                Some(paper),
+                "CALIBRATION {caller:?} {rule}: the twin's only frame owns its cache"
+            );
+
+            assert!(
+                recompute_via(&pool, caller, c).await,
+                "{caller:?} {rule}: a claim with a real input must be recomputed"
+            );
+            let got = cache(&pool, c).await;
+            assert_ne!(got, before, "{caller:?} {rule}: recomputed");
+            assert_eq!(
+                got.belief_frame_id,
+                Some(paper),
+                "{caller:?} {rule}: a frame holding only the ingest template owned the cache"
+            );
+            assert_eq!(
+                got, expected,
+                "{caller:?} {rule}: the cache must be the real frame's fold"
+            );
+        }
     }
 }
