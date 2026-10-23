@@ -105,7 +105,12 @@
 --      while one is active is refused AID08, never skipped in silence;
 --   5. inherits the link: no link on the child and a LIVE-linked parent ->
 --      the link body with the parent's operator. An unlinked or retired parent
---      links nothing (`inherited = false`, with a reason);
+--      links nothing (`inherited = false`, with a reason), and neither does an
+--      unlinked child that already runs in ANOTHER group (`shared_identity`):
+--      one identity serves every group with the same model and files, so the
+--      first parent to name it would choose the operator of all of them, and a
+--      container picks its next identity by editing its own LEARNED.md. A
+--      shared identity is linked by hand;
 --   6. writes one `security_events` row `agent.identity_registered` naming the
 --      child, parent, group, operator, snapshot and `session_user` -- only when
 --      something new was recorded, so a repeat start writes nothing but
@@ -899,6 +904,15 @@ BEGIN
                                            WHERE l.agent_id = v_parent AND l.retired)
                              THEN 'parent_link_retired'
                              ELSE 'parent_unlinked' END;
+        ELSIF v_child_op IS NULL
+              AND EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                           WHERE s.agent_id = v_child AND s.group_folder <> p_group_folder) THEN
+            -- A SHARED identity (it already runs in another group) that nobody
+            -- has linked: whichever group's parent named it first would decide
+            -- the operator of every group running it, and a container chooses
+            -- its next identity through its own LEARNED.md. Record the lineage,
+            -- link nothing; a shared identity is linked by a manual act.
+            v_reason := 'shared_identity';
         ELSIF v_child_op IS NULL THEN
             SELECT b.link_live INTO v_live
               FROM public.epigraph_link_operator_body(
