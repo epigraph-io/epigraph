@@ -1007,6 +1007,45 @@ impl WorkflowRepository {
         Ok(provable_plan_steps(&rows))
     }
 
+    /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
+    /// edges (any level: thesis, phase, step or operation), through the same
+    /// edge and claim predicates as [`Self::plan_step_claim_ids`].
+    ///
+    /// This is the outcome reports' authority predicate. `workflows` has no
+    /// row security, so a report's counter write cannot be scoped by the
+    /// database; the plan's claims and edges can. The ingest executor gives
+    /// every plan claim an `executes` edge, so a caller that reads none of
+    /// them cannot read the workflow at all, and the reports answer it as
+    /// for an id that does not exist. It deliberately does NOT require a
+    /// resolvable step prefix: a member whose first ordinal edge was
+    /// re-owned still reads the rest of the plan and may report.
+    ///
+    /// Run it on the caller's STAMPED transaction, as
+    /// [`Self::plan_step_claim_ids`] must be.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn viewer_reads_any_executes_edge(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM edges e \
+               JOIN claims c ON c.id = e.target_id \
+               WHERE e.source_id = $1 AND e.relationship = 'executes' \
+                 /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
