@@ -151,7 +151,11 @@
 -- a live custodian otherwise), or the session is a maintenance session;
 -- otherwise AID06. It returns one row per (lineage agent, snapshot): the agent
 -- itself, its ancestors up `agent_succession` (negative depth) and its
--- descendants down it (positive depth). A lineage member the caller could not
+-- descendants down it (positive depth), each at its nearest depth, 64 levels
+-- at most each way. The walk is breadth-first with a visited set and ignores
+-- the group of an edge, so it costs one step per lineage member: one identity
+-- is shared by every group with the same files, and a walk over paths would
+-- cost G^k rows at depth k. A lineage member the caller could not
 -- read on its own appears by id with `readable = false` and no snapshot. Blobs
 -- are returned as zstd bytes with their hash; the repository decompresses and
 -- verifies.
@@ -1022,6 +1026,15 @@ SET search_path = public, pg_temp AS $$
 DECLARE
     v_principal uuid := public.epigraph_principal_id();
     v_admin     boolean;
+    -- The lineage, breadth-first, once per direction: up the succession
+    -- (ancestors) and down it (descendants), each with its own visited set.
+    v_up_ids    uuid[] := ARRAY[p_agent];
+    v_up_depths integer[] := ARRAY[0];
+    v_dn_ids    uuid[] := ARRAY[p_agent];
+    v_dn_depths integer[] := ARRAY[0];
+    v_frontier  uuid[];
+    v_next      uuid[];
+    v_level     integer;
 BEGIN
     IF p_agent IS NULL THEN
         RAISE EXCEPTION 'epigraph_agent_prompt_history: an agent is required'
@@ -1041,25 +1054,45 @@ BEGIN
             USING ERRCODE = 'AID06';
     END IF;
 
+    -- The walk. In each direction every lineage member is expanded ONCE (a
+    -- visited set), one level at a time, so its depth there is its shortest
+    -- distance; a member reached both ways keeps the nearer depth (an
+    -- ancestor on a tie). Edges are taken without their group: an identity
+    -- shared by G groups is one hop, not G. The work is linear in the
+    -- succession rows reached, where a walk over PATHS is exponential in the
+    -- depth (G^k rows at depth k). The depth stays bounded at 64 each way.
+    v_frontier := ARRAY[p_agent];
+    v_level := 0;
+    WHILE cardinality(v_frontier) > 0 AND v_level < 64 LOOP
+        v_level := v_level + 1;
+        SELECT COALESCE(array_agg(DISTINCT s.parent_agent_id), '{}'::uuid[]) INTO v_next
+          FROM public.agent_succession s
+         WHERE s.child_agent_id = ANY (v_frontier)
+           AND s.parent_agent_id <> ALL (v_up_ids);
+        v_up_ids := v_up_ids || v_next;
+        v_up_depths := v_up_depths || array_fill(-v_level, ARRAY[cardinality(v_next)]);
+        v_frontier := v_next;
+    END LOOP;
+    v_frontier := ARRAY[p_agent];
+    v_level := 0;
+    WHILE cardinality(v_frontier) > 0 AND v_level < 64 LOOP
+        v_level := v_level + 1;
+        SELECT COALESCE(array_agg(DISTINCT s.child_agent_id), '{}'::uuid[]) INTO v_next
+          FROM public.agent_succession s
+         WHERE s.parent_agent_id = ANY (v_frontier)
+           AND s.child_agent_id <> ALL (v_dn_ids);
+        v_dn_ids := v_dn_ids || v_next;
+        v_dn_depths := v_dn_depths || array_fill(v_level, ARRAY[cardinality(v_next)]);
+        v_frontier := v_next;
+    END LOOP;
+
     RETURN QUERY
-    WITH RECURSIVE
-    up (id, depth, path) AS (
-        SELECT p_agent, 0, ARRAY[p_agent]
-        UNION ALL
-        SELECT s.parent_agent_id, up.depth - 1, up.path || s.parent_agent_id
-          FROM up JOIN public.agent_succession s ON s.child_agent_id = up.id
-         WHERE s.parent_agent_id <> ALL (up.path) AND up.depth > -64
-    ),
-    down (id, depth, path) AS (
-        SELECT p_agent, 0, ARRAY[p_agent]
-        UNION ALL
-        SELECT s.child_agent_id, down.depth + 1, down.path || s.child_agent_id
-          FROM down JOIN public.agent_succession s ON s.parent_agent_id = down.id
-         WHERE s.child_agent_id <> ALL (down.path) AND down.depth < 64
-    ),
+    WITH
     lineage AS (
         SELECT DISTINCT ON (l.id) l.id, l.depth
-          FROM (SELECT u.id, u.depth FROM up u UNION ALL SELECT d.id, d.depth FROM down d) l
+          FROM (SELECT u.id, u.depth FROM unnest(v_up_ids, v_up_depths) AS u(id, depth)
+                UNION ALL
+                SELECT d.id, d.depth FROM unnest(v_dn_ids, v_dn_depths) AS d(id, depth)) l
          ORDER BY l.id, abs(l.depth), l.depth
     ),
     gated AS (
