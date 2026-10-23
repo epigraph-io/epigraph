@@ -620,7 +620,7 @@ type SnapshotTuple = (
 );
 
 /// Write every current claim's cache columns as JSON lines (SPEC §10.8; the
-/// O3a snapshot S0 that every wave's drift report is measured from).
+/// baseline snapshot S0 that every wave's drift report is measured from).
 ///
 /// The whole export is ONE `REPEATABLE READ, READ ONLY` transaction, paged by
 /// keyset on `id` (`opts.page_size` rows per round trip, so memory stays

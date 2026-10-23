@@ -1,5 +1,5 @@
 //! Operator binary: snapshot every current claim's belief-cache columns to a
-//! JSON-lines file (SPEC §10.8 snapshot tooling; the O3a snapshot S0).
+//! JSON-lines file (SPEC §10.8 snapshot tooling; the baseline snapshot S0).
 //!
 //! Usage:
 //!     belief_snapshot --out <path> [--page-size N] [--include-superseded]
