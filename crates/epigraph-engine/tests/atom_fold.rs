@@ -287,7 +287,7 @@ async fn display(pool: &PgPool, id: Uuid) -> Vec<AxiomRow> {
 }
 
 fn ids_of(rows: &[AxiomRow]) -> BTreeSet<Uuid> {
-    rows.iter().map(|r| r.row_id).collect()
+    rows.iter().map(AxiomRow::row_id).collect()
 }
 
 fn set(ids: &[Uuid]) -> BTreeSet<Uuid> {

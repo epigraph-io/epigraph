@@ -158,20 +158,69 @@ pub enum AxiomClass {
 
 /// One row of an atom's AEF input, on the `binary_truth` frame (index 0 =
 /// TRUE), keyed and discounted.
+///
+/// Only [`atom_axiom_rows`] / [`atom_axiom_rows_under`] build one, from a
+/// stored row of the atom, so [`atom_fold`] can only ever fold an atom's own
+/// evidence: a cache value or a compound's derived value cannot be wrapped
+/// as an `AxiomRow` (SPEC §3.5 / §11.4 type split). The fields are read-only:
+///
+/// ```compile_fail,E0451
+/// use epigraph_engine::atom_items::AxiomRow;
+/// let _forged = AxiomRow {
+///     row_id: todo!(),
+///     atom_id: todo!(),
+///     key: todo!(),
+///     class: todo!(),
+///     coarse: todo!(),
+///     bba: todo!(),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct AxiomRow {
+    row_id: Uuid,
+    atom_id: Uuid,
+    key: ItemKey,
+    class: AxiomClass,
+    coarse: MassFunction,
+    bba: MassFunction,
+}
+
+impl AxiomRow {
     /// The `mass_functions` row.
-    pub row_id: Uuid,
+    #[must_use]
+    pub const fn row_id(&self) -> Uuid {
+        self.row_id
+    }
+
     /// The atom it is evidence about.
-    pub atom_id: Uuid,
+    #[must_use]
+    pub const fn atom_id(&self) -> Uuid {
+        self.atom_id
+    }
+
     /// Its canonical item key (SPEC §3.3).
-    pub key: ItemKey,
+    #[must_use]
+    pub const fn key(&self) -> &ItemKey {
+        &self.key
+    }
+
     /// Its class.
-    pub class: AxiomClass,
+    #[must_use]
+    pub const fn class(&self) -> AxiomClass {
+        self.class
+    }
+
     /// Coarsened to `binary_truth`, before the reliability discount.
-    pub coarse: MassFunction,
+    #[must_use]
+    pub const fn coarse(&self) -> &MassFunction {
+        &self.coarse
+    }
+
     /// Coarsened and discounted by α under the read's lens.
-    pub bba: MassFunction,
+    #[must_use]
+    pub const fn bba(&self) -> &MassFunction {
+        &self.bba
+    }
 }
 
 /// An atom's folded evidence. Only [`atom_fold`] builds one, so a value of
