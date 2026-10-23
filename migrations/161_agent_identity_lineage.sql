@@ -89,8 +89,13 @@
 -- lock first (107 section 10), then:
 --   1. finds or creates the agent by its identity public key (`key_kind
 --      'derived'`, `agent_type 'llm'`, properties llm_model / llm_prompt_hash /
---      source 'epiclaw'); an existing agent recorded under another model or
---      prompt hash is refused (22023: the key is a function of both);
+--      source 'epiclaw'); an existing identity whose SNAPSHOTS record another
+--      model or prompt hash is refused (22023: the key is a function of both).
+--      The comparison reads the snapshots, which this function alone writes,
+--      never `agents.properties`, which the application role may rewrite on
+--      the agent's own row (118's column grant, 077's `agents_self_update`,
+--      a principal any login can set): properties are display only, and the
+--      registration re-asserts them when they differ;
 --   2. stores the blobs and finds or creates the snapshot (D4);
 --   3. records the succession and, if unset, `parent_agent_id`;
 --   4. binds the signing key when the agent has no active one (a key already
@@ -655,6 +660,8 @@ DECLARE
     v_unknown    text[];
     v_live       boolean;
     v_bound      bytea;
+    v_rec_model  text;
+    v_rec_hash   text;
     i            integer;
 BEGIN
     -- Inputs.
@@ -743,17 +750,25 @@ BEGIN
                             'not an EpiClaw identity to adopt', v_child
                 USING ERRCODE = 'AID05';
         END IF;
-        IF (v_props ? 'llm_model' AND v_props ->> 'llm_model' IS DISTINCT FROM p_model)
-           OR (v_props ? 'llm_prompt_hash'
-               AND v_props ->> 'llm_prompt_hash' IS DISTINCT FROM p_prompt_hash) THEN
-            RAISE EXCEPTION 'epigraph_register_agent_identity: agent % is recorded under another '
+        -- What the identity was registered under: its earliest snapshot.
+        SELECT s.model, s.prompt_hash INTO v_rec_model, v_rec_hash
+          FROM public.agent_prompt_snapshots s
+         WHERE s.agent_id = v_child
+         ORDER BY s.first_seen, s.id
+         LIMIT 1;
+        IF FOUND AND (v_rec_model IS DISTINCT FROM p_model
+                      OR v_rec_hash IS DISTINCT FROM p_prompt_hash) THEN
+            RAISE EXCEPTION 'epigraph_register_agent_identity: agent % is registered under another '
                             'model or prompt hash; the identity key is a function of both',
                             v_child
                 USING ERRCODE = '22023';
         END IF;
-        IF NOT (v_props ? 'llm_model' AND v_props ? 'llm_prompt_hash') THEN
+        -- Display only, re-asserted (and only written when it differs, so a
+        -- repeat start writes nothing here).
+        IF v_props ->> 'llm_model' IS DISTINCT FROM p_model
+           OR v_props ->> 'llm_prompt_hash' IS DISTINCT FROM p_prompt_hash THEN
             UPDATE public.agents a
-               SET properties = a.properties
+               SET properties = COALESCE(a.properties, '{}'::jsonb)
                                 || jsonb_build_object('llm_model', p_model,
                                                       'llm_prompt_hash', p_prompt_hash),
                    updated_at = now()
