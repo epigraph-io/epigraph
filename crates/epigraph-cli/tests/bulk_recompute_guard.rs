@@ -190,6 +190,30 @@ async fn agent(pool: &PgPool, name: &str) -> Uuid {
     .expect("seed agent")
 }
 
+/// An agent registered as the `workflow-ingest` system agent (migration 148):
+/// the only author whose `source_type: workflow` root stamp makes a tree
+/// procedural. Planted with triggers off (one per test database: the role is
+/// the registry's primary key).
+async fn workflow_ingest_agent(pool: &PgPool, name: &str) -> Uuid {
+    let id = agent(pool, name).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'bulk-guard test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    tx.commit().await.expect("commit");
+    id
+}
+
 /// Get-or-create a two-hypothesis frame by name (`frames.name` is UNIQUE).
 async fn frame(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query(
@@ -623,7 +647,7 @@ async fn a_retired_or_dangling_decomposition_does_not_make_a_compound(pool: PgPo
 /// under it, each against a standalone twin carrying the same row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -666,13 +690,13 @@ async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
 
 /// A git-history tree, shaped the way `ingest_git` writes one (a repository
 /// root stamped `source: git-history`, `node: repo`; a PR node under it; a
-/// commit under the PR), is procedural like a workflow tree (SPEC §2.1), so
-/// its compounds keep today's behaviour and are recomputed. Checked on the
-/// stamped root and on the PR node under it, each against a standalone twin
-/// carrying the same row.
+/// commit under the PR), is an ORDINARY compound tree: its procedural marker
+/// is still pending (SPEC §2.1, Q-F1), and `source` / `node` are caller-set
+/// properties. Its compounds stay frozen like any compound, even when the
+/// registered system agent authored them.
 #[sqlx::test(migrations = "../../migrations")]
-async fn git_history_rooted_compound_is_still_recomputed(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+async fn a_git_history_stamped_compound_is_frozen_like_any_compound(pool: PgPool) {
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -700,16 +724,37 @@ async fn git_history_rooted_compound_is_still_recomputed(pool: PgPool) {
         .await;
         decomposes_to(&pool, repo, pr, false).await;
         decomposes_to(&pool, pr, commit, false).await;
-
-        let twin = claim(&pool, owner, "standalone twin").await;
         for c in [repo, pr] {
             insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
         }
-        insert_row(&pool, twin, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(&pool, caller, repo, bt, "a git repository root").await;
+        assert_frozen(&pool, caller, pr, bt, "a PR node under it").await;
+    }
+}
 
-        for (what, c) in [("git repository root", repo), ("PR node under it", pr)] {
-            assert_recomputed_like_twin(&pool, caller, c, twin, bt, what).await;
+/// A workflow stamp on a root authored by anyone but the registered
+/// `workflow-ingest` system agent exempts nothing: `source_type` is a
+/// caller-set property, so the stamped root and the compound under it stay
+/// frozen. (`workflow_rooted_compound_is_still_recomputed` is the positive
+/// control: the same tree authored by the system agent is recomputed.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_stamp_by_any_other_author_exempts_nothing(pool: PgPool) {
+    let _registered = workflow_ingest_agent(&pool, "the real workflow-ingest agent").await;
+    let stranger = agent(&pool, "stranger").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let root = workflow_claim(&pool, stranger, "stranger's workflow-stamped thesis").await;
+        let mid = claim(&pool, stranger, "step under it").await;
+        let leaf = claim(&pool, stranger, "atom under it").await;
+        decomposes_to(&pool, root, mid, false).await;
+        decomposes_to(&pool, mid, leaf, false).await;
+        for c in [root, mid] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
         }
+        assert_frozen(&pool, caller, root, bt, "a stranger's stamped root").await;
+        assert_frozen(&pool, caller, mid, bt, "a compound under it").await;
     }
 }
 
@@ -904,7 +949,7 @@ async fn workflow_claim(pool: &PgPool, owner: Uuid, what: &str) -> Uuid {
 /// * a compound whose only link up to a workflow root was retired.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_workflow_stamp_off_the_root_or_behind_a_retired_edge_exempts_nothing(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -948,7 +993,7 @@ async fn a_workflow_stamp_off_the_root_or_behind_a_retired_edge_exempts_nothing(
 /// procedural (recomputed like a standalone twin) and n7 is frozen.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -995,7 +1040,7 @@ async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) 
 /// without walking the cycle, and an uncapped walk would go unnoticed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
