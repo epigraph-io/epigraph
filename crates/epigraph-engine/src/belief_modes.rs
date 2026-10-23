@@ -1,19 +1,27 @@
 //! The belief-mode switches this process runs under, read once at startup
 //! (SPEC §10.2).
 //!
-//! Atom-level belief is rolled out behind seven environment flags. Every
-//! process that reads or writes belief reads them: the API server, the HTTP
-//! and stdio MCP servers, the job runner and every CLI wave bin. Because each
+//! Atom-level belief is rolled out behind seven environment flags. Because a
 //! process reads them **once, at startup**, a flag flip is a restart window
 //! over N processes, not an atomic switch, and a process that was never
 //! restarted keeps running the old mode (hazard H13).
 //!
 //! This module is the one place the flags are parsed, so every process
-//! derives the same [`BeliefModes`] from the same environment. The API's
-//! `/health` → `belief_modes` and MCP `system_stats` → `belief_modes` report
-//! [`current`], and gate G0 compares those reports across live processes. A CLI
-//! wave bin compares its own [`current`] with the API's report before a
-//! writing run ([`BeliefModes::skew`]).
+//! derives the same [`BeliefModes`] from the same environment. In this build
+//! they are read by:
+//!
+//! - the API server and the HTTP and stdio MCP servers, which journal them at
+//!   boot and report [`current`] on `/health` → `belief_modes` and
+//!   `system_stats` → `belief_modes`; gate G0 compares those reports across
+//!   live processes;
+//! - the CLI wave bins `recompute_betp`, `backfill_factors` and
+//!   `decompose_claims --retarget`, which compare their own [`current`] with
+//!   the API's report before a writing run ([`BeliefModes::skew`]).
+//!
+//! No other process reads them yet: the job runner (`drain_jobs`),
+//! `recompute_claim_belief` and the other belief writers act on no flag in
+//! this build. Each starts reading [`current`], and journals it at boot, in
+//! the change that makes it act on one.
 //!
 //! # Defaults, and what this build acts on
 //!
