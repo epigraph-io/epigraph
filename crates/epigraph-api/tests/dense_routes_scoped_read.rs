@@ -446,6 +446,7 @@ async fn claim_genealogy_private_claim_is_404_like_a_missing_one(pool: PgPool) {
     let (owner, group) = seed_agent_with_group(&pool, "s5-gen-oracle-owner").await;
     let (stranger, _) = seed_agent_with_group(&pool, "s5-gen-oracle-stranger").await;
     let private = seed_group_claim(&pool, owner, group, "s5 gen oracle: private").await;
+    let public = seed_public_claim(&pool, owner, "s5 gen oracle: public").await;
 
     // CALIBRATION: the owner reads its own private claim's genealogy, so a 404
     // below is the visibility verdict and not a broken handler or fixture.
@@ -460,6 +461,21 @@ async fn claim_genealogy_private_claim_is_404_like_a_missing_one(pool: PgPool) {
         "CALIBRATION: the owner must be served its own group-private claim's \
          genealogy; got {:?}",
         served.err()
+    );
+
+    // CALIBRATION: the SAME stranger is served a public claim it does not own,
+    // so a 404 below is the private-claim verdict, not a probe that fails
+    // closed for anything outside the caller's own groups.
+    let stranger_public = claim_genealogy(
+        ViewerExtractor(viewer_for(&pool, stranger).await),
+        State(split_state(&pool).await),
+        Path(public),
+    )
+    .await;
+    assert!(
+        stranger_public.is_ok(),
+        "CALIBRATION: a stranger must be served a public claim's genealogy; got {:?}",
+        stranger_public.err()
     );
 
     // The reference answer: a UUID naming no claim at all.
