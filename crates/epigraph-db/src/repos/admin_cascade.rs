@@ -41,6 +41,17 @@ use uuid::Uuid;
 /// `security_events.event_type` of an administrative cascade that ran.
 pub const EVENT_APPLIED: &str = "cascade.admin_applied";
 
+/// `security_events.event_type` of the row that keeps the ids an
+/// [`EVENT_APPLIED`] row's `touched` counts (the edges the repair moved,
+/// most of them other writers'). The applied row names the triggering
+/// principal, and `security_events_read` lets a principal read the rows
+/// naming it, so that row carries counts only; this one has `agent_id` NULL,
+/// readable by privileged and admin sessions only, and names its applied row
+/// in `details.applied_event_id`. Written in the applied row's transaction,
+/// on the maintenance connection only (117 refuses a `cascade.*` row
+/// elsewhere).
+pub const EVENT_APPLIED_IDS: &str = "cascade.admin_applied_ids";
+
 /// `security_events.event_type` of a cascade that did not run.
 pub const EVENT_DEFERRED: &str = "cascade.deferred";
 

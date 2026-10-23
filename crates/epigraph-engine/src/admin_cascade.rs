@@ -79,7 +79,9 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use epigraph_db::repos::admin_cascade::{self as audit, EVENT_APPLIED, EVENT_BELIEF, EVENT_FAILED};
+use epigraph_db::repos::admin_cascade::{
+    self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_FAILED,
+};
 use epigraph_db::repos::match_candidate::RetirementOutcome;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
@@ -593,13 +595,31 @@ macro_rules! repair_with_audit {
                 .await
                 .map_err(|e| e.to_string())?;
             let $out = $repair.await.map_err(|e| e.to_string())?;
+            let touched: serde_json::Value = $touched;
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
-            details["touched"] = $touched;
+            // The applied row names the triggering principal, who can read it
+            // (`security_events_read`): it carries COUNTS. The ids the repair
+            // moved -- other writers' edges among them -- go to an agent-less
+            // companion row in the same transaction, when there are any.
+            let counts = counts_only(&touched);
+            let has_ids = counts != touched;
+            details["touched"] = counts;
             let record: Option<serde_json::Value> = $record;
             let id = audit::record(&mut *$tx, EVENT_APPLIED, $trigger.agent_id, true, &details)
                 .await
                 .map_err(|e| format!("the audit row could not be written: {e}"))?;
+            if has_ids {
+                let ids = serde_json::json!({
+                    "cause": $trigger.cause.as_str(),
+                    "applied_event_id": id,
+                    "subject_id": $trigger.subject_id,
+                    "touched": &touched,
+                });
+                audit::record(&mut *$tx, EVENT_APPLIED_IDS, None, true, &ids)
+                    .await
+                    .map_err(|e| format!("the applied ids row could not be written: {e}"))?;
+            }
             // The revert record names other writers' rows: its own row, which
             // the triggering principal cannot read (`audit::record_dedup_revert`),
             // committed with the applied row it belongs to.
@@ -609,7 +629,7 @@ macro_rules! repair_with_audit {
                     .map_err(|e| format!("the revert record could not be written: {e}"))?;
             }
             $tx.commit().await.map_err(|e| e.to_string())?;
-            Ok(($out, id, details["touched"].clone()))
+            Ok(($out, id, touched))
         }
         .await;
         res
