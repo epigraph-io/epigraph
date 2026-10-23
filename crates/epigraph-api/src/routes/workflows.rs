@@ -3312,6 +3312,102 @@ mod tests {
         }
     }
 
+    /// Render an `ApiError` the way a route answers it: status and JSON body.
+    async fn rendered(e: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = axum::response::IntoResponse::into_response(e);
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("an in-memory body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON error body"),
+        )
+    }
+
+    /// The armed-and-unregistered refusal (migration 148) is the operator's
+    /// remedy, so it is answered verbatim through the 500 redaction on both
+    /// executor mapping sites, while any other executor 500 keeps its detail
+    /// out of the body.
+    #[tokio::test]
+    async fn the_unregistered_system_agent_remedy_survives_the_500_redaction() {
+        let role = epigraph_db::SystemAgentRole::WorkflowIngest.as_str();
+        let unregistered =
+            || epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role };
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(unregistered()),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    unregistered(),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert_eq!(body["error"], "InternalError", "{site}: {body}");
+            let text = body.to_string();
+            assert!(
+                text.contains("not registered in system_agents")
+                    && text.contains("register-system-agent --role workflow-ingest"),
+                "{site}: the remedy reaches the caller: {body}"
+            );
+        }
+
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                ),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert!(
+                !body.to_string().contains("secret-detail-3e91"),
+                "{site}: any other executor 500 is redacted: {body}"
+            );
+        }
+    }
+
+    /// `system_agent_unregistered` hand-copies the executor's `Display` text
+    /// (the variant needs a `&'static str`). Pin the copy to the source for
+    /// every registered role, so an edit to the executor's remedy (CLI flags,
+    /// migration number), or a new role landing on the generic fallback,
+    /// fails here instead of drifting from what HTTP callers read.
+    #[test]
+    fn the_unregistered_system_agent_literal_matches_the_executor_text() {
+        for role in epigraph_db::SystemAgentRole::ALL {
+            let role = role.as_str();
+            let ApiError::InternalErrorStatic { message } = system_agent_unregistered(role) else {
+                panic!("{role}: expected InternalErrorStatic");
+            };
+            assert_eq!(
+                message,
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role }
+                    .to_string(),
+                "{role}: the HTTP literal drifted from the executor's error text"
+            );
+        }
+    }
+
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.
