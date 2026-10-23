@@ -446,6 +446,34 @@ async fn bp_loaders_skip_legacy_unkeyed_decomposes_to(pool: PgPool) {
                  decomposes_to pair moved BP by {gap}; without={without:?} legacy={legacy:?}"
             );
 
+            // The legacy arm is narrow: only a `directional_support` row (the
+            // type the trigger mints for decomposes_to) is matched to the
+            // edge. An unkeyed `evidential_support` row on the SAME in-force
+            // pair is not a decomposes_to factor and stays readable (D4 keeps
+            // read-only BP's evidential couplings to compounds).
+            let mut sorted = [t.k, t.a];
+            sorted.sort();
+            let evidential: Uuid = sqlx::query_scalar(
+                "INSERT INTO factors (factor_type, variable_ids, potential, properties) \
+                 VALUES ('evidential_support', $1, '{\"strength\": 0.8}', '{}') RETURNING id",
+            )
+            .bind(sorted.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("seed an unkeyed evidential_support row on the decomposition pair");
+            let (with_evidential, _) = diagnose(&pool, &state, t.agent, mode).await;
+            assert!(
+                max_gap(&legacy, &with_evidential) > 1e-4,
+                "{mode} compound_first={compound_first}: an unkeyed evidential_support row on \
+                 an in-force decomposes_to pair must still be read; legacy={legacy:?} \
+                 with_evidential={with_evidential:?}"
+            );
+            sqlx::query("DELETE FROM factors WHERE id = $1")
+                .bind(evidential)
+                .execute(&pool)
+                .await
+                .expect("remove the evidential_support row again");
+
             // Control: once the edge is retracted (`valid_to` in the past) the
             // pair is no longer an in-force decomposition, and the same
             // unkeyed row is an ordinary factor again.
