@@ -42,7 +42,9 @@
 //! * **The leaf closure is spliced** on both `edges` (`EDGE_VISIBILITY`) and
 //!   `claims` (`VISIBILITY`), because a compound's derived value served to a
 //!   viewer may use only the leaves that viewer can read (§8 T1). A leaf is
-//!   a visible node with no visible outgoing `decomposes_to`.
+//!   a visible node with no visible outgoing `decomposes_to`, so for a
+//!   viewer who sees none of a mid node's decomposition, that mid node is a
+//!   leaf (see [`leaf_closure_batch`]).
 //! * **Spine counts visible leaves.** Whether a compound is served a profile
 //!   instead of a conjunction depends on how many leaves the viewer can see
 //!   (§8 T4), so the spine flag never reveals a hidden leaf count.
@@ -356,8 +358,9 @@ impl ClaimRole {
 ///   the visited set: a cycle re-enters a node only at a greater depth, and
 ///   the walk stops at [`ROLE_MAX_DEPTH`].
 /// * A leaf is a node below the root with no out-edge the walk could take
-///   (in force, to a current claim, visible). A node at the depth cap that
-///   still has children is not a leaf, and its subtree is not reached.
+///   (in force, to a current claim, edge AND child visible): the walk's step
+///   condition, negated. A node at the depth cap that still has children is
+///   not a leaf, and its subtree is not reached.
 /// * `role_leaf` is `DISTINCT`: a leaf reached along several paths, or at
 ///   several depths, is listed once.
 macro_rules! leaf_walk_ctes {
@@ -407,9 +410,18 @@ macro_rules! leaf_walk_ctes {
 /// hidden from this viewer) gets an empty list. An id the viewer cannot read
 /// is absent, the batch-read convention.
 ///
-/// A mid node is never in its parent's list: a compound is derived over its
-/// own flattened leaves, never composed from its children's values, which
-/// would count a shared leaf twice.
+/// A mid node whose decomposition the viewer can see is never in its
+/// parent's list: a compound is derived over its own flattened leaves, never
+/// composed from its children's values, which would count a shared leaf
+/// twice. A visible node whose WHOLE decomposition is hidden from the viewer
+/// has no visible out-edge, so it IS listed as a leaf for that viewer (SPEC
+/// §2.1), while its role ([`roles_batch`], unspliced) stays
+/// [`ClaimRole::Compound`]; a consumer that folds leaves must not fold such a
+/// node's own rows as if it were an atom.
+///
+/// A claim the viewer cannot read behind an edge it can read is simply
+/// absent: the map carries no count of such claims, so a derivation that must
+/// treat them as vacuous conjuncts (SPEC §8 T1) has to count them itself.
 ///
 /// # Errors
 /// Returns [`DbError::QueryFailed`] if the query fails.
