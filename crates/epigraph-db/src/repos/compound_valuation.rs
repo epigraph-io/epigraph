@@ -9,7 +9,8 @@
 //!   compound belief, and folding it into a conjunction would put compound
 //!   belief back into the atom layer.
 //! * [`compound_own_rows`]: a compound's own stored rows, the carrier of its
-//!   `not_all` valuation (refutation of the compound as a whole).
+//!   `not_all` valuation (refutation of the compound as a whole), each with
+//!   the claims whose `attributed_v1` rows carried its refutation onward.
 //! * [`refuting_edges_into`]: live `contradicts` / `refutes` edges into the
 //!   requested claims, as the viewer sees them.
 //!
@@ -104,10 +105,14 @@ pub struct CompoundOwnRow {
     /// compound, and the engine drops it by class).
     #[sqlx(flatten)]
     pub input: AtomInputRow,
-    /// An `attributed_v1` row cites this one (`perspective_id` is this row's
-    /// id, perspective or evidence: readiness P3), as the viewer sees it. Its
-    /// mass then sits on the atoms.
-    pub cited_by_attribution: bool,
+    /// The claims carrying an `attributed_v1` row that cites this one
+    /// (`perspective_id` is this row's id, perspective or evidence: readiness
+    /// P3) with refutation mass, as the viewer sees them. `attributed_v1`
+    /// rows are written on `binary_truth` (SPEC §5.3), so refutation mass is
+    /// mass on `"1"` (FALSE). The engine counts a citation only when its
+    /// claim is one of the compound's visible leaves: only then has this
+    /// row's refutation moved onto the atoms the compound's conjunction reads.
+    pub refuting_citers: Vec<Uuid>,
 }
 
 /// The own rows of each requested claim, as `viewer` sees them, on every
@@ -146,10 +151,11 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
                             WHERE p.id = mf.perspective_id
                               AND p.perspective_type = 'evidence'
                               /* {{VISIBILITY:p}} */) AS perspective_is_evidence,
-                   EXISTS (SELECT 1 FROM mass_functions ar
-                            WHERE ar.combination_method = 'attributed_v1'
-                              AND ar.perspective_id IN (mf.id, mf.perspective_id, mf.evidence_id)
-                              /* {{VISIBILITY:ar}} */) AS cited_by_attribution
+                   ARRAY(SELECT DISTINCT ar.claim_id FROM mass_functions ar
+                          WHERE ar.combination_method = 'attributed_v1'
+                            AND ar.perspective_id IN (mf.id, mf.perspective_id, mf.evidence_id)
+                            AND COALESCE((ar.masses->>'1')::float8, 0) > 0
+                            /* {{VISIBILITY:ar}} */) AS refuting_citers
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             LEFT JOIN claim_frames cf

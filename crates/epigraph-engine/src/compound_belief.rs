@@ -532,13 +532,19 @@ fn serve(
 /// the ingest template are never read) contributes its discounted
 /// refutation mass α·f on ¬(∧ leaves): the f part of a textless (T2/T3) row,
 /// of a mixed row, and of a pure refutation left on the compound (a
-/// `conj_refute` decision writes no atom row). A pure refutation that an
-/// `attributed_v1` row cites (readiness P3) is skipped: its mass now sits on
-/// the atoms.
+/// `conj_refute` decision writes no atom row).
+///
+/// A row whose refutation has moved is skipped: an `attributed_v1` row with
+/// refutation mass cites it (readiness P3) on one of THIS compound's visible
+/// leaves (`closures`), so the conjunction already reads it there. A citation
+/// on another compound's leaf moves nothing off this one, and a citation that
+/// carried only the support side (a mixed row decided "supports") leaves the
+/// f on the compound (SPEC §5.3).
 async fn own_row_valuations(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     compounds: &[Uuid],
+    closures: &HashMap<Uuid, Vec<Uuid>>,
     ctx: &FramedBeliefContext,
 ) -> Result<HashMap<Uuid, BTreeMap<ItemKey, f64>>, String> {
     let own = compound_own_rows(&mut *conn, viewer, compounds, CLAIM_VALIDITY_FRAME_ID)
@@ -546,7 +552,11 @@ async fn own_row_valuations(
         .map_err(|e| format!("compound_own_rows: {e}"))?;
     let moved: BTreeSet<Uuid> = own
         .iter()
-        .filter(|r| r.cited_by_attribution)
+        .filter(|r| {
+            closures
+                .get(&r.input.row.claim_id)
+                .is_some_and(|leaves| r.refuting_citers.iter().any(|c| leaves.contains(c)))
+        })
         .map(|r| r.input.row.id)
         .collect();
     let evidence = read_rows(own.into_iter().map(|r| r.input).collect())?
@@ -555,8 +565,8 @@ async fn own_row_valuations(
         .collect();
     let mut out: HashMap<Uuid, BTreeMap<ItemKey, f64>> = HashMap::new();
     for r in key_and_discount(conn, viewer, evidence, ctx).await? {
-        let (t, f, _, _) = tfo(r.bba());
-        if f <= ZERO || (t <= ZERO && moved.contains(&r.row_id())) {
+        let (_, f, _, _) = tfo(r.bba());
+        if f <= ZERO || moved.contains(&r.row_id()) {
             continue;
         }
         let slot = out
@@ -748,7 +758,7 @@ pub async fn derive_compound_belief_batch(
         .filter(|(_, spine)| !**spine)
         .map(|(id, _)| *id)
         .collect();
-    let own = own_row_valuations(conn, viewer, &non_spine, ctx).await?;
+    let own = own_row_valuations(conn, viewer, &non_spine, &closures, ctx).await?;
 
     // Bel(X) for every edge source, as this derivation reads it.
     let mut x_bel: HashMap<Uuid, f64> = HashMap::new();
