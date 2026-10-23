@@ -802,20 +802,22 @@ pub(crate) async fn create_claim_core(
     };
     let claim_uuid = Uuid::from(created_claim.id);
 
-    // Apply optional content_hash override and properties only when we inserted
-    // a new row. Mutating an existing canonical noun-claim from a different
-    // caller's request would bypass ownership/authorisation checks and can
-    // clobber metadata that another agent set previously. See
+    // Verify the optional content_hash and apply optional properties only when
+    // we inserted a new row. Mutating an existing canonical noun-claim from a
+    // different caller's request would bypass ownership/authorisation checks
+    // and can clobber metadata that another agent set previously. See
     // docs/architecture/noun-claims-and-verb-edges.md §"if_not_exists semantics".
-    if was_created && (request.content_hash.is_some() || request.properties.is_some()) {
-        let content_hash_bytes: Option<Vec<u8>> = if let Some(ref hex_hash) = request.content_hash {
+    if was_created {
+        // `content_hash` is VERIFY-ONLY: it must equal the server-computed
+        // BLAKE3(content) and is never written (the row already carries that
+        // digest). A freshly-created claim can never already be a
+        // compound/parent in a decomposes_to edge at insert time, so this
+        // handler always operates on a non-compound claim.
+        if let Some(ref hex_hash) = request.content_hash {
             let decoded = hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
                 field: "content_hash".to_string(),
                 reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
             })?;
-            // A freshly-created claim can never already be a compound/parent in a
-            // decomposes_to edge at insert time, so this handler always operates
-            // on a non-compound claim: the override must equal BLAKE3(content).
             let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
             if decoded.as_slice() != expected_hash.as_slice() {
                 return Err(ApiError::ValidationError {
@@ -823,41 +825,24 @@ pub(crate) async fn create_claim_core(
                     reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
                 });
             }
-            // Verified equal to the server-computed hash — a no-op for the
-            // UPDATE's COALESCE below either way, so just skip setting it.
-            None
-        } else {
-            None
-        };
+        }
 
-        sqlx::query(
-            "UPDATE claims SET content_hash = COALESCE($1, content_hash), properties = COALESCE($2, properties) WHERE id = $3"
-        )
-        .bind(content_hash_bytes.as_deref())
-        .bind(&request.properties)
-        .bind(claim_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match e {
-            // Post-107: the override sets a content_hash already used by another
-            // row of the same agent. Spec §API surface (line 116) specifies this
-            // surfaces as 409 Conflict from the UPDATE on the
-            // if_not_exists: false path. Pre-107 this branch is unreachable.
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                ApiError::Conflict {
-                    reason: "content_hash override collides with an existing claim for this agent".to_string(),
-                }
-            }
-            other => ApiError::DatabaseError {
-                message: format!("Failed to set content_hash/properties: {other}"),
-            },
-        })?;
+        if let Some(ref properties) = request.properties {
+            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
+                .bind(properties)
+                .bind(claim_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to set properties: {e}"),
+                })?;
+        }
     }
 
     // Apply optional labels within the same transaction.
     //
-    // Guarded on `was_created` for the same reason the content_hash/properties
-    // write above is: on an `if_not_exists` dedup hit this handler returns a row
+    // Guarded on `was_created` for the same reason the properties write above
+    // is: on an `if_not_exists` dedup hit this handler returns a row
     // it did not create, and a caller-supplied label array must not rewrite that
     // row's labels. `policies.rs` uses `'policy:active' = ANY(labels)` as an
     // UPDATE predicate, so an unguarded write here silently detaches a policy

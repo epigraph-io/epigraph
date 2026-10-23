@@ -122,3 +122,106 @@ async fn matching_content_hash_override_is_accepted() {
         "stored content_hash must equal BLAKE3(content)"
     );
 }
+
+/// Characterization of the create path's properties write: `properties` alone
+/// (no `content_hash`) is stored, and the stored digest is the server's
+/// BLAKE3(content). Pins the behaviour across the removal of the dead
+/// `content_hash = COALESCE($1, content_hash)` override.
+#[tokio::test(flavor = "multi_thread")]
+async fn properties_only_create_stores_properties() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let agent = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+
+    let content = format!("properties only create {}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({
+        "content": content,
+        "agent_id": agent,
+        "properties": {"k": "v", "n": 3},
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "properties-only create should succeed; got {status} body={}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let (props, stored_hash): (serde_json::Value, Vec<u8>) =
+        sqlx::query_as("SELECT properties, content_hash FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(props["k"], "v", "stored properties: {props}");
+    assert_eq!(props["n"], 3, "stored properties: {props}");
+    assert_eq!(
+        stored_hash,
+        blake3::hash(content.as_bytes()).as_bytes().to_vec(),
+        "stored content_hash must equal BLAKE3(content)"
+    );
+}
+
+/// A matching `content_hash` together with `properties`: both requests are
+/// honoured — the properties are stored and the digest is BLAKE3(content).
+#[tokio::test(flavor = "multi_thread")]
+async fn matching_override_with_properties_stores_both() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let agent = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+
+    let content = format!("override plus properties {}", uuid::Uuid::new_v4());
+    let correct_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let body = serde_json::json!({
+        "content": content,
+        "agent_id": agent,
+        "content_hash": correct_hash,
+        "properties": {"section": "methods"},
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "matching override + properties should succeed; got {status} body={}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let (props, stored_hash): (serde_json::Value, Vec<u8>) =
+        sqlx::query_as("SELECT properties, content_hash FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(props["section"], "methods", "stored properties: {props}");
+    assert_eq!(
+        stored_hash,
+        blake3::hash(content.as_bytes()).as_bytes().to_vec(),
+        "stored content_hash must equal BLAKE3(content)"
+    );
+}
