@@ -76,7 +76,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // Before the database: a writing run must show its belief modes match the
-    // API's (SPEC §10.2, gate G0). A dry run writes nothing and is exempt.
+    // API's (SPEC §10.2). A dry run writes nothing and is exempt.
     let intent = if cli.dry_run {
         RunIntent::WritesNothing
     } else {

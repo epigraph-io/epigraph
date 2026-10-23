@@ -34,7 +34,7 @@
 //! A writing run (no `--dry-run`) first reads the API's `/health` →
 //! `belief_modes` (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`) and refuses, exit
 //! 3, when this process's belief modes differ or cannot be compared (SPEC
-//! §10.2, gate G0; `epigraph_cli::belief_mode_check`). A dry run writes
+//! §10.2; `epigraph_cli::belief_mode_check`). A dry run writes
 //! nothing and is exempt, so `--dry-run --target-fold <fold>` can run while
 //! the server is still on another fold. This build previews only the legacy
 //! fold; an AEF target reports the cohort and previews nothing. For the same
@@ -104,7 +104,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // Before the database: a writing run must show its belief modes match the
-    // API's (SPEC §10.2, gate G0). A dry run writes nothing and is exempt.
+    // API's (SPEC §10.2). A dry run writes nothing and is exempt.
     let intent = if cli.dry_run {
         RunIntent::WritesNothing
     } else {
@@ -155,7 +155,7 @@ async fn run(
             Some(fold) => {
                 // This build has no AEF fold to preview under; printing the
                 // legacy fold's numbers under an AEF label would mislead a
-                // wave review. The cohort-v2 recompute adds the fold.
+                // wave review. The change that adds the fold to this bin fills it in.
                 println!("DRY-RUN — no writes");
                 println!(
                     "target fold {fold}: this build cannot compute the {fold} fold; \

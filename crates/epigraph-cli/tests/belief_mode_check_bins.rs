@@ -1,5 +1,5 @@
 //! The CLI wave bins check their own belief modes against the API's `/health`
-//! before a writing run (SPEC §10.2 flip runbook, gate G0).
+//! before a writing run (SPEC §10.2 flip runbook).
 //!
 //! Every belief-mode flag is read at startup by each process. A flip is a
 //! restart window, and a bin started from a shell whose environment was not

@@ -4,7 +4,7 @@
 //! Atom-level belief is rolled out behind seven environment flags. Because a
 //! process reads them **once, at startup**, a flag flip is a restart window
 //! over N processes, not an atomic switch, and a process that was never
-//! restarted keeps running the old mode (hazard H13).
+//! restarted keeps running the old mode.
 //!
 //! This module is the one place the flags are parsed, so every process
 //! derives the same [`BeliefModes`] from the same environment. In this build
@@ -12,8 +12,8 @@
 //!
 //! - the API server and the HTTP and stdio MCP servers, which journal them at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
-//!   `system_stats` → `belief_modes`; gate G0 compares those reports across
-//!   live processes;
+//!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
+//!   compares those reports across live processes;
 //! - the CLI wave bins `recompute_betp`, `backfill_factors` and
 //!   `decompose_claims --retarget`, which compare their own [`current`] with
 //!   the API's report before a writing run ([`BeliefModes::skew`]).
@@ -53,7 +53,7 @@
 //! default, and is returned in [`ModeRead::unrecognised`] (for this process,
 //! [`unrecognised`]) so the process can warn at boot: a typo must not
 //! silently enable a mode, and the report on `/health` then shows the mode
-//! the process actually runs, which is what gate G0 compares.
+//! the process actually runs, which is what the pre-flip check compares.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -686,7 +686,7 @@ mod tests {
 
     /// Moving any ONE mode makes `skew` report exactly that mode, with both
     /// values, from either side; moving none reports nothing. A comparison
-    /// that skipped a field would let that flag's skew through gate G0.
+    /// that skipped a field would let that flag's skew through the mode check.
     #[test]
     fn skew_names_exactly_the_modes_that_differ() {
         let base = BeliefModes::default();

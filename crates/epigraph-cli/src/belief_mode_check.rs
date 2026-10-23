@@ -1,8 +1,8 @@
 //! The mode check every CLI wave bin runs before a writing run (SPEC §10.2,
-//! flip runbook; gate G0).
+//! flip runbook).
 //!
-//! Every belief-mode flag is read once, at startup, by every process
-//! ([`epigraph_engine::belief_modes::current`]). A flag flip is therefore a
+//! Every belief-mode flag is read once, at startup, by each process that
+//! reads it ([`epigraph_engine::belief_modes::current`]). A flag flip is therefore a
 //! restart window: an operator shell whose environment was not updated, or was
 //! updated before the servers were restarted, starts a wave bin that would
 //! write under a different fold from the one the API serves. So before a
@@ -118,7 +118,7 @@ pub fn check_writing_run(
     let theirs = server.map_err(|why| {
         format!(
             "{bin}: refusing a writing run: cannot read the API's belief_modes ({why}). \
-             A writing run must show that its belief modes match the API's (SPEC §10.2, gate G0). \
+             A writing run must show that its belief modes match the API's (SPEC §10.2). \
              Checked {api_base}: set EPIGRAPH_API (or EPIGRAPH_API_URL) to the API this run \
              writes alongside, or run with --dry-run.{typos}"
         )
@@ -130,7 +130,7 @@ pub fn check_writing_run(
     let lines: Vec<String> = skew.iter().map(|s| format!("  {s}")).collect();
     Err(format!(
         "{bin}: refusing a writing run: this process's belief modes differ from the API's at \
-         {api_base} (SPEC §10.2, gate G0):\n{}\n\
+         {api_base} (SPEC §10.2):\n{}\n\
          Start this run with the server's modes, or run with --dry-run.{typos}",
         lines.join("\n")
     ))

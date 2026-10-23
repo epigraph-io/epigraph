@@ -1,9 +1,10 @@
 //! MCP `system_stats` and REST `/health` report the same belief modes
-//! (SPEC §10.2, "Visibility"; gate G0).
+//! (SPEC §10.2, "Visibility").
 //!
-//! Gate G0 reads the modes of every live process, and an operator (or a CLI
-//! wave bin) may read either surface. If the two disagreed inside ONE process,
-//! G0 would compare different things depending on which door it knocked on.
+//! The pre-flip mode check (SPEC §10.4) reads the modes of every live
+//! process, and an operator (or a CLI wave bin) may read either surface. If
+//! the two disagreed inside ONE process, that check would compare different
+//! things depending on which door it knocked on.
 //!
 //! The modes are process-global, so this binary holds one test and sets the
 //! environment before anything reads it. Every flag is set to a NON-default

@@ -144,7 +144,7 @@
 //!   LLM call. Both retarget writing modes first check this process's belief
 //!   modes against the API's `/health` and refuse on any difference, before
 //!   the database or the token mint (`epigraph_cli::belief_mode_check`, SPEC
-//!   §10.2 gate G0); the retarget dry run is exempt.
+//!   §10.2); the retarget dry run is exempt.
 //!
 //! Every writing mode resolves API auth BEFORE any LLM call (gh-375).
 //!
@@ -882,7 +882,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mode = resolve_mode(&cli, chrono::Utc::now())?;
     // A retarget write is a wave run: before the database, the ledger and the
-    // token mint, its belief modes must match the API's (SPEC §10.2, gate G0).
+    // token mint, its belief modes must match the API's (SPEC §10.2).
     if mode.is_retarget_write() {
         epigraph_cli::belief_mode_check::enforce_or_exit(
             "decompose_claims --retarget",

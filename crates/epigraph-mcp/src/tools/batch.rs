@@ -204,8 +204,9 @@ pub async fn system_stats(
         "agents": agent_count,
         "frames": counts.frames,
         // The belief modes this process read at startup (SPEC §10.2), the
-        // same report as the API's `/health` → `belief_modes`; gate G0
-        // compares it across live processes, stdio clients included.
+        // same report as the API's `/health` → `belief_modes`; the pre-flip
+        // mode check (SPEC §10.4) compares it across live processes, stdio
+        // clients included.
         "belief_modes": epigraph_engine::belief_modes::current(),
     });
 

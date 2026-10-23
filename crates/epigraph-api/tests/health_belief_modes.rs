@@ -1,8 +1,9 @@
 //! `/health` reports the belief modes this process read from its environment
-//! (SPEC §10.2, "Visibility"; gate G0).
+//! (SPEC §10.2, "Visibility").
 //!
 //! Every belief-mode flag is read once per process, at startup. A flag flip is
-//! therefore a restart window over N processes, and gate G0 compares what each
+//! therefore a restart window over N processes, and the pre-flip mode check
+//! (SPEC §10.4) compares what each
 //! live process says it is running. `/health` is where the API says it, so it
 //! must report the modes the process actually parsed from ITS environment,
 //! not the defaults and not what some other process was configured with.
@@ -88,7 +89,7 @@ async fn health_reports_the_belief_modes_this_process_read_from_its_environment(
         .and_then(serde_json::Value::as_object)
         .unwrap_or_else(|| panic!("/health has no `belief_modes` object: {body}"));
 
-    // Exactly the seven flags: a missing one cannot be compared by gate G0,
+    // Exactly the seven flags: a missing one cannot be compared across processes,
     // and an extra one would be a mode no process can be configured with.
     let mut keys: Vec<&str> = modes.keys().map(String::as_str).collect();
     keys.sort_unstable();
