@@ -1359,6 +1359,13 @@ pub async fn recompute_atom_cache(
 /// (the residue) is served from its old cache, and is vacated only through
 /// the operator accept list (SPEC §10.5). **No arm ever NULLs a cache.**
 ///
+/// **Viewer.** Every arm folds what `viewer` can see and offers it to the one
+/// global `claims` cache, exactly as the legacy writers do, under the
+/// migration-114 non-owner rule. That holds for the empty-fold decision too:
+/// a viewer who cannot see an atom's remaining group-private rows sees an
+/// empty fold. Which viewer each lifecycle site writes as is chosen where the
+/// site is wired (PR-5b1), as `retraction_cascade` chooses it today.
+///
 /// **Row security.** The role is read without a splice, which makes "a
 /// compound is never written" hold on a connection that bypasses row
 /// security. On an application session `edges` row security can hide a
