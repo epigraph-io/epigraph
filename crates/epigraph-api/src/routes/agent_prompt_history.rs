@@ -28,7 +28,9 @@
 //! succession, `distance` 1 = a parent) and `lineage.descendants` (down it),
 //! one entry per agent carrying all of its snapshots. A lineage member the
 //! caller may not read is listed by id with `readable: false` and no
-//! snapshots.
+//! snapshots. The walk goes [`LINEAGE_DEPTH_LIMIT`] generations each way;
+//! `ancestors_at_limit` / `descendants_at_limit` say it reached that limit, so
+//! farther generations, if any, are not listed.
 //!
 //! The listing carries NO file content: each file is named by the BLAKE3 of
 //! its raw bytes (`{"blob_hash": ..}`), so the listing grows with the number of
@@ -78,6 +80,13 @@ use crate::state::AppState;
 /// The scope the route requires.
 pub const REQUIRED_SCOPE: &str = "claims:read";
 
+/// How many generations migration 161's `epigraph_agent_prompt_history` walks
+/// each way (its `v_level < 64`). It is the definer's literal, restated here
+/// so the listing can say when the walk reached it;
+/// `the_listing_says_when_the_lineage_walk_reached_its_depth_limit` fails if
+/// the two drift apart.
+pub const LINEAGE_DEPTH_LIMIT: u32 = 64;
+
 /// `GET /api/v1/agents/:id/prompt-history` response.
 #[derive(Debug, Serialize)]
 pub struct PromptHistoryResponse {
@@ -96,6 +105,13 @@ pub struct LineageView {
     pub ancestors: Vec<LineageMember>,
     /// Down the succession, nearest first.
     pub descendants: Vec<LineageMember>,
+    /// How many generations the walk goes each way.
+    pub depth_limit: u32,
+    /// True when an ancestor is listed at `depth_limit`: the walk stopped
+    /// there, so farther ancestors, if any, are not listed.
+    pub ancestors_at_limit: bool,
+    /// The same, down the succession.
+    pub descendants_at_limit: bool,
 }
 
 /// One agent in the lineage.
@@ -244,12 +260,20 @@ pub fn group_history(agent_id: Uuid, rows: Vec<PromptHistoryIndexEntry>) -> Prom
     // FARTHEST ancestor first.
     ancestors.sort_by_key(|m| m.distance);
     descendants.sort_by_key(|m| m.distance);
+    let at_limit = |members: &[LineageMember]| {
+        members
+            .last()
+            .is_some_and(|m| m.distance >= LINEAGE_DEPTH_LIMIT)
+    };
     PromptHistoryResponse {
         agent_id,
         snapshots: own,
         lineage: LineageView {
+            ancestors_at_limit: at_limit(&ancestors),
+            descendants_at_limit: at_limit(&descendants),
             ancestors,
             descendants,
+            depth_limit: LINEAGE_DEPTH_LIMIT,
         },
     }
 }
