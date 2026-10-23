@@ -728,6 +728,115 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The verdict a dry run prints for each listed id (`{"claim_id", "vacate"}`
+/// lines).
+fn dry_vacate_verdicts(stdout: &str) -> HashMap<Uuid, String> {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            Some((
+                v.get("claim_id")?.as_str()?.parse().ok()?,
+                v.get("vacate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// SPEC §10.5 vacates residue ATOMS, and an atom is a current claim
+/// (`select_wave_cohort` reads `is_current` too). A superseded claim on an
+/// accept list (lists are generated from a class rule, so one can be) is
+/// never vacated: its cache keeps its sentinel and nothing is recorded. The
+/// dry run's verdict for every listed id is the apply's own outcome: an id
+/// the dry run says it would vacate is the one the apply records, and every
+/// other id is reported skipped with the same key by both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_listed_superseded_claim_is_never_vacated_and_the_dry_run_agrees(pool: PgPool) {
+    let dir = scratch_dir();
+    let f = seed_vacate_fixture(&pool).await;
+    let owner = agent(&pool, "superseded-owner").await;
+    let ingest = agent(&pool, "superseded-ingest").await;
+    let rv = frame(&pool, "research_validity").await;
+    let superseded = claim(&pool, owner, "superseded residue").await;
+    insert_row(&pool, superseded, &template_row(rv, ingest)).await;
+    let superseded_before = set_sentinel(&pool, superseded, rv, 0.05).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(superseded)
+        .execute(&pool)
+        .await
+        .expect("supersede");
+    let env = WaveEnv::new(&pool, "legacy").await;
+    let listed = [
+        f.listed_residue,
+        superseded,
+        f.listed_evidenced,
+        f.listed_compound,
+    ];
+    let list = write_accept_list(&dir, &listed);
+
+    let dry = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &["--dry-run", "--accept-vacate", s(&list)],
+        &[("DATABASE_URL", env.db.as_str())],
+    );
+    dry.ok("dry accept-vacate");
+    let verdicts = dry_vacate_verdicts(&dry.stdout);
+    assert_eq!(
+        verdicts.len(),
+        listed.len(),
+        "one verdict per listed id: {}",
+        dry.stdout
+    );
+
+    let wave_file = dir.join("vacate-wave.jsonl");
+    let real = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &vacate_args(s(&list), s(&wave_file), s(&dir)),
+        &env.vars(),
+    );
+    real.ok("accept-vacate run");
+
+    assert_eq!(
+        cache(&pool, superseded).await,
+        superseded_before,
+        "a superseded claim on the accept list was vacated"
+    );
+    assert_ne!(
+        cache(&pool, f.listed_residue).await,
+        f.before[&f.listed_residue],
+        "control: the current listed residue claim is vacated"
+    );
+    let recorded: HashSet<Uuid> = read_wave(std::io::BufReader::new(
+        std::fs::File::open(&wave_file).expect("the wave file exists"),
+    ))
+    .expect("parse the wave file")
+    .into_iter()
+    .map(|r| r.claim_id)
+    .collect();
+    for id in listed {
+        let verdict = &verdicts[&id];
+        if verdict == "would_vacate" {
+            assert!(
+                recorded.contains(&id),
+                "{id}: the dry run said would_vacate, the apply did not vacate it"
+            );
+        } else {
+            assert!(
+                !recorded.contains(&id),
+                "{id}: the dry run said {verdict}, the apply vacated it"
+            );
+            assert!(
+                real.stdout.contains(&format!("{id}: {verdict}")),
+                "{id}: the apply must report the dry run's {verdict}\nstdout: {}",
+                real.stdout
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── (4) compounds ───────────────────────────────────────────────────────────
 
 /// A compound is never written: not by a leaf wave, not by a standalone wave,
