@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
 use epigraph_cli::shadow_report::{
-    run_report, ClaimLine, Flips, ReportOptions, Scope, Summary, DEFAULT_MIN_TRUTH,
+    run_report, ClaimLine, Flips, ObstructionChanges, ReportOptions, Scope, Summary,
+    DEFAULT_MIN_TRUTH,
 };
 use epigraph_db::repos::recall_event::{NewRecallEvent, RecallEventRepository};
 use epigraph_db::{FrameRepository, MassFunctionRepository, Viewer};
@@ -697,10 +698,13 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
 /// The sheaf shadow reads each endpoint's candidate interval, not its cache.
 /// `s -supports-> t` between two atoms whose caches the single writer set
 /// to their folds, and `k -supports-> s` from a compound. With every cache
-/// equal to its fold the shadow's cohomology is the served one. A writer
-/// outside the plan then rewrites t's interval: the served cohomology moves
-/// and the shadow's does not. Strict drops the compound-ended edge: one of
-/// two edges, coverage .5.
+/// equal to its fold (and `k` out of scope) the shadow's cohomology is the
+/// served one. A writer outside the plan then rewrites t's interval: the
+/// served cohomology moves and the shadow's does not. Strict drops the
+/// compound-ended edge; the coverage denominator (SPEC §1.3) is the
+/// atom-atom edge `s -> t` (`k -> s` is not replaced by atom edges, so its
+/// drop is reported, not counted against coverage), and strict evaluates
+/// it: coverage 1.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_sheaf_shadow_reads_the_folds_and_strict_drops_compound_ended_edges(pool: PgPool) {
     let author = agent(&pool).await;
@@ -731,13 +735,46 @@ async fn the_sheaf_shadow_reads_the_folds_and_strict_drops_compound_ended_edges(
         (2, 2, 1),
         "strict drops the compound-ended edge"
     );
+    assert_eq!(
+        (
+            sh.coverage_denominator,
+            sh.atom_atom_edges,
+            sh.compound_ended_edges,
+            sh.compound_ended_replaced
+        ),
+        (1, 1, 1, 0),
+        "the denominator is s -> t; k -> s is compound-ended and not replaced"
+    );
     assert!(
-        (sh.strict.coverage - 0.5).abs() < 1e-12,
-        "1 of 2 edges kept"
+        (sh.strict.coverage - 1.0).abs() < 1e-12,
+        "strict evaluates the one denominator edge: {sh:?}"
     );
     assert!(
         sh.served.h1 > 0.0,
         "the fixture is inconsistent somewhere: {sh:?}"
+    );
+
+    // With k out of scope only s -> t is evaluated, and every cache equals
+    // its fold: the served cohomology and the shadow's are the same.
+    let (no_k, _) = report(
+        &pool,
+        &public,
+        &maint,
+        &opts(Scope::Ids(
+            [s, t].iter().chain(&leaves).copied().collect::<Vec<_>>(),
+        )),
+    )
+    .await;
+    assert_eq!(
+        no_k.sheaf.pairs_outside_scope, 1,
+        "k -> s has an end outside the scope"
+    );
+    assert!(
+        no_k.sheaf.served.h1 > 0.0
+            && (no_k.sheaf.served.h1 - no_k.sheaf.strict.h1).abs() < 1e-12
+            && (no_k.sheaf.served.h1 - no_k.sheaf.progressive.h1).abs() < 1e-12,
+        "caches equal to their folds give the served cohomology: {:?}",
+        no_k.sheaf
     );
 
     // The served side of s -> t alone, against the shadow's, with k's edge
@@ -1452,6 +1489,449 @@ async fn the_owner_rule_stage_is_the_owner_frame_combination(pool: PgPool) {
     assert!(
         (one - 0.9).abs() < 1e-9,
         "the owner-frame combination of .6 and .5 is BetP .9, got {one}"
+    );
+}
+
+// ── spine compounds are tallied apart ───────────────────────────────────────
+
+/// Mark a compound as a spine node (level 1: a section).
+async fn make_spine(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET properties = \
+         jsonb_set(COALESCE(properties, '{}'::jsonb), '{level}', '\"1\"') WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("spine level");
+}
+
+/// A spine compound is served a profile (SPEC §2.2), whose Bel is a Fréchet
+/// floor, never a conjunction; the compound tallies the cutover is reviewed
+/// on count conjunctions, and spines on their own.
+///
+/// * `sp`: a spine over two leaves with no evidence and no cache, serving
+///   .85 today (confirmed): its profile is Bel 0, Pl 1 (vacuous), a spine
+///   vacate and a spine flip FROM confirmed.
+/// * `kc`: a conjunction over leaves .95 / .95, serving .5: Bel .9025, a
+///   conjunction flip TO confirmed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_compounds_are_tallied_apart_from_conjunctions(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (sp, sp_leaves) = compound(&pool, author, "sp", &[&[], &[]]).await;
+    make_spine(&pool, sp).await;
+    set_cache(&pool, sp, 0.8, 0.9, 0.85).await;
+    let (kc, kc_leaves) = compound(&pool, author, "kc", &[&[0.95], &[0.95]]).await;
+    set_cache(&pool, kc, 0.4, 0.6, 0.5).await;
+
+    let mut ids = vec![sp, kc];
+    ids.extend(sp_leaves.iter().chain(&kc_leaves));
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+
+    assert!(
+        lines[&sp].spine && lines[&sp].strict.basis == "profile",
+        "sp is a spine served a profile: {:?}",
+        lines[&sp].strict
+    );
+    assert_eq!(
+        (
+            summary.by_role.get("compound").copied(),
+            summary.by_role.get("compound_spine").copied()
+        ),
+        (Some(1), Some(1)),
+        "one conjunction, one spine: {:?}",
+        summary.by_role
+    );
+    assert!(
+        summary.abs_delta.contains_key("compound_spine"),
+        "the spine's |delta| has its own quantiles"
+    );
+    assert_eq!(
+        (
+            summary.vacate.atoms,
+            summary.vacate.compounds,
+            summary.vacate.spines
+        ),
+        (0, 0, 1),
+        "the vacuous profile is a spine vacate, not a compound one"
+    );
+    assert_eq!(
+        (
+            summary.compound_confirmed_set.strict,
+            summary.spine_confirmed_set.strict
+        ),
+        (1, 0),
+        "kc is the confirmed conjunction; the spine's floor is 0"
+    );
+    assert_eq!(
+        (
+            summary.strict_entry.compounds,
+            summary.strict_entry.confirmed
+        ),
+        (1, Flips { to: 1, from: 0 }),
+        "the conjunction replay sees kc enter confirmed and nothing leave"
+    );
+    assert_eq!(
+        (
+            summary.strict_entry_spine.compounds,
+            summary.strict_entry_spine.confirmed
+        ),
+        (1, Flips { to: 0, from: 1 }),
+        "the spine replay sees sp leave confirmed"
+    );
+    let sp_mover = summary.top_movers.iter().find(|m| m.claim_id == sp);
+    assert_eq!(
+        sp_mover.map(|m| m.role),
+        Some("compound_spine"),
+        "a mover says it is a spine"
+    );
+}
+
+// ── the target fold and the floor-viewer measure ────────────────────────────
+
+/// Under `aef_standalone` only standalones fold under the AEF; a leaf keeps
+/// today's value, so its fold is not what the run serves and is not in the
+/// mismatch denominator, and the compound numbers read leaf folds the run
+/// does not serve. The fold mismatch is the floor-viewer measure (SPEC §1.3)
+/// only for the anonymous viewer under `aef`.
+///
+/// * `st`: a standalone with a support .9 (fold `BetP` .95) and a stale cache
+///   (`BetP` .55): delta .4, returned by two events.
+/// * `kx`: a compound over the leaf `lf`, which has a support .8 (fold `BetP`
+///   .9) and a stale cache (`BetP` .35): delta .55, returned by none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_target_fold_bounds_the_fold_mismatch_and_flags_compound_statistics(pool: PgPool) {
+    let author = agent(&pool).await;
+    let st = claim(&pool, author, "st").await;
+    support(&pool, st, 0.9).await;
+    set_cache(&pool, st, 0.5, 0.6, 0.55).await;
+    let (kx, kx_leaves) = compound(&pool, author, "kx", &[&[0.8]]).await;
+    let lf = kx_leaves[0];
+    set_cache(&pool, lf, 0.3, 0.4, 0.35).await;
+    recall_event(&pool, Some(0.3), &[st]).await;
+    recall_event(&pool, Some(0.3), &[st]).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let scope = Scope::Ids(vec![st, kx, lf]);
+
+    let mut o = opts(scope.clone());
+    o.target_fold = AtomFoldMode::AefStandalone;
+    let (w0, lines) = report(&pool, &public, &maint, &o).await;
+    assert_eq!(
+        (lines[&st].strict.basis, lines[&lf].strict.basis),
+        ("axiom", "served"),
+        "the standalone folds; the leaf keeps today's value"
+    );
+    assert_eq!(
+        (w0.fold_mismatch.p1_atoms, w0.fold_mismatch.mismatched),
+        (1, 1),
+        "only the standalone's fold is what this run serves"
+    );
+    assert!(
+        !w0.fold_mismatch.measures_floor && !w0.compound_statistics_valid,
+        "not the floor measure, and the compound numbers read unserved leaf folds"
+    );
+
+    let (w1, _) = report(&pool, &public, &maint, &opts(scope.clone())).await;
+    assert_eq!(
+        (w1.fold_mismatch.p1_atoms, w1.fold_mismatch.mismatched),
+        (2, 2),
+        "under aef both atoms serve their folds, and both caches are stale"
+    );
+    assert!(
+        w1.fold_mismatch.measures_floor && w1.compound_statistics_valid,
+        "the anonymous run under aef is the floor measure"
+    );
+    let order: Vec<Uuid> = w1.top_movers.iter().map(|m| m.claim_id).collect();
+    assert_eq!(
+        order.first(),
+        Some(&st),
+        "st's .4 returned twice outweighs lf's unreturned .55: {:?}",
+        w1.top_movers
+    );
+    assert_eq!(order.get(1), Some(&lf), "then lf");
+
+    let (as_maint, _) = report(&pool, &maint, &maint, &opts(scope)).await;
+    assert!(
+        !as_maint.fold_mismatch.measures_floor,
+        "the maintenance viewer's run is not the floor measure"
+    );
+}
+
+// ── the drift decomposition: the clamp stage and compounds ──────────────────
+
+/// SPEC §10.4 names a clamp-residue stage (0c) between (0b) and (1); the
+/// report cannot separate it, so it is present and null, and the next stage
+/// absorbs it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_drift_decomposition_carries_the_clamp_stage_as_null(pool: PgPool) {
+    let author = agent(&pool).await;
+    let a = claim(&pool, author, "clamp").await;
+    support(&pool, a, 0.6).await;
+    set_cache(&pool, a, 0.4, 1.0, 0.7).await;
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (_, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![a]))).await;
+    let d = lines[&a]
+        .drift
+        .clone()
+        .expect("a P1 atom has a decomposition");
+    assert_eq!(d.unit, "betp", "an atom's stages are in BetP");
+    assert!(
+        d.stages.contains_key("0c") && d.stages.get("0c") == Some(&None),
+        "0c is named and null: {:?}",
+        d.stages
+    );
+    assert_eq!(
+        d.components.get("0c"),
+        Some(&None),
+        "and its component is null"
+    );
+}
+
+/// A compound's decomposition (SPEC §10.4), in Bel: (a) the legacy own-fold
+/// (today's cache), (b) R-DEP without attribution (not separable here,
+/// null), (c) R-DEP with attribution, (d) (c) met by the `not_all`
+/// valuation; and the product-frame `BetP` as its own line.
+///
+/// `kd`: leaves .95 / .95 (R-DEP Bel .9025), a refutation row .6 of its own
+/// (`not_all` .6), serving Bel .7 / `BetP` .8. Met by `not_all`, Bel becomes
+/// .9025 x .4 / (1 - .6 x .9025) = .787350.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_drift_names_the_conjunction_and_its_not_all(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (kd, leaves) = compound(&pool, author, "kd", &[&[0.95], &[0.95]]).await;
+    refute(&pool, kd, 0.6).await;
+    set_cache(&pool, kd, 0.7, 0.9, 0.8).await;
+    let mut ids = vec![kd];
+    ids.extend(&leaves);
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (_, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+    let line = &lines[&kd];
+    assert!(
+        line.drift.is_some(),
+        "a compound line carries its decomposition: {line:?}"
+    );
+    let d = line.drift.clone().unwrap_or_default();
+    let near = |x: Option<f64>, y: f64| x.is_some_and(|x| (x - y).abs() < 1e-6);
+    assert_eq!(d.unit, "bel", "a compound's stages are in Bel");
+    assert!(near(d.stages.get("a").copied().flatten(), 0.7), "(a) {d:?}");
+    assert_eq!(d.stages.get("b"), Some(&None), "(b) is null: {d:?}");
+    assert!(
+        near(d.stages.get("c").copied().flatten(), 0.9025),
+        "(c) {d:?}"
+    );
+    assert!(
+        near(d.stages.get("d").copied().flatten(), 0.787_350),
+        "(d) {d:?}"
+    );
+    assert!(
+        (d.start - 0.7).abs() < 1e-9
+            && near(Some(d.final_value), 0.787_350)
+            && near(Some(d.total), 0.787_350 - 0.7),
+        "from today's Bel to the served Bel: {d:?}"
+    );
+    let sum: f64 = d.components.values().flatten().sum();
+    assert!((sum - d.total).abs() < 1e-12, "components sum to the total");
+    let betp = d.product_frame_betp.expect("the product-frame line");
+    assert!(
+        (betp.today - 0.8).abs() < 1e-12
+            && (betp.derived - line.strict.interval.betp).abs() < 1e-12
+            && (betp.delta - (betp.derived - betp.today)).abs() < 1e-12,
+        "today's .8 beside the served product-frame BetP: {betp:?}"
+    );
+}
+
+// ── the sheaf shadow maps every changed obstruction to a cause ──────────────
+
+/// An epistemic edge with properties, returning its id.
+async fn edge_with(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+    properties: serde_json::Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+         properties) VALUES ($1, 'claim', $2, 'claim', $3, $4) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .bind(properties)
+    .fetch_one(pool)
+    .await
+    .expect("edge")
+}
+
+/// Every obstruction that vanishes or appears under a candidate mode has a
+/// cause (SPEC §1.3, §10.4). `contradicts` caps its target's Bel at
+/// 1 - .9 x Bel(source); a `supports` edge floors it at .8 x Bel(source).
+/// Atoms marked (w) were written through the single atom-cache writer.
+///
+/// * `s -supports-> t` (w; .9 over t's .2 / refutation .6, Bel .09):
+///   obstructed both ways, no change.
+/// * `k -contradicts-> s`: `k` serves Bel .5 (cap .55) and derives Bel .49
+///   (cap .559) over leaves .7 / .7, under s's .9: obstructed today and in
+///   progressive; strict drops the compound-ended edge, unreplaced.
+/// * `k2 -contradicts-> s2` (s2 w, .9), replaced by `l2 -contradicts-> s2`
+///   (l2 a leaf of `k2`, w, .7: cap .37): progressive and strict drop the
+///   replaced edge; its replacement is obstructed both ways.
+/// * `u -contradicts-> w` (u w, .9; cap .19): `w` serves Bel .95 by a hand
+///   write, but its fold is a refutation .8 (Bel 0): resolved on value.
+/// * `h -contradicts-> g` (h w, .9): `g` has a support .9 and no cache, so
+///   today's cohomology cannot evaluate the edge; its fold (Bel .9) is over
+///   the cap .19: new, with a gained value.
+/// * `r -contradicts-> q` (r w, .9): `q` serves Bel 0 by a hand write over a
+///   support .9: new on value.
+///
+/// The denominator: the four atom-atom edges today evaluates (not h -> g)
+/// plus the replaced compound edge; every mode covers all five.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_sheaf_shadow_maps_each_changed_obstruction_to_a_cause(pool: PgPool) {
+    let author = agent(&pool).await;
+    let atom = |name: &'static str| {
+        let pool = pool.clone();
+        async move { claim(&pool, author, name).await }
+    };
+    let (s, t, s2, u, w, h, g, r, q) = (
+        atom("s").await,
+        atom("t").await,
+        atom("s2").await,
+        atom("u").await,
+        atom("w").await,
+        atom("h").await,
+        atom("g").await,
+        atom("r").await,
+        atom("q").await,
+    );
+    for id in [s, s2, u, h, g, r, q] {
+        support(&pool, id, 0.9).await;
+    }
+    support(&pool, t, 0.2).await;
+    refute(&pool, t, 0.6).await;
+    refute(&pool, w, 0.8).await;
+    let (k, k_leaves) = compound(&pool, author, "k", &[&[0.7], &[0.7]]).await;
+    let (k2, k2_leaves) = compound(&pool, author, "k2", &[&[0.7], &[0.7]]).await;
+    let l2 = k2_leaves[0];
+    set_cache(&pool, k, 0.5, 0.9, 0.7).await;
+    set_cache(&pool, k2, 0.5, 0.9, 0.7).await;
+
+    edge(&pool, s, t, "supports").await;
+    edge(&pool, k, s, "contradicts").await;
+    let replacement = edge_with(&pool, l2, s2, "contradicts", serde_json::json!({})).await;
+    edge_with(
+        &pool,
+        k2,
+        s2,
+        "contradicts",
+        serde_json::json!({"retargeted_to": [replacement], "retarget_unwired": []}),
+    )
+    .await;
+    edge(&pool, u, w, "contradicts").await;
+    edge(&pool, h, g, "contradicts").await;
+    edge(&pool, r, q, "contradicts").await;
+
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    single_writer(&pool, &maint, &[s, t, s2, l2, u, h, r]).await;
+    set_cache(&pool, w, 0.95, 1.0, 0.975).await;
+    set_cache(&pool, q, 0.0, 1.0, 0.5).await;
+
+    let mut ids = vec![s, t, s2, u, w, h, g, r, q, k, k2];
+    ids.extend(k_leaves.iter().chain(&k2_leaves));
+    let public = fixture::public_viewer(&pool).await;
+    let (summary, _) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+    let sh = &summary.sheaf;
+
+    assert_eq!(
+        (
+            sh.coverage_denominator,
+            sh.atom_atom_edges,
+            sh.compound_ended_edges,
+            sh.compound_ended_replaced
+        ),
+        (5, 4, 2, 1),
+        "four atom-atom edges evaluated today plus the replaced compound edge: {sh:?}"
+    );
+    assert_eq!(
+        (
+            sh.served.edge_count,
+            sh.progressive.edge_count,
+            sh.strict.edge_count
+        ),
+        (6, 6, 5),
+        "today: every edge but h -> g; progressive: all but the replaced edge; strict: the \
+         five atom-atom edges"
+    );
+    for (mode, stats) in [("progressive", &sh.progressive), ("strict", &sh.strict)] {
+        assert!(
+            (stats.coverage - 1.0).abs() < 1e-12,
+            "{mode} covers the denominator: {stats:?}"
+        );
+    }
+    assert_eq!(
+        sh.progressive_changes,
+        ObstructionChanges {
+            vanished_on_value: 1,
+            vanished_edge_replaced: 1,
+            vanished_edge_dropped: 0,
+            vanished_endpoint_without_value: 0,
+            new_on_value: 1,
+            new_endpoint_gained_value: 1,
+        },
+        "progressive: u -> w resolves, k2 -> s2 is replaced, r -> q and h -> g appear"
+    );
+    assert_eq!(
+        sh.strict_changes,
+        ObstructionChanges {
+            vanished_on_value: 1,
+            vanished_edge_replaced: 1,
+            vanished_edge_dropped: 1,
+            vanished_endpoint_without_value: 0,
+            new_on_value: 1,
+            new_endpoint_gained_value: 1,
+        },
+        "strict also drops k -> s, which nothing replaced"
+    );
+}
+
+/// `served_as_tool` is today's cohomology exactly as the sheaf tool computes
+/// it: intervals from the cache with the claim's `open_world_mass` (never
+/// written, so 0). The like-for-like `served` reads `mass_on_missing`, the
+/// column the candidate's open-world mass is compared with. With
+/// `mass_on_missing` .2 on t, only `served` carries an open-world component.
+#[sqlx::test(migrations = "../../migrations")]
+async fn served_as_tool_reads_what_the_sheaf_tool_reads(pool: PgPool) {
+    let author = agent(&pool).await;
+    let s = claim(&pool, author, "s").await;
+    let t = claim(&pool, author, "t").await;
+    support(&pool, s, 0.9).await;
+    support(&pool, t, 0.9).await;
+    edge(&pool, s, t, "supports").await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    single_writer(&pool, &maint, &[s, t]).await;
+    sqlx::query("UPDATE claims SET mass_on_missing = 0.2 WHERE id = $1")
+        .bind(t)
+        .execute(&pool)
+        .await
+        .expect("open-world mass on t");
+
+    let public = fixture::public_viewer(&pool).await;
+    let (summary, _) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![s, t]))).await;
+    let sh = &summary.sheaf;
+    assert_eq!(
+        (sh.served_as_tool.edge_count, sh.served.edge_count),
+        (1, 1),
+        "both read s -> t"
+    );
+    assert!(
+        sh.served_as_tool.open_world_h1.abs() < 1e-12 && sh.served.open_world_h1 > 0.1,
+        "the tool reads open_world_mass (0); the like-for-like column is .2: {sh:?}"
     );
 }
 
