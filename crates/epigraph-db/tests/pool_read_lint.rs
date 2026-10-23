@@ -43,13 +43,23 @@
 //! * Writes are selected too (`DELETE FROM claims`, `UPDATE ... FROM edges`).
 //!   Every entry today IS a write, and each is registered with the reason it
 //!   needs no viewer, so the register is the review record.
+//! * [`TENANTED_TABLES`] names six tables: the claim graph's core (`claims`,
+//!   `edges`, `evidence`, `mass_functions`, `reasoning_traces`,
+//!   `claim_versions`). It is NOT the full tier-A list from migration 062
+//!   (`triples`, `frames`, `perspectives`, `recall_events`, the `harvester_*`
+//!   tables, and others carry tenancy too); a viewer-less pool read of one of
+//!   those is not selected here.
+//! * Only a pool named in the PARAMETER list is seen. A repo struct that holds
+//!   its pool in a field and reads it through `&self` / `self.pool` is outside
+//!   this selector.
 
 mod lint_text;
 
 use std::path::{Path, PathBuf};
 
-/// Tables whose rows carry tenancy (`owner_group_id` / `visibility`) and are
-/// read on request paths.
+/// The tenanted tables this lint covers: the claim graph's core, a SUBSET of
+/// the tables whose rows carry tenancy (`owner_group_id` / `visibility`). See
+/// the module's Limits section for what is not covered.
 const TENANTED_TABLES: &[&str] = &[
     "claims",
     "edges",
