@@ -1404,6 +1404,27 @@ restart.
   it an admin (PR-18). Slot 159 per the drain's slot register; 154-158 are
   claimed elsewhere. **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **162**: public `agent_key_retire_closes_window`. Re-states 118's
+  `epigraph_agent_key_set_status(uuid, text, text, uuid)` (`CREATE OR
+  REPLACE`, same signature; owner and grant re-asserted idempotently, as 140
+  does) with ONE change: both transitions (active -> rotated, anything but
+  revoked -> revoked) also set `valid_until = LEAST(valid_until, now())`.
+  Before it, a rotated or revoked key kept an open-ended validity window, so
+  a "key valid at the claim's created_at" check would keep binding signatures
+  made after the key was retired. `LEAST` ignores NULL, so an open window
+  ends at the transition and an already-ended window keeps its earlier end.
+  The rotate handler opens the new key's window no earlier than the returned
+  `valid_until`. Pinned by `epigraph-api/tests/agent_mutation_auth_test.rs`
+  (`*_closes_*_window`, `revoke_agent_key_never_reopens_or_extends_a_closed_window`)
+  and, for the app role's transitions, `epigraph-db/tests/app_role_table_lockdown.rs`.
+  Existing retired rows keep `valid_until` NULL (not reconstructed). Undo:
+  re-run 118's `CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status`
+  block. Slot: 160 and 161 are carried by open PR branches, so 162 is the
+  first number free on `main` and on every open PR branch; an apply before
+  160/161 is harmless (sqlx applies a lower pending version, and neither of
+  them touches this function). **Deploy order:** none against the binaries (an
+  older binary ignores the returned `valid_until`). **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

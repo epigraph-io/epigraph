@@ -270,11 +270,17 @@ pub async fn rotate_agent_key(
         });
     }
 
-    // Mark old key as rotated
-    AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None).await?;
+    // Mark old key as rotated. Since migration 162 this also closes its
+    // validity window (`valid_until`) on the database clock.
+    let retired =
+        AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None)
+            .await?;
 
-    // Store the new active key
+    // Store the new active key. Its window opens no earlier than the old one
+    // closed, so the two never overlap even if this host's clock is behind
+    // the database's.
     let now = Utc::now();
+    let valid_from = retired.valid_until.map_or(now, |closed| closed.max(now));
     let new_key_id = Uuid::new_v4();
     let new_key_row = AgentKeyRepository::store(
         &state.db_pool,
@@ -283,7 +289,7 @@ pub async fn rotate_agent_key(
         &new_key_array,
         "signing",
         "active",
-        now,
+        valid_from,
         None,
         now,
     )
