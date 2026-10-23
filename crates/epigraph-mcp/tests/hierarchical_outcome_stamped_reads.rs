@@ -20,10 +20,13 @@
 //!
 //! * A member of the owning group gets every row attributed to its step, in
 //!   plan order, and no unresolved indices.
-//! * A caller that reads NONE of the plan's `executes` edges is refused with
-//!   the same error as an unknown id, on both tools, and nothing is written:
+//! * A caller that reads NONE of the plan's `executes` edges is refused on
+//!   both tools with the hierarchical not-found error, which is exactly what
+//!   the direct tool answers for an unknown id, and nothing is written:
 //!   `workflows` has no row security, so this is the only gate on its
-//!   counters. It learns no step id.
+//!   counters. It learns no step id. (`report_workflow_outcome` answers an
+//!   unknown id through the flat path's own error; a known, pre-existing
+//!   difference, pinned in `a_non_member_cannot_report_on_a_plan_it_cannot_read`.)
 //! * A reader of the plan whose `step_index` matches no step it can read gets
 //!   that row recorded with a NULL `step_claim_id`, and the response NAMES the
 //!   unresolved indices with a warning; an out-of-range index and a step hidden
@@ -417,10 +420,21 @@ async fn a_hidden_plan_does_not_shift_a_visible_appended_step(pool: PgPool) {
         "step 0 is a private step; the visible appended step must not take its index: {json}"
     );
     assert_eq!(unresolved(&json), vec![0], "{json}");
-    assert!(
-        json["warning"].as_str().is_some(),
-        "an unattributed row is disclosed: {json}"
+    // The disclosure is built from the indices alone: the warning for a step
+    // hidden inside the plan is word for word the one an out-of-range index
+    // gets, and the response names none of the private steps.
+    assert_eq!(
+        json["warning"].as_str(),
+        epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(&[0]).as_deref(),
+        "a hidden step and an absent one get the same warning: {json}"
     );
+    let body = json.to_string();
+    for hidden in &w.planned {
+        assert!(
+            !body.contains(&hidden.to_string()),
+            "the response must not name a step the reporter cannot read: {json}"
+        );
+    }
 }
 
 /// A member reads the whole plan, so the appended step's position (after
@@ -761,6 +775,11 @@ async fn over_http_each_outcome_tool_reads_as_the_token_agent(pool: PgPool) {
         );
         assert!(unresolved(&json).is_empty(), "{tool}: {json}");
         delete_rows(&pool, w.workflow_id).await;
+        let (counter_before, _) = written(&pool, w.workflow_id).await;
+        assert!(
+            counter_before.is_some(),
+            "{tool}: the member's report moved the counter"
+        );
 
         let rpc = http_rpc(
             &url,
@@ -776,9 +795,10 @@ async fn over_http_each_outcome_tool_reads_as_the_token_agent(pool: PgPool) {
             message.contains("no hierarchical workflow with id"),
             "{tool}: refused as for an unknown id: {rpc}"
         );
-        assert!(
-            rows(&pool, w.workflow_id).await.is_empty(),
-            "{tool}: a non-member's token writes nothing: {rpc}"
+        assert_eq!(
+            written(&pool, w.workflow_id).await,
+            (counter_before, 0),
+            "{tool}: a non-member's token moves no counter and writes no row: {rpc}"
         );
     }
 }
@@ -948,17 +968,31 @@ async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
         (None, 0),
         "a refused report moves no counter and writes no row"
     );
-    // The direct tool answers exactly as for an unknown id. (Through
-    // `report_workflow_outcome` an unknown id falls through to the legacy
-    // flat-claim path and its own error; that the `workflows` row exists is
-    // not hidden from anyone, since the table has no row security.) Both tools
-    // give the hierarchical not-found error.
+    // The direct tool answers an unreadable workflow exactly as an unknown id.
+    // `report_workflow_outcome` does NOT: its routing probe sends an unknown
+    // id to the legacy flat-claim path and that path's own error, while an
+    // existing `workflows` row takes the hierarchical branch and gets the
+    // hierarchical not-found error. That difference predates this gate and is
+    // a known limitation: the row's existence is not secret (`workflows` has
+    // no row security), but the delegated tool does tell "exists" from
+    // "absent". Pinned below so that changing it is a deliberate decision.
     let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
     assert_eq!(
         refused[0], unknown[0],
-        "an unreadable workflow and a missing one get the same error"
+        "direct tool: an unreadable workflow and a missing one get the same error"
     );
-    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        refused[1], refused[0],
+        "the delegated tool refuses an unreadable hierarchical workflow as the direct tool does"
+    );
+    assert_eq!(
+        unknown[1],
+        (
+            rmcp::model::ErrorCode::INVALID_PARAMS.0,
+            "workflow <id> not found in `workflows` or `claims` tables".to_string()
+        ),
+        "the delegated tool's unknown-id answer (flat path; differs from refused[1])"
+    );
     for (_, message) in &refused {
         for step in &w.steps {
             assert!(
@@ -971,4 +1005,40 @@ async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
     let json = report(&server, &w.member, w.workflow_id, &[0, 1]).await;
     assert!(unresolved(&json).is_empty(), "{json}");
     assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
+}
+
+/// A `workflows` row with NO `executes` edge (a legacy claim-less plan, or one
+/// whose every edge was retracted) is refused like an unknown id for EVERY
+/// reporter, here a group member with write access to nothing in particular,
+/// and nothing is written. This is a deliberate consequence of the gate: there
+/// is no plan row through which any caller could be shown to read it. The
+/// stricter alternative (fall back to workflow authority when a plan has no
+/// edges) is an operator decision, not taken here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_root_with_no_executes_edge_is_refused_like_an_unknown_id(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-edgeless").await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("viewer");
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-edgeless",
+        0,
+        "A workflow root with no plan claims.",
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("insert workflow root");
+
+    let refused = refusals(&server, &viewer, workflow_id).await;
+    let unknown = refusals(&server, &viewer, Uuid::new_v4()).await;
+    assert_eq!(refused[0], unknown[0], "refused as for an unknown id");
+    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        written(&pool, workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
 }
