@@ -1470,6 +1470,87 @@ pub async fn list_claims(
     }))
 }
 
+/// Query keys `GET /claims` receives but has no predicate for.
+///
+/// [`PaginationParams`] carries no `deny_unknown_fields`, so each of these
+/// used to be dropped in silence: `?created_after=2999-…` answered the
+/// unfiltered newest-first page with the whole visible corpus as `total`, an
+/// answer that looks filtered and is not. They are the
+/// filters the two endpoints that DO honour them accept, so a caller sending
+/// one plainly meant it. Every other key stays accepted: a blanket
+/// `deny_unknown_fields` would break callers that send harmless extras, and
+/// `agent_id` is accepted-and-ignored for wire compatibility.
+#[cfg(feature = "db")]
+const LEGACY_LIST_UNHONORED_FILTERS: &[&str] = &[
+    "label",
+    "labels",
+    "tags",
+    "exclude_labels",
+    "created_after",
+    "created_before",
+    "date",
+    "truth_min",
+    "truth_max",
+    "is_current",
+    "exclude_agent_id",
+    "sort_by",
+    "sort_order",
+    "content_contains",
+    "methodology",
+    "evidence_type",
+];
+
+/// Refuse the first query key in `unhonored` with a 400 naming it, rather than
+/// let a listing handler drop a filter it cannot apply and answer as if it had.
+///
+/// Reads the raw query string, so it sees keys the typed `Query<…>` struct has
+/// no field for (which is exactly the set it exists to catch).
+#[cfg(feature = "db")]
+pub(crate) fn refuse_unhonored_filters(
+    raw_query: Option<&str>,
+    unhonored: &[&str],
+    hint: &str,
+) -> Result<(), ApiError> {
+    let Some(raw) = raw_query else {
+        return Ok(());
+    };
+    for (key, _) in url::form_urlencoded::parse(raw.as_bytes()) {
+        if let Some(name) = unhonored.iter().find(|name| **name == key) {
+            return Err(ApiError::ValidationError {
+                field: (*name).to_string(),
+                reason: format!(
+                    "`{name}` is not a filter this endpoint applies, so it would be \
+                     silently ignored. {hint}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The handler `GET /claims` is routed to: [`list_claims`] behind a refusal of
+/// the filters it cannot honour ([`LEGACY_LIST_UNHONORED_FILTERS`]).
+///
+/// A wrapper rather than an extra extractor on `list_claims` itself so that
+/// handler's signature, which tests call directly, is unchanged.
+#[cfg(feature = "db")]
+pub async fn list_claims_route(
+    viewer: crate::middleware::bearer::ViewerExtractor,
+    state: State<AppState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    params: Query<PaginationParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<PaginatedResponse<ClaimResponse>>, ApiError> {
+    refuse_unhonored_filters(
+        raw_query.as_deref(),
+        LEGACY_LIST_UNHONORED_FILTERS,
+        "GET /claims applies only limit, offset, search and group_id. Use GET \
+         /api/v1/claims for time, truth, currency, author and sort filters, or GET \
+         /api/v1/claims/by-labels for label filters.",
+    )?;
+    list_claims(viewer, state, params, auth_ctx).await
+}
+
 /// List claims with pagination (placeholder - no database)
 ///
 /// GET /claims?limit=20&offset=0

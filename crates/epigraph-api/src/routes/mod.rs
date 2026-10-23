@@ -744,7 +744,7 @@ pub fn create_router_with_extensions(
     // already registered above (`/api/v1/claims/:id` is the clearest case).
     // ------------------------------------------------------------------
     let protected = protected
-        .route("/claims", get(claims::list_claims))
+        .route("/claims", get(claims::list_claims_route))
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
@@ -763,7 +763,7 @@ pub fn create_router_with_extensions(
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
         .route("/api/v1/search/semantic", post(search::semantic_search))
-        .route("/api/v1/claims", get(claims_query::list_claims_query))
+        .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",
             get(claims::find_claims_needing_embeddings),
