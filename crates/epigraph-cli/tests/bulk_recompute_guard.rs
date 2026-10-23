@@ -414,6 +414,23 @@ async fn template_plus_auto_cdst_atom_is_recomputed(pool: PgPool) {
             "{caller:?} reported a write but left the sentinel"
         );
         assert_eq!(after.belief_frame_id, Some(rv), "{caller:?}");
+
+        // KNOWN GAP, pinned so it stays visible: the template is excluded only
+        // from the choice of OWNER frame, not from the owner frame's fold. A
+        // template that shares the owner frame with a real input is still
+        // folded there, so this atom's value differs from a twin carrying the
+        // auto_cdst row alone. Dropping the template from the fold belongs to
+        // the atom-fold change; when it lands, this assertion flips to
+        // `assert_eq!` and must be updated with it.
+        let twin = claim(&pool, owner, "auto_cdst alone").await;
+        insert_row(&pool, twin, &evidence_row(rv, cdst, "auto_cdst")).await;
+        set_sentinel_cache(&pool, twin, rv).await;
+        assert!(recompute_via(&pool, caller, twin).await, "{caller:?} twin");
+        assert_ne!(
+            after.pignistic_prob,
+            cache(&pool, twin).await.pignistic_prob,
+            "{caller:?}: the legacy per-frame fold still includes a same-frame template"
+        );
     }
 }
 
