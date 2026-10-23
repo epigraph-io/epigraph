@@ -20,7 +20,7 @@ use uuid::Uuid;
 use epigraph_db::repos::atom_axiom::{atom_input_rows, AtomInputRow};
 use epigraph_db::repos::claim_role::leaf_closure_batch;
 use epigraph_db::{EvidenceRepository, FrameRepository, MassFunctionRow};
-use epigraph_ds::{combination, FocalElement, FrameOfDiscernment, MassFunction};
+use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 use crate::belief_query::FramedBeliefContext;
 use crate::edge_factor::{
@@ -28,7 +28,9 @@ use crate::edge_factor::{
     CLAIM_VALIDITY_FRAME_ID,
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
-use crate::source_dependence::{item_key, ItemEvidence, ItemKey, EDGE_FACTOR_METHOD};
+use crate::source_dependence::{
+    item_key, item_partition, ItemEvidence, ItemKey, KeyedBba, EDGE_FACTOR_METHOD,
+};
 
 /// Which rows of an atom's input a read takes (SPEC §3.4, §11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -564,10 +566,60 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
     MassFunction::from_raw(frame, out)
 }
 
-/// Fold ONE atom's AEF rows by item.
+/// Fold ONE atom's AEF rows by item (SPEC §3.3): the rows are partitioned by
+/// [`crate::source_dependence::item_partition`] (one key's pure-support rows
+/// keep their max, its refutations are a separate `#neg` item, a mixed row is
+/// its own item), and the items combine by Dempster with exact CDST
+/// open-world semantics (`~` meets anything else as conflict, which the fold
+/// normalises away and reports as the conflict it saw).
+///
+/// No rows is the vacuous interval, [`EvidencedInterval::is_unproven`].
 ///
 /// # Errors
-/// A Dempster step that fails (total conflict between dogmatic items).
-pub fn atom_fold(_rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
-    Ok(EvidencedInterval::unproven())
+/// Rows of more than one atom, or a Dempster step that fails (total conflict
+/// between dogmatic items).
+pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
+    let Some(first) = rows.first() else {
+        return Ok(EvidencedInterval::unproven());
+    };
+    let atom = first.atom_id;
+    if rows.iter().any(|r| r.atom_id != atom) {
+        return Err(format!(
+            "atom_fold: rows of more than one atom (first {atom})"
+        ));
+    }
+    let items = item_partition(
+        rows.iter()
+            .map(|r| KeyedBba {
+                row_id: r.row_id,
+                atom_id: atom,
+                key: r.key.clone(),
+                bba: r.bba.clone(),
+            })
+            .collect(),
+    );
+    let mut for_fold: Vec<MassFunction> =
+        items.iter().filter_map(|it| it.on(atom).cloned()).collect();
+    let n = for_fold.len();
+    let (combined, conflict) = if n == 1 {
+        let only = for_fold.pop().expect("n == 1");
+        let k = only.mass_of_conflict();
+        (only, k)
+    } else {
+        let (combined, reports) =
+            combination::combine_multiple(&for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
+        let k = combination::fold_conflict(&combined, &reports);
+        (combined, k)
+    };
+    let t = FocalElement::positive(BTreeSet::from([0]));
+    Ok(EvidencedInterval {
+        belief: measures::belief(&combined, &t),
+        plausibility: measures::plausibility(&combined, &t),
+        pignistic_prob: measures::pignistic_probability(&combined, 0),
+        pignistic_false: measures::pignistic_probability(&combined, 1),
+        mass_on_conflict: conflict,
+        mass_on_missing: combined.mass_of_missing(),
+        theta: combined.mass_of(&FocalElement::theta(combined.frame())),
+        items: n,
+    })
 }
