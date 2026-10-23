@@ -9,8 +9,8 @@
 //! claim's cache is put back to what the wave found, but only where it still
 //! holds exactly what the wave wrote; see
 //! `epigraph_cli::belief_cache::restore_wave` for the outcomes
-//! (`restored`, `already_restored`, `superseded_since_wave`, `missing`,
-//! `frame_gone`, `not_in_wave`). A second run is a no-op that reports
+//! (`restored`, `restored_partial`, `already_restored`,
+//! `superseded_since_wave`, `missing`, `frame_gone`, `not_in_wave`). A second run is a no-op that reports
 //! `already_restored`.
 //!
 //! Two files are written (never overwritten; by default next to the wave
@@ -146,14 +146,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     .await?;
     let downstream = downstream_edges(maint.pool(), &plan).await?;
 
-    let buckets: [(&str, &Vec<Uuid>); 6] = [
-        ("restored", &report.restored),
-        ("already_restored", &report.already_restored),
-        ("superseded_since_wave", &report.superseded_since_wave),
-        ("missing", &report.missing),
-        ("frame_gone", &report.frame_gone),
-        ("not_in_wave", &report.not_in_wave),
-    ];
+    let buckets = report.buckets();
     for (outcome, ids) in buckets {
         for &claim_id in ids {
             serde_json::to_writer(&mut outcomes_w, &Outcome { claim_id, outcome })?;

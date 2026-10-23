@@ -167,6 +167,37 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
         .unwrap();
         befores.push(before);
     }
+    // A fourth claim written by two runs with an organic write between them
+    // (a broken chain): the restore puts back the organic write's value.
+    let gapped = seed_claim(&pool, agent).await;
+    set_cache(&pool, gapped, 0.2, None).await;
+    for (run, (organic, wave_value)) in [(0.3, 0.8), (0.4, 0.85)].into_iter().enumerate() {
+        let before = cache_of(&pool, gapped).await;
+        set_cache(&pool, gapped, wave_value, Some("supported")).await;
+        write_wave_record(
+            &mut wave,
+            &WaveRecord {
+                claim_id: gapped,
+                before,
+                written: cache_of(&pool, gapped).await,
+                wave: "bins-test".into(),
+                at: at + chrono::Duration::seconds(run as i64),
+            },
+        )
+        .unwrap();
+        if run == 0 {
+            set_cache(&pool, gapped, organic, None).await;
+        }
+    }
+    let intervening = CacheColumns {
+        belief: Some(0.3),
+        plausibility: Some(0.3),
+        pignistic_prob: Some(0.3),
+        mass_on_empty: Some(0.0),
+        mass_on_missing: Some(0.0),
+        belief_frame_id: None,
+        classification: None,
+    };
     let wave_path = dir.join("wave.jsonl");
     std::fs::write(&wave_path, &wave).unwrap();
     set_cache(&pool, ids[2], 0.95, Some("supported")).await;
@@ -177,7 +208,7 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
     std::fs::write(
         &claims_path,
         format!(
-            "# subset\n{}\n\n{}\n{}\n{unknown}\n",
+            "# subset\n{}\n\n{}\n{}\n{gapped}\n{unknown}\n",
             ids[0], ids[1], ids[2]
         ),
     )
@@ -200,6 +231,7 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
     );
     assert!(o.status.success(), "dry run failed");
     assert_eq!(stdout_count(&o, "restored"), 2);
+    assert_eq!(stdout_count(&o, "restored_partial"), 1);
     assert_eq!(stdout_count(&o, "superseded_since_wave"), 1);
     assert_eq!(stdout_count(&o, "not_in_wave"), 1);
     for &id in &ids[..2] {
@@ -228,6 +260,11 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
         assert_eq!(cache_of(&pool, id).await, befores[i]);
     }
     assert_eq!(cache_of(&pool, ids[2]).await, later, "later write survived");
+    assert_eq!(
+        cache_of(&pool, gapped).await,
+        intervening,
+        "a broken chain restores to the intervening write"
+    );
 
     let lines: Vec<serde_json::Value> = std::fs::read_to_string(&outcomes)
         .unwrap()
@@ -247,6 +284,7 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
         (ids[0].to_string(), "restored".to_string()),
         (ids[1].to_string(), "restored".to_string()),
         (ids[2].to_string(), "superseded_since_wave".to_string()),
+        (gapped.to_string(), "restored_partial".to_string()),
         (unknown.to_string(), "not_in_wave".to_string()),
     ]
     .into_iter()

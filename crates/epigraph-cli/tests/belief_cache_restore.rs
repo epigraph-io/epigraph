@@ -811,14 +811,16 @@ fn rec(id: Uuid, before: f64, written: f64, at: DateTime<Utc>) -> WaveRecord {
     }
 }
 
-/// A wave re-run with the same file appends a second record for a claim. When
-/// the second record's `before` is the first's `written`, the two chain: the
-/// restore target is the FIRST `before` and the CAS value the LAST `written`.
-/// When they do not chain, something else wrote the claim between the two
-/// wave writes, and the claim is not planned for a write at all.
+/// A wave re-run with the same file appends a second record for a claim.
+/// Records that chain (each `before` is the previous `written`, in time
+/// order) restore the FIRST `before` and compare against the LAST `written`.
+/// Records that do not chain all the way back restore the `before` of the
+/// trailing chained run, the newest value the wave did not write, marked
+/// `partial`.
 #[test]
-fn a_claim_recorded_twice_chains_or_is_held_back() {
+fn a_claim_recorded_twice_chains_or_restores_past_the_gap() {
     let t: DateTime<Utc> = "2031-03-01T12:00:00Z".parse().unwrap();
+    let m = Duration::minutes(1);
     let (chained, broken, single, wanted_absent) = (
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -826,26 +828,37 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
         Uuid::new_v4(),
     );
     let records = vec![
-        rec(chained, 0.1, 0.2, t + Duration::minutes(5)),
+        rec(chained, 0.2, 0.25, t + m * 5),
         rec(broken, 0.3, 0.4, t),
-        rec(single, 0.6, 0.7, t),
-        rec(chained, 0.2, 0.25, t),
-        rec(broken, 0.45, 0.5, t),
+        rec(single, 0.6, 0.7, t + m),
+        rec(chained, 0.1, 0.2, t),
+        // 0.4 -> 0.45 was someone else's write.
+        rec(broken, 0.45, 0.5, t + m * 5),
+        rec(broken, 0.5, 0.55, t + m * 10),
     ];
 
     let plan = plan_restore(&records, None);
     let by_id: HashMap<Uuid, _> = plan.entries.iter().map(|e| (e.claim_id, e)).collect();
-    assert_eq!(plan.entries.len(), 2, "one entry per writable claim");
+    assert_eq!(plan.entries.len(), 3, "one entry per claim");
     let c = by_id[&chained];
     assert_eq!(c.before, cache_at(0.1));
     assert_eq!(c.written, cache_at(0.25));
+    assert!(!c.partial);
     assert_eq!(by_id[&single].before, cache_at(0.6));
-    assert!(!by_id.contains_key(&broken));
+    assert!(!by_id[&single].partial);
+    let b = by_id[&broken];
+    assert_eq!(
+        b.before,
+        cache_at(0.45),
+        "the trailing chained run's before"
+    );
+    assert_eq!(b.written, cache_at(0.55), "the last written");
+    assert!(b.partial);
     assert_eq!(plan.broken_chain, vec![broken]);
     assert_eq!(
         set_of(&plan.sources),
         set_of(&[chained, broken, single]),
-        "every wave claim is a downstream source, held back or not"
+        "every wave claim is a downstream source"
     );
     assert_eq!(plan.sources.len(), 3, "each source once");
     assert_eq!(
@@ -871,7 +884,11 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
         vec![single],
         "only in-scope claims are sources"
     );
-    assert_eq!(filtered.wave_at, Some(t));
+    assert_eq!(
+        filtered.wave_at,
+        Some(t + m),
+        "the earliest IN-SCOPE record time"
+    );
 }
 
 /// Two runs appended to one file chain in TIME order, whatever order their
@@ -946,4 +963,24 @@ async fn a_broken_chain_is_restored_to_the_intervening_write(pool: PgPool) {
     );
     assert_eq!(cache_of(&pool, neighbour).await, neighbour_before);
     assert_eq!(report.restored, vec![neighbour]);
+    assert_eq!(report.restored_partial, vec![k]);
+    assert_partition(&report, &[k, neighbour]);
+}
+
+/// Every claim the restore considered is in exactly one outcome bucket.
+fn assert_partition(report: &epigraph_cli::belief_cache::RestoreReport, considered: &[Uuid]) {
+    let mut seen: HashMap<Uuid, Vec<&str>> = HashMap::new();
+    for (name, ids) in report.buckets() {
+        for &id in ids {
+            seen.entry(id).or_default().push(name);
+        }
+    }
+    for (id, names) in &seen {
+        assert_eq!(names.len(), 1, "{id} reported in {names:?}");
+    }
+    assert_eq!(
+        seen.keys().copied().collect::<HashSet<_>>(),
+        set_of(considered),
+        "the buckets hold exactly the claims considered"
+    );
 }

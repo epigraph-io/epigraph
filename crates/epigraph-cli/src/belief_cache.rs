@@ -163,12 +163,18 @@ pub struct RestoreEntry {
     pub claim_id: Uuid,
     pub before: CacheColumns,
     pub written: CacheColumns,
+    /// The claim's records do not chain all the way back: another writer
+    /// landed between two wave writes, and `before` is that write's value
+    /// rather than the cache the first run found (see [`plan_restore`]).
+    pub partial: bool,
 }
 
 /// What a wave file asks a restore to do, after the `--claims` filter.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RestorePlan {
     pub entries: Vec<RestoreEntry>,
+    /// Claims whose records do not chain all the way back; each is also in
+    /// `entries`, with `partial` set.
     pub broken_chain: Vec<Uuid>,
     pub not_in_wave: Vec<Uuid>,
     /// Every in-scope wave claim, restorable or held back: the sources
@@ -198,11 +204,31 @@ impl Default for RestoreOptions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RestoreReport {
     pub restored: Vec<Uuid>,
+    /// Restored to the newest value the wave did not write, which is a write
+    /// that landed between two of its runs, not to what the first run found.
+    pub restored_partial: Vec<Uuid>,
     pub already_restored: Vec<Uuid>,
     pub superseded_since_wave: Vec<Uuid>,
     pub missing: Vec<Uuid>,
     pub frame_gone: Vec<Uuid>,
     pub not_in_wave: Vec<Uuid>,
+}
+
+impl RestoreReport {
+    /// Every outcome bucket with its name, in report order. Each claim the
+    /// restore considered is in exactly one.
+    #[must_use]
+    pub fn buckets(&self) -> [(&'static str, &Vec<Uuid>); 7] {
+        [
+            ("restored", &self.restored),
+            ("restored_partial", &self.restored_partial),
+            ("already_restored", &self.already_restored),
+            ("superseded_since_wave", &self.superseded_since_wave),
+            ("missing", &self.missing),
+            ("frame_gone", &self.frame_gone),
+            ("not_in_wave", &self.not_in_wave),
+        ]
+    }
 }
 
 /// An edge whose source is a wave claim and which was created, or had its
@@ -358,14 +384,21 @@ pub fn read_claim_ids<R: BufRead>(input: R) -> anyhow::Result<HashSet<Uuid>> {
 /// # A claim recorded more than once
 ///
 /// A wave re-run against the same file appends a second record for a claim.
-/// The records CHAIN when each one's `before` is the previous one's `written`:
-/// nothing else wrote the claim between them, so the plan restores the FIRST
-/// `before` and compares against the LAST `written`. `wave_at` is the earliest
-/// in-scope record's `at`, so the downstream list covers every edge that could
-/// have frozen any of the wave's values. When they do not chain, another
-/// writer landed between two wave writes; restoring the first `before` would
-/// erase it, so the claim goes to `broken_chain` and is reported
-/// `superseded_since_wave` without a write.
+/// The records are taken in `at` order (file order among equal times), so a
+/// file whose runs were concatenated out of order reads the same. They CHAIN
+/// when each one's `before` is the previous one's `written`: nothing else
+/// wrote the claim between them, so the plan restores the FIRST `before` and
+/// compares against the LAST `written`.
+///
+/// When they do not chain, another writer landed between two wave writes.
+/// Restoring the first `before` would erase that write, and doing nothing
+/// would keep the wave's last value. The plan takes the longest run of
+/// chained records at the END, restores ITS first `before` (the newest value
+/// the wave did not write) and compares against the last `written`; the
+/// entry is marked `partial` and the claim listed in `broken_chain`.
+///
+/// `wave_at` is the earliest in-scope record's `at`, so the downstream list
+/// covers every edge that could have frozen any of the wave's values.
 #[must_use]
 pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> RestorePlan {
     let mut order: Vec<Uuid> = Vec::new();
@@ -388,17 +421,23 @@ pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> Res
         ..RestorePlan::default()
     };
     for id in order {
-        let group = &groups[&id];
+        let mut group = groups[&id].clone();
+        // Stable: records with equal `at` keep their file order.
+        group.sort_by_key(|r| r.at);
         plan.sources.push(id);
-        let chains = group.windows(2).all(|w| w[0].written == w[1].before);
-        match (chains, group.first(), group.last()) {
-            (true, Some(first), Some(last)) => plan.entries.push(RestoreEntry {
-                claim_id: id,
-                before: first.before.clone(),
-                written: last.written.clone(),
-            }),
-            _ => plan.broken_chain.push(id),
+        let mut start = group.len() - 1;
+        while start > 0 && group[start - 1].written == group[start].before {
+            start -= 1;
         }
+        if start > 0 {
+            plan.broken_chain.push(id);
+        }
+        plan.entries.push(RestoreEntry {
+            claim_id: id,
+            before: group[start].before.clone(),
+            written: group[group.len() - 1].written.clone(),
+            partial: start > 0,
+        });
     }
     if let Some(only) = only {
         let mut absent: Vec<Uuid> = only
@@ -494,7 +533,8 @@ fn bind_wave_rows<'q>(
 /// * one `UPDATE` writes `before` only where the row still holds EXACTLY what
 ///   the wave wrote, in all seven cache columns. A row that differs in any of
 ///   them took a later write, which a rollback must not erase; it is left
-///   alone and reported `superseded_since_wave`.
+///   alone and reported `superseded_since_wave`. A restored `partial` entry
+///   (a broken chain, see [`plan_restore`]) is reported `restored_partial`.
 /// * a row that already holds `before` is not written at all (so a second run
 ///   creates no new tuple version and bumps no `updated_at`) and is reported
 ///   `already_restored`. That is what makes the restore idempotent rather than
@@ -541,7 +581,6 @@ pub async fn restore_wave(
     );
 
     let mut report = RestoreReport {
-        superseded_since_wave: plan.broken_chain.clone(),
         not_in_wave: plan.not_in_wave.clone(),
         ..RestoreReport::default()
     };
@@ -572,7 +611,11 @@ pub async fn restore_wave(
         for e in chunk {
             let id = e.claim_id;
             let bucket = if restored.contains(&id) {
-                &mut report.restored
+                if e.partial {
+                    &mut report.restored_partial
+                } else {
+                    &mut report.restored
+                }
             } else {
                 match states.get(&id) {
                     None | Some((false, _, _)) => &mut report.missing,
