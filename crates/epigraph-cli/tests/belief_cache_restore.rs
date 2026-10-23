@@ -346,6 +346,90 @@ async fn a_second_restore_writes_no_row_and_reports_already_restored(pool: PgPoo
     }
 }
 
+/// A write that is in flight when the restore reaches its row: the restore's
+/// UPDATE waits on the row lock, and when the writer commits it re-checks its
+/// compare-and-swap against the NEW row (READ COMMITTED), so the live write
+/// survives and is reported `superseded_since_wave`, and the rest of the batch
+/// is restored. Under REPEATABLE READ the batch would abort instead; with the
+/// check moved out of the UPDATE the write would be overwritten.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_committing_during_the_restore_is_never_overwritten(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let frame = seed_frame(&pool).await;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+
+    let mut ids = Vec::new();
+    let mut befores = HashMap::new();
+    for _ in 0..3 {
+        let id = seed_claim(&pool, agent).await;
+        set_cache(&pool, id, &random_cache(&mut rng, Some(frame), None)).await;
+        befores.insert(id, cache_of(&pool, id).await);
+        ids.push(id);
+    }
+    let at = db_now(&pool).await;
+    let records = run_wave(&pool, &ids, at, |_| {
+        random_cache(&mut rng, Some(frame), Some("supported"))
+    })
+    .await;
+    let plan = plan_restore(&records, None);
+    let contested = ids[1];
+
+    // Writer A: changes the contested claim and holds its transaction open.
+    let mut a = pool.begin().await.expect("writer A");
+    sqlx::query("UPDATE claims SET belief = 0.123456789 WHERE id = $1")
+        .bind(contested)
+        .execute(&mut *a)
+        .await
+        .expect("A's write");
+
+    let restore = tokio::spawn({
+        let pool = pool.clone();
+        async move { restore_wave(&pool, &plan, &opts(10)).await }
+    });
+
+    // Wait until the restore is blocked on A's row lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            !restore.is_finished(),
+            "the restore finished without waiting on the in-flight write"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restore never blocked on the in-flight write"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    a.commit().await.expect("A commits");
+    let a_value = cache_of(&pool, contested).await;
+    assert_eq!(a_value.belief, Some(0.123456789), "fixture: A committed");
+
+    let report = restore
+        .await
+        .expect("restore task")
+        .expect("a concurrent write must not abort the restore");
+    assert_eq!(report.superseded_since_wave, vec![contested]);
+    assert_eq!(
+        cache_of(&pool, contested).await,
+        a_value,
+        "the write that committed during the restore was overwritten"
+    );
+    for id in [ids[0], ids[2]] {
+        assert_eq!(cache_of(&pool, id).await, befores[&id]);
+    }
+    assert_eq!(set_of(&report.restored), set_of(&[ids[0], ids[2]]));
+}
+
 /// A frame deleted after the wave (the operator's `delete-frames` verb exists)
 /// leaves a `before` whose `belief_frame_id` the foreign key refuses. That one
 /// claim is skipped and reported; the claims sharing its transaction are
