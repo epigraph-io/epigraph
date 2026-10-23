@@ -555,6 +555,28 @@ fn conj(query: &[Lit<u32>], items: &[Item<u32>], not_all: f64) -> Option<ConjRes
     }
 }
 
+/// The first violation of the bounds chain lo ≤ Bel ≤ Pl ≤ NR ≤ hi_NR,
+/// Pl ≤ hi (every value in [0, 1]), or `None` when it holds.
+fn chain_violation(r: &ConjResult) -> Option<String> {
+    let f = &r.frechet;
+    let checks = [
+        (f.lo <= r.bel + EPS, "lo > bel"),
+        (r.bel <= r.pl + EPS, "bel > pl"),
+        (r.pl <= r.nr + EPS, "pl > nr"),
+        (r.nr <= f.hi_nr + EPS, "nr > hi_nr"),
+        (r.pl <= f.hi + EPS, "pl > hi"),
+    ];
+    for (ok, what) in checks {
+        if !ok {
+            return Some(format!("{what}: {r:?}"));
+        }
+    }
+    [r.bel, r.pl, r.nr, f.lo, f.hi, f.hi_nr]
+        .iter()
+        .find(|v| !(0.0..=1.0).contains(*v))
+        .map(|v| format!("{v} outside [0, 1]: {r:?}"))
+}
+
 // ---------------------------------------------------------------------------
 // Marginal consistency with the served CDST fold (single-leaf queries)
 // ---------------------------------------------------------------------------
@@ -985,6 +1007,33 @@ proptest! {
         prop_assert!((cf.betp - dp.betp).abs() < 1e-9, "betp {} vs {}", cf.betp, dp.betp);
         prop_assert!((cf.bel_or - dp.bel_or).abs() < 1e-9, "bel_or {} vs {}", cf.bel_or, dp.bel_or);
         prop_assert!((cf.k - dp.k).abs() < 1e-9, "k {} vs {}", cf.k, dp.k);
+        // The envelope floor follows the valuation: each leaf's in-joint Bel
+        // drops to (Belᵢ − K')/(1 − K'), and the DP reads it off the joint.
+        prop_assert!((cf.frechet.lo - dp.frechet.lo).abs() < 1e-9, "lo {} vs {}", cf.frechet.lo, dp.frechet.lo);
+    }
+
+    /// Both closed forms keep the bounds chain lo ≤ Bel ≤ Pl ≤ NR ≤ hi_NR and
+    /// Pl ≤ hi, as the DP does.
+    #[test]
+    fn closed_forms_keep_the_bounds_chain(
+        (query, raws) in arb_case(5, 4, false),
+        rotate in any::<usize>(),
+        m_milli in 1u32..=999,
+    ) {
+        let n = query.len();
+        let mut query = query;
+        query.rotate_left(rotate % n);
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let m = f64::from(m_milli) / 1000.0;
+        let Some(base) = conj(&query, &items, 0.0) else { return Ok(()); };
+        let cf = not_all_closed_form(&base, m).unwrap();
+        prop_assert!(chain_violation(&cf).is_none(), "not_all: {:?}", chain_violation(&cf));
+        if n >= 2 {
+            let pair_bel = joint_bel(&query, &items, 0.0, &[0, 1]).unwrap();
+            if let Ok(sib) = single_negative_sibling(&base, pair_bel, m) {
+                prop_assert!(chain_violation(&sib).is_none(), "sibling: {:?}", chain_violation(&sib));
+            }
+        }
     }
 
     /// The single-negative-sibling closed form (SPEC §3.3) equals the oracle
@@ -1169,6 +1218,54 @@ fn over_the_leaf_cap_is_inexact() {
     assert!(conj_belief(&at_cap, &items, 0.0).unwrap().exact);
 }
 
+/// Over the leaf cap the result is R-IND: one whole item at .9 shared by all
+/// 17 leaves counts once in R-DEP (.9) but once per leaf here (.9¹⁷).
+#[test]
+fn over_the_leaf_cap_a_shared_item_is_counted_per_leaf() {
+    let n = u32::try_from(MAX_LEAVES).unwrap() + 1;
+    let whole = Item::new((0..n).map(|a| (Lit::pos(a), 0.9, 0.0)).collect()).unwrap();
+    let r = conj_belief(&positives(n), &[whole], 0.0).unwrap();
+    assert!(!r.exact);
+    assert!(
+        close(r.bel, 0.9f64.powi(i32::try_from(n).unwrap())),
+        "bel {}",
+        r.bel
+    );
+    assert!(close(r.pl, 1.0));
+}
+
+/// Over the leaf cap with a `not_all` valuation, the served value still sits
+/// inside its own envelope: 17 leaves at T .99 have R-IND Bel ≈ .843 and a
+/// pre-valuation floor of 17·.99 − 16 = .83; m = .5 lowers Bel to ≈ .728, so
+/// the floor must follow it down.
+#[test]
+fn over_the_leaf_cap_a_valuation_keeps_the_bounds_chain() {
+    let n = u32::try_from(MAX_LEAVES).unwrap() + 1;
+    let items: Vec<Item<u32>> = (0..n)
+        .map(|a| Item::new(vec![(Lit::pos(a), 0.99, 0.0)]).unwrap())
+        .collect();
+    let r = conj_belief(&positives(n), &items, 0.5).unwrap();
+    assert!(!r.exact);
+    assert!(
+        r.bel < 0.99f64.powi(17),
+        "the valuation lowers Bel: {}",
+        r.bel
+    );
+    assert_eq!(chain_violation(&r), None);
+
+    // With `~` on every leaf the fallback still applies the closed-world
+    // closed form to the R-IND product, so it lowers Bel (the exact DP under
+    // `~` would not; the fallback is labelled inexact).
+    let open: Vec<Item<u32>> = (0..n)
+        .map(|a| Item::new(vec![(Lit::pos(a), 0.5, 0.2)]).unwrap())
+        .collect();
+    let base = conj_belief(&positives(n), &open, 0.0).unwrap();
+    let r = conj_belief(&positives(n), &open, 0.3).unwrap();
+    assert!(!r.exact);
+    assert!(r.bel <= base.bel && r.pl <= base.pl && r.nr <= base.nr);
+    assert_eq!(chain_violation(&r), None);
+}
+
 /// Too many live states (mixed evidence on 12 leaves gives 3¹² > 10⁵): inexact.
 #[test]
 fn over_the_state_cap_is_inexact() {
@@ -1177,7 +1274,10 @@ fn over_the_state_cap_is_inexact() {
         .collect();
     let r = conj_belief(&positives(12), &items, 0.0).unwrap();
     assert!(!r.exact);
-    assert!(r.frechet.lo <= r.bel && r.bel <= r.pl && r.pl <= r.nr);
+    assert_eq!(chain_violation(&r), None);
+    let r = conj_belief(&positives(12), &items, 0.5).unwrap();
+    assert!(!r.exact);
+    assert_eq!(chain_violation(&r), None);
 }
 
 // ---------------------------------------------------------------------------
