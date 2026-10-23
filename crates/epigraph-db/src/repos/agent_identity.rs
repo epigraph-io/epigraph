@@ -13,8 +13,10 @@
 //! * [`AgentIdentityRepository::prompt_history`] calls
 //!   `epigraph_agent_prompt_history`, which reads the session principal
 //!   (operator or admin, else `AID06`), then decompresses every returned file
-//!   and re-checks its hash, so a stored blob that no longer matches its key is
-//!   an error rather than someone else's text.
+//!   and re-checks its hash. A stored blob that no longer matches its key is
+//!   WITHHELD (named in [`PromptSnapshot::withheld_files`]), never returned as
+//!   someone else's text; and since blobs are shared across agents, one bad
+//!   blob withholds that one file, not every history that names it.
 
 use std::borrow::Cow;
 
@@ -136,6 +138,11 @@ pub struct PromptSnapshot {
     pub in_prompt: Value,
     /// Files the host refused to store, by name.
     pub blob_refused: Vec<String>,
+    /// Files whose stored blob failed verification on this read (it did not
+    /// decompress, exceeded the size bound, or no longer hashes to its key),
+    /// by name. Their field above is `None`: a blob that is not what its key
+    /// says is never returned.
+    pub withheld_files: Vec<String>,
     pub runner_version: Option<String>,
     pub host_sha: Option<String>,
     pub first_seen: DateTime<Utc>,
@@ -276,10 +283,13 @@ impl AgentIdentityRepository {
     /// The definer reads the SESSION principal, so the connection must be
     /// stamped with the caller's principal (the operator or an admin).
     ///
+    /// A stored file that does not decompress, exceeds the size bound, or no
+    /// longer hashes to its key is withheld and named in
+    /// [`PromptSnapshot::withheld_files`]; the rest of the history is returned.
+    ///
     /// # Errors
     /// `DbError::QueryFailed` carrying SQLSTATE [`PROMPT_HISTORY_REFUSED`] when
-    /// the caller is neither. [`DbError::InvalidData`] when a stored file does
-    /// not decompress, exceeds the size bound, or no longer hashes to its key.
+    /// the caller is neither.
     pub async fn prompt_history(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -295,80 +305,87 @@ impl AgentIdentityRepository {
         .bind(agent_id)
         .fetch_all(&mut *conn)
         .await?;
-        rows.into_iter().map(history_entry).collect()
+        Ok(rows.into_iter().map(history_entry).collect())
     }
 }
 
-fn history_entry(r: HistoryRow) -> Result<PromptHistoryEntry, DbError> {
-    let snapshot = match r.snapshot_id {
-        None => None,
-        Some(id) => Some(PromptSnapshot {
+fn history_entry(r: HistoryRow) -> PromptHistoryEntry {
+    let snapshot = r.snapshot_id.map(|id| {
+        let mut withheld_files = Vec::new();
+        let mut take = |file: &str, hash: Option<Vec<u8>>, content: Option<Vec<u8>>| {
+            match verified_blob(file, hash, content) {
+                Ok(blob) => blob,
+                Err(reason) => {
+                    tracing::warn!(
+                        snapshot = %id,
+                        file,
+                        %reason,
+                        "prompt history: withholding a stored file that failed verification"
+                    );
+                    withheld_files.push(file.to_string());
+                    None
+                }
+            }
+        };
+        let identity_md = take("identity_md", r.identity_md_hash, r.identity_md);
+        let global_claude_md = take(
+            "global_claude_md",
+            r.global_claude_md_hash,
+            r.global_claude_md,
+        );
+        let group_claude_md = take("group_claude_md", r.group_claude_md_hash, r.group_claude_md);
+        let learned_md = take("learned_md", r.learned_md_hash, r.learned_md);
+        PromptSnapshot {
             id,
             group_folder: r.group_folder.unwrap_or_default(),
             model: r.model.unwrap_or_default(),
             prompt_hash: r.prompt_hash.unwrap_or_default(),
-            identity_md: verified_blob("identity_md", r.identity_md_hash, r.identity_md)?,
-            global_claude_md: verified_blob(
-                "global_claude_md",
-                r.global_claude_md_hash,
-                r.global_claude_md,
-            )?,
-            group_claude_md: verified_blob(
-                "group_claude_md",
-                r.group_claude_md_hash,
-                r.group_claude_md,
-            )?,
-            learned_md: verified_blob("learned_md", r.learned_md_hash, r.learned_md)?,
+            identity_md,
+            global_claude_md,
+            group_claude_md,
+            learned_md,
             in_prompt: r.in_prompt.unwrap_or(Value::Null),
             blob_refused: r.blob_refused.unwrap_or_default(),
+            withheld_files,
             runner_version: r.runner_version,
             host_sha: r.host_sha,
             first_seen: r.first_seen.unwrap_or_default(),
             last_seen: r.last_seen.unwrap_or_default(),
-        }),
-    };
-    Ok(PromptHistoryEntry {
+        }
+    });
+    PromptHistoryEntry {
         agent_id: r.agent_id,
         relation: r.relation,
         depth: r.depth,
         readable: r.readable,
         snapshot,
-    })
+    }
 }
 
-/// Decompress one stored file and check it against its key.
+/// Decompress one stored file and check it against its key. `Ok(None)` for a
+/// file the snapshot does not have; `Err(reason)` for one that must be
+/// withheld.
 fn verified_blob(
     file: &str,
     hash: Option<Vec<u8>>,
     content: Option<Vec<u8>>,
-) -> Result<Option<PromptBlob>, DbError> {
+) -> Result<Option<PromptBlob>, String> {
     let (hash, content) = match (hash, content) {
         (None, None) => return Ok(None),
         (Some(h), Some(c)) => (h, c),
-        _ => {
-            return Err(DbError::InvalidData {
-                reason: format!("{file}: a snapshot names a blob the history did not return"),
-            })
-        }
+        _ => return Err(format!("{file}: a snapshot names a blob the history did not return")),
     };
     let blob_hash: [u8; 32] = hash
         .as_slice()
         .try_into()
-        .map_err(|_| DbError::InvalidData {
-            reason: format!("{file}: a blob key is not 32 bytes"),
-        })?;
-    let bytes = zstd::bulk::decompress(&content, MAX_PROMPT_FILE_BYTES).map_err(|e| {
-        DbError::InvalidData {
-            reason: format!("{file}: the stored blob does not decompress: {e}"),
-        }
-    })?;
+        .map_err(|_| format!("{file}: a blob key is not 32 bytes"))?;
+    let bytes = zstd::bulk::decompress(&content, MAX_PROMPT_FILE_BYTES)
+        .map_err(|e| format!("{file}: the stored blob does not decompress: {e}"))?;
     if blake3::hash(&bytes).as_bytes() != &blob_hash {
-        return Err(DbError::InvalidData {
-            reason: format!(
-                "{file}: the stored blob does not hash to its key {}; refusing to return it",
-                hex::encode(blob_hash)
-            ),
-        });
+        return Err(format!(
+            "{file}: the stored blob does not hash to its key {}",
+            hex::encode(blob_hash)
+        ));
     }
     Ok(Some(PromptBlob { blob_hash, bytes }))
 }
@@ -435,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_does_not_hash_to_its_key_is_invalid_data() {
+    fn a_frame_that_does_not_hash_to_its_key_is_withheld() {
         let raw = b"true".to_vec();
         let frame = zstd::bulk::compress(&raw, 3).expect("compress");
         let good = verified_blob(
@@ -446,12 +463,12 @@ mod tests {
         .expect("matches")
         .expect("present");
         assert_eq!(good.bytes, raw);
-        let err = verified_blob(
+        let reason = verified_blob(
             "f",
             Some(blake3::hash(b"other").as_bytes().to_vec()),
             Some(frame),
         )
         .expect_err("mismatch");
-        assert!(matches!(err, DbError::InvalidData { .. }));
+        assert!(reason.contains("does not hash to its key"), "{reason}");
     }
 }

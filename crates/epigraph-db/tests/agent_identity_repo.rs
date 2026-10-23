@@ -200,6 +200,7 @@ async fn a_blob_that_no_longer_matches_its_hash_is_withheld_not_fatal(pool: PgPo
         Some(template.clone()),
         "CALIBRATION: the template reads before the tamper"
     );
+    assert!(snap.withheld_files.is_empty());
 
     let forged = zstd::bulk::compress(b"a forged template\n", 3).expect("compress");
     let mut tx = pool.begin().await.expect("begin");
@@ -242,6 +243,7 @@ async fn a_blob_that_no_longer_matches_its_hash_is_withheld_not_fatal(pool: PgPo
             snap.group_claude_md.is_none(),
             "a blob that does not hash to its key must not be returned"
         );
+        assert_eq!(snap.withheld_files, vec!["group_claude_md".to_string()]);
         assert_eq!(
             snap.learned_md.as_ref().map(|f| f.bytes.clone()),
             Some(own),
