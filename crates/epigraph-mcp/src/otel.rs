@@ -37,6 +37,10 @@ pub fn init_tracer_provider() -> Result<SdkTracerProvider, Box<dyn std::error::E
 /// and also logs to stderr (preserving stdout for MCP JSON-RPC).
 ///
 /// Call this *instead of* the plain `tracing_subscriber::fmt().init()`.
+///
+/// Not wired up (there is no `mod otel`). This subscriber lacks the rmcp INFO
+/// cap from `crate::log_filter::subscriber`. Layer that cap before calling
+/// this from `main`, or rmcp DEBUG tool-result bodies reach the log again.
 pub fn init_telemetry(
     provider: &SdkTracerProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {

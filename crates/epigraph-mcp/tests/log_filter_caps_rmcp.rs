@@ -115,6 +115,10 @@ fn default_filter_keeps_tenancy_boot_line_and_hides_debug() {
     assert!(!out.contains("HIDDEN-OWN-DEBUG"), "{out}");
 }
 
+/// The positive `KEEP-TENANCY-BOOT` assertion is what this test pins. A
+/// lossy fallback (an empty filter) would drop that INFO line. The `SECRET-`
+/// check is belt and braces: the default filter excludes rmcp with or
+/// without the cap.
 #[test]
 fn unparseable_rust_log_falls_back_to_default() {
     let out = captured(Some("rmcp=notalevel"), false, || {

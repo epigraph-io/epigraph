@@ -20,6 +20,17 @@
 //!
 //! Local debugging can lift the cap explicitly with
 //! [`PAYLOAD_LOGGING_ENV`]`=1`; [`init_stderr`] then logs a WARN at boot.
+//!
+//! Known residual: the cap is a level cap, so rmcp lines logged at INFO or
+//! WARN still pass with their payload. In rmcp 2.2 these are
+//! `received notification` (INFO, `?notification`) in the service loop and
+//! `Received unexpected message` (WARN, `?notification` / `?message`) on the
+//! client side, which this binary hits as a federation client. They carry
+//! MCP notifications and stray messages, not tool results. They are far
+//! rarer than the per-call DEBUG dump and are not capped here.
+//!
+//! `otel.rs::init_telemetry` (not compiled today) builds its own subscriber
+//! without this cap. Anything that wires it up must layer the same cap.
 
 use tracing::Subscriber;
 use tracing_subscriber::filter::{LevelFilter, Targets};
