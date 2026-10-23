@@ -28,7 +28,7 @@ mod fixture;
 
 use std::collections::{BTreeSet, HashMap};
 
-use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
+use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, Viewer};
 use epigraph_engine::atom_items::{
     atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
 };
@@ -250,6 +250,32 @@ async fn rows(
     atom_axiom_rows_under(&mut conn, &viewer, ids, mode, &ctx(), edges)
         .await
         .expect("atom_axiom_rows")
+}
+
+async fn rows_as(
+    pool: &PgPool,
+    viewer: &Viewer,
+    ids: &[Uuid],
+    mode: AxiomMode,
+    edges: CompoundSourceEdges,
+) -> HashMap<Uuid, Vec<AxiomRow>> {
+    let mut conn = pool.acquire().await.expect("conn");
+    atom_axiom_rows_under(&mut conn, viewer, ids, mode, &ctx(), edges)
+        .await
+        .expect("atom_axiom_rows")
+}
+
+/// Make an edge private to `group` (its owner group, no co-owner).
+async fn hide_edge(pool: &PgPool, edge_id: Uuid, group: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(edge_id)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("make the edge private");
 }
 
 async fn display(pool: &PgPool, id: Uuid) -> Vec<AxiomRow> {
@@ -1181,5 +1207,373 @@ async fn an_axis_claim_at_index_one_is_coarsened_with_its_literals_swapped(pool:
         "mass on index 0 is disbelief for an index-1 claim: Bel 0, Pl .3; got Bel {} Pl {}",
         f.belief(),
         f.plausibility()
+    );
+}
+
+// ── review: the residue is never vacated by an evidence-removal write ───────
+
+/// SPEC §4.2 "Empty fold", first case, and §10.5: an atom that NEVER had AEF
+/// input (the residue: its only row is the ingest template) is left
+/// untouched when a lifecycle act removes that template row. Only an atom
+/// that LOST AEF input is vacated; the residue is vacated only through the
+/// operator accept list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_residue_atom_is_never_vacated_by_an_evidence_removal_write(pool: PgPool) {
+    let author = agent(&pool).await;
+    let residue = claim(&pool, author, "template-only residue").await;
+    let template = store_template(&pool, residue, agent(&pool).await).await;
+    let sentinel = set_sentinel(&pool, residue).await;
+
+    sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+        .bind(template)
+        .execute(&pool)
+        .await
+        .expect("a lifecycle act removes the template row");
+    let outcome = write(
+        &pool,
+        residue,
+        CacheWriteCause::EvidenceRemoved,
+        LegacyFold::OwnerFrame,
+        settings(AtomFoldMode::Aef, true),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        AtomCacheOutcome::KeptEmpty,
+        "the residue never had AEF input, so it is not vacated"
+    );
+    assert_eq!(
+        cache(&pool, residue).await,
+        sentinel,
+        "the residue's cache must not move"
+    );
+}
+
+// ── review: an edge-factor row whose edge the viewer cannot see ─────────────
+
+/// SPEC §6.3: a compound-source edge row is read "through the target's own
+/// viewer splice". A viewer who cannot see the edge cannot tell whether its
+/// source is a compound, so the row must not be read two-sided as an
+/// atom-source row, and `excluded` must not keep it: it is not in that
+/// viewer's fold at all.
+///
+/// CONTROL: the owner group sees the edge, so for it the row is a
+/// compound-source row: one-sided under `frozen` (Bel .5, Pl 1), dropped
+/// under `excluded`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_row_whose_edge_the_viewer_cannot_see_is_not_read(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "aef-hidden-edge").await;
+    let compound = claim(&pool, author, "compound behind a private edge").await;
+    decompose(&pool, compound, claim(&pool, author, "its leaf").await).await;
+    let target = claim(&pool, author, "public target").await;
+    let e = edge(&pool, compound, target, "supports").await;
+    let row = store_edge_factor(
+        &pool,
+        e,
+        target,
+        agent(&pool).await,
+        serde_json::json!({"0": 0.5, "1": 0.2, "0,1": 0.3}),
+    )
+    .await;
+    hide_edge(&pool, e, group).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    for edges in [CompoundSourceEdges::Frozen, CompoundSourceEdges::Excluded] {
+        let got = rows_as(&pool, &public, &[target], AxiomMode::Display, edges).await;
+        assert!(
+            got.get(&target).is_none_or(Vec::is_empty),
+            "{edges:?}: a row whose edge the viewer cannot see is not read, got {:?}",
+            got.get(&target).map(|r| ids_of(r))
+        );
+    }
+
+    let frozen = rows_as(
+        &pool,
+        &owner,
+        &[target],
+        AxiomMode::Display,
+        CompoundSourceEdges::Frozen,
+    )
+    .await
+    .remove(&target)
+    .unwrap_or_default();
+    assert_eq!(ids_of(&frozen), set(&[row]), "the owner group reads the row");
+    let f = atom_fold(&frozen).expect("fold");
+    assert!(
+        close(f.belief(), 0.5) && close(f.plausibility(), 1.0),
+        "for the owner group it is a frozen compound-source row, one-sided: got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+    let excluded = rows_as(
+        &pool,
+        &owner,
+        &[target],
+        AxiomMode::Display,
+        CompoundSourceEdges::Excluded,
+    )
+    .await;
+    assert!(excluded.get(&target).is_none_or(Vec::is_empty));
+}
+
+// ── review: the seed rule counts only rows a fold reads ─────────────────────
+
+/// Ruling O16: a seed is kept while it is the atom's sole input. A row that
+/// no fold reads is not input: a compound-source edge row under `excluded`,
+/// a row the self-reference guard skips, or an edge row whose edge the viewer
+/// cannot see. Beside any of them the seed is still the sole input.
+///
+/// CONTROL: under `frozen`, a compound-source row the fold does read counts,
+/// and the seed drops out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_beside_rows_no_fold_reads_is_still_the_sole_input(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let writer = agent(&pool).await;
+    let (_member, group) = fixture::seed_agent_with_group(&pool, "aef-seed-order").await;
+    let seed_on = |pool: PgPool, c: Uuid| async move {
+        store(
+            &pool,
+            c,
+            b,
+            Row {
+                method: Some("truth_value_seed"),
+                ..Row::plain(author)
+            },
+            serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        )
+        .await
+    };
+    let compound = claim(&pool, author, "compound source").await;
+    let own_leaf = claim(&pool, author, "the compound's own leaf").await;
+    decompose(&pool, compound, own_leaf).await;
+
+    // (a) a standalone with a seed and a compound-source edge row
+    let standalone = claim(&pool, author, "seeded standalone").await;
+    let seed_a = seed_on(pool.clone(), standalone).await;
+    let e = edge(&pool, compound, standalone, "supports").await;
+    let edge_row = store_edge_factor(
+        &pool,
+        e,
+        standalone,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    for mode in [AxiomMode::Display, AxiomMode::Pure] {
+        let got = rows(&pool, &[standalone], mode, CompoundSourceEdges::Excluded).await;
+        assert_eq!(
+            ids_of(got.get(&standalone).map(Vec::as_slice).unwrap_or_default()),
+            set(&[seed_a]),
+            "{mode:?}/excluded: the excluded row is not input, so the seed stays"
+        );
+    }
+    assert_eq!(
+        ids_of(&display(&pool, standalone).await),
+        set(&[edge_row]),
+        "control: under frozen the edge row is read, so the seed drops out"
+    );
+
+    // (b) the compound's own leaf: a seed and a row the guard skips
+    let seed_b = seed_on(pool.clone(), own_leaf).await;
+    let e = edge(&pool, compound, own_leaf, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        own_leaf,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&display(&pool, own_leaf).await),
+        set(&[seed_b]),
+        "a row the self-reference guard skips is not input, so the seed stays"
+    );
+
+    // (c) a seed and an edge row whose edge the viewer cannot see
+    let hidden = claim(&pool, author, "seeded, behind a private edge").await;
+    let seed_c = seed_on(pool.clone(), hidden).await;
+    let source = claim(&pool, author, "atom source").await;
+    let e = edge(&pool, source, hidden, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        hidden,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    hide_edge(&pool, e, group).await;
+    assert_eq!(
+        ids_of(&display(&pool, hidden).await),
+        set(&[seed_c]),
+        "a row whose edge the viewer cannot see is not input, so the seed stays"
+    );
+}
+
+// ── review: one unreadable row costs only that row ──────────────────────────
+
+/// A stored BBA that cannot be parsed is skipped (and logged); the batch read
+/// still returns every other row of every requested atom, including the
+/// readable rows of the atom that carries the bad one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_row_is_skipped_and_never_fails_the_batch(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let good = claim(&pool, author, "every row readable").await;
+    let good_row = store(
+        &pool,
+        good,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let mixed = claim(&pool, author, "one unreadable row").await;
+    let readable = store(
+        &pool,
+        mixed,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    store(
+        &pool,
+        mixed,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": "not a mass", "0,1": 0.3}),
+    )
+    .await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let got = atom_axiom_rows_under(
+        &mut conn,
+        &viewer,
+        &[good, mixed],
+        AxiomMode::Display,
+        &ctx(),
+        CompoundSourceEdges::Frozen,
+    )
+    .await
+    .expect("one unreadable row must not fail the batch");
+    assert_eq!(
+        ids_of(got.get(&good).map(Vec::as_slice).unwrap_or_default()),
+        set(&[good_row])
+    );
+    assert_eq!(
+        ids_of(got.get(&mixed).map(Vec::as_slice).unwrap_or_default()),
+        set(&[readable]),
+        "the unreadable row is skipped, the readable one is kept"
+    );
+}
+
+// ── review: a row citing evidence through its perspective only ─────────────
+
+/// A row that cites its evidence only through an evidence perspective
+/// (`evidence_id` NULL) keys on that evidence row even when the viewer cannot
+/// read it, as a row citing a hidden `evidence_id` does: two agents citing one
+/// evidence row are one item (.8) for every viewer, never one item per row
+/// (.96) for the viewer who cannot read the evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_rows_citing_one_evidence_perspective_are_one_item_for_every_viewer(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "aef-hidden-evidence").await;
+    let (x, y) = (agent(&pool).await, agent(&pool).await);
+    let holder = claim(&pool, author, "evidence holder").await;
+    let ev = doi_evidence(&pool, holder, "10.5555/aef-hidden", x).await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(ev)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("make the evidence private");
+
+    let atom = claim(&pool, author, "cited through a perspective").await;
+    for a in [x, y] {
+        store(
+            &pool,
+            atom,
+            b,
+            Row {
+                perspective: Some(ev),
+                ..Row::plain(a)
+            },
+            serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        )
+        .await;
+    }
+
+    let public = fixture::public_viewer(&pool).await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    for (who, viewer) in [("public", &public), ("owner", &owner)] {
+        let got = rows_as(
+            &pool,
+            viewer,
+            &[atom],
+            AxiomMode::Display,
+            CompoundSourceEdges::Frozen,
+        )
+        .await
+        .remove(&atom)
+        .unwrap_or_default();
+        assert_eq!(got.len(), 2, "{who}: both rows are read");
+        let f = atom_fold(&got).expect("fold");
+        assert!(
+            close(f.belief(), 0.8),
+            "{who}: one cited evidence row is one item at .8, got Bel {}",
+            f.belief()
+        );
+    }
+}
+
+// ── review: a claim_validity complement keeps its open-world share ──────────
+
+/// CDST complement(A) is "outside A, including propositions not in the
+/// frame". On `claim_validity`, complement({refuted, uncertain}) is
+/// "supported or open-world", which coarsens to complement({F}) (`~1`) on
+/// `binary_truth`, not to a closed T. Complement elements carry neither Bel
+/// nor Pl, so the fold is Bel 0, Pl .6, exactly as the same row stored on
+/// `binary_truth`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_validity_complement_keeps_its_open_world_share(pool: PgPool) {
+    let author = agent(&pool).await;
+    let cv = claim(&pool, author, "claim_validity complement").await;
+    store(
+        &pool,
+        cv,
+        CLAIM_VALIDITY_FRAME_ID,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"~1,2": 0.4, "0,1,2": 0.6}),
+    )
+    .await;
+    let twin = claim(&pool, author, "the same row on binary_truth").await;
+    store(
+        &pool,
+        twin,
+        binary(&pool).await,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"~1": 0.4, "0,1": 0.6}),
+    )
+    .await;
+
+    let f = atom_fold(&display(&pool, cv).await).expect("fold");
+    assert!(
+        close(f.belief(), 0.0) && close(f.plausibility(), 0.6),
+        "complement({{refuted, uncertain}}) is not a closed T: want Bel 0, Pl .6, got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+    let t = atom_fold(&display(&pool, twin).await).expect("fold");
+    assert_eq!(
+        (f.belief(), f.plausibility(), f.pignistic_prob(), f.mass_on_missing()),
+        (t.belief(), t.plausibility(), t.pignistic_prob(), t.mass_on_missing()),
+        "the coarsened row folds as its binary_truth twin"
     );
 }
