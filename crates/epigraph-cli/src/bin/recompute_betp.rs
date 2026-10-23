@@ -52,6 +52,10 @@
 //!   and a legacy recompute of the cohort is the frozen cohort-v1 apply
 //!   (exit 3 otherwise).
 //!
+//! Exit status: 0 done; 2 usage refusal; 3 mode refusal; 4 disk-gate abort;
+//! 5 one or more claims failed (each rolled back; the others committed and
+//! recorded); 1 any other error.
+//!
 //! **`--accept-vacate <list.jsonl>`** writes the explicit vacuous cache (Bel
 //! 0, Pl 1, BetP .5, `binary_truth`, read back as `unproven`), in list order,
 //! ONLY for listed ids, and only for those that are residue: a listed
@@ -97,6 +101,9 @@ use epigraph_engine::edge_factor::{AtomCacheOutcome, AtomCacheSettings, VacateOu
 const DISK_GATE_EXIT: i32 = 4;
 /// Exit status of a usage refusal (as clap's).
 const USAGE_EXIT: i32 = 2;
+/// Exit status of a run in which one or more claims failed (each rolled
+/// back; the others committed and recorded).
+const CLAIM_ERRORS_EXIT: i32 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -343,7 +350,7 @@ async fn main() {
         }
         Err(RunError::ClaimErrors(n)) => {
             eprintln!("recompute_betp: {n} claim(s) failed; see above");
-            std::process::exit(2);
+            std::process::exit(CLAIM_ERRORS_EXIT);
         }
         Err(RunError::Other(e)) => {
             eprintln!("Error: {e}");
