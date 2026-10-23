@@ -23,6 +23,7 @@ use epigraph_db::{
 };
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
+use crate::belief_profile::{BeliefProfile, FrameTier, PerspectiveTier};
 use crate::calibration::CalibrationConfig;
 use crate::epistemic_interval::{
     restrict_epistemic_frame_evidence, restrict_epistemic_negative, restrict_epistemic_positive,
@@ -31,6 +32,7 @@ use crate::epistemic_interval::{
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 
 const BINARY_FRAME_NAME: &str = "binary_truth";
+// belief-profile: allow-literal (array length of a fixed hypothesis list)
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
 /// The canonical claim-assessment frame's name. It replaced the per-source
@@ -42,8 +44,10 @@ pub const CLAIM_VALIDITY_FRAME_NAME: &str = "claim_validity";
 /// can create a frame of any name, so a by-name lookup lets the first one to
 /// name a frame `claim_validity` decide what every assess writes into.
 pub const CLAIM_VALIDITY_FRAME_ID: Uuid =
+    // belief-profile: allow-literal (a frame's fixed id, not a parameter)
     Uuid::from_u128(0x8a59_4393_c343_4f1a_b942_5c5b_7862_f792);
 /// `claim_validity`'s ordered axis: 0 = supported, 1 = refuted, 2 = uncertain.
+// belief-profile: allow-literal (array length of a fixed hypothesis list)
 pub const CLAIM_VALIDITY_HYPOTHESES: [&str; 3] = ["supported", "refuted", "uncertain"];
 
 /// Outcome of an edge-factor auto-wire pass.
@@ -90,8 +94,13 @@ pub async fn auto_wire_ds_for_edge(
     let Some((Some(bel), Some(pl), ow_opt)) = source_row else {
         return Ok(EdgeFactorOutcome::SourceFactorless);
     };
-    let source_interval =
-        EpistemicInterval::new(bel, pl, ow_opt.unwrap_or((pl - bel).max(0.0) * 0.5));
+    // Write-time constants come from the served (default) profile.
+    let profile = BeliefProfile::served();
+    let source_interval = EpistemicInterval::new(
+        bel,
+        pl,
+        ow_opt.unwrap_or((pl - bel).max(0.0) * profile.edge_factor.open_world_fraction_default),
+    );
 
     // Extract the restriction transmission factor `f`. This is the baseline
     // per-BBA reliability before locality composition. (`f` is ALSO folded
@@ -117,7 +126,9 @@ pub async fn auto_wire_ds_for_edge(
         RestrictionKind::Neutral => unreachable!(),
     };
 
-    if restricted.width() >= 0.999 && restricted.bel < 0.01 {
+    if restricted.width() >= profile.edge_factor.vacuous_width
+        && restricted.bel < profile.edge_factor.vacuous_belief
+    {
         return Ok(EdgeFactorOutcome::Vacuous);
     }
 
@@ -169,8 +180,8 @@ pub async fn auto_wire_ds_for_edge(
     //      Lets operators tune locality discounting per epistemic context
     //      (binary_truth vs textbook_veracity_* vs research_validity etc.)
     //      without code releases. Set via FrameRepository::set_property.
-    //   2. Global default from calibration.toml.
-    //   3. Hardcoded fallback 0.3 if calibration.toml is unreadable.
+    //   2. The served belief profile (calibration.toml, then the built-in
+    //      default when calibration.toml is unreadable).
     //
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
@@ -180,18 +191,16 @@ pub async fn auto_wire_ds_for_edge(
         FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
             .await
             .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
-    // Single calibration load for both the locality fallback AND the
-    // Phase 2 canonical-key alias resolution below. Cheap on the local
-    // filesystem; failure is recoverable (the helper's
-    // `default_for_phase2_fallback` mirrors the pre-Phase-2 hardcodes).
+    // Calibration load for the Phase 2 canonical-key alias resolution below
+    // (the locality factor comes from the profile). Cheap: process-cached.
     let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
-    let intra_factor = per_frame_factor.unwrap_or_else(|| {
-        calibration
-            .as_ref()
-            .map(|c| c.evidence_locality.intra_evidence_locality_factor)
-            .unwrap_or(0.3)
-    });
-    let locality_factor = if is_intra { intra_factor } else { 1.0 };
+    let intra_factor =
+        per_frame_factor.unwrap_or(profile.reliability.intra_evidence_locality_factor);
+    let locality_factor = if is_intra {
+        intra_factor
+    } else {
+        profile.reliability.cross_locality_factor
+    };
     let source_strength = transmission_factor * locality_factor;
 
     let frame = binary_frame()?;
@@ -579,6 +588,27 @@ pub fn effective_source_strength(
     per_frame_evidence_weights: Option<&HashMap<String, f64>>,
     calibration: &CalibrationConfig,
 ) -> f64 {
+    // Kept for callers that hold a calibration rather than a profile. It
+    // resolves a profile per call, so fold loops use
+    // [`effective_source_strength_profiled`] with a profile resolved once.
+    let profile = BeliefProfile::from_calibration(calibration).resolve(
+        FrameTier {
+            overrides: None,
+            intra_evidence_locality_factor: per_frame_intra_factor,
+            evidence_type_weights: per_frame_evidence_weights,
+        },
+        PerspectiveTier::default(),
+    );
+    global_source_strength(row, &profile)
+}
+
+/// The global (no perspective opinion on this BBA) branch of
+/// [`effective_source_strength_profiled`]: the chain documented on
+/// [`effective_source_strength`], with every constant read from `profile`
+/// (the per-frame tier lives in `profile.lens.frame_evidence_type_weights` and
+/// in the resolved `intra_evidence_locality_factor`).
+fn global_source_strength(row: &MassFunctionRow, profile: &BeliefProfile) -> f64 {
+    let r = &profile.reliability;
     // Step (1): legacy null-evidence_type cohort. The 5202ded backfill
     // populated `source_strength` on these rows without setting
     // `evidence_type`; we honor the stored value verbatim until Phase
@@ -588,8 +618,8 @@ pub fn effective_source_strength(
         if let Some(ss) = row.source_strength {
             return ss.clamp(0.0, 1.0);
         }
-        // Step (5): everything NULL → unknown-key 0.5 fallback.
-        return 0.5;
+        // Step (5): everything NULL → the unknown-key fallback weight.
+        return r.unknown_evidence_type_weight;
     }
 
     // SAFETY: just matched `Some` above.
@@ -600,14 +630,13 @@ pub fn effective_source_strength(
     // 2 global calibration). Keeps the locality semantics identical
     // across both tiers — an operator who writes `{"empirical": 0.5}`
     // expects the same `intra` discount to apply on top of 0.5 as it
-    // would have applied to the global 1.0.
+    // would have applied to the global 1.0. The intra factor arrives
+    // resolved (per-frame override ∨ profile).
     let compose_with_locality = |base: f64| -> f64 {
-        let intra_factor = per_frame_intra_factor
-            .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor);
         let locality_factor = if row.locality_tag.starts_with("intra") {
-            intra_factor
+            r.intra_evidence_locality_factor
         } else {
-            1.0
+            r.cross_locality_factor
         };
         (base * locality_factor).clamp(0.0, 1.0)
     };
@@ -616,11 +645,12 @@ pub fn effective_source_strength(
     // Map keys are already lowercased by the repo accessor; lowercase
     // the BBA's evidence_type to match. NO alias resolution at this
     // tier — see Q9 locked decision in Phase 4 spec § 5.
-    if let Some(map) = per_frame_evidence_weights {
-        let key = evidence_type.to_lowercase();
-        if let Some(&w) = map.get(&key) {
-            return compose_with_locality(w);
-        }
+    if let Some(&w) = profile
+        .lens
+        .frame_evidence_type_weights
+        .get(&evidence_type.to_lowercase())
+    {
+        return compose_with_locality(w);
     }
 
     // Step (3): evidence_type resolves to a calibrated weight (direct
@@ -630,20 +660,20 @@ pub fn effective_source_strength(
     // historical 'intra' rows are migrated to 'intra_self_cite' in
     // the same PR — applies the intra discount. Everything else
     // ('cross', 'unknown', or any future tag we haven't taught the
-    // helper) gets the un-discounted base weight.
-    if calibration.evidence_type_weight_present(evidence_type) {
-        let base = calibration.get_evidence_type_weight(evidence_type);
+    // helper) gets the cross factor.
+    if profile.evidence_type_weight_present(evidence_type) {
+        let base = profile.evidence_type_weight(evidence_type);
         return compose_with_locality(base);
     }
 
     // Step (4): evidence_type was set but isn't a calibrated key (path
     // 1 sentinel from Phase 2 spec § 4). The legacy `source_strength`
     // cache preserves write-time semantics; without it we drop to the
-    // 0.5 unknown-key fallback.
+    // unknown-key fallback weight.
     if let Some(ss) = row.source_strength {
         return ss.clamp(0.0, 1.0);
     }
-    0.5
+    r.unknown_evidence_type_weight
 }
 
 /// A querying perspective's reliability overrides — the "frame function"
@@ -695,50 +725,83 @@ pub fn effective_source_strength_with_perspective(
     calibration: &CalibrationConfig,
     perspective: &PerspectiveReliability,
 ) -> f64 {
+    // Calibration-holding entry point; resolves a profile per call (see
+    // [`effective_source_strength`]).
+    let profile = BeliefProfile::from_calibration(calibration).resolve(
+        FrameTier {
+            overrides: None,
+            intra_evidence_locality_factor: per_frame_intra_factor,
+            evidence_type_weights: per_frame_evidence_weights,
+        },
+        PerspectiveTier {
+            overrides: None,
+            reliability: Some(perspective),
+        },
+    );
+    effective_source_strength_profiled(row, &profile)
+}
+
+/// Per-BBA reliability under a resolved [`BeliefProfile`]: the tier chain of
+/// [`effective_source_strength_with_perspective`] with every constant, every
+/// table and every lens map read from the profile.
+///
+/// - **base weight** = `lens.perspective_source_reliability[evidence_type]`
+///   → `lens.frame_evidence_type_weights` → the profile's evidence-type
+///   weights (aliases resolved) → stored `source_strength` → the unknown-type
+///   weight.
+/// - **locality factor** = `lens.perspective_locality_reliability[locality_tag]`
+///   → the resolved intra factor when the tag is `intra*` → the cross factor.
+/// - result = `base × locality`, clamped.
+///
+/// When the perspective maps have no entry touching this BBA, the result is
+/// the global chain documented on [`effective_source_strength`], so a profile
+/// without a perspective opinion reproduces the global belief.
+#[must_use]
+pub fn effective_source_strength_profiled(row: &MassFunctionRow, profile: &BeliefProfile) -> f64 {
+    let lens = &profile.lens;
+    let r = &profile.reliability;
     let etype = row.evidence_type.as_deref().map(str::to_lowercase);
     let locality_key = row.locality_tag.to_lowercase();
 
     let persp_base = etype
         .as_ref()
-        .and_then(|t| perspective.source_reliability.get(t))
+        .and_then(|t| lens.perspective_source_reliability.get(t))
         .copied();
-    let persp_locality = perspective.locality_reliability.get(&locality_key).copied();
+    let persp_locality = lens
+        .perspective_locality_reliability
+        .get(&locality_key)
+        .copied();
 
     // No override touches this BBA → identical to the global computation.
     if persp_base.is_none() && persp_locality.is_none() {
-        return effective_source_strength(
-            row,
-            per_frame_intra_factor,
-            per_frame_evidence_weights,
-            calibration,
-        );
+        return global_source_strength(row, profile);
     }
 
-    // Base evidence-type weight: perspective → per-frame → calibration →
-    // stored source_strength → 0.5.
+    // Base evidence-type weight: perspective → per-frame → profile table →
+    // stored source_strength → unknown-type weight.
     let base = persp_base
         .or_else(|| {
             etype
                 .as_ref()
-                .and_then(|t| per_frame_evidence_weights.and_then(|m| m.get(t)).copied())
+                .and_then(|t| lens.frame_evidence_type_weights.get(t))
+                .copied()
         })
         .or_else(|| {
             etype
                 .as_ref()
-                .filter(|t| calibration.evidence_type_weight_present(t))
-                .map(|t| calibration.get_evidence_type_weight(t))
+                .filter(|t| profile.evidence_type_weight_present(t))
+                .map(|t| profile.evidence_type_weight(t))
         })
         .or(row.source_strength)
-        .unwrap_or(0.5);
+        .unwrap_or(r.unknown_evidence_type_weight);
 
-    // Locality factor: perspective → legacy intra logic (per-frame ∨ global
-    // intra factor when the tag is intra*, else 1.0).
+    // Locality factor: perspective → resolved intra factor when the tag is
+    // intra*, else the cross factor.
     let locality = persp_locality.unwrap_or_else(|| {
         if locality_key.starts_with("intra") {
-            per_frame_intra_factor
-                .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor)
+            r.intra_evidence_locality_factor
         } else {
-            1.0
+            r.cross_locality_factor
         }
     });
 
@@ -878,12 +941,11 @@ async fn compute_combined_belief(
     // in `calibration.toml` or via a per-frame override — flows through
     // to combined BetP without any DB rewrite.
     //
-    // The load is hoisted above the loop to avoid a per-row I/O cost
-    // for the multi-BBA branch. Calibration I/O failure is recoverable
-    // (per CalibrationConfig::from_workspace_root docs); we fall back
-    // to the synthetic config that mirrors the pre-Phase-2 hardcodes.
-    let calibration = CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+    // Every reliability input is resolved ONCE, above the loop, into a
+    // belief profile: the served (default) profile, then this frame's tier
+    // (its `belief_profile` object and the per-frame keys below). The
+    // process-cached calibration is kept only for the vocabulary warn-log.
+    let calibration = CalibrationConfig::cached();
     let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
@@ -910,8 +972,24 @@ async fn compute_combined_belief(
     // Surfaces operator typos in operational logs without blocking the
     // write.
     if let Some(ref map) = per_frame_evidence_weights {
-        warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
+        warn_on_unknown_evidence_type_keys(frame_id, map, calibration);
     }
+
+    // The frame's generic `belief_profile` override object. Best-effort like
+    // the per-frame keys above: a failed read means "no override".
+    let frame_overrides = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|f| crate::belief_profile::overrides_in(&f.properties).cloned());
+    let profile = BeliefProfile::served().resolve(
+        FrameTier {
+            overrides: frame_overrides.as_ref(),
+            intra_evidence_locality_factor: per_frame_intra,
+            evidence_type_weights: per_frame_evidence_weights.as_ref(),
+        },
+        PerspectiveTier::default(),
+    );
 
     // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
     // one `source_url`) are folded cautiously into one before the Dempster
@@ -932,18 +1010,15 @@ async fn compute_combined_belief(
     let mut items = Vec::with_capacity(all_rows.len());
     for (row, key) in all_rows.iter().zip(source_keys) {
         let mf = parse_stored_bba(frame, &row.masses)?;
-        let reliability = effective_source_strength(
-            row,
-            per_frame_intra,
-            per_frame_evidence_weights.as_ref(),
-            &calibration,
-        );
+        let reliability = effective_source_strength_profiled(row, &profile);
         let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
         items.push((key, d));
     }
-    let (combined, fold_conflict) =
-        crate::source_dependence::combine_with_source_dependence(items, 0.9)
-            .map_err(|e| format!("combine_multiple: {e}"))?;
+    let (combined, fold_conflict) = crate::source_dependence::combine_with_source_dependence(
+        items,
+        profile.combination.conflict_threshold,
+    )
+    .map_err(|e| format!("combine_multiple: {e}"))?;
 
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
     // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.
@@ -976,10 +1051,10 @@ async fn compute_combined_belief(
     // CDST classification — a verdict on the COMBINED belief via the
     // deterministic BetP 7-rule cascade. Defined only on the canonical binary
     // {TRUE, FALSE} frame (supported = idx 0, contradicted = idx 1); other
-    // frames leave classification unset. Thresholds come from `calibration`
-    // (operator-tunable, same load as the discount path).
+    // frames leave classification unset. Thresholds come from the resolved
+    // profile (operator-tunable, same resolution as the discount path).
     let classification = if frame.id == BINARY_FRAME_NAME {
-        let thresholds = &calibration.classifier_thresholds;
+        let thresholds = &profile.classifier.thresholds();
         // theta = closed-world full-frame ignorance m({0,1}); the open-world
         // missing mass is excluded (Smets TBM), matching the legacy
         // `compute_betp` the cascade was calibrated against.
