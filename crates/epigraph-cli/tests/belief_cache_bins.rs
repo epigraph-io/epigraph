@@ -200,6 +200,17 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
     };
     let wave_path = dir.join("wave.jsonl");
     std::fs::write(&wave_path, &wave).unwrap();
+    // One edge a wave claim sources after the wave: the downstream file's line.
+    let target = seed_claim(&pool, agent).await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(ids[0])
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("post-wave edge");
     set_cache(&pool, ids[2], 0.95, Some("supported")).await;
     let later = cache_of(&pool, ids[2]).await;
 
@@ -291,17 +302,51 @@ async fn snapshot_then_dry_run_then_restore_through_the_binaries(pool: PgPool) {
     .collect();
     assert_eq!(pairs, want);
     assert_eq!(lines.len(), want.len());
-    assert!(downstream.exists());
+    assert_eq!(
+        edge_ids(&downstream),
+        vec![edge],
+        "the downstream file lists exactly the post-wave edge"
+    );
 
     // Outputs are never overwritten: the same explicit paths refuse a re-run,
-    // before the database is touched.
+    // BEFORE the database is touched. Put the wave's value back on ids[0] so a
+    // re-run that reached the database would visibly restore it again.
+    set_cache(&pool, ids[0], 0.9, Some("supported")).await;
+    let rewaved = cache_of(&pool, ids[0]).await;
+    let outcomes_before = std::fs::read(&outcomes).unwrap();
     let o = run(RESTORE, &dir, Some(&url), &real_args);
     assert!(
         !o.status.success(),
         "an existing outcomes file must be refused"
     );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains(outcomes.to_str().unwrap()) && err.contains("exists"),
+        "refused for the wrong reason"
+    );
+    assert_eq!(
+        cache_of(&pool, ids[0]).await,
+        rewaved,
+        "the refused run touched the database"
+    );
+    assert_eq!(
+        std::fs::read(&outcomes).unwrap(),
+        outcomes_before,
+        "the refused run rewrote the outcomes file"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn edge_ids(path: &Path) -> Vec<Uuid> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["edge_id"].as_str().unwrap().parse().unwrap()
+        })
+        .collect()
 }
 
 fn outcome_pairs(path: &Path) -> HashSet<(String, String)> {
@@ -433,16 +478,8 @@ async fn a_failed_batch_still_leaves_the_committed_batches_outcomes_and_downstre
         want,
         "the committed batch's outcomes, and only those, are on file"
     );
-    let listed: Vec<Uuid> = std::fs::read_to_string(&downstream)
-        .unwrap()
-        .lines()
-        .map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).unwrap();
-            v["edge_id"].as_str().unwrap().parse().unwrap()
-        })
-        .collect();
     assert_eq!(
-        listed,
+        edge_ids(&downstream),
         vec![edge],
         "the downstream list is written even though the run failed"
     );
