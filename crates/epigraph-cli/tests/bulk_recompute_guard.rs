@@ -764,7 +764,10 @@ async fn a_template_only_frame_cannot_own_a_claim_with_real_input_elsewhere(pool
             insert_row(&pool, twin, &evidence_row(paper, assessor, "discount")).await;
             set_sentinel_cache(&pool, twin, recorded).await;
 
-            assert!(recompute_via(&pool, caller, twin).await, "{caller:?} {rule}: twin");
+            assert!(
+                recompute_via(&pool, caller, twin).await,
+                "{caller:?} {rule}: twin"
+            );
             let expected = cache(&pool, twin).await;
             assert_eq!(
                 expected.belief_frame_id,
@@ -958,10 +961,11 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
             .execute(&mut *conn)
             .await
             .expect("set statement_timeout");
-        let owner_frame =
-            epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, &viewer, a)
-                .await
-                .expect("the owner lookup on a cycle must terminate");
+        let owner_frame = epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(
+            &mut *conn, &viewer, a,
+        )
+        .await
+        .expect("the owner lookup on a cycle must terminate");
         assert_eq!(owner_frame, None, "a node of a cycle is a frozen compound");
         sqlx::query("RESET statement_timeout")
             .execute(&mut *conn)
@@ -996,8 +1000,11 @@ async fn a_viewer_that_cannot_see_the_decomposition_cannot_refold_the_compound(p
     let bt = frame(&pool, "binary_truth").await;
 
     for caller in CALLERS {
-        let compound = fixture::seed_public_claim(&pool, author, &format!("public compound {caller:?}")).await;
-        let leaf = fixture::seed_group_claim(&pool, author, group, &format!("private leaf {caller:?}")).await;
+        let compound =
+            fixture::seed_public_claim(&pool, author, &format!("public compound {caller:?}")).await;
+        let leaf =
+            fixture::seed_group_claim(&pool, author, group, &format!("private leaf {caller:?}"))
+                .await;
         decomposes_to(&pool, compound, leaf, false).await;
         let edge_visibility: String = sqlx::query_scalar(
             "SELECT visibility FROM edges WHERE source_id = $1 AND target_id = $2",
@@ -1015,14 +1022,20 @@ async fn a_viewer_that_cannot_see_the_decomposition_cannot_refold_the_compound(p
         // Calibration: the same row on a public standalone IS recomputed by
         // this caller, so the compound's row is visible to it and "no write"
         // below is the guard, not an empty input set.
-        let twin = fixture::seed_public_claim(&pool, author, &format!("public standalone {caller:?}")).await;
+        let twin =
+            fixture::seed_public_claim(&pool, author, &format!("public standalone {caller:?}"))
+                .await;
         insert_row(&pool, twin, &evidence_row(bt, source, "auto_wire")).await;
         let twin_before = set_sentinel_cache(&pool, twin, bt).await;
         assert!(
             recompute_via(&pool, caller, twin).await,
             "CALIBRATION {caller:?}: the public twin is recomputed"
         );
-        assert_ne!(cache(&pool, twin).await, twin_before, "CALIBRATION {caller:?}");
+        assert_ne!(
+            cache(&pool, twin).await,
+            twin_before,
+            "CALIBRATION {caller:?}"
+        );
 
         insert_row(&pool, compound, &evidence_row(bt, source, "auto_wire")).await;
         assert_frozen(

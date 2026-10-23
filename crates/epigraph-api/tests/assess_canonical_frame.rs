@@ -1116,19 +1116,18 @@ async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) 
 /// Base: the recorded `research_validity` frame keeps ownership (it still
 /// holds an input) and the cache becomes the template's fold.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_assessment_moves_ownership_off_a_frame_holding_only_the_ingest_template(
-    pool: PgPool,
-) {
+async fn an_assessment_moves_ownership_off_a_frame_holding_only_the_ingest_template(pool: PgPool) {
     let (claim, _viewer, caller) = seed_claim(&pool, "assess over an ingest template").await;
     let (ingest, _) = seed_agent_with_group(&pool, "assess-ingest").await;
-    let rv: Uuid = match sqlx::query_scalar("SELECT id FROM frames WHERE name = 'research_validity'")
-        .fetch_optional(&pool)
-        .await
-        .expect("look up research_validity")
-    {
-        Some(id) => id,
-        None => create_frame(&pool, "research_validity", &["TRUE", "FALSE"]).await,
-    };
+    let rv: Uuid =
+        match sqlx::query_scalar("SELECT id FROM frames WHERE name = 'research_validity'")
+            .fetch_optional(&pool)
+            .await
+            .expect("look up research_validity")
+        {
+            Some(id) => id,
+            None => create_frame(&pool, "research_validity", &["TRUE", "FALSE"]).await,
+        };
     sqlx::query(
         "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
          VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
@@ -1156,7 +1155,10 @@ async fn an_assessment_moves_ownership_off_a_frame_holding_only_the_ingest_templ
 
     let paper = create_frame(&pool, "paper_validity_x", &["supported", "refuted"]).await;
     let resp = assess(&pool, caller, claim, request_on(paper, true, 0.8)).await;
-    assert_eq!(resp.frame_id, paper, "CALIBRATION: the explicit frame is used");
+    assert_eq!(
+        resp.frame_id, paper,
+        "CALIBRATION: the explicit frame is used"
+    );
 
     let (owner, betp) = cache(&pool, claim).await;
     assert_eq!(
