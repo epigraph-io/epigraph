@@ -259,9 +259,11 @@ pub const fn fold_str(fold: AtomFoldMode) -> &'static str {
 /// Which atoms a wave covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveRole {
-    /// Claims with no in-force `decomposes_to` in either direction (W0).
+    /// Claims with no in-force `decomposes_to` in either direction (the
+    /// standalone wave).
     Standalone,
-    /// Decomposition leaves: a `decomposes_to` in-edge and none out (W1).
+    /// Decomposition leaves: a `decomposes_to` in-edge and none out (the leaf
+    /// wave).
     Leaf,
 }
 
