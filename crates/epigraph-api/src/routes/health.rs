@@ -10,6 +10,8 @@ pub struct HealthResponse {
     /// The belief modes this process read from its environment at startup
     /// (SPEC §10.2): `atom_fold`, `compound_belief`, `compound_write_guard`,
     /// `compound_source_edges`, `atom_cache_mode`, `inference`, `bp_apply`.
+    /// A reported mode is not necessarily acted on by this build; see
+    /// `epigraph_engine::belief_modes` for which ones are.
     /// Gate G0 compares this report across every live process, and a CLI wave
     /// bin refuses a writing run when its own modes differ from it.
     #[schema(value_type = Object)]

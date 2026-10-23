@@ -15,32 +15,37 @@
 //! wave bin compares its own [`current`] with the API's report before a
 //! writing run ([`BeliefModes::skew`]).
 //!
-//! # Defaults
+//! # Defaults, and what this build acts on
 //!
-//! Every default is today's behaviour, so an unset flag changes nothing:
+//! Every default is the mode the rollout starts from. With every flag unset
+//! this build behaves exactly as the build before it did: reading and
+//! reporting a flag changes nothing by itself.
 //!
-//! | flag | values | default |
-//! |---|---|---|
-//! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` |
-//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` |
-//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` |
-//! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` |
-//! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` |
-//! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` |
-//! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` |
+//! | flag | values | default | acted on in this build |
+//! |---|---|---|---|
+//! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | only by the CLI wave bins that fold caches, which refuse a writing run under any fold but `legacy` |
+//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | no |
+//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | no: a textless BBA write on a compound is neither kept inert nor logged yet |
+//! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | no |
+//! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
+//! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
+//! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` | no: a BP request with `apply_updates: true` still writes its results |
+//!
+//! The value docs below say what each mode means once the change that acts on
+//! it lands. Until then a reported mode is configuration, not behaviour:
+//! `bp_apply: off` on `/health` does not mean BP apply is refused. Each flag is
+//! wired into its code path by the change that introduces the behaviour, which
+//! reads [`current`] rather than parsing the environment again; this module
+//! only guarantees that every process reads and reports the flags alike.
 //!
 //! # Parsing
 //!
 //! A value is matched trimmed and case-insensitively against the spellings
 //! above. Unset or blank is the default. Anything else also reads as the
 //! default, and is returned in [`ModeRead::unrecognised`] (for this process,
-//! [`unrecognised`]) so the process can warn at boot: a typo must not silently enable a mode, and the report on
-//! `/health` then shows the mode the process actually runs, which is what
-//! gate G0 compares.
-//!
-//! Reporting a mode does not mean this build acts on it yet. The flags are
-//! wired into their code paths by the PRs that introduce each behaviour; this
-//! module only guarantees that every process reads and reports them alike.
+//! [`unrecognised`]) so the process can warn at boot: a typo must not
+//! silently enable a mode, and the report on `/health` then shows the mode
+//! the process actually runs, which is what gate G0 compares.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -129,7 +134,9 @@ belief_mode! {
 }
 
 belief_mode! {
-    /// What a textless BBA write aimed at a compound does.
+    /// What a textless BBA write aimed at a compound does. Reported only in
+    /// this build (see the module doc); the variants describe the enforced
+    /// meaning.
     CompoundWriteGuard, env = "EPIGRAPH_COMPOUND_WRITE_GUARD", default = Warn, {
         /// Accepted, kept inert, the caller warned and logged.
         Warn => "warn",
@@ -173,6 +180,8 @@ belief_mode! {
 
 belief_mode! {
     /// Whether a belief-propagation run may write its results to claims.
+    /// Reported only in this build (see the module doc); the variants describe
+    /// the enforced meaning.
     BpApply, env = "EPIGRAPH_BP_APPLY", default = Off, {
         /// BP results are not written.
         Off => "off",
