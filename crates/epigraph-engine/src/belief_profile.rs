@@ -94,7 +94,8 @@ pub mod defaults {
     pub const CROSS_LOCALITY_FACTOR: f64 = 1.0;
     /// Locality factor for an intra-source BBA (`locality_tag` `intra*`).
     pub const INTRA_EVIDENCE_LOCALITY_FACTOR: f64 = 0.3;
-    /// Conflict threshold handed to the Dempster fold.
+    /// Conflict threshold handed to the Dempster fold (not consumed: see
+    /// [`super::CombinationParams::conflict_threshold`]).
     pub const CONFLICT_THRESHOLD: f64 = 0.9;
     /// Journal reliability when no journal entry matches.
     pub const DEFAULT_JOURNAL_RELIABILITY: f64 = 0.78;
@@ -164,6 +165,15 @@ pub struct ReliabilityParams {
 #[serde(deny_unknown_fields)]
 pub struct CombinationParams {
     /// Conflict threshold handed to `combine_multiple` (the Dempster fold).
+    ///
+    /// **Not consumed.** `epigraph_ds::combination::combine_multiple` ignores
+    /// its threshold argument (every fold step is Dempster), so overriding
+    /// this moves no served value. It is still threaded to every fold and
+    /// hashed, like the other not-yet-consumed parameters, so a fold that
+    /// honours it later needs no profile change; that change is pinned by the
+    /// golden test `the_combination_conflict_threshold_is_not_consumed_today`,
+    /// which must then be updated on purpose. Until then an override of it
+    /// changes the profile hash without changing any value.
     pub conflict_threshold: f64,
 }
 

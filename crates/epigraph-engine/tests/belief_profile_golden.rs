@@ -94,9 +94,14 @@ fn case(name: &str) -> fixtures::Case {
 /// calibration, the case's per-frame and perspective inputs layered on as the
 /// frame and perspective tiers, then the context-carrying combine.
 fn profile_fold(c: &fixtures::Case, cal: &CalibrationConfig) -> fixtures::FoldBits {
+    fold_under(c, &BeliefProfile::from_calibration(cal))
+}
+
+/// [`profile_fold`] over a given global profile.
+fn fold_under(c: &fixtures::Case, global: &BeliefProfile) -> fixtures::FoldBits {
     let pfw = fixtures::per_frame_weights(c);
     let persp = fixtures::perspective(c);
-    let profile = BeliefProfile::from_calibration(cal).resolve(
+    let profile = global.resolve(
         FrameTier {
             overrides: None,
             intra_evidence_locality_factor: c.per_frame_intra,
@@ -227,4 +232,43 @@ fn the_named_global_profile_in_calibration_toml_is_honoured_by_the_fold() {
         }
     }
     assert_ne!(before.bel, after.bel, "the fold must see the moved weight");
+}
+
+#[test]
+fn the_combination_conflict_threshold_is_not_consumed_today() {
+    // `combine_multiple` ignores its threshold argument, so the profile's
+    // `combination.conflict_threshold` moves no value. This pins that, on a
+    // fixture whose fold conflict is well inside (0, 1) so thresholds on BOTH
+    // sides of it are tried: a later change that makes the threshold live
+    // turns this red and has to update it (and the parameter's docs) on
+    // purpose.
+    let g = GOLDEN
+        .iter()
+        .find(|g| g.config == "toml" && g.case == "tier_mix_global")
+        .expect("golden row");
+    let conflict = f64::from_bits(g.measures[3]);
+    assert!(
+        conflict > 0.1 && conflict < 0.5,
+        "the fixture must carry real conflict for this to mean anything ({conflict})"
+    );
+    let base = BeliefProfile::from_calibration(&fixtures::golden_calibration());
+    let c = case(g.case);
+    for threshold in [0.0, 0.1, 0.5, 1.0] {
+        let moved = base
+            .with_overrides(
+                &serde_json::json!({ "combination": { "conflict_threshold": threshold } }),
+            )
+            .expect("a threshold in [0, 1] is a valid override");
+        assert_ne!(
+            moved.profile_hash(),
+            base.profile_hash(),
+            "the parameter is hashed ({threshold})"
+        );
+        assert_eq!(
+            fold_under(&c, &moved),
+            expected(g),
+            "conflict_threshold = {threshold} moved the fold: it is now consumed; update \
+             CombinationParams::conflict_threshold's docs and this test"
+        );
+    }
 }
