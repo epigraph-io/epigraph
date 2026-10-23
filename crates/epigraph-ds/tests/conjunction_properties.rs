@@ -1069,6 +1069,56 @@ proptest! {
         prop_assert!((cf.k - o.k).abs() < 1e-9, "k {} vs {}", cf.k, o.k);
         prop_assert!((cf.betp - betp).abs() < 1e-9, "betp {} vs {}", cf.betp, betp);
     }
+
+    /// The closed forms are the ow = 0 case of SPEC §3.3 / §3.6. When some
+    /// item gives `~` mass on a query atom they are not exact CDST, so they
+    /// must say so (`exact: false`); without `~` they stay exact.
+    #[test]
+    fn closed_forms_are_exact_only_without_open_world(
+        (query, raws) in arb_case(5, 4, true),
+        m_milli in 1u32..=999,
+    ) {
+        let n = query.len();
+        prop_assume!(n >= 2);
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let m = f64::from(m_milli) / 1000.0;
+        let Some(base) = conj(&query, &items, 0.0) else { return Ok(()); };
+        let carries_open_world = raws.iter().any(|r| match r {
+            Raw::Coupled(es) => es.iter().any(|(_, _, _, o)| *o > 0.0),
+            Raw::Mixed(_, _, _, o) => *o > 0.0,
+        });
+        let cf = not_all_closed_form(&base, m).unwrap();
+        prop_assert_eq!(cf.exact, !carries_open_world, "not_all closed form");
+        let pair_bel = joint_bel(&query, &items, 0.0, &[0, 1]).unwrap();
+        if let Ok(sib) = single_negative_sibling(&base, pair_bel, m) {
+            prop_assert_eq!(sib.exact, !carries_open_world, "sibling closed form");
+        }
+    }
+}
+
+/// a {T .6, `~` .4}, b {T 1}: Bel(a ∧ b) = Bel(a ∧ b in the pair) = .6. A
+/// sibling edge at m = .5 gives the closed form Bel .6·.5/.7 ≈ .429, but in
+/// exact CDST the valuation's frame part annihilates a's `~` and Bel is 1
+/// (the DP's `not_all` over the same two leaves agrees). The closed form must
+/// not label that value exact.
+#[test]
+fn closed_forms_with_open_world_are_not_exact() {
+    let items = vec![
+        Item::new(vec![(Lit::pos(0u32), 0.6, 0.4)]).unwrap(),
+        Item::new(vec![(Lit::pos(1u32), 1.0, 0.0)]).unwrap(),
+    ];
+    let q = positives(2);
+    let base = conj_belief(&q, &items, 0.0).unwrap();
+    assert!(close(base.bel, 0.6) && base.exact);
+    let pair_bel = joint_bel(&q, &items, 0.0, &[0, 1]).unwrap();
+    let sib = single_negative_sibling(&base, pair_bel, 0.5).unwrap();
+    let cf = not_all_closed_form(&base, 0.5).unwrap();
+    let dp = conj_belief(&q, &items, 0.5).unwrap();
+    assert!(close(sib.bel, 0.3 / 0.7), "closed form {}", sib.bel);
+    assert!(close(dp.bel, 1.0), "exact CDST {}", dp.bel);
+    assert!(dp.exact, "the DP is exact CDST under `~`");
+    assert!(!sib.exact, "sibling closed form under `~` claimed exact");
+    assert!(!cf.exact, "not_all closed form under `~` claimed exact");
 }
 
 // ---------------------------------------------------------------------------
