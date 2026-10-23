@@ -717,6 +717,7 @@ async fn run_wave_batches(
     let written = AtomicUsize::new(0);
     let scoped = AtomicUsize::new(0);
     let compound = AtomicUsize::new(0);
+    let role_changed = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     for (i, batch) in cohort.chunks(cli.batch_size.max(1)).enumerate() {
         pace(cli, i).await;
@@ -724,8 +725,8 @@ async fn run_wave_batches(
             .map_err(|why| RunError::DiskGate(format!("before wave batch {}: {why}", i + 1)))?;
         futures::stream::iter(batch.iter().copied())
             .map(|claim_id| {
-                let (done, written, scoped, compound, errors) =
-                    (&done, &written, &scoped, &compound, &errors);
+                let (done, written, scoped, compound, role_changed, errors) =
+                    (&done, &written, &scoped, &compound, &role_changed, &errors);
                 async move {
                     match write_wave_claim(pool, viewer, claim_id, role, settings, log).await {
                         Ok(o) => {
@@ -733,8 +734,12 @@ async fn run_wave_batches(
                                 written.fetch_add(1, Ordering::Relaxed);
                             }
                             scoped.fetch_add(o.scoped_rewritten, Ordering::Relaxed);
-                            if o.outcome == AtomCacheOutcome::CompoundSkipped {
+                            if o.outcome == Some(AtomCacheOutcome::CompoundSkipped) {
                                 compound.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if o.role_changed {
+                                role_changed.fetch_add(1, Ordering::Relaxed);
+                                println!("  {claim_id}: role_changed (skipped)");
                             }
                         }
                         Err(e) => {
@@ -757,11 +762,12 @@ async fn run_wave_batches(
             .await;
     }
     println!(
-        "wave done: {} caches changed, {} scoped rows resynced, {} compounds skipped, {} errors \
-         (of {total})",
+        "wave done: {} caches changed, {} scoped rows resynced, {} compounds skipped, {} \
+         skipped as role_changed, {} errors (of {total})",
         written.load(Ordering::Relaxed),
         scoped.load(Ordering::Relaxed),
         compound.load(Ordering::Relaxed),
+        role_changed.load(Ordering::Relaxed),
         errors.load(Ordering::Relaxed),
     );
     match errors.load(Ordering::Relaxed) {

@@ -556,8 +556,12 @@ impl WaveLog {
 /// What one wave write did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaveClaimOutcome {
-    /// The single atom-cache writer's outcome.
-    pub outcome: AtomCacheOutcome,
+    /// The single atom-cache writer's outcome; `None` when the claim was
+    /// skipped because its role is no longer the wave's (`role_changed`).
+    pub outcome: Option<AtomCacheOutcome>,
+    /// The claim's role, re-read inside the write's transaction, is not the
+    /// wave's: nothing was written or recorded.
+    pub role_changed: bool,
     /// The claim's cache changed (and was recorded).
     pub changed: bool,
     /// Scoped rows rewritten (and recorded).
@@ -585,32 +589,46 @@ async fn lock_cache(
 }
 
 /// One wave write (SPEC §10.7) of a claim of the wave's `role`: in ONE
-/// transaction, lock the claim, read its cache, run the single atom-cache
-/// writer under `settings`, read the cache back, record `before` and
-/// `written` (only when it changed), resync the atom's existing per-scope
-/// rows from the fold (when the AEF wrote), and commit. Records are flushed
-/// before the commit.
+/// transaction, lock the claim, read its cache, re-read its role (a claim
+/// whose role is no longer the wave's is skipped, `role_changed`), run the
+/// single atom-cache writer under `settings`, read the cache back, record
+/// `before` and `written` (only when it changed), resync the atom's existing
+/// per-scope rows from the fold (when the AEF wrote), and commit. Records are
+/// flushed before the commit.
 ///
 /// # Errors
-/// A database read or write, a fold, or a record write; the transaction is
-/// rolled back.
+/// A database read or write, a fold, or a record write, and a `settings`
+/// fold that does not fold `role` with the AEF (the writer would write the
+/// legacy owner fold); the transaction is rolled back.
 pub async fn write_wave_claim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
-    _role: WaveRole,
+    role: WaveRole,
     settings: AtomCacheSettings,
     log: &WaveLog,
 ) -> Result<WaveClaimOutcome, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    let Some(before) = lock_cache(&mut tx, claim_id).await? else {
-        return Ok(WaveClaimOutcome {
-            outcome: AtomCacheOutcome::NotVisible,
-            changed: false,
-            scoped_rewritten: 0,
-            scoped_kept: 0,
-        });
+    let skipped = |outcome, role_changed| WaveClaimOutcome {
+        outcome,
+        role_changed,
+        changed: false,
+        scoped_rewritten: 0,
+        scoped_kept: 0,
     };
+    let Some(before) = lock_cache(&mut tx, claim_id).await? else {
+        return Ok(skipped(Some(AtomCacheOutcome::NotVisible), false));
+    };
+    // The role, on the locked row: a claim whose role changed since the
+    // cohort was selected (a decomposition landed, say) is not this wave's.
+    let now = epigraph_db::repos::claim_role::roles_batch(&mut *tx, viewer, &[claim_id])
+        .await
+        .map_err(|e| format!("roles_batch: {e}"))?
+        .remove(&claim_id);
+    if now != Some(role.claim_role()) {
+        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
+        return Ok(skipped(None, true));
+    }
     let outcome = epigraph_engine::edge_factor::recompute_atom_cache_with(
         &mut tx,
         viewer,
@@ -620,6 +638,17 @@ pub async fn write_wave_claim(
         settings,
     )
     .await?;
+    if matches!(outcome, AtomCacheOutcome::Legacy { .. }) {
+        // A wave applies AEF values only (the binary refuses a fold that does
+        // not cover the wave's role); never the legacy owner fold.
+        tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
+        return Err(format!(
+            "claim {claim_id}: atom_fold={} does not fold a {} with the AEF; a wave never \
+             writes the legacy owner fold",
+            fold_str(settings.fold),
+            role.as_str()
+        ));
+    }
     let after = read_cache_columns(&mut *tx, &[claim_id])
         .await
         .map_err(|e| format!("read cache: {e}"))?
@@ -644,7 +673,8 @@ pub async fn write_wave_claim(
     };
     tx.commit().await.map_err(|e| format!("commit: {e}"))?;
     Ok(WaveClaimOutcome {
-        outcome,
+        outcome: Some(outcome),
+        role_changed: false,
         changed,
         scoped_rewritten,
         scoped_kept,
