@@ -617,9 +617,11 @@ async fn read_family(
         let dups = ClaimRepository::marked_duplicates_of(&mut *read, viewer, &ids, cap_i64)
             .await
             .map_err(db_caller_error)?;
-        let dups_truncated = dups.len() > cap;
+        // Over the cap, or a chain deeper than the walk follows: either way
+        // some duplicate (and its dates) is missing from the read.
+        let dups_truncated = dups.rows.len() > cap || dups.chain_truncated;
         let mut by_canonical: BTreeMap<Uuid, Vec<DedupClaim>> = BTreeMap::new();
-        for d in dups.into_iter().take(cap) {
+        for d in dups.rows.into_iter().take(cap) {
             // Only the canonical's own owner's duplicates feed the plan: a
             // stranger who marked a claim onto a public member must not move
             // its dates (a far deadline would hold off its close-out).
@@ -1941,11 +1943,12 @@ pub async fn label_dedup_index_view(
     .await
     .map_err(db_caller_error)?;
     read.commit().await.map_err(db_caller_error)?;
-    let truncated = dups.len() > max.effective;
+    let truncated = dups.rows.len() > max.effective || dups.chain_truncated;
     let views: Vec<Value> = found
         .into_iter()
         .map(|(id, content, labels)| {
             let duplicates: Vec<Value> = dups
+                .rows
                 .iter()
                 .take(max.effective)
                 .filter(|d| d.canonical == id)

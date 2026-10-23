@@ -346,7 +346,10 @@ included.
   should do the same.
 - It takes any claim ids; it does not check the index-family allowlist.
 - `max_claims` caps the duplicates read; `truncated` reports a read that hit
-  the cap.
+  the cap, or a chain deeper than the walk follows (16 marks,
+  `MAX_DUPLICATE_CHAIN_DEPTH`). The duplicates past that depth are not
+  returned. The plan reports the same as `coverage.truncated`, so apply
+  refuses it.
 
 ## `probe_label_dedup` (claims:read)
 

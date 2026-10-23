@@ -1900,6 +1900,125 @@ async fn duplicates_over_the_cap_truncate_the_read(pool: PgPool) {
     );
 }
 
+/// The duplicates walk stops at `MAX_DUPLICATE_CHAIN_DEPTH`; a chain that goes
+/// deeper must say so, not lose its tail silently. A chain of 17 marks
+/// (d17 -> d16 -> ... -> d1 -> canonical): read from d1 it is 16 deep and
+/// whole; read from the canonical it is TRUNCATED in the index view and in the
+/// plan (so apply refuses, nothing written), and d17 is never returned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_duplicate_chain_deeper_than_the_walk_bound_is_reported_truncated(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let canonical = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let bound =
+        usize::try_from(epigraph_db::repos::claim::MAX_DUPLICATE_CHAIN_DEPTH).expect("bound");
+    // chain[0] = d1 (marked onto the canonical) .. chain[bound] = d17.
+    let mut chain = Vec::with_capacity(bound + 1);
+    for i in 1..=bound + 1 {
+        chain.push(
+            seed(
+                &pool,
+                agent,
+                group,
+                "public",
+                &format!(
+                    "Pump station rehab link {i} | Acme Water Authority | due: 2026-11-20 \
+                     | ref ACME-9{i:05}"
+                ),
+                &["chain-link"],
+                "2026-09-01T00:00:00Z",
+            )
+            .await,
+        );
+    }
+    // Deepest first, so every mark's canonical is current when it is marked.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let mut marks: Vec<(Uuid, Uuid)> = (1..=bound)
+        .rev()
+        .map(|k| (chain[k], chain[k - 1]))
+        .collect();
+    marks.push((chain[0], canonical));
+    for (dup, canon) in marks {
+        epigraph_db::ClaimRepository::mark_duplicate_act_attributed_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canon),
+            &epigraph_db::DuplicateProvenance::new("test", "strong_id"),
+        )
+        .await
+        .expect("mark");
+    }
+    drop(conn);
+
+    let view_of = |id: Uuid| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            first_text(
+                &label_dedup_index_view(
+                    server,
+                    viewer,
+                    serde_json::from_value::<LabelDedupIndexViewParams>(
+                        json!({"claim_ids": [id.to_string()]}),
+                    )
+                    .expect("params"),
+                    None,
+                )
+                .await
+                .expect("index view"),
+            )
+        }
+    };
+    let dup_ids = |view: &Value| -> Vec<String> {
+        view["views"][0]["duplicates"]
+            .as_array()
+            .expect("duplicates")
+            .iter()
+            .map(|d| d["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+
+    // Control: exactly the bound deep, from d1. Whole, not truncated.
+    let whole = view_of(chain[0]).await;
+    assert_eq!(whole["truncated"], false, "{whole}");
+    assert_eq!(dup_ids(&whole).len(), bound, "{whole}");
+    assert!(
+        dup_ids(&whole).contains(&chain[bound].to_string()),
+        "d17 is 16 deep from d1: {whole}"
+    );
+
+    // One past the bound, from the canonical.
+    let deep = view_of(canonical).await;
+    assert_eq!(deep["truncated"], true, "{deep}");
+    assert_eq!(dup_ids(&deep).len(), bound, "{deep}");
+    assert!(
+        !dup_ids(&deep).contains(&chain[bound].to_string()),
+        "a duplicate past the bound is not returned: {deep}"
+    );
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    assert_eq!(plan["coverage"]["truncated"], true, "{plan}");
+    let mut ids = chain.clone();
+    ids.push(canonical);
+    let before = snapshot(&pool, &ids).await;
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(out["status"], "refused", "{out}");
+    assert_eq!(out["refusal"]["code"], "TRUNCATED", "{out}");
+    assert_eq!(snapshot(&pool, &ids).await, before, "nothing written");
+}
+
 /// apply's canonical check holds its answer to the unit's commit. A
 /// retirement of the canonical that is in flight (uncommitted) when apply
 /// checks it is waited for and read, so the unit refuses ("no longer

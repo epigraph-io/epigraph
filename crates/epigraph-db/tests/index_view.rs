@@ -70,7 +70,8 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
 
     let rows = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[c], 100)
         .await
-        .expect("index view");
+        .expect("index view")
+        .rows;
     let got: Vec<(Uuid, Uuid)> = rows.iter().map(|r| (r.canonical, r.id)).collect();
     let mut want = vec![(c, d1), (c, d2)];
     want.sort();
@@ -88,7 +89,8 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     }
     let moved = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[elsewhere], 100)
         .await
-        .expect("index view");
+        .expect("index view")
+        .rows;
     assert_eq!(
         moved.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![undone],
@@ -98,7 +100,8 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     // The read of a mid-chain claim starts there.
     let mid = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[d1], 100)
         .await
-        .expect("index view");
+        .expect("index view")
+        .rows;
     assert_eq!(
         mid.iter().map(|r| (r.canonical, r.id)).collect::<Vec<_>>(),
         vec![(d1, d2)]
@@ -107,7 +110,8 @@ async fn the_index_view_reads_every_marked_duplicate_down_the_chain_and_nothing_
     // The cap reports itself: cap + 1 rows come back when more exist.
     let capped = ClaimRepository::marked_duplicates_of(&pool, &bypass, &[c], 1)
         .await
-        .expect("capped");
+        .expect("capped")
+        .rows;
     assert_eq!(capped.len(), 2, "cap + 1 rows signal truncation");
 }
 
@@ -128,6 +132,7 @@ async fn the_index_view_is_filtered_by_the_viewer(pool: PgPool) {
             ClaimRepository::marked_duplicates_of(&pool, &v, &[c], 100)
                 .await
                 .expect("read")
+                .rows
                 .len()
         }
     };
@@ -148,13 +153,15 @@ async fn a_private_duplicate_of_a_public_canonical_is_read_only_by_its_group(poo
     let outsider = Viewer::resolve(&pool, stranger).await.expect("viewer");
     let member_rows = ClaimRepository::marked_duplicates_of(&pool, &member, &[c], 100)
         .await
-        .expect("read");
+        .expect("read")
+        .rows;
     assert_eq!(
         member_rows.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![d]
     );
     let outsider_rows = ClaimRepository::marked_duplicates_of(&pool, &outsider, &[c], 100)
         .await
-        .expect("read");
+        .expect("read")
+        .rows;
     assert!(outsider_rows.is_empty(), "{outsider_rows:?}");
 }
