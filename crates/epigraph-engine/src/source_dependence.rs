@@ -240,6 +240,13 @@ pub const ATTRIBUTED_METHOD: &str = "attributed_v1";
 pub const EDGE_FACTOR_METHOD: &str = "edge_factor";
 /// `combination_method` of an ingest self-assertion ("paper P asserts this
 /// claim"), written by the ingest batch with no perspective and no evidence.
+///
+/// The row shape is NOT unique to ingest: `ds_auto::auto_wire_ds_for_claim`
+/// (the creation BBA of `submit_claim` / `memorize` when the caller wrote no
+/// evidence row) and `ds_auto::auto_wire_ds_batch` as called from workflow
+/// ingest write the same method with NULL perspective and NULL evidence.
+/// Only the caller's `asserting_paper` argument to [`item_key`] tells them
+/// apart; see its contract there.
 pub const INGEST_ASSERTION_METHOD: &str = "auto_wire";
 
 /// The one canonical identity of a BBA row's evidential source.
@@ -285,9 +292,13 @@ pub struct ItemEvidence {
     pub source_url: Option<String>,
 }
 
-/// Prefixes that turn a link into a bare DOI, longest first; matched
-/// case-insensitively. Ingest writes `https://doi.org/<doi>` for a `10.`
-/// identifier and `doi:<id>` for any other one.
+/// Prefixes that turn a link or a label into a bare DOI, longest first;
+/// matched case-insensitively. What reaches the evidence row: ingest persists
+/// its document identifier bare in `properties.doi` (a DOI, an arXiv-style
+/// id, a synthesized document key, or the document's URI when it has none of
+/// those) and writes no `source_url` for literature; `source_url` holds what
+/// other writers passed, which may be a doi.org link, a `doi:<id>` label (the
+/// spelling ingest uses for a paper's label), any other link, or free text.
 const DOI_PREFIXES: [&str; 7] = [
     "https://www.doi.org/",
     "http://www.doi.org/",
@@ -439,7 +450,15 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 ///    attribution; its perspective is the original BBA's id), or `edge:` — an
 ///    [`EDGE_FACTOR_METHOD`] row (its perspective is the edge id);
 /// 5. `paper:` — an [`INGEST_ASSERTION_METHOD`] row with neither perspective
-///    nor evidence, when the caller resolved its `asserting_paper`;
+///    nor evidence, when the caller resolved its `asserting_paper`.
+///    **Caller contract:** pass `asserting_paper` only for a row the caller
+///    has shown came from that paper's ingest batch (for example: the row's
+///    agent is the agent that ingested the paper, and the claim has that
+///    paper's `asserts` / `level_3` link). The same NULL/NULL `auto_wire`
+///    shape is written by `submit_claim` / `memorize` creation BBAs and by
+///    workflow ingest (see [`INGEST_ASSERTION_METHOD`]); resolving a paper
+///    per claim rather than per row would merge such an unrelated agent's
+///    BBA into the paper's self-assertion. With `None` the row is `row:`;
 /// 6. `row:` — anything else is its own item.
 ///
 /// `doi:`, `url:` and `paper:` ignore the row's agent: one paper read by two
@@ -538,8 +557,12 @@ impl KeyedItem {
 
 /// The side of its key a row belongs to, and its weight there.
 ///
-/// On a 2-hypothesis frame (index 0 = the claim holds), with t = m({0}) and
-/// f = m({1}):
+/// On a 2-hypothesis frame, with t = m({0}) and f = m({1}). Index 0 is read
+/// as "the claim holds": callers coarsen every row to `binary_truth` (index 0
+/// = TRUE) before partitioning. A claim wired at hypothesis index 1 of an
+/// axis frame must be coarsened first, or [`ItemSide::Support`] and
+/// [`ItemSide::Refute`] name the opposite literals. The fold itself is
+/// symmetric in the two sides, so only readers of the side labels care:
 /// - f = 0: pure support, weight t. This includes a vacuous or open-world-only
 ///   row (weight 0), which any real support row of the key outweighs;
 /// - t = 0 < f: pure refutation, weight f;
