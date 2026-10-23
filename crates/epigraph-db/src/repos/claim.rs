@@ -6029,51 +6029,71 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(new_content.as_bytes());
         let new_truth_val = new_truth.value();
 
-        // Verify old claim exists and is current; also pull labels so the new
-        // claim can inherit them. Without the label carry, downstream consumers
-        // that filter by labels (e.g. find_workflow's `labels @> ['workflow']`
-        // predicate) silently lose the replacement. Properties are NOT carried
+        // Retire the old claim and read what the replacement inherits in ONE
+        // statement. `AND is_current` is what makes two concurrent
+        // supersessions of one claim mutually exclusive: under READ COMMITTED
+        // the second blocks on the first's row lock, re-evaluates the WHERE
+        // once the first commits, and matches nothing. A separate unlocked
+        // `SELECT is_current` followed by `UPDATE … WHERE id = $1` let both
+        // pass and insert two current successors.
+        //
+        // Both embedding columns are nulled in this same statement: the CHECK
+        // constraint `chk_deprecated_no_embedding` (migration 052) fires
+        // per-statement, not per-transaction, so a two-step update would
+        // violate it between statements.
+        //
+        // Labels are carried so that downstream consumers that filter by
+        // labels (e.g. find_workflow's `labels @> ['workflow']` predicate) do
+        // not silently lose the replacement. Properties are NOT carried
         // forward: if the supersession is fixing something that lived in
         // `properties` (e.g. a stale `confidence_source`), blanket copy would
         // propagate the bug the supersede was meant to correct. Callers that
         // want to preserve specific properties on the new claim should set
         // them via a follow-up `patch_claim`.
-        let old_row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT agent_id, COALESCE(is_current, true),
-                    COALESCE(labels, ARRAY[]::text[])
-             FROM claims WHERE id = $1"#,
+        let retired: Option<(Uuid, Vec<String>)> = sqlx::query_as(
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+             updated_at = NOW() WHERE id = $1 AND is_current \
+             RETURNING agent_id, COALESCE(labels, ARRAY[]::text[])",
         )
         .bind(old_uuid)
         .fetch_optional(&mut *conn)
         .await?;
 
-        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
-            entity: "Claim".to_string(),
-            id: old_uuid,
-        })?;
-
-        if !is_current {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "Claim {} has already been superseded",
-                    old_uuid
-                )),
-            });
-        }
-
-        // Mark old claim as non-current and null both embedding columns in one
-        // statement. Combining all three in a single UPDATE is required by the
-        // CHECK constraint `chk_deprecated_no_embedding` (migration 052) which
-        // fires per-statement, not per-transaction: a two-step update would
-        // violate it between statements.
-        sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
-             updated_at = NOW() WHERE id = $1",
-        )
-        .bind(old_uuid)
-        .execute(&mut *conn)
-        .await?;
+        let (agent_id, old_labels) = match retired {
+            Some(r) => r,
+            None => {
+                // Nothing retired: tell a missing claim from a retired one, the
+                // two refusals this function has always distinguished.
+                let is_current: Option<bool> = sqlx::query_scalar(
+                    r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read classifies the refusal of the mutation it guards, not a disclosure to a caller.
+                     SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
+                )
+                .bind(old_uuid)
+                .fetch_optional(&mut *conn)
+                .await?;
+                return Err(match is_current {
+                    None => DbError::NotFound {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                    },
+                    Some(false) => DbError::QueryFailed {
+                        source: sqlx::Error::Protocol(format!(
+                            "Claim {} has already been superseded",
+                            old_uuid
+                        )),
+                    },
+                    // Visible and current, yet the UPDATE matched no row: the
+                    // session may read it but not retire it. Refuse rather
+                    // than insert a successor next to a still-current claim.
+                    Some(true) => DbError::QueryFailed {
+                        source: sqlx::Error::Protocol(format!(
+                            "Claim {} could not be retired by this session",
+                            old_uuid
+                        )),
+                    },
+                });
+            }
+        };
 
         // Insert new claim with supersedes link, carrying forward only labels
         // from the old row. Embeddings are intentionally NOT copied: the new
