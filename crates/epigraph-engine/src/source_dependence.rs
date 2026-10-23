@@ -433,7 +433,8 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 /// 2. `url:` — `evidence` names an `http(s)://` link that is not a DOI link,
 ///    in `source_url` or (for a document ingest identified by its URI) in
 ///    `properties.doi` ([`normalize_source_url`]); free text names no source;
-/// 3. `ev:` — `evidence` carries neither;
+/// 3. `ev:` — `evidence` names neither, or the row cites an `evidence_id`
+///    the viewer cannot see (`evidence` is `None`);
 /// 4. `attr:` — an [`ATTRIBUTED_METHOD`] row citing no evidence (a textless
 ///    attribution; its perspective is the original BBA's id), or `edge:` — an
 ///    [`EDGE_FACTOR_METHOD`] row (its perspective is the edge id);
@@ -447,8 +448,13 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 /// `evidence` is the row's cited evidence **as the caller's viewer sees it**:
 /// the row's `evidence_id`, or its `perspective_id` when that perspective is
 /// an evidence perspective. A row whose evidence is hidden from the viewer
-/// gets `None` and, citing evidence it cannot key on, falls to `row:`: it
-/// folds as independent, as hidden evidence does under the legacy key.
+/// gets `None` and keys `ev:<row.evidence_id>`: the id is already on the
+/// visible `mass_functions` row and no evidence content is read, so this
+/// discloses nothing, and rows citing that one evidence row (a `whole`
+/// attribution copied onto several atoms, or two agents citing it) still fold
+/// as one source instead of being counted once per row. Such a row cannot get
+/// the `doi:` / `url:` key a viewer who sees the evidence gives it, so the two
+/// viewers' partitions can differ; that is the per-viewer fold, not a leak.
 ///
 /// A real lens perspective (an analytical or empirical lens, say) is never a
 /// key: keying on it would make every row of one lens a single comonotone
@@ -474,10 +480,13 @@ pub fn item_key(
             .cloned()
             .unwrap_or(ItemKey::Evidence(ev.id));
     }
+    if let Some(cited) = row.evidence_id {
+        return ItemKey::Evidence(cited);
+    }
     let method = row.combination_method.as_deref();
     match (method, row.perspective_id, row.evidence_id) {
         (Some(ATTRIBUTED_METHOD), Some(original), None) => ItemKey::Attribution(original),
-        (Some(EDGE_FACTOR_METHOD), Some(edge), _) => ItemKey::Edge(edge),
+        (Some(EDGE_FACTOR_METHOD), Some(edge), None) => ItemKey::Edge(edge),
         (Some(INGEST_ASSERTION_METHOD), None, None) => {
             asserting_paper.map_or(ItemKey::Row(row.id), ItemKey::Paper)
         }
