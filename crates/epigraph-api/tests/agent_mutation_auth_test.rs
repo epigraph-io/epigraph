@@ -904,3 +904,66 @@ async fn rotate_agent_key_is_404_when_only_a_key_of_another_type_is_active() {
         "nothing may change"
     );
 }
+
+// ===========================================================================
+// revoke_agent_key — `revoked_by` never names someone who did not revoke
+// ===========================================================================
+
+async fn revoked_by_of(pool: &sqlx::PgPool, key_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT revoked_by FROM agent_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_one(pool)
+        .await
+        .expect("read revoked_by")
+}
+
+async fn post_revoke(
+    addr: std::net::SocketAddr,
+    agent_id: Uuid,
+    key_id: Uuid,
+    token: &str,
+) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/agents/{agent_id}/keys/{key_id}/revoke"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"reason": "attribution test"}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_agent_key_records_the_agent_only_when_the_agent_revoked() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    // Self-revocation: the agent did it, and the row says so.
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    let status = post_revoke(addr, agent, key, &token_as_agent(agent, &["agents:write"])).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        revoked_by_of(&pool, key).await,
+        Some(agent),
+        "a self-revocation is attributed to the agent"
+    );
+
+    // Admin override: a different principal did it. The row must not claim
+    // the agent revoked its own key.
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    let admin = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+    let status = post_revoke(addr, agent, key, &admin).await;
+    assert_eq!(status, 200);
+    assert_ne!(
+        revoked_by_of(&pool, key).await,
+        Some(agent),
+        "an admin revocation must not be recorded as the agent's own"
+    );
+}
