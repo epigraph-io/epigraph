@@ -2296,3 +2296,423 @@ async fn a_pre_provisioned_attestor_is_checked_for_isolation(pool: PgPool) {
     .expect_err("the application role assumed the attestor");
     assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: coverage the first cut lacked (TC3, TC5, TC6, and the walk's
+// cycle case).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// R5's confidentiality rests on an application session reading no blob,
+/// snapshot or succession row DIRECTLY, only through the gated history read
+/// (review TC3). Measured at runtime, as `epigraph_app` stamped as the agent's
+/// own operator with the operator's group writable (the strongest claim a
+/// container can make): every table reads 0 rows and refuses an INSERT with
+/// 42501. CALIBRATION: the maintenance session sees rows in all three, and the
+/// same stamped session reads the history through the definer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_session_reads_and_writes_no_lineage_row_directly(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-direct").await;
+    let child = register(&pool, &new_identity(), Some(parent), "g-direct", snapshot("g", "l"))
+        .await;
+    let group = operator_group(&pool, operator).await;
+    const TABLES: [&str; 3] = ["agent_prompt_blobs", "agent_prompt_snapshots", "agent_succession"];
+
+    let seen = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let mut out = Vec::new();
+        for t in TABLES {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.{t}"))
+                .fetch_one(&mut *conn)
+                .await
+                .expect("maintenance count");
+            out.push(n);
+        }
+        (conn, out)
+    })
+    .await;
+    assert!(seen.iter().all(|n| *n > 0), "CALIBRATION: rows exist: {seen:?}");
+
+    let (counts, inserts, history) =
+        as_app_stamped(&pool, operator, &[group], |mut conn| async move {
+            let mut counts = Vec::new();
+            for t in TABLES {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.{t}"))
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("app count");
+                counts.push(n);
+            }
+            let snapshot_id = child.snapshot_id;
+            let mut inserts = Vec::new();
+            for stmt in [
+                "INSERT INTO agent_prompt_blobs (blob_hash, codec, raw_size, content) \
+                 VALUES (decode(repeat('ab', 32), 'hex'), 'zstd', 0, '\\x28b52ffd00'::bytea)",
+                "INSERT INTO agent_prompt_snapshots (agent_id, group_folder, model, prompt_hash, \
+                                                    in_prompt) \
+                 SELECT $1, 'g-forged', 'm', repeat('a', 64), '{}'::jsonb",
+                "INSERT INTO agent_succession (child_agent_id, parent_agent_id, group_folder, \
+                                              snapshot_id) \
+                 SELECT $1, $2, 'g-forged', $3",
+            ] {
+                let mut q = sqlx::query(stmt);
+                if stmt.contains("$3") {
+                    q = q.bind(child.agent_id).bind(parent).bind(snapshot_id);
+                } else if stmt.contains("$1") {
+                    q = q.bind(child.agent_id);
+                }
+                inserts.push(q.execute(&mut *conn).await.map(|_| ()));
+            }
+            let history: Result<i64, sqlx::Error> = sqlx::query_scalar(
+                "SELECT count(*) FROM public.epigraph_agent_prompt_history($1)",
+            )
+            .bind(child.agent_id)
+            .fetch_one(&mut *conn)
+            .await;
+            (conn, (counts, inserts, history))
+        })
+        .await;
+    assert_eq!(counts, vec![0, 0, 0], "an application session reads no lineage row");
+    for (t, r) in TABLES.iter().zip(inserts) {
+        let err = r.expect_err("an application session inserted a lineage row");
+        assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{t}: {err}");
+    }
+    assert!(
+        history.expect("CALIBRATION: the gated read answers the operator") > 0,
+        "the operator reads through the definer"
+    );
+}
+
+/// The history read's admin arm under ARMED admin scopes (129's model): a
+/// custodian reads another operator's agent only while ELEVATED; unelevated it
+/// is refused AID06 like anyone else (review TC5). CALIBRATIONS: the arming
+/// took, the connection's elevation is what the database says it is, and the
+/// agent's own operator still reads.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_admin_scopes_admit_an_elevated_custodian_only(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-armed").await;
+    let child = register(&pool, &new_identity(), Some(parent), "g-armed", snapshot("g", "l"))
+        .await;
+    let custodian = elevation::holder(&pool, "armed custodian", 7).await;
+    let live = elevation::session(&pool, &custodian).await;
+
+    let armed: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT armed FROM public.epigraph_set_admin_scope_enforcement(true, 'lineage test')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("maintenance arms admin scopes");
+        (conn, r)
+    })
+    .await;
+    assert!(armed, "CALIBRATION: admin scopes are armed");
+
+    let read = |elevated: bool| {
+        let pool = pool.clone();
+        let (person, family) = (custodian.person, custodian.family);
+        let agent = child.agent_id;
+        async move {
+            fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', $1, false), \
+                            set_config('epigraph.elevation_id', $2, false), \
+                            set_config('epigraph.family_id', $3, false), \
+                            set_config('epigraph.access_recorder', 'on', false)",
+                )
+                .bind(person.to_string())
+                .bind(if elevated { live.to_string() } else { String::new() })
+                .bind(family.to_string())
+                .execute(&mut *conn)
+                .await
+                .expect("stamp");
+                let is: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("is_elevated");
+                let r: Result<i64, sqlx::Error> = sqlx::query_scalar(
+                    "SELECT count(*) FROM public.epigraph_agent_prompt_history($1)",
+                )
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await;
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', '', false), \
+                            set_config('epigraph.elevation_id', '', false), \
+                            set_config('epigraph.family_id', '', false), \
+                            set_config('epigraph.access_recorder', '', false)",
+                )
+                .execute(&mut *conn)
+                .await
+                .expect("unstamp");
+                (conn, (is, r))
+            })
+            .await
+        }
+    };
+    let (is, plain) = read(false).await;
+    assert!(!is, "CALIBRATION: the unelevated connection is not elevated");
+    let err = plain.expect_err("an unelevated custodian read under armed admin scopes");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID06"), "{err}");
+
+    let (is, elevated) = read(true).await;
+    assert!(is, "CALIBRATION: the elevated connection is elevated");
+    assert!(elevated.expect("an elevated custodian reads") > 0);
+
+    let own = history_as(&pool, Some(operator), child.agent_id)
+        .await
+        .expect("CALIBRATION: the operator still reads under armed scopes");
+    assert!(own.iter().any(|r| r.relation == "self" && r.readable));
+}
+
+/// A snapshot changes in one way only (`last_seen`, forward) and a succession
+/// row never changes, for every role (review TC6). Maintenance holds UPDATE
+/// (last_seen) on snapshots and its policy admits the maintenance session, so
+/// the guard is the only control on that path. CALIBRATION: moving
+/// `last_seen` forward as maintenance succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_snapshot_only_moves_last_seen_forward_and_succession_never_changes(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-guard").await;
+    let child = register(&pool, &new_identity(), Some(parent), "g-guard", snapshot("g", "l"))
+        .await;
+    let snap = child.snapshot_id;
+    let agent = child.agent_id;
+
+    let as_maint = |stmt: &'static str| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+                let r = sqlx::query(stmt)
+                    .bind(snap)
+                    .bind(agent)
+                    .execute(&mut *conn)
+                    .await
+                    .map(|r| r.rows_affected());
+                (conn, r)
+            })
+            .await
+        }
+    };
+    let backward =
+        "UPDATE agent_prompt_snapshots SET last_seen = last_seen - interval '1 hour' \
+          WHERE id = $1 AND agent_id = $2";
+    let host = "UPDATE agent_prompt_snapshots SET host_sha = 'x' WHERE id = $1 AND agent_id = $2";
+    let succ_update = "UPDATE agent_succession SET group_folder = 'g-moved' \
+                        WHERE snapshot_id = $1 AND child_agent_id = $2";
+    let succ_delete =
+        "DELETE FROM agent_succession WHERE snapshot_id = $1 AND child_agent_id = $2";
+    let snap_delete = "DELETE FROM agent_prompt_snapshots WHERE id = $1 AND agent_id = $2";
+
+    for (stmt, maint_code) in [
+        (backward, "55000"),
+        (host, INSUFFICIENT_PRIVILEGE),
+        (succ_update, INSUFFICIENT_PRIVILEGE),
+        (succ_delete, INSUFFICIENT_PRIVILEGE),
+        (snap_delete, INSUFFICIENT_PRIVILEGE),
+    ] {
+        let err = as_maint(stmt)
+            .await
+            .expect_err("the maintenance role changed lineage state");
+        assert_eq!(sqlstate(&err).as_deref(), Some(maint_code), "maintenance {stmt}: {err}");
+        let err = sqlx::query(stmt)
+            .bind(snap)
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .expect_err("a superuser changed lineage state");
+        assert_eq!(sqlstate(&err).as_deref(), Some("55000"), "superuser {stmt}: {err}");
+    }
+
+    let forward = as_maint(
+        "UPDATE agent_prompt_snapshots SET last_seen = last_seen + interval '1 second' \
+          WHERE id = $1 AND agent_id = $2",
+    )
+    .await
+    .expect("CALIBRATION: maintenance moves last_seen forward");
+    assert_eq!(forward, 1);
+}
+
+/// A lineage with a CYCLE (a LEARNED.md revert brings back an earlier
+/// identity, so X's descendant C is also its grandparent) still lists every
+/// ancestor, each at its nearest depth: the walk keeps one visited set per
+/// direction, so reaching C downward first does not stop the upward walk
+/// before C's own parent Q. Read as maintenance.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_through_a_cycle_keeps_every_ancestor_at_its_nearest_depth(pool: PgPool) {
+    let q = register(&pool, &new_identity(), None, "g-c3", snapshot("g", "q")).await.agent_id;
+    let p_id = new_identity();
+    let p = register(&pool, &p_id, None, "g-c1", snapshot("g", "p")).await.agent_id;
+    let x = register(&pool, &new_identity(), Some(p), "g-c1", snapshot("g", "x")).await.agent_id;
+    let c_id = new_identity();
+    let c = register(&pool, &c_id, Some(x), "g-c1", snapshot("g", "c")).await.agent_id;
+    register(&pool, &p_id, Some(c), "g-c2", snapshot("g", "p2")).await; // C -> P
+    register(&pool, &c_id, Some(q), "g-c3", snapshot("g", "c3")).await; // Q -> C
+
+    let rows: Vec<(Uuid, i32)> = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT DISTINCT agent_id, depth FROM public.epigraph_agent_prompt_history($1)",
+        )
+        .bind(x)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("history");
+        (conn, r)
+    })
+    .await;
+    let depth = |a: Uuid| rows.iter().find(|(id, _)| *id == a).map(|(_, d)| *d);
+    assert_eq!(depth(x), Some(0));
+    assert_eq!(depth(p), Some(-1), "P is X's parent");
+    assert_eq!(depth(c), Some(1), "C is nearer as X's child than as its grandparent");
+    assert_eq!(depth(q), Some(-3), "Q, C's parent, is X's ancestor through P and C");
+    assert_eq!(rows.len(), 4, "each member once: {rows:?}");
+}
+
+/// A custodian with a confirmed elevation session, built through migration
+/// 125's definers exactly as `elevated_arms.rs` builds one (the minimal subset
+/// of its fixtures).
+mod elevation {
+    use super::fixture;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    pub struct Holder {
+        pub person: Uuid,
+        pub client: Uuid,
+        pub cred: Vec<u8>,
+        pub family: Uuid,
+    }
+
+    async fn as_app<F, Fut, T>(pool: &PgPool, principal: Option<Uuid>, f: F) -> T
+    where
+        F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+        Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+    {
+        let principal = principal.map(|p| p.to_string()).unwrap_or_default();
+        fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+            sqlx::query(
+                "SELECT set_config('epigraph.principal_id', $1, false), \
+                        set_config('epigraph.elevation_id', '', false), \
+                        set_config('epigraph.family_id', '', false)",
+            )
+            .bind(&principal)
+            .execute(&mut *conn)
+            .await
+            .expect("stamp");
+            let (mut conn, out) = f(conn).await;
+            sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+                .execute(&mut *conn)
+                .await
+                .expect("unstamp");
+            (conn, out)
+        })
+        .await
+    }
+
+    pub async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
+        let (person, _group) = fixture::seed_human_operator(pool, label).await;
+        let client: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+        )
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("the human's client");
+        fixture::make_custodian(pool, person).await;
+        let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+            let e = sqlx::query_scalar(
+                "SELECT public.epigraph_create_passkey_enrollment($1, 'lineage test', 'key')",
+            )
+            .bind(person)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("enroll");
+            (conn, e)
+        })
+        .await;
+        let mut cred = vec![0xA5_u8; 16];
+        cred[0] = n;
+        let c = cred.clone();
+        as_app(pool, None, |mut conn| async move {
+            sqlx::query(
+                "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+            )
+            .bind(e)
+            .execute(&mut *conn)
+            .await
+            .expect("enrollment challenge");
+            sqlx::query(
+                "SELECT public.epigraph_complete_passkey_enrollment($1, $2, \
+                        '{\"cred\": 1}'::jsonb, '00000000-0000-0000-0000-000000000000'::uuid, \
+                        'none', true, false)",
+            )
+            .bind(e)
+            .bind(c)
+            .execute(&mut *conn)
+            .await
+            .expect("complete the enrollment");
+            (conn, ())
+        })
+        .await;
+        let hash: Vec<u8> = [
+            Uuid::new_v4().as_bytes().to_vec(),
+            Uuid::new_v4().as_bytes().to_vec(),
+        ]
+        .concat();
+        let family: Uuid = sqlx::query_scalar(
+            "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+             VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+        )
+        .bind(&hash)
+        .bind(client)
+        .fetch_one(pool)
+        .await
+        .expect("a refresh token");
+        Holder {
+            person,
+            client,
+            cred,
+            family,
+        }
+    }
+
+    /// A confirmed grant-mode session for `h`; its id.
+    pub async fn session(pool: &PgPool, h: &Holder) -> Uuid {
+        let (client, fam) = (h.client, h.family);
+        let ticket: Uuid = as_app(pool, Some(h.person), |mut conn| async move {
+            let t = sqlx::query_scalar(
+                "SELECT public.epigraph_create_elevation_ticket($1, $2, 'grant', \
+                        'lineage test', sha256('a lineage test secret'::bytea))",
+            )
+            .bind(client)
+            .bind(fam)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a ticket");
+            (conn, t)
+        })
+        .await;
+        let cred = h.cred.clone();
+        as_app(pool, None, |mut conn| async move {
+            sqlx::query(
+                "SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)",
+            )
+            .bind(ticket)
+            .execute(&mut *conn)
+            .await
+            .expect("the ceremony's challenge");
+            let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+                "SELECT outcome, session_id \
+                   FROM public.epigraph_confirm_elevation($1, $2, 0, false, '{\"ev\": 1}'::jsonb)",
+            )
+            .bind(ticket)
+            .bind(cred)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("confirm");
+            assert_eq!(outcome, "confirmed", "CALIBRATION: the ceremony confirms");
+            (conn, session.expect("a session"))
+        })
+        .await
+    }
+}
