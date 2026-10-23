@@ -1150,6 +1150,108 @@ fn strict_entry(
     se
 }
 
+/// An interval as the sheaf reads it.
+fn sheaf_interval(iv: &Interval) -> epigraph_engine::EpistemicInterval {
+    let pl = iv.pl.max(iv.bel);
+    epigraph_engine::EpistemicInterval::new(iv.bel, pl, iv.open_world)
+}
+
+fn sheaf_stats(
+    obstructions: Vec<epigraph_engine::CdstSheafObstruction>,
+    threshold: f64,
+    served_edges: usize,
+) -> SheafStats {
+    let c = epigraph_engine::compute_cdst_cohomology(obstructions, threshold);
+    #[allow(clippy::cast_precision_loss)]
+    let coverage = if served_edges == 0 {
+        1.0
+    } else {
+        c.edge_count as f64 / served_edges as f64
+    };
+    SheafStats {
+        edge_count: c.edge_count,
+        coverage,
+        h1: c.h1,
+        h1_normalized: c.h1_normalized,
+        conflict_h1: c.conflict_h1,
+        ignorance_h1: c.ignorance_h1,
+        open_world_h1: c.open_world_h1,
+        obstructed: c.obstructions.len(),
+    }
+}
+
+/// The sheaf shadow (SPEC §7.2 sheaf row, §10.4): the cohomology of the
+/// epistemic edges the viewer can see, with each endpoint's interval today,
+/// under progressive and under strict. A candidate interval the report did
+/// not compute (a kept cache) is today's, so the comparison isolates value
+/// change; today's interval is read from the same cache columns (Bel, Pl,
+/// open-world mass). Progressive keeps every edge (whether a compound-ended
+/// edge was replaced is not read here); strict drops every edge with a
+/// compound end, and its coverage is the share of edges kept. An edge with
+/// an endpoint outside the run's scope is skipped and counted.
+async fn sheaf_shadow(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    recs: &HashMap<Uuid, Rec>,
+    threshold: f64,
+) -> Result<SheafShadow, String> {
+    let pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(&mut *conn, viewer, None)
+        .await
+        .map_err(|e| format!("get_epistemic_edge_pairs: {e}"))?;
+    let profile = epigraph_engine::sheaf::RestrictionProfile::scientific();
+    let shadow_iv = |c: &Cand, today: &Cand| {
+        if c.computed() {
+            sheaf_interval(&c.iv)
+        } else {
+            sheaf_interval(&today.iv)
+        }
+    };
+    let (mut served, mut progressive, mut strict) = (Vec::new(), Vec::new(), Vec::new());
+    let mut out = SheafShadow::default();
+    for p in pairs {
+        let (Some(rs), Some(rt)) = (recs.get(&p.source_id), recs.get(&p.target_id)) else {
+            out.pairs_outside_scope += 1;
+            continue;
+        };
+        let edge = |s, t| {
+            epigraph_engine::compute_cdst_edge_inconsistency(
+                p.source_id,
+                p.target_id,
+                s,
+                t,
+                &p.relationship,
+                &profile,
+            )
+        };
+        let o_served = edge(sheaf_interval(&rs.today.iv), sheaf_interval(&rt.today.iv));
+        let o_prog = edge(
+            shadow_iv(&rs.progressive, &rs.today),
+            shadow_iv(&rt.progressive, &rt.today),
+        );
+        let was = o_served.interval_inconsistency > threshold;
+        let is = if rs.compound || rt.compound {
+            false
+        } else {
+            let o_strict = edge(
+                shadow_iv(&rs.strict, &rs.today),
+                shadow_iv(&rt.strict, &rt.today),
+            );
+            let is = o_strict.interval_inconsistency > threshold;
+            strict.push(o_strict);
+            is
+        };
+        out.vanished_obstructions += usize::from(was && !is);
+        out.new_obstructions += usize::from(!was && is);
+        served.push(o_served);
+        progressive.push(o_prog);
+    }
+    let n = served.len();
+    out.served = sheaf_stats(served, threshold, n);
+    out.progressive = sheaf_stats(progressive, threshold, n);
+    out.strict = sheaf_stats(strict, threshold, n);
+    Ok(out)
+}
+
 /// The running totals of the per-claim pass.
 #[derive(Default)]
 struct Totals {
@@ -1377,6 +1479,7 @@ where
         progressive: replay(&events, &totals.recs, |r| &r.progressive),
         strict: replay(&events, &totals.recs, |r| &r.strict),
     };
+    totals.summary.sheaf = sheaf_shadow(conn, viewer, &totals.recs, opts.sheaf_threshold).await?;
     totals.summary.strict_entry = strict_entry(
         &totals.recs,
         opts.rank_threshold,
