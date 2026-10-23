@@ -1,6 +1,8 @@
 #[cfg(feature = "db")]
 pub mod backfill_factors;
 #[cfg(feature = "db")]
+pub mod belief_cache;
+#[cfg(feature = "db")]
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;
