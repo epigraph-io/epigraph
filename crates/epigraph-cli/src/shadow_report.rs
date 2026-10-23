@@ -55,7 +55,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use epigraph_db::repos::claim_role::{self, ClaimRole};
-use epigraph_db::repos::recall_event::RecallEventRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, MassFunctionRepository};
 use epigraph_engine::atom_items::{
@@ -1189,9 +1188,12 @@ struct Event {
     returned: Vec<Uuid>,
 }
 
-/// Every recall event created in `[since, until]`, as `viewer` reads them.
+/// Every recall event created in `[since, until]`, as `viewer` reads them
+/// (the same visibility rule `RecallEventRepository::list` applies).
 /// `until` is fixed at the run's start, so events logged during the run do
-/// not shift the pages.
+/// not shift the pages. Pages are a keyset on `(created_at, id)`, newest
+/// first: events logged in one statement share `created_at`, and an OFFSET
+/// over a sort key with ties may skip one across a page boundary.
 async fn read_events(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
@@ -1199,41 +1201,49 @@ async fn read_events(
     until: DateTime<Utc>,
 ) -> Result<Vec<Event>, String> {
     const PAGE: i64 = 500;
+    let sql = viewer.splice(
+        "SELECT r.id, r.params, r.returned_claim_ids, r.created_at \
+           FROM recall_events r \
+          WHERE r.created_at >= $1 AND r.created_at <= $2 \
+            AND ($3::timestamptz IS NULL OR (r.created_at, r.id) < ($3, $4::uuid)) \
+            /* {VISIBILITY:r} */ \
+          ORDER BY r.created_at DESC, r.id DESC \
+          LIMIT $5",
+        6,
+    );
+    type Row = (Uuid, serde_json::Value, Vec<Uuid>, DateTime<Utc>);
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut offset = 0i64;
+    let mut after: Option<(DateTime<Utc>, Uuid)> = None;
     loop {
-        let rows = RecallEventRepository::list(
-            &mut *conn,
-            viewer,
-            None,
-            None,
-            Some(since),
-            Some(until),
-            PAGE,
-            offset,
-        )
-        .await
-        .map_err(|e| format!("recall_events: {e}"))?;
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(since)
+            .bind(until)
+            .bind(after.map(|(t, _)| t))
+            .bind(after.map(|(_, id)| id))
+            .bind(PAGE);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| format!("recall_events: {e}"))?;
         let n = rows.len();
-        for r in rows {
-            if seen.insert(r.id) {
-                let min_truth = r
-                    .params
-                    .get("min_truth")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(DEFAULT_MIN_TRUTH);
-                out.push(Event {
-                    id: r.id,
-                    min_truth,
-                    returned: r.returned_claim_ids,
-                });
-            }
+        for (id, params, returned, created_at) in rows {
+            after = Some((created_at, id));
+            let min_truth = params
+                .get("min_truth")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(DEFAULT_MIN_TRUTH);
+            out.push(Event {
+                id,
+                min_truth,
+                returned,
+            });
         }
         if i64::try_from(n).unwrap_or(0) < PAGE {
             break;
         }
-        offset += PAGE;
     }
     Ok(out)
 }
