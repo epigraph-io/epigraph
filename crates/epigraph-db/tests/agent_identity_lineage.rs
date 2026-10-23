@@ -653,6 +653,27 @@ async fn the_same_child_parent_and_group_twice_only_bumps_last_seen(pool: PgPool
     )
     .await
     .expect("first registration");
+    // Age the snapshot by an hour (superuser, guard off for this one statement)
+    // so "last_seen moved forward" does not depend on two transactions being
+    // ordered by a wall clock that a build host may step backward.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("ALTER TABLE agent_prompt_snapshots DISABLE TRIGGER USER")
+        .execute(&mut *tx)
+        .await
+        .expect("disable the snapshot guard (test only)");
+    sqlx::query(
+        "UPDATE agent_prompt_snapshots SET first_seen = first_seen - interval '1 hour', \
+                last_seen = last_seen - interval '1 hour' WHERE id = $1",
+    )
+    .bind(first.snapshot_id)
+    .execute(&mut *tx)
+    .await
+    .expect("age the snapshot");
+    sqlx::query("ALTER TABLE agent_prompt_snapshots ENABLE TRIGGER USER")
+        .execute(&mut *tx)
+        .await
+        .expect("re-enable");
+    tx.commit().await.expect("commit");
     let (first_seen_1, last_seen_1): (
         chrono::DateTime<chrono::Utc>,
         chrono::DateTime<chrono::Utc>,
@@ -1369,4 +1390,42 @@ async fn history_withholds_the_content_of_an_ancestor_the_caller_does_not_operat
 
     let me = rows.iter().find(|r| r.relation == "self").expect("self");
     assert!(me.readable && me.learned_md.is_some());
+}
+
+/// The registration's audit event family is reserved: an application session
+/// cannot write an `agent.identity_registered` row, even one attributed to its
+/// own principal, so a forged "the host registered X" record cannot exist.
+/// CALIBRATION: the same session writes an unreserved event type about itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_forge_a_registration_audit_row(pool: PgPool) {
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let me = human_operator(&pool).await;
+    let (forged, allowed) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(me.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("set principal");
+        let insert = "INSERT INTO security_events (event_type, agent_id, success, details) \
+                      VALUES ($1, $2, true, '{}'::jsonb)";
+        let forged = sqlx::query(insert)
+            .bind("agent.identity_registered")
+            .bind(me)
+            .execute(&mut *conn)
+            .await;
+        let allowed = sqlx::query(insert)
+            .bind("agent.self_reported")
+            .bind(me)
+            .execute(&mut *conn)
+            .await;
+        (conn, (forged, allowed))
+    })
+    .await;
+    allowed.expect("CALIBRATION: an app session records an unreserved event about itself");
+    let err = forged.expect_err("an app session forged a registration audit row");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
 }
