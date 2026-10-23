@@ -354,9 +354,12 @@ impl ClaimRole {
 ///
 /// * Only in-force `decomposes_to` edges between claims, to current claims,
 ///   that the viewer can read (edge AND target claim).
-/// * The recursive `UNION` over `(root, node, depth)` with the depth cap is
-///   the visited set: a cycle re-enters a node only at a greater depth, and
-///   the walk stops at [`ROLE_MAX_DEPTH`].
+/// * The walk terminates by the depth cap, not by a visited set: the
+///   recursive `UNION` over `(root, node, depth)` drops a row only when the
+///   same node is reached again at the SAME depth, so a cycle is re-expanded
+///   at each greater depth until [`ROLE_MAX_DEPTH`]. That bounds the walk to
+///   at most (nodes reached) x 7 rows per root; a per-path visited array
+///   would instead grow with the number of paths through a DAG.
 /// * A leaf is a node below the root with no out-edge the walk could take
 ///   (in force, to a current claim, edge AND child visible): the walk's step
 ///   condition, negated. A node at the depth cap that still has children is
