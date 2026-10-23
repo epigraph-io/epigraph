@@ -712,6 +712,100 @@ fn not_all_worked_example() {
     assert!((r.pl - 0.519).abs() < 1e-3, "pl {}", r.pl);
 }
 
+/// The served fold's reading of a single-leaf `not_all`: (Bel, Pl, NR) of
+/// `lit` after folding `bbas` with one more row that refutes `lit` at mass m
+/// ({F m, Θ 1 − m} for a positive literal, {T m, Θ 1 − m} for a negated one).
+/// `None` on total conflict.
+fn served_with_refutation(bbas: &[(f64, f64, f64)], positive: bool, m: f64) -> Option<[f64; 3]> {
+    let refutation = if positive {
+        served_bba(0.0, m, 0.0)
+    } else {
+        served_bba(m, 0.0, 0.0)
+    };
+    let mut served = refutation;
+    for (t, f, o) in bbas {
+        match dempster_combine(&served, &served_bba(*t, *f, *o)) {
+            Ok(x) => served = x,
+            Err(DsError::TotalConflict) => return None,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let (holds, fails) = if positive { (0, 1) } else { (1, 0) };
+    let h = FocalElement::positive(BTreeSet::from([holds]));
+    let f = FocalElement::positive(BTreeSet::from([fails]));
+    Some([
+        belief(&served, &h),
+        plausibility(&served, &h),
+        1.0 - belief(&served, &f),
+    ])
+}
+
+/// A `not_all` valuation is one more positive BBA, and in exact CDST (the
+/// served fold, SPEC §3.3) any positive BBA meets `~` as conflict. So with
+/// `~` on the leaf, a refutation can RAISE Bel and Pl: a {T .5, `~` .3} at
+/// Bel .5 / Pl .7 goes to ≈ .692 / ≈ .969 under m = .1, because the `~` .3
+/// is annihilated and renormalized away. The served fold does exactly the
+/// same with an F .1 row on the atom. This pins the stage-1 reading (exact
+/// CDST, SPEC §3.6: "the CDST meet table decides how O states meet it");
+/// changing it is an operator decision, not a bug fix.
+#[test]
+fn not_all_with_open_world_follows_the_served_fold_even_upward() {
+    let items = vec![Item::mixed(0u32, 0.5, 0.0, 0.3).unwrap()];
+    let base = conj_belief(&[Lit::pos(0)], &items, 0.0).unwrap();
+    let r = conj_belief(&[Lit::pos(0)], &items, 0.1).unwrap();
+    let [bel, pl, nr] = served_with_refutation(&[(0.5, 0.0, 0.3)], true, 0.1).unwrap();
+    assert!(close(r.bel, bel), "bel {} vs served {bel}", r.bel);
+    assert!(close(r.pl, pl), "pl {} vs served {pl}", r.pl);
+    assert!(close(r.nr, nr), "nr {} vs served {nr}", r.nr);
+    // The sign, stated: K = .35, T .45 and Θ .18 survive.
+    assert!(close(base.bel, 0.5) && close(base.pl, 0.7));
+    assert!(close(r.bel, 0.45 / 0.65), "bel {}", r.bel);
+    assert!(close(r.pl, 0.63 / 0.65), "pl {}", r.pl);
+    assert!(r.bel > base.bel && r.pl > base.pl);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Single-leaf `not_all` equals the served fold with one more row that
+    /// refutes the literal at mass m, `~` included (marginal consistency for
+    /// the valuation; the world-set oracle shares the DP's reading of the
+    /// valuation, so this is the independent arbiter for it).
+    #[test]
+    fn single_leaf_not_all_equals_served_fold_with_a_refuting_row(
+        bbas in proptest::collection::vec(arb_tfo(true), 1..=3),
+        positive in any::<bool>(),
+        m_milli in 1u32..=999,
+    ) {
+        let m = f64::from(m_milli) / 1000.0;
+        let Some([bel, pl, nr]) = served_with_refutation(&bbas, positive, m) else { return Ok(()); };
+        let items: Vec<Item<u32>> = bbas.iter().map(|(t, f, o)| Item::mixed(0, *t, *f, *o).unwrap()).collect();
+        let lit = if positive { Lit::pos(0) } else { Lit::neg(0) };
+        let Some(r) = conj(&[lit], &items, m) else { return Ok(()); };
+        prop_assert!((r.bel - bel).abs() < 1e-7, "bel {} vs served {}", r.bel, bel);
+        prop_assert!((r.pl - pl).abs() < 1e-7, "pl {} vs served {}", r.pl, pl);
+        prop_assert!((r.nr - nr).abs() < 1e-7, "nr {} vs served {}", r.nr, nr);
+    }
+
+    /// Without `~`, a stronger refutation never raises Bel, Pl or NR.
+    #[test]
+    fn not_all_is_non_increasing_without_open_world(
+        (query, raws) in arb_case(5, 4, false),
+        a_milli in 0u32..=999,
+        b_milli in 0u32..=999,
+    ) {
+        let (lo, hi) = (a_milli.min(b_milli), a_milli.max(b_milli));
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let (Some(weak), Some(strong)) = (
+            conj(&query, &items, f64::from(lo) / 1000.0),
+            conj(&query, &items, f64::from(hi) / 1000.0),
+        ) else { return Ok(()); };
+        prop_assert!(strong.bel <= weak.bel + EPS, "bel {} -> {}", weak.bel, strong.bel);
+        prop_assert!(strong.pl <= weak.pl + EPS, "pl {} -> {}", weak.pl, strong.pl);
+        prop_assert!(strong.nr <= weak.nr + EPS, "nr {} -> {}", weak.nr, strong.nr);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The SPEC §3.1 reference case
 // ---------------------------------------------------------------------------
