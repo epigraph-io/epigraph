@@ -190,15 +190,22 @@ async fn run_one(
 
 fn headline(label: &str, s: &Summary) {
     println!(
-        "{label}: {} claims; residue {}; vacate {} atoms / {} compounds; fold mismatch {}/{}; \
+        "{label}: {} claims; residue {}; vacate {} atoms / {} compounds / {} spines; \
+         fold mismatch {}/{} ({}); \
          compound confirmed set {} (progressive) / {} (strict); \
          gate loss {} (progressive) / {} (strict) over {} events",
         s.claims,
         s.residue,
         s.vacate.atoms,
         s.vacate.compounds,
+        s.vacate.spines,
         s.fold_mismatch.mismatched,
         s.fold_mismatch.p1_atoms,
+        if s.fold_mismatch.measures_floor {
+            "the floor-viewer measure"
+        } else {
+            "not the floor-viewer measure"
+        },
         s.compound_confirmed_set.progressive,
         s.compound_confirmed_set.strict,
         s.replay.progressive.lost,

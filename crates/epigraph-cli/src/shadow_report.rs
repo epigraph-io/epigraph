@@ -308,10 +308,14 @@ pub struct Quantiles {
     pub max: f64,
 }
 
-/// The served value against the atom's own fold (SPEC §1.3).
+/// The served value against the atom's own fold (SPEC §1.3), over the atoms
+/// whose fold this run serves: an atom with AEF input the viewer can see,
+/// whose role the target fold covers. (A leaf under `aef_standalone` keeps
+/// today's value; its line still shows its gap, but it is no mismatch of the
+/// run's.)
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
 pub struct FoldMismatch {
-    /// Atoms with AEF input the viewer can see.
+    /// Atoms with AEF input the viewer can see, whose fold the run serves.
     pub p1_atoms: usize,
     /// Of those, the ones whose served Bel, Pl or `BetP` differs from the
     /// fold by more than [`MISMATCH_TOLERANCE`].
@@ -576,6 +580,9 @@ struct Eval {
     progressive: Cand,
     strict: Cand,
     served_vs_fold: Option<f64>,
+    /// The fold is what this run serves (P1, and the target fold covers the
+    /// role): the atom counts in the fold mismatch.
+    fold_served: bool,
     /// An atom with no AEF input whose cache is kept.
     residue: bool,
 }
@@ -874,6 +881,7 @@ async fn eval_atoms(
                     progressive: cand,
                     strict: cand,
                     served_vs_fold: Some(served_vs_fold(&base.cache, &f)),
+                    fold_served: covered,
                     residue: false,
                 }
             }
@@ -891,6 +899,7 @@ async fn eval_atoms(
                     progressive: cand,
                     strict: cand,
                     served_vs_fold: None,
+                    fold_served: false,
                     residue: kept,
                 }
             }
@@ -956,6 +965,7 @@ async fn eval_compounds(
                     progressive: today,
                     strict: today,
                     served_vs_fold: None,
+                    fold_served: false,
                     residue: false,
                 },
             );
@@ -1017,6 +1027,7 @@ async fn eval_compounds(
                 progressive,
                 strict,
                 served_vs_fold: None,
+                fold_served: false,
                 residue: false,
             },
         );
@@ -1512,7 +1523,7 @@ impl Totals {
         if e.residue {
             s.residue += 1;
         }
-        if let Some(gap) = e.served_vs_fold {
+        if let Some(gap) = e.served_vs_fold.filter(|_| e.fold_served) {
             s.fold_mismatch.p1_atoms += 1;
             if gap > MISMATCH_TOLERANCE {
                 s.fold_mismatch.mismatched += 1;
@@ -1619,6 +1630,10 @@ where
     let page_size = opts.page_size.max(1);
     let mut totals = Totals::default();
     totals.summary.settings = RunSettings::of(opts);
+    // The one-atom-value-on-prod measure (SPEC §1.3) is the public floor
+    // viewer's (a scoped viewer in no group) under the `aef` fold.
+    totals.summary.fold_mismatch.measures_floor = matches!(opts.target_fold, AtomFoldMode::Aef)
+        && viewer.group_bind().is_some_and(<[Uuid]>::is_empty);
 
     let mut after: Option<Uuid> = None;
     let mut listed = match &opts.scope {
@@ -1674,6 +1689,7 @@ where
                     progressive: today,
                     strict: today,
                     served_vs_fold: None,
+                    fold_served: false,
                     residue: false,
                 }
             });
