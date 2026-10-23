@@ -103,7 +103,17 @@ async fn recompute_via(pool: &PgPool, caller: Caller, claim: Uuid) -> bool {
                 Some(0),
                 "recompute_beliefs must not report errors: {json}"
             );
-            json["claims_recomputed"] == 1
+            // One candidate, counted in exactly one bucket: a claim the guard
+            // leaves alone is reported as skipped (no recomputable input), not
+            // as an error and not silently dropped.
+            assert_eq!(json["claims_considered"], 1, "{json}");
+            let recomputed = json["claims_recomputed"] == 1;
+            let skipped = json["claims_skipped_no_bba"] == 1;
+            assert!(
+                recomputed != skipped,
+                "exactly one of claims_recomputed / claims_skipped_no_bba: {json}"
+            );
+            recomputed
         }
     }
 }
@@ -1022,4 +1032,52 @@ async fn a_viewer_that_cannot_see_the_decomposition_cannot_refold_the_compound(p
         )
         .await;
     }
+}
+
+// ── (9) the dry-run prediction shares the guard ─────────────────────────────
+
+/// `recompute_betp`'s dry run predicts the cache through the same owner lookup
+/// (`predict_cached_after`): nothing for a template-only claim or a compound,
+/// and the owner frame for a standalone with a real row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dry_run_predicts_no_write_for_guarded_claims(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let ingest = agent(&pool, "guard-ingest").await;
+    let source = agent(&pool, "guard-source").await;
+    let rv = frame(&pool, "research_validity").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    let template_only = claim(&pool, owner, "template-only").await;
+    insert_row(&pool, template_only, &template_row(rv, ingest, 0.9)).await;
+
+    let compound = claim(&pool, owner, "compound").await;
+    let leaf = claim(&pool, owner, "leaf").await;
+    decomposes_to(&pool, compound, leaf, false).await;
+    insert_row(&pool, compound, &evidence_row(bt, source, "auto_wire")).await;
+
+    let standalone = claim(&pool, owner, "standalone").await;
+    insert_row(&pool, standalone, &evidence_row(bt, source, "auto_wire")).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let predict = |c: Uuid| {
+        let pool = pool.clone();
+        let viewer = &viewer;
+        async move {
+            epigraph_cli::recompute_betp::predict_cached_after(&pool, viewer, c)
+                .await
+                .expect("predict_cached_after")
+        }
+    };
+    assert!(
+        predict(template_only).await.is_none(),
+        "a template-only claim has no predicted write"
+    );
+    assert!(
+        predict(compound).await.is_none(),
+        "a compound has no predicted write"
+    );
+    let (frame_owner, _) = predict(standalone)
+        .await
+        .expect("CALIBRATION: a standalone with a real row has a predicted write");
+    assert_eq!(frame_owner, bt, "CALIBRATION: its only frame owns it");
 }
