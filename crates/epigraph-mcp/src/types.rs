@@ -842,7 +842,9 @@ pub struct ReportWorkflowOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(description = "Step-by-step execution log: planned vs actual")]
@@ -972,7 +974,9 @@ pub struct ReportHierarchicalOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed.")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(
