@@ -1,7 +1,10 @@
 #![cfg(feature = "db")]
-//! `GET /api/v1/agents/:id/prompt-history` (agent identity lineage design D4):
-//! an agent's prompt snapshots and its succession lineage, readable by the
-//! agent's operator and by admins, and by nobody else.
+//! `GET /api/v1/agents/:id/prompt-history` and
+//! `GET /api/v1/agents/:id/prompt-history/blobs/:hash` (agent identity lineage
+//! design D4): an agent's prompt snapshots and its succession lineage, and the
+//! content of one prompt file named in them, readable by the agent's operator
+//! and by admins, and by nobody else. The listing names each file by hash and
+//! carries no content, so its size does not grow with the files'.
 //!
 //! Every request goes through the full router (`create_router`) with a real
 //! bearer, so route registration, the bearer middleware, the scope check and
@@ -201,20 +204,20 @@ async fn family(pool: &PgPool, operator: Uuid) -> Family {
     }
 }
 
-/// `GET /api/v1/agents/{agent}/prompt-history` through the full router as
-/// `caller` holding `scopes`: `(status, body)`.
-async fn get_history(
+/// `GET uri` through the full router as `caller` holding `scopes`:
+/// `(status, body)`.
+async fn get_json(
     state: &AppState,
     caller: Uuid,
     scopes: &[&str],
-    agent: Uuid,
+    uri: &str,
 ) -> (StatusCode, Value) {
     let token = common::mint_token_with_agent(scopes, caller);
     let resp = create_router(state.clone())
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/agents/{agent}/prompt-history"))
+                .uri(uri)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
@@ -226,6 +229,53 @@ async fn get_history(
     let body = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
     (status, body)
+}
+
+/// `GET /api/v1/agents/{agent}/prompt-history` as `caller` holding `scopes`.
+async fn get_history(
+    state: &AppState,
+    caller: Uuid,
+    scopes: &[&str],
+    agent: Uuid,
+) -> (StatusCode, Value) {
+    get_json(
+        state,
+        caller,
+        scopes,
+        &format!("/api/v1/agents/{agent}/prompt-history"),
+    )
+    .await
+}
+
+/// `GET /api/v1/agents/{agent}/prompt-history/blobs/{hash}` as `caller`
+/// holding `claims:read`.
+async fn get_blob(state: &AppState, caller: Uuid, agent: Uuid, hash: &str) -> (StatusCode, Value) {
+    get_json(
+        state,
+        caller,
+        &["claims:read"],
+        &format!("/api/v1/agents/{agent}/prompt-history/blobs/{hash}"),
+    )
+    .await
+}
+
+async fn read_blob_ok(state: &AppState, caller: Uuid, agent: Uuid, hash: &str) -> Value {
+    let (status, body) = get_blob(state, caller, agent, hash).await;
+    assert_eq!(status, StatusCode::OK, "expected a served blob: {body}");
+    body
+}
+
+/// The listing's reference to one file: its hash, and nothing else.
+fn file_hash(file: &Value) -> &str {
+    let obj = file
+        .as_object()
+        .unwrap_or_else(|| panic!("a stored file is an object, got {file}"));
+    assert_eq!(
+        obj.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["blob_hash"],
+        "the listing names a file by hash and carries no content: {file}"
+    );
+    obj["blob_hash"].as_str().expect("hex hash")
 }
 
 async fn read_ok(state: &AppState, caller: Uuid, agent: Uuid) -> Value {
@@ -268,15 +318,20 @@ async fn the_operator_reads_its_agents_snapshots_and_lineage(pool: PgPool) {
         "the identity hash is returned: {s}"
     );
     assert_eq!(s["in_prompt"]["group_claude_md"], json!(true));
-    let learned = &s["files"]["learned_md"];
+    let learned_hash = file_hash(&s["files"]["learned_md"]);
+    assert_eq!(learned_hash, blake3_hex(&f.child_learned));
+    let learned = read_blob_ok(&state, operator, f.child, learned_hash).await;
     assert_eq!(
         learned["text"].as_str(),
         Some(f.child_learned.as_str()),
         "LEARNED.md round-trips byte for byte through compression: {learned}"
     );
-    assert_eq!(learned["blob_hash"], json!(blake3_hex(&f.child_learned)));
+    assert_eq!(learned["blob_hash"], json!(learned_hash));
+    assert_eq!(learned["raw_size"], json!(f.child_learned.len()));
+    assert_eq!(learned["lossy"], json!(false));
+    let group_hash = file_hash(&s["files"]["group_claude_md"]);
     assert_eq!(
-        s["files"]["group_claude_md"]["text"].as_str(),
+        read_blob_ok(&state, operator, f.child, group_hash).await["text"].as_str(),
         Some(f.child_group_claude.as_str())
     );
     assert_eq!(
@@ -290,7 +345,6 @@ async fn the_operator_reads_its_agents_snapshots_and_lineage(pool: PgPool) {
         json!(["identity_md"]),
         "the refused file is named; the absent one is not"
     );
-    assert_eq!(s["withheld_files"], json!([]));
     let (first, last) = (
         s["first_seen"].as_str().expect("first_seen"),
         s["last_seen"].as_str().expect("last_seen"),
@@ -317,6 +371,13 @@ async fn the_operator_reads_its_agents_snapshots_and_lineage(pool: PgPool) {
     groups.sort_unstable();
     assert_eq!(groups, ["g-hist-a", "g-hist-b"]);
     assert_eq!(body["lineage"]["descendants"], json!([]));
+    // A readable ancestor's file is served through the child's history.
+    let parent_learned =
+        arr(&up[0]["snapshots"], "parent snapshots")[0]["files"]["learned_md"].clone();
+    assert_eq!(
+        read_blob_ok(&state, operator, f.child, file_hash(&parent_learned)).await["text"],
+        json!("parent lesson\n")
+    );
 
     let parent_view = read_ok(&state, operator, f.parent).await;
     assert_eq!(arr(&parent_view["snapshots"], "snapshots").len(), 2);
@@ -387,8 +448,9 @@ async fn an_admin_reads_any_agents_history_and_only_as_admin(pool: PgPool) {
     let body = read_ok(&state, custodian, f.child).await;
     let snaps = arr(&body["snapshots"], "snapshots");
     assert_eq!(snaps.len(), 1, "{body}");
+    let hash = file_hash(&snaps[0]["files"]["learned_md"]);
     assert_eq!(
-        snaps[0]["files"]["learned_md"]["text"].as_str(),
+        read_blob_ok(&state, custodian, f.child, hash).await["text"].as_str(),
         Some(f.child_learned.as_str()),
         "the admin gets the content, not a redacted shape"
     );
@@ -451,6 +513,252 @@ async fn the_route_requires_claims_read(pool: PgPool) {
         StatusCode::FORBIDDEN,
         "the scope check runs before any lookup"
     );
+    let body = read_ok(&state, operator, f.child).await;
+    let hash = file_hash(&body["snapshots"][0]["files"]["learned_md"]).to_string();
+    let blob_uri = format!("/api/v1/agents/{}/prompt-history/blobs/{hash}", f.child);
+    let (status, body) = get_json(&state, operator, &["claims:write"], &blob_uri).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the blob read needs claims:read too: {body}"
+    );
+    read_blob_ok(&state, operator, f.child, &hash).await;
+}
 
-    read_ok(&state, operator, f.child).await;
+/// A parent registered unlinked and later linked to `other`, and a child of
+/// it (which inherits nothing from an unlinked parent) linked by hand to
+/// `operator`: each human operates one of the two. Returns `(parent, child)`.
+async fn split_family(pool: &PgPool, operator: Uuid, other: Uuid) -> (Uuid, Uuid) {
+    let p = register(
+        pool,
+        &identity(
+            "g-split",
+            None,
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored("split group rules\n"),
+                stored(PARENT_PRIVATE),
+            ],
+        ),
+    )
+    .await;
+    let c = register(
+        pool,
+        &identity(
+            "g-split",
+            Some(p.agent_id),
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored("split group rules\n"),
+                stored("the child's own lesson\n"),
+            ],
+        ),
+    )
+    .await;
+    assert!(
+        !c.link_live,
+        "CALIBRATION: a child of an unlinked parent inherits no link ({c:?})"
+    );
+    link(pool, c.agent_id, operator).await;
+    link(pool, p.agent_id, other).await;
+    (p.agent_id, c.agent_id)
+}
+
+const PARENT_PRIVATE: &str = "the parent's lesson, which only its own operator reads\n";
+
+/// The blob endpoint serves a file only when a snapshot the caller may read
+/// in that agent's history names it. The parent's file, asked for through the
+/// child's history by the child's operator (who does not operate the parent),
+/// is the 404 an unknown hash gets; the parent's own operator reads it
+/// (CONTROL), and so does an admin through the child. A stranger gets the
+/// absent-agent 404 even for a hash the history names; a malformed hash is a
+/// 400.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_blob_is_served_only_through_a_snapshot_the_caller_may_read(pool: PgPool) {
+    let operator = human(&pool).await;
+    let other = human(&pool).await;
+    let stranger = human(&pool).await;
+    let custodian = human(&pool).await;
+    let (parent, child) = split_family(&pool, operator, other).await;
+    viewer_fixture::make_custodian(&pool, custodian).await;
+    let state = app_role_state(&pool).await;
+    let private = blake3_hex(PARENT_PRIVATE);
+
+    // CONTROL: the parent's operator reads it, through the parent.
+    let body = read_blob_ok(&state, other, parent, &private).await;
+    assert_eq!(body["text"], json!(PARENT_PRIVATE));
+
+    let own = blake3_hex("the child's own lesson\n");
+    assert_eq!(
+        read_blob_ok(&state, operator, child, &own).await["text"],
+        json!("the child's own lesson\n"),
+        "CONTROL: the child's operator reads the child's file"
+    );
+    let (status, withheld) = get_blob(&state, operator, child, &private).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a file of a lineage member the caller does not operate is not served: {withheld}"
+    );
+    let unknown = blake3_hex("no snapshot names this file");
+    let (status, nothing) = get_blob(&state, operator, child, &unknown).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{nothing}");
+    assert_eq!(
+        withheld.to_string().replace(&private, "<hash>"),
+        nothing.to_string().replace(&unknown, "<hash>"),
+        "an unreadable member's file looks exactly like a file nobody stored"
+    );
+
+    // An admin reads every lineage member, so the parent's file too.
+    assert_eq!(
+        read_blob_ok(&state, custodian, child, &private).await["text"],
+        json!(PARENT_PRIVATE)
+    );
+
+    // A stranger: the absent-agent 404, whatever the hash.
+    let absent = Uuid::new_v4();
+    let (s_real, b_real) = get_blob(&state, stranger, child, &own).await;
+    let (s_absent, b_absent) = get_blob(&state, stranger, absent, &own).await;
+    assert_eq!(s_real, StatusCode::NOT_FOUND, "{b_real}");
+    assert_eq!(s_absent, StatusCode::NOT_FOUND, "{b_absent}");
+    assert_eq!(
+        b_real.to_string().replace(&child.to_string(), "<id>"),
+        b_absent.to_string().replace(&absent.to_string(), "<id>")
+    );
+
+    let (status, body) = get_blob(&state, operator, child, "not-a-hash").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A file that is not valid UTF-8 is served with `lossy: true` (its text
+/// replaces the invalid bytes) and its exact raw size; a UTF-8 file of the
+/// same snapshot is `lossy: false`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_blob_says_when_its_text_is_not_byte_exact(pool: PgPool) {
+    let operator = human(&pool).await;
+    let raw = vec![b'o', b'k', 0xff, 0xfe];
+    let a = register(
+        &pool,
+        &identity(
+            "g-lossy",
+            None,
+            [
+                stored("plain identity\n"),
+                PromptFile::Absent,
+                PromptFile::Absent,
+                PromptFile::Stored(raw.clone()),
+            ],
+        ),
+    )
+    .await;
+    link(&pool, a.agent_id, operator).await;
+    let state = app_role_state(&pool).await;
+
+    let body = read_ok(&state, operator, a.agent_id).await;
+    let files = &body["snapshots"][0]["files"];
+    let lossy = read_blob_ok(
+        &state,
+        operator,
+        a.agent_id,
+        file_hash(&files["learned_md"]),
+    )
+    .await;
+    assert_eq!(lossy["lossy"], json!(true), "{lossy}");
+    assert_eq!(lossy["raw_size"], json!(raw.len()));
+    assert_eq!(lossy["text"], json!("ok\u{FFFD}\u{FFFD}"));
+    assert_eq!(
+        lossy["blob_hash"],
+        json!(blake3::hash(&raw).to_hex().to_string()),
+        "the hash is of the raw bytes, not of the replaced text"
+    );
+    let exact = read_blob_ok(
+        &state,
+        operator,
+        a.agent_id,
+        file_hash(&files["identity_md"]),
+    )
+    .await;
+    assert_eq!(exact["lossy"], json!(false), "{exact}");
+    assert_eq!(exact["text"], json!("plain identity\n"));
+}
+
+/// A stored blob that no longer decompresses to its key is WITHHELD: the
+/// blob endpoint refuses it (500, naming the verification failure) and never
+/// serves the bytes it holds, while the other files of the same snapshot are
+/// still served and the listing still names it. The corruption swaps in
+/// another stored file's valid frame (as the superuser, triggers off), so only
+/// the hash check can catch it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_blob_that_fails_verification_is_withheld(pool: PgPool) {
+    let operator = human(&pool).await;
+    let a = register(
+        &pool,
+        &identity(
+            "g-corrupt",
+            None,
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored("the intact group file\n"),
+                stored("the file that will be corrupted\n"),
+            ],
+        ),
+    )
+    .await;
+    link(&pool, a.agent_id, operator).await;
+    let intact = blake3::hash(b"the intact group file\n").as_bytes().to_vec();
+    let corrupted = blake3::hash(b"the file that will be corrupted\n")
+        .as_bytes()
+        .to_vec();
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let n = sqlx::query(
+        "UPDATE agent_prompt_blobs SET content = \
+           (SELECT content FROM agent_prompt_blobs WHERE blob_hash = $1) \
+          WHERE blob_hash = $2",
+    )
+    .bind(&intact)
+    .bind(&corrupted)
+    .execute(&mut *conn)
+    .await
+    .expect("swap the frame")
+    .rows_affected();
+    assert_eq!(n, 1, "CALIBRATION: the blob was rewritten");
+    sqlx::query("RESET session_replication_role")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    drop(conn);
+    let state = app_role_state(&pool).await;
+
+    let body = read_ok(&state, operator, a.agent_id).await;
+    let files = &body["snapshots"][0]["files"];
+    let bad = file_hash(&files["learned_md"]).to_string();
+    assert_eq!(bad, hex::encode(&corrupted), "the listing still names it");
+    let (status, refused) = get_blob(&state, operator, a.agent_id, &bad).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{refused}");
+    assert!(
+        refused.to_string().contains("failed verification"),
+        "the refusal names the verification failure: {refused}"
+    );
+    assert!(
+        !refused.to_string().contains("intact group file"),
+        "the frame's actual bytes are never served: {refused}"
+    );
+    assert_eq!(
+        read_blob_ok(
+            &state,
+            operator,
+            a.agent_id,
+            file_hash(&files["group_claude_md"])
+        )
+        .await["text"],
+        json!("the intact group file\n"),
+        "CONTROL: the snapshot's other file is still served"
+    );
 }
