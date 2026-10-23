@@ -14,6 +14,11 @@
 //! `belief-profile: allow-literal (<reason>)`, so every exception is visible
 //! in review with its reason.
 //!
+//! The defaults table is exempt only in `belief_profile.rs`, and only as ONE
+//! balanced `defaults-table-begin` / `defaults-table-end` pair. A marker in
+//! any other module, an unclosed or second pair, or a stray end exempts
+//! nothing and is itself reported.
+//!
 //! The scanner is plain text processing over the source files (no proc-macro,
 //! no syn), so it runs everywhere the test suite runs.
 
@@ -216,25 +221,50 @@ fn allowed_value(lit: &str) -> bool {
     matches!(core.as_str(), "0" | "1" | "0.0" | "1.0")
 }
 
-/// Scan one module's source; lines inside the defaults table and lines
-/// carrying (or directly under) the allow marker are exempt.
+/// Scan a fold module that may NOT carry the defaults table: every table
+/// marker is itself a finding and exempts nothing.
 fn scan(src: &str) -> Vec<Finding> {
+    scan_with(src, false)
+}
+
+/// The defaults table's line range (inclusive, 0-based), when `src` carries
+/// exactly one `begin` marker followed by exactly one `end` marker.
+fn table_range(raw_lines: &[&str]) -> Option<(usize, usize)> {
+    let begins: Vec<usize> = (0..raw_lines.len())
+        .filter(|&i| raw_lines[i].contains(TABLE_BEGIN))
+        .collect();
+    let ends: Vec<usize> = (0..raw_lines.len())
+        .filter(|&i| raw_lines[i].contains(TABLE_END))
+        .collect();
+    match (begins.as_slice(), ends.as_slice()) {
+        ([b], [e]) if b < e => Some((*b, *e)),
+        _ => None,
+    }
+}
+
+/// Scan one module's source. Lines carrying (or directly under) the allow
+/// marker are exempt. When `table_allowed` (the profile module only) and the
+/// source carries exactly one balanced table, the table's lines are exempt;
+/// otherwise every table marker is reported and nothing is exempt.
+fn scan_with(src: &str, table_allowed: bool) -> Vec<Finding> {
     let raw_lines: Vec<&str> = src.lines().collect();
     let code = code_only(src);
-    let mut in_table = false;
+    let table = if table_allowed {
+        table_range(&raw_lines)
+    } else {
+        None
+    };
     let mut findings = Vec::new();
     for (idx, line) in code.lines().enumerate() {
         let raw = raw_lines.get(idx).copied().unwrap_or("");
-        if raw.contains(TABLE_BEGIN) {
-            in_table = true;
+        if table.is_some_and(|(b, e)| (b..=e).contains(&idx)) {
             continue;
         }
-        if raw.contains(TABLE_END) {
-            in_table = false;
-            continue;
-        }
-        if in_table {
-            continue;
+        if raw.contains(TABLE_BEGIN) || raw.contains(TABLE_END) {
+            findings.push(Finding {
+                line: idx + 1,
+                literal: MISPLACED_MARKER.into(),
+            });
         }
         let marked =
             raw.contains(ALLOW_MARKER) || (idx > 0 && raw_lines[idx - 1].contains(ALLOW_MARKER));
@@ -290,9 +320,9 @@ const PROFILE_MODULE: &str = "belief_profile.rs";
 /// What a defaults-table marker that does not delimit THE table is reported as.
 const MISPLACED_MARKER: &str = "<defaults-table marker>";
 
-/// Scan one named fold module.
-fn scan_module(_module: &str, src: &str) -> Vec<Finding> {
-    scan(src)
+/// Scan one named fold module: only [`PROFILE_MODULE`] may carry the table.
+fn scan_module(module: &str, src: &str) -> Vec<Finding> {
+    scan_with(src, module == PROFILE_MODULE)
 }
 
 fn src_dir() -> PathBuf {
