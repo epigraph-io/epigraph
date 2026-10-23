@@ -297,15 +297,74 @@ impl CompoundBeliefMode {
     /// Parse one value: trimmed, case-insensitive; `None` when it is neither
     /// `legacy` nor `shadow`.
     #[must_use]
-    pub fn parse_value(_raw: &str) -> Option<Self> {
-        None
+    pub fn parse_value(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("legacy") {
+            Some(Self::Legacy)
+        } else if v.eq_ignore_ascii_case("shadow") {
+            Some(Self::Shadow)
+        } else {
+            None
+        }
     }
 
     /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
     /// unrecognised value (including the not-yet-wired `progressive` and
-    /// `strict`) is the default, [`Self::Legacy`].
+    /// `strict`) is the default, [`Self::Legacy`]; an unrecognised one is
+    /// logged.
     #[must_use]
     pub fn current() -> Self {
-        Self::Legacy
+        static CELL: std::sync::OnceLock<CompoundBeliefMode> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| crate::atom_items::read_flag(Self::ENV, Self::parse_value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_legacy_and_shadow_are_recognised_and_legacy_is_the_default() {
+        assert_eq!(CompoundBeliefMode::default(), CompoundBeliefMode::Legacy);
+        assert_eq!(
+            CompoundBeliefMode::parse_value(" Shadow "),
+            Some(CompoundBeliefMode::Shadow)
+        );
+        assert_eq!(
+            CompoundBeliefMode::parse_value("LEGACY"),
+            Some(CompoundBeliefMode::Legacy)
+        );
+        // The modes that change served values are not wired here, so no
+        // spelling of them (or a typo) can select anything but the default.
+        for raw in ["progressive", "strict", "shadows", "on", ""] {
+            assert_eq!(CompoundBeliefMode::parse_value(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn readiness_is_blocked_by_a_legacy_leaf_only() {
+        use LeafState::{Axiom, Legacy, Unproven};
+        assert!(compound_ready([Axiom, Unproven, Unproven]));
+        assert!(compound_ready([]));
+        assert!(!compound_ready([Axiom, Legacy]));
+    }
+
+    #[test]
+    fn the_wire_shape_names_the_basis_in_lower_case_and_omits_absent_parts() {
+        let v = BeliefView {
+            claim_id: Uuid::nil(),
+            basis: Basis::Unproven,
+            bel: 0.0,
+            pl: 1.0,
+            betp: 0.5,
+            nr: 1.0,
+            derived: None,
+            profile: None,
+            rule_version: AEF_RULE,
+            inputs: InputSummary::default(),
+        };
+        let j = serde_json::to_value(&v).expect("serialize");
+        assert_eq!(j["basis"], "unproven");
+        assert!(j.get("derived").is_none() && j.get("profile").is_none());
     }
 }
