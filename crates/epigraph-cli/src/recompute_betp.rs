@@ -439,3 +439,313 @@ fn parse_df_available_kib(out: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+// ── the wave file ──────────────────────────────────────────────────────────
+
+/// Where a writing run records what it wrote (SPEC §10.8): the wave file
+/// (claim caches, [`WaveRecord`]) and its scoped sidecar
+/// ([`ScopedWaveRecord`]), both appended and flushed BEFORE the write they
+/// record commits, so every committed write has a record.
+pub struct WaveLog {
+    wave: String,
+    at: DateTime<Utc>,
+    claims: std::sync::Mutex<std::fs::File>,
+    scoped: std::sync::Mutex<std::fs::File>,
+}
+
+impl WaveLog {
+    /// Open (append, create) `wave_file` and its sidecar for the wave named
+    /// `wave` whose run started at `at` (the database clock, before the first
+    /// write; see [`WaveRecord::at`]).
+    ///
+    /// # Errors
+    /// Either file cannot be opened.
+    pub fn open(wave_file: &std::path::Path, wave: &str, at: DateTime<Utc>) -> Result<Self, String> {
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .map_err(|e| format!("{}: {e}", p.display()))
+        };
+        Ok(Self {
+            wave: wave.to_string(),
+            at,
+            claims: std::sync::Mutex::new(open(wave_file)?),
+            scoped: std::sync::Mutex::new(open(&scoped_sidecar_path(wave_file))?),
+        })
+    }
+
+    /// The run's `wave_at`.
+    #[must_use]
+    pub const fn at(&self) -> DateTime<Utc> {
+        self.at
+    }
+
+    fn record(&self, wave: &str, claim_id: Uuid, before: CacheColumns, written: CacheColumns) -> Result<(), String> {
+        let mut f = self.claims.lock().map_err(|_| "wave file lock poisoned".to_string())?;
+        let mut line = Vec::new();
+        write_wave_record(
+            &mut line,
+            &WaveRecord {
+                claim_id,
+                before,
+                written,
+                wave: wave.to_string(),
+                at: self.at,
+            },
+        )
+        .map_err(|e| format!("wave record: {e}"))?;
+        f.write_all(&line)
+            .and_then(|()| f.flush())
+            .and_then(|()| f.sync_data())
+            .map_err(|e| format!("wave file write: {e}"))
+    }
+
+    fn record_scoped(&self, rec: &ScopedWaveRecord) -> Result<(), String> {
+        let mut f = self.scoped.lock().map_err(|_| "scoped file lock poisoned".to_string())?;
+        let mut line = Vec::new();
+        write_scoped_record(&mut line, rec).map_err(|e| format!("scoped record: {e}"))?;
+        f.write_all(&line)
+            .and_then(|()| f.flush())
+            .and_then(|()| f.sync_data())
+            .map_err(|e| format!("scoped file write: {e}"))
+    }
+}
+
+/// What one wave write did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaveClaimOutcome {
+    /// The single atom-cache writer's outcome.
+    pub outcome: AtomCacheOutcome,
+    /// The claim's cache changed (and was recorded).
+    pub changed: bool,
+    /// Scoped rows rewritten (and recorded).
+    pub scoped_rewritten: usize,
+    /// Scoped rows left alone: no AEF row of their scope, or an override.
+    pub scoped_kept: usize,
+}
+
+async fn lock_cache(
+    tx: &mut sqlx::PgConnection,
+    claim_id: Uuid,
+) -> Result<Option<CacheColumns>, String> {
+    let locked: Option<Uuid> = sqlx::query_scalar("SELECT id FROM claims WHERE id = $1 FOR UPDATE")
+        .bind(claim_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("lock claim: {e}"))?;
+    if locked.is_none() {
+        return Ok(None);
+    }
+    Ok(read_cache_columns(&mut *tx, &[claim_id])
+        .await
+        .map_err(|e| format!("read cache: {e}"))?
+        .remove(&claim_id))
+}
+
+/// One wave write (SPEC §10.7): in ONE transaction, lock the claim, read its
+/// cache, run the single atom-cache writer under `settings`, read the cache
+/// back, record `before` and `written` (only when it changed), resync the
+/// atom's existing per-scope rows from the fold (when the AEF wrote), and
+/// commit. Records are flushed before the commit.
+///
+/// # Errors
+/// A database read or write, a fold, or a record write; the transaction is
+/// rolled back.
+pub async fn write_wave_claim(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    settings: AtomCacheSettings,
+    log: &WaveLog,
+) -> Result<WaveClaimOutcome, String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let Some(before) = lock_cache(&mut tx, claim_id).await? else {
+        return Ok(WaveClaimOutcome {
+            outcome: AtomCacheOutcome::NotVisible,
+            changed: false,
+            scoped_rewritten: 0,
+            scoped_kept: 0,
+        });
+    };
+    let outcome = epigraph_engine::edge_factor::recompute_atom_cache_with(
+        &mut tx,
+        viewer,
+        claim_id,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        settings,
+    )
+    .await?;
+    let after = read_cache_columns(&mut *tx, &[claim_id])
+        .await
+        .map_err(|e| format!("read cache: {e}"))?
+        .remove(&claim_id)
+        .ok_or_else(|| format!("claim {claim_id} vanished inside its own transaction"))?;
+    let changed = after != before;
+    if changed {
+        log.record(&log.wave, claim_id, before, after)?;
+    }
+    let (scoped_rewritten, scoped_kept) = match &outcome {
+        AtomCacheOutcome::Folded {
+            interval,
+            written: true,
+        } => {
+            resync_scoped_rows(
+                &mut tx,
+                viewer,
+                claim_id,
+                interval,
+                settings.compound_source_edges,
+                log,
+            )
+            .await?
+        }
+        _ => (0, 0),
+    };
+    tx.commit().await.map_err(|e| format!("commit: {e}"))?;
+    Ok(WaveClaimOutcome {
+        outcome,
+        changed,
+        scoped_rewritten,
+        scoped_kept,
+    })
+}
+
+/// `strategy_used` of a scoped row a wave rewrote from the atom fold.
+pub const SCOPED_RESYNC_STRATEGY: &str = "atom_fold";
+/// `strategy_used` of a community row written from the community's own mass
+/// override (`routes/belief.rs`): not a fold of the atom's rows, kept.
+const SCOPED_OVERRIDE_STRATEGY: &str = "override";
+
+type ScopedRow = (
+    Uuid,
+    Uuid,
+    String,
+    Option<Uuid>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    Option<f64>,
+);
+
+/// Resync an atom's EXISTING `ds_combined_beliefs` rows from the atom fold
+/// (SPEC §7.2), mirroring the selection `routes/belief.rs` folds per scope:
+/// a `global` row takes the atom's fold (`interval`, what the cache got); a
+/// `perspective` row the fold of the atom's AEF rows from that perspective;
+/// a `community` row the fold of the rows from its member perspectives. A
+/// scope with no AEF row, and a community override row, is left as it is.
+/// No row is created. Returns `(rewritten, kept)`.
+async fn resync_scoped_rows(
+    tx: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    interval: &EvidencedInterval,
+    compound_source_edges: CompoundSourceEdges,
+    log: &WaveLog,
+) -> Result<(usize, usize), String> {
+    let rows: Vec<ScopedRow> = sqlx::query_as(
+        "SELECT id, frame_id, scope_type, scope_id, belief, plausibility, mass_on_empty, \
+                mass_on_missing, conflict_k, strategy_used, pignistic_prob \
+           FROM ds_combined_beliefs WHERE claim_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(claim_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| format!("scoped rows: {e}"))?;
+    if rows.is_empty() {
+        return Ok((0, 0));
+    }
+    let drift_rows = if rows.iter().any(|r| r.2 != "global") {
+        epigraph_engine::atom_items::atom_drift_rows(
+            &mut *tx,
+            viewer,
+            &[claim_id],
+            compound_source_edges,
+        )
+        .await?
+        .remove(&claim_id)
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let (mut rewritten, mut kept) = (0, 0);
+    for (id, frame_id, scope_type, scope_id, b, p, me, mm, k, strategy, betp) in rows {
+        let before = ScopedColumns {
+            belief: b,
+            plausibility: p,
+            mass_on_empty: me,
+            mass_on_missing: mm,
+            conflict_k: k,
+            strategy_used: strategy.clone(),
+            pignistic_prob: betp,
+        };
+        let fold = match (scope_type.as_str(), scope_id) {
+            ("global", _) => Some(interval.clone()),
+            ("perspective", Some(pid)) => drift_scope_fold(&drift_rows, &BTreeSet::from([pid]))?,
+            ("community", Some(cid)) if strategy.as_deref() != Some(SCOPED_OVERRIDE_STRATEGY) => {
+                let members: BTreeSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
+                    "SELECT perspective_id FROM community_members WHERE community_id = $1",
+                )
+                .bind(cid)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| format!("community members: {e}"))?
+                .into_iter()
+                .collect();
+                drift_scope_fold(&drift_rows, &members)?
+            }
+            _ => None,
+        };
+        let Some(fold) = fold else {
+            kept += 1;
+            continue;
+        };
+        let written = ScopedColumns {
+            belief: Some(fold.belief()),
+            plausibility: Some(fold.plausibility()),
+            mass_on_empty: Some(fold.mass_on_conflict()),
+            mass_on_missing: Some(fold.mass_on_missing()),
+            conflict_k: (fold.items() > 1).then_some(fold.mass_on_conflict()),
+            strategy_used: Some(SCOPED_RESYNC_STRATEGY.to_string()),
+            pignistic_prob: Some(fold.pignistic_prob()),
+        };
+        if written == before {
+            continue;
+        }
+        log.record_scoped(&ScopedWaveRecord {
+            row_id: id,
+            claim_id,
+            frame_id,
+            scope_type,
+            scope_id,
+            before,
+            written: written.clone(),
+            wave: log.wave.clone(),
+            at: log.at,
+        })?;
+        sqlx::query(
+            "UPDATE ds_combined_beliefs SET belief = $2, plausibility = $3, mass_on_empty = $4, \
+                    mass_on_missing = $5, conflict_k = $6, strategy_used = $7, \
+                    pignistic_prob = $8, computed_at = now() \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(written.belief)
+        .bind(written.plausibility)
+        .bind(written.mass_on_empty)
+        .bind(written.mass_on_missing)
+        .bind(written.conflict_k)
+        .bind(written.strategy_used)
+        .bind(written.pignistic_prob)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("scoped resync write: {e}"))?;
+        rewritten += 1;
+    }
+    Ok((rewritten, kept))
+}
+
