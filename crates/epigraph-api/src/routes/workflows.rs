@@ -2054,7 +2054,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2563,8 +2563,8 @@ pub struct DeleteStepRequest {
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
 /// detail logged and kept out of the body. A content-less generation
-/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
-/// else stays a 500.
+/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
+/// the caller's payload errors: 400. Everything else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2580,6 +2580,14 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         // U032: a content-less generation is the caller's payload error: 400,
         // not a 500 that invites the retry loop that minted the stubs.
         e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // Blank claim content in the payload (thesis, phase, step or
+        // operation), refused by the executor's pre-flight: 400 naming the
+        // field.
+        e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
             ApiError::BadRequest {
                 message: format!("workflow ingest: {e}"),
             }
@@ -3294,6 +3302,26 @@ mod tests {
         }
     }
 
+    /// The executor's pre-flight refusal of blank claim content in the
+    /// caller's payload is a 400 carrying the field path, not a 500 that
+    /// invites a retry of a payload that can never succeed.
+    #[test]
+    fn blank_claim_content_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::InvalidContent {
+                path: "phases[0].steps[0].operations[0]".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.starts_with("workflow ingest: ")
+                    && message.contains("blank claim content at phases[0].steps[0].operations[0]"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.
@@ -3580,6 +3608,53 @@ mod tests {
             "content must equal goal for hierarchical workflows"
         );
         assert!(body["canonical_name"].as_str().is_some());
+    }
+
+    /// Through the route: a payload whose only step has a blank `compound` is
+    /// answered 400 naming the field, and no `workflows` row is written.
+    /// Positive control: the same payload with its content intact is a 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_refuses_blank_step_content_as_400(pool: PgPool) {
+        let post = |app: axum::Router, payload: serde_json::Value| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/workflows/ingest")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let count = |pool: PgPool, name: &'static str| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let app = test_router(pool.clone()).await;
+
+        let mut blank = ingest_payload("http-blank-step-content");
+        blank["phases"][0]["steps"][0]["compound"] = serde_json::json!("   ");
+        let (status, text) = post(app.clone(), blank).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("blank claim content at phases[0].steps[0]"),
+            "the 400 names the field: {text}"
+        );
+        assert_eq!(count(pool.clone(), "http-blank-step-content").await, 0);
+
+        let (status, text) = post(app, ingest_payload("http-intact-step-content")).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(count(pool, "http-intact-step-content").await, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
