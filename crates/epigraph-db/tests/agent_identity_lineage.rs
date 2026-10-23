@@ -126,7 +126,10 @@ async fn try_register_as(
     snap: Value,
     principal: Option<String>,
 ) -> Result<Registered, sqlx::Error> {
-    try_register_full(pool, role, id, MODEL, parent, group, signing, snap, principal).await
+    try_register_full(
+        pool, role, id, MODEL, parent, group, signing, snap, principal,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,15 +402,14 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
             .contains("CREATE ROLE epigraph_identity_attestor NOLOGIN;"),
         "the migration must create the attestor NOLOGIN"
     );
-    let (sup, createrole, createdb, bypass, repl): (bool, bool, bool, bool, bool) =
-        sqlx::query_as(
-            "SELECT rolsuper, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication \
+    let (sup, createrole, createdb, bypass, repl): (bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolsuper, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication \
                FROM pg_roles WHERE rolname = $1",
-        )
-        .bind(ATTESTOR)
-        .fetch_one(&pool)
-        .await
-        .expect("the attestor role exists");
+    )
+    .bind(ATTESTOR)
+    .fetch_one(&pool)
+    .await
+    .expect("the attestor role exists");
     assert!(!(sup || createrole || createdb || bypass || repl));
 
     // Nobody can act as the attestor (161's own fault list, which the
@@ -975,7 +977,11 @@ async fn adopting_an_agent_with_claims_and_no_registration_is_refused_aid05(pool
         .fetch_one(&pool)
         .await
         .expect("adopted properties");
-    assert_eq!(props["llm_model"], json!(MODEL), "adoption records the model");
+    assert_eq!(
+        props["llm_model"],
+        json!(MODEL),
+        "adoption records the model"
+    );
     assert_eq!(props["llm_prompt_hash"], json!(quiet.prompt_hash));
 
     // CALIBRATION 2: registered earlier, then wrote claims, re-registers.
@@ -1027,15 +1033,31 @@ async fn a_parent_that_is_not_an_llm_agent_is_refused_aid03(pool: PgPool) {
 
     for (parent, what) in [
         (plain, "an ed25519 software agent with no llm_model"),
-        (keyless_operator, "a registered human operator with a derived key"),
-        (human_typed, "an agent_type 'human' agent with a derived key"),
+        (
+            keyless_operator,
+            "a registered human operator with a derived key",
+        ),
+        (
+            human_typed,
+            "an agent_type 'human' agent with a derived key",
+        ),
     ] {
         let before = footprint(&pool).await;
-        let err = try_register(&pool, &new_identity(), Some(parent), "g-h", snapshot("g", "l"))
-            .await
-            .expect_err(what);
+        let err = try_register(
+            &pool,
+            &new_identity(),
+            Some(parent),
+            "g-h",
+            snapshot("g", "l"),
+        )
+        .await
+        .expect_err(what);
         assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{what}: {err}");
-        assert_eq!(footprint(&pool).await, before, "{what}: AID03 changes nothing");
+        assert_eq!(
+            footprint(&pool).await,
+            before,
+            "{what}: AID03 changes nothing"
+        );
     }
 
     let legacy = Uuid::new_v4();
@@ -1165,7 +1187,10 @@ async fn the_signing_key_is_bound_once_and_a_different_one_is_refused_aid08(pool
     let same = register_with(key.clone(), "g-k", "l2")
         .await
         .expect("CALIBRATION: the same key again registers");
-    assert!(!same.signing_key_registered, "the same key is already bound");
+    assert!(
+        !same.signing_key_registered,
+        "the same key is already bound"
+    );
 
     let before = footprint(&pool).await;
     let err = register_with(random32(), "g-k", "l3")
@@ -1694,7 +1719,8 @@ async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: 
     let victim = plain_agent(&pool, "software_agent").await;
     let (signing, legacy, spelled, other) =
         as_app_stamped(&pool, victim, &[], |mut conn| async move {
-            let ins = "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+            let ins =
+                "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
                        VALUES ($1, $2, $3, 'active', '2020-01-01')";
             let mut out = Vec::new();
             for t in ["signing", "identity-legacy", " Signing", "encryption"] {
@@ -1774,13 +1800,12 @@ async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: 
     set_key_status_as(&pool, "epigraph_app", victim, other_key, "rotated")
         .await
         .expect("CALIBRATION: the application role still rotates a key of another type");
-    let statuses: Vec<String> = sqlx::query_scalar(
-        "SELECT status::text FROM agent_keys WHERE id = ANY($1) ORDER BY id",
-    )
-    .bind(vec![bound, legacy_key])
-    .fetch_all(&pool)
-    .await
-    .expect("statuses");
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status::text FROM agent_keys WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![bound, legacy_key])
+            .fetch_all(&pool)
+            .await
+            .expect("statuses");
     assert_eq!(statuses, vec!["active".to_string(), "active".to_string()]);
 
     set_key_status_as(&pool, "epigraph_maintenance", victim, bound, "revoked")
@@ -1944,7 +1969,14 @@ async fn an_unlinked_identity_running_in_another_group_inherits_nothing(pool: Pg
     assert_eq!(r.operator_id, None);
     assert_eq!(human_of(&pool, r.agent_id, false).await, None);
 
-    let solo = register(&pool, &new_identity(), Some(parent), "g-own", snapshot("t", "x")).await;
+    let solo = register(
+        &pool,
+        &new_identity(),
+        Some(parent),
+        "g-own",
+        snapshot("t", "x"),
+    )
+    .await;
     assert!(
         solo.inherited,
         "CALIBRATION: an identity with no other group inherits"
@@ -2140,7 +2172,9 @@ async fn history_over_a_lineage_shared_by_many_groups_stays_linear(pool: PgPool)
     for (i, agent) in lineage.iter().enumerate() {
         let want = i as i32 - (GENERATIONS as i32 - 1);
         assert!(
-            rows.iter().filter(|(a, _, _)| a == agent).all(|(_, d, _)| *d == want),
+            rows.iter()
+                .filter(|(a, _, _)| a == agent)
+                .all(|(_, d, _)| *d == want),
             "generation {i} must sit at depth {want}"
         );
     }
@@ -2178,9 +2212,15 @@ async fn the_legacy_key_backfill_reruns_for_agents_created_after_161(pool: PgPoo
     let err = run("epigraph_app")
         .await
         .expect_err("the application role ran the legacy backfill");
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
 
-    let added = run("epigraph_maintenance").await.expect("maintenance backfills");
+    let added = run("epigraph_maintenance")
+        .await
+        .expect("maintenance backfills");
     assert!(added >= 1, "the late agent gets its row");
     let rows: Vec<(Vec<u8>, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
         "SELECT k.public_key, k.status::text, k.valid_until FROM agent_keys k \
@@ -2222,7 +2262,14 @@ async fn the_legacy_key_backfill_reruns_for_agents_created_after_161(pool: PgPoo
 async fn no_role_can_truncate_the_lineage_tables(pool: PgPool) {
     let operator = human_operator(&pool).await;
     let parent = live_linked_parent(&pool, operator, "g-t").await;
-    register(&pool, &new_identity(), Some(parent), "g-t", snapshot("g", "l")).await;
+    register(
+        &pool,
+        &new_identity(),
+        Some(parent),
+        "g-t",
+        snapshot("g", "l"),
+    )
+    .await;
     let counts = |pool: PgPool| async move {
         sqlx::query_as::<_, (i64, i64, i64)>(
             "SELECT (SELECT count(*) FROM agent_prompt_blobs), \
@@ -2234,7 +2281,10 @@ async fn no_role_can_truncate_the_lineage_tables(pool: PgPool) {
         .expect("counts")
     };
     let before = counts(pool.clone()).await;
-    assert!(before.0 > 0 && before.1 > 0 && before.2 > 0, "CALIBRATION: rows exist");
+    assert!(
+        before.0 > 0 && before.1 > 0 && before.2 > 0,
+        "CALIBRATION: rows exist"
+    );
     for stmt in [
         "TRUNCATE agent_succession",
         "TRUNCATE agent_prompt_snapshots CASCADE",
@@ -2268,7 +2318,10 @@ async fn a_pre_provisioned_attestor_is_checked_for_isolation(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("faults on a fresh database");
-    assert!(faults.is_empty(), "a fresh attestor has no faults: {faults:?}");
+    assert!(
+        faults.is_empty(),
+        "a fresh attestor has no faults: {faults:?}"
+    );
 
     let mut tx = pool.begin().await.expect("begin");
     sqlx::query("GRANT epigraph_identity_attestor TO epigraph_app")
@@ -2294,7 +2347,11 @@ async fn a_pre_provisioned_attestor_is_checked_for_isolation(pool: PgPool) {
     })
     .await
     .expect_err("the application role assumed the attestor");
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2313,10 +2370,20 @@ async fn a_pre_provisioned_attestor_is_checked_for_isolation(pool: PgPool) {
 async fn an_application_session_reads_and_writes_no_lineage_row_directly(pool: PgPool) {
     let operator = human_operator(&pool).await;
     let parent = live_linked_parent(&pool, operator, "g-direct").await;
-    let child = register(&pool, &new_identity(), Some(parent), "g-direct", snapshot("g", "l"))
-        .await;
+    let child = register(
+        &pool,
+        &new_identity(),
+        Some(parent),
+        "g-direct",
+        snapshot("g", "l"),
+    )
+    .await;
     let group = operator_group(&pool, operator).await;
-    const TABLES: [&str; 3] = ["agent_prompt_blobs", "agent_prompt_snapshots", "agent_succession"];
+    const TABLES: [&str; 3] = [
+        "agent_prompt_blobs",
+        "agent_prompt_snapshots",
+        "agent_succession",
+    ];
 
     let seen = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let mut out = Vec::new();
@@ -2330,7 +2397,10 @@ async fn an_application_session_reads_and_writes_no_lineage_row_directly(pool: P
         (conn, out)
     })
     .await;
-    assert!(seen.iter().all(|n| *n > 0), "CALIBRATION: rows exist: {seen:?}");
+    assert!(
+        seen.iter().all(|n| *n > 0),
+        "CALIBRATION: rows exist: {seen:?}"
+    );
 
     let (counts, inserts, history) =
         as_app_stamped(&pool, operator, &[group], |mut conn| async move {
@@ -2362,19 +2432,26 @@ async fn an_application_session_reads_and_writes_no_lineage_row_directly(pool: P
                 }
                 inserts.push(q.execute(&mut *conn).await.map(|_| ()));
             }
-            let history: Result<i64, sqlx::Error> = sqlx::query_scalar(
-                "SELECT count(*) FROM public.epigraph_agent_prompt_history($1)",
-            )
-            .bind(child.agent_id)
-            .fetch_one(&mut *conn)
-            .await;
+            let history: Result<i64, sqlx::Error> =
+                sqlx::query_scalar("SELECT count(*) FROM public.epigraph_agent_prompt_history($1)")
+                    .bind(child.agent_id)
+                    .fetch_one(&mut *conn)
+                    .await;
             (conn, (counts, inserts, history))
         })
         .await;
-    assert_eq!(counts, vec![0, 0, 0], "an application session reads no lineage row");
+    assert_eq!(
+        counts,
+        vec![0, 0, 0],
+        "an application session reads no lineage row"
+    );
     for (t, r) in TABLES.iter().zip(inserts) {
         let err = r.expect_err("an application session inserted a lineage row");
-        assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{t}: {err}");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{t}: {err}"
+        );
     }
     assert!(
         history.expect("CALIBRATION: the gated read answers the operator") > 0,
@@ -2391,8 +2468,14 @@ async fn an_application_session_reads_and_writes_no_lineage_row_directly(pool: P
 async fn armed_admin_scopes_admit_an_elevated_custodian_only(pool: PgPool) {
     let operator = human_operator(&pool).await;
     let parent = live_linked_parent(&pool, operator, "g-armed").await;
-    let child = register(&pool, &new_identity(), Some(parent), "g-armed", snapshot("g", "l"))
-        .await;
+    let child = register(
+        &pool,
+        &new_identity(),
+        Some(parent),
+        "g-armed",
+        snapshot("g", "l"),
+    )
+    .await;
     let custodian = elevation::holder(&pool, "armed custodian", 7).await;
     let live = elevation::session(&pool, &custodian).await;
 
@@ -2421,7 +2504,11 @@ async fn armed_admin_scopes_admit_an_elevated_custodian_only(pool: PgPool) {
                             set_config('epigraph.access_recorder', 'on', false)",
                 )
                 .bind(person.to_string())
-                .bind(if elevated { live.to_string() } else { String::new() })
+                .bind(if elevated {
+                    live.to_string()
+                } else {
+                    String::new()
+                })
                 .bind(family.to_string())
                 .execute(&mut *conn)
                 .await
@@ -2451,7 +2538,10 @@ async fn armed_admin_scopes_admit_an_elevated_custodian_only(pool: PgPool) {
         }
     };
     let (is, plain) = read(false).await;
-    assert!(!is, "CALIBRATION: the unelevated connection is not elevated");
+    assert!(
+        !is,
+        "CALIBRATION: the unelevated connection is not elevated"
+    );
     let err = plain.expect_err("an unelevated custodian read under armed admin scopes");
     assert_eq!(sqlstate(&err).as_deref(), Some("AID06"), "{err}");
 
@@ -2474,8 +2564,14 @@ async fn armed_admin_scopes_admit_an_elevated_custodian_only(pool: PgPool) {
 async fn a_snapshot_only_moves_last_seen_forward_and_succession_never_changes(pool: PgPool) {
     let operator = human_operator(&pool).await;
     let parent = live_linked_parent(&pool, operator, "g-guard").await;
-    let child = register(&pool, &new_identity(), Some(parent), "g-guard", snapshot("g", "l"))
-        .await;
+    let child = register(
+        &pool,
+        &new_identity(),
+        Some(parent),
+        "g-guard",
+        snapshot("g", "l"),
+    )
+    .await;
     let snap = child.snapshot_id;
     let agent = child.agent_id;
 
@@ -2494,14 +2590,12 @@ async fn a_snapshot_only_moves_last_seen_forward_and_succession_never_changes(po
             .await
         }
     };
-    let backward =
-        "UPDATE agent_prompt_snapshots SET last_seen = last_seen - interval '1 hour' \
+    let backward = "UPDATE agent_prompt_snapshots SET last_seen = last_seen - interval '1 hour' \
           WHERE id = $1 AND agent_id = $2";
     let host = "UPDATE agent_prompt_snapshots SET host_sha = 'x' WHERE id = $1 AND agent_id = $2";
     let succ_update = "UPDATE agent_succession SET group_folder = 'g-moved' \
                         WHERE snapshot_id = $1 AND child_agent_id = $2";
-    let succ_delete =
-        "DELETE FROM agent_succession WHERE snapshot_id = $1 AND child_agent_id = $2";
+    let succ_delete = "DELETE FROM agent_succession WHERE snapshot_id = $1 AND child_agent_id = $2";
     let snap_delete = "DELETE FROM agent_prompt_snapshots WHERE id = $1 AND agent_id = $2";
 
     for (stmt, maint_code) in [
@@ -2514,14 +2608,22 @@ async fn a_snapshot_only_moves_last_seen_forward_and_succession_never_changes(po
         let err = as_maint(stmt)
             .await
             .expect_err("the maintenance role changed lineage state");
-        assert_eq!(sqlstate(&err).as_deref(), Some(maint_code), "maintenance {stmt}: {err}");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some(maint_code),
+            "maintenance {stmt}: {err}"
+        );
         let err = sqlx::query(stmt)
             .bind(snap)
             .bind(agent)
             .execute(&pool)
             .await
             .expect_err("a superuser changed lineage state");
-        assert_eq!(sqlstate(&err).as_deref(), Some("55000"), "superuser {stmt}: {err}");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("55000"),
+            "superuser {stmt}: {err}"
+        );
     }
 
     let forward = as_maint(
@@ -2540,31 +2642,48 @@ async fn a_snapshot_only_moves_last_seen_forward_and_succession_never_changes(po
 /// before C's own parent Q. Read as maintenance.
 #[sqlx::test(migrations = "../../migrations")]
 async fn history_through_a_cycle_keeps_every_ancestor_at_its_nearest_depth(pool: PgPool) {
-    let q = register(&pool, &new_identity(), None, "g-c3", snapshot("g", "q")).await.agent_id;
+    let q = register(&pool, &new_identity(), None, "g-c3", snapshot("g", "q"))
+        .await
+        .agent_id;
     let p_id = new_identity();
-    let p = register(&pool, &p_id, None, "g-c1", snapshot("g", "p")).await.agent_id;
-    let x = register(&pool, &new_identity(), Some(p), "g-c1", snapshot("g", "x")).await.agent_id;
+    let p = register(&pool, &p_id, None, "g-c1", snapshot("g", "p"))
+        .await
+        .agent_id;
+    let x = register(&pool, &new_identity(), Some(p), "g-c1", snapshot("g", "x"))
+        .await
+        .agent_id;
     let c_id = new_identity();
-    let c = register(&pool, &c_id, Some(x), "g-c1", snapshot("g", "c")).await.agent_id;
+    let c = register(&pool, &c_id, Some(x), "g-c1", snapshot("g", "c"))
+        .await
+        .agent_id;
     register(&pool, &p_id, Some(c), "g-c2", snapshot("g", "p2")).await; // C -> P
     register(&pool, &c_id, Some(q), "g-c3", snapshot("g", "c3")).await; // Q -> C
 
-    let rows: Vec<(Uuid, i32)> = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let r = sqlx::query_as(
-            "SELECT DISTINCT agent_id, depth FROM public.epigraph_agent_prompt_history($1)",
-        )
-        .bind(x)
-        .fetch_all(&mut *conn)
-        .await
-        .expect("history");
-        (conn, r)
-    })
-    .await;
+    let rows: Vec<(Uuid, i32)> =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query_as(
+                "SELECT DISTINCT agent_id, depth FROM public.epigraph_agent_prompt_history($1)",
+            )
+            .bind(x)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("history");
+            (conn, r)
+        })
+        .await;
     let depth = |a: Uuid| rows.iter().find(|(id, _)| *id == a).map(|(_, d)| *d);
     assert_eq!(depth(x), Some(0));
     assert_eq!(depth(p), Some(-1), "P is X's parent");
-    assert_eq!(depth(c), Some(1), "C is nearer as X's child than as its grandparent");
-    assert_eq!(depth(q), Some(-3), "Q, C's parent, is X's ancestor through P and C");
+    assert_eq!(
+        depth(c),
+        Some(1),
+        "C is nearer as X's child than as its grandparent"
+    );
+    assert_eq!(
+        depth(q),
+        Some(-3),
+        "Q, C's parent, is X's ancestor through P and C"
+    );
     assert_eq!(rows.len(), 4, "each member once: {rows:?}");
 }
 

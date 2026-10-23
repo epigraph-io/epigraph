@@ -229,7 +229,11 @@ async fn a_blob_that_no_longer_matches_its_hash_is_withheld_not_fatal(pool: PgPo
     let other_operator = operate(&pool, b.agent_id).await;
     for (who, agent, own) in [
         (operator, a.agent_id, lesson.clone()),
-        (other_operator, b.agent_id, b"another agent's lesson\n".to_vec()),
+        (
+            other_operator,
+            b.agent_id,
+            b"another agent's lesson\n".to_vec(),
+        ),
     ] {
         let entries = history_as(&pool, who, agent)
             .await

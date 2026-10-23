@@ -316,8 +316,10 @@ impl AgentIdentityRepository {
 fn history_entry(r: HistoryRow) -> PromptHistoryEntry {
     let snapshot = r.snapshot_id.map(|id| {
         let mut withheld_files = Vec::new();
-        let mut take = |file: &str, hash: Option<Vec<u8>>, content: Option<Vec<u8>>| {
-            match verified_blob(file, hash, content) {
+        let mut take =
+            |file: &str, hash: Option<Vec<u8>>, content: Option<Vec<u8>>| match verified_blob(
+                file, hash, content,
+            ) {
                 Ok(blob) => blob,
                 Err(reason) => {
                     tracing::warn!(
@@ -329,8 +331,7 @@ fn history_entry(r: HistoryRow) -> PromptHistoryEntry {
                     withheld_files.push(file.to_string());
                     None
                 }
-            }
-        };
+            };
         let identity_md = take("identity_md", r.identity_md_hash, r.identity_md);
         let global_claude_md = take(
             "global_claude_md",
@@ -377,7 +378,11 @@ fn verified_blob(
     let (hash, content) = match (hash, content) {
         (None, None) => return Ok(None),
         (Some(h), Some(c)) => (h, c),
-        _ => return Err(format!("{file}: a snapshot names a blob the history did not return")),
+        _ => {
+            return Err(format!(
+                "{file}: a snapshot names a blob the history did not return"
+            ))
+        }
     };
     let blob_hash: [u8; 32] = hash
         .as_slice()
