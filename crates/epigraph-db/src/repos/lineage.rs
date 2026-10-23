@@ -14,6 +14,7 @@
 //! - Diamond dependencies require proper deduplication via DISTINCT ON
 
 use crate::errors::DbError;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use tracing::instrument;
@@ -68,6 +69,11 @@ pub struct LineageClaim {
     pub id: Uuid,
     pub content: String,
     pub truth_value: f64,
+    /// The claim's author, projected by the walk itself so a caller needs no
+    /// per-node point read to serve it.
+    pub agent_id: Uuid,
+    /// When the claim was created; projected by the walk for the same reason.
+    pub created_at: DateTime<Utc>,
     pub depth: i32,
     pub parent_ids: Vec<Uuid>,
     pub evidence_ids: Vec<Uuid>,
@@ -104,6 +110,8 @@ struct LineageRow {
     id: Uuid,
     content: String,
     truth_value: f64,
+    agent_id: Uuid,
+    created_at: DateTime<Utc>,
     trace_id: Option<Uuid>,
     depth: i32,
     path: Vec<Uuid>,
@@ -373,6 +381,8 @@ impl LineageRepository {
                     c.id,
                     c.content,
                     c.truth_value,
+                    c.agent_id,
+                    c.created_at,
                     c.trace_id,
                     0 as depth,
                     ARRAY[c.id] as path,
@@ -391,6 +401,8 @@ impl LineageRepository {
                     c.id,
                     c.content,
                     c.truth_value,
+                    c.agent_id,
+                    c.created_at,
                     c.trace_id,
                     l.depth + 1,
                     l.path || c.id,
@@ -411,6 +423,8 @@ impl LineageRepository {
                 id,
                 content,
                 truth_value,
+                agent_id,
+                created_at,
                 trace_id,
                 depth,
                 path,
@@ -592,6 +606,8 @@ impl LineageRepository {
                 id: row.id,
                 content: row.content.clone(),
                 truth_value: row.truth_value,
+                agent_id: row.agent_id,
+                created_at: row.created_at,
                 depth: row.depth,
                 parent_ids: parent_map.get(&row.id).cloned().unwrap_or_default(),
                 evidence_ids: claim_evidence_map.get(&row.id).cloned().unwrap_or_default(),
@@ -937,6 +953,8 @@ impl LineageRepository {
                     c.id,
                     c.content,
                     c.truth_value,
+                    c.agent_id,
+                    c.created_at,
                     c.trace_id,
                     0 as depth,
                     ARRAY[c.id] as path,
@@ -952,6 +970,8 @@ impl LineageRepository {
                     c.id,
                     c.content,
                     c.truth_value,
+                    c.agent_id,
+                    c.created_at,
                     c.trace_id,
                     d.depth + 1,
                     d.path || c.id,
@@ -967,6 +987,8 @@ impl LineageRepository {
                 id,
                 content,
                 truth_value,
+                agent_id,
+                created_at,
                 trace_id,
                 depth,
                 path,
@@ -1136,6 +1158,8 @@ impl LineageRepository {
                 id: row.id,
                 content: row.content.clone(),
                 truth_value: row.truth_value,
+                agent_id: row.agent_id,
+                created_at: row.created_at,
                 depth: row.depth,
                 parent_ids: parent_map.get(&row.id).cloned().unwrap_or_default(),
                 evidence_ids: claim_evidence_map.get(&row.id).cloned().unwrap_or_default(),
