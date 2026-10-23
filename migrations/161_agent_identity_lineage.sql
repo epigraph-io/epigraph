@@ -33,6 +33,21 @@
 --   * The registration is a SECURITY DEFINER owned by `epigraph_maintenance`.
 --     EXECUTE is revoked from PUBLIC, from `epigraph_app` and from its own
 --     owner, and granted to the attestor alone. No API route registers.
+--   * An attestor that already exists is checked, not trusted:
+--     `epigraph_identity_attestor_faults()` lists any elevated attribute, any
+--     membership of its own, and any other non-superuser role that can act as
+--     it (SET or USAGE), and the migration raises on any. Operations can call
+--     it at any time (maintenance); an empty array is the pass.
+--   * If this migration cannot create the role (no CREATEROLE), it says so
+--     and skips the attestor grant, leaving the owner's own EXECUTE in place.
+--     Operations then create it (`CREATE ROLE epigraph_identity_attestor
+--     NOLOGIN`, a member of nothing) and run, as a superuser or the owner:
+--       GRANT USAGE ON SCHEMA public TO epigraph_identity_attestor;
+--       GRANT EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
+--           bytea, uuid, text, text, text, bytea, jsonb) TO epigraph_identity_attestor;
+--       REVOKE EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
+--           bytea, uuid, text, text, text, bytea, jsonb) FROM epigraph_maintenance;
+--       SELECT public.epigraph_identity_attestor_faults();   -- must be {}
 --
 -- Inside the definer `session_user` is the attestor, which is NOT a member of
 -- `epigraph_maintenance`, so `epigraph_bypass()` is false there and every write
@@ -217,6 +232,7 @@
 --   DROP POLICY security_events_agent_identity_privileged ON public.security_events;
 --   DROP TABLE public.agent_succession, public.agent_prompt_snapshots, public.agent_prompt_blobs;
 --   DROP FUNCTION public.epigraph_agent_lineage_append_only(), public.epigraph_agent_prompt_snapshots_guard();
+--   DROP FUNCTION public.epigraph_identity_attestor_faults();
 --   DROP TRIGGER agent_keys_attested_guard ON public.agent_keys;
 --   DROP FUNCTION public.epigraph_agent_keys_attested_guard();
 --   -- re-run 118's CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status(...), then
@@ -229,9 +245,57 @@ SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================
 -- THE ROLE. Cluster-scoped, so guarded exactly as 060 guards its three: a
--- parallel test database may create it first.
+-- parallel test database may create it first. And because it may already
+-- exist (another database, or operations), an existing role is CHECKED, not
+-- trusted: `epigraph_identity_attestor_faults()` names every way it could be
+-- abused, and the migration refuses to continue on any.
 -- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_identity_attestor_faults()
+RETURNS text[]
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, public AS $$
+DECLARE
+    v_role oid;
+    v_out  text[] := '{}';
+    -- PostgreSQL 16 split membership into SET / USAGE (INHERIT) / ADMIN. Only
+    -- SET and USAGE let a role act as the attestor. ADMIN alone does not, and
+    -- a non-superuser CREATEROLE runner holds exactly that on a role it creates
+    -- on 16, so MEMBER would flag the deployment's own runner. Before 16,
+    -- MEMBER is the right to SET ROLE.
+    v_set  text := CASE WHEN current_setting('server_version_num')::integer >= 160000
+                        THEN 'SET' ELSE 'MEMBER' END;
+BEGIN
+    SELECT r.oid INTO v_role FROM pg_roles r WHERE r.rolname = 'epigraph_identity_attestor';
+    IF v_role IS NULL THEN
+        RETURN ARRAY['epigraph_identity_attestor does not exist'];
+    END IF;
+    SELECT array_remove(ARRAY[
+               CASE WHEN r.rolsuper THEN 'epigraph_identity_attestor is SUPERUSER' END,
+               CASE WHEN r.rolbypassrls THEN 'epigraph_identity_attestor is BYPASSRLS' END,
+               CASE WHEN r.rolcreaterole THEN 'epigraph_identity_attestor is CREATEROLE' END,
+               CASE WHEN r.rolcreatedb THEN 'epigraph_identity_attestor is CREATEDB' END,
+               CASE WHEN r.rolreplication THEN 'epigraph_identity_attestor is REPLICATION' END],
+           NULL)
+      INTO v_out
+      FROM pg_roles r WHERE r.oid = v_role;
+    v_out := v_out || ARRAY(
+        SELECT 'epigraph_identity_attestor is a member of ' || r.rolname
+          FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
+         WHERE m.member = v_role
+         ORDER BY 1);
+    v_out := v_out || ARRAY(
+        SELECT r.rolname || ' can act as epigraph_identity_attestor'
+          FROM pg_roles r
+         WHERE r.oid <> v_role AND NOT r.rolsuper
+           AND (pg_has_role(r.oid, v_role, 'USAGE') OR pg_has_role(r.oid, v_role, v_set))
+         ORDER BY 1);
+    RETURN v_out;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_identity_attestor_faults() FROM PUBLIC;
+
 DO $$
+DECLARE
+    v_faults text[];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_identity_attestor') THEN
         BEGIN
@@ -239,10 +303,20 @@ BEGIN
         EXCEPTION
             WHEN insufficient_privilege THEN
                 RAISE NOTICE 'Cannot CREATE ROLE epigraph_identity_attestor: provision it out of '
-                             'band (NOLOGIN, member of nothing) before the host registers identities.';
+                             'band (NOLOGIN, member of nothing), then run the grants in this '
+                             'file''s header section 2, before the host registers identities.';
             WHEN duplicate_object THEN NULL;
             WHEN unique_violation THEN NULL;
         END;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_identity_attestor') THEN
+        v_faults := public.epigraph_identity_attestor_faults();
+        IF cardinality(v_faults) > 0 THEN
+            RAISE EXCEPTION 'epigraph_identity_attestor exists but is not isolated: %', v_faults
+                USING ERRCODE = '55000',
+                      HINT = 'Only the host may act as the attestor; remove the grants or '
+                             'attributes named before applying migration 161.';
+        END IF;
     END IF;
 END $$;
 
@@ -1168,6 +1242,8 @@ DO $$ BEGIN
                 'public.agent_prompt_snapshots, public.agent_succession TO epigraph_maintenance';
         EXECUTE 'GRANT UPDATE (last_seen) ON public.agent_prompt_snapshots TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_agent_prompt_history(uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_identity_attestor_faults() '
                 'TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN

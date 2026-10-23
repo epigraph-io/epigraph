@@ -1408,7 +1408,11 @@ restart.
 - **161**: public `agent_identity_lineage` (agent identity lineage design
   D2-D4, slice S1). Creates the role `epigraph_identity_attestor` NOLOGIN and
   a member of nothing (operations grants LOGIN and a password out of band; no
-  migration carries one); the FORCE-RLS tables `agent_prompt_blobs`
+  migration carries one), and REFUSES to apply if the role already exists and
+  `epigraph_identity_attestor_faults()` names anything (an elevated attribute,
+  a membership, or another role able to act as it); where the migration
+  cannot create the role, the header's section 2 lists the grants operations
+  run after provisioning it; the FORCE-RLS tables `agent_prompt_blobs`
   (content-addressed zstd; UPDATE, DELETE and TRUNCATE refused for every
   role, a superuser included, short of disabling triggers),
   `agent_prompt_snapshots` (only `last_seen` moves, forward; no TRUNCATE) and
