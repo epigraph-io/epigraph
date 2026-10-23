@@ -50,7 +50,10 @@
 //!
 //! The SPEC sections this implements are §3.3 (R-DEP, the DP, the cap and the
 //! single negative sibling), §3.6 (the `not_all` valuation) and §2.2 (the
-//! spine profile).
+//! spine profile). The SPEC is the atom-level belief design document, which
+//! is not part of this repository: every rule of it that this module relies
+//! on is stated here and on the items below, so the section numbers are
+//! cross-references only.
 
 use crate::errors::DsError;
 use std::collections::BTreeSet;

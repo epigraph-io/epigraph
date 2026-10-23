@@ -1,6 +1,8 @@
 //! Properties of `conjunction::conj_belief`, the item-structured conjunction
 //! (R-DEP) of SPEC §3.3, its `not_all` valuation (§3.6) and the spine profile
-//! (§2.2).
+//! (§2.2). The SPEC (the atom-level belief design) is not in this repository;
+//! the rules these tests rely on are stated in `conjunction`'s documentation
+//! and next to each test.
 //!
 //! Every expectation here comes from an independent source, never from the
 //! formula the operator is implemented by:
