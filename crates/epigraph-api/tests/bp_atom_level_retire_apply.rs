@@ -413,36 +413,54 @@ async fn bp_loaders_skip_legacy_unkeyed_decomposes_to(pool: PgPool) {
     let state = state_default(&pool).await;
 
     for mode in ["cdst", "scalar"] {
-        let t = tree(&pool).await;
-        let (without, _) = diagnose(&pool, &state, t.agent, mode).await;
+        // Both orders of `variable_ids`, each pinned explicitly: the trigger
+        // sorts them by uuid, so a row taken as minted would exercise only
+        // whichever arm of the either-order edge match the random ids pick.
+        for compound_first in [true, false] {
+            let t = tree(&pool).await;
+            let (without, _) = diagnose(&pool, &state, t.agent, mode).await;
 
-        let edge = decomposes_to(&pool, t.k, t.a).await;
-        let factor = trigger_factor(&pool, edge).await;
-        // The shape rows minted before the trigger keyed them: no properties.
-        set_factor_properties(&pool, factor, json!({})).await;
-
-        let (legacy, _) = diagnose(&pool, &state, t.agent, mode).await;
-        let gap = max_gap(&without, &legacy);
-        assert!(
-            gap < SAME,
-            "{mode}: an unkeyed factor on an in-force decomposes_to pair moved BP by {gap}; \
-             without={without:?} legacy={legacy:?}"
-        );
-
-        // Control: once the edge is retracted (`valid_to` in the past) the
-        // pair is no longer an in-force decomposition, and the same unkeyed
-        // row is an ordinary factor again.
-        sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
-            .bind(edge)
+            let edge = decomposes_to(&pool, t.k, t.a).await;
+            let factor = trigger_factor(&pool, edge).await;
+            // The shape rows minted before the trigger keyed them: no
+            // properties, and the pair in the order this case pins.
+            let vars = if compound_first {
+                vec![t.k, t.a]
+            } else {
+                vec![t.a, t.k]
+            };
+            sqlx::query(
+                "UPDATE factors SET properties = '{}'::jsonb, variable_ids = $2 WHERE id = $1",
+            )
+            .bind(factor)
+            .bind(&vars)
             .execute(&pool)
             .await
-            .expect("retract the edge");
-        let (retracted, _) = diagnose(&pool, &state, t.agent, mode).await;
-        assert!(
-            max_gap(&without, &retracted) > 1e-4,
-            "{mode} control: with the edge retracted the unkeyed factor is read; \
-             without={without:?} retracted={retracted:?}"
-        );
+            .expect("reshape the row to a legacy row in the pinned order");
+
+            let (legacy, _) = diagnose(&pool, &state, t.agent, mode).await;
+            let gap = max_gap(&without, &legacy);
+            assert!(
+                gap < SAME,
+                "{mode} compound_first={compound_first}: an unkeyed factor on an in-force \
+                 decomposes_to pair moved BP by {gap}; without={without:?} legacy={legacy:?}"
+            );
+
+            // Control: once the edge is retracted (`valid_to` in the past) the
+            // pair is no longer an in-force decomposition, and the same
+            // unkeyed row is an ordinary factor again.
+            sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+                .bind(edge)
+                .execute(&pool)
+                .await
+                .expect("retract the edge");
+            let (retracted, _) = diagnose(&pool, &state, t.agent, mode).await;
+            assert!(
+                max_gap(&without, &retracted) > 1e-4,
+                "{mode} compound_first={compound_first} control: with the edge retracted the \
+                 unkeyed factor is read; without={without:?} retracted={retracted:?}"
+            );
+        }
     }
 }
 
