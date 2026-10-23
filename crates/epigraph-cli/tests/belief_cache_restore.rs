@@ -316,6 +316,44 @@ async fn a_second_restore_writes_no_row_and_reports_already_restored(pool: PgPoo
     }
 }
 
+/// A frame deleted after the wave (the operator's `delete-frames` verb exists)
+/// leaves a `before` whose `belief_frame_id` the foreign key refuses. That one
+/// claim is skipped and reported; the claims sharing its transaction are
+/// still restored rather than the whole batch aborting.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deleted_before_frame_skips_only_its_claim(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let doomed = seed_frame(&pool).await;
+    let kept = seed_frame(&pool).await;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+
+    let orphaned = seed_claim(&pool, agent).await;
+    let neighbour = seed_claim(&pool, agent).await;
+    set_cache(&pool, orphaned, &random_cache(&mut rng, Some(doomed), None)).await;
+    set_cache(&pool, neighbour, &random_cache(&mut rng, Some(kept), None)).await;
+    let neighbour_before = cache_of(&pool, neighbour).await;
+
+    let at = db_now(&pool).await;
+    let records = run_wave(&pool, &[orphaned, neighbour], at, |_| {
+        random_cache(&mut rng, Some(kept), Some("supported"))
+    })
+    .await;
+    let orphaned_written = cache_of(&pool, orphaned).await;
+    sqlx::query("DELETE FROM frames WHERE id = $1")
+        .bind(doomed)
+        .execute(&pool)
+        .await
+        .expect("delete the before frame");
+
+    let report = restore_wave(&pool, &plan_restore(&records, None), &opts(10))
+        .await
+        .expect("a deleted frame must not abort the batch");
+    assert_eq!(report.frame_gone, vec![orphaned]);
+    assert_eq!(report.restored, vec![neighbour]);
+    assert_eq!(cache_of(&pool, orphaned).await, orphaned_written);
+    assert_eq!(cache_of(&pool, neighbour).await, neighbour_before);
+}
+
 // ---------------------------------------------------------------------------
 // (3) NULL -> value -> restore is exact
 // ---------------------------------------------------------------------------

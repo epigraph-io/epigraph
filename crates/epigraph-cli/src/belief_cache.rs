@@ -342,35 +342,179 @@ pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> Res
     plan
 }
 
-/// Put every planned claim back to its `before` value.
+/// The cache columns, in the order every statement below names them.
+const CACHE_COLUMN_NAMES: [&str; 7] = [
+    "belief",
+    "plausibility",
+    "pignistic_prob",
+    "mass_on_empty",
+    "mass_on_missing",
+    "belief_frame_id",
+    "classification",
+];
+
+/// `w`: one row per planned claim, `b_*` = the wave's `before`, `w_*` = what
+/// it wrote. Binds `$1` (ids) and `$2..$15` (see [`bind_wave_rows`]).
+const WAVE_ROWS_CTE: &str = "WITH w AS ( \
+    SELECT * FROM unnest($1::uuid[], \
+        $2::float8[], $3::float8[], $4::float8[], $5::float8[], $6::float8[], $7::uuid[], $8::text[], \
+        $9::float8[], $10::float8[], $11::float8[], $12::float8[], $13::float8[], $14::uuid[], $15::text[]) \
+      AS w(id, b_belief, b_plausibility, b_pignistic_prob, b_mass_on_empty, b_mass_on_missing, \
+              b_belief_frame_id, b_classification, \
+              w_belief, w_plausibility, w_pignistic_prob, w_mass_on_empty, w_mass_on_missing, \
+              w_belief_frame_id, w_classification) \
+)";
+
+/// `c`'s cache equals the `w` row's `prefix` values in EVERY column, NULL
+/// equal to NULL (`IS NOT DISTINCT FROM`; `=` would never match a column the
+/// wave left NULL).
+fn cache_equals(prefix: &str) -> String {
+    CACHE_COLUMN_NAMES
+        .iter()
+        .map(|c| format!("c.{c} IS NOT DISTINCT FROM w.{prefix}_{c}"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn bind_wave_rows<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    chunk: &[RestoreEntry],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    fn floats(chunk: &[RestoreEntry], f: impl Fn(&RestoreEntry) -> Option<f64>) -> Vec<Option<f64>> {
+        chunk.iter().map(f).collect()
+    }
+    let mut q = q.bind(chunk.iter().map(|e| e.claim_id).collect::<Vec<_>>());
+    fn before(e: &RestoreEntry) -> &CacheColumns {
+        &e.before
+    }
+    fn written(e: &RestoreEntry) -> &CacheColumns {
+        &e.written
+    }
+    let sides: [fn(&RestoreEntry) -> &CacheColumns; 2] = [before, written];
+    for side in sides {
+        q = q
+            .bind(floats(chunk, |e| side(e).belief))
+            .bind(floats(chunk, |e| side(e).plausibility))
+            .bind(floats(chunk, |e| side(e).pignistic_prob))
+            .bind(floats(chunk, |e| side(e).mass_on_empty))
+            .bind(floats(chunk, |e| side(e).mass_on_missing))
+            .bind(
+                chunk
+                    .iter()
+                    .map(|e| side(e).belief_frame_id)
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                chunk
+                    .iter()
+                    .map(|e| side(e).classification.clone())
+                    .collect::<Vec<_>>(),
+            );
+    }
+    q
+}
+
+/// Put every planned claim back to its `before` value, compare-and-swap.
+///
+/// Per batch of `opts.batch_size` claims, in one transaction:
+///
+/// * one `UPDATE` writes `before` only where the row still holds EXACTLY what
+///   the wave wrote, in all seven cache columns. A row that differs in any of
+///   them took a later write, which a rollback must not erase; it is left
+///   alone and reported `superseded_since_wave`.
+/// * a row that already holds `before` is not written at all (so a second run
+///   creates no new tuple version and bumps no `updated_at`) and is reported
+///   `already_restored`. That is what makes the restore idempotent rather than
+///   a second run reporting every claim as superseded.
+/// * a `before` whose `belief_frame_id` names a frame deleted since the wave
+///   would abort the whole batch on the foreign key, so that row is skipped
+///   and reported `frame_gone`.
+///
+/// The `UPDATE` re-checks its `WHERE` against a row a concurrent writer
+/// changed (READ COMMITTED), so a write that commits during the restore is
+/// still never overwritten. `dry_run` runs the same statements and rolls each
+/// batch back.
 ///
 /// # Errors
-/// Any database error.
+/// Any database error; batches already committed stay committed.
 pub async fn restore_wave(
     pool: &PgPool,
     plan: &RestorePlan,
     opts: &RestoreOptions,
 ) -> anyhow::Result<RestoreReport> {
-    let _ = opts;
-    let mut report = RestoreReport::default();
-    for e in &plan.entries {
-        sqlx::query(
-            "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
-                    mass_on_empty = $5, mass_on_missing = $6, belief_frame_id = $7, \
-                    classification = $8 \
-              WHERE id = $1",
-        )
-        .bind(e.claim_id)
-        .bind(e.before.belief)
-        .bind(e.before.plausibility)
-        .bind(e.before.pignistic_prob)
-        .bind(e.before.mass_on_empty)
-        .bind(e.before.mass_on_missing)
-        .bind(e.before.belief_frame_id)
-        .bind(e.before.classification.as_deref())
-        .execute(pool)
-        .await?;
-        report.restored.push(e.claim_id);
+    let restore_sql = format!(
+        "{WAVE_ROWS_CTE} \
+         UPDATE claims c \
+            SET belief = w.b_belief, plausibility = w.b_plausibility, \
+                pignistic_prob = w.b_pignistic_prob, mass_on_empty = w.b_mass_on_empty, \
+                mass_on_missing = w.b_mass_on_missing, belief_frame_id = w.b_belief_frame_id, \
+                classification = w.b_classification \
+           FROM w \
+          WHERE c.id = w.id \
+            AND {written} \
+            AND NOT ({before}) \
+            AND (w.b_belief_frame_id IS NULL \
+                 OR EXISTS (SELECT 1 FROM frames f WHERE f.id = w.b_belief_frame_id)) \
+         RETURNING c.id",
+        written = cache_equals("w"),
+        before = cache_equals("b"),
+    );
+    let classify_sql = format!(
+        "{WAVE_ROWS_CTE} \
+         SELECT w.id, c.id IS NOT NULL, COALESCE({before}, false), COALESCE({written}, false) \
+           FROM w LEFT JOIN claims c ON c.id = w.id",
+        written = cache_equals("w"),
+        before = cache_equals("b"),
+    );
+
+    let mut report = RestoreReport {
+        superseded_since_wave: plan.broken_chain.clone(),
+        not_in_wave: plan.not_in_wave.clone(),
+        ..RestoreReport::default()
+    };
+    for chunk in plan.entries.chunks(opts.batch_size.max(1)) {
+        let mut tx = pool.begin().await?;
+        let restored: HashSet<Uuid> = bind_wave_rows(sqlx::query(&restore_sql), chunk)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|row| sqlx::Row::get::<Uuid, _>(row, 0))
+            .collect();
+        let states: HashMap<Uuid, (bool, bool, bool)> =
+            bind_wave_rows(sqlx::query(&classify_sql), chunk)
+                .fetch_all(&mut *tx)
+                .await?
+                .iter()
+                .map(|row| {
+                    (
+                        sqlx::Row::get::<Uuid, _>(row, 0),
+                        (
+                            sqlx::Row::get::<bool, _>(row, 1),
+                            sqlx::Row::get::<bool, _>(row, 2),
+                            sqlx::Row::get::<bool, _>(row, 3),
+                        ),
+                    )
+                })
+                .collect();
+        for e in chunk {
+            let id = e.claim_id;
+            let bucket = if restored.contains(&id) {
+                &mut report.restored
+            } else {
+                match states.get(&id) {
+                    None | Some((false, _, _)) => &mut report.missing,
+                    Some((true, true, _)) => &mut report.already_restored,
+                    Some((true, false, true)) => &mut report.frame_gone,
+                    Some((true, false, false)) => &mut report.superseded_since_wave,
+                }
+            };
+            bucket.push(id);
+        }
+        if opts.dry_run {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+        }
     }
     Ok(report)
 }
