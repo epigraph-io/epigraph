@@ -1203,6 +1203,12 @@ BEGIN
     RETURN n;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_backfill_legacy_agent_keys() FROM PUBLIC;
+
+-- The first run, by the migration runner while it still owns the function (the
+-- same privileges the inline backfill had), before the re-own below and before
+-- the attested-key guard exists.
+SELECT public.epigraph_backfill_legacy_agent_keys();
+
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_backfill_legacy_agent_keys() '
@@ -1215,8 +1221,6 @@ DO $$ BEGIN
                 'FROM epigraph_app';
     END IF;
 END $$;
-
-SELECT public.epigraph_backfill_legacy_agent_keys();
 
 -- The attested-key guard (section 7a), after the backfill above.
 DROP TRIGGER IF EXISTS agent_keys_attested_guard ON public.agent_keys;
