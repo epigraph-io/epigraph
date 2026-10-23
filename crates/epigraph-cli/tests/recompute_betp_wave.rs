@@ -1543,3 +1543,259 @@ async fn scoped(pool: &PgPool, claim: Uuid) -> Vec<(String, f64, f64, Option<f64
     .await
     .expect("read scoped rows")
 }
+
+/// Every value column of one `ds_combined_beliefs` row.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+struct ScopedRow {
+    belief: Option<f64>,
+    plausibility: Option<f64>,
+    mass_on_empty: Option<f64>,
+    mass_on_missing: Option<f64>,
+    conflict_k: Option<f64>,
+    strategy_used: Option<String>,
+    pignistic_prob: Option<f64>,
+}
+
+async fn seed_scoped_row(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    scope: (&str, Option<Uuid>),
+    belief: f64,
+    strategy: &str,
+) {
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, scope_id, belief, \
+             plausibility, mass_on_empty, mass_on_missing, conflict_k, strategy_used, \
+             pignistic_prob) \
+         VALUES ($1, $2, $3, $4, $5, 0.913, 0.007, 0.011, 0.019, $6, 0.517)",
+    )
+    .bind(frame)
+    .bind(claim)
+    .bind(scope.0)
+    .bind(scope.1)
+    .bind(belief)
+    .bind(strategy)
+    .execute(pool)
+    .await
+    .expect("seed scoped row");
+}
+
+async fn scoped_row(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    scope: (&str, Option<Uuid>),
+) -> ScopedRow {
+    sqlx::query_as(
+        "SELECT belief, plausibility, mass_on_empty, mass_on_missing, conflict_k, \
+                strategy_used, pignistic_prob \
+           FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = $3 \
+            AND scope_id IS NOT DISTINCT FROM $4",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(scope.0)
+    .bind(scope.1)
+    .fetch_one(pool)
+    .await
+    .expect("read scoped row")
+}
+
+async fn perspective(pool: &PgPool, owner: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(format!("{name} {}", Uuid::new_v4()))
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("seed perspective")
+}
+
+async fn community(pool: &PgPool, name: &str, members: &[Uuid]) -> Uuid {
+    let id: Uuid = sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
+        .bind(format!("{name} {}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .expect("seed community");
+    for m in members {
+        sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
+            .bind(id)
+            .bind(m)
+            .execute(pool)
+            .await
+            .expect("seed community member");
+    }
+    id
+}
+
+fn assert_row_is_fold(row: &ScopedRow, twin: &Cache, what: &str) {
+    for (got, want, col) in [
+        (row.belief, twin.belief, "belief"),
+        (row.plausibility, twin.plausibility, "plausibility"),
+        (row.pignistic_prob, twin.pignistic_prob, "pignistic_prob"),
+        (row.mass_on_missing, twin.mass_on_missing, "mass_on_missing"),
+    ] {
+        let (got, want) = (got.expect(col), want.expect(col));
+        assert!(
+            (got - want).abs() < 1e-12,
+            "{what}: {col} {got} is not the twin's fold {want}\nrow: {row:?}\ntwin: {twin:?}"
+        );
+    }
+    assert_eq!(
+        row.strategy_used.as_deref(),
+        Some("atom_fold"),
+        "{what}: a resynced row is marked atom_fold: {row:?}"
+    );
+}
+
+/// SPEC §7.2 per-frame rows: `ds_combined_beliefs` holds one row per (frame,
+/// scope), each the fold of that frame's rows in that scope
+/// (`routes/belief.rs::submit_evidence`). A wave resyncs a row on a
+/// 2-hypothesis frame from the AEF fold of the atom's rows on THAT frame in
+/// THAT scope, each checked against a TWIN claim holding only those rows. It
+/// leaves alone every row the AEF does not fold, compared column for column:
+/// a row on a frame of more than two hypotheses (its Bel/Pl are of one
+/// hypothesis of that frame, not of the coarsened TRUE), a perspective row on
+/// a frame where that perspective has no row, a perspective with no row at
+/// all, and a community `override` row. A community row is the fold of its
+/// member perspectives' rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn scoped_rows_resync_per_frame_and_keep_what_the_aef_does_not_fold(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "frames-owner").await;
+    let source = agent(&pool, "frames-source").await;
+    let other_source = agent(&pool, "frames-other-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let bin2 = frame(&pool, "cohort_v2_binary_two").await;
+    let tri: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses) \
+         VALUES ('cohort_v2_three', 'cohort v2 test frame', ARRAY['A', 'B', 'C']) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("three-hypothesis frame");
+    let p = perspective(&pool, owner, "with rows").await;
+    let q = perspective(&pool, owner, "without rows").await;
+    let members = community(&pool, "members", &[p]).await;
+    let overridden = community(&pool, "override", &[p]).await;
+
+    let bin_plain = evidence_row(bin, source, 0.8, None);
+    let bin_p = || Row {
+        perspective_id: Some(p),
+        ..evidence_row(bin, other_source, 0.55, None)
+    };
+    let bin2_plain = evidence_row(bin2, source, 0.3, None);
+
+    let atom = claim(&pool, owner, "atom on two frames").await;
+    insert_row(&pool, atom, &bin_plain).await;
+    insert_row(&pool, atom, &bin_p()).await;
+    insert_row(&pool, atom, &bin2_plain).await;
+    // The twins: each holds only the rows one scoped row folds.
+    let twin_bin = claim(&pool, owner, "twin: the binary frame's rows").await;
+    insert_row(&pool, twin_bin, &bin_plain).await;
+    insert_row(&pool, twin_bin, &bin_p()).await;
+    let twin_bin2 = claim(&pool, owner, "twin: the second frame's row").await;
+    insert_row(&pool, twin_bin2, &bin2_plain).await;
+    let twin_p = claim(&pool, owner, "twin: the perspective's row").await;
+    insert_row(&pool, twin_p, &bin_p()).await;
+    set_sentinel(&pool, atom, bin, 0.0).await;
+
+    let rewritten = [
+        (
+            "global on the binary frame",
+            bin,
+            ("global", None),
+            twin_bin,
+        ),
+        (
+            "global on the second frame",
+            bin2,
+            ("global", None),
+            twin_bin2,
+        ),
+        (
+            "perspective on the binary frame",
+            bin,
+            ("perspective", Some(p)),
+            twin_p,
+        ),
+        (
+            "community of the perspective",
+            bin,
+            ("community", Some(members)),
+            twin_p,
+        ),
+    ];
+    let kept = [
+        (
+            "global on a three-hypothesis frame",
+            tri,
+            ("global", None),
+            "seeded",
+        ),
+        (
+            "perspective on a frame it has no row on",
+            bin2,
+            ("perspective", Some(p)),
+            "seeded",
+        ),
+        (
+            "perspective with no row",
+            bin,
+            ("perspective", Some(q)),
+            "seeded",
+        ),
+        (
+            "community override",
+            bin,
+            ("community", Some(overridden)),
+            "override",
+        ),
+    ];
+    for (i, (_, f, scope, _)) in rewritten.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        seed_scoped_row(&pool, atom, *f, *scope, 0.101 + 0.01 * i as f64, "seeded").await;
+    }
+    let mut kept_before = Vec::new();
+    for (i, (_, f, scope, strategy)) in kept.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        seed_scoped_row(&pool, atom, *f, *scope, 0.201 + 0.01 * i as f64, strategy).await;
+        kept_before.push(scoped_row(&pool, atom, *f, *scope).await);
+    }
+
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+    let wave_file = dir.join("wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("the wave");
+
+    for (what, f, scope, twin) in rewritten {
+        let row = scoped_row(&pool, atom, f, scope).await;
+        assert_row_is_fold(&row, &cache(&pool, twin).await, what);
+    }
+    for ((what, f, scope, _), before) in kept.iter().zip(&kept_before) {
+        assert_eq!(
+            &scoped_row(&pool, atom, *f, *scope).await,
+            before,
+            "the wave rewrote a row the AEF does not fold: {what}"
+        );
+    }
+    // The fixture: each frame's fold differs from the atom's whole fold, so
+    // a row given the whole fold fails above.
+    let whole = cache(&pool, atom).await;
+    for twin in [twin_bin, twin_bin2] {
+        let t = cache(&pool, twin).await;
+        assert!(
+            (t.belief.unwrap() - whole.belief.unwrap()).abs() > 1e-6,
+            "fixture: one frame's fold must differ from the whole fold: {t:?} vs {whole:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
