@@ -25,6 +25,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+#[path = "support/statement_log.rs"]
+mod statement_log;
+
 mod helpers;
 
 use epigraph_core::domain::reasoning_trace::Methodology;
@@ -1348,4 +1351,102 @@ async fn lineage_truncation_follows_the_viewer(pool: PgPool) {
          result was cut"
     );
     assert!(!down_member.claims.contains_key(&below));
+}
+
+// ============================================================================
+// `max_nodes` trims BEFORE the follow-up queries
+// ============================================================================
+
+/// The `max_nodes` cap bounds what `get_lineage` FETCHES, not only what it
+/// returns: claims the cap drops must never reach the edges, evidence or
+/// reasoning-trace statements.
+///
+/// Far ancestors carry evidence and traces, the kept target carries none and
+/// has no edge inside the kept set, so every follow-up statement must return
+/// zero rows. The second half pins the
+/// trimmed result explicitly, so moving the trim cannot change the answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_max_nodes_trims_before_the_follow_up_queries(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // c0 -> c1 -> c2 -> c3 -> c4; the target is c4.
+    let chain = create_claim_chain(&pool, 5).await;
+    let target = chain[4];
+    let mut far_evidence = Vec::new();
+    for &far in &chain[0..3] {
+        for kind in ["document", "observation", "reference"] {
+            far_evidence.push(fixture::seed_evidence(&pool, far, kind).await);
+        }
+        fixture::seed_reasoning_trace(&pool, far, "deductive").await;
+    }
+
+    // ---- cost: max_nodes = 1 keeps only the target ----
+    let (lineage, statements) = statement_log::capture(LineageRepository::get_lineage(
+        &pool,
+        &viewer,
+        target,
+        None,
+        Some(1),
+    ))
+    .await;
+    let lineage = lineage.expect("capped lineage");
+    assert_eq!(lineage.topological_order, vec![target]);
+    assert!(lineage.truncated);
+
+    let follow_ups: Vec<_> = statements
+        .iter()
+        .filter(|s| {
+            let t = s.normalized();
+            t.contains("FROM edges")
+                || t.contains("FROM evidence")
+                || t.contains("FROM reasoning_traces")
+        })
+        .collect();
+    assert!(
+        !follow_ups.is_empty(),
+        "CALIBRATION: the capture must see the edge/evidence/trace statements:\n{}",
+        statement_log::describe(&statements)
+    );
+    for s in &follow_ups {
+        assert_eq!(
+            s.rows_returned,
+            0,
+            "a claim dropped by max_nodes must not be fetched by a follow-up statement \
+             (the far ancestors hold {} evidence rows and 3 traces):\n{}",
+            far_evidence.len(),
+            statement_log::describe(&statements)
+        );
+    }
+
+    // ---- answer: max_nodes = 2 keeps the target and its nearest ancestor ----
+    let c3_evidence = fixture::seed_evidence(&pool, chain[3], "testimony").await;
+    let c3_trace = fixture::seed_reasoning_trace(&pool, chain[3], "inductive").await;
+    let two = LineageRepository::get_lineage(&pool, &viewer, target, None, Some(2))
+        .await
+        .expect("capped lineage");
+    assert!(two.truncated);
+    assert_eq!(two.topological_order, vec![chain[3], target]);
+    let mut kept: Vec<Uuid> = two.claims.keys().copied().collect();
+    kept.sort();
+    let mut expected = vec![chain[3], target];
+    expected.sort();
+    assert_eq!(kept, expected);
+    assert_eq!(two.claims[&target].parent_ids, vec![chain[3]]);
+    assert!(
+        two.claims[&chain[3]].parent_ids.is_empty(),
+        "the dropped c2 must not be named as a parent"
+    );
+    assert_eq!(
+        two.evidence.keys().copied().collect::<Vec<_>>(),
+        vec![c3_evidence]
+    );
+    assert_eq!(two.claims[&chain[3]].evidence_ids, vec![c3_evidence]);
+    assert_eq!(
+        two.traces.keys().copied().collect::<Vec<_>>(),
+        vec![c3_trace]
+    );
+    assert_eq!(
+        two.max_depth_reached, 4,
+        "measured on the walk, before the cap"
+    );
+    assert!(!two.cycle_detected);
 }

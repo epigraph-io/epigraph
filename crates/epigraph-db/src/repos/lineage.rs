@@ -270,10 +270,11 @@ impl LineageRepository {
     ///   ancestors while discarding the target claim itself. Instead, when
     ///   the full result exceeds `max_nodes`, this keeps the target claim
     ///   plus its `max_nodes - 1` nearest ancestors — i.e. the last `n`
-    ///   entries of `topological_order` — and drops `claims`/`evidence`/
-    ///   `traces` entries whose associated claim id falls outside that
-    ///   trimmed set. Each kept claim's `parent_ids` is pruned to the kept
-    ///   set too, so every id in it is a key of `claims`. (`parent_trace_ids`
+    ///   entries of `topological_order`. The trim happens right after the
+    ///   walk, BEFORE the edges/evidence/traces statements, so a dropped
+    ///   claim is never fetched by them and `claims`/`evidence`/`traces`
+    ///   hold the kept set only. Each kept claim's `parent_ids` therefore
+    ///   names kept claims only, so every id in it is a key of `claims`. (`parent_trace_ids`
     ///   is not pruned: it can name traces outside the lineage even
     ///   uncapped.) `None` disables the cap entirely.
     ///
@@ -474,15 +475,54 @@ impl LineageRepository {
         // the same rows as before and only `truncated` learns about the probe.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // Check for cycles
+        // Check for cycles. Both of these describe the WALK, so they are
+        // measured before the node cap below trims it.
         let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
+
+        // Depth-based truncation is exact: the probe layer found a visible
+        // ancestor past `max_depth` (see `drop_probe_layer`).
+        let mut truncated = truncated_by_depth;
+
+        // Apply the optional node cap BEFORE any follow-up statement, so the
+        // cap bounds what is fetched and not only what is returned.
+        //
+        // topological_order is ancestors-first / target-last, so keeping the
+        // *first* n entries would keep the furthest ancestors while dropping
+        // the target claim itself. Instead we keep the LAST n entries of that
+        // order: the target claim plus its (n - 1) nearest ancestors. The
+        // order is computed here with the SAME stable sort used to build
+        // `topological_order` below, over rows in the CTE's order, so the kept
+        // set is exactly the one the late trim used to keep.
+        //
+        // Every map below is then built from the kept rows only, and the edges
+        // query constrains both ends to them, so `parent_ids` cannot name a
+        // claim outside `claims`.
+        let mut lineage_rows = lineage_rows;
+        if let Some(n) = max_nodes {
+            if lineage_rows.len() > n {
+                let mut order: Vec<(Uuid, i32)> =
+                    lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
+                order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
+                let kept_ids: HashSet<Uuid> =
+                    order[order.len() - n..].iter().map(|(id, _)| *id).collect();
+                lineage_rows.retain(|r| kept_ids.contains(&r.id));
+                truncated = true;
+            }
+        }
 
         // Collect claim IDs for subsequent queries
         let claim_ids: Vec<Uuid> = lineage_rows.iter().map(|r| r.id).collect();
 
         if claim_ids.is_empty() {
-            return Ok(LineageResult::default());
+            // No row at all (an invisible or missing root) or a cap of zero:
+            // the walk's own measurements still stand.
+            return Ok(LineageResult {
+                cycle_detected,
+                max_depth_reached,
+                truncated,
+                ..LineageResult::default()
+            });
         }
 
         // Query edges to build parent relationships: the same derivation set
@@ -650,39 +690,8 @@ impl LineageRepository {
         let mut topological_order: Vec<(Uuid, i32)> =
             lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
         topological_order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
-        let mut topological_order: Vec<Uuid> =
+        let topological_order: Vec<Uuid> =
             topological_order.into_iter().map(|(id, _)| id).collect();
-
-        // Depth-based truncation is exact: the probe layer found a visible
-        // ancestor past `max_depth` (see `drop_probe_layer`).
-        let mut truncated = truncated_by_depth;
-
-        // Apply the optional node cap. topological_order is ancestors-first /
-        // target-last, so keeping the *first* n entries would keep the
-        // furthest ancestors while dropping the target claim itself. Instead
-        // we keep the LAST n entries: the target claim plus its (n - 1)
-        // nearest ancestors.
-        //
-        // Only a cut needs the trim below. Uncapped, every map already holds
-        // exactly the walked ids, and the edges query constrains both ends to
-        // them, so `parent_ids` cannot reference a claim outside `claims`.
-        if let Some(n) = max_nodes {
-            if topological_order.len() > n {
-                let start = topological_order.len() - n;
-                topological_order = topological_order.split_off(start);
-                truncated = true;
-
-                let kept_ids: HashSet<Uuid> = topological_order.iter().copied().collect();
-                claims_map.retain(|id, _| kept_ids.contains(id));
-                evidence_map.retain(|_, evidence| kept_ids.contains(&evidence.claim_id));
-                trace_map.retain(|_, trace| kept_ids.contains(&trace.claim_id));
-                // `parent_ids` was built from the untrimmed parent map; without
-                // this a kept claim names an ancestor the cap just dropped.
-                for claim in claims_map.values_mut() {
-                    claim.parent_ids.retain(|p| kept_ids.contains(p));
-                }
-            }
-        }
 
         Ok(LineageResult {
             claims: claims_map,
