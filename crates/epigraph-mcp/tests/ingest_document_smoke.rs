@@ -904,6 +904,86 @@ async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
     assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
 }
 
+// ── DOI key canonicalization: a resolver-URL DOI keys the bare-DOI row ─────
+
+async fn query_paper_json(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::paper_queries::query_paper(
+        server,
+        &viewer,
+        epigraph_mcp::types::QueryPaperParams {
+            doi: doi.to_string(),
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("query_paper answers");
+    serde_json::from_str(&result_text(&result)).expect("query_paper JSON")
+}
+
+/// Observed: an agent ingested with `doi: "https://doi.org/10.1021/..."` and
+/// the URL was stored verbatim as the paper key, so `query_paper` on the bare
+/// DOI kept answering the zero-shaped "not in the graph" response. The ingest
+/// must key the bare DOI, and both probes (`query_paper`,
+/// `check_already_ingested`) must find it by the bare DOI.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let mut extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    extraction.source.doi = Some(format!("https://doi.org/{SMOKE_DOI}"));
+
+    do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest succeeds");
+
+    let paper = query_paper_json(&server, &pool, SMOKE_DOI).await;
+    assert_eq!(paper["title"], "Test Hierarchical Paper", "{paper}");
+    assert_eq!(paper["claim_count"], serde_json::json!(5), "{paper}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "the claims carry the bare-DOI label, not `doi:https://doi.org/...`"
+    );
+
+    let gate = tools::ingestion::check_already_ingested(
+        &server,
+        &viewer,
+        epigraph_mcp::types::CheckAlreadyIngestedParams {
+            doi: SMOKE_DOI.to_string(),
+            pipeline_version: None,
+        },
+    )
+    .await
+    .expect("check_already_ingested answers");
+    let gate: serde_json::Value = serde_json::from_str(&result_text(&gate)).expect("JSON");
+    assert_eq!(gate["already_ingested"], serde_json::json!(true), "{gate}");
+
+    // The URL spelling, asked later, names the same paper.
+    let by_url = query_paper_json(&server, &pool, &format!("https://doi.org/{SMOKE_DOI}")).await;
+    assert_eq!(by_url["claim_count"], serde_json::json!(5), "{by_url}");
+}
+
+/// A row written under a resolver-URL key BEFORE keys were canonicalized is
+/// still found by that spelling: the lookup falls back to the key as given.
+/// The not-found contract (a zero-shaped response, not an error) is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_still_finds_a_legacy_url_form_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let legacy = "https://doi.org/10.5555/legacy-url-key";
+    epigraph_db::PaperRepository::get_or_create(&pool, legacy, Some("Legacy URL-keyed"), None)
+        .await
+        .expect("seed a legacy URL-keyed paper");
+
+    let paper = query_paper_json(&server, &pool, legacy).await;
+    assert_eq!(paper["title"], "Legacy URL-keyed", "{paper}");
+
+    let unknown = query_paper_json(&server, &pool, "https://doi.org/10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
+}
+
 /// D9 writer-side guard: when an extraction carries `source_text`, every
 /// span-backed paragraph's stored `text` must equal the bytes its span points
 /// at. Here the span `0..5` of `"alpha beta"` is `"alpha"` but the paragraph
