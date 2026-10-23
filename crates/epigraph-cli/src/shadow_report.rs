@@ -178,15 +178,29 @@ pub struct Candidate {
     pub interval: Interval,
 }
 
-/// An atom's drift decomposition (SPEC §10.4).
+/// A compound's product-frame `BetP` beside today's gate score: its own line
+/// of the decomposition, never a stage (SPEC §10.4).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub struct BetpLine {
+    pub today: f64,
+    pub derived: f64,
+    pub delta: f64,
+}
+
+/// A claim's drift decomposition (SPEC §10.4).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Drift {
+    /// What the stages are measured in: `betp` for an atom (its fold's
+    /// `BetP`), `bel` for a compound (its rank key). The two never sum.
+    pub unit: &'static str,
     pub start: f64,
     pub stages: BTreeMap<&'static str, Option<f64>>,
     pub components: BTreeMap<&'static str, Option<f64>>,
     #[serde(rename = "final")]
     pub final_value: f64,
     pub total: f64,
+    /// A compound's product-frame `BetP` line; `None` for an atom.
+    pub product_frame_betp: Option<BetpLine>,
 }
 
 /// One claim's line of the report.
@@ -299,6 +313,9 @@ pub struct FoldMismatch {
     /// fold by more than [`MISMATCH_TOLERANCE`].
     pub mismatched: usize,
     pub share: f64,
+    /// Whether this run is the one the one-atom-value-on-prod criterion
+    /// reads (SPEC §1.3): the anonymous viewer under the `aef` target fold.
+    pub measures_floor: bool,
 }
 
 /// Sheaf cohomology under one set of intervals.
@@ -314,15 +331,46 @@ pub struct SheafStats {
     pub obstructed: usize,
 }
 
+/// How the obstructions of one candidate mode differ from today's, each
+/// mapped to a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct ObstructionChanges {
+    /// Evaluated both ways; the candidate's values resolve it.
+    pub vanished_on_value: usize,
+    /// A compound-ended edge the mode drops because atom edges replaced it.
+    pub vanished_edge_replaced: usize,
+    /// A compound-ended edge the mode drops with no replacement.
+    pub vanished_edge_dropped: usize,
+    /// An endpoint has no value under the candidate.
+    pub vanished_endpoint_without_value: usize,
+    /// Evaluated both ways; the candidate's values raise it.
+    pub new_on_value: usize,
+    /// Not evaluated today (an endpoint had no served value) and obstructed
+    /// under the candidate.
+    pub new_endpoint_gained_value: usize,
+}
+
 /// The sheaf shadow.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct SheafShadow {
+    /// Today's cohomology computed exactly as the sheaf tool computes it.
+    pub served_as_tool: SheafStats,
     pub served: SheafStats,
     pub progressive: SheafStats,
     pub strict: SheafStats,
     pub vanished_obstructions: usize,
     pub new_obstructions: usize,
     pub pairs_outside_scope: usize,
+    /// The coverage denominator (SPEC §1.3).
+    pub coverage_denominator: usize,
+    /// Atom-to-atom edges today's cohomology evaluates.
+    pub atom_atom_edges: usize,
+    /// Edges with a compound end.
+    pub compound_ended_edges: usize,
+    /// Of those, the ones atom edges replaced (SPEC §7.1 P4).
+    pub compound_ended_replaced: usize,
+    pub progressive_changes: ObstructionChanges,
+    pub strict_changes: ObstructionChanges,
 }
 
 /// The conflict set.
@@ -353,7 +401,10 @@ pub struct Mover {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct Vacate {
     pub atoms: usize,
+    /// Conjunction compounds.
     pub compounds: usize,
+    /// Spine compounds (served a profile).
+    pub spines: usize,
 }
 
 /// What a report ran under, so two reports (before and after a wave) can be
@@ -423,9 +474,18 @@ pub struct Summary {
     pub vacate: Vacate,
     pub residue: usize,
     pub fold_mismatch: FoldMismatch,
+    /// Conjunction compounds in the `confirmed` set.
     pub compound_confirmed_set: ByMode<usize>,
+    /// Spine compounds in the `confirmed` set (on their profile's floor).
+    pub spine_confirmed_set: ByMode<usize>,
+    /// Whether the compound statistics read the leaf values the candidate
+    /// serves: only under the `aef` target fold.
+    pub compound_statistics_valid: bool,
     pub replay: ByMode<ReplaySummary>,
+    /// The strict-entry replay over conjunction compounds.
     pub strict_entry: StrictEntry,
+    /// The same over spine compounds.
+    pub strict_entry_spine: StrictEntry,
     pub sheaf: SheafShadow,
     pub conflicts: ConflictShadow,
     pub top_movers: Vec<Mover>,
@@ -734,11 +794,13 @@ async fn drift(
         components.insert(*key, c);
     }
     Ok(Drift {
+        unit: "betp",
         start,
         stages,
         components,
         final_value: fold_betp,
         total: fold_betp - start,
+        product_frame_betp: None,
     })
 }
 
