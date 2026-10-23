@@ -130,6 +130,7 @@ async fn run_dry(
     );
     let mut previewed = 0usize;
     let mut unchanged = 0usize;
+    let mut skipped = 0usize;
     for &claim_id in cohort {
         let cached_before: Option<f64> =
             sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
@@ -141,7 +142,12 @@ async fn run_dry(
         // A real run caches only the owner frame's value (`run_claim` ->
         // `recompute_claim_cached_belief`); report that as "what a real run
         // would leave cached".
+        //
+        // No owner: a real run writes nothing for this claim (no BBA, only
+        // ingest templates, or a compound). Counted, so the report tells a
+        // guarded claim from an absent one.
         let Some((_, owned)) = predict_cached_after(pool, viewer, claim_id).await? else {
+            skipped += 1;
             continue;
         };
         let recomputed_after = owned.pignistic_prob;
@@ -170,7 +176,9 @@ async fn run_dry(
         }
     }
     println!(
-        "dry-run summary: {previewed} claims previewed, {unchanged} unchanged (of {} cohort claims)",
+        "dry-run summary: {previewed} claims previewed, {unchanged} unchanged, {skipped} with no \
+         recomputable input (no BBA, only ingest templates, or a compound; a real run leaves \
+         their cache as it is) (of {} cohort claims)",
         cohort.len()
     );
     Ok(())
@@ -270,7 +278,8 @@ async fn run_for_real(
         .await;
 
     println!(
-        "done: {} claims recomputed across {} (claim, frame) writes, {} had no BBAs, {} errors (of {total})",
+        "done: {} claims recomputed across {} (claim, frame) writes, {} had no recomputable input \
+         (no BBA, only ingest templates, or a compound; cache left as it was), {} errors (of {total})",
         claims_with_work.load(Ordering::Relaxed),
         frame_writes.load(Ordering::Relaxed),
         claims_empty.load(Ordering::Relaxed),
