@@ -72,12 +72,21 @@ pub fn bp_readable_factor_sql() -> String {
 }
 
 /// SQL: of the claim ids bound as `$1` (`uuid[]`), the COMPOUNDS — those with
-/// an in-force `decomposes_to` out-edge to a claim.
-///
-/// Run it on the transaction the caller's write is stamped on, so the role is
-/// decided over the edges that caller can see (SPEC §2.1: a leaf is a visible
-/// node with no VISIBLE outgoing `decomposes_to`). Used by BP apply, which
+/// an in-force `decomposes_to` out-edge to a claim. Used by BP apply, which
 /// writes atoms only (D4).
+///
+/// # Decided over the edges the session can see
+///
+/// The intent is structural (SPEC §2.1: "role is structural, not secret"),
+/// and the claim cache it guards is shared by every viewer. But `edges` is
+/// under row security, and BP apply runs this on the caller's stamped write
+/// transaction, so a decomposition the CALLER cannot see (one co-owned with a
+/// group the caller is not in, say) does not make its source a compound
+/// here, and apply would write that compound's cache. A structural read needs
+/// either a connection past row security, which a request-serving process
+/// does not hold, or a definer function, which is a migration this stage
+/// does not take. BP apply is refused unless `EPIGRAPH_BP_APPLY=on` and is
+/// run by hand only, so the residual is recorded here rather than closed.
 #[must_use]
 pub fn compound_ids_among_sql() -> String {
     format!(

@@ -601,7 +601,8 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// (read-only diagnostics keep the `evidential_support` / `mutual_exclusion`
 /// factors that name compounds), but apply skips it and counts it in
 /// `skipped_compounds`. The role is read on the same stamped transaction, so
-/// it is decided over the edges the caller can see.
+/// it is decided over the edges the caller can see, not structurally; see
+/// `compound_ids_among_sql` for the residual that leaves.
 ///
 /// Returns `(written, skipped_not_visible, skipped_compounds)`.
 #[cfg(feature = "db")]
