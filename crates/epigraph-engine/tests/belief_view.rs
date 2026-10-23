@@ -51,9 +51,9 @@ async fn group_claim(pool: &PgPool, author: Uuid, group: Uuid, what: &str) -> Uu
     .await
 }
 
-async fn binary(pool: &PgPool) -> Uuid {
+async fn frame(pool: &PgPool, name: &str, hyps: &[&str]) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
-    if let Some(f) = FrameRepository::get_by_name(pool, &viewer, "binary_truth")
+    if let Some(f) = FrameRepository::get_by_name(pool, &viewer, name)
         .await
         .expect("frame lookup")
     {
@@ -61,13 +61,17 @@ async fn binary(pool: &PgPool) -> Uuid {
     }
     FrameRepository::create(
         pool,
-        "binary_truth",
+        name,
         None,
-        &["TRUE".to_string(), "FALSE".to_string()],
+        &hyps.iter().map(|h| (*h).to_string()).collect::<Vec<_>>(),
     )
     .await
     .expect("frame")
     .id
+}
+
+async fn binary(pool: &PgPool) -> Uuid {
+    frame(pool, "binary_truth", &["TRUE", "FALSE"]).await
 }
 
 /// One BBA row on `binary_truth`. With `evidence_type` `None` and
@@ -98,10 +102,21 @@ impl Row {
 
 async fn store(pool: &PgPool, claim: Uuid, row: Row, masses: serde_json::Value) -> Uuid {
     let b = binary(pool).await;
+    store_on(pool, claim, b, row, masses).await
+}
+
+/// One BBA row on frame `frame_id`.
+async fn store_on(
+    pool: &PgPool,
+    claim: Uuid,
+    frame_id: Uuid,
+    row: Row,
+    masses: serde_json::Value,
+) -> Uuid {
     MassFunctionRepository::store_with_perspective(
         pool,
         claim,
-        b,
+        frame_id,
         row.agent,
         row.perspective,
         &masses,
@@ -167,6 +182,60 @@ async fn hide_edge(pool: &PgPool, edge_id: Uuid, group: Uuid) {
     .execute(pool)
     .await
     .expect("make the edge private");
+}
+
+/// Make a stored BBA row private to `group`.
+async fn hide_row(pool: &PgPool, row_id: Uuid, group: Uuid) {
+    sqlx::query(
+        "UPDATE mass_functions SET visibility = 'group', owner_group_id = $2 WHERE id = $1",
+    )
+    .bind(row_id)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("make the row private");
+}
+
+/// A row citing evidence `ev` (perspective and evidence both `ev`), as the
+/// ingest or a submission files a text-bearing BBA.
+fn citing(writer: Uuid, ev: Uuid) -> Row {
+    Row {
+        perspective: Some(ev),
+        evidence: Some(ev),
+        ..Row::plain(writer)
+    }
+}
+
+/// An `attributed_v1` row citing evidence `ev`, with `masses`.
+async fn attribute(
+    pool: &PgPool,
+    atom: Uuid,
+    ev: Uuid,
+    writer: Uuid,
+    masses: serde_json::Value,
+) -> Uuid {
+    store(
+        pool,
+        atom,
+        Row {
+            method: Some("attributed_v1"),
+            ..citing(writer, ev)
+        },
+        masses,
+    )
+    .await
+}
+
+/// A compound over `n` fresh leaves. Returns (compound, leaves).
+async fn compound_of(pool: &PgPool, author: Uuid, what: &str, n: usize) -> (Uuid, Vec<Uuid>) {
+    let k = claim(pool, author, what).await;
+    let mut leaves = Vec::with_capacity(n);
+    for i in 0..n {
+        let l = claim(pool, author, &format!("{what} leaf {i}")).await;
+        decompose(pool, k, l).await;
+        leaves.push(l);
+    }
+    (k, leaves)
 }
 
 /// An evidence row on `holder` carrying `properties.doi`, plus the evidence
@@ -1114,4 +1183,302 @@ async fn the_shadow_view_exists_only_in_shadow_mode(pool: PgPool) {
         .expect("atom shadow");
     assert_eq!(sa.basis, Basis::Axiom);
     assert!(near(sa.bel, 0.8, 1e-9), "{}", sa.bel);
+}
+
+// ── review: not_all sources counted once ────────────────────────────────────
+
+/// A refuting X→K edge whose refutation already sits on one of K's leaves (a
+/// retargeted parent: the parent edge stays in force and X now also refutes
+/// the atom a1, whose frozen edge-factor BBA {F .64} is in a1's fold) is
+/// counted once, on a1: K = a1 ∧ a2 is a1's fold (.590) times .8 = .472, Pl
+/// a1's .738. Counted twice (the parent as `not_all` m .64 on top) it would
+/// be ≈ .243. The control: the same atom edge with no frozen BBA (an unwired
+/// retarget) puts nothing on the leaf, so the parent edge still refutes the
+/// whole, at m = .8 (refutes) × .8 = .64: Bel .390, Pl .610.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retargeted_refutation_is_counted_once_on_the_atom(pool: PgPool) {
+    let author = agent(&pool).await;
+    let x = claim(&pool, author, "X").await;
+    support(&pool, x, 0.8).await;
+
+    let (k, leaves) = compound_of(&pool, author, "K", 2).await;
+    for &l in &leaves {
+        support(&pool, l, 0.8).await;
+    }
+    let parent = edge(&pool, x, k, "refutes").await;
+    let atom_edge = edge(&pool, x, leaves[0], "refutes").await;
+    store_edge_factor(
+        &pool,
+        atom_edge,
+        leaves[0],
+        serde_json::json!({"1": 0.64, "0,1": 0.36}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE edges SET properties = jsonb_build_object( \
+             'retargeted_to', jsonb_build_array($2::text), 'retarget_unwired', '[]'::jsonb) \
+         WHERE id = $1",
+    )
+    .bind(parent)
+    .bind(atom_edge.to_string())
+    .execute(&pool)
+    .await
+    .expect("mark the parent retargeted");
+
+    let v = derive(&pool, k).await;
+    let not_all = v.derived.as_ref().expect("derived").not_all;
+    assert!(
+        near(not_all.m, 0.0, 1e-12) && not_all.sources == 0,
+        "the parent's refutation already sits on a1: not_all must be empty, got m {} from {} \
+         sources",
+        not_all.m,
+        not_all.sources
+    );
+    assert!(
+        near(v.bel, 0.4721, 5e-4) && near(v.pl, 0.7377, 5e-4),
+        "counted once: Bel .472, Pl .738; got Bel {} Pl {}",
+        v.bel,
+        v.pl
+    );
+
+    // Control: the atom edge carries no BBA, so the parent still counts.
+    let (k2, leaves2) = compound_of(&pool, author, "K unwired", 2).await;
+    for &l in &leaves2 {
+        support(&pool, l, 0.8).await;
+    }
+    edge(&pool, x, k2, "refutes").await;
+    edge(&pool, x, leaves2[0], "refutes").await;
+    let v2 = derive(&pool, k2).await;
+    assert!(
+        near(v2.derived.as_ref().unwrap().not_all.m, 0.64, 1e-9),
+        "an unwired atom edge leaves the parent's refutation on the whole: m .64, got {}",
+        v2.derived.as_ref().unwrap().not_all.m
+    );
+    assert!(
+        near(v2.bel, 0.3902, 5e-4) && near(v2.pl, 0.6098, 5e-4),
+        "refutes (.8) from X at .8 over Bel .64: Bel .390, Pl .610; got Bel {} Pl {}",
+        v2.bel,
+        v2.pl
+    );
+}
+
+/// Two negative siblings serve the Fréchet envelope, and the compound's
+/// `not_all` valuation still meets it. Three independent .8 leaves give the
+/// envelope [.4, 1]; refuted as a whole at .7, the floor follows the
+/// valuation (.4·.3/(1 − .7·.4) = .167) and Pl and NR are bounded by the
+/// largest Bel the conjunction can have, min Belᵢ = .8: .3/(1 − .7·.8) = .682,
+/// not 1. The envelope still contains the independent coupling's value
+/// (R-DEP with the valuation: Bel .239, Pl .468), and the twin without the
+/// refutation still serves Pl = NR = 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_envelope_of_contested_siblings_meets_the_not_all_valuation(pool: PgPool) {
+    let author = agent(&pool).await;
+    let mut views = Vec::new();
+    for refuted in [true, false] {
+        let (k, b) = compound_of(&pool, author, "contested", 3).await;
+        for &l in &b {
+            support(&pool, l, 0.8).await;
+        }
+        edge(&pool, b[0], b[1], "contradicts").await;
+        edge(&pool, b[1], b[2], "refutes").await;
+        if refuted {
+            refute(&pool, k, 0.7).await;
+        }
+        views.push(derive(&pool, k).await);
+    }
+    let (v, twin) = (&views[0], &views[1]);
+    let d = v.derived.as_ref().expect("derived");
+    assert!(d.internally_contested);
+    assert!(near(d.not_all.m, 0.7, 1e-9), "not_all m {}", d.not_all.m);
+    assert!(
+        near(v.bel, 0.1667, 5e-4),
+        "the floor follows the valuation: .167, got {}",
+        v.bel
+    );
+    assert!(
+        near(v.pl, 0.6818, 5e-4) && near(v.nr, 0.6818, 5e-4),
+        "a compound refuted as a whole at .7 is not served Pl or NR 1: .682, got Pl {} NR {}",
+        v.pl,
+        v.nr
+    );
+    assert!(
+        v.bel <= 0.2394 + 1e-9 && v.pl >= 0.4676 - 1e-9 && v.nr >= 0.4676 - 1e-9,
+        "the envelope contains the independent coupling (.239 / .468): [{}, {}], NR {}",
+        v.bel,
+        v.pl,
+        v.nr
+    );
+    assert!(
+        near(twin.pl, 1.0, 1e-9) && near(twin.nr, 1.0, 1e-9),
+        "control: without the refutation the envelope is [.4, 1]: Pl {} NR {}",
+        twin.pl,
+        twin.nr
+    );
+}
+
+/// A compound's own refutation row has moved to the atoms only when an
+/// `attributed_v1` row cites it on one of THIS compound's leaves, as the
+/// viewer sees it:
+/// - one paper's refutation filed on K1 and K2 (disjoint leaves), attributed
+///   to a leaf of K1 only: K1's row has moved (m 0), K2's has not (m .7);
+/// - a citation the viewer cannot read moves nothing for that viewer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_own_refutation_moves_only_with_a_citation_on_this_compound_s_leaves(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "bv-owner").await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    let public = fixture::public_viewer(&pool).await;
+    let author = agent(&pool).await;
+    let x = agent(&pool).await;
+    let m_of = |v: &BeliefView| v.derived.as_ref().expect("derived").not_all.m;
+
+    // One refutation filed on two compounds with disjoint leaves.
+    let (k1, l1) = compound_of(&pool, author, "K1", 2).await;
+    let (k2, _) = compound_of(&pool, author, "K2", 2).await;
+    let ev = doi_evidence(&pool, k1, "10.5555/bv-shared-refutation", x).await;
+    for k in [k1, k2] {
+        store(
+            &pool,
+            k,
+            citing(x, ev),
+            serde_json::json!({"1": 0.7, "0,1": 0.3}),
+        )
+        .await;
+    }
+    attribute(
+        &pool,
+        l1[0],
+        ev,
+        x,
+        serde_json::json!({"1": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    assert!(
+        near(m_of(&derive(&pool, k1).await), 0.0, 1e-12),
+        "K1's refutation sits on its leaf now"
+    );
+    let m2 = m_of(&derive(&pool, k2).await);
+    assert!(
+        near(m2, 0.7, 1e-9),
+        "an attribution onto another compound's leaf moves nothing off K2: m .7, got {m2}"
+    );
+
+    // A citation only the group can read.
+    let (k5, l5) = compound_of(&pool, author, "privately attributed", 2).await;
+    let ev5 = doi_evidence(&pool, k5, "10.5555/bv-private-citer", x).await;
+    store(
+        &pool,
+        k5,
+        citing(x, ev5),
+        serde_json::json!({"1": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    let citer = attribute(
+        &pool,
+        l5[0],
+        ev5,
+        x,
+        serde_json::json!({"1": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    hide_row(&pool, citer, group).await;
+    let m_pub = m_of(&derive_one_as(&pool, &public, k5).await);
+    let m_grp = m_of(&derive_one_as(&pool, &owner, k5).await);
+    assert!(
+        near(m_pub, 0.7, 1e-9) && near(m_grp, 0.0, 1e-12),
+        "the public cannot see the citation (m .7); the group can (m 0); got {m_pub} / {m_grp}"
+    );
+}
+
+/// Only the side of a mixed own row that an `attributed_v1` row carried to a
+/// leaf has moved (SPEC §5.3). A mixed row (t .3, f .2) whose refutation was
+/// attributed to a leaf no longer refutes the whole (m 0); the same row whose
+/// SUPPORT was attributed keeps its f on the compound (m .2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mixed_own_row_keeps_on_the_compound_the_side_that_did_not_move(pool: PgPool) {
+    let author = agent(&pool).await;
+    let x = agent(&pool).await;
+    let m_of = |v: &BeliefView| v.derived.as_ref().expect("derived").not_all.m;
+
+    // A mixed row whose refutation moved, and one whose support moved.
+    let mixed = serde_json::json!({"0": 0.3, "1": 0.2, "0,1": 0.5});
+    let (k3, l3) = compound_of(&pool, author, "mixed, f moved", 2).await;
+    let ev3 = doi_evidence(&pool, k3, "10.5555/bv-mixed-f", x).await;
+    store(&pool, k3, citing(x, ev3), mixed.clone()).await;
+    attribute(
+        &pool,
+        l3[0],
+        ev3,
+        x,
+        serde_json::json!({"1": 0.2, "0,1": 0.8}),
+    )
+    .await;
+    let m3 = m_of(&derive(&pool, k3).await);
+    assert!(
+        near(m3, 0.0, 1e-12),
+        "a mixed row whose refutation was attributed has moved its f: m 0, got {m3}"
+    );
+    let (k4, l4) = compound_of(&pool, author, "mixed, t moved", 2).await;
+    let ev4 = doi_evidence(&pool, k4, "10.5555/bv-mixed-t", x).await;
+    store(&pool, k4, citing(x, ev4), mixed).await;
+    attribute(
+        &pool,
+        l4[0],
+        ev4,
+        x,
+        serde_json::json!({"0": 0.3, "0,1": 0.7}),
+    )
+    .await;
+    let m4 = m_of(&derive(&pool, k4).await);
+    assert!(
+        near(m4, 0.2, 1e-9),
+        "a mixed row whose support was attributed keeps its f on the compound: m .2, got {m4}"
+    );
+}
+
+/// A promoted hypothesis reads its promoted `research_validity` copy and an
+/// unpromoted one its `hypothesis_assessment` row, never both (SPEC §11.4),
+/// on a compound's own rows as on an atom's: one f .5 assessment refutes the
+/// whole at m .5 either side of promotion, not 1 − .5² = .75.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_hypothesis_reads_one_frame_either_side_of_promotion(pool: PgPool) {
+    let author = agent(&pool).await;
+    let experimenter = agent(&pool).await;
+    let ha = frame(
+        &pool,
+        "hypothesis_assessment",
+        &["supported", "unsupported"],
+    )
+    .await;
+    let rv = frame(&pool, "research_validity", &["valid", "invalid"]).await;
+    for promoted in [false, true] {
+        let (h, _) = compound_of(&pool, author, "hypothesis", 2).await;
+        for f in [ha, rv] {
+            store_on(
+                &pool,
+                h,
+                f,
+                Row {
+                    method: Some("error_derived"),
+                    ..Row::plain(experimenter)
+                },
+                serde_json::json!({"1": 0.5, "0,1": 0.5}),
+            )
+            .await;
+        }
+        if promoted {
+            sqlx::query(
+                "UPDATE claims SET properties = properties || \
+                 '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1",
+            )
+            .bind(h)
+            .execute(&pool)
+            .await
+            .expect("promote");
+        }
+        let m = derive(&pool, h).await.derived.expect("derived").not_all.m;
+        assert!(
+            near(m, 0.5, 1e-9),
+            "promoted {promoted}: one assessment, read once: m .5, got {m}"
+        );
+    }
 }
