@@ -385,20 +385,65 @@ async fn the_app_role_cannot_register_even_with_a_forged_principal(pool: PgPool)
 /// member of no role, holds no elevated attribute and no read of the lineage
 /// tables, and can execute the registration but neither link function nor the
 /// history read. The registration's ACL is EXACTLY the attestor's EXECUTE, and
-/// it is a maintenance-owned definer pinned to a search_path.
+/// it is a maintenance-owned definer pinned to a search_path. No other role can
+/// act as it, and the only privilege granted to it BY NAME, on any function or
+/// relation in `public`, is that EXECUTE (a catalog sweep, not a hand list).
+///
+/// NOLOGIN is pinned in the migration TEXT, not on the role: the role is
+/// cluster-wide and operations give it LOGIN on any cluster where the host
+/// registers (review TC9), which must not turn this test red there.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(pool: PgPool) {
-    let (login, sup, createrole, createdb, bypass, repl): (bool, bool, bool, bool, bool, bool) =
+    assert!(
+        include_str!("../../../migrations/161_agent_identity_lineage.sql")
+            .contains("CREATE ROLE epigraph_identity_attestor NOLOGIN;"),
+        "the migration must create the attestor NOLOGIN"
+    );
+    let (sup, createrole, createdb, bypass, repl): (bool, bool, bool, bool, bool) =
         sqlx::query_as(
-            "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication \
+            "SELECT rolsuper, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication \
                FROM pg_roles WHERE rolname = $1",
         )
         .bind(ATTESTOR)
         .fetch_one(&pool)
         .await
         .expect("the attestor role exists");
-    assert!(!login, "the migration must create the attestor NOLOGIN");
     assert!(!(sup || createrole || createdb || bypass || repl));
+
+    // Nobody can act as the attestor (161's own fault list, which the
+    // migration also enforces), and it is a member of nothing.
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT public.epigraph_identity_attestor_faults()")
+            .fetch_one(&pool)
+            .await
+            .expect("faults");
+    assert!(faults.is_empty(), "{faults:?}");
+
+    // Every privilege granted to the attestor by name, swept from the catalog.
+    let granted: Vec<String> = sqlx::query_scalar(
+        "SELECT p.oid::regprocedure::text || ' ' || a.privilege_type \
+           FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) a \
+          WHERE p.pronamespace = 'public'::regnamespace \
+            AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1) \
+         UNION ALL \
+         SELECT c.oid::regclass::text || ' ' || a.privilege_type \
+           FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a \
+          WHERE c.relnamespace = 'public'::regnamespace \
+            AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1) \
+         ORDER BY 1",
+    )
+    .bind(ATTESTOR)
+    .fetch_all(&pool)
+    .await
+    .expect("the attestor's grants");
+    assert_eq!(
+        granted,
+        vec![
+            "epigraph_register_agent_identity(bytea,uuid,text,text,text,bytea,jsonb) EXECUTE"
+                .to_string()
+        ],
+        "the attestor holds exactly one named privilege"
+    );
 
     let member_of: Vec<String> = sqlx::query_scalar(
         "SELECT r.rolname::text FROM pg_auth_members m \
