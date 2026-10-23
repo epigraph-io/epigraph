@@ -361,16 +361,45 @@ pub fn normalize_doi(raw: &str) -> Option<String> {
     }
 }
 
-/// The source a `source_url` names, if any: a DOI link or a `doi:` label
-/// names its DOI or nothing (a resolver link with no DOI behind it is not a
-/// web page that rows could share), a bare `10.` DOI names that DOI, and any
-/// other value names its URL.
+/// An `http://` or `https://` link with something after the scheme.
+fn is_web_url(t: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        t.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+            && !t[scheme.len()..].trim().trim_matches('/').is_empty()
+    })
+}
+
+/// A bare DOI as free text would hold one: `10.`, a 4–9 digit registrant
+/// code, `/`, a non-blank suffix. "10.0.0.5/notes" and "10.5 mg dose" are not.
+fn is_bare_doi(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix("10.") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (4..=9).contains(&digits)
+        && rest[digits..]
+            .strip_prefix('/')
+            .is_some_and(|suffix| !suffix.trim().is_empty())
+}
+
+/// The source a `source_url` names, if any. The column holds whatever the
+/// writer passed (MCP testimony stores a witness's name or a note there as
+/// often as a link), and `url:` is agent-free, so only a real link is a key:
+/// - a DOI link or a `doi:` label names its DOI or nothing (a resolver link
+///   with no DOI behind it is not a web page that rows could share);
+/// - a bare, well-formed DOI names that DOI;
+/// - an `http(s)://` link names its URL;
+/// - anything else (free text, a scheme-less host) names nothing, and the
+///   row keys on its evidence id.
 fn source_url_key(url: &str) -> Option<ItemKey> {
     let t = url.trim();
-    if peel_doi_prefixes(t).is_some() || t.starts_with("10.") {
+    if peel_doi_prefixes(t).is_some() || is_bare_doi(t) {
         normalize_doi(t).map(ItemKey::Doi)
-    } else {
+    } else if is_web_url(t) {
         normalize_source_url(t).map(ItemKey::Url)
+    } else {
+        None
     }
 }
 
@@ -379,8 +408,9 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 ///
 /// 1. `doi:` — `evidence` carries a DOI in `properties.doi`, or its
 ///    `source_url` is a DOI link ([`normalize_doi`]);
-/// 2. `url:` — `evidence` carries any other `source_url`
-///    ([`normalize_source_url`]);
+/// 2. `url:` — `evidence` carries an `http(s)://` `source_url` that is not a
+///    DOI link ([`normalize_source_url`]); free text in that column names no
+///    source;
 /// 3. `ev:` — `evidence` carries neither;
 /// 4. `attr:` — an [`ATTRIBUTED_METHOD`] row citing no evidence (a textless
 ///    attribution; its perspective is the original BBA's id), or `edge:` — an
