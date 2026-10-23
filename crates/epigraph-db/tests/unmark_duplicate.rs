@@ -971,3 +971,116 @@ async fn unmark_reports_and_leaves_rows_a_later_write_changed(pool: PgPool) {
         .expect("edge");
     assert_eq!(target, canonical, "a retracted edge is not re-pointed");
 }
+
+/// The BP factors `edges_auto_factor` minted from `edge` (migration 038 keys
+/// each one to its edge in `properties.source_edge_id`), as their sorted
+/// variable pairs.
+async fn factors_of_edge(pool: &PgPool, edge: Uuid) -> Vec<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text \
+          ORDER BY id",
+    )
+    .bind(edge)
+    .fetch_all(pool)
+    .await
+    .expect("factors")
+}
+
+fn sorted_pair(a: Uuid, b: Uuid) -> Vec<Uuid> {
+    vec![a.min(b), a.max(b)]
+}
+
+/// Retiring the duplicate deletes every BP factor naming it
+/// (`claims_deactivate_factors`); the un-mark makes it current again and puts
+/// its edges back by UPDATE, which `edges_auto_factor` (INSERT only) never
+/// sees. So the reversal re-mints them: after the un-mark the duplicate is in
+/// the BP factor graph again, through both an incoming and an outgoing edge,
+/// exactly as before the mark.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_restores_the_duplicates_bp_factors(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let supported = fixture::seed_public_claim(&pool, a, "supported").await;
+    let e_in = edge(&pool, supporter, dup, "supports").await;
+    let e_out = edge(&pool, dup, supported, "supports").await;
+    assert_eq!(
+        factors_of_edge(&pool, e_in).await,
+        vec![sorted_pair(supporter, dup)],
+        "calibration: the insert trigger minted the incoming edge's factor"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_out).await,
+        vec![sorted_pair(dup, supported)],
+        "calibration: and the outgoing edge's"
+    );
+    let potential_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT potential FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_in)
+    .fetch_one(&pool)
+    .await
+    .expect("potential");
+
+    let repair = mark(&pool, dup, canonical).await;
+    assert!(
+        factors_of_edge(&pool, e_in).await.is_empty()
+            && factors_of_edge(&pool, e_out).await.is_empty(),
+        "calibration: retiring the duplicate deleted its factors"
+    );
+
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_in).await,
+        vec![sorted_pair(supporter, dup)],
+        "the un-mark re-mints the incoming edge's factor on the duplicate"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_out).await,
+        vec![sorted_pair(dup, supported)],
+        "and the outgoing edge's"
+    );
+    let (ft, potential): (String, serde_json::Value) = sqlx::query_as(
+        "SELECT factor_type, potential FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_in)
+    .fetch_one(&pool)
+    .await
+    .expect("re-minted factor");
+    assert_eq!(ft, "directional_support");
+    assert_eq!(
+        potential, potential_before,
+        "the re-minted factor carries the potential the insert trigger gave it"
+    );
+}
+
+/// A chain un-marked in reverse order: the edge follows the chain back, and
+/// the factor follows the edge. Un-marking c1 re-mints the supporter's factor
+/// on c1 (the edge is on c1 then); un-marking d1 moves the edge on to d1, so
+/// that factor is stale and goes, and d1's is minted. No factor keyed to the
+/// edge is left naming a claim the edge no longer touches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chain_unmark_leaves_no_factor_on_a_claim_the_edge_left(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let c2 = fixture::seed_public_claim(&pool, a, "newest canonical").await;
+    let c1 = fixture::seed_public_claim(&pool, a, "first canonical").await;
+    let d1 = fixture::seed_public_claim(&pool, a, "first duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let e = edge(&pool, supporter, d1, "supports").await;
+
+    let r1 = mark(&pool, d1, c1).await;
+    let r2 = mark(&pool, c1, c2).await;
+    unmark(&pool, c1, &r2.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e).await,
+        vec![sorted_pair(supporter, c1)],
+        "with the edge back on c1, c1 is in the factor graph through it"
+    );
+    unmark(&pool, d1, &r1.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e).await,
+        vec![sorted_pair(supporter, d1)],
+        "the edge is on d1 again: one factor, on d1, and none left on c1"
+    );
+}

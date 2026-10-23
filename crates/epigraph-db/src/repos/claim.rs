@@ -11775,6 +11775,36 @@ async fn reverse_marked_duplicate(
     let done = out.unretracted_edges.clone();
     note_drift(&record.retracted_edges, &done, &mut drifted);
 
+    // The BP factor graph. Retiring the duplicate deleted every factor naming
+    // it (`claims_deactivate_factors`), and the edges came back above by
+    // UPDATE, which `edges_auto_factor` (INSERT only) never sees. A factor
+    // keyed to an edge just moved back off the canonical names the canonical
+    // (one an earlier un-mark in a chain minted there) and is stale; it goes
+    // first, then both endpoints' edges are re-minted.
+    let moved_back: Vec<String> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .map(|id| id.to_string())
+        .collect();
+    if !moved_back.is_empty() {
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM factors f
+              WHERE f.variable_ids @> ARRAY[$1]::uuid[]
+                AND f.properties->>'source_edge_id' = ANY($2)"#,
+        )
+        .bind(canon_uuid)
+        .bind(&moved_back)
+        .execute(&mut *conn)
+        .await?;
+    }
+    sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+        .bind([dup_uuid, canon_uuid].as_slice())
+        .execute(&mut *conn)
+        .await?;
+
     // BBAs moved onto the canonical go back with their old tenancy while the
     // duplicate is still public (its audience then is what it was); on a
     // duplicate that has since gone non-public a row becomes the claim's own,
@@ -11944,6 +11974,63 @@ async fn reverse_marked_duplicate(
     out.drifted = drifted;
     Ok(out)
 }
+
+/// The INSERT minting the BP factors `edges_auto_factor` would mint for every in-force
+/// claim-claim edge touching the claims in `$1` whose endpoints are both current, as if
+/// each edge were inserted now: the body of migration 038's
+/// `auto_create_factor_from_edge`, over a set. For a path that puts edges
+/// back by UPDATE (which that INSERT trigger never sees) onto a claim made
+/// current again. A dedup identity edge is skipped (the act writes it after
+/// retiring the duplicate, so it never had one). One factor per
+/// `(factor_type, pair)`, from the earliest edge, and an existing one is kept
+/// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
+const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         INSERT INTO factors (factor_type, variable_ids, potential, description, properties)
+         SELECT DISTINCT ON (x.ft, x.var_ids) x.ft, x.var_ids, x.pot, x.descr, x.props
+           FROM (
+             SELECT e.id, e.created_at, m.ft,
+                    CASE WHEN e.source_id < e.target_id
+                         THEN ARRAY[e.source_id, e.target_id]
+                         ELSE ARRAY[e.target_id, e.source_id] END AS var_ids,
+                    CASE WHEN m.ft = 'mutual_exclusion' THEN '{}'::jsonb
+                         WHEN m.ft = 'directional_support' THEN jsonb_build_object(
+                              'forward_strength', m.fwd, 'reverse_strength', m.rev,
+                              'source_var', e.source_id::text)
+                         ELSE jsonb_build_object('strength', m.fwd) END AS pot,
+                    format('Auto-generated from %s edge %s', e.relationship, e.id) AS descr,
+                    jsonb_build_object('source_edge_id', e.id, 'relationship', e.relationship,
+                                       'edge_source_id', e.source_id,
+                                       'edge_target_id', e.target_id) AS props
+               FROM edges e
+               JOIN claims s ON s.id = e.source_id
+               JOIN claims t ON t.id = e.target_id
+               CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+               -- 038's override: a cross-source matcher's evidential_support
+               -- edge carries its own strength in properties.score.
+               CROSS JOIN LATERAL (
+                 SELECT ft.factor_type AS ft,
+                        CASE WHEN ms.score IS NOT NULL
+                             THEN GREATEST(0.0, LEAST(1.0, ms.score))
+                             ELSE ft.forward_strength END AS fwd,
+                        CASE WHEN ms.score IS NOT NULL
+                             THEN GREATEST(0.0, LEAST(1.0, ms.score))
+                             ELSE ft.reverse_strength END AS rev
+                   FROM (SELECT CASE WHEN ft.factor_type = 'evidential_support'
+                                      AND e.properties ? 'source'
+                                      AND e.properties->>'source' = 'cross_source_matcher'
+                                      AND e.properties ? 'score'
+                                     THEN (e.properties->>'score')::double precision
+                                END AS score) ms
+               ) m
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+                AND e.valid_to IS NULL
+                AND (e.source_id = ANY($1) OR e.target_id = ANY($1))
+                AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
+                AND m.ft IS NOT NULL
+           ) x
+          ORDER BY x.ft, x.var_ids, x.created_at, x.id
+         ON CONFLICT DO NOTHING"#;
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
 /// keyed to any edge (those follow their edge, or stay with it), not an
