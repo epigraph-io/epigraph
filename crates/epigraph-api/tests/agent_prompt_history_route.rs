@@ -358,8 +358,7 @@ async fn a_stranger_gets_the_404_an_absent_agent_gets(pool: PgPool) {
     );
 
     // The operator asking for an absent id gets the same 404 as well.
-    let (s_op_absent, b_op_absent) =
-        get_history(&state, operator, &["claims:read"], absent).await;
+    let (s_op_absent, b_op_absent) = get_history(&state, operator, &["claims:read"], absent).await;
     assert_eq!(s_op_absent, StatusCode::NOT_FOUND, "{b_op_absent}");
     assert_eq!(
         normalised(&b_op_absent, absent),
@@ -446,8 +445,7 @@ async fn the_route_requires_claims_read(pool: PgPool) {
 
     let (status, body) = get_history(&state, operator, &["claims:write"], f.child).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    let (status_absent, _) =
-        get_history(&state, operator, &["claims:write"], Uuid::new_v4()).await;
+    let (status_absent, _) = get_history(&state, operator, &["claims:write"], Uuid::new_v4()).await;
     assert_eq!(
         status_absent,
         StatusCode::FORBIDDEN,
