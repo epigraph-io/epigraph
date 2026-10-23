@@ -366,8 +366,11 @@ pub struct ObstructionChanges {
 /// The sheaf shadow (see `sheaf_shadow`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct SheafShadow {
-    /// Today's cohomology computed exactly as the sheaf tool computes it.
+    /// Today's cohomology computed exactly as the sheaf tool computes it
+    /// (coverage not computed: 1).
     pub served_as_tool: SheafStats,
+    /// Today's cohomology like for like with the candidate (`mass_on_missing`
+    /// as the open-world mass).
     pub served: SheafStats,
     pub progressive: SheafStats,
     pub strict: SheafStats,
@@ -1498,6 +1501,43 @@ async fn sheaf_edges(
         .collect())
 }
 
+/// One edge's obstruction exactly as the sheaf cohomology tool computes it
+/// today: each endpoint's interval from its cached `BetP`, Bel and Pl (`BetP`
+/// standing in for a missing one) and its `open_world_mass` column.
+fn tool_obstruction(
+    ep: &epigraph_db::EpistemicEdgePairRow,
+    profile: &epigraph_engine::sheaf::RestrictionProfile,
+) -> Option<epigraph_engine::CdstSheafObstruction> {
+    let iv = |betp: f64, bel: Option<f64>, pl: Option<f64>, ow: Option<f64>| {
+        let s = epigraph_engine::EpistemicInterval::from_scalar(
+            betp,
+            bel.unwrap_or(betp),
+            pl.unwrap_or(betp),
+        );
+        epigraph_engine::EpistemicInterval::new(s.bel, s.pl, ow.unwrap_or(s.open_world))
+    };
+    let source = iv(
+        ep.source_betp?,
+        ep.source_belief,
+        ep.source_plausibility,
+        ep.source_open_world,
+    );
+    let target = iv(
+        ep.target_betp?,
+        ep.target_belief,
+        ep.target_plausibility,
+        ep.target_open_world,
+    );
+    Some(epigraph_engine::compute_cdst_edge_inconsistency(
+        ep.source_id,
+        ep.target_id,
+        source,
+        target,
+        &ep.relationship,
+        profile,
+    ))
+}
+
 /// Why a mode does not evaluate an edge it was evaluated on today.
 #[derive(Clone, Copy)]
 enum Unevaluated {
@@ -1539,9 +1579,15 @@ fn count_change(
 
 /// The sheaf shadow (SPEC §1.3, §7.2 sheaf row, §10.4).
 ///
-/// * `served`: today's cohomology: each endpoint's cached Bel, Pl and
-///   open-world mass. An edge is evaluated when both endpoints hold a cached
-///   `BetP`.
+/// * `served_as_tool`: today's cohomology exactly as the sheaf tool computes
+///   it (every edge `get_epistemic_edge_pairs` returns, intervals from the
+///   cache with `open_world_mass`); restricted to edges with both ends in
+///   scope when the run's scope is a list of ids.
+/// * `served`: today's cohomology like for like with the candidate: each
+///   endpoint's cached Bel and Pl with `mass_on_missing` (the column the
+///   single writer fills from the fold's open-world mass, which the
+///   candidate interval carries). An edge is evaluated when both endpoints
+///   hold a cached `BetP`, as the tool requires.
 /// * `progressive`: the candidate's intervals; a compound-ended edge atom
 ///   edges replaced (P4) is dropped, any other is kept.
 /// * `strict`: the candidate's intervals; every compound-ended edge is
@@ -1567,10 +1613,19 @@ async fn sheaf_shadow(
     viewer: &Viewer,
     recs: &HashMap<Uuid, Rec>,
     threshold: f64,
-    _scoped: bool,
+    scoped: bool,
 ) -> Result<SheafShadow, String> {
     let profile = epigraph_engine::sheaf::RestrictionProfile::scientific();
     let mut out = SheafShadow::default();
+
+    let pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(&mut *conn, viewer, None)
+        .await
+        .map_err(|e| format!("get_epistemic_edge_pairs: {e}"))?;
+    let as_tool: Vec<_> = pairs
+        .iter()
+        .filter(|p| !scoped || (recs.contains_key(&p.source_id) && recs.contains_key(&p.target_id)))
+        .filter_map(|p| tool_obstruction(p, &profile))
+        .collect();
 
     // Per edge in scope: (edge, compound-ended, today's / progressive's /
     // strict's inconsistency where the mode evaluates it).
@@ -1675,6 +1730,7 @@ async fn sheaf_shadow(
         }
     }
     let [served, progressive, strict] = lists;
+    out.served_as_tool = sheaf_stats(as_tool, threshold, 1.0);
     out.served = sheaf_stats(served, threshold, coverage(covered[0]));
     out.progressive = sheaf_stats(progressive, threshold, coverage(covered[1]));
     out.strict = sheaf_stats(strict, threshold, coverage(covered[2]));
