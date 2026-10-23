@@ -1116,6 +1116,45 @@ async fn query_paper_still_finds_a_legacy_url_form_row(pool: PgPool) {
     assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
 }
 
+/// The filed probe: the row was written under `https://doi.org/<doi>` before
+/// keys were canonicalized, and the monitor asks by the BARE DOI. Both probes
+/// must find that legacy row, or the monitor reads "not ingested", re-extracts
+/// the paper, and the re-ingest mints a bare-keyed twin of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bare_doi_finds_a_legacy_resolver_url_keyed_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let bare = "10.5555/legacy-bare-probe";
+    for (n, prefix) in ["https://doi.org/", "http://dx.doi.org/"]
+        .iter()
+        .enumerate()
+    {
+        let bare = format!("{bare}-{n}");
+        let legacy = format!("{prefix}{bare}");
+        let paper_id = seed_processed_paper(&server, &pool, &legacy, "Legacy by bare").await;
+
+        let paper = query_paper_json(&server, &pool, &bare).await;
+        assert_eq!(
+            paper["title"], "Legacy by bare",
+            "query_paper({bare:?}): {paper}"
+        );
+        for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+            let gate = gate_json(&server, &pool, &bare, pipeline_version).await;
+            assert_eq!(
+                gate["already_ingested"],
+                serde_json::json!(true),
+                "check_already_ingested({bare:?}, {pipeline_version:?}) on {legacy:?}: {gate}"
+            );
+            assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+        }
+    }
+
+    // A bare DOI nobody ingested, under any spelling, is still the
+    // zero-shaped not-found answer.
+    let unknown = query_paper_json(&server, &pool, "10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
+}
+
 /// D9 writer-side guard: when an extraction carries `source_text`, every
 /// span-backed paragraph's stored `text` must equal the bytes its span points
 /// at. Here the span `0..5` of `"alpha beta"` is `"alpha"` but the paragraph

@@ -1765,9 +1765,12 @@ pub(crate) fn canonical_document_key(raw: &str) -> String {
 }
 
 /// Find the `papers` row a caller-supplied document key names: the
-/// [`canonical_document_key`] first, then the key as given (trimmed), so a
-/// row written under a resolver-URL spelling before keys were canonicalized
-/// is still found by that spelling.
+/// [`canonical_document_key`] first, then the key as given (trimmed), then,
+/// for a bare DOI, each [`DOI_KEY_PREFIXES`] spelling of it. A row written
+/// under a resolver-URL spelling before keys were canonicalized is thus found
+/// by that spelling AND by the bare DOI, which is what the monitor's dedup
+/// probe asks with. The legacy spellings are exact-match: a row keyed on a
+/// case variant of a prefix (`HTTPS://DOI.ORG/...`) is found only as given.
 pub(crate) async fn find_paper_by_document_key(
     pool: &sqlx::PgPool,
     raw: &str,
@@ -1780,12 +1783,30 @@ pub(crate) async fn find_paper_by_document_key(
         return Ok(Some(row));
     }
     let as_given = raw.trim();
-    if as_given == canonical {
+    if as_given != canonical {
+        if let Some(row) = PaperRepository::find_by_doi(pool, as_given)
+            .await
+            .map_err(internal_error)?
+        {
+            return Ok(Some(row));
+        }
+    }
+    if !is_bare_doi(&canonical) {
         return Ok(None);
     }
-    PaperRepository::find_by_doi(pool, as_given)
-        .await
-        .map_err(internal_error)
+    for prefix in DOI_KEY_PREFIXES {
+        let legacy = format!("{prefix}{canonical}");
+        if legacy == as_given {
+            continue;
+        }
+        if let Some(row) = PaperRepository::find_by_doi(pool, &legacy)
+            .await
+            .map_err(internal_error)?
+        {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve the identity key a document's `papers` row is keyed on.
