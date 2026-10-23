@@ -1948,7 +1948,14 @@ where
     F: FnMut(&ClaimLine) -> Result<(), String>,
 {
     let ctx = FramedBeliefContext::global();
-    let events = read_events(conn, events_viewer, opts.since, Utc::now()).await?;
+    // The window's end is the database's clock, the one `created_at` is
+    // stamped by: a client clock behind it would drop events logged just
+    // before the run.
+    let until: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("database clock: {e}"))?;
+    let events = read_events(conn, events_viewer, opts.since, until).await?;
     let exposure = recall_exposure(&events);
     let page_size = opts.page_size.max(1);
     let mut totals = Totals::default();
