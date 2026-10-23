@@ -1496,6 +1496,79 @@ fn run_record(wave_file: &Path) -> serde_json::Value {
     serde_json::from_str(&text).expect("the run record is JSON")
 }
 
+/// A claim whose write fails does not stop the wave: the other claims are
+/// written, the failed one is left and unrecorded (its transaction rolled
+/// back), and the run exits 5, distinct from a usage refusal (2), a mode
+/// refusal (3) and a disk-gate abort (4), so a wrapper can tell them apart.
+/// The failure is a database trigger refusing that one claim's cache write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_whose_write_fails_exits_5_and_the_others_are_written(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "errors-owner").await;
+    let source = agent(&pool, "errors-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let failing = claim(&pool, owner, "a write the database refuses").await;
+    insert_row(&pool, failing, &evidence_row(bin, source, 0.8, None)).await;
+    let fine = claim(&pool, owner, "a write that lands").await;
+    insert_row(&pool, fine, &evidence_row(bin, source, 0.6, None)).await;
+    let failing_before = set_sentinel(&pool, failing, bin, 0.0).await;
+    let fine_before = set_sentinel(&pool, fine, bin, 0.03).await;
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_refuse_one_claim() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.id = '{failing}' THEN RAISE EXCEPTION 'test: refused write'; END IF; \
+         RETURN NEW; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_one_claim BEFORE UPDATE ON claims \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_one_claim()",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+
+    let wave_file = dir.join("wave.jsonl");
+    let r = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    );
+    assert_eq!(
+        r.code,
+        Some(5),
+        "a run with a failed claim exits 5\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert_eq!(
+        cache(&pool, failing).await,
+        failing_before,
+        "the failed claim is left"
+    );
+    assert_ne!(
+        cache(&pool, fine).await,
+        fine_before,
+        "the other claim is written"
+    );
+    let recorded: HashSet<Uuid> = read_wave(std::io::BufReader::new(
+        std::fs::File::open(&wave_file).expect("the wave file exists"),
+    ))
+    .expect("parse the wave file")
+    .into_iter()
+    .map(|r| r.claim_id)
+    .collect();
+    assert_eq!(
+        recorded,
+        HashSet::from([fine]),
+        "only the committed write is recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── the per-scope rows the wave resyncs ─────────────────────────────────────
 
 /// SPEC §7.2: a wave resyncs the atom's existing `ds_combined_beliefs` rows
