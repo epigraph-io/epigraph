@@ -186,7 +186,8 @@ pub async fn auto_wire_ds_for_edge(
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
     // per-frame override naturally follows because we look up by frame_id.
-    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
+    let frame_row = ensure_binary_frame_row(&mut *conn, viewer).await?;
+    let frame_id = frame_row.id;
     let per_frame_factor =
         FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
             .await
@@ -251,7 +252,15 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(&mut *conn, viewer, target_id, frame_id, &frame).await?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        target_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&frame_row.properties),
+    )
+    .await?;
     Ok(EdgeFactorOutcome::Wired)
 }
 
@@ -461,7 +470,15 @@ pub async fn recompute_claim_belief_on_frame(
     if all_rows.is_empty() {
         return Ok(false);
     }
-    recompute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -496,7 +513,15 @@ pub async fn preview_claim_belief_on_frame(
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await
+    compute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+    )
+    .await
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
@@ -922,12 +947,19 @@ pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) ->
 /// classifier) without also performing the `UPDATE claims ...` write —
 /// see that function's doc comment for why a caller-side rolled-back
 /// transaction can't substitute for this split.
+///
+/// `frame_overrides` is the frame's `belief_profile` object, taken from the
+/// frame row the caller already loaded under `viewer` (every caller loads it
+/// before combining and stops when the frame is invisible), so the frame tier
+/// costs no query here and always comes from the same visible row as the
+/// per-frame keys.
 async fn compute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
     let all_rows =
         MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
@@ -979,16 +1011,9 @@ async fn compute_combined_belief(
         warn_on_unknown_evidence_type_keys(frame_id, map, calibration);
     }
 
-    // The frame's generic `belief_profile` override object. Best-effort like
-    // the per-frame keys above: a failed read means "no override".
-    let frame_overrides = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|f| crate::belief_profile::overrides_in(&f.properties).cloned());
     let profile = BeliefProfile::served().resolve(
         FrameTier {
-            overrides: frame_overrides.as_ref(),
+            overrides: frame_overrides,
             intra_evidence_locality_factor: per_frame_intra,
             evidence_type_weights: per_frame_evidence_weights.as_ref(),
         },
@@ -1116,9 +1141,17 @@ async fn recompute_combined_belief(
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let Some(preview) =
-        compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, frame).await?
+    let Some(preview) = compute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        frame_overrides,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -1240,11 +1273,20 @@ pub async fn ensure_binary_frame(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
+    ensure_binary_frame_row(conn, viewer).await.map(|r| r.id)
+}
+
+/// [`ensure_binary_frame`], returning the frame row (its `properties` carry
+/// the frame tier of the belief profile).
+async fn ensure_binary_frame_row(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<epigraph_db::FrameRow, String> {
     if let Some(row) = FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
-        return Ok(row.id);
+        return Ok(row);
     }
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
     // Under its own SAVEPOINT because the failure below is swallowed into a
@@ -1269,7 +1311,7 @@ pub async fn ensure_binary_frame(
             sp.commit().await.map_err(|e| {
                 format!("binary_truth: could not release the create savepoint: {e}")
             })?;
-            Ok(row.id)
+            Ok(row)
         }
         Err(_) => {
             sp.rollback()
@@ -1278,7 +1320,6 @@ pub async fn ensure_binary_frame(
             FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
                 .await
                 .map_err(|e| format!("fallback get_by_name: {e}"))?
-                .map(|r| r.id)
                 .ok_or_else(|| "binary_truth frame missing after create attempt".to_string())
         }
     }
