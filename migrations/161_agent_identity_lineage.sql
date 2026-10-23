@@ -113,7 +113,11 @@
 --      shared identity is linked by hand. A refusal of the link body itself
 --      (55000, e.g. 107's shared-signer fingerprint, whose OPERATED_BY edges
 --      any application session can forge) refuses the link, not the
---      registration: `inherited = false`, reason `link_refused`;
+--      registration: `inherited = false`, reason `link_refused`. The result
+--      says what happened, separately: `inherited` (THIS call recorded the
+--      child's link from the parent's operator), `link_live` (the child can
+--      write after the call) and the reason, which names a child whose own
+--      link is retired (`child_link_retired`) rather than calling it linked;
 --   6. writes one `security_events` row `agent.identity_registered` naming the
 --      child, parent, group, operator, snapshot and `session_user` -- only when
 --      something new was recorded, so a repeat start writes nothing but
@@ -639,6 +643,7 @@ RETURNS TABLE (agent_id uuid,
                signing_key_registered boolean,
                operator_id uuid,
                inherited boolean,
+               link_live boolean,
                inherit_reason text)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -667,6 +672,7 @@ DECLARE
     v_stored     integer;
     v_unknown    text[];
     v_live       boolean;
+    v_link_live  boolean;
     v_bound      bytea;
     v_rec_model  text;
     v_rec_hash   text;
@@ -930,15 +936,22 @@ BEGIN
                            jsonb_build_object('source', 'epigraph_register_agent_identity',
                                               'inherited_from', v_parent,
                                               'group_folder', p_group_folder)) b;
-                v_inherited := COALESCE(v_live, false);
-                IF NOT v_inherited THEN
+                -- The body recorded the link (the child had none): that is
+                -- the inheritance, live or not; `link_live` below says which.
+                v_inherited := true;
+                IF NOT COALESCE(v_live, false) THEN
                     v_reason := 'link_not_live';
                 END IF;
             EXCEPTION WHEN SQLSTATE '55000' THEN
                 v_reason := 'link_refused';
             END;
         ELSIF v_child_op = v_parent_op THEN
-            v_reason := 'already_linked';
+            -- Linked to the same operator already; a RETIRED link cannot
+            -- write, which the host must hear about rather than "linked".
+            v_reason := CASE WHEN EXISTS (SELECT 1 FROM public.operator_links l
+                                           WHERE l.agent_id = v_child AND l.retired)
+                             THEN 'child_link_retired'
+                             ELSE 'already_linked' END;
         ELSE
             RAISE EXCEPTION 'AID07: agent % is linked to operator %, but its parent % is live-linked '
                             'to operator %; nothing was recorded', v_child, v_child_op, v_parent,
@@ -948,6 +961,7 @@ BEGIN
         END IF;
     END IF;
     v_child_op := public.epigraph_human_of(v_child, false);
+    v_link_live := public.epigraph_human_of(v_child, true) IS NOT NULL;
 
     -- 6. The audit row, when something new was recorded.
     IF v_created OR v_succ_rows > 0 OR v_snap_new OR v_key_new OR v_inherited THEN
@@ -964,13 +978,14 @@ BEGIN
                                    'snapshot_created', v_snap_new,
                                    'signing_key_registered', v_key_new,
                                    'inherited', v_inherited,
+                                   'link_live', v_link_live,
                                    'inherit_reason', v_reason,
                                    'recorded_by', session_user));
     END IF;
 
     RETURN QUERY
     SELECT v_child, v_created, v_succ_rows > 0, v_snapshot, v_snap_new, v_key_new,
-           v_child_op, v_inherited, v_reason;
+           v_child_op, v_inherited, v_link_live, v_reason;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
     bytea, uuid, text, text, text, bytea, jsonb) FROM PUBLIC;

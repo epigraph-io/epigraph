@@ -92,10 +92,17 @@ pub struct IdentityRegistered {
     pub signing_key_registered: bool,
     /// The agent's operator after the call (a link of any state), if any.
     pub operator_id: Option<Uuid>,
-    /// True when THIS call linked the agent to its parent's operator.
+    /// True when THIS call recorded the agent's link to its parent's
+    /// operator (live or not: see `link_live`).
     pub inherited: bool,
-    /// Why nothing was inherited: `no_parent`, `parent_unlinked`,
-    /// `parent_link_retired`, `already_linked` or `link_not_live`.
+    /// True when the agent is live-linked after the call, i.e. can write.
+    pub link_live: bool,
+    /// Why nothing (or nothing live) was inherited: `no_parent`,
+    /// `parent_unlinked`, `parent_link_retired`, `shared_identity` (an
+    /// unlinked identity already running in another group: link it by hand),
+    /// `link_refused` (the link body refused, e.g. a shared-signer
+    /// fingerprint), `already_linked`, `child_link_retired` or
+    /// `link_not_live`.
     pub inherit_reason: Option<String>,
 }
 
@@ -248,7 +255,7 @@ impl AgentIdentityRepository {
         let snapshot = Self::snapshot_document(reg)?;
         Ok(sqlx::query_as::<_, IdentityRegistered>(
             "SELECT agent_id, agent_created, succession_created, snapshot_id, snapshot_created, \
-                    signing_key_registered, operator_id, inherited, inherit_reason \
+                    signing_key_registered, operator_id, inherited, link_live, inherit_reason \
                FROM public.epigraph_register_agent_identity($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(reg.identity_pubkey.as_slice())

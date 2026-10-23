@@ -111,6 +111,7 @@ struct Registered {
     signing_key_registered: bool,
     operator_id: Option<Uuid>,
     inherited: bool,
+    link_live: bool,
     inherit_reason: Option<String>,
 }
 
@@ -507,6 +508,7 @@ async fn assert_inherits(pool: &PgPool) {
         r.inherited,
         "a child of a live-linked parent inherits the link"
     );
+    assert!(r.link_live, "the inherited link is live");
     assert_eq!(r.inherit_reason, None);
     assert_eq!(r.operator_id, Some(operator));
     assert_ne!(r.agent_id, parent);
@@ -625,6 +627,7 @@ async fn an_unlinked_or_retired_parent_passes_on_nothing(pool: PgPool) {
         .await;
         assert!(r.agent_created && r.succession_created);
         assert!(!r.inherited, "{reason}: nothing may be inherited");
+        assert!(!r.link_live, "{reason}: the child cannot write");
         assert_eq!(r.inherit_reason.as_deref(), Some(reason));
         assert_eq!(r.operator_id, None);
         assert_eq!(human_of(&pool, r.agent_id, false).await, None);
