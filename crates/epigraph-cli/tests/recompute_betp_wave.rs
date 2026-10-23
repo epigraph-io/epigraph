@@ -1341,7 +1341,50 @@ async fn a_real_run_without_a_backup_check_refuses(pool: PgPool) {
     )
     .ok("control: the same run with a check command");
     assert_ne!(cache(&pool, atom).await, sentinel, "control: the run wrote");
+    let record = run_record(&wave_file);
+    assert_eq!(
+        record["disk_gate"]["backup_check"]["command"], "true",
+        "the run record names the check command: {record}"
+    );
+
+    // The explicit opt-out proceeds, says so, and is recorded.
+    set_sentinel(&pool, atom, bin, 0.0).await;
+    let opted_file = dir.join("opted-out.jsonl");
+    let opted = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &{
+            let mut a = gate_args(s(&opted_file), s(&dir));
+            a.extend(["--min-free-gb", "0", "--no-backup-check"]);
+            a
+        },
+        &env.vars(),
+    );
+    opted.ok("--no-backup-check");
+    assert!(
+        opted.stdout.contains("NO backup check"),
+        "the opt-out is printed\nstdout: {}",
+        opted.stdout
+    );
+    assert_ne!(
+        cache(&pool, atom).await,
+        sentinel,
+        "the opted-out run wrote"
+    );
+    let record = run_record(&opted_file);
+    assert_eq!(
+        record["disk_gate"]["backup_check"]["no_backup_check"], true,
+        "the opt-out is recorded: {record}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `<wave file>.run.json`, the run's own record of its modes and gate.
+fn run_record(wave_file: &Path) -> serde_json::Value {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".run.json");
+    let text = std::fs::read_to_string(PathBuf::from(p)).expect("the run record exists");
+    serde_json::from_str(&text).expect("the run record is JSON")
 }
 
 // ── the per-scope rows the wave resyncs ─────────────────────────────────────

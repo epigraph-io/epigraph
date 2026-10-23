@@ -14,7 +14,8 @@
 //! # apply a wave, or an accepted vacate list (one per run)
 //! recompute_betp (--role standalone|leaf | --accept-vacate <list>) \
 //!     --snapshot <wave file> --wave <name> --disk-path <path> \
-//!     [--min-free-gb N] [--projected-bytes-per-claim N] [--disk-check-cmd <cmd>] \
+//!     (--disk-check-cmd <cmd> | --no-backup-check) \
+//!     [--min-free-gb N] [--projected-bytes-per-claim N] \
 //!     [--batch-size N] [--pace-ms N] [--concurrency N]
 //!
 //! # the cohort-v1 report (#197's arms (a) and (b)), legacy fold, dry run only
@@ -39,9 +40,11 @@
 //!   `restore_belief_cache --from <wave file>` can undo exactly that run by
 //!   compare-and-swap;
 //! * `--wave <name>` and the disk gate (`--disk-path`, headroom
-//!   `--min-free-gb`, provisional default 20, and optional `--disk-check-cmd`),
+//!   `--min-free-gb`, provisional default 20, and the backup and archive
+//!   health check `--disk-check-cmd`, or an explicit `--no-backup-check`),
 //!   checked before EVERY batch; a failure aborts before that batch writes
-//!   (exit 4);
+//!   (exit 4). The run's modes and gate are recorded in
+//!   `<wave file>.run.json`;
 //! * matching belief modes: the API's `/health` (`EPIGRAPH_API`, else
 //!   `EPIGRAPH_API_URL`) must report this process's modes (exit 3 otherwise);
 //! * for `--role`, a fold that covers the role (`aef_standalone` or `aef`
@@ -141,12 +144,19 @@ struct Cli {
     /// Free space (GB) that must remain after each batch's projected writes.
     #[arg(long, default_value_t = 20.0)]
     min_free_gb: f64,
-    /// Projected write volume (WAL and archive) per claim, in bytes.
+    /// Projected write volume per claim, in bytes: WAL and archive, plus the
+    /// wave file's and sidecar's records when they are on the measured volume.
     #[arg(long, default_value_t = 65_536)]
     projected_bytes_per_claim: u64,
-    /// A shell command the disk gate runs before each batch (exit 0 = pass).
-    #[arg(long)]
+    /// The backup and archive health check the disk gate runs before each
+    /// batch (exit 0 = pass), for example `pgbackrest check` plus a backup-age
+    /// test. A real run needs this or `--no-backup-check`.
+    #[arg(long, conflicts_with = "no_backup_check")]
     disk_check_cmd: Option<String>,
+    /// Run the disk gate on free space alone, with no backup check. A
+    /// deliberate opt-out: printed, and recorded in `<wave file>.run.json`.
+    #[arg(long)]
+    no_backup_check: bool,
     /// Claims per batch (the disk gate runs before each).
     #[arg(long, default_value_t = 1000)]
     batch_size: usize,
@@ -214,6 +224,12 @@ fn validate(cli: &Cli) -> Result<(), String> {
     }
     if cli.disk_path.is_none() {
         missing.push("--disk-path <path on the data volume> (the disk gate)");
+    }
+    if cli.disk_check_cmd.is_none() && !cli.no_backup_check {
+        missing.push(
+            "--disk-check-cmd <backup and archive health check> (the disk gate's backup \
+             half; --no-backup-check to opt out, recorded)",
+        );
     }
     if !missing.is_empty() {
         return Err(format!(
@@ -596,6 +612,30 @@ async fn run_real(
         "wave {wave}: wave_at {wave_at}; recording to {}",
         wave_file.display()
     );
+    let disk_check = match &gate.check_cmd {
+        Some(cmd) => serde_json::json!({ "command": cmd }),
+        None => {
+            println!("disk gate: free space only, NO backup check (--no-backup-check; recorded)");
+            serde_json::json!({ "command": null, "no_backup_check": true })
+        }
+    };
+    write_run_record(
+        wave_file,
+        &serde_json::json!({
+            "wave": wave,
+            "wave_at": wave_at,
+            "role": cli.role.map(WaveRole::as_str),
+            "accept_vacate_sha256": accepted.as_ref().map(|(l, _)| l.sha256.clone()),
+            "atom_fold": fold_str(settings.fold),
+            "compound_source_edges": cse_str(settings.compound_source_edges),
+            "disk_gate": {
+                "path": gate.path,
+                "min_free_bytes": gate.min_free_bytes,
+                "projected_bytes_per_claim": gate.projected_bytes_per_claim,
+                "backup_check": disk_check,
+            },
+        }),
+    )?;
 
     if let Some(role) = cli.role {
         let cohort = select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
@@ -635,6 +675,24 @@ async fn run_real(
         .await?;
     }
     Ok(())
+}
+
+/// `<wave file>.run.json`: what the run was (its modes and its disk gate,
+/// including a `--no-backup-check` opt-out), beside the records it makes.
+fn write_run_record(wave_file: &std::path::Path, record: &serde_json::Value) -> Result<(), String> {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".run.json");
+    let p = PathBuf::from(p);
+    let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// The CLI spelling of a compound-source-edges setting.
+const fn cse_str(cse: CompoundSourceEdges) -> &'static str {
+    match cse {
+        CompoundSourceEdges::Frozen => "frozen",
+        CompoundSourceEdges::Excluded => "excluded",
+    }
 }
 
 async fn pace(cli: &Cli, batch: usize) {
