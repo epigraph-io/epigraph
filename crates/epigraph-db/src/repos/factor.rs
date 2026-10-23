@@ -41,6 +41,18 @@ use crate::repos::edge::EDGE_IN_FORCE;
 /// close is removing the rows themselves (SPEC §6.2's export-and-delete of
 /// `decomposes_to` factors and its sweep job, which run on the maintenance
 /// connection). A KEYED row needs no edge read and is excluded for everyone.
+///
+/// # A directional edge parallel to a decomposition
+///
+/// The trigger maps `decomposes_to`, `supports` and several other
+/// relationships to `directional_support`, and `idx_factors_type_vars_frame`
+/// is unique on (type, sorted pair, frame), so a pair holds ONE trigger
+/// factor, keyed by the edge created first. If that is the `decomposes_to`
+/// edge, the parallel edge has no factor of its own and BP reads no coupling
+/// for it; created the other way round, BP reads the parallel edge's factor.
+/// A legacy row on a decomposition pair is excluded whichever edge minted it.
+/// Known and pinned (`bp_parallel_supports_and_decomposes_to`); a migration
+/// that stops the trigger minting `decomposes_to` factors removes it.
 #[must_use]
 pub fn bp_readable_factor_sql() -> String {
     format!(
