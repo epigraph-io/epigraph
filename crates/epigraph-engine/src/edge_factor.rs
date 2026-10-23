@@ -1233,15 +1233,25 @@ pub enum AtomCacheOutcome {
     Vacated { written: bool },
 }
 
+/// Process-wide count behind [`compound_cache_write_skipped`].
+static COMPOUND_CACHE_WRITE_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// How many times [`recompute_atom_cache`] refused to write a compound's cache
-/// in this process.
+/// in this process (the `compound_cache_write_skipped` counter, SPEC §4.2).
 #[must_use]
 pub fn compound_cache_write_skipped() -> u64 {
-    0
+    COMPOUND_CACHE_WRITE_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The single atom-cache writer (SPEC §4.2), under this process's
-/// [`AtomCacheSettings::current`].
+/// [`AtomCacheSettings::current`]. See [`recompute_atom_cache_with`].
+///
+/// The SPEC names it `recompute_atom_cache(conn, viewer, claim_id)`. It also
+/// takes the call's `cause` (only the caller knows whether a lifecycle act
+/// just removed the atom's evidence, which the empty-fold rule turns on) and
+/// the `legacy` fold the call site used before, which it keeps wherever the
+/// AEF does not cover the claim.
 ///
 /// # Errors
 /// A database read or write, or a fold that fails.
@@ -1265,23 +1275,171 @@ pub async fn recompute_atom_cache(
 
 /// [`recompute_atom_cache`] under explicit settings.
 ///
+/// By the claim's role ([`epigraph_db::repos::claim_role::roles_batch`]):
+///
+/// * **compound**: nothing is written, under every mode and whatever the
+///   `legacy` fold, and [`compound_cache_write_skipped`] counts it. A
+///   compound's belief is a query over its leaves.
+/// * **standalone** under `aef_standalone` or `aef`, and **leaf atom** under
+///   `aef`: the AEF. The cache becomes
+///   [`crate::atom_items::atom_fold`] of the claim's
+///   [`crate::atom_items::AxiomMode::Display`] rows under no lens, stamped
+///   `binary_truth`, with its classification.
+/// * everything else (any role under `legacy`, a leaf under
+///   `aef_standalone`, a procedural or rule claim): the `legacy` fold,
+///   exactly as the call site ran it before.
+///
+/// **Empty fold** under the AEF: after [`CacheWriteCause::EvidenceRemoved`],
+/// and when ruling O24 is on, the cache is set to an explicit vacuous value
+/// (Bel 0, Pl 1, BetP .5, `binary_truth`) and the atom is logged on the
+/// evidence-removal vacate list (target `epigraph::atom_cache::vacate`).
+/// Otherwise the cache is left as it is (an atom that never had AEF input is
+/// served from its old cache). **No arm ever NULLs a cache.**
+///
 /// # Errors
 /// A database read or write, or a fold that fails.
 pub async fn recompute_atom_cache_with(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
-    _cause: CacheWriteCause,
+    cause: CacheWriteCause,
     legacy: LegacyFold,
-    _settings: AtomCacheSettings,
+    settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    let written = match legacy {
-        LegacyFold::OwnerFrame => recompute_claim_cached_belief(conn, viewer, claim_id).await?,
-        LegacyFold::Frame(frame_id) => {
-            recompute_claim_belief_on_frame(conn, viewer, claim_id, frame_id).await?
-        }
+    use crate::atom_items::{atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode};
+    use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
+
+    let roles = roles_batch(&mut *conn, viewer, &[claim_id])
+        .await
+        .map_err(|e| format!("roles_batch: {e}"))?;
+    let Some(role) = roles.get(&claim_id).copied() else {
+        return Ok(AtomCacheOutcome::NotVisible);
     };
-    Ok(AtomCacheOutcome::Legacy { written })
+    let aef = match role {
+        ClaimRole::Compound { .. } => {
+            COMPOUND_CACHE_WRITE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                claim = %claim_id,
+                counter = "compound_cache_write_skipped",
+                "the atom-cache writer leaves a compound's cache alone"
+            );
+            return Ok(AtomCacheOutcome::CompoundSkipped);
+        }
+        ClaimRole::Standalone => {
+            matches!(
+                settings.fold,
+                AtomFoldMode::AefStandalone | AtomFoldMode::Aef
+            )
+        }
+        ClaimRole::Atom => settings.fold == AtomFoldMode::Aef,
+        ClaimRole::Procedural | ClaimRole::Rule => false,
+    };
+    if !aef {
+        let written = match legacy {
+            LegacyFold::OwnerFrame => recompute_claim_cached_belief(conn, viewer, claim_id).await?,
+            LegacyFold::Frame(frame_id) => {
+                recompute_claim_belief_on_frame(conn, viewer, claim_id, frame_id).await?
+            }
+        };
+        return Ok(AtomCacheOutcome::Legacy { written });
+    }
+
+    let ctx = crate::belief_query::FramedBeliefContext::global();
+    let rows = atom_axiom_rows_under(
+        &mut *conn,
+        viewer,
+        &[claim_id],
+        AxiomMode::Display,
+        &ctx,
+        settings.compound_source_edges,
+    )
+    .await?
+    .remove(&claim_id)
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        if cause == CacheWriteCause::EvidenceRemoved && settings.vacate_on_evidence_removal {
+            let written = write_atom_cache(
+                conn,
+                viewer,
+                claim_id,
+                &crate::atom_items::EvidencedInterval::unproven(),
+                false,
+                &ctx.calibration,
+            )
+            .await?;
+            tracing::warn!(
+                target: "epigraph::atom_cache::vacate",
+                claim = %claim_id,
+                written,
+                "evidence-removal vacate: a lifecycle act emptied the atom's AEF input;                  explicit vacuous cache (basis unproven)"
+            );
+            return Ok(AtomCacheOutcome::Vacated { written });
+        }
+        return Ok(AtomCacheOutcome::KeptEmpty);
+    }
+
+    let interval = atom_fold(&rows)?;
+    let thresholds = &ctx.calibration.classifier_thresholds;
+    let has_opposing = rows
+        .iter()
+        .any(|r| measures::pignistic_probability(&r.coarse, 1) > thresholds.has_opposing_threshold);
+    let written = write_atom_cache(
+        conn,
+        viewer,
+        claim_id,
+        &interval,
+        has_opposing,
+        &ctx.calibration,
+    )
+    .await?;
+    Ok(AtomCacheOutcome::Folded { interval, written })
+}
+
+/// Write an AEF value to the claim's cache, stamped `binary_truth`, and its
+/// classification when the cache took it. Returns whether it did.
+async fn write_atom_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    interval: &crate::atom_items::EvidencedInterval,
+    has_opposing: bool,
+    calibration: &CalibrationConfig,
+) -> Result<bool, String> {
+    let binary = ensure_binary_frame(&mut *conn, viewer).await?;
+    let written = MassFunctionRepository::update_claim_belief(
+        &mut *conn,
+        claim_id,
+        epigraph_db::CachedBelief {
+            belief: interval.belief(),
+            plausibility: interval.plausibility(),
+            mass_on_empty: interval.mass_on_conflict(),
+            pignistic_prob: Some(interval.pignistic_prob()),
+            mass_on_missing: interval.mass_on_missing(),
+            belief_frame_id: Some(binary),
+        },
+    )
+    .await
+    .map_err(|e| format!("update_claim_belief: {e}"))?;
+    if written {
+        let label = crate::classifier::classify(
+            interval.mass_on_conflict(),
+            interval.theta(),
+            interval.pignistic_prob(),
+            interval.pignistic_false(),
+            has_opposing,
+            &calibration.classifier_thresholds,
+        );
+        MassFunctionRepository::update_claim_classification(
+            &mut *conn,
+            claim_id,
+            &label.to_string(),
+            binary,
+        )
+        .await
+        .map_err(|e| format!("update_claim_classification: {e}"))?;
+    }
+    Ok(written)
 }
 
 /// Get-or-create the canonical `binary_truth` frame.
