@@ -16,6 +16,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use epigraph_engine::atom_items::AtomFoldMode;
+use epigraph_engine::edge_factor::{AtomCacheOutcome, CacheWriteCause, LegacyFold};
+
 /// Cohort SQL: claims whose cached BetP is due for a refresh under the
 /// current (dynamic reliability) combine pipeline.
 ///
@@ -168,30 +171,56 @@ pub async fn predict_cached_after(
     .map(|preview| (owner, preview)))
 }
 
-/// Real-write half: recompute and persist the claim's cached belief from
-/// its owner frame via
-/// `epigraph_engine::edge_factor::recompute_claim_cached_belief` (the same
-/// path `recompute_claim_belief.rs` uses). Returns 1 when the cache was
-/// written, 0 otherwise.
+/// One claim through the single atom-cache writer
+/// (`epigraph_engine::edge_factor::recompute_atom_cache`, SPEC §4.2) under
+/// this process's `EPIGRAPH_ATOM_FOLD`: the AEF where the fold covers the
+/// claim's role, else the owner-frame legacy fold this binary always wrote.
+/// A compound is never written. Returns 1 when the cache was written, 0
+/// otherwise.
+///
+/// Under the default `legacy` fold this is exactly the previous behaviour
+/// (`recompute_claim_cached_belief`, which carries the PR-0 guard).
 ///
 /// # Errors
-/// Propagates any error from the frame-discovery query or from the engine's
-/// recompute-and-write call.
+/// Propagates any error from the engine's recompute-and-write call.
 pub async fn run_claim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<usize, String> {
-    // Backlog 696d3a1c: one frame owns the shared claims.* cache. Looping over
-    // every frame wrote it repeatedly and let the alphabetically last win; the
-    // owner is now resolved independently of frame names.
-    // An operator one-shot, run on whatever DSN the operator supplies — in
-    // practice a superuser, where a stamp is inert. The acquire is mechanical:
-    // the whole recompute rides ONE connection instead of a checkout per
-    // statement.
+    // An operator one-shot: the whole recompute rides ONE connection.
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-    let did =
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, viewer, claim_id)
-            .await?;
-    Ok(usize::from(did))
+    let outcome = epigraph_engine::edge_factor::recompute_atom_cache(
+        &mut conn,
+        viewer,
+        claim_id,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+    )
+    .await?;
+    Ok(usize::from(outcome_written(&outcome)))
 }
+
+/// Whether the writer reports a cache write.
+#[must_use]
+pub const fn outcome_written(outcome: &AtomCacheOutcome) -> bool {
+    match outcome {
+        AtomCacheOutcome::Legacy { written }
+        | AtomCacheOutcome::Folded { written, .. }
+        | AtomCacheOutcome::Vacated { written } => *written,
+        AtomCacheOutcome::CompoundSkipped
+        | AtomCacheOutcome::NotVisible
+        | AtomCacheOutcome::KeptEmpty => false,
+    }
+}
+
+/// The CLI spelling of a fold mode (as `EPIGRAPH_ATOM_FOLD` takes it).
+#[must_use]
+pub const fn fold_str(fold: AtomFoldMode) -> &'static str {
+    match fold {
+        AtomFoldMode::Legacy => "legacy",
+        AtomFoldMode::AefStandalone => "aef_standalone",
+        AtomFoldMode::Aef => "aef",
+    }
+}
+
