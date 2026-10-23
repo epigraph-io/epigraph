@@ -110,7 +110,10 @@
 --      one identity serves every group with the same model and files, so the
 --      first parent to name it would choose the operator of all of them, and a
 --      container picks its next identity by editing its own LEARNED.md. A
---      shared identity is linked by hand;
+--      shared identity is linked by hand. A refusal of the link body itself
+--      (55000, e.g. 107's shared-signer fingerprint, whose OPERATED_BY edges
+--      any application session can forge) refuses the link, not the
+--      registration: `inherited = false`, reason `link_refused`;
 --   6. writes one `security_events` row `agent.identity_registered` naming the
 --      child, parent, group, operator, snapshot and `session_user` -- only when
 --      something new was recorded, so a repeat start writes nothing but
@@ -914,16 +917,26 @@ BEGIN
             -- link nothing; a shared identity is linked by a manual act.
             v_reason := 'shared_identity';
         ELSIF v_child_op IS NULL THEN
-            SELECT b.link_live INTO v_live
-              FROM public.epigraph_link_operator_body(
-                       v_child, v_parent_op,
-                       jsonb_build_object('source', 'epigraph_register_agent_identity',
-                                          'inherited_from', v_parent,
-                                          'group_folder', p_group_folder)) b;
-            v_inherited := COALESCE(v_live, false);
-            IF NOT v_inherited THEN
-                v_reason := 'link_not_live';
-            END IF;
+            -- The link body's own refusals (55000: 107's shared-signer
+            -- fingerprint, single hop, one operator ever) refuse the LINK, not
+            -- the registration. Their inputs include OPERATED_BY edges, which
+            -- any application session can write, so letting one abort the
+            -- call would let a container stop its group starting. The block
+            -- rolls back only the body's own writes.
+            BEGIN
+                SELECT b.link_live INTO v_live
+                  FROM public.epigraph_link_operator_body(
+                           v_child, v_parent_op,
+                           jsonb_build_object('source', 'epigraph_register_agent_identity',
+                                              'inherited_from', v_parent,
+                                              'group_folder', p_group_folder)) b;
+                v_inherited := COALESCE(v_live, false);
+                IF NOT v_inherited THEN
+                    v_reason := 'link_not_live';
+                END IF;
+            EXCEPTION WHEN SQLSTATE '55000' THEN
+                v_reason := 'link_refused';
+            END;
         ELSIF v_child_op = v_parent_op THEN
             v_reason := 'already_linked';
         ELSE
