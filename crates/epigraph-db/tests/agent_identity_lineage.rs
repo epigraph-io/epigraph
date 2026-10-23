@@ -1976,3 +1976,70 @@ async fn a_child_whose_own_link_is_retired_is_reported_retired(pool: PgPool) {
     assert!(live, "CALIBRATION: a live-linked child can write");
     assert_eq!(reason.as_deref(), Some("already_linked"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: the lineage walk is linear in the lineage (TC2/CR5).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One identity shared by many groups is the design's own case: every group
+/// with the same files is one agent. A lineage of `GENERATIONS` identities,
+/// each registered in all `GROUPS` groups with the previous one as its parent,
+/// has `GROUPS` succession rows per hop. The history read must expand each
+/// lineage member ONCE: one row per (member, snapshot), inside a statement
+/// timeout. A walk over paths instead of members materialises
+/// GROUPS^(GENERATIONS-1) rows first (review TC2/CR5). Read as the maintenance
+/// session, so the read gate and link inheritance play no part.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_over_a_lineage_shared_by_many_groups_stays_linear(pool: PgPool) {
+    const GROUPS: usize = 10;
+    const GENERATIONS: usize = 8;
+    let groups: Vec<String> = (0..GROUPS).map(|g| format!("g-wide-{g}")).collect();
+    let mut lineage: Vec<Uuid> = Vec::new();
+    for gen in 0..GENERATIONS {
+        let id = new_identity();
+        let parent = lineage.last().copied();
+        let mut agent = None;
+        for g in &groups {
+            let r = register(&pool, &id, parent, g, snapshot(g, &format!("gen {gen}"))).await;
+            agent = Some(r.agent_id);
+        }
+        lineage.push(agent.expect("registered"));
+    }
+    let newest = *lineage.last().expect("newest");
+
+    let rows = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SET statement_timeout = '3s'")
+            .execute(&mut *conn)
+            .await
+            .expect("timeout");
+        let r: Result<Vec<(Uuid, i32, Option<Uuid>)>, sqlx::Error> = sqlx::query_as(
+            "SELECT agent_id, depth, snapshot_id FROM public.epigraph_agent_prompt_history($1)",
+        )
+        .bind(newest)
+        .fetch_all(&mut *conn)
+        .await;
+        sqlx::query("RESET statement_timeout")
+            .execute(&mut *conn)
+            .await
+            .expect("reset");
+        (conn, r)
+    })
+    .await
+    .expect("the history of a wide lineage reads inside the timeout");
+
+    assert_eq!(
+        rows.len(),
+        GROUPS * GENERATIONS,
+        "one row per (lineage member, snapshot)"
+    );
+    let distinct: std::collections::BTreeSet<(Uuid, Option<Uuid>)> =
+        rows.iter().map(|(a, _, s)| (*a, *s)).collect();
+    assert_eq!(distinct.len(), rows.len(), "no (member, snapshot) twice");
+    for (i, agent) in lineage.iter().enumerate() {
+        let want = i as i32 - (GENERATIONS as i32 - 1);
+        assert!(
+            rows.iter().filter(|(a, _, _)| a == agent).all(|(_, d, _)| *d == want),
+            "generation {i} must sit at depth {want}"
+        );
+    }
+}
