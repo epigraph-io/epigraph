@@ -2861,6 +2861,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          callers still pass their pool. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "divergence.rs",
+        "store",
+        "INSERT INTO `ds_bayesian_divergence` ... RETURNING id; a WRITE with no FROM for a \
+         viewer splice. Its control is the table's FORCE'd RLS (079) against the connection's \
+         GUCs, tenancy inherited from the claim (070's inheritor list, 114's writer-owned arm). \
+         Generic so REST `submit_evidence` can write its divergence record on a `write_as` \
+         transaction: on the unstamped raw pool FORCE refused it without an error. Pinned by \
+         `epigraph-api/tests/frames_evidence_armed.rs`. SCOPE: executor only; the \
+         SQL is unchanged.",
+    ),
+    (
         "mass_function.rs",
         "copy_to_frame",
         "Runs no SQL of its own: it re-stores an already-read `MassFunctionRow` onto another \
