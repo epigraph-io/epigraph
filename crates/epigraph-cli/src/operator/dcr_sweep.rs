@@ -38,8 +38,16 @@
 //! * **Dry run by default.** Without `--apply` the same statements, audit rows
 //!   included, run in a transaction that is rolled back.
 //! * **One transaction.** The candidates are read `FOR UPDATE` with the
-//!   predicate above, so a code minted concurrently either lands first (and the
-//!   row is not a candidate) or waits.
+//!   predicate above. The lock serializes the sweep against other sweeps and
+//!   against status writers on the same rows; it does NOT serialize it against
+//!   a code being minted. `consent_endpoint` names the DCR client only by its
+//!   text `client_id` on the code row (no foreign key to `oauth_clients`,
+//!   migration 049) and never reads or locks the DCR row, so a code inserted
+//!   while the sweep runs neither waits nor shows up in the `NOT EXISTS`
+//!   snapshot. That race is harmless: the client is already older than the
+//!   floor, and the code is redeemed against the PER-USER client
+//!   (`handle_authorization_code` gates on `oauth_client_id`'s status), not the
+//!   DCR row, so an in-flight flow still completes.
 //! * **Audited.** Every swept client gets one `security_events` row
 //!   (`oauth.dcr_client_swept`) in the same transaction: who ran it (the same
 //!   facts as `grant-client-scope`), the client, the age floor and the reason.
