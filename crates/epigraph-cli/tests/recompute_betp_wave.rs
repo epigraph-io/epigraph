@@ -1288,7 +1288,8 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
 /// for compound-source edges (SPEC §6.3) can differ from the server's that
 /// the apply is checked against; stages (3b) to (4) and the cohort depend on
 /// it. So every report line names the setting it was computed under: the
-/// process's `EPIGRAPH_COMPOUND_SOURCE_EDGES`, `frozen` when unset.
+/// process's `EPIGRAPH_COMPOUND_SOURCE_EDGES`, `frozen` when unset, unless
+/// `--target-compound-source-edges` names the setting the review is for.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_drift_report_names_the_compound_source_edges_setting_it_read(pool: PgPool) {
     let dir = scratch_dir();
@@ -1300,29 +1301,33 @@ async fn a_drift_report_names_the_compound_source_edges_setting_it_read(pool: Pg
     insert_row(&pool, atom, &evidence_row(bin, source, 0.7, None)).await;
     let s0 = take_snapshot(&db, &dir, "s0.jsonl");
 
-    for (env_value, want) in [(None, "frozen"), (Some("excluded"), "excluded")] {
-        let report = dir.join(format!("report-{want}.jsonl"));
+    for (env_value, flag, want) in [
+        (None, None, "frozen"),
+        (Some("excluded"), None, "excluded"),
+        (None, Some("excluded"), "excluded"),
+        (Some("excluded"), Some("frozen"), "frozen"),
+    ] {
+        let report = dir.join(format!("report-{}.jsonl", Uuid::new_v4()));
         let mut env = vec![("DATABASE_URL", db.as_str())];
         if let Some(v) = env_value {
             env.push(("EPIGRAPH_COMPOUND_SOURCE_EDGES", v));
         }
-        run(
-            RECOMPUTE_BETP,
-            &dir,
-            &[
-                "--dry-run",
-                "--role",
-                "standalone",
-                "--target-fold",
-                "aef_standalone",
-                "--s0",
-                s(&s0),
-                "--report",
-                s(&report),
-            ],
-            &env,
-        )
-        .ok(&format!("dry run under {want}"));
+        let mut args = vec![
+            "--dry-run",
+            "--role",
+            "standalone",
+            "--target-fold",
+            "aef_standalone",
+            "--s0",
+            s(&s0),
+            "--report",
+            s(&report),
+        ];
+        if let Some(f) = flag {
+            args.extend(["--target-compound-source-edges", f]);
+        }
+        run(RECOMPUTE_BETP, &dir, &args, &env)
+            .ok(&format!("dry run, env {env_value:?}, flag {flag:?}"));
         let lines = report_lines(&report);
         assert!(!lines.is_empty(), "control: the atom is reported");
         for line in &lines {

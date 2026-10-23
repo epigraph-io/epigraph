@@ -254,6 +254,16 @@ pub const fn fold_str(fold: AtomFoldMode) -> &'static str {
     }
 }
 
+/// The CLI spelling of a compound-source-edges setting (as
+/// `EPIGRAPH_COMPOUND_SOURCE_EDGES` takes it).
+#[must_use]
+pub const fn cse_str(cse: CompoundSourceEdges) -> &'static str {
+    match cse {
+        CompoundSourceEdges::Frozen => "frozen",
+        CompoundSourceEdges::Excluded => "excluded",
+    }
+}
+
 // ── cohort v2: waves over evidenced atoms (SPEC §10.3, §10.7) ──────────────
 
 /// Which atoms a wave covers.
@@ -957,6 +967,10 @@ pub struct DriftLine {
     pub claim_id: Uuid,
     pub role: &'static str,
     pub target_fold: &'static str,
+    /// The compound-source-edges setting the cohort and stages (3b) to (4)
+    /// were computed under (the dry run is exempt from the mode check, so it
+    /// can differ from the server's).
+    pub compound_source_edges: &'static str,
     /// The S0 value; `None` when the claim is not in S0 (the components then
     /// start from the served value, and `s0_missing` says so).
     pub s0: Option<f64>,
@@ -1160,6 +1174,7 @@ pub async fn drift_decomposition(
         claim_id,
         role: role.as_str(),
         target_fold: fold_str(target),
+        compound_source_edges: cse_str(compound_source_edges),
         s0,
         s0_missing: s0.is_none(),
         served: served.pignistic_prob,

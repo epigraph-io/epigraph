@@ -8,7 +8,8 @@
 //! ```text
 //! # review a wave (writes nothing; exempt from the mode check)
 //! recompute_betp --dry-run --role standalone|leaf \
-//!     [--target-fold legacy|aef_standalone|aef] --s0 <snapshot> \
+//!     [--target-fold legacy|aef_standalone|aef] \
+//!     [--target-compound-source-edges frozen|excluded] --s0 <snapshot> \
 //!     [--alpha-manifest <row ids>] [--report <file>] [--accept-vacate <list>]
 //!
 //! # apply a wave, or an accepted vacate list (one per run)
@@ -68,8 +69,8 @@
 //! **`--dry-run`** writes nothing and is exempt from the mode check. With
 //! `--role` it prints (or writes to `--report`) one JSON line per cohort atom
 //! with the drift decomposition from S0 (`--s0`, a `belief_snapshot` file)
-//! under `--target-fold` (default: this process's fold), whatever the
-//! server's flag is: components (0b) organic writes since S0, (0c) the clamp
+//! under `--target-fold` and `--target-compound-source-edges` (default: this
+//! process's settings), whatever the server's are; each line names both: components (0b) organic writes since S0, (0c) the clamp
 //! residue, (1) the owner-rule recompute, (1') the α change (only with
 //! `--alpha-manifest`, the `mass_functions` ids a type backfill set after S0;
 //! else `null`), (2) the template drop, (3) the AEF row set, (3a) the
@@ -90,7 +91,7 @@ use uuid::Uuid;
 use epigraph_cli::belief_cache::read_snapshot;
 use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent, MODE_CHECK_REFUSED_EXIT};
 use epigraph_cli::recompute_betp::{
-    drift_decomposition, fold_str, parse_accept_list, predict_cached_after, select_cohort,
+    cse_str, drift_decomposition, fold_str, parse_accept_list, predict_cached_after, select_cohort,
     select_wave_cohort, vacate_listed_claim, write_wave_claim, DiskGate, DriftLine, WaveLog,
     WaveRole, DRIFT_COMPONENTS,
 };
@@ -122,6 +123,11 @@ struct Cli {
     /// server's `EPIGRAPH_ATOM_FOLD` is (SPEC §10.3). Default: this process's.
     #[arg(long, requires = "dry_run", requires = "role", value_parser = parse_target_fold)]
     target_fold: Option<AtomFoldMode>,
+    /// With --dry-run --role: the compound-source-edges setting the cohort
+    /// and decomposition are for (`frozen` or `excluded`), whatever this
+    /// process's `EPIGRAPH_COMPOUND_SOURCE_EDGES` is. Default: this process's.
+    #[arg(long, requires = "dry_run", requires = "role", value_parser = parse_cse)]
+    target_compound_source_edges: Option<CompoundSourceEdges>,
     /// With --dry-run --role: snapshot S0 (a `belief_snapshot` file), the
     /// decomposition's starting point.
     #[arg(long)]
@@ -186,6 +192,11 @@ struct Cli {
 fn parse_target_fold(raw: &str) -> Result<AtomFoldMode, String> {
     AtomFoldMode::parse_value(raw)
         .ok_or_else(|| format!("unknown fold {raw:?}; one of legacy, aef_standalone, aef"))
+}
+
+fn parse_cse(raw: &str) -> Result<CompoundSourceEdges, String> {
+    CompoundSourceEdges::parse_value(raw)
+        .ok_or_else(|| format!("unknown setting {raw:?}; one of frozen, excluded"))
 }
 
 fn parse_role(raw: &str) -> Result<WaveRole, String> {
@@ -422,12 +433,16 @@ async fn run_dry(
             Some(p) => Some(read_row_manifest(p)?),
             None => None,
         };
-        let cohort = select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
+        let cse = cli
+            .target_compound_source_edges
+            .unwrap_or(settings.compound_source_edges);
+        let cohort = select_wave_cohort(pool, viewer, role, cse).await?;
         println!(
-            "wave cohort: {} {} atoms with AEF input; target fold {}",
+            "wave cohort: {} {} atoms with AEF input; target fold {}, compound_source_edges {}",
             cohort.len(),
             role.as_str(),
-            fold_str(target)
+            fold_str(target),
+            cse_str(cse)
         );
         let mut out: Box<dyn std::io::Write> = match &cli.report {
             Some(p) => Box::new(std::io::BufWriter::new(
@@ -443,7 +458,7 @@ async fn run_dry(
                 claim_id,
                 role,
                 target,
-                settings.compound_source_edges,
+                cse,
                 s0.get(&claim_id).copied().flatten(),
                 manifest.as_ref(),
             )
@@ -625,10 +640,11 @@ async fn run_real(
     if let Some(role) = cli.role {
         let cohort = select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
         println!(
-            "wave cohort: {} {} atoms with AEF input; atom_fold {}",
+            "wave cohort: {} {} atoms with AEF input; atom_fold {}, compound_source_edges {}",
             cohort.len(),
             role.as_str(),
-            fold_str(settings.fold)
+            fold_str(settings.fold),
+            cse_str(settings.compound_source_edges)
         );
         run_wave_batches(cli, pool, viewer, role, settings, &gate, &log, &cohort).await?;
     }
@@ -670,14 +686,6 @@ fn write_run_record(wave_file: &std::path::Path, record: &serde_json::Value) -> 
     let p = PathBuf::from(p);
     let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
     std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
-}
-
-/// The CLI spelling of a compound-source-edges setting.
-const fn cse_str(cse: CompoundSourceEdges) -> &'static str {
-    match cse {
-        CompoundSourceEdges::Frozen => "frozen",
-        CompoundSourceEdges::Excluded => "excluded",
-    }
 }
 
 async fn pace(cli: &Cli, batch: usize) {
