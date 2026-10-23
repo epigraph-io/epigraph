@@ -19,19 +19,22 @@ pub const CHALLENGE_NOT_WRITER_RULE: &str = "challenge_requires_claim_group_writ
 /// authority, not a server fault and not a bad parameter. Not that helper
 /// itself, because its text offers `claims:admin` as a way in, and a
 /// `claims:admin` token does not change whose group this row is written into.
-fn challenge_not_writer(claim_id: uuid::Uuid, owner_group: uuid::Uuid) -> McpError {
+///
+/// It does NOT name the claim's owning group: no claim read surface returns
+/// `owner_group_id`, and for another agent's public claim it is usually that
+/// agent's personal group. Same shape as `claim_not_writer`'s `data`.
+fn challenge_not_writer(claim_id: uuid::Uuid) -> McpError {
     McpError {
         code: ErrorCode::INVALID_REQUEST,
         message: std::borrow::Cow::from(format!(
             "cannot challenge claim {claim_id}: a challenge is owned by the challenged claim's \
-             group ({owner_group}), and the challenger holds no live writer or admin membership \
-             in it; nothing was written"
+             group, and the challenger holds no live writer or admin membership in it; nothing \
+             was written"
         )),
         data: Some(serde_json::json!({
             "error": "not_writer",
             "rule": CHALLENGE_NOT_WRITER_RULE,
             "claim_id": claim_id,
-            "owner_group_id": owner_group,
             "retryable": false,
         })),
     }
@@ -136,7 +139,7 @@ pub async fn challenge_claim(
         .await
         .map_err(internal_error)?;
     if !challenger_viewer.writable_groups().contains(&owner_group) {
-        return Err(challenge_not_writer(claim_id, owner_group));
+        return Err(challenge_not_writer(claim_id));
     }
 
     let challenge_id = ChallengeRepository::create(
@@ -149,7 +152,7 @@ pub async fn challenge_claim(
     .await
     .map_err(|e| {
         if is_insufficient_privilege(&e) {
-            challenge_not_writer(claim_id, owner_group)
+            challenge_not_writer(claim_id)
         } else {
             internal_error(e)
         }

@@ -108,8 +108,18 @@ fn assert_clean_refusal(e: &rmcp::ErrorData, claim: Uuid, group: Uuid, arm: &str
         "{arm}: {data}"
     );
     assert_eq!(data["claim_id"], claim.to_string(), "{arm}: {data}");
-    assert_eq!(data["owner_group_id"], group.to_string(), "{arm}: {data}");
     assert_eq!(data["retryable"], false, "{arm}: {data}");
+    // The owning group is not disclosed: no claim read surface returns it, and
+    // for another agent's public claim it is usually that agent's personal
+    // group.
+    assert!(
+        data.get("owner_group_id").is_none(),
+        "{arm}: the refusal must not disclose the claim's owning group: {data}"
+    );
+    assert!(
+        !e.message.contains(&group.to_string()) && !data.to_string().contains(&group.to_string()),
+        "{arm}: the owning group's id appears nowhere in the refusal: {e:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
