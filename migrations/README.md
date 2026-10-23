@@ -1416,18 +1416,29 @@ restart.
   (content-addressed zstd; UPDATE, DELETE and TRUNCATE refused for every
   role, a superuser included, short of disabling triggers),
   `agent_prompt_snapshots` (only `last_seen` moves, forward; no TRUNCATE) and
-  `agent_succession` (append-only, no TRUNCATE), each readable and writable by a maintenance-owned definer
-  frame only; moves `epigraph_link_operator`'s body unchanged into the
+  `agent_succession` (append-only, no TRUNCATE), each readable and writable
+  by a maintenance-owned definer frame only; moves `epigraph_link_operator`'s body unchanged into the
   maintenance-only invoker `epigraph_link_operator_body(uuid, uuid, jsonb)`
   (the entry point keeps its owner, ACL and edge properties); adds the
   definer `epigraph_register_agent_identity(...)`, EXECUTE-able by the
   attestor ALONE (PUBLIC, `epigraph_app` and its owner revoked), which finds
-  or creates the identity, stores the snapshot, records the succession,
-  registers the signing key and inherits a LIVE-linked parent's operator
-  (AID03 / AID05 / AID07 refuse and change nothing); adds the definer
-  `epigraph_agent_prompt_history(uuid)` for the request DSN (operator or
-  admin; AID06 otherwise); reserves the `agent.identity_` audit family; and
-  backfills one active `identity-legacy` `agent_keys` row per existing agent.
+  or creates the identity (checked against its own snapshots, never against
+  app-writable properties), stores the snapshot, records the succession,
+  binds the signing key once (a different key while one is active is AID08)
+  and inherits a LIVE-linked parent's operator, except into an unlinked
+  identity already running in another group (`shared_identity`) or where the
+  link body refuses (`link_refused`); the result reports `inherited`,
+  `link_live` and a reason (AID03 / AID05 / AID07 / AID08 refuse and change
+  nothing); adds the definer `epigraph_agent_prompt_history(uuid)` for the
+  request DSN (operator or admin; AID06 otherwise), whose lineage walk is
+  breadth-first, one step per member; reserves the `agent.identity_` audit
+  family; guards `agent_keys` so that `signing` and `identity-legacy` rows
+  are written, and their status moved, only by the attested registration or
+  a maintenance session (`epigraph_agent_key_set_status` gains that gate);
+  and backfills one active `identity-legacy` `agent_keys` row per existing
+  agent through the re-runnable maintenance function
+  `epigraph_backfill_legacy_agent_keys()`, which the cut-over (S5) runs
+  again.
   Behaviour in `epigraph-db/tests/agent_identity_lineage.rs` and
   `agent_identity_repo.rs`; `operator_link.rs` pins the entry point unchanged.
   Undo is in the file's header. Slot: 160 is carried by a non-PR remote branch,
