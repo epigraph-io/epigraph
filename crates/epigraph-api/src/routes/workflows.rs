@@ -2245,11 +2245,16 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
                 "write refused: could not establish the workflow-ingest-system agent's write \
                  authority. Nothing was written."
             );
-            ApiError::InternalError {
-                message: format!(
-                    "{route}: could not establish the workflow-ingest-system agent's write \
-                     authority: {e}. Nothing was written."
-                ),
+            match e {
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                    system_agent_unregistered(role)
+                }
+                e => ApiError::InternalError {
+                    message: format!(
+                        "{route}: could not establish the workflow-ingest-system agent's write \
+                         authority: {e}. Nothing was written."
+                    ),
+                },
             }
         })?;
 
@@ -2296,9 +2301,35 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
     })?;
     epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
+        .map_err(|e| match e {
+            epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                system_agent_unregistered(role)
+            }
+            other => ApiError::InternalError {
+                message: other.to_string(),
+            },
         })
+}
+
+/// The armed-and-unregistered refusal (migration 148), as a 500 the CALLER
+/// can read: its text is the operator's remedy, not a driver error, so it is
+/// [`ApiError::InternalErrorStatic`] and survives the 500 body redaction that
+/// every other `InternalError` gets. One literal per
+/// [`epigraph_db::SystemAgentRole`]; `role` is that enum's `as_str()`.
+#[cfg(feature = "db")]
+pub(crate) fn system_agent_unregistered(role: &'static str) -> ApiError {
+    ApiError::InternalErrorStatic {
+        message: if role == epigraph_db::SystemAgentRole::WorkflowIngest.as_str() {
+            "the workflow-ingest system agent is not registered in system_agents and this \
+             database is armed (migration 122): workflow ingest is refused until a maintenance \
+             session registers it (epigraph-operator register-system-agent --role \
+             workflow-ingest --agent <id> --reason <text> --apply). Nothing was written"
+        } else {
+            "a system agent is not registered in system_agents and this database is armed \
+             (migration 122): the request is refused until a maintenance session registers it \
+             (epigraph-operator register-system-agent). Nothing was written"
+        },
+    }
 }
 
 /// Embed the claims a workflow ingest just committed. This runs post-commit and
@@ -2569,6 +2600,9 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
             reason: format!("workflow ingest: {e}"),
         },
+        epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+            system_agent_unregistered(role)
+        }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
         },
@@ -2603,6 +2637,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
         {
             ApiError::from(db)
         }
+        E::Executor(epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered {
+            role,
+        }) => system_agent_unregistered(role),
         E::Db(e) => ApiError::InternalError {
             message: format!("db: {e}"),
         },
@@ -3760,9 +3797,18 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_is_all_or_nothing_when_a_step_row_fails(pool: PgPool) {
         let (app, workflow_id) = outcome_fixture(&pool, "outcome-atomic-http").await;
+        // A SEQUENCE counts the step-row INSERTs the trigger saw: `nextval` is
+        // not transactional, so the count survives the rollback and ties the
+        // 500 to step B's refusal (the 500 body is redacted, so the error
+        // text can no longer do that).
+        sqlx::query("CREATE SEQUENCE u033_http_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE FUNCTION u033_http_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             BEGIN PERFORM nextval('u033_http_attempts'); \
+             IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
              RETURN NEW; END $$",
         )
         .execute(&pool)
@@ -3792,12 +3838,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Tie the 500 to the injected refusal of step B, so an unrelated
-        // early error (begin, lookup) cannot satisfy this test.
+        // early error (begin, lookup) cannot satisfy this test: the trigger
+        // saw BOTH step rows, and step B's always raises.
+        let attempts: i64 = sqlx::query_scalar("SELECT last_value FROM u033_http_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "the 500 must come from step B's refused row, after step A's INSERT ran"
+        );
+        // And the 500 body does not carry the database's error text
+        // (F-route-error-text-remainder).
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&body);
         assert!(
-            body.contains("behavioral_executions write failed") && body.contains("u033 injected"),
-            "the error must carry the step-row refusal: {body}"
+            !body.contains("u033 injected"),
+            "the 500 body must not carry the database's error text: {body}"
         );
         let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
         assert!(

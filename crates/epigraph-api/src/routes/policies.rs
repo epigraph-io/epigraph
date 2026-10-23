@@ -150,11 +150,10 @@ pub async fn create_challenge(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
-    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve system agent: {e}"),
-        })?;
+    // Passed through as-is: the resolver's armed-and-unregistered refusal is an
+    // `InternalErrorStatic` the caller must read (it names the registry and the
+    // remedy), and re-wrapping it as `InternalError` would redact it.
+    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool).await?;
 
     let content = format!(
         "Network access challenge: {}:{} ({})",
