@@ -1693,3 +1693,32 @@ async fn on_an_app_session_row_security_hides_a_compound_from_the_fold(pool: PgP
         "KNOWN GAP (PR-5b1): row security hides the decomposition, so the compound's row is read"
     );
 }
+
+// ── review: total conflict ──────────────────────────────────────────────────
+
+/// Two dogmatic items that contradict each other (K = 1) do not fail the
+/// fold: `combine_multiple` falls back to Yager's closed rule, so the
+/// conflict mass goes to Θ (Bel 0, Pl 1), and the fold reports the K = 1 it
+/// saw. A one-leaf derivation that must equal `atom_fold` (D11) has to adopt
+/// the same convention.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_dogmatic_contradicting_items_fold_to_ignorance_not_an_error(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let atom = claim(&pool, author, "dogmatic conflict").await;
+    for masses in [serde_json::json!({"0": 1.0}), serde_json::json!({"1": 1.0})] {
+        store(&pool, atom, b, Row::plain(agent(&pool).await), masses).await;
+    }
+    let f = atom_fold(&display(&pool, atom).await).expect("total conflict is not an error");
+    assert!(
+        close(f.belief(), 0.0) && close(f.plausibility(), 1.0),
+        "Yager closed: all mass on Θ, got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+    assert!(
+        close(f.mass_on_conflict(), 1.0),
+        "the fold saw K = 1, got {}",
+        f.mass_on_conflict()
+    );
+}

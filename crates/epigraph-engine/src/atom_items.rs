@@ -720,9 +720,13 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
 ///
 /// No rows is the vacuous interval, [`EvidencedInterval::is_unproven`].
 ///
+/// At total conflict between dogmatic items (K = 1) the fold does not fail:
+/// `combine_multiple` falls back to Yager's closed rule, so the conflict mass
+/// goes to Θ (Bel 0, Pl 1). A derivation that must agree with this fold on
+/// one leaf (D11) has to use the same K = 1 convention.
+///
 /// # Errors
-/// Rows of more than one atom, or a Dempster step that fails (total conflict
-/// between dogmatic items).
+/// Rows of more than one atom, or a Dempster step that errors.
 pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
     let Some(first) = rows.first() else {
         return Ok(EvidencedInterval::unproven());
