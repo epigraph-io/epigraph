@@ -75,6 +75,7 @@ impl BeliefInterval {
         Self {
             belief: 0.0,
             plausibility: 1.0,
+            // belief-profile: allow-literal (the uniform 1/n BetP of a frame with no evidence)
             pignistic_prob: 1.0 / hypothesis_count as f64,
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
@@ -194,7 +195,9 @@ pub async fn get_belief(
             // fall back to belief rather than to truth_value, which is the scalar this
             // whole read path exists to stop conflating with the DS state.
             pignistic_prob: cols.pignistic_prob.unwrap_or(belief),
+            // belief-profile: allow-literal (a NULL cached mass is no mass)
             mass_on_conflict: cols.mass_on_empty.unwrap_or(0.0),
+            // belief-profile: allow-literal (a NULL cached mass is no mass)
             mass_on_missing: cols.mass_on_missing.unwrap_or(0.0),
             framed: false,
             source: "cached".to_string(),

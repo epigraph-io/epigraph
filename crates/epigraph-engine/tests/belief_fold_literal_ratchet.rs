@@ -14,6 +14,15 @@
 //! `belief-profile: allow-literal (<reason>)`, so every exception is visible
 //! in review with its reason.
 //!
+//! A float `0.0` / `1.0` is NOT allowed where it stands for a parameter's
+//! value: the whole of an `else` or then arm, an `unwrap_or` /
+//! `unwrap_or_else` default, a match arm, a `return`, or a factor of `*` /
+//! `/` (that is how a parameter whose default is 0 or 1, such as the cross
+//! locality factor or a class weight, would be hardcoded back). Known limit:
+//! a 0/1 in any other position (a function argument, a struct field, a
+//! `let`) is still read as an identity or a bound, and integer `0` / `1` are
+//! never flagged.
+//!
 //! The defaults table is exempt only in `belief_profile.rs`, and only as ONE
 //! balanced `defaults-table-begin` / `defaults-table-end` pair. A marker in
 //! any other module, an unclosed or second pair, or a stray end exempts
@@ -266,8 +275,7 @@ fn scan_with(src: &str, table_allowed: bool) -> Vec<Finding> {
                 literal: MISPLACED_MARKER.into(),
             });
         }
-        let marked =
-            raw.contains(ALLOW_MARKER) || (idx > 0 && raw_lines[idx - 1].contains(ALLOW_MARKER));
+        let marked = is_marked(&raw_lines, idx);
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -311,7 +319,118 @@ fn scan_with(src: &str, table_allowed: bool) -> Vec<Finding> {
             }
         }
     }
+    let exempt = |idx: usize| {
+        table.is_some_and(|(b, e)| (b..=e).contains(&idx)) || is_marked(&raw_lines, idx)
+    };
+    findings.extend(positional_findings(&code, exempt));
+    findings.sort_by_key(|f| f.line);
     findings
+}
+
+/// The line (0-based) carries the allow marker, or the line directly above
+/// it does.
+fn is_marked(raw_lines: &[&str], idx: usize) -> bool {
+    raw_lines.get(idx).is_some_and(|l| l.contains(ALLOW_MARKER))
+        || (idx > 0 && raw_lines[idx - 1].contains(ALLOW_MARKER))
+}
+
+/// A float-typed 0 or 1 (`0.0`, `1.0`, `0_f64`, `1.0f32`, ...). Integer `0` /
+/// `1` are indices and counts, never a belief parameter's value, so they are
+/// not considered.
+fn is_float_zero_or_one(lit: &str) -> bool {
+    let core = lit.replace('_', "");
+    let (core, suffixed) = match core
+        .strip_suffix("f64")
+        .or_else(|| core.strip_suffix("f32"))
+    {
+        Some(c) => (c.to_string(), true),
+        None => (core.clone(), false),
+    };
+    matches!(core.as_str(), "0.0" | "1.0") || (suffixed && matches!(core.as_str(), "0" | "1"))
+}
+
+/// `text` ends with the keyword `kw` as a whole word.
+fn ends_with_word(text: &str, kw: &str) -> bool {
+    text.strip_suffix(kw)
+        .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// `text` starts with the keyword `kw` as a whole word.
+fn starts_with_word(text: &str, kw: &str) -> bool {
+    text.strip_prefix(kw)
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// A float 0 or 1 in a position where it stands for a parameter's VALUE
+/// rather than an identity or a bound: the whole of an `else` or then arm,
+/// an `unwrap_or` / `unwrap_or_else` default, a match arm, a `return`, or a
+/// factor of `*` / `/`. Scanned over the whole code text, so rustfmt's
+/// multi-line arms are seen. `exempt(line_idx)` skips marked and table lines.
+fn positional_findings(code: &str, exempt: impl Fn(usize) -> bool) -> Vec<Finding> {
+    let closure_default =
+        regex::Regex::new(r"unwrap_or_else\s*\(\s*(move\s*)?\|[^|]*\|$").expect("regex");
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let starts_number = c.is_ascii_digit()
+            && !prev.is_some_and(|p| p.is_alphanumeric() || p == '_' || p == '.');
+        if !starts_number {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() {
+            let ch = chars[i];
+            let fractional_dot = ch == '.'
+                && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())
+                && !chars[start..i].contains(&'.');
+            if ch.is_ascii_alphanumeric() || ch == '_' || fractional_dot {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let lit: String = chars[start..i].iter().collect();
+        if !is_float_zero_or_one(&lit) {
+            continue;
+        }
+        let line_idx = chars[..start].iter().filter(|&&ch| ch == '\n').count();
+        if exempt(line_idx) {
+            continue;
+        }
+        let window = start.saturating_sub(160);
+        let before: String = chars[window..start].iter().collect();
+        let before = before.trim_end();
+        let after_end = (i + 160).min(chars.len());
+        let after: String = chars[i..after_end].iter().collect();
+        let after = after.trim_start();
+        let arm_open = before.strip_suffix('{').map(str::trim_end);
+        let is_param = (after.starts_with(')')
+            && before
+                .strip_suffix('(')
+                .is_some_and(|b| ends_with_word(b.trim_end(), "unwrap_or")))
+            || (after.starts_with(')') && closure_default.is_match(before))
+            || (after.starts_with('}') && arm_open.is_some_and(|b| ends_with_word(b, "else")))
+            || (after.starts_with('}')
+                && arm_open.is_some()
+                && starts_with_word(after[1..].trim_start(), "else"))
+            || before.ends_with("=>")
+            || ends_with_word(before, "return")
+            || before.ends_with('*')
+            || before.ends_with('/')
+            || after.starts_with('*')
+            || after.starts_with('/');
+        if is_param {
+            out.push(Finding {
+                line: line_idx + 1,
+                literal: lit,
+            });
+        }
+    }
+    out
 }
 
 /// The module that owns the defaults table.

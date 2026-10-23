@@ -775,6 +775,7 @@ fn canonical_encode(v: &Value, out: &mut Vec<u8>) {
                 out.extend_from_slice(&i.to_le_bytes());
             } else {
                 let x = n.as_f64().unwrap_or(f64::NAN);
+                // belief-profile: allow-literal (reads -0.0 as 0.0 in the hash encoding)
                 let x = if x == 0.0 { 0.0 } else { x };
                 out.push(b'd');
                 out.extend_from_slice(&x.to_bits().to_le_bytes());
