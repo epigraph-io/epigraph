@@ -868,6 +868,72 @@ async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: P
     assert_failed_walk_reported(&pool, outcome).await;
 }
 
+/// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the
+/// caller and leaves no `papers` row: the wait arm skips the handler's eager
+/// `ensure_paper_node`, and the walk's own get-or-create runs after its guards.
+/// Detached, the same document is answered `queued` and its row survives.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": "Wait Drift Doc",
+            "doi": "10.1/wait-drift",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "t",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "S",
+            "paragraphs": [{
+                "text": "TAMPERED",
+                "span": { "start": 0, "end": 5 },
+                "atoms": ["a"],
+                "generality": [0],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": [],
+        "source_text": "alpha beta"
+    }))
+    .unwrap();
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the guard refusal, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("verbatim guard"),
+        "the refusal must be the verbatim guard, got: {}",
+        err.message
+    );
+    let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
+        .bind("10.1/wait-drift")
+        .fetch_one(&pool)
+        .await
+        .expect("count papers");
+    assert_eq!(
+        papers, 0,
+        "a guard refusal in wait mode must leave no papers row"
+    );
+}
+
 /// Positive arm: with `wait: true` a walk that succeeds returns the walk's own
 /// counts (not a queue acknowledgement), and its claims exist the moment the
 /// call returns, with no sleep.
