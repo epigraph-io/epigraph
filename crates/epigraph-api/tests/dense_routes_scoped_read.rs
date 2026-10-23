@@ -86,6 +86,7 @@
 //! |---|---|---|
 //! | `political.rs::epistemic_profile` | `AgentRepository::get_by_id`, `PoliticalRepository::{get_agent_profile_claims, get_agent_evidence_distribution}` | [`epistemic_profile_counts_the_viewers_own_group_private_claim`] |
 //! | `political.rs::claim_genealogy` | `PoliticalRepository::get_claim_genealogy` | [`claim_genealogy_serves_the_viewers_own_group_private_edge`] |
+//! | `political.rs::claim_genealogy` (existence probe) | `ClaimRepository::visible_claim_ids` | [`claim_genealogy_private_claim_is_404_like_a_missing_one`] |
 //! | `political.rs::compare_agents` | `AgentRepository::get_by_id`, `PoliticalRepository::get_agent_profile_claims`, over N agents | [`compare_agents_measures_every_agent_against_the_same_corpus`] |
 //! | `structural.rs::get_structural_features` | nine `StructuralRepository` reads on one connection | [`structural_features_counts_the_viewers_own_group_private_claim`] |
 //!
