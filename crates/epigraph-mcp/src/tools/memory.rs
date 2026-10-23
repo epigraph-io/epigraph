@@ -1062,13 +1062,13 @@ async fn recall_post_embed(
     //  * AFTER the audit block — that block derives `returned_claim_ids` from
     //    `results`, and this consumes `results` by value.
     //
-    // The score is the SAME `truth_value` `min_truth` gates on above, read out
-    // of the already-built result rather than recomputed, so the threshold and
-    // the gate cannot come to disagree about what a claim's belief is.
+    // The score is `belief_score`, the value `min_truth` gated on above, read
+    // out of the already-built result through `RecallGatedSignals` rather than
+    // chosen here: this site used to pass `truth_value`, which the gate stopped
+    // reading when it moved to the DS cache, so the threshold and the gate
+    // disagreed on every claim whose evidence has moved it.
     let (results, epistemic_partition) =
-        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
-            (r.truth_value, r.is_contested)
-        });
+        crate::types::split_epistemic(results, params.epistemic_partition);
 
     success_json(&RecallEnvelope {
         results,
