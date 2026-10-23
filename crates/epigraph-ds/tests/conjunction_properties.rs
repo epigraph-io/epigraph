@@ -1153,10 +1153,17 @@ fn profile_summarizes_leaves_without_a_conjunction() {
     assert_eq!(p.n, 6);
     assert_eq!(p.evidenced, 5, "the untouched leaf is not evidenced");
     assert_eq!(p.contested, 1, "only the refuted leaf has Pl < .5");
-    assert!(p.bel.min <= p.bel.median && p.bel.median <= p.bel.max);
-    assert!(p.betp.min <= p.betp.median && p.betp.median <= p.betp.max);
-    assert!(close(p.bel.max, 0.8), "strongest leaf {}", p.bel.max);
+    // Leaf Bel: .2, .4, .6, .8, 0 (refuted), 0 (untouched). Sorted
+    // 0, 0, .2, .4, .6, .8: the even-count median is (.2 + .4)/2.
     assert!(close(p.bel.min, 0.0));
+    assert!(close(p.bel.median, 0.3), "bel median {}", p.bel.median);
+    assert!(close(p.bel.max, 0.8), "strongest leaf {}", p.bel.max);
+    // Leaf BetP = Bel + Θ/2: .6, .7, .8, .9, then .15 for the refuted leaf
+    // (F .7, Θ .3) and .5 for the untouched one. Sorted .15, .5, .6, .7, .8,
+    // .9: median .65.
+    assert!(close(p.betp.min, 0.15), "betp min {}", p.betp.min);
+    assert!(close(p.betp.median, 0.65), "betp median {}", p.betp.median);
+    assert!(close(p.betp.max, 0.9), "betp max {}", p.betp.max);
     // The weakest leaf caps the envelope: the refuted leaf (F .7) has
     // Pl .3, every other leaf has Pl 1. Its floor is 0 (Σ Bel = 2 over six
     // leaves); its NR cap is the refuted leaf's 1 − .7.
@@ -1165,5 +1172,20 @@ fn profile_summarizes_leaves_without_a_conjunction() {
     assert!(
         close(p.frechet.lo, 0.0),
         "six leaves at ≤ .8 have no Fréchet floor"
+    );
+
+    // Odd count (leaves 0..=4): Bel sorted 0, .2, .4, .6, .8 has median .4;
+    // BetP sorted .15, .6, .7, .8, .9 has median .7.
+    let odd = profile(&leaves[..5], &items).unwrap();
+    assert_eq!(odd.n, 5);
+    assert!(
+        close(odd.bel.median, 0.4),
+        "odd bel median {}",
+        odd.bel.median
+    );
+    assert!(
+        close(odd.betp.median, 0.7),
+        "odd betp median {}",
+        odd.betp.median
     );
 }
