@@ -155,6 +155,9 @@ pub struct RestorePlan {
     pub entries: Vec<RestoreEntry>,
     pub broken_chain: Vec<Uuid>,
     pub not_in_wave: Vec<Uuid>,
+    /// Every in-scope wave claim, restorable or held back, with its earliest
+    /// record time: the sources [`downstream_edges`] lists edges for.
+    pub sources: Vec<(Uuid, DateTime<Utc>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +367,9 @@ pub fn plan_restore(records: &[WaveRecord], only: Option<&HashSet<Uuid>>) -> Res
     let mut plan = RestorePlan::default();
     for id in order {
         let group = &groups[&id];
+        if let Some(earliest) = group.iter().map(|r| r.at).min() {
+            plan.sources.push((id, earliest));
+        }
         let chains = group.windows(2).all(|w| w[0].written == w[1].before);
         match (chains, group.first(), group.last()) {
             (true, Some(first), Some(last)) => plan.entries.push(RestoreEntry {
@@ -567,13 +573,17 @@ pub async fn restore_wave(
     Ok(report)
 }
 
-/// Edges created after the wave whose source is a planned claim.
+/// Edges created after the wave whose source is a wave claim in scope.
 ///
 /// SPEC §10.8: an edge a wave claim sourced after the wave wrote an
 /// edge-factor BBA from the wave's value, and a cache restore does not undo
 /// that BBA. These are the targets of the follow-up targeted re-wire.
 ///
-/// "After" is per claim: `created_at > at` of THAT claim's record, so an edge
+/// Every in-scope wave claim counts ([`RestorePlan::sources`]), including one
+/// held back from the restore as a broken chain: the wave still wrote its
+/// value.
+///
+/// "After" is per claim: `created_at > at` of THAT claim's (earliest) record, so an edge
 /// created after the wave started but before its source was written (which
 /// froze the pre-wave value) is not listed. Only edges whose SOURCE is the
 /// wave claim: the BBA lands on the target. Closed edges (`valid_to` set) are
@@ -586,9 +596,9 @@ pub async fn downstream_edges(
     plan: &RestorePlan,
 ) -> anyhow::Result<Vec<DownstreamEdge>> {
     let mut out = Vec::new();
-    for chunk in plan.entries.chunks(DEFAULT_RESTORE_BATCH) {
-        let ids: Vec<Uuid> = chunk.iter().map(|e| e.claim_id).collect();
-        let ats: Vec<DateTime<Utc>> = chunk.iter().map(|e| e.at).collect();
+    for chunk in plan.sources.chunks(DEFAULT_RESTORE_BATCH) {
+        let ids: Vec<Uuid> = chunk.iter().map(|(id, _)| *id).collect();
+        let ats: Vec<DateTime<Utc>> = chunk.iter().map(|(_, at)| *at).collect();
         let mut rows: Vec<DownstreamEdge> = sqlx::query_as(
             "SELECT e.id AS edge_id, e.source_id, e.target_id, \
                     e.target_type::text AS target_type, e.relationship::text AS relationship, \
