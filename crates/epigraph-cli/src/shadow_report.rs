@@ -63,7 +63,9 @@ use epigraph_engine::atom_items::{
 };
 use epigraph_engine::belief_query::FramedBeliefContext;
 use epigraph_engine::belief_view::{Basis, BeliefView};
-use epigraph_engine::compound_belief::derive_compound_belief_batch;
+use epigraph_engine::compound_belief::{
+    derive_compound_belief_batch, derive_compound_conjunction_batch,
+};
 use epigraph_engine::source_dependence::ATTRIBUTED_METHOD;
 
 /// The `confirmed` partition's threshold (SPEC §3.2).
@@ -191,7 +193,9 @@ pub struct BetpLine {
     pub delta: f64,
 }
 
-/// A claim's drift decomposition (SPEC §10.4).
+/// A claim's drift decomposition (SPEC §10.4): an atom's in `BetP` from S0
+/// (or today) to its AEF fold, a compound's in Bel from today's own-fold to
+/// its derivation (see `compound_drift`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Drift {
     /// What the stages are measured in: `betp` for an atom (its fold's
@@ -746,6 +750,76 @@ async fn attributed_rows(
 /// clamp holds up, is null and folded into the next separable stage.
 const DRIFT_STAGES: [&str; 11] = ["0", "0b", "0c", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
 
+/// Each stage after the first, less the last separable stage before it
+/// (from `start`); a null stage is null and carries nothing, so the next
+/// separable stage absorbs it and the components sum to the last stage less
+/// `start`.
+fn telescope(
+    stages: &BTreeMap<&'static str, Option<f64>>,
+    order: &[&'static str],
+    start: f64,
+) -> BTreeMap<&'static str, Option<f64>> {
+    let mut prev = start;
+    order
+        .iter()
+        .skip(1)
+        .map(|key| {
+            let c = stages[key].map(|v| {
+                let d = v - prev;
+                prev = v;
+                d
+            });
+            (*key, c)
+        })
+        .collect()
+}
+
+/// A compound's drift stages, in Bel (SPEC §10.4): (a) the legacy own-fold,
+/// (b) R-DEP without attribution, (c) R-DEP with attribution, (d) (c) met by
+/// the `not_all` valuation.
+const COMPOUND_DRIFT_STAGES: [&str; 4] = ["a", "b", "c", "d"];
+
+/// One compound's drift decomposition, in Bel (its rank key):
+///
+/// * (a) today's own-fold: the cache's Bel (else today's gate score, for a
+///   compound with no cache);
+/// * (b) R-DEP over its leaves without `attributed_v1` rows: null, the
+///   derivation reads the leaves' rows as they are, so (c) absorbs it;
+/// * (c) R-DEP over its leaves as they are, before `not_all`
+///   (`conjunction`, read only for a compound with a `not_all` mass; with
+///   none, (c) is (d));
+/// * (d) the served derivation: (c) met by `not_all` (a spine's profile
+///   floor).
+///
+/// The product-frame `BetP` against today's gate score is its own line,
+/// never a stage: it is not in Bel. A snapshot (S0) holds `BetP`, so it does
+/// not start a compound's decomposition.
+fn compound_drift(base: &Base, view: &BeliefView, conjunction: Option<&BeliefView>) -> Drift {
+    let start = base.cache.bel.unwrap_or(base.score);
+    let stages: BTreeMap<&'static str, Option<f64>> = [
+        ("a", Some(start)),
+        ("b", None),
+        ("c", Some(conjunction.map_or(view.bel, |c| c.bel))),
+        ("d", Some(view.bel)),
+    ]
+    .into_iter()
+    .collect();
+    let components = telescope(&stages, &COMPOUND_DRIFT_STAGES, start);
+    Drift {
+        unit: "bel",
+        start,
+        stages,
+        components,
+        final_value: view.bel,
+        total: view.bel - start,
+        product_frame_betp: Some(BetpLine {
+            today: base.score,
+            derived: view.betp,
+            delta: view.betp - base.score,
+        }),
+    }
+}
+
 /// One atom's drift decomposition, in `BetP` (see [`Drift`]):
 ///
 /// * (0) the snapshot's value, when one was given;
@@ -801,16 +875,7 @@ async fn drift(
     stages.insert("4", Some(fold_betp));
 
     let start = s0.unwrap_or(base.score);
-    let mut prev = start;
-    let mut components = BTreeMap::new();
-    for key in DRIFT_STAGES.iter().skip(1) {
-        let c = stages[key].map(|v| {
-            let d = v - prev;
-            prev = v;
-            d
-        });
-        components.insert(*key, c);
-    }
+    let components = telescope(&stages, &DRIFT_STAGES, start);
     Ok(Drift {
         unit: "betp",
         start,
@@ -929,6 +994,18 @@ async fn eval_compounds(
         return Ok((HashMap::new(), HashMap::new()));
     }
     let views = derive_compound_belief_batch(&mut *conn, viewer, &ids, ctx).await?;
+    // Drift stage (c), the conjunction before `not_all`, for the compounds
+    // that carry a `not_all` mass (for the rest it is the served value).
+    let refuted: Vec<Uuid> = views
+        .iter()
+        .filter(|(_, v)| v.derived.as_ref().is_some_and(|d| d.not_all.m > 0.0))
+        .map(|(id, _)| *id)
+        .collect();
+    let conjunctions = if refuted.is_empty() {
+        HashMap::new()
+    } else {
+        derive_compound_conjunction_batch(&mut *conn, viewer, &refuted, ctx).await?
+    };
     let closures = claim_role::leaf_closure_batch(&mut *conn, viewer, &ids)
         .await
         .map_err(|e| format!("leaf_closure_batch: {e}"))?;
@@ -1028,7 +1105,7 @@ async fn eval_compounds(
             *id,
             Eval {
                 aef: None,
-                drift: None,
+                drift: Some(compound_drift(base, view, conjunctions.get(id))),
                 view: Some(view.clone()),
                 ready: Some(ready),
                 progressive,
