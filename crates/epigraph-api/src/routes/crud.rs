@@ -305,16 +305,32 @@ pub async fn create_evidence(
             reason: format!("Invalid evidence_type JSON: {e}"),
         })?;
 
-    // Compute content hash from raw_content (or use provided hash)
+    // Compute content hash from raw_content (or use provided hash).
+    //
+    // A provided hash is verified whenever there is raw_content to verify it
+    // against: the stored digest must be the digest of the stored body, or the
+    // row's integrity claim is false (and, through the
+    // (content_hash, claim_id) uniqueness, a chosen digest could block a later
+    // legitimate row). With no raw_content the evidence is external and the
+    // caller's hash is the only one there is, as on `/api/v1/submit`.
     let content_hash: [u8; 32] = if let Some(ref hex_hash) = request.content_hash {
         let bytes = hex::decode(hex_hash).map_err(|e| ApiError::ValidationError {
             field: "content_hash".to_string(),
             reason: format!("Invalid hex: {e}"),
         })?;
-        bytes.try_into().map_err(|_| ApiError::ValidationError {
+        let provided: [u8; 32] = bytes.try_into().map_err(|_| ApiError::ValidationError {
             field: "content_hash".to_string(),
             reason: "content_hash must be exactly 32 bytes (64 hex chars)".to_string(),
-        })?
+        })?;
+        if let Some(ref raw) = request.raw_content {
+            if *blake3::hash(raw.as_bytes()).as_bytes() != provided {
+                return Err(ApiError::ValidationError {
+                    field: "content_hash".to_string(),
+                    reason: "content_hash does not match BLAKE3(raw_content)".to_string(),
+                });
+            }
+        }
+        provided
     } else {
         let hashable = request.raw_content.as_deref().unwrap_or("");
         let hash = blake3::hash(hashable.as_bytes());
