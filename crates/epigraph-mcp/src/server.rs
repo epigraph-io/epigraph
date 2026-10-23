@@ -2326,7 +2326,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation."
+        description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation. A `shadow` object appears only when the server runs with EPIGRAPH_COMPOUND_BELIEF=shadow: the claim's atom-level view beside the served values, which it does not change. basis=derived: computed from N visible atoms (shadow.derived.leaves_used); not evidence about this claim; never cite or resubmit as evidence."
     )]
     async fn get_belief(
         &self,

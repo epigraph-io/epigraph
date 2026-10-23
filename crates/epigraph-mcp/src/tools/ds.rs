@@ -617,6 +617,24 @@ pub async fn get_belief(
     viewer: &epigraph_db::visibility::Viewer,
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
+    get_belief_in_mode(
+        server,
+        viewer,
+        params,
+        epigraph_engine::belief_view::CompoundBeliefMode::current(),
+    )
+    .await
+}
+
+/// [`get_belief`] under an explicit `EPIGRAPH_COMPOUND_BELIEF` mode: in
+/// `shadow` the response also carries the claim's atom-level `shadow` view;
+/// in `legacy` it is exactly today's response.
+pub async fn get_belief_in_mode(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: GetBeliefParams,
+    mode: epigraph_engine::belief_view::CompoundBeliefMode,
+) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
 
@@ -688,6 +706,9 @@ pub async fn get_belief(
         None => None,
     };
 
+    let shadow =
+        epigraph_engine::belief_query::shadow_belief(&server.pool, viewer, claim_id, mode).await;
+
     let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
         claim_id: claim_id.to_string(),
@@ -699,6 +720,7 @@ pub async fn get_belief(
         mass_on_missing: interval.mass_on_missing,
         source: interval.source,
         lensed_belief,
+        shadow,
     })
 }
 
