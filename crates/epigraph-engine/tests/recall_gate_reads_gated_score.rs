@@ -5,9 +5,14 @@
 //! from) has no epistemic partition, so the property it must hold is the one
 //! the partition now depends on: the gate admits or drops a claim on its gated
 //! belief, never on its authored `truth_value`, and reports that gated score
-//! as `belief_score`. The two claims below are identical to retrieval (same
-//! vector, so both are exact-match semantic hits) and differ only in which
-//! side of the gate their authored value and their DS value fall on.
+//! as `belief_score`. In each test the two claims are identical to retrieval
+//! and differ only in which side of the gate their authored value and their DS
+//! value fall on.
+//!
+//! `recall` has two legs that gate separately: the semantic leg, and
+//! `text_search_fallback` (the ILIKE leg that serves a seed whenever the
+//! embedder errs). Each leg gets its own case, so a regression in either one
+//! is caught on its own.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -28,7 +33,15 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     id
 }
 
-async fn seed_claim(pool: &PgPool, agent: Uuid, content: &str, truth: f64, pgvec: &str) -> Uuid {
+/// `pgvec: None` seeds a claim with no embedding, which only the ILIKE
+/// fallback leg can return.
+async fn seed_claim(
+    pool: &PgPool,
+    agent: Uuid,
+    content: &str,
+    truth: f64,
+    pgvec: Option<&str>,
+) -> Uuid {
     let id = Uuid::new_v4();
     let mut hash = vec![0u8; 32];
     hash[..16].copy_from_slice(id.as_bytes());
@@ -78,8 +91,22 @@ async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
     );
 
     let agent = seed_agent(&pool).await;
-    let inflated = seed_claim(&pool, agent, "brelltide sorption inflated", 0.9, &pgvec).await;
-    let understated = seed_claim(&pool, agent, "brelltide sorption understated", 0.4, &pgvec).await;
+    let inflated = seed_claim(
+        &pool,
+        agent,
+        "brelltide sorption inflated",
+        0.9,
+        Some(&pgvec),
+    )
+    .await;
+    let understated = seed_claim(
+        &pool,
+        agent,
+        "brelltide sorption understated",
+        0.4,
+        Some(&pgvec),
+    )
+    .await;
     set_ds_cache(&pool, inflated, 0.3, 0.5, 0.4).await;
     set_ds_cache(&pool, understated, 0.85, 0.95, 0.9).await;
 
@@ -110,6 +137,71 @@ async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
     assert!(
         (kept.belief_score - 0.9).abs() < 1e-9 && (kept.truth_value - 0.4).abs() < 1e-9,
         "the engine must report the gated score as belief_score (0.9) and the authored \
+         truth_value (0.4) unchanged; got belief_score={} truth_value={}",
+        kept.belief_score,
+        kept.truth_value
+    );
+}
+
+/// The ILIKE fallback leg: the embedder errs on every call, and the fixture
+/// claims carry no embedding, so only `text_search_fallback` can return them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn engine_recall_fallback_leg_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // failure_rate 1.0: every generate_query errs, so `recall` takes the
+    // text-search fallback on every call below.
+    let failing = MockProvider::new(EmbeddingConfig::openai(1536)).with_failures(1.0);
+    assert!(
+        failing.generate_query("probe").await.is_err(),
+        "fixture: the provider must refuse to embed, or the semantic leg runs instead"
+    );
+    // ILIKE is `%query%`: every fixture's content contains the whole query.
+    let query = "vexmorrow lattice strain";
+
+    let agent = seed_agent(&pool).await;
+    let inflated = seed_claim(&pool, agent, "vexmorrow lattice strain inflated", 0.9, None).await;
+    let understated = seed_claim(
+        &pool,
+        agent,
+        "vexmorrow lattice strain understated",
+        0.4,
+        None,
+    )
+    .await;
+    set_ds_cache(&pool, inflated, 0.3, 0.5, 0.4).await;
+    set_ds_cache(&pool, understated, 0.85, 0.95, 0.9).await;
+
+    // Control: with the gate wide open the fallback leg returns both claims, so
+    // an absence below is the gate deciding.
+    let open = recall(&pool, &viewer, &failing, query, 10, 0.0)
+        .await
+        .expect("recall");
+    let open_ids: Vec<&str> = open.iter().map(|r| r.claim_id.as_str()).collect();
+    assert!(
+        open_ids.contains(&inflated.to_string().as_str())
+            && open_ids.contains(&understated.to_string().as_str()),
+        "control: both claims must be returned by the fallback leg at min_truth 0.0, \
+         got {open_ids:?}"
+    );
+
+    let gated = recall(&pool, &viewer, &failing, query, 10, 0.5)
+        .await
+        .expect("recall");
+    assert!(
+        !gated.iter().any(|r| r.claim_id == inflated.to_string()),
+        "a claim with truth_value 0.9 and BetP 0.4 passed a 0.5 gate on the fallback leg: \
+         text_search_fallback is reading truth_value"
+    );
+    let kept = gated
+        .iter()
+        .find(|r| r.claim_id == understated.to_string())
+        .expect(
+            "a claim with BetP 0.9 must pass a 0.5 gate on the fallback leg whatever its \
+             truth_value (0.4)",
+        );
+    assert!(
+        (kept.belief_score - 0.9).abs() < 1e-9 && (kept.truth_value - 0.4).abs() < 1e-9,
+        "the fallback leg must report the gated score as belief_score (0.9) and the authored \
          truth_value (0.4) unchanged; got belief_score={} truth_value={}",
         kept.belief_score,
         kept.truth_value
