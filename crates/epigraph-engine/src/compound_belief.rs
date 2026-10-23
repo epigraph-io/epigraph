@@ -15,6 +15,8 @@
 //!    items never depend on which other compounds share the batch;
 //! 3. for a leaf with no AEF input but a kept cache, one `legacy:<atom>`
 //!    pseudo-item built from the cache interval;
+//! 4. the compound's `not_all` valuation (SPEC §3.6): its own unmoved
+//!    refutation rows and the live refuting edges into it.
 //!
 //! A spine compound (level 0/1, or more than 16 visible leaves) gets a
 //! profile of its leaves, never a conjunction. Exactly one refuting edge
@@ -31,7 +33,7 @@ use uuid::Uuid;
 
 use epigraph_db::repos::claim_role::{leaf_closure_batch, roles_batch, ClaimRole};
 use epigraph_db::repos::compound_valuation::{
-    atom_cache_batch, refuting_edges_into, AtomCache, RefutingEdge,
+    atom_cache_batch, compound_own_rows, refuting_edges_into, AtomCache, RefutingEdge,
 };
 use epigraph_ds::conjunction::{
     conj_belief, joint_bel, not_all_closed_form, single_negative_sibling, ConjResult, Frechet,
@@ -39,12 +41,15 @@ use epigraph_ds::conjunction::{
 };
 use epigraph_ds::{DsError, FocalElement, MassFunction};
 
-use crate::atom_items::{atom_axiom_rows, atom_fold, AxiomClass, AxiomMode, AxiomRow};
+use crate::atom_items::{
+    atom_axiom_rows, atom_fold, key_and_discount, read_rows, AxiomClass, AxiomMode, AxiomRow,
+};
 use crate::belief_query::FramedBeliefContext;
 use crate::belief_view::{
     compound_ready, Basis, BeliefView, DerivedBelief, Envelope, InputSummary, LeafProfile,
     LeafState, NotAll, Summary3, AEF_RULE, DEP_RULE, LEGACY_RULE, PRODUCT_FRAME_BETP, PROFILE_RULE,
 };
+use crate::edge_factor::CLAIM_VALIDITY_FRAME_ID;
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 use crate::source_dependence::{item_partition, ItemId, ItemKey, ItemSide, KeyedBba};
 
@@ -467,6 +472,53 @@ fn serve(
     })
 }
 
+// ── not_all ─────────────────────────────────────────────────────────────────
+
+/// Each compound's own-row refutation masses (SPEC §3.6), per item key (the
+/// max within a key), as the viewer sees them.
+///
+/// Every visible row of the compound that is evidence about it (not an
+/// edge-factor, seed, propagated or `auto_cdst` row; cached combinations and
+/// the ingest template are never read) contributes its discounted
+/// refutation mass α·f on ¬(∧ leaves): the f part of a textless (T2/T3) row,
+/// of a mixed row, and of a pure refutation left on the compound (a
+/// `conj_refute` decision writes no atom row). A pure refutation that an
+/// `attributed_v1` row cites (readiness P3) is skipped: its mass now sits on
+/// the atoms.
+async fn own_row_valuations(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    compounds: &[Uuid],
+    ctx: &FramedBeliefContext,
+) -> Result<HashMap<Uuid, BTreeMap<ItemKey, f64>>, String> {
+    let own = compound_own_rows(&mut *conn, viewer, compounds, CLAIM_VALIDITY_FRAME_ID)
+        .await
+        .map_err(|e| format!("compound_own_rows: {e}"))?;
+    let moved: BTreeSet<Uuid> = own
+        .iter()
+        .filter(|r| r.cited_by_attribution)
+        .map(|r| r.input.row.id)
+        .collect();
+    let evidence = read_rows(own.into_iter().map(|r| r.input).collect())?
+        .into_iter()
+        .filter(|(_, class, _)| *class == AxiomClass::Evidence)
+        .collect();
+    let mut out: HashMap<Uuid, BTreeMap<ItemKey, f64>> = HashMap::new();
+    for r in key_and_discount(conn, viewer, evidence, ctx).await? {
+        let (t, f, _, _) = tfo(r.bba());
+        if f <= ZERO || (t <= ZERO && moved.contains(&r.row_id())) {
+            continue;
+        }
+        let slot = out
+            .entry(r.atom_id())
+            .or_default()
+            .entry(r.key().clone())
+            .or_insert(0.0);
+        *slot = slot.max(f);
+    }
+    Ok(out)
+}
+
 // ── entry points ────────────────────────────────────────────────────────────
 
 /// Each requested atom's [`LeafState`] as `viewer` sees it (SPEC §7.1): P1
@@ -595,16 +647,75 @@ pub async fn derive_compound_belief_batch(
         .map_err(|e| format!("leaf_closure_batch: {e}"))?;
     let leaf_union: BTreeSet<Uuid> = closures.values().flatten().copied().collect();
 
-    // Refuting edges between the compounds' leaves (negative siblings), as
-    // the viewer sees them.
-    let targets: Vec<Uuid> = leaf_union.iter().copied().collect();
+    // Refuting edges into the compounds (not_all) and between their leaves
+    // (negative siblings), as the viewer sees them.
+    let targets: Vec<Uuid> = compound_ids
+        .iter()
+        .chain(leaf_union.iter())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let edges = refuting_edges_into(&mut *conn, viewer, &targets)
         .await
         .map_err(|e| format!("refuting_edges_into: {e}"))?;
 
-    // ONE read of every leaf's Display rows, ONE partition into items.
-    let inputs = AtomInputs::read(conn, viewer, &leaf_union, ctx).await?;
+    // The sources of refuting edges into a compound, and their leaves.
+    let x_ids: Vec<Uuid> = edges
+        .iter()
+        .filter(|e| compounds.contains_key(&e.target_id))
+        .map(|e| e.source_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let x_compounds = compounds_of(conn, viewer, &x_ids).await?;
+    let x_closures = if x_compounds.is_empty() {
+        HashMap::new()
+    } else {
+        let ids: Vec<Uuid> = x_compounds.keys().copied().collect();
+        leaf_closure_batch(&mut *conn, viewer, &ids)
+            .await
+            .map_err(|e| format!("leaf_closure_batch: {e}"))?
+    };
+    let x_leaves = |x: Uuid| -> Vec<Uuid> {
+        if x_compounds.contains_key(&x) {
+            x_closures.get(&x).cloned().unwrap_or_default()
+        } else {
+            vec![x]
+        }
+    };
+
+    // ONE read of every atom's Display rows, ONE partition into items.
+    let mut atoms = leaf_union;
+    for &x in &x_ids {
+        atoms.extend(x_leaves(x));
+    }
+    let inputs = AtomInputs::read(conn, viewer, &atoms, ctx).await?;
     let batch = batch_items(&inputs.rows)?;
+
+    let non_spine: Vec<Uuid> = compounds
+        .iter()
+        .filter(|(_, spine)| !**spine)
+        .map(|(id, _)| *id)
+        .collect();
+    let own = own_row_valuations(conn, viewer, &non_spine, ctx).await?;
+
+    // Bel(X) for every edge source, as this derivation reads it.
+    let mut x_bel: HashMap<Uuid, f64> = HashMap::new();
+    for &x in &x_ids {
+        let bel = if x_compounds.contains_key(&x) {
+            let leaves = x_leaves(x);
+            if leaves.is_empty() {
+                0.0
+            } else {
+                let q = query_items(&leaves, &batch, &inputs, None)?;
+                conj(&leaves, &q.items, 0.0)?.bel
+            }
+        } else {
+            inputs.view(x)?.bel
+        };
+        x_bel.insert(x, bel);
+    }
 
     let mut out = HashMap::with_capacity(compounds.len());
     for (&id, &spine) in &compounds {
@@ -612,7 +723,29 @@ pub async fn derive_compound_belief_batch(
         let view = if spine {
             profile_view(id, &leaves, &batch, &inputs)?
         } else {
-            derived_view(id, &leaves, &batch, &inputs, &edges, NotAll::NONE)?
+            let leaf_set: BTreeSet<Uuid> = leaves.iter().copied().collect();
+            // not_all: own rows, then edges into the compound.
+            let mut masses: Vec<f64> = own
+                .get(&id)
+                .map(|keys| keys.values().copied().collect())
+                .unwrap_or_default();
+            let mut shared_leaf_skipped = 0;
+            for e in edges.iter().filter(|e| e.target_id == id) {
+                if x_leaves(e.source_id).iter().any(|l| leaf_set.contains(l)) {
+                    shared_leaf_skipped += 1;
+                    continue;
+                }
+                let m = negative_strength(&e.relationship) * x_bel[&e.source_id];
+                if m > ZERO {
+                    masses.push(m);
+                }
+            }
+            let not_all = NotAll {
+                m: 1.0 - masses.iter().map(|m| 1.0 - m).product::<f64>(),
+                sources: masses.len(),
+                shared_leaf_skipped,
+            };
+            derived_view(id, &leaves, &batch, &inputs, &edges, not_all)?
         };
         out.insert(id, view);
     }
