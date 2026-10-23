@@ -1405,6 +1405,33 @@ restart.
   claimed elsewhere. **Applied to throwaway databases only, NOT to any
   deployed database.**
 
+- **161**: public `agent_identity_lineage` (agent identity lineage design
+  D2-D4, slice S1). Creates the role `epigraph_identity_attestor` NOLOGIN and
+  a member of nothing (operations grants LOGIN and a password out of band; no
+  migration carries one); the FORCE-RLS tables `agent_prompt_blobs`
+  (content-addressed zstd, append-only even for a superuser),
+  `agent_prompt_snapshots` (only `last_seen` moves) and `agent_succession`
+  (append-only), each readable and writable by a maintenance-owned definer
+  frame only; moves `epigraph_link_operator`'s body unchanged into the
+  maintenance-only invoker `epigraph_link_operator_body(uuid, uuid, jsonb)`
+  (the entry point keeps its owner, ACL and edge properties); adds the
+  definer `epigraph_register_agent_identity(...)`, EXECUTE-able by the
+  attestor ALONE (PUBLIC, `epigraph_app` and its owner revoked), which finds
+  or creates the identity, stores the snapshot, records the succession,
+  registers the signing key and inherits a LIVE-linked parent's operator
+  (AID03 / AID05 / AID07 refuse and change nothing); adds the definer
+  `epigraph_agent_prompt_history(uuid)` for the request DSN (operator or
+  admin; AID06 otherwise); reserves the `agent.identity_` audit family; and
+  backfills one active `identity-legacy` `agent_keys` row per existing agent.
+  Behaviour in `epigraph-db/tests/agent_identity_lineage.rs` and
+  `agent_identity_repo.rs`; `operator_link.rs` pins the entry point unchanged.
+  Undo is in the file's header. Slot: 160 is carried by a non-PR remote branch,
+  so 161 is the first number free on `main`, on every open PR branch and on
+  every remote branch. **Deploy order:** none against the binaries (no
+  binary calls the new functions yet); the attestor login is provisioned
+  after the migration. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
