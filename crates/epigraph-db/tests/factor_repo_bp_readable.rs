@@ -141,3 +141,137 @@ async fn factor_repo_loaders_skip_decomposes_to(pool: PgPool) {
          get_all={all:?} get_for_claim={for_k:?}"
     );
 }
+
+// ── the policy half: the legacy arm under row security ──────────────────────
+//
+// `bp_readable_factor_sql`'s legacy arm decides by reading `edges`, which row
+// security filters, so what it excludes depends on the session it runs on.
+// The API runs it on the caller's `read_as` connection. These arms run the
+// predicate itself on a genuinely filtered session (`epigraph_app`, no
+// bypass), the shape of `lineage_scoped_read_policy.rs`: stamped by
+// `ScopedPool::read_as` first, or not stamped at all.
+
+/// Whether the predicate admits `factor` on `conn`, and whether `conn`
+/// bypasses row security (it must not, or the arm proves nothing).
+async fn readable_on(conn: &mut sqlx::PgConnection, factor: Uuid) -> (bool, bool) {
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epigraph_bypass()");
+    let readable: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM factors f WHERE f.id = $1 AND {})",
+        epigraph_db::repos::factor::bp_readable_factor_sql()
+    ))
+    .bind(factor)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("run the predicate");
+    (readable, bypass)
+}
+
+async fn stamped_readable(
+    pool: &PgPool,
+    mode: epigraph_db::SessionGucMode,
+    agent: Uuid,
+    factor: Uuid,
+) -> (bool, bool) {
+    use sqlx::Executor;
+    let scoped = viewer_fixture::scoped_pool_with_mode(pool, mode).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve on the superuser pool, before any downgrade");
+    let mut r = scoped.read_as(&viewer).await.expect("read_as");
+    r.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade the stamped connection");
+    let out = readable_on(&mut r, factor).await;
+    r.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    r.commit().await.expect("commit");
+    out
+}
+
+async fn unstamped_readable(pool: &PgPool, factor: Uuid) -> (bool, bool) {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade");
+    let out = readable_on(&mut conn, factor).await;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    out
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_arm_sees_the_callers_private_decomposition_only_when_stamped(pool: PgPool) {
+    let (owner, group) = seed_agent_with_group(&pool, "factor-policy-owner").await;
+    let (stranger, _) = seed_agent_with_group(&pool, "factor-policy-stranger").await;
+    let k = seed_group_claim(&pool, owner, group, "factor policy compound").await;
+    let a = seed_group_claim(&pool, owner, group, "factor policy atom").await;
+    // Both ends private to `group`, so the trigger stamps the edge private to
+    // `group` too.
+    let edge = decomposes_to(&pool, k, a).await;
+    let legacy = trigger_factor(&pool, edge).await;
+    sqlx::query("UPDATE factors SET properties = '{}'::jsonb WHERE id = $1")
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .expect("strip the row to the legacy shape");
+
+    for mode in [
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::SessionGucMode::Transaction,
+    ] {
+        let (readable, bypass) = stamped_readable(&pool, mode, owner, legacy).await;
+        assert!(
+            !bypass,
+            "CALIBRATION ({mode:?}): the stamped arm must be filtered"
+        );
+        assert!(
+            !readable,
+            "{mode:?}: stamped as a member of the edge's group, the legacy arm sees the \
+             decomposition and excludes the row"
+        );
+
+        // KNOWN GAP, pinned so a structural fix shows up here: a caller who
+        // cannot see the decomposition cannot exclude its legacy row. The
+        // structural close is deleting such rows on the maintenance connection
+        // (SPEC §6.2), not this predicate.
+        let (readable, bypass) = stamped_readable(&pool, mode, stranger, legacy).await;
+        assert!(
+            !bypass,
+            "CALIBRATION ({mode:?}): the stranger arm must be filtered"
+        );
+        assert!(
+            readable,
+            "{mode:?}: known gap changed: a caller outside the edge's group now excludes \
+             the legacy row; update bp_readable_factor_sql's doc and this assertion"
+        );
+    }
+
+    // Unstamped, even the owner's session sees no private edge: the reason the
+    // API loads factors on `read_as` and not on the raw pool.
+    let (readable, bypass) = unstamped_readable(&pool, legacy).await;
+    assert!(!bypass, "CALIBRATION: the unstamped arm must be filtered");
+    assert!(
+        readable,
+        "unstamped, the legacy arm cannot see a group-private edge, so the row is admitted"
+    );
+
+    // Control: a KEYED row needs no edge read, so it is excluded on every
+    // session, the unstamped one included.
+    sqlx::query("UPDATE factors SET properties = $2 WHERE id = $1")
+        .bind(legacy)
+        .bind(json!({"relationship": "decomposes_to", "source_edge_id": edge.to_string()}))
+        .execute(&pool)
+        .await
+        .expect("re-key the row");
+    let (readable, _) = unstamped_readable(&pool, legacy).await;
+    assert!(
+        !readable,
+        "control: a keyed decomposes_to row is excluded without any edge read"
+    );
+}
