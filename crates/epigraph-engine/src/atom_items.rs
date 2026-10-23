@@ -290,14 +290,18 @@ pub async fn atom_axiom_rows(
 ///    `research_validity` copy and no `hypothesis_assessment` row; any other
 ///    claim reads its `hypothesis_assessment` rows and no `error_derived`
 ///    `research_validity` copy. Never both.
-/// 2. **Seed** (ruling O16): a `truth_value_seed` row is kept only while it is
-///    the claim's sole input. Decided over the whole input, before the mode
-///    and compound-source filters, so `Display` and `Pure` agree on it.
-/// 3. **Compound-source edge rows** (SPEC §6.3): dropped under
+/// 2. **Compound-source edge rows** (SPEC §6.3): dropped under
 ///    [`CompoundSourceEdges::Excluded`], and under `Frozen` when the edge's
 ///    source compound is an ancestor of the claim (the self-reference guard,
 ///    over the viewer's leaf closure). A kept one on a positive relationship
 ///    is read one-sided: its m(F) moves to Θ.
+/// 3. **Seed** (ruling O16): a `truth_value_seed` row is kept only while it is
+///    the claim's sole input. Decided over the rows steps 1 and 2 kept (a row
+///    no fold reads is no input), and before the mode filter, so `Display`
+///    and `Pure` agree on it: beside an inferred row (an atom-source
+///    `edge_factor`, `propagated_*`, `auto_cdst`) the seed is dropped in both,
+///    which leaves `Pure` empty there, as O16's "sole non-template input"
+///    reads.
 /// 4. **Mode**: [`AxiomMode::Pure`] keeps evidence and the seed only.
 ///
 /// Each kept row is coarsened to `binary_truth` (a claim at hypothesis
@@ -330,49 +334,27 @@ pub async fn atom_axiom_rows_under(
         return Ok(HashMap::new());
     }
 
-    // Steps 1-4, per claim, before any further read.
-    let mut by_claim: HashMap<Uuid, Vec<AtomInputRow>> = HashMap::new();
-    for r in inputs {
-        by_claim.entry(r.row.claim_id).or_default().push(r);
-    }
-    let mut kept: Vec<(AtomInputRow, AxiomClass)> = Vec::new();
-    for (_, rows) in by_claim {
-        let rows: Vec<(AtomInputRow, AxiomClass)> = rows
-            .into_iter()
-            .filter(reads_this_side_of_promotion)
-            .map(|r| {
-                let class = classify(&r);
-                (r, class)
-            })
-            .collect();
-        let has_other_input = rows.iter().any(|(_, c)| *c != AxiomClass::Seed);
-        kept.extend(rows.into_iter().filter(|(_, class)| {
-            !(has_other_input && *class == AxiomClass::Seed)
-                && match class {
-                    AxiomClass::EdgeFactor {
-                        compound_source: true,
-                    } => compound_source_edges == CompoundSourceEdges::Frozen,
-                    _ => true,
-                }
-                && (mode == AxiomMode::Display
-                    || matches!(class, AxiomClass::Evidence | AxiomClass::Seed))
-        }));
-    }
+    // Step 1, and the class of each row.
+    let mut kept: Vec<(AtomInputRow, AxiomClass)> = inputs
+        .into_iter()
+        .filter(reads_this_side_of_promotion)
+        .map(|r| {
+            let class = classify(&r);
+            (r, class)
+        })
+        .collect();
 
+    // Step 2: compound-source edge rows. Under `Excluded` none is read.
+    if compound_source_edges == CompoundSourceEdges::Excluded {
+        kept.retain(|(_, class)| !is_compound_source(*class));
+    }
     // The self-reference guard: a compound-source edge row whose source
     // decomposes (through the viewer's closure) into the row's own claim.
     let sources: Vec<Uuid> = kept
         .iter()
-        .filter(|(_, c)| {
-            matches!(
-                c,
-                AxiomClass::EdgeFactor {
-                    compound_source: true
-                }
-            )
-        })
+        .filter(|(_, c)| is_compound_source(*c))
         .filter_map(|(r, _)| r.edge_source_id)
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
     let closures = if sources.is_empty() {
@@ -383,17 +365,28 @@ pub async fn atom_axiom_rows_under(
             .map_err(|e| format!("leaf_closure_batch: {e}"))?
     };
     kept.retain(|(r, class)| {
-        !matches!(
-            class,
-            AxiomClass::EdgeFactor {
-                compound_source: true
-            }
-        ) || !r.edge_source_id.is_some_and(|s| {
-            closures
-                .get(&s)
-                .is_some_and(|leaves| leaves.contains(&r.row.claim_id))
-        })
+        !is_compound_source(*class)
+            || !r.edge_source_id.is_some_and(|s| {
+                closures
+                    .get(&s)
+                    .is_some_and(|leaves| leaves.contains(&r.row.claim_id))
+            })
     });
+
+    // Step 3: the seed, over the rows some fold still reads.
+    let with_other_input: BTreeSet<Uuid> = kept
+        .iter()
+        .filter(|(_, c)| *c != AxiomClass::Seed)
+        .map(|(r, _)| r.row.claim_id)
+        .collect();
+    kept.retain(|(r, class)| {
+        *class != AxiomClass::Seed || !with_other_input.contains(&r.row.claim_id)
+    });
+
+    // Step 4: the mode.
+    if mode == AxiomMode::Pure {
+        kept.retain(|(_, class)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
+    }
     if kept.is_empty() {
         return Ok(HashMap::new());
     }
@@ -499,6 +492,16 @@ fn reads_this_side_of_promotion(r: &AtomInputRow) -> bool {
         !(r.frame_name == PROMOTED_FRAME_NAME
             && r.row.combination_method.as_deref() == Some(ERROR_DERIVED_METHOD))
     }
+}
+
+/// An edge-factor row whose edge's source is a compound.
+const fn is_compound_source(class: AxiomClass) -> bool {
+    matches!(
+        class,
+        AxiomClass::EdgeFactor {
+            compound_source: true
+        }
+    )
 }
 
 fn classify(r: &AtomInputRow) -> AxiomClass {
