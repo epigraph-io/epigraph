@@ -747,8 +747,7 @@ pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
             })
             .collect(),
     );
-    let for_fold: Vec<MassFunction> =
-        items.iter().filter_map(|it| it.on(atom).cloned()).collect();
+    let for_fold: Vec<MassFunction> = items.iter().filter_map(|it| it.on(atom).cloned()).collect();
     let n = for_fold.len();
     let (combined, conflict) =
         dempster_across_items(for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
@@ -789,8 +788,20 @@ mod tests {
     #[test]
     fn an_unset_blank_or_unrecognised_switch_is_the_default() {
         let fold = |raw| flag_value(AtomFoldMode::ENV, raw, AtomFoldMode::parse_value);
-        let edges = |raw| flag_value(CompoundSourceEdges::ENV, raw, CompoundSourceEdges::parse_value);
-        for raw in [None, Some(""), Some("   "), Some("aef-standalone"), Some("on")] {
+        let edges = |raw| {
+            flag_value(
+                CompoundSourceEdges::ENV,
+                raw,
+                CompoundSourceEdges::parse_value,
+            )
+        };
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("aef-standalone"),
+            Some("on"),
+        ] {
             assert_eq!(fold(raw), AtomFoldMode::Legacy, "{raw:?}");
         }
         assert_eq!(fold(Some(" AEF ")), AtomFoldMode::Aef);

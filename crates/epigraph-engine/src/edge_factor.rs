@@ -1477,9 +1477,9 @@ pub async fn recompute_atom_cache_with(
 
     let interval = atom_fold(&rows)?;
     let thresholds = &ctx.calibration.classifier_thresholds;
-    let has_opposing = rows
-        .iter()
-        .any(|r| measures::pignistic_probability(r.coarse(), 1) > thresholds.has_opposing_threshold);
+    let has_opposing = rows.iter().any(|r| {
+        measures::pignistic_probability(r.coarse(), 1) > thresholds.has_opposing_threshold
+    });
     let written = write_atom_cache(
         conn,
         viewer,
