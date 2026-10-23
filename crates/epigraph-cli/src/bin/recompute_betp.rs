@@ -37,7 +37,10 @@
 //! §10.2, gate G0; `epigraph_cli::belief_mode_check`). A dry run writes
 //! nothing and is exempt, so `--dry-run --target-fold <fold>` can run while
 //! the server is still on another fold. This build previews only the legacy
-//! fold; an AEF target reports the cohort and previews nothing.
+//! fold; an AEF target reports the cohort and previews nothing. For the same
+//! reason a writing run also refuses, exit 3, when its own
+//! `EPIGRAPH_ATOM_FOLD` is not `legacy`, even if the API agrees: this build
+//! writes only the legacy fold.
 //!
 //! `--dry-run` prints, per cohort claim, the cached `pignistic_prob` before
 //! the run alongside what the current combine pipeline would recompute it
@@ -51,7 +54,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent};
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::recompute_betp::{predict_cached_after, run_claim, select_cohort};
 use epigraph_engine::belief_modes::AtomFold;
 
@@ -108,6 +111,9 @@ async fn main() {
         RunIntent::Writes
     };
     enforce_or_exit("recompute_betp", intent, cli.allow_mode_skew).await;
+    // Agreement on the flag is not enough: this build's cache writers fold only
+    // the legacy way, so a writing run under another fold refuses.
+    enforce_build_fold_or_exit("recompute_betp", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a

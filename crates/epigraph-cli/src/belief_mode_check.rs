@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use epigraph_engine::belief_modes::{BeliefModes, UnrecognisedFlag};
+use epigraph_engine::belief_modes::{AtomFold, BeliefModes, UnrecognisedFlag};
 
 /// The exit status of a run the mode check refused, distinct from a run that
 /// failed for any other reason.
@@ -180,10 +180,75 @@ pub async fn enforce_or_exit(bin: &str, intent: RunIntent, allow_skew: bool) {
     }
 }
 
+/// The decision for a WRITING run of a bin whose writes fold atom caches, given
+/// this process's modes. Pure.
+///
+/// The cache writers in this build implement only the legacy fold. The mode
+/// check compares flag VALUES with the API's, not what either build can do,
+/// so a binary older than the server's fold would pass it and write
+/// legacy-fold caches while another fold is in force. That is refused here,
+/// whatever the server reports. The change that adds a fold to these writers
+/// widens this check.
+///
+/// # Errors
+/// The refusal text, when `ours.atom_fold` is not the legacy fold.
+pub fn check_build_writes_fold(bin: &str, ours: &BeliefModes) -> Result<(), String> {
+    if ours.atom_fold == AtomFold::Legacy {
+        return Ok(());
+    }
+    Err(format!(
+        "{bin}: refusing a writing run: this process runs atom_fold={fold} (set by {env}), but \
+         this build writes only the legacy fold, so it would write legacy-fold caches while \
+         the {fold} fold is in force. Run a build that implements the {fold} fold, or run \
+         with --dry-run. --allow-mode-skew does not lift this.",
+        fold = ours.atom_fold,
+        env = AtomFold::ENV,
+    ))
+}
+
+/// [`check_build_writes_fold`] for this process, then exit with
+/// [`MODE_CHECK_REFUSED_EXIT`] on a refusal. A run that writes nothing is
+/// exempt. For the `main` of a bin whose writes fold atom caches, after
+/// [`enforce_or_exit`] (so a skew is reported as a skew) and before it opens
+/// the database.
+pub fn enforce_build_fold_or_exit(bin: &str, intent: RunIntent) {
+    if intent == RunIntent::WritesNothing {
+        return;
+    }
+    if let Err(refusal) = check_build_writes_fold(bin, epigraph_engine::belief_modes::current()) {
+        eprintln!("{refusal}");
+        std::process::exit(MODE_CHECK_REFUSED_EXIT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epigraph_engine::belief_modes::{AtomFold, BpApply, CompoundWriteGuard};
+    use epigraph_engine::belief_modes::{BpApply, CompoundWriteGuard};
+
+    /// Only the legacy fold passes, whatever the other modes are; every other
+    /// fold is refused, named, with what this build writes.
+    #[test]
+    fn a_fold_this_build_cannot_write_is_refused_and_legacy_is_not() {
+        for fold in AtomFold::ALL.iter().copied() {
+            let ours = BeliefModes {
+                atom_fold: fold,
+                bp_apply: BpApply::On,
+                ..BeliefModes::default()
+            };
+            let decision = check_build_writes_fold("bin", &ours);
+            if fold == AtomFold::Legacy {
+                assert_eq!(decision, Ok(()));
+            } else {
+                let refusal = decision.unwrap_err();
+                assert!(
+                    refusal.contains(&format!("atom_fold={fold}"))
+                        && refusal.contains("writes only the legacy fold"),
+                    "{refusal}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn matching_modes_pass_and_any_difference_refuses_naming_every_differing_mode() {

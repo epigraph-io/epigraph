@@ -26,7 +26,7 @@
 
 use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
-use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent};
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -83,6 +83,9 @@ async fn main() {
         RunIntent::Writes
     };
     enforce_or_exit("backfill_factors", intent, cli.allow_mode_skew).await;
+    // Agreement on the flag is not enough: this build's cache writers fold only
+    // the legacy way, so a writing run under another fold refuses.
+    enforce_build_fold_or_exit("backfill_factors", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
