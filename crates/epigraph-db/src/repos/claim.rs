@@ -11019,18 +11019,35 @@ async fn mark_duplicate_act(
             source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
         });
     }
-    let canon_exists: bool = sqlx::query_scalar(
+    // The canonical must exist and be CURRENT: a mark onto a retired claim
+    // builds a dedup chain the caller never saw, which the un-mark then
+    // refuses while that canonical stays retired. A plain read, not FOR SHARE
+    // (that would take the UPDATE policy on the caller's stamped session); a
+    // concurrent retirement after it makes an ordinary chain, which the
+    // un-mark already orders.
+    let canon_current: Option<bool> = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+        SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
     )
     .bind(canon_uuid)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    if !canon_exists {
-        return Err(DbError::NotFound {
-            entity: "Claim".into(),
-            id: canon_uuid,
-        });
+    match canon_current {
+        None => {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: canon_uuid,
+            })
+        }
+        Some(false) => {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
+                     dedup chain onto a retired claim"
+                )),
+            })
+        }
+        Some(true) => {}
     }
     let row: Option<(Option<Uuid>,)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
