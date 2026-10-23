@@ -372,28 +372,34 @@ fn near(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() < tol
 }
 
-/// A view as JSON without its claim id, every number rounded to 1e-12, so
-/// two twin compounds compare by everything they disclose. (The twin's items
-/// have other row ids, so the conjunction may sum them in another order.)
+/// A view as JSON without its claim id: everything it discloses.
 fn disclosed(v: &BeliefView) -> serde_json::Value {
-    fn round(j: &mut serde_json::Value) {
-        match j {
-            serde_json::Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    if n.is_f64() {
-                        *j = serde_json::json!((f * 1e12).round() / 1e12);
-                    }
-                }
-            }
-            serde_json::Value::Array(a) => a.iter_mut().for_each(round),
-            serde_json::Value::Object(o) => o.values_mut().for_each(round),
-            _ => {}
-        }
-    }
     let mut j = serde_json::to_value(v).expect("serialize");
     j.as_object_mut().expect("object").remove("claim_id");
-    round(&mut j);
     j
+}
+
+/// Whether two disclosed views are the same: the same keys and non-float
+/// values everywhere, and floats within 1e-12. (A twin's items have other
+/// row ids, so the conjunction may sum them in another order; rounding to a
+/// grid instead would split two values one ulp apart across a boundary.)
+fn same_disclosure(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Number, Object};
+    match (a, b) {
+        (Number(x), Number(y)) if x.is_f64() || y.is_f64() => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-12,
+            _ => false,
+        },
+        (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_disclosure(x, y))
+        }
+        (Object(x), Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| same_disclosure(v, w)))
+        }
+        _ => a == b,
+    }
 }
 
 // ── (1), (2): Example 3, leak by division and per-viewer leaf sets ──────────
@@ -496,11 +502,11 @@ async fn each_viewer_counts_its_own_leaves_and_no_response_exposes_a_total(pool:
     assert_eq!(used(&grp_view), 4, "the group also sees a4");
 
     let twin_view = derive_one_as(&pool, &public, twin).await;
-    assert_eq!(
-        disclosed(&pub_view),
-        disclosed(&twin_view),
+    let (pub_json, twin_json) = (disclosed(&pub_view), disclosed(&twin_view));
+    assert!(
+        same_disclosure(&pub_json, &twin_json),
         "the public response over a tree with a private atom must be the response over \
-         a tree without one"
+         a tree without one:\n{pub_json}\n{twin_json}"
     );
 }
 
