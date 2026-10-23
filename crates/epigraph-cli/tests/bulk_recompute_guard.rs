@@ -946,3 +946,63 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
         }
     }
 }
+
+// ── (8) the role is decided without a viewer splice ─────────────────────────
+
+/// A PUBLIC compound whose only decomposition edge points at a group-private
+/// leaf (so the edge is stamped group-private too). Its role is structure, so
+/// a public viewer that cannot see the edge or the leaf must still find it a
+/// compound and leave its cache alone.
+///
+/// The test harness connects as a superuser, where row security does not
+/// apply, so this pins the SQL: no `VISIBILITY` splice on the compound test.
+/// (On a connection where row security applies, the server's own filtering
+/// still hides the edge; see `frozen_compound_predicate`.) The two public
+/// viewer callers are the arms that can see a splice; the MCP caller runs on a
+/// maintenance session and is kept for completeness.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_viewer_that_cannot_see_the_decomposition_cannot_refold_the_compound(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "guard-private").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let compound = fixture::seed_public_claim(&pool, author, &format!("public compound {caller:?}")).await;
+        let leaf = fixture::seed_group_claim(&pool, author, group, &format!("private leaf {caller:?}")).await;
+        decomposes_to(&pool, compound, leaf, false).await;
+        let edge_visibility: String = sqlx::query_scalar(
+            "SELECT visibility FROM edges WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(compound)
+        .bind(leaf)
+        .fetch_one(&pool)
+        .await
+        .expect("edge visibility");
+        assert_eq!(
+            edge_visibility, "group",
+            "CALIBRATION: an edge onto a group-private leaf is group-private"
+        );
+
+        // Calibration: the same row on a public standalone IS recomputed by
+        // this caller, so the compound's row is visible to it and "no write"
+        // below is the guard, not an empty input set.
+        let twin = fixture::seed_public_claim(&pool, author, &format!("public standalone {caller:?}")).await;
+        insert_row(&pool, twin, &evidence_row(bt, source, "auto_wire")).await;
+        let twin_before = set_sentinel_cache(&pool, twin, bt).await;
+        assert!(
+            recompute_via(&pool, caller, twin).await,
+            "CALIBRATION {caller:?}: the public twin is recomputed"
+        );
+        assert_ne!(cache(&pool, twin).await, twin_before, "CALIBRATION {caller:?}");
+
+        insert_row(&pool, compound, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(
+            &pool,
+            caller,
+            compound,
+            bt,
+            "a public compound whose decomposition the viewer cannot see",
+        )
+        .await;
+    }
+}
