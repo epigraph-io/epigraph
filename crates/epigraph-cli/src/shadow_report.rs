@@ -740,13 +740,17 @@ async fn attributed_rows(
 
 /// The drift decomposition's stages, in telescoping order (SPEC §10.4). The
 /// ones this report cannot separate are `null`, and the next separable
-/// stage absorbs them; `recompute_betp --dry-run` gives the full one.
-const DRIFT_STAGES: [&str; 10] = ["0", "0b", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
+/// stage absorbs them; `recompute_betp --dry-run` gives the full one. Every
+/// stage is present, so a reader can tell "not separated here" (null) from
+/// "not a stage" (absent): (0c), the part of the served value a monotonicity
+/// clamp holds up, is null and folded into the next separable stage.
+const DRIFT_STAGES: [&str; 11] = ["0", "0b", "0c", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
 
 /// One atom's drift decomposition, in `BetP` (see [`Drift`]):
 ///
 /// * (0) the snapshot's value, when one was given;
 /// * (0b) today's gate score;
+/// * (0c) the clamp residue: null (not separable here);
 /// * (1) the owner-rule recompute (what the held apply would write; today's
 ///   value where it would write nothing), only with `owner_preview`;
 /// * (3c) the AEF over the current rows without `attributed_v1` (paper-key
