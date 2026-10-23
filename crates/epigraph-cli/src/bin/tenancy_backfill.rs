@@ -1910,6 +1910,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // ran nothing" (quiet, the stake that makes the owner a control here).
     ("epigraph_register_agent_identity", 161),
     ("epigraph_agent_prompt_history", 161),
+    // 161 (review CR6), the re-runnable identity-legacy key backfill. It skips
+    // a host-registered identity by reading `agent_prompt_snapshots`, a FORCEd
+    // table whose policy admits only `epigraph_definer_bypass()`: under a
+    // non-member owner that read sees no snapshot, so a cut-over re-run gives
+    // every keyed identity a legacy row it must never have (quiet, and in the
+    // direction of binding a key that never signs).
+    ("epigraph_backfill_legacy_agent_keys", 161),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2519,6 +2526,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_agent_prompt_history",
             "public.epigraph_agent_prompt_history(uuid)",
             true,
+        ),
+        // 161 (review CR6): the cut-over's legacy-key backfill is a
+        // maintenance act; the request DSN never runs it.
+        (
+            "epigraph_backfill_legacy_agent_keys",
+            "public.epigraph_backfill_legacy_agent_keys()",
+            false,
         ),
     ];
 
