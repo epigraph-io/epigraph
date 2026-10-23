@@ -564,8 +564,13 @@ async fn rotate_agent_key_other_agent_gets_403_not_404_for_unknown_agent() {
 }
 
 // ---------------------------------------------------------------------------
-// rotate_agent_key — the caller check precedes body validation
+// rotate_agent_key — the caller check precedes the hex decode
 // ---------------------------------------------------------------------------
+//
+// The body below deserializes (every field is a string), so it reaches the
+// handler; only `hex::decode` would refuse it. A body serde cannot decode is
+// refused earlier, by the extractor, alike for every caller (see
+// `rotate_agent_key_undecodable_body_is_422_for_owner_and_non_owner_alike`).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rotate_agent_key_other_agent_gets_403_not_400_for_malformed_body() {
@@ -588,7 +593,7 @@ async fn rotate_agent_key_other_agent_gets_403_not_400_for_malformed_body() {
     let (status, text) = post_rotate(addr, victim.id, &token, &body).await;
     assert_eq!(
         status, 403,
-        "a non-owner must be refused before the body is validated; got {status} — {text}"
+        "a non-owner must be refused before the hex decode; got {status} — {text}"
     );
 }
 
