@@ -284,8 +284,8 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// `recompute_claim_belief_on_frame` callers) do not pass through this check;
 /// they are moved onto the single atom-cache writer separately.
 ///
-/// A procedural node (a workflow-rooted tree) is no compound and keeps
-/// today's behaviour; a cycle or a tree deeper than
+/// A procedural node (a workflow- or git-history-rooted tree) is no compound
+/// and keeps today's behaviour; a cycle or a tree deeper than
 /// [`super::claim_role::ROLE_MAX_DEPTH`] finds no procedural root, so its
 /// compounds stay frozen: the safe direction.
 ///

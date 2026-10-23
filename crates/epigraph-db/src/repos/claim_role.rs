@@ -8,7 +8,7 @@
 //!
 //! | role | predicate |
 //! |---|---|
-//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge) stamped as a workflow tree (`properties.source_type = 'workflow'`) |
+//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge) stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`) |
 //! | [`ClaimRole::Rule`] | labelled `rule` AND an in-force `rule_conclusion` out-edge to a current claim |
 //! | [`ClaimRole::Compound`] | an in-force `decomposes_to` out-edge to a current claim |
 //! | [`ClaimRole::Atom`] | an in-force `decomposes_to` in-edge from a current claim, and none out |
@@ -116,10 +116,14 @@ macro_rules! is_decomposed_from {
     };
 }
 
-/// The procedural root stamp, over a `claims` row aliased `role_root`.
+/// The procedural root stamp, over a `claims` row aliased `role_root`: a
+/// workflow tree's root (the workflow builder stamps `source_type: workflow`
+/// on its thesis) or a git-history tree's root (`ingest_git` stamps
+/// `source: git-history` on its repository node).
 macro_rules! procedural_root_stamp {
     () => {
-        "role_root.properties->>'source_type' = 'workflow'"
+        "(role_root.properties->>'source_type' = 'workflow' \
+          OR role_root.properties->>'source' = 'git-history')"
     };
 }
 
@@ -265,7 +269,8 @@ pub enum ClaimRole {
     /// than [`SPINE_LEAF_CAP`] leaves the viewer can see; a spine compound is
     /// served a profile, never a conjunction.
     Compound { spine: bool },
-    /// A node of a workflow tree: out of scope, today's behaviour.
+    /// A node of a workflow or git-history tree: out of scope, today's
+    /// behaviour.
     Procedural,
     /// A rule claim (label `rule` and a `rule_conclusion` edge).
     Rule,
