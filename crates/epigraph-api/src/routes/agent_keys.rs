@@ -81,6 +81,24 @@ pub struct RevokeKeyRequest {
 // HANDLERS
 // =============================================================================
 
+/// The caller rule for every agent-key mutation: the caller must be the
+/// target agent (`auth.agent_id == agent_id`) or hold `claims:admin`.
+///
+/// Key rotation and revocation both call this before any read, decode or
+/// signature check, so a non-owner learns nothing about the agent or its keys.
+#[cfg(feature = "db")]
+fn require_self_or_admin(
+    auth: &crate::middleware::bearer::AuthContext,
+    agent_id: Uuid,
+) -> Result<(), ApiError> {
+    if !auth.has_scope("claims:admin") && auth.agent_id != Some(agent_id) {
+        return Err(ApiError::Forbidden {
+            reason: "can only mutate your own agent record".into(),
+        });
+    }
+    Ok(())
+}
+
 /// List all keys for an agent
 ///
 /// GET /api/v1/agents/:id/keys
@@ -151,12 +169,7 @@ pub async fn rotate_agent_key(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        // Caller must be the target agent OR have claims:admin
-        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
-            return Err(ApiError::Forbidden {
-                reason: "can only mutate your own agent record".into(),
-            });
-        }
+        require_self_or_admin(auth, id)?;
     }
 
     // Decode the new public key from hex
@@ -317,12 +330,7 @@ pub async fn revoke_agent_key(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        // Caller must be the target agent OR have claims:admin
-        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
-            return Err(ApiError::Forbidden {
-                reason: "can only mutate your own agent record".into(),
-            });
-        }
+        require_self_or_admin(auth, id)?;
     }
 
     // Look up the key to verify it belongs to this agent
