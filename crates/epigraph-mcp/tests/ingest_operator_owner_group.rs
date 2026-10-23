@@ -282,6 +282,43 @@ async fn inline_ingest_by_a_linked_agent_lands_in_its_operators_group(pool: PgPo
     assert_ne!(own, human_group);
 }
 
+/// Wait mode authors under the same authority as the detached arm: the
+/// in-request walk of a linked agent lands in its OPERATOR's personal group,
+/// and has committed by the time the call returns (no polling).
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_ingest_by_a_linked_agent_lands_in_its_operators_group(pool: PgPool) {
+    let (human, human_group) = fixture::seed_human_operator(&pool, "human").await;
+    let server = app_role_server(&pool, SEED).await;
+    let agent = linked_after_own_group(&pool, &server, human).await;
+    let own = own_personal_group(&pool, agent)
+        .await
+        .expect("own personal group");
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("stdio viewer");
+
+    let doi = "10.9999/operator-owner-inline-wait";
+    let result = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            wait: Some(true),
+            extraction: doc(doi),
+        },
+        None,
+    )
+    .await
+    .map(|r| common::first_text(&r))
+    .map_err(|e| e.message.to_string())
+    .expect("a linked, acting agent's wait-mode ingest must commit");
+    assert!(
+        result.get("status").is_none(),
+        "wait mode returns the walk's result, not a queue acknowledgement: {result}"
+    );
+    assert_landed_in(&pool, doi, agent, human_group, "inline wait").await;
+    assert_ne!(own, human_group);
+}
+
 /// The same state, driving the walk directly so the failure is the walk's own
 /// error rather than a timeout.
 #[sqlx::test(migrations = "../../migrations")]
@@ -614,6 +651,42 @@ async fn an_allowlist_only_author_is_refused_opl02_synchronously(pool: PgPool) {
     .map_err(|e| e.message.to_string())
     .expect_err("an allowlist-only author must be refused");
     assert!(err.contains("OPL02"), "the refusal must be OPL02: {err}");
+    assert_nothing_written(&pool, doi).await;
+}
+
+/// The same HTTP principal in wait mode: the owner-group refusal is still the
+/// synchronous preflight's, so the call answers OPL02 and writes no `papers`
+/// row (the wait arm runs after the preflight, never instead of it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowlist_only_author_is_refused_opl02_in_wait_mode(pool: PgPool) {
+    let (human, _human_group) = fixture::seed_human_operator(&pool, "human").await;
+    let (agent, client) = allowlisted_agent(&pool, human, "svc").await;
+    arm(&pool).await;
+    let server = app_role_server(&pool, SEED).await;
+    let auth = token(agent, client);
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, Some(&auth))
+        .await
+        .expect("the allowlisted caller's HTTP viewer");
+
+    let doi = "10.9999/operator-owner-allowlisted-wait";
+    let err = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            wait: Some(true),
+            extraction: doc(doi),
+        },
+        Some(&auth),
+    )
+    .await
+    .map(|r| common::first_text(&r))
+    .map_err(|e| e.message.to_string())
+    .expect_err("an allowlist-only author must be refused in wait mode too");
+    assert!(err.contains("OPL02"), "the refusal must be OPL02: {err}");
+    assert!(
+        !err.contains("ingest walk is one transaction"),
+        "the refusal must come from the preflight, not a failed walk: {err}"
+    );
     assert_nothing_written(&pool, doi).await;
 }
 
