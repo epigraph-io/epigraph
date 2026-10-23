@@ -33,7 +33,11 @@
 //!   the frame tier the dedicated older keys win over the generic object.
 //! - *Perspective override*: a `belief_profile` object in
 //!   `perspectives.properties`, then the perspective's `source_reliability` /
-//!   `locality_reliability` maps.
+//!   `locality_reliability` maps. The perspective tier sits above the whole
+//!   frame tier, map entries included: an evidence type the perspective's
+//!   `reliability.evidence_type_weights` names (set, or removed with `null`)
+//!   is answered by the perspective, not by the frame's dedicated
+//!   `evidence_type_weights` key.
 //!
 //! Override objects are JSON merge patches (RFC 7386) over the serialized
 //! profile: objects merge key by key, any other value replaces, `null`
@@ -538,7 +542,21 @@ impl BeliefProfile {
             p.lens.frame_evidence_type_weights = to_btree(w);
         }
         if let Some(o) = perspective.overrides {
-            p = p.overlaid("perspective", o);
+            if let Some(mut q) = p.try_overlaid("perspective", o) {
+                // The perspective tier sits above the WHOLE frame tier,
+                // including the frame's dedicated weight map, which both
+                // reliability branches consult before the profile table. So
+                // every evidence type the perspective names (a weight, or
+                // `null` to remove one) leaves that map and is answered by
+                // the merged table. Only on success: a rejected tier changes
+                // nothing.
+                for key in named_evidence_type_weights(o) {
+                    q.lens
+                        .frame_evidence_type_weights
+                        .remove(&key.to_lowercase());
+                }
+                p = q;
+            }
         }
         if let Some(r) = perspective.reliability {
             p.lens.perspective_source_reliability = to_btree(&r.source_reliability);
@@ -548,11 +566,18 @@ impl BeliefProfile {
     }
 
     fn overlaid(&self, tier: &'static str, overrides: &Value) -> Self {
+        self.try_overlaid(tier, overrides)
+            .unwrap_or_else(|| self.clone())
+    }
+
+    /// [`Self::with_overrides`], with a rejection logged and returned as
+    /// `None` (the tier below stands).
+    fn try_overlaid(&self, tier: &'static str, overrides: &Value) -> Option<Self> {
         match self.with_overrides(overrides) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
             Err(e) => {
                 tracing::warn!(tier, error = %e, "belief_profile override rejected; tier ignored");
-                self.clone()
+                None
             }
         }
     }
@@ -643,6 +668,17 @@ impl BeliefProfile {
         let [support, against, ignorance] = *p;
         (support, against, ignorance)
     }
+}
+
+/// The evidence types an override object names under
+/// `reliability.evidence_type_weights` (set or removed).
+fn named_evidence_type_weights(overrides: &Value) -> impl Iterator<Item = &String> {
+    overrides
+        .get("reliability")
+        .and_then(|r| r.get("evidence_type_weights"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(Map::keys)
 }
 
 /// RFC 7386 merge patch.
