@@ -341,6 +341,12 @@ impl Mode {
         }
     }
 
+    /// Whether this mode is a retarget WRITE, which runs the belief-mode check
+    /// (SPEC §10.2). Decomposition modes are not wave runs and are not checked.
+    fn is_retarget_write(&self) -> bool {
+        matches!(self, Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_))
+    }
+
     /// The OAuth scope a minted token must carry for this mode's writes.
     ///
     /// Decomposition POSTs `/api/v1/claims` (`claims:write`). Retarget POSTs
@@ -349,12 +355,6 @@ impl Mode {
     /// would 403 on the first retarget write. The service client must be
     /// GRANTED `edges:write` for the mint to succeed — an operator check,
     /// since a refused scope fails the mint before any LLM call.
-    /// Whether this mode is a retarget WRITE, which runs the belief-mode check
-    /// (SPEC §10.2). Decomposition modes are not wave runs and are not checked.
-    fn is_retarget_write(&self) -> bool {
-        matches!(self, Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_))
-    }
-
     fn mint_scope(&self) -> &'static str {
         match self {
             Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_) => "claims:write edges:write",
