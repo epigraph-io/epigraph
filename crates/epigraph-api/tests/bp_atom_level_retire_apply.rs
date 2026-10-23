@@ -45,7 +45,10 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use uuid::Uuid;
-use viewer_fixture::{database_url_for, seed_agent_with_group, seed_group_claim};
+use viewer_fixture::{
+    database_url_for, downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim,
+    seed_public_claim,
+};
 
 /// Two BP runs agree when every claim's BetP agrees to this tolerance. The
 /// engines fold messages in `HashMap` order, so two runs over the same graph
@@ -95,6 +98,16 @@ async fn binary_frame(pool: &PgPool) -> Uuid {
 /// a write is observable and the scalar engine has a prior.
 async fn claim(pool: &PgPool, agent: Uuid, group: Uuid, label: &str, betp: f64) -> Uuid {
     let id = seed_group_claim(pool, agent, group, &format!("bp atom-level {label}")).await;
+    with_belief(pool, id, betp).await
+}
+
+/// [`claim`], but public.
+async fn public_claim(pool: &PgPool, agent: Uuid, label: &str, betp: f64) -> Uuid {
+    let id = seed_public_claim(pool, agent, &format!("bp atom-level {label}")).await;
+    with_belief(pool, id, betp).await
+}
+
+async fn with_belief(pool: &PgPool, id: Uuid, betp: f64) -> Uuid {
     sqlx::query(
         "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4 WHERE id = $1",
     )
@@ -430,6 +443,121 @@ async fn bp_loaders_skip_legacy_unkeyed_decomposes_to(pool: PgPool) {
             "{mode} control: with the edge retracted the unkeyed factor is read; \
              without={without:?} retracted={retracted:?}"
         );
+    }
+}
+
+// ── (3b) the legacy arm, on a session row security filters ────────────────
+
+/// The split `AppState` of `belief_computation_scoped_read.rs`: the raw
+/// `db_pool` is downgraded to `epigraph_app` (filtered by row security and
+/// stamped with no viewer, as a request-path raw-pool read is), while
+/// `scoped` is an ordinary `ScopedPool`. Every other fixture in this file runs
+/// on the superuser test DSN, which bypasses row security, so a read that only
+/// works because it sees every edge passes there; here it cannot.
+async fn state_app_role(pool: &PgPool) -> AppState {
+    let raw = downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped_pool(pool).await);
+    let raw_user: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&state.db_pool)
+        .await
+        .expect("current_user on the raw pool");
+    assert_eq!(
+        raw_user, "epigraph_app",
+        "CALIBRATION: the raw pool must be the filtered application role"
+    );
+    state
+}
+
+/// The baseline [`Tree`] with PUBLIC claims, so their priors and BBAs are
+/// readable on a filtered session whatever is stamped on it, and only the
+/// edge's own tenancy differs between the arms below.
+async fn public_tree(pool: &PgPool) -> (Tree, Uuid) {
+    let (agent, group) = seed_agent_with_group(pool, "bp-atom-level-app-role").await;
+    let frame = binary_frame(pool).await;
+    let k = public_claim(pool, agent, "public compound", 0.5).await;
+    let a = public_claim(pool, agent, "public atom", 0.8).await;
+    let b = public_claim(pool, agent, "public sibling atom", 0.7).await;
+    bba(pool, a, frame, agent, 0.85).await;
+    bba(pool, b, frame, agent, 0.6).await;
+    evidential_factor(pool, a, b, None).await;
+    evidential_factor(pool, k, b, None).await;
+    (Tree { agent, k, a }, group)
+}
+
+/// An in-force `decomposes_to` edge `compound -> atom` declared private to
+/// `group`. Both ends are public, so migration 072's no-widening arm keeps
+/// the declaration: a decomposition only `group` can see.
+async fn private_decomposes_to(pool: &PgPool, compound: Uuid, atom: Uuid, group: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            visibility, owner_group_id) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to', 'group', $3) RETURNING id",
+    )
+    .bind(compound)
+    .bind(atom)
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("seed a group-private decomposes_to edge")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn bp_legacy_skip_holds_on_the_app_role_for_the_callers_private_edge(pool: PgPool) {
+    let state = state_app_role(&pool).await;
+
+    for mode in ["cdst", "scalar"] {
+        // `private = false` is the calibration arm: a public edge is visible
+        // to any session, so the skip must hold there whatever the loader runs
+        // on. `private = true` is the subject: the edge is private to the
+        // caller's own group.
+        for private in [false, true] {
+            let (t, group) = public_tree(&pool).await;
+            let (without, _) = diagnose(&pool, &state, t.agent, mode).await;
+
+            let edge = if private {
+                private_decomposes_to(&pool, t.k, t.a, group).await
+            } else {
+                decomposes_to(&pool, t.k, t.a).await
+            };
+            let visibility: String =
+                sqlx::query_scalar("SELECT visibility::text FROM edges WHERE id = $1")
+                    .bind(edge)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read the edge's visibility");
+            assert_eq!(
+                visibility,
+                if private { "group" } else { "public" },
+                "CALIBRATION: the edge carries the tenancy this arm is about"
+            );
+            let factor = trigger_factor(&pool, edge).await;
+            set_factor_properties(&pool, factor, json!({})).await;
+
+            let (legacy, _) = diagnose(&pool, &state, t.agent, mode).await;
+            let gap = max_gap(&without, &legacy);
+            assert!(
+                gap < SAME,
+                "{mode} private={private}: an unkeyed factor on the caller's own in-force \
+                 decomposes_to pair moved BP by {gap} on a filtered session; \
+                 without={without:?} legacy={legacy:?}"
+            );
+
+            // Control: retracted, the same row is an ordinary factor and moves
+            // the result, so the equality above is the skip and not a factor
+            // the engine could not use.
+            sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+                .bind(edge)
+                .execute(&pool)
+                .await
+                .expect("retract the edge");
+            let (retracted, _) = diagnose(&pool, &state, t.agent, mode).await;
+            assert!(
+                max_gap(&without, &retracted) > 1e-4,
+                "{mode} private={private} control: with the edge retracted the unkeyed \
+                 factor is read; without={without:?} retracted={retracted:?}"
+            );
+        }
     }
 }
 
