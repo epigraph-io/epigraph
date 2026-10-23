@@ -71,7 +71,7 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
 }
 
 /// The obstruction on the edge `source -> target`, if the tool reported one.
-fn obstruction<'a>(obstructions: &'a [Value], source: Uuid, target: Uuid) -> Option<&'a Value> {
+fn obstruction(obstructions: &[Value], source: Uuid, target: Uuid) -> Option<&Value> {
     obstructions
         .iter()
         .find(|o| o["source_id"] == source.to_string() && o["target_id"] == target.to_string())
