@@ -2043,3 +2043,154 @@ async fn history_over_a_lineage_shared_by_many_groups_stays_linear(pool: PgPool)
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: the legacy backfill is re-runnable (CR6).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// D2 keeps a claim signed before cut-over bound to its author's legacy key.
+/// The fleet keeps minting unkeyed identities between this migration and the
+/// cut-over, so the backfill must be re-runnable (review CR6): a maintenance
+/// call gives every agent with no legacy row one (its current public key,
+/// valid from its creation, open-ended), skips a host-registered identity
+/// (whose identity key never signs, D1), and a second call adds nothing.
+/// The application role cannot run it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_legacy_key_backfill_reruns_for_agents_created_after_161(pool: PgPool) {
+    let late = plain_agent(&pool, "software_agent").await;
+    let registered = register(&pool, &new_identity(), None, "g-late", snapshot("g", "l")).await;
+
+    let run = |role: &'static str| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, role, |mut conn| async move {
+                let r: Result<i32, sqlx::Error> =
+                    sqlx::query_scalar("SELECT public.epigraph_backfill_legacy_agent_keys()")
+                        .fetch_one(&mut *conn)
+                        .await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    let err = run("epigraph_app")
+        .await
+        .expect_err("the application role ran the legacy backfill");
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+
+    let added = run("epigraph_maintenance").await.expect("maintenance backfills");
+    assert!(added >= 1, "the late agent gets its row");
+    let rows: Vec<(Vec<u8>, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT k.public_key, k.status::text, k.valid_until FROM agent_keys k \
+          WHERE k.agent_id = $1 AND k.key_type = 'identity-legacy'",
+    )
+    .bind(late)
+    .fetch_all(&pool)
+    .await
+    .expect("legacy rows");
+    let pk: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+        .bind(late)
+        .fetch_one(&pool)
+        .await
+        .expect("pk");
+    assert_eq!(rows, vec![(pk, "active".to_string(), None)]);
+    let reg_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_keys WHERE agent_id = $1 AND key_type = 'identity-legacy'",
+    )
+    .bind(registered.agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("registered identity's legacy rows");
+    assert_eq!(reg_rows, 0, "a host-registered identity key never signs");
+
+    let again = run("epigraph_maintenance").await.expect("re-run");
+    assert_eq!(again, 0, "a re-run adds nothing");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: TRUNCATE is refused too (CR9).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Row triggers do not fire on TRUNCATE, so "append-only for every role" held
+/// only for UPDATE and DELETE: the owner or a superuser could TRUNCATE ...
+/// CASCADE all three lineage tables at once (review CR9). Each is refused with
+/// the guard's 55000, alone and cascaded. CALIBRATION: the rows are there
+/// before and after.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_role_can_truncate_the_lineage_tables(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-t").await;
+    register(&pool, &new_identity(), Some(parent), "g-t", snapshot("g", "l")).await;
+    let counts = |pool: PgPool| async move {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM agent_prompt_blobs), \
+                    (SELECT count(*) FROM agent_prompt_snapshots), \
+                    (SELECT count(*) FROM agent_succession)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counts")
+    };
+    let before = counts(pool.clone()).await;
+    assert!(before.0 > 0 && before.1 > 0 && before.2 > 0, "CALIBRATION: rows exist");
+    for stmt in [
+        "TRUNCATE agent_succession",
+        "TRUNCATE agent_prompt_snapshots CASCADE",
+        "TRUNCATE agent_prompt_blobs CASCADE",
+    ] {
+        let err = sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .expect_err("a superuser truncated a lineage table");
+        assert_eq!(sqlstate(&err).as_deref(), Some("55000"), "{stmt}: {err}");
+    }
+    assert_eq!(counts(pool.clone()).await, before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: a pre-provisioned attestor is validated (CR10, TC8).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The attestor role is cluster-wide, so 161 may find it already provisioned
+/// and must not accept one that could be abused (review CR10).
+/// `epigraph_identity_attestor_faults()` names each way it could be: a role
+/// that can act as it (SET or USAGE, superusers aside), a membership of its
+/// own, or an elevated attribute. The migration refuses to proceed on any.
+/// On a fresh database it names none; with the application role granted the
+/// attestor (inside a rolled-back transaction) it names that grant; and as
+/// `epigraph_app` the role cannot be assumed (42501).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pre_provisioned_attestor_is_checked_for_isolation(pool: PgPool) {
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT public.epigraph_identity_attestor_faults()")
+            .fetch_one(&pool)
+            .await
+            .expect("faults on a fresh database");
+    assert!(faults.is_empty(), "a fresh attestor has no faults: {faults:?}");
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("GRANT epigraph_identity_attestor TO epigraph_app")
+        .execute(&mut *tx)
+        .await
+        .expect("grant (rolled back)");
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT public.epigraph_identity_attestor_faults()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("faults with a member");
+    tx.rollback().await.expect("rollback");
+    assert!(
+        faults.iter().any(|f| f.contains("epigraph_app")),
+        "a role that can act as the attestor is a fault: {faults:?}"
+    );
+
+    let err = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query("SET ROLE epigraph_identity_attestor")
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect_err("the application role assumed the attestor");
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+}
