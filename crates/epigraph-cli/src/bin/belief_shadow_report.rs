@@ -190,12 +190,13 @@ async fn run_one(
 
 fn headline(label: &str, s: &Summary) {
     println!(
-        "{label}: {} claims; residue {}; vacate {}; fold mismatch {}/{}; \
+        "{label}: {} claims; residue {}; vacate {} atoms / {} compounds; fold mismatch {}/{}; \
          compound confirmed set {} (progressive) / {} (strict); \
          gate loss {} (progressive) / {} (strict) over {} events",
         s.claims,
         s.residue,
-        s.vacate,
+        s.vacate.atoms,
+        s.vacate.compounds,
         s.fold_mismatch.mismatched,
         s.fold_mismatch.p1_atoms,
         s.compound_confirmed_set.progressive,

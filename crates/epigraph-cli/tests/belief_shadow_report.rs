@@ -904,3 +904,39 @@ async fn the_drift_decomposition_telescopes_from_s0_through_attribution(pool: Pg
         );
     }
 }
+
+// ── the vacate count, by role ───────────────────────────────────────────────
+
+/// The vacate count (served value newly vacuous: Bel under .01, Pl over .99)
+/// gates the atom waves, so compounds are counted apart.
+///
+/// * `v`: an atom whose only row is vacuous (all mass on {TRUE, FALSE}),
+///   serving a non-vacuous cache: an atom vacate.
+/// * `k`: a compound over two leaves with no evidence and no cache, serving
+///   a cache of its own: strict derives Bel 0, Pl 1, a compound vacate.
+/// * `r`: a residue atom (no rows, a kept cache): served `legacy`, no
+///   vacate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_vacate_count_keeps_atoms_and_compounds_apart(pool: PgPool) {
+    let author = agent(&pool).await;
+    let v = claim(&pool, author, "v").await;
+    bba(&pool, v, serde_json::json!({"0,1": 1.0})).await;
+    set_cache(&pool, v, 0.6, 0.9, 0.75).await;
+    let (k, leaves) = compound(&pool, author, "k", &[&[], &[]]).await;
+    set_cache(&pool, k, 0.5, 0.9, 0.7).await;
+    let r = claim(&pool, author, "r").await;
+    set_cache(&pool, r, 0.64, 1.0, 0.82).await;
+
+    let mut ids = vec![v, k, r];
+    ids.extend(&leaves);
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+    assert_eq!(lines[&r].strict.basis, "legacy", "r keeps its cache");
+    assert_eq!(
+        (summary.vacate.atoms, summary.vacate.compounds),
+        (1, 1),
+        "v is an atom vacate and k a compound one; r is residue, not a vacate"
+    );
+    assert_eq!(summary.residue, 1, "r");
+}

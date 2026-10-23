@@ -346,13 +346,21 @@ pub struct Mover {
     pub weight: f64,
 }
 
+/// Claims whose served value becomes vacuous (Bel under .01, Pl over .99)
+/// where it was not (SPEC §10.4 vacate count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct Vacate {
+    pub atoms: usize,
+    pub compounds: usize,
+}
+
 /// The report's summary.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Summary {
     pub claims: usize,
     pub by_role: BTreeMap<&'static str, usize>,
     pub abs_delta: BTreeMap<&'static str, Quantiles>,
-    pub vacate: usize,
+    pub vacate: Vacate,
     pub residue: usize,
     pub fold_mismatch: FoldMismatch,
     pub compound_confirmed_set: ByMode<usize>,
@@ -1352,7 +1360,7 @@ impl Totals {
         let served_vacuous =
             matches!((base.cache.bel, base.cache.pl), (Some(b), Some(p)) if vacuous(b, p));
         if e.strict.computed() && vacuous(e.strict.iv.bel, e.strict.iv.pl) && !served_vacuous {
-            s.vacate += 1;
+            s.vacate.atoms += 1;
         }
         if e.residue {
             s.residue += 1;
