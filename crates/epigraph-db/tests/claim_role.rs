@@ -664,6 +664,45 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     assert_one_spelling(&pool, &viewer, &ids).await;
 }
 
+/// `ingest_git` stamps `source: git-history` on EVERY claim it writes, commits
+/// included, but only its repository node (`node: repo`) roots a git tree. A
+/// commit with no repository or PR above it is an ordinary root: when
+/// `decompose_claims` decomposes it (it is offered as undecomposed), it is a
+/// compound over atoms, and those atoms stay in the atom program.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposed_lone_commit_is_a_compound_over_its_atoms(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+
+    let commit = claim_with(
+        &pool,
+        &s,
+        "lone commit",
+        serde_json::json!({
+            "source": "git-history",
+            "commit_hash": "0000000000000000000000000000000000000000",
+            "commit_type": "fix",
+        }),
+    )
+    .await;
+    let a1 = claim(&pool, &s, "commit atom 1").await;
+    let a2 = claim(&pool, &s, "commit atom 2").await;
+    decomposes_to(&pool, commit, a1).await;
+    decomposes_to(&pool, commit, a2).await;
+
+    let ids = [commit, a1, a2];
+    let got = roles(&pool, &viewer, &ids).await;
+    assert_eq!(
+        got[&commit],
+        ClaimRole::Compound { spine: false },
+        "a commit is no git tree root"
+    );
+    assert_eq!(got[&a1], ClaimRole::Atom);
+    assert_eq!(got[&a2], ClaimRole::Atom);
+
+    assert_one_spelling(&pool, &viewer, &ids).await;
+}
+
 /// Decomposition is a DAG, not a tree: a claim can sit under a stamped root
 /// AND an ordinary one. It is procedural only when EVERY root above it is
 /// stamped. Otherwise one edge from a stamped claim (whose stamp is a
