@@ -284,6 +284,17 @@ fn scan(src: &str) -> Vec<Finding> {
     findings
 }
 
+/// The module that owns the defaults table.
+const PROFILE_MODULE: &str = "belief_profile.rs";
+
+/// What a defaults-table marker that does not delimit THE table is reported as.
+const MISPLACED_MARKER: &str = "<defaults-table marker>";
+
+/// Scan one named fold module.
+fn scan_module(_module: &str, src: &str) -> Vec<Finding> {
+    scan(src)
+}
+
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -300,13 +311,13 @@ fn fold_modules_carry_no_numeric_literal_outside_the_profile_defaults_table() {
                 continue;
             }
         };
-        if *module == "belief_profile.rs" {
+        if *module == PROFILE_MODULE {
             assert!(
                 src.contains(TABLE_BEGIN) && src.contains(TABLE_END),
                 "belief_profile.rs must delimit its defaults table"
             );
         }
-        for f in scan(&src) {
+        for f in scan_module(module, &src) {
             report.push(format!("{module}:{}: literal `{}`", f.line, f.literal));
         }
     }
@@ -368,7 +379,64 @@ mod tests {
     fn t() { assert_eq!(0.42, 0.42); }
 }
 "##;
-    assert_eq!(scan(src), vec![]);
+    assert_eq!(scan_module(PROFILE_MODULE, src), vec![]);
+}
+
+fn misplaced(line: usize) -> Finding {
+    Finding {
+        line,
+        literal: MISPLACED_MARKER.into(),
+    }
+}
+
+fn lit(line: usize, literal: &str) -> Finding {
+    Finding {
+        line,
+        literal: literal.into(),
+    }
+}
+
+#[test]
+fn a_defaults_table_outside_the_profile_module_exempts_nothing_and_is_flagged() {
+    // Only belief_profile.rs owns THE table; a fold module cannot open its own.
+    let src = "// belief-profile: defaults-table-begin\nconst X: f64 = 0.33;\n\
+               // belief-profile: defaults-table-end\nfn f() -> f64 { 0.42 }\n";
+    assert_eq!(
+        scan_module("edge_factor.rs", src),
+        vec![misplaced(1), lit(2, "0.33"), misplaced(3), lit(4, "0.42")]
+    );
+}
+
+#[test]
+fn an_unclosed_table_in_the_profile_module_exempts_nothing_and_is_flagged() {
+    let src = "// belief-profile: defaults-table-begin\nconst X: f64 = 0.33;\n\
+               fn f() -> f64 { 0.42 }\n";
+    assert_eq!(
+        scan_module(PROFILE_MODULE, src),
+        vec![misplaced(1), lit(2, "0.33"), lit(3, "0.42")]
+    );
+}
+
+#[test]
+fn a_second_table_in_the_profile_module_exempts_nothing_and_is_flagged() {
+    // Exactly one balanced pair: a second pair (or a stray end) voids the
+    // exemption, so the table cannot be split to hide a literal between.
+    let src = "// belief-profile: defaults-table-begin\nconst A: f64 = 0.33;\n\
+               // belief-profile: defaults-table-end\nfn f() -> f64 { 0.42 }\n\
+               // belief-profile: defaults-table-begin\nconst B: f64 = 0.55;\n\
+               // belief-profile: defaults-table-end\n";
+    assert_eq!(
+        scan_module(PROFILE_MODULE, src),
+        vec![
+            misplaced(1),
+            lit(2, "0.33"),
+            misplaced(3),
+            lit(4, "0.42"),
+            misplaced(5),
+            lit(6, "0.55"),
+            misplaced(7)
+        ]
+    );
 }
 
 #[test]
