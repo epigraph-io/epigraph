@@ -47,11 +47,14 @@
 //!
 //! # Where it applies
 //!
-//! At fold time only. Stored rows keep their raw masses; nothing in a profile
-//! is baked into `mass_functions`. The served cache is the anonymous viewer
-//! under the default profile ([`BeliefProfile::served`]) with the frame's
-//! overrides; lens reads resolve the perspective tier on top and never write
-//! the cache.
+//! The lens tiers (frame, perspective) apply at fold time only. The
+//! write-time construction constants (the edge-factor parameters and the DS
+//! write path's simple-support and truth-seed bounds) are read from the served
+//! (default) profile when a row is written, so a stored row carries the
+//! default profile's construction and never a lens's. The served cache is the
+//! anonymous viewer under the default profile ([`BeliefProfile::served`]) with
+//! the frame's overrides; lens reads resolve the perspective tier on top and
+//! never write the cache.
 //!
 //! # Hash
 //!
@@ -109,6 +112,15 @@ pub mod defaults {
     pub const VACUOUS_WIDTH: f64 = 0.999;
     /// ... and whose belief is below this is vacuous and not written.
     pub const VACUOUS_BELIEF: f64 = 0.01;
+    /// Bounds on a written simple-support BBA's committed mass
+    /// (`confidence × weight`): never vacuous, never categorical.
+    pub const SIMPLE_SUPPORT_MASS_MIN: f64 = 0.01;
+    pub const SIMPLE_SUPPORT_MASS_MAX: f64 = 0.99;
+    /// Bounds a claim's `truth_value` is capped to before it seeds a BBA, so
+    /// the seed is never categorical (a categorical BBA absorbs every later
+    /// one under Dempster's rule).
+    pub const TRUTH_SEED_MIN: f64 = 0.005;
+    pub const TRUTH_SEED_MAX: f64 = 0.995;
     /// Classifier thresholds (the BetP cascade on the binary frame).
     pub const CLASSIFIER_NEI_THRESHOLD: f64 = 0.85;
     pub const CLASSIFIER_SUPPORT_THRESHOLD: f64 = 0.15;
@@ -205,6 +217,21 @@ pub struct EdgeFactorParams {
     pub vacuous_width: f64,
     /// ... with belief below this is vacuous and not written.
     pub vacuous_belief: f64,
+}
+
+/// Write-time BBA construction bounds of the DS write path
+/// (`epigraph_mcp::tools::ds_auto`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConstructionParams {
+    /// Lower bound on a written simple-support BBA's committed mass.
+    pub simple_support_mass_min: f64,
+    /// Upper bound on a written simple-support BBA's committed mass.
+    pub simple_support_mass_max: f64,
+    /// Lower bound a `truth_value` is capped to before it seeds a BBA.
+    pub truth_seed_min: f64,
+    /// Upper bound a `truth_value` is capped to before it seeds a BBA.
+    pub truth_seed_max: f64,
 }
 
 /// The BetP classifier cascade's thresholds.
@@ -367,6 +394,7 @@ pub struct BeliefProfile {
     pub combination: CombinationParams,
     pub tables: CalibrationTables,
     pub edge_factor: EdgeFactorParams,
+    pub construction: ConstructionParams,
     pub classifier: ClassifierParams,
     pub gates: GateParams,
     pub attribution_k: AttributionK,
@@ -459,6 +487,12 @@ impl BeliefProfile {
                 open_world_fraction_default: d::OPEN_WORLD_FRACTION_DEFAULT,
                 vacuous_width: d::VACUOUS_WIDTH,
                 vacuous_belief: d::VACUOUS_BELIEF,
+            },
+            construction: ConstructionParams {
+                simple_support_mass_min: d::SIMPLE_SUPPORT_MASS_MIN,
+                simple_support_mass_max: d::SIMPLE_SUPPORT_MASS_MAX,
+                truth_seed_min: d::TRUTH_SEED_MIN,
+                truth_seed_max: d::TRUTH_SEED_MAX,
             },
             classifier: ClassifierParams {
                 nei_threshold: d::CLASSIFIER_NEI_THRESHOLD,
@@ -826,6 +860,10 @@ mod tests {
         assert_eq!(p.gates.confirmed_score, 0.75);
         assert_eq!(p.tables.methodology_fallback, [0.50, 0.08, 0.42]);
         assert_eq!(p.tables.default_journal_reliability, 0.78);
+        assert_eq!(p.construction.simple_support_mass_min, 0.01);
+        assert_eq!(p.construction.simple_support_mass_max, 0.99);
+        assert_eq!(p.construction.truth_seed_min, 0.005);
+        assert_eq!(p.construction.truth_seed_max, 0.995);
     }
 
     #[test]
