@@ -83,6 +83,10 @@ pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
+    agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
+    PromptFile, PromptHistoryEntry, PromptSnapshot,
+};
+pub use repos::{
     carries_dedup_identity_key, ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken,
     AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow,
     AlternativeSetRepository, AnalysisRecord, AnalysisRepository, AuthorOperator,
@@ -127,10 +131,6 @@ pub use repos::{
     DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
-pub use repos::{
-    agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
-    PromptFile, PromptHistoryEntry, PromptSnapshot,
-};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
     AdminScopeSwitch,
