@@ -480,3 +480,79 @@ fn a_literal_after_the_test_module_is_still_scanned() {
         }]
     );
 }
+
+#[test]
+fn a_zero_or_one_in_a_parameter_position_is_flagged() {
+    // 0.0 and 1.0 are allowed as identities and bounds, but NOT where they
+    // stand for a parameter's value: an `else` / then arm, an `unwrap_or`
+    // default, a match arm, a `return`, or a factor of a product. These are
+    // exactly how a profile parameter whose default is 0 or 1 (the cross
+    // locality factor, a class weight) gets hardcoded back into a fold.
+    // rustfmt's multi-line shape, as the fold modules are written.
+    let src = r##"
+fn fold(r: &R, intra: bool, w: Option<f64>) -> f64 {
+    let locality = if intra {
+        r.intra
+    } else {
+        1.0
+    };
+    let primary = if intra {
+        1.0
+    } else {
+        r.cross
+    };
+    let base = w.unwrap_or(1.0);
+    let k = w.unwrap_or_else(|| 0.0_f64);
+    let m = match intra {
+        true => r.intra,
+        false => 1.0,
+    };
+    if base > r.cap {
+        return 1.0;
+    }
+    let scaled = base * 1.0;
+    let halved = 1.0 / base;
+    locality * primary * k * m * scaled * halved
+}
+"##;
+    assert_eq!(
+        scan(src),
+        vec![
+            lit(6, "1.0"),
+            lit(9, "1.0"),
+            lit(13, "1.0"),
+            lit(14, "0.0_f64"),
+            lit(17, "1.0"),
+            lit(20, "1.0"),
+            lit(22, "1.0"),
+            lit(23, "1.0"),
+        ]
+    );
+}
+
+#[test]
+fn a_zero_or_one_as_a_bound_identity_or_index_is_not_flagged() {
+    let src = r##"
+fn f(x: f64, v: &[f64], i: Option<usize>) -> f64 {
+    let a = x.clamp(0.0, 1.0);
+    let b = 1.0 - x;
+    let c = if x > 0.0 { x } else { a };
+    let d = (0.0..=1.0).contains(&x);
+    let e = i.unwrap_or(0);
+    let g = vec![0.0; v.len()];
+    let h = [0.0, 1.0];
+    let s = Some(1.0);
+    let t = x == 1.0 || x.max(0.0) < 1.0;
+    a + b + c + f64::from(u8::from(d)) + e as f64 + g[0] + h[0] + s.unwrap() + f64::from(u8::from(t))
+}
+"##;
+    assert_eq!(scan(src), vec![]);
+}
+
+#[test]
+fn a_marked_zero_or_one_in_a_parameter_position_is_not_flagged() {
+    let src = "fn f(w: Option<f64>) -> f64 {\n    \
+               // belief-profile: allow-literal (a probability's upper bound)\n    \
+               w.unwrap_or(1.0)\n}\n";
+    assert_eq!(scan(src), vec![]);
+}
