@@ -581,8 +581,11 @@ const BINARY_FRAME_NAME: &str = "binary_truth";
 ///   complement focal elements alike (a bijection, so nothing is lost).
 /// * `claim_validity` {supported, refuted, uncertain} maps supported → T,
 ///   refuted → F and uncertain → Θ: a positive set maps to the union of its
-///   images; open-world `~` stays `~`; any other complement set is read as
-///   its classical complement first.
+///   images. A complement set keeps its open-world share (exact CDST):
+///   complement(A) maps to the binary complement element whose positive part
+///   is the image of Ω \ A, so `~` stays `~`, complement(∅) stays the
+///   open-world vacuous, and complement({refuted, uncertain}) is `~{F}`
+///   ("TRUE or not in the frame"), never a closed T.
 fn coarsen_to_binary(
     r: &AtomInputRow,
     binary: &FrameOfDiscernment,
@@ -603,13 +606,15 @@ fn coarsen_to_binary(
                 })
                 .collect()
         };
+        let binary_full = binary.full_set();
         for (fe, &m) in stored.focal_elements() {
-            let to = if fe.complement && fe.subset == full {
-                FocalElement::missing(binary)
-            } else if fe.complement && fe.subset.is_empty() {
-                FocalElement::vacuous()
-            } else if fe.complement {
-                FocalElement::positive(image(&full.difference(&fe.subset).copied().collect()))
+            let to = if fe.complement {
+                // complement(A) is "outside A, or not in the frame": the image
+                // of the frame's own part (Ω \ A), plus the open world, which
+                // on binary_truth is complement(Ω₂ \ image(Ω \ A)). A = Ω
+                // gives `~` (missing), A = ∅ gives the open-world vacuous.
+                let inside = image(&full.difference(&fe.subset).copied().collect());
+                FocalElement::negative(binary_full.difference(&inside).copied().collect())
             } else {
                 FocalElement::positive(image(&fe.subset))
             };
