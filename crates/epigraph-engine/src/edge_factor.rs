@@ -871,27 +871,40 @@ pub fn is_known_evidence_type_key(key: &str, calibration: &CalibrationConfig) ->
         || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
 }
 
+/// [`is_known_evidence_type_key`] against a belief profile's weight and alias
+/// tables: the vocabulary the fold under `profile` actually resolves. Write
+/// surfaces and the recompute's warn-log use this with the profile the combine
+/// folds under, so a `[belief_profiles]` override that adds or removes a
+/// weight moves the verdict with the combine.
+#[must_use]
+pub fn is_known_evidence_type_key_in(key: &str, profile: &BeliefProfile) -> bool {
+    profile.evidence_type_weight_present(key)
+        || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
-/// keys that aren't in calibration's known vocabulary.
+/// keys that aren't in the known vocabulary of the profile the combine folds
+/// under.
 ///
-/// "Known vocabulary" = canonical key in `calibration.evidence_type_weights`
-/// ∪ alias in `calibration.evidence_type_aliases` ∪ a small allow-list of
+/// "Known vocabulary" = canonical key in the profile's `evidence_type_weights`
+/// ∪ alias in its `evidence_type_aliases` (both filled from
+/// `calibration.toml`, then the profile tiers) ∪ a small allow-list of
 /// relationship-vocab strings the `auto_wire_ds_for_edge` write path may
 /// emit before they're added to `evidence_type_aliases`. Operators may
 /// legitimately register weights for future evidence types not yet in
 /// calibration.toml; this is a log signal for typos, not a hard reject.
 ///
-/// The vocabulary test itself is [`is_known_evidence_type_key`], public so the
+/// The vocabulary test itself is [`is_known_evidence_type_key_in`], public so the
 /// MCP write surfaces that accept these keys can return the same verdict to
 /// the caller as a warning instead of only logging it (backlog 86ee2d30).
 fn warn_on_unknown_evidence_type_keys(
     frame_id: Uuid,
     map: &HashMap<String, f64>,
-    calibration: &CalibrationConfig,
+    profile: &BeliefProfile,
 ) {
     for key in map.keys() {
         // Map keys are already lowercased by the repo accessor.
-        if is_known_evidence_type_key(key, calibration) {
+        if is_known_evidence_type_key_in(key, profile) {
             continue;
         }
         tracing::warn!(
@@ -979,9 +992,7 @@ async fn compute_combined_belief(
     //
     // Every reliability input is resolved ONCE, above the loop, into a
     // belief profile: the served (default) profile, then this frame's tier
-    // (its `belief_profile` object and the per-frame keys below). The
-    // process-cached calibration is kept only for the vocabulary warn-log.
-    let calibration = CalibrationConfig::cached();
+    // (its `belief_profile` object and the per-frame keys below).
     let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
@@ -1000,17 +1011,6 @@ async fn compute_combined_belief(
             .ok()
             .flatten();
 
-    // Vocabulary warn-log (Q8 locked: loose validation at set_property,
-    // warn-log at read-site). Iterate the override map's keys and warn
-    // on any that don't resolve to a known evidence-type vocabulary
-    // entry: canonical calibration key, calibration alias, or one of
-    // the relationship-vocab strings the auto-wire write path emits.
-    // Surfaces operator typos in operational logs without blocking the
-    // write.
-    if let Some(ref map) = per_frame_evidence_weights {
-        warn_on_unknown_evidence_type_keys(frame_id, map, calibration);
-    }
-
     let profile = BeliefProfile::served().resolve(
         FrameTier {
             overrides: frame_overrides,
@@ -1019,6 +1019,17 @@ async fn compute_combined_belief(
         },
         PerspectiveTier::default(),
     );
+
+    // Vocabulary warn-log (Q8 locked: loose validation at set_property,
+    // warn-log at read-site). Iterate the override map's keys and warn
+    // on any that don't resolve to a known evidence-type vocabulary
+    // entry of the profile this combine folds under: canonical key, alias, or one of
+    // the relationship-vocab strings the auto-wire write path emits.
+    // Surfaces operator typos in operational logs without blocking the
+    // write.
+    if let Some(ref map) = per_frame_evidence_weights {
+        warn_on_unknown_evidence_type_keys(frame_id, map, &profile);
+    }
 
     // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
     // one `source_url`) are folded cautiously into one before the Dempster
