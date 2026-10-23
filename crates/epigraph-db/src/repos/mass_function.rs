@@ -289,9 +289,17 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 ///   `properties.source_type = 'workflow'`. A cycle or a tree deeper than the
 ///   cap finds no root, so the claim stays frozen: the safe direction.
 ///
-/// Role is structure, not content, so these edge and claim reads are not
-/// spliced by the viewer: a viewer that cannot see a decomposition must not
-/// be able to refold the compound's cache for everyone.
+/// Role is structure, not content, so these edge and claim reads carry no
+/// viewer splice: a viewer that cannot see a decomposition must not be able
+/// to refold the compound's cache for everyone. That holds as written only on
+/// a connection that bypasses row security, which is how the bulk
+/// recomputers run (the maintenance pool and the maintenance session).
+/// `edges` and `claims` are FORCE ROW LEVEL SECURITY, so on an app connection
+/// (the per-write `routes::assess` refresh) the server still filters these
+/// reads, and a caller who can see none of a compound's in-force
+/// decomposition edges finds no compound here. Making the role read
+/// independent of row security is left to the claim-role module that
+/// replaces this predicate.
 ///
 /// Inline until the claim-role module gives the compound and procedural
 /// predicates their one shared spelling, which then replaces this one.
