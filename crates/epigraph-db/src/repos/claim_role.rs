@@ -8,7 +8,7 @@
 //!
 //! | role | predicate |
 //! |---|---|
-//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`); and no root the walk reaches is unstamped |
+//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (its repository node: `properties.source = 'git-history'` and `properties.node = 'repo'`); and no root the walk reaches is unstamped |
 //! | [`ClaimRole::Rule`] | labelled `rule` AND an in-force `rule_conclusion` out-edge to a current claim |
 //! | [`ClaimRole::Compound`] | an in-force `decomposes_to` out-edge to a current claim |
 //! | [`ClaimRole::Atom`] | an in-force `decomposes_to` in-edge from a current claim, and none out |
@@ -130,17 +130,22 @@ macro_rules! is_decomposed_from {
 
 /// The procedural root stamp, over the `claims` row aliased `$root`: a
 /// workflow tree's root (the workflow builder stamps `source_type: workflow`
-/// on its thesis) or a git-history tree's root (`ingest_git` stamps
-/// `source: git-history` on its repository node). Never NULL, so its negation
-/// is "unstamped" on a claim with neither property.
+/// on its thesis) or a git-history tree's root, the repository node
+/// `ingest_git` writes (`source: git-history` AND `node: repo`). `ingest_git`
+/// puts `source: git-history` on every claim it writes, commits included, so
+/// the source alone would make a flat commit that `decompose_claims` later
+/// decomposes a procedural root. Never NULL, so its negation is "unstamped" on
+/// a claim with neither stamp.
 macro_rules! procedural_root_stamp {
     ($root:literal) => {
         concat!(
             "COALESCE(",
             $root,
-            ".properties->>'source_type' = 'workflow' OR ",
+            ".properties->>'source_type' = 'workflow' OR (",
             $root,
-            ".properties->>'source' = 'git-history', false)"
+            ".properties->>'source' = 'git-history' AND ",
+            $root,
+            ".properties->>'node' = 'repo'), false)"
         )
     };
 }

@@ -284,10 +284,10 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// `recompute_claim_belief_on_frame` callers) do not pass through this check;
 /// they are moved onto the single atom-cache writer separately.
 ///
-/// A procedural node (a workflow- or git-history-rooted tree) is no compound
-/// and keeps today's behaviour; a cycle or a tree deeper than
-/// [`super::claim_role::ROLE_MAX_DEPTH`] finds no procedural root, so its
-/// compounds stay frozen: the safe direction.
+/// A procedural node (every root above it is a workflow thesis or an
+/// `ingest_git` repository node) is no compound and keeps today's behaviour;
+/// a cycle or a tree deeper than [`super::claim_role::ROLE_MAX_DEPTH`] finds
+/// no procedural root, so its compounds stay frozen: the safe direction.
 ///
 /// The role read carries no viewer splice (role is structure: a viewer that
 /// cannot see a decomposition must not be able to refold the compound's
@@ -1307,8 +1307,9 @@ impl MassFunctionRepository {
     /// its belief is a query over its leaves, so no recompute that resolves its
     /// owner here (the three bulk recomputers and the `routes::assess`
     /// refresh) refolds the BBAs that sit on it into its cache. Writers that
-    /// fold a named frame directly are not covered. A workflow-rooted
-    /// (procedural) tree keeps the rules below.
+    /// fold a named frame directly are not covered. A procedural node (one
+    /// whose every root is a workflow thesis or an `ingest_git` repository
+    /// node, [`super::claim_role::IS_PROCEDURAL_SQL`]) keeps the rules below.
     ///
     /// Among the frames holding the claim's remaining inputs:
     ///
