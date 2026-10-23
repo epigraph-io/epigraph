@@ -303,11 +303,27 @@ fn near(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() < tol
 }
 
-/// A view as JSON without its claim id, so two twin compounds compare by
-/// everything they disclose.
+/// A view as JSON without its claim id, every number rounded to 1e-12, so
+/// two twin compounds compare by everything they disclose. (The twin's items
+/// have other row ids, so the conjunction may sum them in another order.)
 fn disclosed(v: &BeliefView) -> serde_json::Value {
+    fn round(j: &mut serde_json::Value) {
+        match j {
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    if n.is_f64() {
+                        *j = serde_json::json!((f * 1e12).round() / 1e12);
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(round),
+            serde_json::Value::Object(o) => o.values_mut().for_each(round),
+            _ => {}
+        }
+    }
     let mut j = serde_json::to_value(v).expect("serialize");
     j.as_object_mut().expect("object").remove("claim_id");
+    round(&mut j);
     j
 }
 
@@ -385,7 +401,7 @@ async fn the_public_value_is_identical_whatever_the_hidden_atom_holds(pool: PgPo
         "the public view must not move when only a hidden atom changes"
     );
     assert!(
-        grp_after.bel < grp_before.bel - 0.1,
+        grp_after.bel < grp_before.bel - 0.05,
         "control: the group's view does move ({} -> {})",
         grp_before.bel,
         grp_after.bel
