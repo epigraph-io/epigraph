@@ -915,6 +915,15 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// Neither direction moves a dedup identity edge
+/// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
+/// [`DUPLICATE_IDENTITY_PROPERTY`]), as [`repair_marked_duplicate`] does not:
+/// it names the claim its duplicate's `supersedes` names, and the un-mark and
+/// the index view read it by that pointer. A duplicate of a canonical that is
+/// later superseded (or consolidated) therefore keeps its edge to the retired
+/// canonical, and stays marked: the un-mark refuses it while that canonical is
+/// retired, and the canonical, retired by another act, has no mark to undo.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -970,6 +979,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -988,6 +998,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -10674,6 +10685,10 @@ async fn migrate_consolidated_edges(
     // a redundant copy. The test is on the source endpoint's own row (a
     // missing row counting as non-public), so the deferred replay gives the
     // same result.
+    //
+    // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
+    // candidate either: it names the claim its duplicate supersedes, so it is
+    // neither moved nor retracted (see `migrate_superseded_edges`).
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -10686,6 +10701,7 @@ async fn migrate_consolidated_edges(
           AND e.valid_to IS NULL
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
+          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c

@@ -1020,3 +1020,132 @@ async fn the_identity_edge_keeps_the_named_agent_and_a_bounded_reason(pool: PgPo
         Some(DuplicateProvenance::MAX_REASON_CHARS)
     );
 }
+
+async fn edge_target(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid, bool) {
+    sqlx::query_as("SELECT source_id, target_id, valid_to IS NULL FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(pool)
+        .await
+        .expect("edge row")
+}
+
+async fn duplicates_listed_under(pool: &PgPool, canonical: Uuid) -> Vec<Uuid> {
+    let viewer = fixture::bypass(pool).await.1;
+    ClaimRepository::marked_duplicates_of(pool, &viewer, &[canonical], 50)
+        .await
+        .expect("index view")
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Superseding a canonical moves other writers' edges onto its replacement,
+/// but not its duplicates' identity edges: each names the claim that
+/// duplicate's `supersedes` names, so the un-mark (which looks the edge up by
+/// `supersedes`) and the index view (which walks the edges) keep agreeing
+/// with the duplicate's own row. Both supersede paths share the migration;
+/// this arm runs the request path's act + deferred migration.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let supporter = seed_claim(&pool, a, "supporter").await;
+    let support = seed_supports_edge(&pool, supporter, canonical).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
+    )
+    .await
+    .expect("mark");
+    let identity = r.revert.identity_edge.expect("the act's identity edge");
+
+    let (replacement, _) = ClaimRepository::supersede_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(canonical),
+        "canonical, revised",
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    ClaimRepository::migrate_superseded_edges_conn(&mut conn, canonical, replacement)
+        .await
+        .expect("edge migration");
+
+    assert_eq!(
+        edge_target(&pool, support).await,
+        (supporter, replacement, true),
+        "calibration: an ordinary edge on the canonical moved to its replacement"
+    );
+    assert_eq!(
+        edge_target(&pool, identity).await,
+        (dup, canonical, true),
+        "the identity edge keeps naming the claim the duplicate supersedes"
+    );
+    assert!(
+        !duplicates_listed_under(&pool, replacement)
+            .await
+            .contains(&dup),
+        "the index view must not list the duplicate under a claim it does not supersede"
+    );
+    assert!(
+        duplicates_listed_under(&pool, canonical)
+            .await
+            .contains(&dup),
+        "the index view lists the duplicate under the claim it supersedes"
+    );
+}
+
+/// The same for a consolidation of the canonical: the identity edge is
+/// neither re-pointed onto the merged claim nor retracted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidating_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, a, "canonical").await;
+    let other = seed_claim(&pool, a, "another source").await;
+    let dup = seed_claim(&pool, a, "duplicate").await;
+    let supporter = seed_claim(&pool, a, "supporter").await;
+    let support = seed_supports_edge(&pool, supporter, canonical).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+        &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
+    )
+    .await
+    .expect("mark");
+    let identity = r.revert.identity_edge.expect("the act's identity edge");
+
+    let merged = ClaimRepository::consolidate(
+        &pool,
+        &[canonical, other],
+        "the merged claim",
+        0.5,
+        epigraph_db::ConsolidateMode::Merge,
+        "test",
+        a,
+    )
+    .await
+    .expect("consolidate")
+    .merged_id;
+
+    assert_eq!(
+        edge_target(&pool, support).await,
+        (supporter, merged, true),
+        "calibration: an ordinary edge on the canonical moved to the merged claim"
+    );
+    assert_eq!(
+        edge_target(&pool, identity).await,
+        (dup, canonical, true),
+        "the identity edge keeps naming the claim the duplicate supersedes, in force"
+    );
+    assert!(
+        !duplicates_listed_under(&pool, merged).await.contains(&dup),
+        "the index view must not list the duplicate under the merged claim"
+    );
+}
