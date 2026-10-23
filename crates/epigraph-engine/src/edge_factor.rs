@@ -1130,9 +1130,17 @@ async fn recompute_combined_belief(
 /// first writer. The claim row records the owner in `belief_frame_id`, so the
 /// number is self-describing rather than an anonymous one-of-N.
 ///
-/// The owner is always a frame this recompute can fold, and every claim with an
-/// input the viewer can see has one, so this function never makes a claim's
-/// cache emptier than it was.
+/// The owner is always a frame this recompute can fold, and every
+/// non-compound claim with a non-template input the viewer can see has one
+/// (a workflow-rooted compound counts as non-compound here). A claim with no
+/// owner is left exactly as it was (`Ok(false)`): that covers a claim whose
+/// only inputs are ingest template rows (`epigraph_db::repos::mass_function::ingest_template_predicate`),
+/// whose cache a bulk recompute would otherwise replace with the template's
+/// near-vacuous fold, and a non-procedural compound (an in-force
+/// `decomposes_to` out-edge, not under a workflow root), whose belief is a
+/// query over its leaves rather than a fold of its own BBAs. So this function
+/// never makes a claim's cache emptier than it was. Every caller inherits
+/// both, including the per-write `routes::assess` refresh.
 ///
 /// Resolving the owner is a read: this function creates no frame. (It used to
 /// get-or-create `binary_truth` here only to compare ids.)

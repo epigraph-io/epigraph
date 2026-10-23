@@ -1559,17 +1559,13 @@ fn doi_to_slug(doi: &str) -> String {
 /// URN prefix for a synthesized (non-DOI) document identity key.
 const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 
-/// Values callers pass to mean "this document has no DOI". Treated as ABSENT,
-/// not as an identity: keying on them collapsed every DOI-less document onto a
-/// single shared `papers` row (issue #356 — one node had accrued 1244 claims
-/// from at least four unrelated sources, with their author lists unioned).
-const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
-
-/// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`].
-fn is_placeholder_id(s: &str) -> bool {
-    let t = s.trim();
-    t.is_empty() || DOI_PLACEHOLDERS.contains(&t.to_ascii_lowercase().as_str())
-}
+// Values callers pass to mean "this document has no DOI" are treated as
+// ABSENT, not as an identity: keying on them collapsed every DOI-less document
+// onto a single shared `papers` row (issue #356 — one node had accrued 1244
+// claims from at least four unrelated sources, with their author lists
+// unioned). The list lives in epigraph-core so the belief engine's source key
+// rejects exactly the same values.
+use epigraph_core::domain::evidence::is_placeholder_id;
 
 /// Legible-but-bounded slug for the human-readable half of a synthetic key:
 /// lowercased, non-alphanumerics collapsed to single `-`, capped at 48 bytes on
