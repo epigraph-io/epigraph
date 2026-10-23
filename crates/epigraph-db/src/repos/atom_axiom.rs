@@ -21,8 +21,16 @@
 //! * every row of a **compound** ([`super::claim_role::is_compound_sql`]):
 //!   its belief is a query over its leaves, never a fold of its own rows. The
 //!   role test carries no splice (role is structure, as the
-//!   [`claim_role`](super::claim_role) module doc states), so a viewer who
-//!   cannot see a compound's decomposition still never folds its rows.
+//!   [`claim_role`](super::claim_role) module doc states). On a connection
+//!   that bypasses row security (the maintenance pool and session, where the
+//!   bulk writers run) a viewer who cannot see a compound's decomposition
+//!   therefore still never folds its rows. **On an application session it
+//!   can:** `edges` is FORCE ROW LEVEL SECURITY, so a session that can read
+//!   none of a compound's in-force decomposition edges finds no compound and
+//!   reads that compound's rows as an atom's (the gap the `claim_role` doc
+//!   records; pinned by `atom_fold.rs::on_an_app_session_row_security_hides_a_compound_from_the_fold`).
+//!   Per-request callers must close it before they fold (PR-5b1: fail closed,
+//!   or a definer-rights role read under a ruling).
 //!
 //! The mode filters (`Display` / `Pure`), the seed rule and the
 //! hypothesis-promotion rule are the engine's, over these rows.

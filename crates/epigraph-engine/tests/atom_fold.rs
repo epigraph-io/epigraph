@@ -10,7 +10,9 @@
 //!   so a new `binary_truth` row never evicts another frame's evidence (the
 //!   owner-frame rule's frame flip);
 //! * it never reads a cached combination, an ingest template row, or any row
-//!   of a compound (role is structure, whatever the viewer sees);
+//!   of a compound (role is structure, whatever the viewer sees, on a
+//!   connection that bypasses row security; on an application session row
+//!   security can hide a compound, which one test pins as a known gap);
 //! * `Pure` is evidence only; `Display` adds the inferred classes, and reads a
 //!   compound-source edge row one-sided while compound-source edges are frozen;
 //! * one paper's two citations are one item (the max), and `~` mass meets a
@@ -836,6 +838,10 @@ async fn compound_source_edge_rows_are_one_sided_while_frozen(pool: PgPool) {
 
 /// Plan test (9), D1. A compound's own rows are never AEF input, whether or
 /// not the viewer can see its decomposition (role is structure).
+///
+/// This holds on the superuser pool the harness connects with, where row
+/// security does not apply; on an application session it does not
+/// (`on_an_app_session_row_security_hides_a_compound_from_the_fold`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn atom_fold_never_reads_compound_rows(pool: PgPool) {
     let author = agent(&pool).await;
@@ -1608,5 +1614,82 @@ async fn a_claim_validity_complement_keeps_its_open_world_share(pool: PgPool) {
         (f.belief(), f.plausibility(), f.pignistic_prob(), f.mass_on_missing()),
         (t.belief(), t.plausibility(), t.pignistic_prob(), t.mass_on_missing()),
         "the coarsened row folds as its binary_truth twin"
+    );
+}
+
+// ── review: the row-security limit of "role is structure" ───────────────────
+
+/// The documented limit of D1 (module doc of `epigraph_db::repos::atom_axiom`,
+/// and of `claim_role`): on an `epigraph_app` session, row security filters
+/// `edges` whatever the query splices, so for an anonymous session a public
+/// compound whose whole decomposition is private reads as a standalone, and
+/// its own rows ARE returned. This pins the gap as it stands, so the fix that
+/// PR-5b1 needs before it wires a per-request site (fail closed, or a
+/// definer-rights role read) turns it red and has to update it.
+///
+/// CALIBRATION: in the same session a compound whose decomposition is public
+/// is still never read, so the hidden compound's rows are row security at
+/// work, not a session that skips the role test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_an_app_session_row_security_hides_a_compound_from_the_fold(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let (_member, group) = fixture::seed_agent_with_group(&pool, "aef-rls").await;
+    let hidden = claim(&pool, author, "public compound, private decomposition").await;
+    let e = decompose(&pool, hidden, claim(&pool, author, "leaf").await).await;
+    hide_edge(&pool, e, group).await;
+    let open = claim(&pool, author, "public compound, public decomposition").await;
+    decompose(&pool, open, claim(&pool, author, "public leaf").await).await;
+    let mut hidden_row = Uuid::nil();
+    for c in [hidden, open] {
+        let r = store(
+            &pool,
+            c,
+            b,
+            Row::plain(agent(&pool).await),
+            serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        )
+        .await;
+        if c == hidden {
+            hidden_row = r;
+        }
+    }
+
+    let anonymous = fixture::public_viewer(&pool).await;
+    let got = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let got = {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+            sqlx::query(
+                "SELECT set_config('epigraph.group_ids', '', true), \
+                        set_config('epigraph.writable_group_ids', '', true), \
+                        set_config('epigraph.principal_id', '', true)",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("stamp the app session");
+            let got = atom_axiom_rows_under(
+                &mut tx,
+                &anonymous,
+                &[hidden, open],
+                AxiomMode::Display,
+                &ctx(),
+                CompoundSourceEdges::Frozen,
+            )
+            .await
+            .expect("atom_axiom_rows on an app session");
+            tx.rollback().await.expect("rollback");
+            got
+        };
+        (conn, got)
+    })
+    .await;
+    assert!(
+        got.get(&open).is_none_or(Vec::is_empty),
+        "calibration: a compound the session can see is never read"
+    );
+    assert_eq!(
+        ids_of(got.get(&hidden).map(Vec::as_slice).unwrap_or_default()),
+        set(&[hidden_row]),
+        "KNOWN GAP (PR-5b1): row security hides the decomposition, so the compound's row is read"
     );
 }

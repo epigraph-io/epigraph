@@ -1359,6 +1359,13 @@ pub async fn recompute_atom_cache(
 /// (the residue) is served from its old cache, and is vacated only through
 /// the operator accept list (SPEC §10.5). **No arm ever NULLs a cache.**
 ///
+/// **Row security.** The role is read without a splice, which makes "a
+/// compound is never written" hold on a connection that bypasses row
+/// security. On an application session `edges` row security can hide a
+/// compound's whole decomposition, and the compound then reads as a
+/// standalone (the `claim_role` module doc). Per-request call sites must not
+/// be wired until that is closed (PR-5b1).
+///
 /// # Errors
 /// A database read or write, a fold that fails, or a
 /// [`CacheWriteCause::EvidenceRemoved`] read for another claim.
