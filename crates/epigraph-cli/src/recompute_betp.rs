@@ -30,11 +30,17 @@ use uuid::Uuid;
 ///     (issue #197 Phase 2/4) since the cached value was last written.
 ///
 /// (b) **Single-BBA non-simple-shape claims** — claims with exactly one BBA
-///     on a binary frame whose `masses` JSONB contains a focal-element key
-///     of `"1"` (mass on the non-supported hypothesis alone) or `"~"`
-///     (open-world/complement mass on the empty set). Both are focal-element
-///     shapes beyond the simple `{"0", "0,1"}` case a raw single-source
-///     discount was originally calibrated against.
+///     on a binary frame whose `masses` JSONB puts POSITIVE mass on a
+///     focal-element key of `"1"` (mass on the non-supported hypothesis
+///     alone) or `"~"` (open-world/complement mass on the empty set). Both
+///     are focal-element shapes beyond the simple `{"0", "0,1"}` case a raw
+///     single-source discount was originally calibrated against. A key
+///     present with zero mass does not qualify (cohort v2 narrowing).
+///
+/// **Cohort v1 is a dry-run report only** (SPEC §10.7, §10.6 freeze F3): the
+/// writing path is [`select_wave_cohort`]'s waves. Arms (a) and (b) skip an
+/// evidenced atom with one simple BBA, whose cache can still be stale, and
+/// admit claims the wave never writes.
 ///
 /// `UNION` (not `UNION ALL`) so a claim that happens to satisfy both (a) and
 /// (b) — a hub claim where one of its BBAs also has a "~" key — is not
@@ -59,11 +65,20 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
             -- complement mass on the empty set). The `?` operator is exact
             -- top-level-key containment, so `masses ? '~'` matches only the
             -- bare "~" key, not "~0" / "~0,1" / "~1".
+            --
+            -- Narrowed for cohort v2 (SPEC §10.7): the key must carry mass.
+            -- A zero-mass "1" or "~" is the simple shape written with an
+            -- explicit zero, so it no longer qualifies a claim by itself.
+            -- `COALESCE` keeps a non-numeric value (no stored BBA has one)
+            -- from failing the whole cohort: it reads as no mass.
             SELECT mf.claim_id
               FROM mass_functions mf
               JOIN frames f ON f.id = mf.frame_id
              WHERE array_length(f.hypotheses, 1) = 2
-               AND (mf.masses ? '1' OR mf.masses ? '~')
+               AND (COALESCE(CASE WHEN jsonb_typeof(mf.masses->'1') = 'number'
+                                  THEN (mf.masses->>'1')::float8 END, 0) > 0
+                    OR COALESCE(CASE WHEN jsonb_typeof(mf.masses->'~') = 'number'
+                                     THEN (mf.masses->>'~')::float8 END, 0) > 0)
              GROUP BY mf.claim_id, mf.frame_id
             HAVING COUNT(*) = 1
         ) cohort
