@@ -1427,10 +1427,16 @@ restart.
   `agent_identity_repo.rs`; `operator_link.rs` pins the entry point unchanged.
   Undo is in the file's header. Slot: 160 is carried by a non-PR remote branch,
   so 161 is the first number free on `main`, on every open PR branch and on
-  every remote branch. **Deploy order:** none against the binaries (no
-  binary calls the new functions yet); the attestor login is provisioned
-  after the migration. **Applied to throwaway databases only, NOT to any
-  deployed database.**
+  every remote branch. **Deploy order:** AFTER the rotate-route caller check
+  (slice S0) and with a binary whose `AgentKeyRepository::get_active_key`
+  reads only `signing` keys (this PR). The backfill gives every agent an
+  active `identity-legacy` key, so it changes what the live list-keys and
+  rotate routes see. 161's guard already refuses the application role any
+  write to that key type, and to `signing` keys; the HTTP rotate and revoke
+  routes therefore cannot touch either type after 161, and rotating or
+  revoking one is a maintenance act. The attestor login is provisioned after
+  the migration. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 

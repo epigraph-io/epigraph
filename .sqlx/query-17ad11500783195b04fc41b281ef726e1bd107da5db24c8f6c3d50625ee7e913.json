@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, agent_id, public_key, key_type, status,\n                valid_from, valid_until, revocation_reason, revoked_by, created_at\n            FROM agent_keys\n            WHERE agent_id = $1\n              AND status = 'active'\n            ORDER BY created_at DESC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT\n                id, agent_id, public_key, key_type, status,\n                valid_from, valid_until, revocation_reason, revoked_by, created_at\n            FROM agent_keys\n            WHERE agent_id = $1\n              AND key_type = 'signing'\n              AND status = 'active'\n            ORDER BY created_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -72,5 +72,5 @@
       false
     ]
   },
-  "hash": "adcf409802ab8fd324f6c79212d970073431193b4f7d762c3635a2578c976b6e"
+  "hash": "17ad11500783195b04fc41b281ef726e1bd107da5db24c8f6c3d50625ee7e913"
 }
