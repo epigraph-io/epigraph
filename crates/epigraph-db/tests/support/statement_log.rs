@@ -13,28 +13,48 @@
 //! file, so the capture needs no new dev-dependency and no `Cargo.lock` change.
 //! `tracing-subscriber` would be one more edge in the lock file for ~60 lines.
 //!
+//! # Why a GLOBAL subscriber, routed per future
+//!
+//! `tracing` caches each callsite's `Interest` process-wide, and computes it
+//! the first time the callsite runs, against whichever dispatcher is the
+//! default ON THE THREAD THAT RAN IT. sqlx's per-statement `event!` only runs
+//! once its `enabled!` check passes, so with a scoped (`WithSubscriber`)
+//! capture, a parallel test thread could be the first to reach that `event!`
+//! and cache `never` for it, silently emptying every later capture. Measured:
+//! that is exactly what happened under `--test-threads=2`.
+//!
+//! So ONE global subscriber is installed (once per test binary) and is
+//! interested in `sqlx::query` events from every thread; it appends each
+//! event to the capture that is active on the current thread, if any. A
+//! capture is active only while its own future is being polled.
+//!
 //! # What it sees, and what it does not
 //!
-//! The subscriber is attached with `WithSubscriber`, so it is the default only
-//! while the wrapped future is being polled. A statement run by a task the
-//! pool SPAWNS (connection return, background maintenance) is not captured.
-//! That is what a footprint test wants: the statements the request itself
-//! issued on its connection. It also means two captures in one test never see
-//! each other's statements.
+//! A statement run by a task the pool SPAWNS (connection return, background
+//! maintenance) is polled outside the captured future and is not captured.
+//! That is what a footprint test wants: the statements the call itself issued.
+//! Two captures never see each other's statements, on one thread or on many.
+//!
+//! The global subscriber records nothing else and emits nothing, so it does
+//! not change what any other test observes. If a test binary already set a
+//! different global subscriber, [`capture`] panics rather than return an
+//! empty, vacuous log.
 //!
 //! Included with `#[path]`, never linked: it lives under `tests/support/` so
 //! cargo does not auto-discover it as a test target of its own.
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 
 use tracing::field::{Field, Visit};
-use tracing::instrument::WithSubscriber;
 use tracing::span::{Attributes, Id, Record};
-use tracing::{Dispatch, Event, Metadata, Subscriber};
+use tracing::{Event, Metadata, Subscriber};
 
 /// The target sqlx logs every executed statement on.
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
@@ -68,9 +88,17 @@ impl Statement {
     }
 }
 
-struct Capture {
+type Log = Arc<Mutex<Vec<Statement>>>;
+
+thread_local! {
+    /// The capture whose future is being polled on this thread, if any.
+    static ACTIVE: RefCell<Option<Log>> = const { RefCell::new(None) };
+}
+
+/// The process-wide subscriber: interested in `sqlx::query` events only, and
+/// routes each one to the capture active on the emitting thread.
+struct Router {
     next_span: AtomicU64,
-    log: Arc<Mutex<Vec<Statement>>>,
 }
 
 #[derive(Default)]
@@ -113,7 +141,7 @@ impl Visit for StatementVisitor {
     }
 }
 
-impl Subscriber for Capture {
+impl Subscriber for Router {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         // Only sqlx's statement events. Spans (`#[instrument]` on the repo
         // functions) are disabled, so `new_span` is never asked for one.
@@ -133,9 +161,13 @@ impl Subscriber for Capture {
         if event.metadata().target() != SQLX_QUERY_TARGET {
             return;
         }
-        let mut visitor = StatementVisitor::default();
-        event.record(&mut visitor);
-        self.log.lock().expect("statement log").push(visitor.0);
+        ACTIVE.with(|active| {
+            if let Some(log) = active.borrow().as_ref() {
+                let mut visitor = StatementVisitor::default();
+                event.record(&mut visitor);
+                log.lock().expect("statement log").push(visitor.0);
+            }
+        });
     }
 
     fn enter(&self, _span: &Id) {}
@@ -143,15 +175,51 @@ impl Subscriber for Capture {
     fn exit(&self, _span: &Id) {}
 }
 
+/// Install [`Router`] as the global default, once per test binary.
+fn install_router() {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    let ok = *INSTALLED.get_or_init(|| {
+        tracing::subscriber::set_global_default(Router {
+            next_span: AtomicU64::new(1),
+        })
+        .is_ok()
+    });
+    assert!(
+        ok,
+        "statement_log needs to be the global tracing subscriber, and this test \
+         binary already installed another one; a capture here would be empty"
+    );
+}
+
+/// Makes `log` the active capture on the current thread for each poll of
+/// `inner`, restoring whatever was active before.
+struct Capturing<F> {
+    inner: Pin<Box<F>>,
+    log: Log,
+}
+
+impl<F: Future> Future for Capturing<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        let previous = ACTIVE.with(|a| a.replace(Some(Arc::clone(&this.log))));
+        let out = this.inner.as_mut().poll(cx);
+        ACTIVE.with(|a| *a.borrow_mut() = previous);
+        out
+    }
+}
+
 /// Run `fut` and return its output together with every statement sqlx
 /// executed while it was being polled, in execution order.
 pub async fn capture<F: Future>(fut: F) -> (F::Output, Vec<Statement>) {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let dispatch = Dispatch::new(Capture {
-        next_span: AtomicU64::new(1),
+    install_router();
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let out = Capturing {
+        inner: Box::pin(fut),
         log: Arc::clone(&log),
-    });
-    let out = fut.with_subscriber(dispatch).await;
+    }
+    .await;
     let statements = std::mem::take(&mut *log.lock().expect("statement log"));
     (out, statements)
 }
