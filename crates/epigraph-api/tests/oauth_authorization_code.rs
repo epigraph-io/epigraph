@@ -135,6 +135,58 @@ async fn oauth_error_responses_carry_the_oauth_headers() {
     assert_oauth_headers(&headers, "token endpoint 413");
 }
 
+/// The rate limiter wraps the merged router, OUTSIDE the OAuth header layer,
+/// so its 429 never passes through that layer. It must still be
+/// uncacheable. The limiter keys an anonymous request on its forwarded IP;
+/// the CONTROL (the first request is 200 and carries the full set) shows the
+/// limiter is live and the route is an OAuth one.
+#[tokio::test]
+async fn a_rate_limited_oauth_response_is_not_cacheable() {
+    if std::env::var("DATABASE_URL").is_err() {
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://test_dummy:test_dummy@localhost/test_dummy",
+        );
+    }
+    let limiter = epigraph_api::AgentRateLimiter::new(epigraph_api::RateLimitConfig {
+        default_rpm: 1,
+        global_rpm: 1000,
+        replenish_interval_secs: 60,
+        enable_global_limit: false,
+    });
+    let state = AppState::new(config())
+        .with_providers(Arc::new(ProviderRegistry::default()))
+        .with_rate_limiter(limiter);
+    let app = create_router(state);
+    let uri = "/.well-known/oauth-authorization-server";
+
+    let (status, headers) = status_and_headers(app.clone(), Method::GET, uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: the first request is admitted"
+    );
+    assert_oauth_headers(&headers, "control: metadata 200");
+
+    let (status, headers) = status_and_headers(app, Method::GET, uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second request inside the window is limited"
+    );
+    for (name, expected) in [("cache-control", "no-store"), ("pragma", "no-cache")] {
+        assert_eq!(
+            headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "429 header {name}"
+        );
+    }
+    assert!(
+        headers.get("retry-after").is_some(),
+        "429 keeps Retry-After"
+    );
+}
+
 // ── DB-backed authorization_code redeem tests ────────────────────────────────
 //
 // These run against a real Postgres test DB (migrations 001-049 applied,
