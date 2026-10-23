@@ -926,6 +926,10 @@ struct Rec {
     strict: Cand,
     recall_exposure: u64,
     graph_view_exposure: Option<u64>,
+    /// In the conflict set today (a stored row's K at least the threshold).
+    conflict_served: bool,
+    /// In the conflict set under strict.
+    conflict_shadow: bool,
 }
 
 /// One recall event, as the replay reads it.
@@ -1252,6 +1256,71 @@ async fn sheaf_shadow(
     Ok(out)
 }
 
+/// The largest stored `conflict_k` over each claim's rows the viewer can
+/// see: the predicate of the conflict scan route (per claim, not per frame),
+/// spliced for the viewer.
+async fn stored_conflict(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, f64>, String> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = viewer.splice(
+        "SELECT mf.claim_id, MAX(mf.conflict_k)::float8 FROM mass_functions mf \
+          WHERE mf.claim_id = ANY($1) AND mf.conflict_k IS NOT NULL /* {VISIBILITY:mf} */ \
+          GROUP BY mf.claim_id",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(ids);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    Ok(q.fetch_all(&mut *conn)
+        .await
+        .map_err(|e| format!("stored conflict: {e}"))?
+        .into_iter()
+        .collect())
+}
+
+/// The conflict set (SPEC §7.2 conflicts row; §10.4): today, claims with a
+/// stored K at least `min_k`; under strict, an atom the report folded is in
+/// it by its fold's K, any other atom keeps today's membership, and every
+/// compound is out. A dropped compound is explained when one of its visible
+/// leaves is in the strict set (its K now shows on an atom), and reported
+/// otherwise.
+fn conflict_shadow(
+    recs: &HashMap<Uuid, Rec>,
+    dropped: &[(Uuid, Vec<Uuid>)],
+    min_k: f64,
+) -> ConflictShadow {
+    let mut c = ConflictShadow {
+        min_k,
+        ..ConflictShadow::default()
+    };
+    for r in recs.values() {
+        c.served += usize::from(r.conflict_served);
+        c.shadow += usize::from(r.conflict_shadow);
+        if !r.compound {
+            c.atoms_added += usize::from(!r.conflict_served && r.conflict_shadow);
+            c.atoms_removed += usize::from(r.conflict_served && !r.conflict_shadow);
+        }
+    }
+    for (_, leaves) in dropped {
+        c.compounds_dropped += 1;
+        if leaves
+            .iter()
+            .any(|l| recs.get(l).is_some_and(|r| r.conflict_shadow))
+        {
+            c.compounds_dropped_with_leaf_conflict += 1;
+        } else {
+            c.compounds_dropped_unexplained += 1;
+        }
+    }
+    c
+}
+
 /// The running totals of the per-claim pass.
 #[derive(Default)]
 struct Totals {
@@ -1259,6 +1328,8 @@ struct Totals {
     deltas: BTreeMap<&'static str, Vec<f64>>,
     movers: Vec<Mover>,
     recs: HashMap<Uuid, Rec>,
+    /// Compounds in today's conflict set, with their visible leaves.
+    conflicted_compounds: Vec<(Uuid, Vec<Uuid>)>,
 }
 
 impl Totals {
@@ -1269,6 +1340,7 @@ impl Totals {
         e: &Eval,
         recall_exposure: u64,
         graph_view_exposure: Option<u64>,
+        conflict: (bool, bool),
     ) {
         let role = base.role.as_sql();
         let s = &mut self.summary;
@@ -1316,6 +1388,8 @@ impl Totals {
                 strict: e.strict,
                 recall_exposure,
                 graph_view_exposure,
+                conflict_served: conflict.0,
+                conflict_shadow: conflict.1,
             },
         );
     }
@@ -1421,9 +1495,11 @@ where
             }
         }
         let mut evals = eval_atoms(conn, viewer, &ctx, opts, &atoms, true).await?;
-        let (compound_evals, _closures) =
+        let (compound_evals, mut closures) =
             eval_compounds(conn, viewer, &ctx, opts, &compounds).await?;
         evals.extend(compound_evals);
+        let visible: Vec<Uuid> = bases.keys().copied().collect();
+        let stored_k = stored_conflict(conn, viewer, &visible).await?;
 
         for id in &page {
             let Some(base) = bases.get(id) else { continue };
@@ -1471,7 +1547,26 @@ where
                 served_vs_fold: eval.served_vs_fold,
             };
             sink(&line)?;
-            totals.add(*id, base, &eval, recall_exposure, line.graph_view_exposure);
+            let conflict_served = stored_k.get(id).is_some_and(|k| *k >= opts.conflict_min_k);
+            let compound = matches!(base.role, ClaimRole::Compound { .. });
+            let conflict_shadow = match (&eval.aef, eval.strict.basis) {
+                _ if compound => false,
+                (Some(aef), "axiom") => aef.conflict >= opts.conflict_min_k,
+                _ => conflict_served,
+            };
+            if compound && conflict_served {
+                totals
+                    .conflicted_compounds
+                    .push((*id, closures.remove(id).unwrap_or_default()));
+            }
+            totals.add(
+                *id,
+                base,
+                &eval,
+                recall_exposure,
+                line.graph_view_exposure,
+                (conflict_served, conflict_shadow),
+            );
         }
     }
     totals.finish_claims(opts.top);
@@ -1479,6 +1574,11 @@ where
         progressive: replay(&events, &totals.recs, |r| &r.progressive),
         strict: replay(&events, &totals.recs, |r| &r.strict),
     };
+    totals.summary.conflicts = conflict_shadow(
+        &totals.recs,
+        &totals.conflicted_compounds,
+        opts.conflict_min_k,
+    );
     totals.summary.sheaf = sheaf_shadow(conn, viewer, &totals.recs, opts.sheaf_threshold).await?;
     totals.summary.strict_entry = strict_entry(
         &totals.recs,
