@@ -60,11 +60,27 @@ impl CompoundSourceEdges {
     /// The environment variable this switch is read from.
     pub const ENV: &'static str = "EPIGRAPH_COMPOUND_SOURCE_EDGES";
 
+    /// Parse one value: trimmed, case-insensitive; `None` when it is neither
+    /// `frozen` nor `excluded`.
+    #[must_use]
+    pub fn parse_value(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("frozen") {
+            Some(Self::Frozen)
+        } else if v.eq_ignore_ascii_case("excluded") {
+            Some(Self::Excluded)
+        } else {
+            None
+        }
+    }
+
     /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
-    /// unrecognised value is the default, [`Self::Frozen`].
+    /// unrecognised value is the default, [`Self::Frozen`] (an unrecognised
+    /// one is logged).
     #[must_use]
     pub fn current() -> Self {
-        Self::default()
+        static CELL: std::sync::OnceLock<CompoundSourceEdges> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| read_flag(Self::ENV, Self::parse_value))
     }
 }
 
@@ -85,11 +101,41 @@ impl AtomFoldMode {
     /// The environment variable this switch is read from.
     pub const ENV: &'static str = "EPIGRAPH_ATOM_FOLD";
 
+    /// Parse one value: trimmed, case-insensitive; `None` when it is none of
+    /// `legacy`, `aef_standalone`, `aef`.
+    #[must_use]
+    pub fn parse_value(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        [
+            ("legacy", Self::Legacy),
+            ("aef_standalone", Self::AefStandalone),
+            ("aef", Self::Aef),
+        ]
+        .into_iter()
+        .find(|(spelling, _)| v.eq_ignore_ascii_case(spelling))
+        .map(|(_, mode)| mode)
+    }
+
     /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
-    /// unrecognised value is the default, [`Self::Legacy`].
+    /// unrecognised value is the default, [`Self::Legacy`] (an unrecognised
+    /// one is logged): a typo never enables the AEF.
     #[must_use]
     pub fn current() -> Self {
-        Self::default()
+        static CELL: std::sync::OnceLock<AtomFoldMode> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| read_flag(Self::ENV, Self::parse_value))
+    }
+}
+
+/// Read one switch from the environment: unset or blank is the default; an
+/// unrecognised value is the default too, and is logged.
+fn read_flag<T: Default + std::fmt::Debug>(env: &str, parse: fn(&str) -> Option<T>) -> T {
+    match std::env::var(env) {
+        Ok(raw) if !raw.trim().is_empty() => parse(&raw).unwrap_or_else(|| {
+            let fallback = T::default();
+            tracing::warn!(flag = env, value = %raw, ?fallback, "unrecognised belief mode; using the default");
+            fallback
+        }),
+        _ => T::default(),
     }
 }
 
@@ -622,4 +668,30 @@ pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
         theta: combined.mass_of(&FocalElement::theta(combined.frame())),
         items: n,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_typo_never_selects_a_fold_mode() {
+        for raw in ["aef ", " AEF", "Aef_Standalone", "LEGACY"] {
+            assert!(AtomFoldMode::parse_value(raw).is_some(), "{raw:?}");
+        }
+        for raw in ["aef-standalone", "aefstandalone", "on", "true", "aef_all"] {
+            assert_eq!(AtomFoldMode::parse_value(raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            CompoundSourceEdges::parse_value("excluded "),
+            Some(CompoundSourceEdges::Excluded)
+        );
+        assert_eq!(CompoundSourceEdges::parse_value("exclude"), None);
+    }
+
+    #[test]
+    fn every_default_is_todays_behaviour() {
+        assert_eq!(AtomFoldMode::default(), AtomFoldMode::Legacy);
+        assert_eq!(CompoundSourceEdges::default(), CompoundSourceEdges::Frozen);
+    }
 }
