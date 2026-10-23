@@ -1013,7 +1013,7 @@ async fn an_operator_whose_link_is_retired_still_reads_the_history(pool: PgPool)
 // =====================================================================
 
 /// The authenticator model the test authenticator claims (synthetic).
-const MODEL: Uuid = Uuid::from_u128(0x6a1e_7e57_0000_4a11_8c0d_000000000161);
+const MODEL: Uuid = Uuid::from_u128(0x6a1e_7e57_0000_4a11_8c0d_0000_0000_0161);
 
 fn software() -> Passkeys {
     Passkeys::new(PasskeyConfig {
