@@ -1359,8 +1359,13 @@ impl Totals {
         let vacuous = |bel: f64, pl: f64| bel < 0.01 && pl > 0.99;
         let served_vacuous =
             matches!((base.cache.bel, base.cache.pl), (Some(b), Some(p)) if vacuous(b, p));
+        let compound = matches!(base.role, ClaimRole::Compound { .. });
         if e.strict.computed() && vacuous(e.strict.iv.bel, e.strict.iv.pl) && !served_vacuous {
-            s.vacate.atoms += 1;
+            if compound {
+                s.vacate.compounds += 1;
+            } else {
+                s.vacate.atoms += 1;
+            }
         }
         if e.residue {
             s.residue += 1;
@@ -1371,7 +1376,6 @@ impl Totals {
                 s.fold_mismatch.mismatched += 1;
             }
         }
-        let compound = matches!(base.role, ClaimRole::Compound { .. });
         if compound {
             s.compound_confirmed_set.progressive += usize::from(e.progressive.confirmed);
             s.compound_confirmed_set.strict += usize::from(e.strict.confirmed);
