@@ -550,6 +550,10 @@ async fn pure_reads_evidence_only_and_display_adds_the_inferred_classes(pool: Pg
 /// Plan test (4), the atom half of D11. Two `attributed_v1` rows citing one
 /// paper (two evidence rows, one DOI) are one item: .8, not Dempster's .96.
 /// Two different papers still reinforce.
+///
+/// The other half, single-leaf `conj_belief` == `atom_fold` on this fixture
+/// and on the `~` fixture below (.8 and .897), needs `conj_belief` (PR-3), so
+/// it is carried into PR-6's red tests by name.
 #[sqlx::test(migrations = "../../migrations")]
 async fn one_papers_two_attributed_items_fold_to_the_max(pool: PgPool) {
     let author = agent(&pool).await;
