@@ -334,6 +334,7 @@ pub struct FoldMismatch {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
 pub struct SheafStats {
     pub edge_count: usize,
+    /// The share of the coverage denominator (SPEC §1.3) this set covers.
     pub coverage: f64,
     pub h1: f64,
     pub h1_normalized: f64,
@@ -362,7 +363,7 @@ pub struct ObstructionChanges {
     pub new_endpoint_gained_value: usize,
 }
 
-/// The sheaf shadow.
+/// The sheaf shadow (see `sheaf_shadow`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct SheafShadow {
     /// Today's cohomology computed exactly as the sheaf tool computes it.
@@ -370,8 +371,6 @@ pub struct SheafShadow {
     pub served: SheafStats,
     pub progressive: SheafStats,
     pub strict: SheafStats,
-    pub vanished_obstructions: usize,
-    pub new_obstructions: usize,
     pub pairs_outside_scope: usize,
     /// The coverage denominator (SPEC §1.3).
     pub coverage_denominator: usize,
@@ -538,6 +537,9 @@ struct Cand {
     confirmed: bool,
     contested: bool,
     iv: Interval,
+    /// The claim has a value the sheaf can read: a computed candidate, or a
+    /// cached `BetP` today (the served cohomology's own requirement).
+    valued: bool,
 }
 
 impl Cand {
@@ -556,6 +558,7 @@ impl Cand {
                 betp: b.cache.betp.unwrap_or(s),
                 open_world: b.cache.missing.unwrap_or(0.0),
             },
+            valued: b.cache.betp.is_some(),
         }
     }
 
@@ -936,6 +939,7 @@ async fn eval_atoms(
                             betp: aef.betp,
                             open_world: aef.open_world,
                         },
+                        valued: true,
                     }
                 } else {
                     today
@@ -1091,6 +1095,7 @@ async fn eval_compounds(
                 betp: view.betp,
                 open_world: (view.nr - view.pl).max(0.0),
             },
+            valued: true,
         };
         let ready = legacy_leaves == 0;
         let progressive = if ready {
@@ -1405,15 +1410,9 @@ fn sheaf_interval(iv: &Interval) -> epigraph_engine::EpistemicInterval {
 fn sheaf_stats(
     obstructions: Vec<epigraph_engine::CdstSheafObstruction>,
     threshold: f64,
-    served_edges: usize,
+    coverage: f64,
 ) -> SheafStats {
     let c = epigraph_engine::compute_cdst_cohomology(obstructions, threshold);
-    #[allow(clippy::cast_precision_loss)]
-    let coverage = if served_edges == 0 {
-        1.0
-    } else {
-        c.edge_count as f64 / served_edges as f64
-    };
     SheafStats {
         edge_count: c.edge_count,
         coverage,
@@ -1426,75 +1425,259 @@ fn sheaf_stats(
     }
 }
 
-/// The sheaf shadow (SPEC §7.2 sheaf row, §10.4): the cohomology of the
-/// epistemic edges the viewer can see, with each endpoint's interval today,
-/// under progressive and under strict. A candidate interval the report did
-/// not compute (a kept cache) is today's, so the comparison isolates value
-/// change; today's interval is read from the same cache columns (Bel, Pl,
-/// open-world mass). Progressive keeps every edge (whether a compound-ended
-/// edge was replaced is not read here); strict drops every edge with a
-/// compound end, and its coverage is the share of edges kept. An edge with
-/// an endpoint outside the run's scope is skipped and counted.
+/// The relationships the sheaf cohomology reads, as
+/// `SheafRepository::get_epistemic_edge_pairs` lists them.
+const SHEAF_RELATIONSHIPS: &str = "'supports', 'refutes', 'contradicts', 'corroborates', \
+     'elaborates', 'specializes', 'generalizes', 'frame_validates'";
+
+/// One live epistemic edge between two claims the viewer can read.
+struct SheafEdge {
+    id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relationship: String,
+    /// Replaced by atom edges (SPEC §7.1 P4: `retargeted_to` present and
+    /// `retarget_unwired` empty).
+    replaced: bool,
+    /// The atom edges that replaced it.
+    retargeted_to: Vec<Uuid>,
+}
+
+/// Every live epistemic edge the viewer can see, WITHOUT the served
+/// cohomology's prefilter (both endpoints holding a cached `BetP`): an edge
+/// whose endpoint gains a value only under the candidate must be read too.
+/// Whether each mode can evaluate an edge is decided from the endpoints'
+/// values, per mode.
+async fn sheaf_edges(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+) -> Result<Vec<SheafEdge>, String> {
+    let sql = viewer.splice(
+        &format!(
+            "SELECT e.id, e.source_id, e.target_id, e.relationship, \
+                    COALESCE(e.properties ? 'retargeted_to' \
+                             AND e.properties -> 'retarget_unwired' = '[]'::jsonb, false), \
+                    e.properties -> 'retargeted_to' \
+               FROM edges e \
+               JOIN claims src ON src.id = e.source_id \
+               JOIN claims tgt ON tgt.id = e.target_id \
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+                AND e.relationship IN ({SHEAF_RELATIONSHIPS}) \
+                AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:src}} */ /* {{VISIBILITY:tgt}} */"
+        ),
+        1,
+    );
+    type Row = (Uuid, Uuid, Uuid, String, bool, Option<serde_json::Value>);
+    let mut q = sqlx::query_as::<_, Row>(&sql);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    Ok(q.fetch_all(&mut *conn)
+        .await
+        .map_err(|e| format!("sheaf edges: {e}"))?
+        .into_iter()
+        .map(
+            |(id, source_id, target_id, relationship, replaced, retargeted)| SheafEdge {
+                id,
+                source_id,
+                target_id,
+                relationship,
+                replaced,
+                retargeted_to: retargeted
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        )
+        .collect())
+}
+
+/// Why a mode does not evaluate an edge it was evaluated on today.
+#[derive(Clone, Copy)]
+enum Unevaluated {
+    /// A compound-ended edge the mode drops because atom edges replaced it.
+    Replaced,
+    /// A compound-ended edge the mode drops with no replacement.
+    Dropped,
+    /// An endpoint has no value under the candidate.
+    NoValue,
+}
+
+/// Count how one edge's obstruction changed from today to a mode.
+/// `served` / `mode` are the edge's inconsistency where it is evaluated;
+/// `dropped` is the mode's reason for not evaluating a compound-ended edge.
+fn count_change(
+    c: &mut ObstructionChanges,
+    served: Option<f64>,
+    mode: Option<f64>,
+    dropped: Option<Unevaluated>,
+    threshold: f64,
+) {
+    let was = served.is_some_and(|x| x > threshold);
+    let is = mode.is_some_and(|x| x > threshold);
+    if was && !is {
+        match (mode, dropped.unwrap_or(Unevaluated::NoValue)) {
+            (Some(_), _) => c.vanished_on_value += 1,
+            (None, Unevaluated::Replaced) => c.vanished_edge_replaced += 1,
+            (None, Unevaluated::Dropped) => c.vanished_edge_dropped += 1,
+            (None, Unevaluated::NoValue) => c.vanished_endpoint_without_value += 1,
+        }
+    } else if !was && is {
+        if served.is_some() {
+            c.new_on_value += 1;
+        } else {
+            c.new_endpoint_gained_value += 1;
+        }
+    }
+}
+
+/// The sheaf shadow (SPEC §1.3, §7.2 sheaf row, §10.4).
+///
+/// * `served`: today's cohomology: each endpoint's cached Bel, Pl and
+///   open-world mass. An edge is evaluated when both endpoints hold a cached
+///   `BetP`.
+/// * `progressive`: the candidate's intervals; a compound-ended edge atom
+///   edges replaced (P4) is dropped, any other is kept.
+/// * `strict`: the candidate's intervals; every compound-ended edge is
+///   dropped.
+///
+/// A candidate interval the report did not compute (a kept cache) is
+/// today's, so the comparison isolates value change; a mode evaluates an
+/// edge whose endpoints both have a value under it (an atom with AEF input
+/// and no cache gains one).
+///
+/// Coverage (SPEC §1.3) is over a fixed denominator: the atom-atom edges
+/// today's cohomology evaluates plus the compound-ended edges atom edges
+/// replaced. A mode covers an atom-atom edge it evaluates, and a replaced
+/// edge when it evaluates every edge in its `retargeted_to`. A compound-ended
+/// edge nothing replaced is outside the denominator: strict's drop of it is
+/// an accepted, reported loss (`strict_changes.vanished_edge_dropped`).
+///
+/// Every obstruction that vanishes or appears under a mode is counted under
+/// its cause in `progressive_changes` / `strict_changes`. An edge with an
+/// endpoint outside the run's scope is skipped and counted.
 async fn sheaf_shadow(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
     recs: &HashMap<Uuid, Rec>,
     threshold: f64,
+    _scoped: bool,
 ) -> Result<SheafShadow, String> {
-    let pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(&mut *conn, viewer, None)
-        .await
-        .map_err(|e| format!("get_epistemic_edge_pairs: {e}"))?;
     let profile = epigraph_engine::sheaf::RestrictionProfile::scientific();
-    let shadow_iv = |c: &Cand, today: &Cand| {
-        if c.computed() {
-            sheaf_interval(&c.iv)
-        } else {
-            sheaf_interval(&today.iv)
-        }
-    };
-    let (mut served, mut progressive, mut strict) = (Vec::new(), Vec::new(), Vec::new());
     let mut out = SheafShadow::default();
-    for p in pairs {
-        let (Some(rs), Some(rt)) = (recs.get(&p.source_id), recs.get(&p.target_id)) else {
+
+    // Per edge in scope: (edge, compound-ended, today's / progressive's /
+    // strict's inconsistency where the mode evaluates it).
+    let mut evaluated: Vec<(
+        &SheafEdge,
+        bool,
+        [Option<epigraph_engine::CdstSheafObstruction>; 3],
+    )> = Vec::new();
+    let edges = sheaf_edges(conn, viewer).await?;
+    for e in &edges {
+        let (Some(rs), Some(rt)) = (recs.get(&e.source_id), recs.get(&e.target_id)) else {
             out.pairs_outside_scope += 1;
             continue;
         };
-        let edge = |s, t| {
-            epigraph_engine::compute_cdst_edge_inconsistency(
-                p.source_id,
-                p.target_id,
-                s,
-                t,
-                &p.relationship,
-                &profile,
-            )
+        let compound_end = rs.compound || rt.compound;
+        let edge = |s: &Cand, t: &Cand| {
+            (s.valued && t.valued).then(|| {
+                epigraph_engine::compute_cdst_edge_inconsistency(
+                    e.source_id,
+                    e.target_id,
+                    sheaf_interval(&s.iv),
+                    sheaf_interval(&t.iv),
+                    &e.relationship,
+                    &profile,
+                )
+            })
         };
-        let o_served = edge(sheaf_interval(&rs.today.iv), sheaf_interval(&rt.today.iv));
-        let o_prog = edge(
-            shadow_iv(&rs.progressive, &rs.today),
-            shadow_iv(&rt.progressive, &rt.today),
-        );
-        let was = o_served.interval_inconsistency > threshold;
-        let is = if rs.compound || rt.compound {
-            false
+        let served = edge(&rs.today, &rt.today);
+        let progressive = if compound_end && e.replaced {
+            None
         } else {
-            let o_strict = edge(
-                shadow_iv(&rs.strict, &rs.today),
-                shadow_iv(&rt.strict, &rt.today),
-            );
-            let is = o_strict.interval_inconsistency > threshold;
-            strict.push(o_strict);
-            is
+            edge(&rs.progressive, &rt.progressive)
         };
-        out.vanished_obstructions += usize::from(was && !is);
-        out.new_obstructions += usize::from(!was && is);
-        served.push(o_served);
-        progressive.push(o_prog);
+        let strict = if compound_end {
+            None
+        } else {
+            edge(&rs.strict, &rt.strict)
+        };
+        if compound_end {
+            out.compound_ended_edges += 1;
+            out.compound_ended_replaced += usize::from(e.replaced);
+        } else if served.is_some() {
+            out.atom_atom_edges += 1;
+        }
+        evaluated.push((e, compound_end, [served, progressive, strict]));
     }
-    let n = served.len();
-    out.served = sheaf_stats(served, threshold, n);
-    out.progressive = sheaf_stats(progressive, threshold, n);
-    out.strict = sheaf_stats(strict, threshold, n);
+
+    // Which edges each mode evaluates, for a replaced edge's coverage.
+    let mut by_mode: [HashSet<Uuid>; 3] = Default::default();
+    for (e, _, obs) in &evaluated {
+        for (set, o) in by_mode.iter_mut().zip(obs) {
+            if o.is_some() {
+                set.insert(e.id);
+            }
+        }
+    }
+    out.coverage_denominator = out.atom_atom_edges + out.compound_ended_replaced;
+    let mut covered = [0usize; 3];
+    for (e, compound_end, obs) in &evaluated {
+        for (m, n) in covered.iter_mut().enumerate() {
+            let counts = if *compound_end {
+                e.replaced
+                    && !e.retargeted_to.is_empty()
+                    && e.retargeted_to.iter().all(|r| by_mode[m].contains(r))
+            } else {
+                obs[0].is_some() && obs[m].is_some()
+            };
+            *n += usize::from(counts);
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let coverage = |n: usize| {
+        if out.coverage_denominator == 0 {
+            1.0
+        } else {
+            n as f64 / out.coverage_denominator as f64
+        }
+    };
+
+    let mut lists: [Vec<epigraph_engine::CdstSheafObstruction>; 3] = Default::default();
+    for (e, compound_end, obs) in evaluated {
+        let x = |o: &Option<epigraph_engine::CdstSheafObstruction>| {
+            o.as_ref().map(|o| o.interval_inconsistency)
+        };
+        let replaced = (compound_end && e.replaced).then_some(Unevaluated::Replaced);
+        count_change(
+            &mut out.progressive_changes,
+            x(&obs[0]),
+            x(&obs[1]),
+            replaced,
+            threshold,
+        );
+        count_change(
+            &mut out.strict_changes,
+            x(&obs[0]),
+            x(&obs[2]),
+            replaced.or(compound_end.then_some(Unevaluated::Dropped)),
+            threshold,
+        );
+        for (list, o) in lists.iter_mut().zip(obs) {
+            list.extend(o);
+        }
+    }
+    let [served, progressive, strict] = lists;
+    out.served = sheaf_stats(served, threshold, coverage(covered[0]));
+    out.progressive = sheaf_stats(progressive, threshold, coverage(covered[1]));
+    out.strict = sheaf_stats(strict, threshold, coverage(covered[2]));
     Ok(out)
 }
 
@@ -1844,7 +2027,14 @@ where
         &totals.conflicted_compounds,
         opts.conflict_min_k,
     );
-    totals.summary.sheaf = sheaf_shadow(conn, viewer, &totals.recs, opts.sheaf_threshold).await?;
+    totals.summary.sheaf = sheaf_shadow(
+        conn,
+        viewer,
+        &totals.recs,
+        opts.sheaf_threshold,
+        matches!(opts.scope, Scope::Ids(_)),
+    )
+    .await?;
     let today_places = places(&totals.recs, |r| r.today.rank);
     let strict_places = places(&totals.recs, |r| r.strict.rank);
     for (spine, slot) in [
