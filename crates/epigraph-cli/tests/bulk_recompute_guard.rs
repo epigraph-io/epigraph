@@ -1,5 +1,7 @@
 //! The bulk belief recompute leaves compounds and ingest-template-only claims
-//! alone (atom-level belief program, PR-0; SPEC §10.3, §11.1).
+//! alone (atom-level belief program, PR-0; SPEC §2.1 roles, §6.1 compound
+//! caches frozen, §10.1 hazards H1 and H2, §10.5 the template-only residue,
+//! §10.6 freeze list).
 //!
 //! Three bulk recomputers resolve a claim's cache owner through the ONE choke
 //! point `MassFunctionRepository::cache_owner_frame_for_claim`:
