@@ -40,6 +40,35 @@ fn challenge_not_writer(claim_id: uuid::Uuid) -> McpError {
     }
 }
 
+/// A `42501` from the challenge INSERT AFTER [`challenge_claim`]'s preflight
+/// admitted the challenger. That is not the caller's denial (the preflight
+/// already answers that by name): it is a membership revoked in between, or a
+/// server-side GRANT / policy fault. So it is logged, and answered as an
+/// `INTERNAL_ERROR` with a fixed message: neither the raw row-security text
+/// nor a `not_writer` refusal that would blame the caller.
+fn challenge_refused_after_preflight(claim_id: uuid::Uuid, e: &sqlx::Error) -> McpError {
+    tracing::error!(
+        target: "tenancy.scoped_write",
+        tool = "challenge_claim",
+        claim_id = %claim_id,
+        error = %e,
+        "challenge INSERT refused (insufficient_privilege) after the writer preflight admitted \
+         the challenger. Nothing was written."
+    );
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: std::borrow::Cow::from(format!(
+            "challenge_claim: the database refused the challenge on claim {claim_id} after the \
+             writer check admitted it (a membership change in between, or a server-side policy \
+             fault; the detail is in the server log); nothing was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "write_refused_after_preflight",
+            "claim_id": claim_id,
+        })),
+    }
+}
+
 /// `true` for PostgreSQL's `insufficient_privilege` (SQLSTATE `42501`), which
 /// a row-security `WITH CHECK` raises.
 fn is_insufficient_privilege(e: &sqlx::Error) -> bool {
@@ -99,7 +128,8 @@ const VALID_CHALLENGE_TYPES: &[&str] = &[
 /// carries. It used to surface as an `INTERNAL_ERROR` carrying the raw
 /// `new row violates row-level security policy for table "challenges"`
 /// (backlog deebc487). A claim the caller cannot read stays "not found". A
-/// `42501` from the INSERT itself is mapped to the same refusal, as a backstop.
+/// `42501` from the INSERT itself, past the preflight, is a server-side fault
+/// or a race, not the caller's denial ([`challenge_refused_after_preflight`]).
 pub async fn challenge_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -152,7 +182,7 @@ pub async fn challenge_claim(
     .await
     .map_err(|e| {
         if is_insufficient_privilege(&e) {
-            challenge_not_writer(claim_id)
+            challenge_refused_after_preflight(claim_id, &e)
         } else {
             internal_error(e)
         }

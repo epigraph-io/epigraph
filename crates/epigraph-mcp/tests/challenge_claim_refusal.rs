@@ -204,3 +204,51 @@ async fn challenge_claim_on_an_unwritable_group_claim_is_a_clean_refusal(pool: P
         .expect("the server agent challenges a claim in its own group");
     assert_eq!(challenges_on(&pool, mine).await, 1, "the control lands");
 }
+
+/// A `42501` from the challenge INSERT itself, AFTER the preflight admitted
+/// the challenger (here forced by a trigger; in production a membership
+/// revoked in between, or a GRANT / policy fault), is a server fault: it is
+/// answered as `INTERNAL_ERROR` with a fixed message, neither the raw database
+/// text nor a `not_writer` refusal that would blame the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_42501_past_the_preflight_is_a_fixed_text_internal_error(pool: PgPool) {
+    let (server, agent, viewer) = app_role_server(&pool).await;
+    let own_group = personal_group_of(&pool, agent).await;
+    let mine = public_claim_in(&pool, agent, own_group, "a public claim, own group").await;
+
+    const MARKER: &str = "forced-insufficient-privilege-c41d";
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_force_42501() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION '{MARKER}' USING ERRCODE = '42501'; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create the forcing function");
+    sqlx::query("GRANT EXECUTE ON FUNCTION test_force_42501() TO PUBLIC")
+        .execute(&pool)
+        .await
+        .expect("grant execute");
+    sqlx::query(
+        "CREATE TRIGGER test_force_42501 BEFORE INSERT ON challenges \
+         FOR EACH ROW EXECUTE FUNCTION test_force_42501()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the forcing trigger");
+
+    let e = challenge_claim(&server, &viewer, params(mine), None)
+        .await
+        .expect_err("the forced 42501 refuses the INSERT");
+    assert_eq!(e.code, ErrorCode::INTERNAL_ERROR, "{e:?}");
+    assert!(
+        !e.message.contains(MARKER),
+        "the raw database text is not passed on: {e:?}"
+    );
+    assert!(
+        e.message.contains("nothing was written") && e.message.contains(&mine.to_string()),
+        "the fixed message names the claim and says nothing was written: {e:?}"
+    );
+    let data = e.data.clone().expect("the error carries data");
+    assert_eq!(data["error"], "write_refused_after_preflight", "{data}");
+    assert_eq!(challenges_on(&pool, mine).await, 0, "nothing written");
+}
