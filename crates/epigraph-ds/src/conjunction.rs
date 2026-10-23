@@ -554,9 +554,12 @@ fn run_dp(p: &Prepared, not_all: f64) -> Result<Option<Joint>, DsError> {
                     None => k += mass,
                 }
             }
-        }
-        if next.len() > MAX_STATES {
-            return Ok(None);
+            // Checked per source state, not once the item is done: one item
+            // can multiply the live states by its focal count (up to 3n + 1),
+            // so a check after the item lets `next` grow far past the cap.
+            if next.len() > MAX_STATES {
+                return Ok(None);
+            }
         }
         states = next;
     }
