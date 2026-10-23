@@ -1,0 +1,1185 @@
+//! The atom evidence fold (AEF) and the single atom-cache writer
+//! (atom-level belief program, PR-5; SPEC §3.3 item keys and lens context,
+//! §3.4 Display and Pure, §4.2 the single atom-cache writer, §6.3
+//! compound-source edges, §10.2 `EPIGRAPH_ATOM_FOLD`, §11.4 axiom input).
+//!
+//! What is pinned here, as properties of the rows an atom's fold reads and of
+//! what the writer does with them:
+//!
+//! * the AEF reads every 2-hypothesis frame plus `claim_validity` (coarsened),
+//!   so a new `binary_truth` row never evicts another frame's evidence (the
+//!   owner-frame rule's frame flip);
+//! * it never reads a cached combination, an ingest template row, or any row
+//!   of a compound (role is structure, whatever the viewer sees);
+//! * `Pure` is evidence only; `Display` adds the inferred classes, and reads a
+//!   compound-source edge row one-sided while compound-source edges are frozen;
+//! * one paper's two citations are one item (the max), and `~` mass meets a
+//!   second item exactly as CDST Dempster does (D11, atom side);
+//! * a seed counts only while it is the atom's sole input;
+//! * the writer never writes a compound, folds only the roles its flag covers,
+//!   stamps `binary_truth`, and never NULLs an atom.
+//!
+//! Expected values are absolute numbers from the SPEC's worked examples or
+//! from sentinels and twin claims; none is computed here by the operator
+//! under test.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use std::collections::{BTreeSet, HashMap};
+
+use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
+use epigraph_engine::atom_items::{
+    atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
+};
+use epigraph_engine::belief_query::FramedBeliefContext;
+use epigraph_engine::calibration::CalibrationConfig;
+use epigraph_engine::edge_factor::{
+    compound_cache_write_skipped, recompute_atom_cache_with, AtomCacheOutcome, AtomCacheSettings,
+    CacheWriteCause, LegacyFold, PerspectiveReliability, CLAIM_VALIDITY_FRAME_ID,
+};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const TOL: f64 = 1e-9;
+
+// ── fixtures ────────────────────────────────────────────────────────────────
+
+async fn agent(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key) VALUES (sha256(gen_random_uuid()::text::bytea)) \
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("agent")
+}
+
+async fn claim(pool: &PgPool, author: Uuid, what: &str) -> Uuid {
+    fixture::seed_public_claim(pool, author, &format!("aef {what} {}", Uuid::new_v4())).await
+}
+
+async fn frame(pool: &PgPool, name: &str, hyps: &[&str]) -> Uuid {
+    if let Some(f) = FrameRepository::get_by_name(pool, &fixture::public_viewer(pool).await, name)
+        .await
+        .expect("frame lookup")
+    {
+        return f.id;
+    }
+    FrameRepository::create(
+        pool,
+        name,
+        None,
+        &hyps.iter().map(|h| (*h).to_string()).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("frame")
+    .id
+}
+
+async fn binary(pool: &PgPool) -> Uuid {
+    frame(pool, "binary_truth", &["TRUE", "FALSE"]).await
+}
+
+async fn research_validity(pool: &PgPool) -> Uuid {
+    frame(pool, "research_validity", &["valid", "invalid"]).await
+}
+
+/// One BBA row. With `evidence_type` `None` and `source_strength` 1.0 its
+/// reliability is exactly 1 whatever the calibration (the stored-strength
+/// tier of `effective_source_strength`).
+#[derive(Clone)]
+struct Row {
+    agent: Option<Uuid>,
+    perspective: Option<Uuid>,
+    method: Option<&'static str>,
+    strength: Option<f64>,
+    evidence_type: Option<&'static str>,
+    evidence: Option<Uuid>,
+}
+
+impl Row {
+    fn plain(agent: Uuid) -> Self {
+        Self {
+            agent: Some(agent),
+            perspective: None,
+            method: None,
+            strength: Some(1.0),
+            evidence_type: None,
+            evidence: None,
+        }
+    }
+}
+
+async fn store(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    row: Row,
+    masses: serde_json::Value,
+) -> Uuid {
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        row.agent,
+        row.perspective,
+        &masses,
+        None,
+        row.method,
+        row.strength,
+        row.evidence_type,
+        "unknown",
+        row.evidence,
+    )
+    .await
+    .expect("store BBA")
+}
+
+/// The ingest template: `research_validity`, no method, strength .3, m(Θ) ≥ .80.
+async fn store_template(pool: &PgPool, claim: Uuid, ingest_agent: Uuid) -> Uuid {
+    let rv = research_validity(pool).await;
+    store(
+        pool,
+        claim,
+        rv,
+        Row {
+            strength: Some(0.3),
+            ..Row::plain(ingest_agent)
+        },
+        serde_json::json!({"0": 0.1, "0,1": 0.9}),
+    )
+    .await
+}
+
+async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("edge")
+}
+
+/// An edge-factor row on `target` for edge `edge_id`: perspective = edge id.
+async fn store_edge_factor(
+    pool: &PgPool,
+    edge_id: Uuid,
+    target: Uuid,
+    writer: Uuid,
+    masses: serde_json::Value,
+) -> Uuid {
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge') ON CONFLICT DO NOTHING")
+        .bind(edge_id)
+        .execute(pool)
+        .await
+        .expect("edge perspective");
+    let b = binary(pool).await;
+    store(
+        pool,
+        target,
+        b,
+        Row {
+            perspective: Some(edge_id),
+            method: Some("edge_factor"),
+            ..Row::plain(writer)
+        },
+        masses,
+    )
+    .await
+}
+
+/// `parent` decomposes into `child`.
+async fn decompose(pool: &PgPool, parent: Uuid, child: Uuid) -> Uuid {
+    edge(pool, parent, child, "decomposes_to").await
+}
+
+/// An evidence row on `holder` carrying `properties.doi`, plus the evidence
+/// perspective a citation of it uses.
+async fn doi_evidence(pool: &PgPool, holder: Uuid, doi: &str, cite_agent: Uuid) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, properties) \
+         VALUES ($1, 'document', sha256(gen_random_uuid()::text::bytea), \
+                 jsonb_build_object('doi', $2::text)) RETURNING id",
+    )
+    .bind(holder)
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("evidence");
+    PerspectiveRepository::ensure_evidence_perspective(pool, id, Some(cite_agent))
+        .await
+        .expect("evidence perspective");
+    id
+}
+
+/// An `attributed_v1` row citing evidence `ev` on `atom`.
+async fn store_attributed(pool: &PgPool, atom: Uuid, ev: Uuid, writer: Uuid, t: f64) -> Uuid {
+    let b = binary(pool).await;
+    store(
+        pool,
+        atom,
+        b,
+        Row {
+            perspective: Some(ev),
+            evidence: Some(ev),
+            method: Some("attributed_v1"),
+            ..Row::plain(writer)
+        },
+        serde_json::json!({"0": t, "0,1": 1.0 - t}),
+    )
+    .await
+}
+
+fn ctx() -> FramedBeliefContext {
+    FramedBeliefContext::new(CalibrationConfig::default_for_phase2_fallback(), None)
+}
+
+async fn rows(
+    pool: &PgPool,
+    ids: &[Uuid],
+    mode: AxiomMode,
+    edges: CompoundSourceEdges,
+) -> HashMap<Uuid, Vec<AxiomRow>> {
+    let viewer = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    atom_axiom_rows_under(&mut conn, &viewer, ids, mode, &ctx(), edges)
+        .await
+        .expect("atom_axiom_rows")
+}
+
+async fn display(pool: &PgPool, id: Uuid) -> Vec<AxiomRow> {
+    rows(pool, &[id], AxiomMode::Display, CompoundSourceEdges::Frozen)
+        .await
+        .remove(&id)
+        .unwrap_or_default()
+}
+
+fn ids_of(rows: &[AxiomRow]) -> BTreeSet<Uuid> {
+    rows.iter().map(|r| r.row_id).collect()
+}
+
+fn set(ids: &[Uuid]) -> BTreeSet<Uuid> {
+    ids.iter().copied().collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct Cache {
+    belief: Option<f64>,
+    plausibility: Option<f64>,
+    pignistic: Option<f64>,
+    frame: Option<Uuid>,
+}
+
+async fn cache(pool: &PgPool, id: Uuid) -> Cache {
+    let (belief, plausibility, pignistic, frame): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT belief, plausibility, pignistic_prob, belief_frame_id FROM claims WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("cache");
+    Cache {
+        belief,
+        plausibility,
+        pignistic,
+        frame,
+    }
+}
+
+/// A cache value no fold of the fixture rows can produce.
+async fn set_sentinel(pool: &PgPool, id: Uuid) -> Cache {
+    sqlx::query(
+        "UPDATE claims SET belief = 0.123, plausibility = 0.877, pignistic_prob = 0.5, \
+         mass_on_empty = 0, mass_on_missing = 0, belief_frame_id = NULL WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("sentinel");
+    cache(pool, id).await
+}
+
+fn settings(fold: AtomFoldMode, vacate: bool) -> AtomCacheSettings {
+    AtomCacheSettings {
+        fold,
+        compound_source_edges: CompoundSourceEdges::Frozen,
+        vacate_on_evidence_removal: vacate,
+    }
+}
+
+async fn write(
+    pool: &PgPool,
+    id: Uuid,
+    cause: CacheWriteCause,
+    legacy: LegacyFold,
+    s: AtomCacheSettings,
+) -> AtomCacheOutcome {
+    let viewer = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    recompute_atom_cache_with(&mut conn, &viewer, id, cause, legacy, s)
+        .await
+        .expect("recompute_atom_cache")
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < TOL
+}
+
+// ── (1) frame flip ──────────────────────────────────────────────────────────
+
+/// Plan test (1). Under the owner-frame rule the first `binary_truth` row
+/// evicts every other frame from the cache (hazard H7). The AEF reads every
+/// 2-hypothesis frame, so adding that row only ADDS to the input.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_binary_row_keeps_research_validity_and_auto_cdst_rows_in_the_fold(pool: PgPool) {
+    let author = agent(&pool).await;
+    let atom = claim(&pool, author, "frame flip").await;
+    let rv = research_validity(&pool).await;
+    let b = binary(&pool).await;
+
+    let substantive = store(
+        &pool,
+        atom,
+        rv,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let cdst = store(
+        &pool,
+        atom,
+        b,
+        Row {
+            method: Some("auto_cdst"),
+            ..Row::plain(agent(&pool).await)
+        },
+        serde_json::json!({"0": 0.3, "0,1": 0.7}),
+    )
+    .await;
+    let before = ids_of(&display(&pool, atom).await);
+    assert!(
+        before.contains(&substantive) && before.contains(&cdst),
+        "the AEF input must hold the research_validity and auto_cdst rows, got {before:?}"
+    );
+
+    let new_binary = store(
+        &pool,
+        atom,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    let after_rows = display(&pool, atom).await;
+    let after = ids_of(&after_rows);
+    assert!(
+        before.is_subset(&after) && after.contains(&new_binary),
+        "a binary_truth row must add to the input, never evict: before {before:?}, after {after:?}"
+    );
+    let fold = atom_fold(&after_rows).expect("fold");
+    assert_eq!(fold.items(), 3, "three distinct sources are three items");
+}
+
+// ── (2) template-only ───────────────────────────────────────────────────────
+
+/// Plan test (2): the ingest template is never AEF input, so a template-only
+/// atom folds empty (Unproven), and a template beside real evidence is not
+/// read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_template_only_atom_folds_empty_and_a_template_is_never_read(pool: PgPool) {
+    let author = agent(&pool).await;
+    let ingest = agent(&pool).await;
+    let only = claim(&pool, author, "template only").await;
+    store_template(&pool, only, ingest).await;
+    let mixed = claim(&pool, author, "template plus evidence").await;
+    store_template(&pool, mixed, ingest).await;
+    let real = store(
+        &pool,
+        mixed,
+        binary(&pool).await,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+
+    let got = rows(
+        &pool,
+        &[only, mixed],
+        AxiomMode::Display,
+        CompoundSourceEdges::Frozen,
+    )
+    .await;
+    let only_rows = got.get(&only).cloned().unwrap_or_default();
+    assert!(
+        only_rows.is_empty(),
+        "a template-only atom has no AEF input"
+    );
+    let fold = atom_fold(&only_rows).expect("empty fold");
+    assert!(fold.is_unproven());
+    assert!(close(fold.belief(), 0.0) && close(fold.plausibility(), 1.0));
+
+    assert_eq!(
+        ids_of(got.get(&mixed).map(Vec::as_slice).unwrap_or_default()),
+        set(&[real]),
+        "beside real evidence the template is still not read"
+    );
+}
+
+// ── (3) Pure vs Display ─────────────────────────────────────────────────────
+
+/// Plan test (3). Pure is the engine's premise input: evidence only. Display
+/// adds the inferred classes; an edge-factor row from an ATOM source is kept.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pure_reads_evidence_only_and_display_adds_the_inferred_classes(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let atom = claim(&pool, author, "pure vs display").await;
+    let source = claim(&pool, author, "atom source").await;
+
+    let evidence = store(
+        &pool,
+        atom,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let e = edge(&pool, source, atom, "supports").await;
+    let edge_row = store_edge_factor(
+        &pool,
+        e,
+        atom,
+        agent(&pool).await,
+        serde_json::json!({"0": 0.4, "0,1": 0.6}),
+    )
+    .await;
+    let mut inferred = vec![edge_row];
+    for method in [
+        "propagated_from_parent",
+        "propagated_from_neighbor",
+        "auto_cdst",
+    ] {
+        inferred.push(
+            store(
+                &pool,
+                atom,
+                b,
+                Row {
+                    method: Some(method),
+                    ..Row::plain(agent(&pool).await)
+                },
+                serde_json::json!({"0": 0.2, "0,1": 0.8}),
+            )
+            .await,
+        );
+    }
+
+    let pure = rows(&pool, &[atom], AxiomMode::Pure, CompoundSourceEdges::Frozen).await;
+    assert_eq!(
+        ids_of(pure.get(&atom).map(Vec::as_slice).unwrap_or_default()),
+        set(&[evidence]),
+        "Pure must read the evidence row and nothing inferred"
+    );
+    let mut all = inferred.clone();
+    all.push(evidence);
+    assert_eq!(
+        ids_of(&display(&pool, atom).await),
+        set(&all),
+        "Display must read the evidence row and every inferred row"
+    );
+}
+
+// ── (4) D11, atom side ──────────────────────────────────────────────────────
+
+/// Plan test (4), the atom half of D11. Two `attributed_v1` rows citing one
+/// paper (two evidence rows, one DOI) are one item: .8, not Dempster's .96.
+/// Two different papers still reinforce.
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_papers_two_attributed_items_fold_to_the_max(pool: PgPool) {
+    let author = agent(&pool).await;
+    let holder = claim(&pool, author, "the compound the citations were filed on").await;
+    let (x, y) = (agent(&pool).await, agent(&pool).await);
+
+    let same = claim(&pool, author, "one paper twice").await;
+    let e1 = doi_evidence(&pool, holder, "10.5555/aef-one", x).await;
+    let e2 = doi_evidence(&pool, holder, "https://doi.org/10.5555/AEF-ONE", y).await;
+    store_attributed(&pool, same, e1, x, 0.8).await;
+    store_attributed(&pool, same, e2, y, 0.8).await;
+    let fold = atom_fold(&display(&pool, same).await).expect("fold");
+    assert!(
+        close(fold.belief(), 0.8),
+        "one paper cited twice is one item at .8, got Bel {}",
+        fold.belief()
+    );
+
+    let two = claim(&pool, author, "two papers").await;
+    let p = doi_evidence(&pool, holder, "10.5555/aef-p", x).await;
+    let q = doi_evidence(&pool, holder, "10.5555/aef-q", y).await;
+    store_attributed(&pool, two, p, x, 0.8).await;
+    store_attributed(&pool, two, q, y, 0.8).await;
+    let fold = atom_fold(&display(&pool, two).await).expect("fold");
+    assert!(
+        close(fold.belief(), 0.96),
+        "two papers are two items, 1 - .2·.2 = .96, got Bel {}",
+        fold.belief()
+    );
+}
+
+/// Plan test (4), second half: an edge-factor row carrying `~` mass plus one
+/// other item. SPEC §3.3's worked example: {T .5, ~ .3, Θ .2} with
+/// {T .64, Θ .36} gives K .3 and Bel .897 (exact CDST Dempster: `~` meets
+/// T and Θ as conflict).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_open_world_edge_row_meets_a_second_item_as_cdst_dempster(pool: PgPool) {
+    let author = agent(&pool).await;
+    let atom = claim(&pool, author, "open world").await;
+    let source = claim(&pool, author, "source with open-world mass").await;
+    let e = edge(&pool, source, atom, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        atom,
+        agent(&pool).await,
+        serde_json::json!({"0": 0.5, "~0,1": 0.3, "0,1": 0.2}),
+    )
+    .await;
+    store(
+        &pool,
+        atom,
+        binary(&pool).await,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.64, "0,1": 0.36}),
+    )
+    .await;
+
+    let fold = atom_fold(&display(&pool, atom).await).expect("fold");
+    assert!(
+        (fold.belief() - 0.628 / 0.7).abs() < 1e-9,
+        "Bel must be .628/.7 = .897, got {}",
+        fold.belief()
+    );
+    assert!(
+        close(fold.mass_on_conflict(), 0.3),
+        "the fold saw K = .3, got {}",
+        fold.mass_on_conflict()
+    );
+}
+
+// ── (5) claim_validity ──────────────────────────────────────────────────────
+
+/// Plan test (5): `claim_validity` is coarsened supported → T, refuted → F,
+/// uncertain → Θ. Uncertain mass is neither belief nor disbelief.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_validity_uncertain_mass_lands_on_theta(pool: PgPool) {
+    let author = agent(&pool).await;
+    let leaning = claim(&pool, author, "supported .3, uncertain .7").await;
+    store(
+        &pool,
+        leaning,
+        CLAIM_VALIDITY_FRAME_ID,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.3, "2": 0.7}),
+    )
+    .await;
+    let doubted = claim(&pool, author, "refuted .4, uncertain .6").await;
+    store(
+        &pool,
+        doubted,
+        CLAIM_VALIDITY_FRAME_ID,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"1": 0.4, "2": 0.6}),
+    )
+    .await;
+
+    let f = atom_fold(&display(&pool, leaning).await).expect("fold");
+    assert!(
+        close(f.belief(), 0.3) && close(f.plausibility(), 1.0),
+        "supported .3 + uncertain .7 is Bel .3, Pl 1; got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+    let f = atom_fold(&display(&pool, doubted).await).expect("fold");
+    assert!(
+        close(f.belief(), 0.0) && close(f.plausibility(), 0.6),
+        "refuted .4 + uncertain .6 is Bel 0, Pl .6; got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+}
+
+// ── (6) the writer never writes a compound ──────────────────────────────────
+
+/// Plan test (6), under every fold mode and through a legacy fold that names
+/// a frame directly (the per-write sites, which the owner-frame guard does not
+/// cover).
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_atom_cache_never_writes_a_compound(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let compound = claim(&pool, author, "compound").await;
+    let leaf = claim(&pool, author, "its leaf").await;
+    decompose(&pool, compound, leaf).await;
+    store(
+        &pool,
+        compound,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.9, "0,1": 0.1}),
+    )
+    .await;
+
+    for fold in [
+        AtomFoldMode::Legacy,
+        AtomFoldMode::AefStandalone,
+        AtomFoldMode::Aef,
+    ] {
+        let sentinel = set_sentinel(&pool, compound).await;
+        let skipped_before = compound_cache_write_skipped();
+        let outcome = write(
+            &pool,
+            compound,
+            CacheWriteCause::Organic,
+            LegacyFold::Frame(b),
+            settings(fold, true),
+        )
+        .await;
+        assert_eq!(outcome, AtomCacheOutcome::CompoundSkipped, "{fold:?}");
+        assert_eq!(
+            cache(&pool, compound).await,
+            sentinel,
+            "{fold:?}: compound cache moved"
+        );
+        assert!(
+            compound_cache_write_skipped() > skipped_before,
+            "{fold:?}: the skip must be counted"
+        );
+    }
+}
+
+// ── (7) the seed ────────────────────────────────────────────────────────────
+
+/// Plan test (7), ruling O16: a `truth_value` seed is read only while it is
+/// the atom's sole input.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_counts_only_while_it_is_the_sole_input(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let seed_row = |a| Row {
+        method: Some("truth_value_seed"),
+        ..Row::plain(a)
+    };
+
+    let alone = claim(&pool, author, "seed alone").await;
+    let seed = store(
+        &pool,
+        alone,
+        b,
+        seed_row(author),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    assert_eq!(ids_of(&display(&pool, alone).await), set(&[seed]));
+
+    let both = claim(&pool, author, "seed plus evidence").await;
+    store(
+        &pool,
+        both,
+        b,
+        seed_row(author),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    let evidence = store(
+        &pool,
+        both,
+        b,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    let got = display(&pool, both).await;
+    assert_eq!(ids_of(&got), set(&[evidence]), "the seed must drop out");
+    let fold = atom_fold(&got).expect("fold");
+    assert!(
+        close(fold.belief(), 0.6),
+        "the fold is the evidence alone, got Bel {}",
+        fold.belief()
+    );
+}
+
+// ── (8) compound-source edge rows ───────────────────────────────────────────
+
+/// Plan test (8), SPEC §6.3. While compound-source edges are `frozen`, a
+/// POSITIVE compound-source edge row is read one-sided: its m(F) moves to Θ.
+/// A negative one keeps its F. A row whose edge source is an ancestor
+/// compound of the target is skipped. Under `excluded` none is read, and Pure
+/// never reads them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compound_source_edge_rows_are_one_sided_while_frozen(pool: PgPool) {
+    let author = agent(&pool).await;
+    let writer = agent(&pool).await;
+    let compound = claim(&pool, author, "compound source").await;
+    let own_leaf = claim(&pool, author, "the compound's own leaf").await;
+    decompose(&pool, compound, own_leaf).await;
+
+    let supported = claim(&pool, author, "supported by a compound").await;
+    let e = edge(&pool, compound, supported, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        supported,
+        writer,
+        serde_json::json!({"0": 0.5, "1": 0.2, "0,1": 0.3}),
+    )
+    .await;
+
+    let contradicted = claim(&pool, author, "contradicted by a compound").await;
+    let e = edge(&pool, compound, contradicted, "contradicts").await;
+    store_edge_factor(
+        &pool,
+        e,
+        contradicted,
+        writer,
+        serde_json::json!({"1": 0.4, "0,1": 0.6}),
+    )
+    .await;
+
+    let e = edge(&pool, compound, own_leaf, "supports").await;
+    store_edge_factor(
+        &pool,
+        e,
+        own_leaf,
+        writer,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+    )
+    .await;
+
+    let f = atom_fold(&display(&pool, supported).await).expect("fold");
+    assert!(
+        close(f.belief(), 0.5) && close(f.plausibility(), 1.0),
+        "frozen positive compound-source row contributes no F: Bel .5, Pl 1; got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+    let f = atom_fold(&display(&pool, contradicted).await).expect("fold");
+    assert!(
+        close(f.plausibility(), 0.6),
+        "a negative compound-source row keeps its F: Pl .6, got {}",
+        f.plausibility()
+    );
+    assert!(
+        display(&pool, own_leaf).await.is_empty(),
+        "an edge from an ancestor compound of the target is skipped"
+    );
+
+    let ids = [supported, contradicted, own_leaf];
+    for (mode, edges) in [
+        (AxiomMode::Display, CompoundSourceEdges::Excluded),
+        (AxiomMode::Pure, CompoundSourceEdges::Frozen),
+    ] {
+        let got = rows(&pool, &ids, mode, edges).await;
+        assert!(
+            got.values().all(Vec::is_empty),
+            "{mode:?}/{edges:?} must read no compound-source edge row"
+        );
+    }
+}
+
+// ── (9) D1 ──────────────────────────────────────────────────────────────────
+
+/// Plan test (9), D1. A compound's own rows are never AEF input, whether or
+/// not the viewer can see its decomposition (role is structure).
+#[sqlx::test(migrations = "../../migrations")]
+async fn atom_fold_never_reads_compound_rows(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let (_member, group) = fixture::seed_agent_with_group(&pool, "aef-d1").await;
+
+    let visible = claim(&pool, author, "compound, visible decomposition").await;
+    let leaf = claim(&pool, author, "visible leaf").await;
+    decompose(&pool, visible, leaf).await;
+
+    let hidden = claim(&pool, author, "compound, hidden decomposition").await;
+    let hidden_leaf = claim(&pool, author, "leaf behind a private edge").await;
+    let private_edge = decompose(&pool, hidden, hidden_leaf).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(private_edge)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("make the decomposition private");
+
+    let mut atom_rows = Vec::new();
+    for c in [visible, leaf, hidden, hidden_leaf] {
+        let r = store(
+            &pool,
+            c,
+            b,
+            Row::plain(agent(&pool).await),
+            serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        )
+        .await;
+        if c == leaf || c == hidden_leaf {
+            atom_rows.push((c, r));
+        }
+    }
+
+    let got = rows(
+        &pool,
+        &[visible, leaf, hidden, hidden_leaf],
+        AxiomMode::Display,
+        CompoundSourceEdges::Frozen,
+    )
+    .await;
+    for c in [visible, hidden] {
+        assert!(
+            got.get(&c).is_none_or(Vec::is_empty),
+            "a compound's own rows must never be read (claim {c})"
+        );
+    }
+    for (c, r) in atom_rows {
+        assert_eq!(
+            ids_of(got.get(&c).map(Vec::as_slice).unwrap_or_default()),
+            set(&[r]),
+            "the atom's own row is read"
+        );
+    }
+}
+
+// ── (10) lens ───────────────────────────────────────────────────────────────
+
+/// Plan test (10), SPEC §3.3 "Lens context": under a lens {empirical: .2} a
+/// leaf with one empirical item at .8 folds to .16.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lens_discounts_each_row_by_its_evidence_type(pool: PgPool) {
+    let author = agent(&pool).await;
+    let atom = claim(&pool, author, "lens").await;
+    store(
+        &pool,
+        atom,
+        binary(&pool).await,
+        Row {
+            strength: None,
+            evidence_type: Some("empirical"),
+            ..Row::plain(agent(&pool).await)
+        },
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+
+    let lens = FramedBeliefContext::new(
+        CalibrationConfig::default_for_phase2_fallback(),
+        Some(PerspectiveReliability {
+            source_reliability: HashMap::from([("empirical".to_string(), 0.2)]),
+            locality_reliability: HashMap::new(),
+        }),
+    );
+    let viewer = fixture::public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let got = atom_axiom_rows_under(
+        &mut conn,
+        &viewer,
+        &[atom],
+        AxiomMode::Display,
+        &lens,
+        CompoundSourceEdges::Frozen,
+    )
+    .await
+    .expect("rows");
+    let f = atom_fold(got.get(&atom).map(Vec::as_slice).unwrap_or_default()).expect("fold");
+    assert!(
+        close(f.belief(), 0.16),
+        "lens .2 x item .8 = .16, got {}",
+        f.belief()
+    );
+}
+
+// ── (11) empty fold after a lifecycle act ───────────────────────────────────
+
+/// Plan test (11), SPEC §4.2 "Empty fold" and ruling O24. An atom whose only
+/// AEF row a lifecycle act removed gets an explicit vacuous cache (Bel 0,
+/// Pl 1, BetP .5, `binary_truth`) when O24 is on, and keeps its cache when it
+/// is off. An organic write with no input leaves the cache alone. No arm
+/// NULLs it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_atom_that_lost_its_only_input_is_vacated_never_nulled(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let aef = |vacate| settings(AtomFoldMode::Aef, vacate);
+
+    let mut atoms = Vec::new();
+    for what in ["vacate on", "vacate off", "organic"] {
+        let a = claim(&pool, author, what).await;
+        let row = store(
+            &pool,
+            a,
+            b,
+            Row::plain(agent(&pool).await),
+            serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        )
+        .await;
+        write(
+            &pool,
+            a,
+            CacheWriteCause::Organic,
+            LegacyFold::OwnerFrame,
+            aef(true),
+        )
+        .await;
+        let before = cache(&pool, a).await;
+        assert!(
+            before.belief.is_some_and(|v| close(v, 0.7)),
+            "{what}: the AEF wrote the fold first, got {before:?}"
+        );
+        sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+            .bind(row)
+            .execute(&pool)
+            .await
+            .expect("remove the atom's only row");
+        atoms.push((a, before));
+    }
+
+    let (on, _) = &atoms[0];
+    let outcome = write(
+        &pool,
+        *on,
+        CacheWriteCause::EvidenceRemoved,
+        LegacyFold::OwnerFrame,
+        aef(true),
+    )
+    .await;
+    assert!(
+        matches!(outcome, AtomCacheOutcome::Vacated { written: true }),
+        "{outcome:?}"
+    );
+    let c = cache(&pool, *on).await;
+    assert_eq!(
+        (c.belief, c.plausibility, c.pignistic, c.frame),
+        (Some(0.0), Some(1.0), Some(0.5), Some(b)),
+        "O24 on: explicit vacuous cache on binary_truth"
+    );
+
+    let (off, before_off) = &atoms[1];
+    write(
+        &pool,
+        *off,
+        CacheWriteCause::EvidenceRemoved,
+        LegacyFold::OwnerFrame,
+        aef(false),
+    )
+    .await;
+    assert_eq!(
+        &cache(&pool, *off).await,
+        before_off,
+        "O24 off: the old cache is kept"
+    );
+
+    let (organic, before_organic) = &atoms[2];
+    let outcome = write(
+        &pool,
+        *organic,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        aef(true),
+    )
+    .await;
+    assert_eq!(outcome, AtomCacheOutcome::KeptEmpty);
+    assert_eq!(
+        &cache(&pool, *organic).await,
+        before_organic,
+        "organic empty fold: untouched"
+    );
+}
+
+// ── role scope of EPIGRAPH_ATOM_FOLD ────────────────────────────────────────
+
+/// SPEC §4.2 / §10.2: `aef_standalone` folds standalones with the AEF and
+/// leaves leaves on their legacy fold; `aef` folds both; `legacy` neither. An
+/// AEF write stamps `binary_truth`.
+///
+/// Each atom carries a research_validity row (T .6) and a binary row (T .5).
+/// The owner-frame rule folds only the binary row (Bel .5); the AEF folds
+/// both (1 − .4·.5 = .8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_fold_flag_scopes_the_aef_by_role(pool: PgPool) {
+    let author = agent(&pool).await;
+    let b = binary(&pool).await;
+    let rv = research_validity(&pool).await;
+    let parent = claim(&pool, author, "parent").await;
+
+    async fn atom_with_two_frames(pool: &PgPool, a: Uuid, rv: Uuid, b: Uuid) {
+        store(
+            pool,
+            a,
+            rv,
+            Row::plain(agent(pool).await),
+            serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        )
+        .await;
+        store(
+            pool,
+            a,
+            b,
+            Row::plain(agent(pool).await),
+            serde_json::json!({"0": 0.5, "0,1": 0.5}),
+        )
+        .await;
+    }
+
+    for (fold, leaf_bel, standalone_bel) in [
+        (AtomFoldMode::Legacy, 0.5, 0.5),
+        (AtomFoldMode::AefStandalone, 0.5, 0.8),
+        (AtomFoldMode::Aef, 0.8, 0.8),
+    ] {
+        let leaf = claim(&pool, author, "leaf").await;
+        decompose(&pool, parent, leaf).await;
+        atom_with_two_frames(&pool, leaf, rv, b).await;
+        let standalone = claim(&pool, author, "standalone").await;
+        atom_with_two_frames(&pool, standalone, rv, b).await;
+
+        for (id, want) in [(leaf, leaf_bel), (standalone, standalone_bel)] {
+            write(
+                &pool,
+                id,
+                CacheWriteCause::Organic,
+                LegacyFold::OwnerFrame,
+                settings(fold, true),
+            )
+            .await;
+            let c = cache(&pool, id).await;
+            assert!(
+                c.belief.is_some_and(|v| close(v, want)),
+                "{fold:?}: {} expected Bel {want}, got {c:?}",
+                if id == leaf { "leaf" } else { "standalone" }
+            );
+            assert_eq!(
+                c.frame,
+                Some(b),
+                "{fold:?}: the cache is stamped binary_truth"
+            );
+        }
+    }
+
+    // A research_validity-only standalone: the owner rule stamps
+    // research_validity, the AEF stamps binary_truth.
+    let rv_only = claim(&pool, author, "research_validity only").await;
+    store(
+        &pool,
+        rv_only,
+        rv,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    write(
+        &pool,
+        rv_only,
+        CacheWriteCause::Organic,
+        LegacyFold::OwnerFrame,
+        settings(AtomFoldMode::Aef, true),
+    )
+    .await;
+    assert_eq!(
+        cache(&pool, rv_only).await.frame,
+        Some(b),
+        "an AEF write stamps binary_truth"
+    );
+}
+
+// ── hypothesis promotion and the axis index ─────────────────────────────────
+
+/// SPEC §11.4: a hypothesis reads its `hypothesis_assessment` rows until
+/// promotion and the promoted `research_validity` copy after it, never both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hypothesis_reads_one_frame_either_side_of_promotion(pool: PgPool) {
+    let author = agent(&pool).await;
+    let ha = frame(
+        &pool,
+        "hypothesis_assessment",
+        &["supported", "unsupported"],
+    )
+    .await;
+    let rv = research_validity(&pool).await;
+    let experimenter = agent(&pool).await;
+
+    let mut by_status = Vec::new();
+    for promoted in [false, true] {
+        let h = claim(&pool, author, "hypothesis").await;
+        let assessment = store(
+            &pool,
+            h,
+            ha,
+            Row {
+                method: Some("error_derived"),
+                ..Row::plain(experimenter)
+            },
+            serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        )
+        .await;
+        let copy = store(
+            &pool,
+            h,
+            rv,
+            Row {
+                method: Some("error_derived"),
+                ..Row::plain(experimenter)
+            },
+            serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        )
+        .await;
+        if promoted {
+            sqlx::query(
+                "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+                 WHERE id = $1",
+            )
+            .bind(h)
+            .execute(&pool)
+            .await
+            .expect("promote");
+        }
+        by_status.push((h, if promoted { copy } else { assessment }));
+    }
+    for (h, want) in by_status {
+        assert_eq!(ids_of(&display(&pool, h).await), set(&[want]));
+    }
+}
+
+/// A claim placed at hypothesis index 1 of a 2-hypothesis axis frame is TRUE
+/// when index 1 holds: its row is coarsened with the literals swapped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_axis_claim_at_index_one_is_coarsened_with_its_literals_swapped(pool: PgPool) {
+    let author = agent(&pool).await;
+    let axis = frame(&pool, "aef_axis_test", &["low", "high"]).await;
+    let high = claim(&pool, author, "the high end of an axis").await;
+    FrameRepository::assign_claim(&pool, high, axis, Some(1))
+        .await
+        .expect("assign index 1");
+    store(
+        &pool,
+        high,
+        axis,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    let f = atom_fold(&display(&pool, high).await).expect("fold");
+    assert!(
+        close(f.belief(), 0.0) && close(f.plausibility(), 0.3),
+        "mass on index 0 is disbelief for an index-1 claim: Bel 0, Pl .3; got Bel {} Pl {}",
+        f.belief(),
+        f.plausibility()
+    );
+}

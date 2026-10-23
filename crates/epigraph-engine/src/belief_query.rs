@@ -312,14 +312,49 @@ pub async fn get_perspective_belief(
 /// captures them so the batch path resolves them once (see
 /// [`get_perspective_belief_batch`]) and the pure combine
 /// ([`combine_framed_bbas`]) touches the DB zero more times.
-struct FramedBeliefContext {
-    calibration: CalibrationConfig,
-    per_frame_intra: Option<f64>,
-    per_frame_weights: Option<std::collections::HashMap<String, f64>>,
-    perspective: Option<PerspectiveReliability>,
+///
+/// It is also the lens context of the atom fold
+/// ([`crate::atom_items::atom_axiom_rows`], SPEC §3.3 "Lens context"): there
+/// the calibration and the perspective apply, while each row's per-frame
+/// overrides come from that row's own frame, because the atom fold reads
+/// several frames at once. A context built by [`Self::new`] carries no
+/// per-frame overrides.
+pub struct FramedBeliefContext {
+    pub(crate) calibration: CalibrationConfig,
+    pub(crate) per_frame_intra: Option<f64>,
+    pub(crate) per_frame_weights: Option<std::collections::HashMap<String, f64>>,
+    pub(crate) perspective: Option<PerspectiveReliability>,
 }
 
 impl FramedBeliefContext {
+    /// A lens context with no per-frame overrides: `calibration`, and the
+    /// querying perspective's reliability overrides when there is a lens
+    /// (`None` is the global, no-lens read).
+    #[must_use]
+    pub fn new(
+        calibration: CalibrationConfig,
+        perspective: Option<PerspectiveReliability>,
+    ) -> Self {
+        Self {
+            calibration,
+            per_frame_intra: None,
+            per_frame_weights: None,
+            perspective,
+        }
+    }
+
+    /// The global (no-lens) context over the workspace calibration, falling
+    /// back to the built-in calibration when `calibration.toml` cannot be
+    /// loaded, exactly as the cache recompute does.
+    #[must_use]
+    pub fn global() -> Self {
+        Self::new(
+            CalibrationConfig::from_workspace_root()
+                .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback()),
+            None,
+        )
+    }
+
     /// Resolve the frame-scoped reliability inputs from the DB exactly once.
     ///
     /// Per-frame loads are best-effort: a DB error there falls back to global

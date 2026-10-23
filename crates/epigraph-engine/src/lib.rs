@@ -18,6 +18,7 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;

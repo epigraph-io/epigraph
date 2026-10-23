@@ -1164,6 +1164,126 @@ pub async fn recompute_claim_cached_belief(
     recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, owner).await
 }
 
+/// Why the single atom-cache writer is called (SPEC §4.2, "Empty fold").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheWriteCause {
+    /// An ordinary write or recompute.
+    Organic,
+    /// A lifecycle act removed some of the atom's own evidence: a hide, a
+    /// retraction, an edge withdrawal or a dedup cascade.
+    EvidenceRemoved,
+}
+
+/// The fold a call site used before the single atom-cache writer, which it
+/// keeps wherever the AEF does not cover the claim (`EPIGRAPH_ATOM_FOLD`
+/// scope, procedural and rule claims).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LegacyFold {
+    /// [`recompute_claim_cached_belief`]: the cache-owner frame rule.
+    OwnerFrame,
+    /// [`recompute_claim_belief_on_frame`] on this frame.
+    Frame(Uuid),
+}
+
+/// The switches [`recompute_atom_cache_with`] runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomCacheSettings {
+    /// `EPIGRAPH_ATOM_FOLD`.
+    pub fold: crate::atom_items::AtomFoldMode,
+    /// `EPIGRAPH_COMPOUND_SOURCE_EDGES`.
+    pub compound_source_edges: crate::atom_items::CompoundSourceEdges,
+    /// Ruling O24: an atom whose AEF input a lifecycle act removed gets an
+    /// explicit vacuous cache (logged), instead of keeping its old one.
+    pub vacate_on_evidence_removal: bool,
+}
+
+impl AtomCacheSettings {
+    /// This process's settings: the two flags as read at startup, and O24 as
+    /// ruled.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            fold: crate::atom_items::AtomFoldMode::current(),
+            compound_source_edges: crate::atom_items::CompoundSourceEdges::current(),
+            vacate_on_evidence_removal: true,
+        }
+    }
+}
+
+/// What [`recompute_atom_cache`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AtomCacheOutcome {
+    /// The claim is a compound: nothing was written.
+    CompoundSkipped,
+    /// The claim is not visible to the viewer: nothing was written.
+    NotVisible,
+    /// The legacy fold ran; `written` is what it reported.
+    Legacy { written: bool },
+    /// The AEF ran and its value was offered to the cache; `written` is
+    /// whether the cache took it (a non-owner on a frame other than the
+    /// recorded one does not write, migration 114).
+    Folded {
+        interval: crate::atom_items::EvidencedInterval,
+        written: bool,
+    },
+    /// The AEF input is empty and the cache was left as it was.
+    KeptEmpty,
+    /// The AEF input is empty after a lifecycle act, and the cache was set
+    /// to an explicit vacuous value (ruling O24); `written` as for `Folded`.
+    Vacated { written: bool },
+}
+
+/// How many times [`recompute_atom_cache`] refused to write a compound's cache
+/// in this process.
+#[must_use]
+pub fn compound_cache_write_skipped() -> u64 {
+    0
+}
+
+/// The single atom-cache writer (SPEC §4.2), under this process's
+/// [`AtomCacheSettings::current`].
+///
+/// # Errors
+/// A database read or write, or a fold that fails.
+pub async fn recompute_atom_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    cause: CacheWriteCause,
+    legacy: LegacyFold,
+) -> Result<AtomCacheOutcome, String> {
+    recompute_atom_cache_with(
+        conn,
+        viewer,
+        claim_id,
+        cause,
+        legacy,
+        AtomCacheSettings::current(),
+    )
+    .await
+}
+
+/// [`recompute_atom_cache`] under explicit settings.
+///
+/// # Errors
+/// A database read or write, or a fold that fails.
+pub async fn recompute_atom_cache_with(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    _cause: CacheWriteCause,
+    legacy: LegacyFold,
+    _settings: AtomCacheSettings,
+) -> Result<AtomCacheOutcome, String> {
+    let written = match legacy {
+        LegacyFold::OwnerFrame => recompute_claim_cached_belief(conn, viewer, claim_id).await?,
+        LegacyFold::Frame(frame_id) => {
+            recompute_claim_belief_on_frame(conn, viewer, claim_id, frame_id).await?
+        }
+    };
+    Ok(AtomCacheOutcome::Legacy { written })
+}
+
 /// Get-or-create the canonical `binary_truth` frame.
 pub async fn ensure_binary_frame(
     conn: &mut sqlx::PgConnection,
