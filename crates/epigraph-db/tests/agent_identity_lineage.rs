@@ -1001,8 +1001,11 @@ async fn adopting_an_agent_with_claims_and_no_registration_is_refused_aid05(pool
 /// * a registered human operator;
 /// * the agent side of an operator link;
 /// * an OAuth client's principal;
-/// * an agent that already holds an active signing key.
+/// * an agent that already holds an active signing key;
+/// * a member of any group other than its own personal group;
+/// * an agent that ever held a non-legacy key (a rotated signing key).
 ///
+/// The rule fails closed: adoption is allowed only for a FRESH agent.
 /// CALIBRATION: `adopting_an_agent_with_claims_and_no_registration_is_refused_aid05`
 /// keeps a claimless, unbound software agent adoptable.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1067,11 +1070,39 @@ async fn adopting_a_bound_agent_is_refused_aid09(pool: PgPool) {
     .await
     .expect("seed an active signing key");
 
+    // A member of a group that is not its own personal group.
+    let member = new_identity();
+    let member_id = bare(&pool, &member).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(fixture::seed_group(&pool).await)
+    .bind(member_id)
+    .execute(&pool)
+    .await
+    .expect("seed a non-personal membership");
+
+    // An agent that once held a signing key, now rotated (any status counts).
+    let retired = new_identity();
+    let retired_id = bare(&pool, &retired).await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+         VALUES ($1, $2, 'signing', 'rotated')",
+    )
+    .bind(retired_id)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed a rotated signing key");
+
     for (what, id) in [
         ("a registered human operator", &human),
         ("an operated agent", &operated),
         ("an OAuth client principal", &client),
         ("an agent with an active signing key", &keyed),
+        ("a member of a non-personal group", &member),
+        ("an agent with a rotated signing key", &retired),
     ] {
         let before = footprint(&pool).await;
         let err = try_register(&pool, id, None, "g-aid09", snapshot("g", "l"))
@@ -1084,6 +1115,20 @@ async fn adopting_a_bound_agent_is_refused_aid09(pool: PgPool) {
             "{what}: AID09 changes nothing"
         );
     }
+
+    // CALIBRATION: an agent whose only binding is its OWN personal group (the
+    // shape epigraph-mcp creates when it meets an identity before the host
+    // has registered it) is fresh, and adoptable.
+    let fresh = new_identity();
+    let fresh_id = bare(&pool, &fresh).await;
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(fresh_id)
+        .execute(&pool)
+        .await
+        .expect("its own personal group");
+    let adopted = register(&pool, &fresh, None, "g-aid09", snapshot("g", "l")).await;
+    assert_eq!(adopted.agent_id, fresh_id);
+    assert!(!adopted.agent_created);
 }
 
 /// AID03: the parent must be an LLM agent (a derived identity, or one whose
