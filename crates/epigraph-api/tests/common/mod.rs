@@ -51,6 +51,31 @@ pub async fn spawn_app_with_admin_cascade(database_url: &str) -> (SocketAddr, on
     (addr, tx)
 }
 
+/// [`spawn_app`] with BP apply switched ON (`EPIGRAPH_BP_APPLY=on`): the only
+/// fixture on which `POST /api/v1/bp/propagate` with `apply_updates: true`
+/// writes rather than answering 409.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: only the BP apply binaries use it"
+)]
+pub async fn spawn_app_with_bp_apply(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = epigraph_api::build_app_for_tests_with_bp_apply(database_url)
+        .await
+        .expect("app builds for tests");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 /// [`spawn_app`] with a caller-chosen webhook-registration egress guard, for
 /// tests that need particular DNS answers (a name that resolves to loopback,
 /// one that does not resolve). No real DNS: pass a guard over a `StubResolver`.
