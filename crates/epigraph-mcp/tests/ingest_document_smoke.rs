@@ -661,6 +661,58 @@ fn inline_tool_wire_schema_is_self_contained() {
     }
 }
 
+/// `wait` is reachable only through the published schema and the wire
+/// payload: every handler test builds the params struct directly. Pin that
+/// both detached ingest tools publish a boolean `wait` and that a wire payload
+/// carrying it deserializes to `Some(true)`, so a serde or schemars change
+/// cannot silently drop it and bring back the queued-only contract.
+#[test]
+fn ingest_tools_publish_and_deserialize_the_wait_flag() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
+    let arr = tools.as_array().expect("tool array");
+    for name in ["ingest_document_inline", "ingest_document"] {
+        let tool = arr
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} registered in live tool router"));
+        let wait = &tool["inputSchema"]["properties"]["wait"];
+        let ty = &wait["type"];
+        let is_boolean = ty == "boolean"
+            || ty
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t == "boolean"));
+        assert!(
+            is_boolean,
+            "{name} must publish a boolean `wait`; got {wait}"
+        );
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|r| r == "wait"),
+            "{name}: `wait` is opt-in and must not be required: {required:?}"
+        );
+    }
+
+    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture, "wait": true }))
+            .expect("inline params with wait deserialize");
+    assert_eq!(inline.wait, Some(true));
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture }))
+            .expect("inline params without wait deserialize");
+    assert_eq!(
+        inline.wait, None,
+        "omitted `wait` keeps the queued contract"
+    );
+    let file: IngestDocumentParams =
+        serde_json::from_value(serde_json::json!({ "file_path": "x.json", "wait": true }))
+            .expect("file-path params with wait deserialize");
+    assert_eq!(file.wait, Some(true));
+}
+
 /// The discoverability fix: the typed inline param must expose the full
 /// hierarchical `DocumentExtraction` shape as a JSON schema, so an MCP client
 /// can introspect exactly what to produce — down to atoms — instead of
@@ -871,7 +923,6 @@ async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: P
 /// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the
 /// caller and leaves no `papers` row: the wait arm skips the handler's eager
 /// `ensure_paper_node`, and the walk's own get-or-create runs after its guards.
-/// Detached, the same document is answered `queued` and its row survives.
 #[sqlx::test(migrations = "../../migrations")]
 async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
