@@ -1492,8 +1492,9 @@ async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool
 
 // ── F-089-D: seed-owned harvester fragments already on disk ──
 
-/// Migration 074's seed group, as `epigraph_cli::operator::SEED` spells it.
-const SEED_GROUP: Uuid = Uuid::from_u128(0xdead);
+// Migration 074's seed group: the crate's own spelling, the one the binary
+// binds, so the test cannot seed rows the binary does not treat as seed.
+use epigraph_cli::operator::SEED as SEED_GROUP;
 
 /// A `('public', SEED)` claim: what 074's seed arm leaves for an undeclared
 /// insert on a seed-member session.
@@ -1577,8 +1578,11 @@ fn fragment_line(stderr: &str) -> Option<&str> {
 /// by `run --entity harvester-fragments` and counted by `verify` (strict and
 /// `--legacy-owner platform`), mirroring migration 089's predicate: target
 /// either sentinel, source any non-world claim, and only where the tenancy
-/// actually differs. Control: a world fragment on a SEED claim is still
-/// counted and moved, as it was before.
+/// actually differs. Controls: a world fragment on a SEED claim is still
+/// counted and moved, as it was before; a seed fragment on a seed claim
+/// already carries its claim's tenancy, so it is neither counted (or `verify`
+/// would stay red with nothing to run) nor rewritten in place (or `rows_done`
+/// would over-report).
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "fragment author").await;
@@ -1587,6 +1591,7 @@ async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPo
 
     let repairable = seed_unstamped_fragment(&pool, SEED_GROUP, private).await;
     let world_on_seed = seed_unstamped_fragment(&pool, WORLD, seed_claim).await;
+    let seed_on_seed = seed_unstamped_fragment(&pool, SEED_GROUP, seed_claim).await;
 
     // CALIBRATION: the bypass held, so the fragment is still in its pre-089
     // shape, and the trigger is armed again afterwards.
@@ -1615,7 +1620,8 @@ async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPo
         assert!(
             line.contains("FAIL: 2 row(s) in harvester_fragments"),
             "{args:?}: verify must count the seed fragment on a group claim as well as the \
-             world fragment on a seed claim (2), not the world one alone; got: {line}"
+             world fragment on a seed claim (2): not the world one alone, and not the seed \
+             fragment on a seed claim, which has nothing to move; got: {line}"
         );
     }
 
@@ -1641,6 +1647,22 @@ async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPo
         fragment_tenancy(&pool, world_on_seed).await,
         (SEED_GROUP, "public".to_string()),
         "control: a world fragment on a seed claim is still moved, as before"
+    );
+    assert_eq!(
+        fragment_tenancy(&pool, seed_on_seed).await,
+        (SEED_GROUP, "public".to_string()),
+        "control: a seed fragment on a seed claim keeps its (already equal) tenancy"
+    );
+    let rows_done: i64 = sqlx::query_scalar(
+        "SELECT rows_done FROM tenancy_backfill_progress WHERE entity = 'harvester_fragments'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read fragment progress");
+    assert_eq!(
+        rows_done, 2,
+        "the fragment arm moves the two differing rows only; a seed-on-seed fragment \
+         rewritten to its own values must not be counted as done"
     );
 
     for args in [
