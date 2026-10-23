@@ -127,11 +127,20 @@ impl AtomFoldMode {
     }
 }
 
-/// Read one switch from the environment: unset or blank is the default; an
-/// unrecognised value is the default too, and is logged.
+/// Read one switch from the environment ([`flag_value`]).
 fn read_flag<T: Default + std::fmt::Debug>(env: &str, parse: fn(&str) -> Option<T>) -> T {
-    match std::env::var(env) {
-        Ok(raw) if !raw.trim().is_empty() => parse(&raw).unwrap_or_else(|| {
+    flag_value(env, std::env::var(env).ok().as_deref(), parse)
+}
+
+/// One switch's value from its raw setting: unset or blank is the default; an
+/// unrecognised value is the default too, and is logged.
+fn flag_value<T: Default + std::fmt::Debug>(
+    env: &str,
+    raw: Option<&str>,
+    parse: fn(&str) -> Option<T>,
+) -> T {
+    match raw {
+        Some(raw) if !raw.trim().is_empty() => parse(raw).unwrap_or_else(|| {
             let fallback = T::default();
             tracing::warn!(flag = env, value = %raw, ?fallback, "unrecognised belief mode; using the default");
             fallback
@@ -769,6 +778,30 @@ mod tests {
             Some(CompoundSourceEdges::Excluded)
         );
         assert_eq!(CompoundSourceEdges::parse_value("exclude"), None);
+    }
+
+    /// The environment wrapper: unset, blank and unrecognised settings are
+    /// the default; a recognised one is parsed (trimmed, any case).
+    #[test]
+    fn an_unset_blank_or_unrecognised_switch_is_the_default() {
+        let fold = |raw| flag_value(AtomFoldMode::ENV, raw, AtomFoldMode::parse_value);
+        let edges = |raw| flag_value(CompoundSourceEdges::ENV, raw, CompoundSourceEdges::parse_value);
+        for raw in [None, Some(""), Some("   "), Some("aef-standalone"), Some("on")] {
+            assert_eq!(fold(raw), AtomFoldMode::Legacy, "{raw:?}");
+        }
+        assert_eq!(fold(Some(" AEF ")), AtomFoldMode::Aef);
+        assert_eq!(fold(Some("aef_standalone")), AtomFoldMode::AefStandalone);
+        for raw in [None, Some(" "), Some("exclude")] {
+            assert_eq!(edges(raw), CompoundSourceEdges::Frozen, "{raw:?}");
+        }
+        assert_eq!(edges(Some("Excluded")), CompoundSourceEdges::Excluded);
+    }
+
+    /// Ruling O24 is ruled yes: the process settings vacate an atom whose AEF
+    /// input a lifecycle act removed.
+    #[test]
+    fn the_process_settings_carry_ruling_o24() {
+        assert!(crate::edge_factor::AtomCacheSettings::current().vacate_on_evidence_removal);
     }
 
     #[test]
