@@ -504,21 +504,75 @@ async fn each_viewer_counts_its_own_leaves_and_no_response_exposes_a_total(pool:
     );
 }
 
-/// A compound's view does not depend on which other compounds share its batch
-/// (the items are partitioned once over the whole batch).
+/// A compound's view does not depend on which other compounds share its
+/// batch. R = {a1, a2} and S = {b1, b2} share no leaf, but one paper is cited
+/// on a2 and on b1, so one item spans both compounds' leaves once S is in the
+/// batch. b1 also carries an independent refutation and a row with mass on a
+/// set the conjunction cannot spell (`~0`), which makes S inexact. None of
+/// that is R's evidence: R's whole view (value, `exact`, item count) is the
+/// same alone, after S and before S.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_compound_s_view_does_not_depend_on_its_batch(pool: PgPool) {
     let public = fixture::public_viewer(&pool).await;
-    let (r, m1, _) = example_three(&pool, None).await;
+    let author = agent(&pool).await;
+    let holder = claim(&pool, author, "evidence holder").await;
+    let (x, y) = (agent(&pool).await, agent(&pool).await);
+    let (r, a) = compound_of(&pool, author, "R", 2).await;
+    let (s, b) = compound_of(&pool, author, "S", 2).await;
+    support(&pool, a[0], 0.9).await;
+    let e1 = doi_evidence(&pool, holder, "10.5555/bv-batch", x).await;
+    let e2 = doi_evidence(&pool, holder, "10.5555/bv-batch", y).await;
+    store_attributed(&pool, a[1], e1, x, 0.8).await;
+    store_attributed(&pool, b[0], e2, y, 0.6).await;
+    refute(&pool, b[0], 0.5).await;
+    store(
+        &pool,
+        b[0],
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.3, "~0": 0.2, "0,1": 0.5}),
+    )
+    .await;
+    support(&pool, b[1], 0.7).await;
+
     let alone = derive_as(&pool, &public, &[r], &ctx()).await;
-    let together = derive_as(&pool, &public, &[r, m1], &ctx()).await;
-    assert_eq!(alone.get(&r), together.get(&r));
-    let m1_alone = derive_as(&pool, &public, &[m1], &ctx()).await;
-    assert_eq!(m1_alone.get(&m1), together.get(&m1));
+    let s_first = derive_as(&pool, &public, &[s, r], &ctx()).await;
+    let r_first = derive_as(&pool, &public, &[r, s], &ctx()).await;
+    let sv = s_first[&s].derived.as_ref().expect("S is derived");
+    assert_eq!(
+        sv.leaves_used, 2,
+        "precondition: S's leaves are in the batch, so the batch atom sets differ"
+    );
     assert!(
-        near(together[&m1].bel, 0.4846, 5e-5),
+        !sv.exact,
+        "precondition: S reads a set it cannot spell, so S is labelled inexact"
+    );
+
+    let rv = &alone[&r];
+    assert!(
+        near(rv.bel, 0.72, 1e-9),
+        "R = a1 (.9) ∧ a2 (.8 from the shared paper): .72, got {}",
+        rv.bel
+    );
+    assert!(rv.derived.as_ref().expect("derived").exact);
+    assert_eq!(
+        rv.inputs.items, 2,
+        "R reads a1's item and the shared paper's item once"
+    );
+    assert_eq!(Some(rv), s_first.get(&r), "R after S in the batch");
+    assert_eq!(Some(rv), r_first.get(&r), "R before S in the batch");
+}
+
+/// A mid node is derived over its own flattened leaves: M1 = a1 ∧ a2 of the
+/// design note's Example 3 is .4846.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mid_node_is_derived_over_its_own_leaves(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let (_, m1, _) = example_three(&pool, None).await;
+    let v = derive_one_as(&pool, &public, m1).await;
+    assert!(
+        near(v.bel, 0.4846, 5e-5),
         "M1 = a1 ∧ a2 over its own leaves (.4846), got {}",
-        together[&m1].bel
+        v.bel
     );
 }
 
@@ -628,6 +682,97 @@ async fn a_compound_seen_as_a_leaf_is_never_read_from_its_cache(pool: PgPool) {
     assert_eq!(p2.get(&root), Some(&true));
 }
 
+/// P1 wins over a kept cache. An atom with an AEF row AND a cache (the normal
+/// state once the cache writer has run, or a stale write left by another
+/// writer) is `Axiom` and is read from its fold (.8), never from the cache
+/// (.2), as an atom view and as a leaf of a compound.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_evidenced_leaf_is_read_from_its_fold_never_from_its_cache(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let author = agent(&pool).await;
+    let leaf = claim(&pool, author, "evidenced and cached").await;
+    support(&pool, leaf, 0.8).await;
+    set_cache(&pool, leaf, 0.2, 0.3, 0.25, 0.0).await;
+
+    let mut conn = pool.acquire().await.expect("conn");
+    let states = leaf_states_batch(&mut conn, &public, &[leaf], &ctx())
+        .await
+        .expect("leaf states");
+    assert_eq!(states.get(&leaf), Some(&LeafState::Axiom));
+    let views = atom_belief_view_batch(&mut conn, &public, &[leaf], &ctx())
+        .await
+        .expect("atom views");
+    assert_eq!(views[&leaf].basis, Basis::Axiom);
+    assert!(
+        near(views[&leaf].bel, 0.8, 1e-9),
+        "the atom view is its fold (.8), not its cache (.2): {}",
+        views[&leaf].bel
+    );
+    drop(conn);
+
+    let v = single_leaf(&pool, leaf).await;
+    let d = v.derived.as_ref().expect("derived");
+    assert!(
+        near(v.bel, 0.8, 1e-9),
+        "the leaf enters the conjunction as its fold (.8), not its cache (.2): {}",
+        v.bel
+    );
+    assert_eq!((d.evidenced, d.legacy_leaves), (1, 0));
+}
+
+/// P1 is decided per viewer (SPEC §7.1, §8 T4). A public atom with a kept
+/// cache (Bel .6, Pl .9) whose only AEF row is private to a group is `Legacy`
+/// for the public, read from its cache, and `Axiom` for the group, read from
+/// its fold (.8). A compound over it and an independent .7 leaf is therefore
+/// .42 and not ready for the public, .56 and ready for the group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn p1_and_p2_are_decided_per_viewer(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "bv-owner").await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    let public = fixture::public_viewer(&pool).await;
+    let author = agent(&pool).await;
+    let (k, leaves) = compound_of(&pool, author, "over a privately evidenced leaf", 2).await;
+    let (private_row_leaf, other) = (leaves[0], leaves[1]);
+    let row = support(&pool, private_row_leaf, 0.8).await;
+    hide_row(&pool, row, group).await;
+    set_cache(&pool, private_row_leaf, 0.6, 0.9, 0.75, 0.0).await;
+    support(&pool, other, 0.7).await;
+
+    let mut conn = pool.acquire().await.expect("conn");
+    for (viewer, state, bel, ready) in [
+        (&public, LeafState::Legacy, 0.6, false),
+        (&owner, LeafState::Axiom, 0.8, true),
+    ] {
+        let states = leaf_states_batch(&mut conn, viewer, &[private_row_leaf], &ctx())
+            .await
+            .expect("leaf states");
+        assert_eq!(states.get(&private_row_leaf), Some(&state));
+        let views = atom_belief_view_batch(&mut conn, viewer, &[private_row_leaf], &ctx())
+            .await
+            .expect("atom views");
+        assert!(
+            near(views[&private_row_leaf].bel, bel, 1e-9),
+            "{state:?}: {} must be {bel}",
+            views[&private_row_leaf].bel
+        );
+        let p2 = compound_ready_batch(&mut conn, viewer, &[k], &ctx())
+            .await
+            .expect("p2");
+        assert_eq!(p2.get(&k), Some(&ready), "P2 for a viewer seeing {state:?}");
+    }
+    drop(conn);
+    let pub_v = derive_one_as(&pool, &public, k).await;
+    let grp_v = derive_one_as(&pool, &owner, k).await;
+    assert!(
+        near(pub_v.bel, 0.42, 1e-9) && near(grp_v.bel, 0.56, 1e-9),
+        "public reads the cache (.6 · .7 = .42), the group the fold (.8 · .7 = .56): {} / {}",
+        pub_v.bel,
+        grp_v.bel
+    );
+    assert_eq!(pub_v.derived.as_ref().unwrap().legacy_leaves, 1);
+    assert_eq!(grp_v.derived.as_ref().unwrap().legacy_leaves, 0);
+}
+
 // ── (4) spine ───────────────────────────────────────────────────────────────
 
 /// Plan test (4). A spine node (level 1) returns a profile, never a
@@ -674,6 +819,75 @@ async fn a_spine_node_returns_a_profile_never_a_conjunction(pool: PgPool) {
         near(spine.bel, 0.6, 1e-9),
         "a spine node serves the envelope floor .6, never the conjunction .8, got {}",
         spine.bel
+    );
+    // The whole profile, by hand: each leaf alone is Bel .8, Pl 1, BetP .9.
+    assert_eq!(
+        (profile.evidenced, profile.legacy_leaves, profile.contested),
+        (2, 0, 0)
+    );
+    for (what, s3, want) in [("bel", profile.bel, 0.8), ("betp", profile.betp, 0.9)] {
+        assert!(
+            near(s3.min, want, 1e-9) && near(s3.median, want, 1e-9) && near(s3.max, want, 1e-9),
+            "{what} summary must be {want} throughout: {s3:?}"
+        );
+    }
+    assert!(
+        near(profile.frechet.lo, 0.6, 1e-9)
+            && near(profile.frechet.hi, 1.0, 1e-9)
+            && near(profile.frechet.hi_nr, 1.0, 1e-9),
+        "envelope [.6, 1], NR ≤ 1: {:?}",
+        profile.frechet
+    );
+    assert!(near(spine.pl, 1.0, 1e-9) && near(spine.nr, 1.0, 1e-9) && near(spine.betp, 0.8, 1e-9));
+}
+
+/// A spine profile over leaves that differ: l1 .9, l2 .6, l3 refuted at .7
+/// (Pl .3) and l4 unevidenced. Alone they are Bel {.9, .6, 0, 0}, `BetP`
+/// {.95, .8, .15, .5} and Pl {1, 1, .3, 1}: medians .3 and .65 (an even
+/// count), one contested leaf (Pl < .5), three evidenced (P1), and the
+/// envelope [0, .3] (Fréchet floor 1.5 − 3 < 0; Pl and NR capped by l3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_spine_profile_summarizes_each_leaf_alone(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (section, l) = compound_of(&pool, author, "thesis", 4).await;
+    set_level(&pool, section, "0").await;
+    support(&pool, l[0], 0.9).await;
+    support(&pool, l[1], 0.6).await;
+    refute(&pool, l[2], 0.7).await;
+
+    let v = derive(&pool, section).await;
+    assert_eq!(v.basis, Basis::Profile);
+    let p = v.profile.as_ref().expect("profile");
+    assert_eq!(
+        (p.n, p.evidenced, p.legacy_leaves, p.contested),
+        (4, 3, 0, 1)
+    );
+    for (what, s3, (min, median, max)) in [
+        ("bel", p.bel, (0.0, 0.3, 0.9)),
+        ("betp", p.betp, (0.15, 0.65, 0.95)),
+    ] {
+        assert!(
+            near(s3.min, min, 1e-9) && near(s3.median, median, 1e-9) && near(s3.max, max, 1e-9),
+            "{what} summary must be ({min}, {median}, {max}): {s3:?}"
+        );
+    }
+    assert!(
+        near(p.frechet.lo, 0.0, 1e-9)
+            && near(p.frechet.hi, 0.3, 1e-9)
+            && near(p.frechet.hi_nr, 0.3, 1e-9),
+        "envelope [0, .3], NR ≤ .3: {:?}",
+        p.frechet
+    );
+    assert!(
+        near(v.bel, 0.0, 1e-9)
+            && near(v.pl, 0.3, 1e-9)
+            && near(v.nr, 0.3, 1e-9)
+            && near(v.betp, 0.15, 1e-9),
+        "served: the envelope and its midpoint: Bel {} Pl {} NR {} BetP {}",
+        v.bel,
+        v.pl,
+        v.nr,
+        v.betp
     );
 }
 
@@ -829,6 +1043,11 @@ async fn a_refuting_edge_into_a_compound_is_its_not_all_valuation_per_viewer(poo
     let v = derive_one_as(&pool, &public, k).await;
     assert!(near(v.bel, 0.332, 5e-4), "Bel must be .332, got {}", v.bel);
     assert!(near(v.pl, 0.519, 5e-4), "Pl must be .519, got {}", v.pl);
+    assert!(
+        near(v.nr, 0.519, 5e-4),
+        "NR gains the refutation of the whole: .519, got {}",
+        v.nr
+    );
 
     // The same shape behind an edge only the group can read.
     let k2 = claim(&pool, author, "K2").await;
@@ -850,6 +1069,13 @@ async fn a_refuting_edge_into_a_compound_is_its_not_all_valuation_per_viewer(poo
         pub_v.pl
     );
     assert_eq!(pub_v.derived.as_ref().unwrap().not_all.sources, 0);
+    assert!(
+        near(pub_v.betp, 0.81, 1e-9),
+        "product-frame BetP of two independent .8 leaves: .64 + 2 · .16 · ½ + .04 · ¼ = .81, \
+         got {}",
+        pub_v.betp
+    );
+    assert!(pub_v.derived.as_ref().unwrap().exact);
     let grp_v = derive_one_as(&pool, &owner, k2).await;
     assert!(
         near(grp_v.bel, 0.332, 5e-4),
@@ -872,6 +1098,181 @@ async fn a_refuting_edge_into_a_compound_is_its_not_all_valuation_per_viewer(poo
         "and contributes nothing: m {} Bel {}",
         n3.m,
         v3.bel
+    );
+}
+
+/// `not_all` across sources and from a compound source (SPEC §3.6):
+/// - K1 (Bel .64) refuted by its own f .5 row and by X (.8) contradicts K1
+///   (m .72): Dempster across the two, m = 1 − .5 · .28 = .86 from 2 sources,
+///   so Bel .199 and Pl .311;
+/// - K2 contradicted by a compound X2 = x1 ∧ x2 (each .9): Bel(X2) is the
+///   conjunction of X2's leaves, .81, so m = .9 · .81 = .729, Bel .325,
+///   Pl .508;
+/// - K3 = d1 ∧ d2 contradicted by a compound X3 = d1 ∧ x3: they share d1, so
+///   the edge is skipped and counted (m 0, Bel .64).
+#[sqlx::test(migrations = "../../migrations")]
+async fn not_all_combines_its_sources_and_reads_a_compound_source_over_its_leaves(pool: PgPool) {
+    let author = agent(&pool).await;
+    let not_all = |v: &BeliefView| v.derived.as_ref().expect("derived").not_all;
+
+    let (k1, l1) = compound_of(&pool, author, "K1", 2).await;
+    for &l in &l1 {
+        support(&pool, l, 0.8).await;
+    }
+    refute(&pool, k1, 0.5).await;
+    let x = claim(&pool, author, "X").await;
+    support(&pool, x, 0.8).await;
+    edge(&pool, x, k1, "contradicts").await;
+    let v1 = derive(&pool, k1).await;
+    let n1 = not_all(&v1);
+    assert!(
+        near(n1.m, 0.86, 1e-9) && n1.sources == 2,
+        "two independent refuters: m .86 from 2 sources, got {} from {}",
+        n1.m,
+        n1.sources
+    );
+    assert!(
+        near(v1.bel, 0.1993, 5e-4) && near(v1.pl, 0.3114, 5e-4),
+        "Bel .199, Pl .311; got {} / {}",
+        v1.bel,
+        v1.pl
+    );
+
+    let (k2, l2) = compound_of(&pool, author, "K2", 2).await;
+    for &l in &l2 {
+        support(&pool, l, 0.8).await;
+    }
+    let (x2, xl) = compound_of(&pool, author, "X2", 2).await;
+    for &l in &xl {
+        support(&pool, l, 0.9).await;
+    }
+    edge(&pool, x2, k2, "contradicts").await;
+    let v2 = derive(&pool, k2).await;
+    assert!(
+        near(not_all(&v2).m, 0.729, 1e-9),
+        "a compound source is read as the conjunction of its leaves (.81): m .729, got {}",
+        not_all(&v2).m
+    );
+    assert!(
+        near(v2.bel, 0.3251, 5e-4) && near(v2.pl, 0.5080, 5e-4),
+        "Bel .325, Pl .508; got {} / {}",
+        v2.bel,
+        v2.pl
+    );
+
+    let (k3, l3) = compound_of(&pool, author, "K3", 2).await;
+    for &l in &l3 {
+        support(&pool, l, 0.8).await;
+    }
+    let x3 = claim(&pool, author, "X3").await;
+    let x3_leaf = claim(&pool, author, "X3's own leaf").await;
+    decompose(&pool, x3, l3[0]).await;
+    decompose(&pool, x3, x3_leaf).await;
+    support(&pool, x3_leaf, 0.9).await;
+    edge(&pool, x3, k3, "contradicts").await;
+    let v3 = derive(&pool, k3).await;
+    let n3 = not_all(&v3);
+    assert_eq!(
+        n3.shared_leaf_skipped, 1,
+        "a compound source sharing a leaf is skipped and counted"
+    );
+    assert!(
+        near(n3.m, 0.0, 1e-12) && near(v3.bel, 0.64, 1e-9),
+        "and contributes nothing: m {} Bel {}",
+        n3.m,
+        v3.bel
+    );
+}
+
+/// Which of a compound's own rows refute the whole, and how much:
+/// - two refutations citing one paper (two agents) are one source, the max
+///   (.7), not Dempster (.85);
+/// - a row is discounted by its α (strength .5): f .7 counts .35;
+/// - a mixed row (t .3, f .2) no citation moved counts its f (.2);
+/// - seed, propagated and `auto_cdst` rows on the compound are inert;
+/// - a refutation row only a group can read refutes the whole for that group
+///   alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn own_rows_refute_the_whole_by_key_by_alpha_and_per_viewer(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "bv-owner").await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    let public = fixture::public_viewer(&pool).await;
+    let author = agent(&pool).await;
+    let m_of = |v: &BeliefView| v.derived.as_ref().expect("derived").not_all.m;
+    let f7 = serde_json::json!({"1": 0.7, "0,1": 0.3});
+
+    let (k1, _) = compound_of(&pool, author, "one paper refutes twice", 2).await;
+    let (x, y) = (agent(&pool).await, agent(&pool).await);
+    let e1 = doi_evidence(&pool, k1, "10.5555/bv-same-paper", x).await;
+    let e2 = doi_evidence(&pool, k1, "10.5555/bv-same-paper", y).await;
+    store(&pool, k1, citing(x, e1), f7.clone()).await;
+    store(
+        &pool,
+        k1,
+        citing(y, e2),
+        serde_json::json!({"1": 0.5, "0,1": 0.5}),
+    )
+    .await;
+    let v1 = derive(&pool, k1).await;
+    assert!(
+        near(m_of(&v1), 0.7, 1e-9) && v1.derived.as_ref().unwrap().not_all.sources == 1,
+        "one paper is one source, the max: m .7 from 1, got {} from {}",
+        m_of(&v1),
+        v1.derived.as_ref().unwrap().not_all.sources
+    );
+
+    let (k2, _) = compound_of(&pool, author, "discounted", 2).await;
+    store(
+        &pool,
+        k2,
+        Row {
+            strength: Some(0.5),
+            ..Row::plain(agent(&pool).await)
+        },
+        f7.clone(),
+    )
+    .await;
+    let m2 = m_of(&derive(&pool, k2).await);
+    assert!(near(m2, 0.35, 1e-9), "α · f = .5 · .7 = .35, got {m2}");
+
+    let (k3, _) = compound_of(&pool, author, "mixed", 2).await;
+    store(
+        &pool,
+        k3,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.3, "1": 0.2, "0,1": 0.5}),
+    )
+    .await;
+    let m3 = m_of(&derive(&pool, k3).await);
+    assert!(near(m3, 0.2, 1e-9), "a mixed row's f counts: .2, got {m3}");
+
+    let (k4, _) = compound_of(&pool, author, "machinery rows", 2).await;
+    for method in ["truth_value_seed", "propagated_from_parent", "auto_cdst"] {
+        store(
+            &pool,
+            k4,
+            Row {
+                method: Some(method),
+                ..Row::plain(agent(&pool).await)
+            },
+            f7.clone(),
+        )
+        .await;
+    }
+    let m4 = m_of(&derive(&pool, k4).await);
+    assert!(
+        near(m4, 0.0, 1e-12),
+        "seed, propagated and auto_cdst rows are not evidence about the whole: m {m4}"
+    );
+
+    let (k5, _) = compound_of(&pool, author, "privately refuted", 2).await;
+    let row = refute(&pool, k5, 0.7).await;
+    hide_row(&pool, row, group).await;
+    let m_pub = m_of(&derive_one_as(&pool, &public, k5).await);
+    let m_grp = m_of(&derive_one_as(&pool, &owner, k5).await);
+    assert!(
+        near(m_pub, 0.0, 1e-12) && near(m_grp, 0.7, 1e-9),
+        "a private refutation refutes the whole for its group only: {m_pub} / {m_grp}"
     );
 }
 
@@ -920,14 +1321,97 @@ async fn one_negative_sibling_uses_the_closed_form_and_two_serve_the_envelope(po
     let v2 = derive(&pool, k2).await;
     let d2 = v2.derived.as_ref().expect("derived");
     assert!(
-        d2.internally_contested,
-        "two negative siblings are contested"
+        d2.internally_contested && !d2.exact,
+        "two negative siblings are contested, and the envelope is not exact"
     );
     assert!(
         near(v2.bel, 0.4, 1e-9) && near(v2.pl, 1.0, 1e-9),
         "two siblings serve the envelope [.4, 1], got Bel {} Pl {}",
         v2.bel,
         v2.pl
+    );
+}
+
+/// Negative siblings as live data carries them, each with its frozen
+/// edge-factor BBA on its target:
+/// - two siblings, b1 contradicts b2 ({F .72} on b2) and b2 refutes b3
+///   ({F .64} on b3): the envelope is built from the leaves as they are
+///   served, frozen rows included (b2 T .528 / Pl .660, b3 T .590 / Pl .738),
+///   so its floor is 0 and its ceiling .660, labelled inexact;
+/// - a reciprocal pair (c1 contradicts c2 and c2 contradicts c1) is two
+///   edges: the envelope [.6, 1], labelled internally contested;
+/// - a sibling edge and its frozen row that only a group can read: the public
+///   sees two independent leaves (.64, Pl 1), the group the closed form
+///   (.151 / .236).
+#[sqlx::test(migrations = "../../migrations")]
+async fn negative_siblings_are_read_with_their_frozen_rows_and_per_viewer(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "bv-owner").await;
+    let owner = Viewer::resolve(&pool, member).await.expect("owner viewer");
+    let public = fixture::public_viewer(&pool).await;
+    let author = agent(&pool).await;
+
+    let (k, b) = compound_of(&pool, author, "two wired siblings", 3).await;
+    for &l in &b {
+        support(&pool, l, 0.8).await;
+    }
+    let e1 = edge(&pool, b[0], b[1], "contradicts").await;
+    store_edge_factor(&pool, e1, b[1], serde_json::json!({"1": 0.72, "0,1": 0.28})).await;
+    let e2 = edge(&pool, b[1], b[2], "refutes").await;
+    store_edge_factor(&pool, e2, b[2], serde_json::json!({"1": 0.64, "0,1": 0.36})).await;
+    let v = derive(&pool, k).await;
+    let d = v.derived.as_ref().expect("derived");
+    assert!(d.internally_contested && !d.exact);
+    assert!(
+        near(v.bel, 0.0, 1e-9) && near(v.pl, 0.6604, 5e-4),
+        "the envelope of the served leaves is [0, .660]: Bel {} Pl {}",
+        v.bel,
+        v.pl
+    );
+
+    let (k2, c) = compound_of(&pool, author, "reciprocal pair", 2).await;
+    for &l in &c {
+        support(&pool, l, 0.8).await;
+    }
+    edge(&pool, c[0], c[1], "contradicts").await;
+    edge(&pool, c[1], c[0], "contradicts").await;
+    let v2 = derive(&pool, k2).await;
+    assert!(v2.derived.as_ref().unwrap().internally_contested);
+    assert!(
+        near(v2.bel, 0.6, 1e-9) && near(v2.pl, 1.0, 1e-9),
+        "a reciprocal pair is two siblings: the envelope [.6, 1], got Bel {} Pl {}",
+        v2.bel,
+        v2.pl
+    );
+
+    let (k3, d3) = compound_of(&pool, author, "privately contradicted", 2).await;
+    for &l in &d3 {
+        support(&pool, l, 0.8).await;
+    }
+    let e3 = edge(&pool, d3[0], d3[1], "contradicts").await;
+    let row = store_edge_factor(
+        &pool,
+        e3,
+        d3[1],
+        serde_json::json!({"1": 0.72, "0,1": 0.28}),
+    )
+    .await;
+    hide_edge(&pool, e3, group).await;
+    hide_row(&pool, row, group).await;
+    let pub_v = derive_one_as(&pool, &public, k3).await;
+    let grp_v = derive_one_as(&pool, &owner, k3).await;
+    assert!(
+        near(pub_v.bel, 0.64, 1e-9)
+            && near(pub_v.pl, 1.0, 1e-9)
+            && !pub_v.derived.as_ref().unwrap().internally_contested,
+        "the public reads no sibling: .64 / 1, got {} / {}",
+        pub_v.bel,
+        pub_v.pl
+    );
+    assert!(
+        near(grp_v.bel, 0.151, 5e-4) && near(grp_v.pl, 0.236, 5e-4),
+        "the group reads the closed form: .151 / .236, got {} / {}",
+        grp_v.bel,
+        grp_v.pl
     );
 }
 
@@ -1123,6 +1607,32 @@ async fn d11_total_conflict_is_ignorance_in_both_reads(pool: PgPool) {
         "the conjunction saw K = 1 (and did not divide by 1 - K), got {conflict}"
     );
     assert!(near(v.bel, bel, 1e-9) && near(v.pl, pl, 1e-9) && near(conflict, k, 1e-9));
+}
+
+/// A leaf whose fold holds a frozen edge-factor row from a COMPOUND source is
+/// a labelled fidelity cost (SPEC §6.3): a compound over it reports one
+/// `legacy_compound_edge_items`, and one over an ordinary leaf reports none.
+/// The positive row is read one-sided (T .5), so the compound is .5 · .8.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_source_edge_row_is_reported_on_the_compounds_that_read_it(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (y, y_leaves) = compound_of(&pool, author, "compound source Y", 1).await;
+    support(&pool, y_leaves[0], 0.9).await;
+    let (k, l) = compound_of(&pool, author, "reads a compound-source row", 2).await;
+    let e = edge(&pool, y, l[0], "supports").await;
+    store_edge_factor(&pool, e, l[0], serde_json::json!({"0": 0.5, "0,1": 0.5})).await;
+    support(&pool, l[1], 0.8).await;
+    let (plain, pl) = compound_of(&pool, author, "reads none", 1).await;
+    support(&pool, pl[0], 0.8).await;
+
+    let v = derive(&pool, k).await;
+    assert_eq!(v.inputs.legacy_compound_edge_items, 1);
+    assert_eq!(v.inputs.items, 2);
+    assert!(near(v.bel, 0.4, 1e-9), "T .5 · .8 = .4, got {}", v.bel);
+    assert_eq!(
+        derive(&pool, plain).await.inputs.legacy_compound_edge_items,
+        0
+    );
 }
 
 // ── atom views and the shadow field ─────────────────────────────────────────

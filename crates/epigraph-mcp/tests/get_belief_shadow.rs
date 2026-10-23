@@ -6,9 +6,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::{FrameRepository, MassFunctionRepository, PgPool};
+use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_engine::belief_view::CompoundBeliefMode;
-use epigraph_mcp::tools::ds::get_belief_in_mode;
+use epigraph_mcp::tools::ds::{get_belief, get_belief_in_mode};
 use epigraph_mcp::types::GetBeliefParams;
 use serde_json::Value;
 use uuid::Uuid;
@@ -43,6 +43,10 @@ async fn decompose(pool: &PgPool, parent: Uuid, child: Uuid) {
 }
 
 async fn support(pool: &PgPool, claim: Uuid, t: f64) {
+    store_support(pool, claim, t, None, Some(1.0)).await;
+}
+
+async fn binary_frame(pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
     let frame = match FrameRepository::get_by_name(pool, &viewer, "binary_truth")
         .await
@@ -61,6 +65,18 @@ async fn support(pool: &PgPool, claim: Uuid, t: f64) {
             .id
         }
     };
+    frame
+}
+
+/// A support row at `t`, with the given evidence type and stored strength.
+async fn store_support(
+    pool: &PgPool,
+    claim: Uuid,
+    t: f64,
+    evidence_type: Option<&str>,
+    strength: Option<f64>,
+) {
+    let frame = binary_frame(pool).await;
     let a = agent(pool).await;
     MassFunctionRepository::store_with_perspective(
         pool,
@@ -71,8 +87,8 @@ async fn support(pool: &PgPool, claim: Uuid, t: f64) {
         &serde_json::json!({"0": t, "0,1": 1.0 - t}),
         None,
         None,
-        Some(1.0),
-        None,
+        strength,
+        evidence_type,
         "unknown",
         None,
     )
@@ -145,5 +161,92 @@ async fn get_belief_carries_a_shadow_view_only_in_shadow_mode(pool: PgPool) {
     assert!(
         (legacy["belief"].as_f64().unwrap() - 0.9).abs() < 1e-9,
         "the served value is still the cache"
+    );
+}
+
+/// The tool entry point reads the mode from `EPIGRAPH_COMPOUND_BELIEF`; unset,
+/// it is `legacy`, so `get_belief` itself carries no `shadow` key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_belief_with_the_switch_unset_carries_no_shadow(pool: PgPool) {
+    assert!(
+        std::env::var_os(CompoundBeliefMode::ENV).is_none(),
+        "precondition: {} is unset in the test environment",
+        CompoundBeliefMode::ENV
+    );
+    let author = agent(&pool).await;
+    let k = claim(&pool, author, "K").await;
+    let a1 = claim(&pool, author, "a1").await;
+    decompose(&pool, k, a1).await;
+    support(&pool, a1, 0.8).await;
+    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let r: Value = first_text(
+        &get_belief(&server, &viewer, params(k))
+            .await
+            .expect("get_belief"),
+    );
+    assert!(
+        r.get("shadow").is_none(),
+        "default mode adds no shadow: {r}"
+    );
+}
+
+/// The shadow is the global view whatever lens the served read used (it
+/// mirrors the top-level fields, which are global; the lensed value stays in
+/// `lensed_belief`). Under a lens {empirical: .2} an atom with one empirical
+/// item at .8 has `lensed_belief` .16 and a shadow of .8.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_shadow_stays_global_beside_a_lensed_belief(pool: PgPool) {
+    let author = agent(&pool).await;
+    let atom = claim(&pool, author, "lensed atom").await;
+    store_support(&pool, atom, 0.8, Some("empirical"), None).await;
+    let lens = PerspectiveRepository::create(
+        &pool,
+        "empirical skeptic",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("perspective");
+    PerspectiveRepository::set_source_reliability(
+        &pool,
+        lens.id,
+        &std::collections::HashMap::from([("empirical".to_string(), 0.2)]),
+    )
+    .await
+    .expect("reliability map");
+    let frame = binary_frame(&pool).await;
+
+    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let r: Value = first_text(
+        &get_belief_in_mode(
+            &server,
+            &viewer,
+            GetBeliefParams {
+                claim_id: atom.to_string(),
+                frame_id: Some(frame.to_string()),
+                perspective_id: Some(lens.id.to_string()),
+            },
+            CompoundBeliefMode::Shadow,
+        )
+        .await
+        .expect("lensed get_belief"),
+    );
+    let lensed = r["lensed_belief"]["belief"]
+        .as_f64()
+        .expect("lensed belief");
+    let shadow = r["shadow"]["bel"].as_f64().expect("shadow bel");
+    assert!(
+        (lensed - 0.16).abs() < 1e-9,
+        "lensed .16, got {lensed}: {r}"
+    );
+    assert!(
+        (shadow - 0.8).abs() < 1e-9,
+        "the shadow is the global view, .8, got {shadow}: {r}"
     );
 }
