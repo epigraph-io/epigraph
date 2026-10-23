@@ -273,7 +273,7 @@ async fn matching_modes_let_the_same_writing_run_proceed_and_write(pool: PgPool)
     );
 }
 
-/// The W0/W1 review shape (SPEC §10.3 O4/O7): the server still runs `legacy`
+/// The wave-review shape (SPEC §10.3): the server still runs `legacy`
 /// and the bin is asked for the fold the server will flip to. The bin's own
 /// environment is ALSO skewed (`aef`), the worst case; a dry run is exempt
 /// all the same, and writes nothing.

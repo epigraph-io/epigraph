@@ -17,7 +17,7 @@
 //!
 //! A run that writes nothing (`--dry-run`, including `--dry-run --target-fold
 //! <mode>`) is exempt and does not contact the API, so a wave can be reviewed
-//! under the fold the server will flip to before the flip (SPEC §10.3 O4, O7).
+//! under the fold the server will flip to before the flip (SPEC §10.3).
 //!
 //! `--allow-mode-skew` turns a refusal into a loud warning. It is hidden from
 //! `--help` and exists for tests and for a deliberate, recorded operator

@@ -73,7 +73,7 @@ struct Cli {
     progress_every: usize,
     /// With --dry-run: the atom fold the preview is for (`legacy`,
     /// `aef_standalone`, `aef`), whatever the server's `EPIGRAPH_ATOM_FOLD`
-    /// is, so a wave can be reviewed before its flag flips (SPEC §10.3 O4/O7).
+    /// is, so a wave can be reviewed before its flag flips (SPEC §10.3).
     /// A dry run writes nothing, so it is exempt from the mode check.
     #[arg(long, requires = "dry_run", value_parser = parse_target_fold)]
     target_fold: Option<AtomFold>,
