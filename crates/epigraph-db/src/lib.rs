@@ -128,6 +128,10 @@ pub use repos::{
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
+    agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
+    PromptFile, PromptHistoryEntry, PromptSnapshot,
+};
+pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
     AdminScopeSwitch,
 };

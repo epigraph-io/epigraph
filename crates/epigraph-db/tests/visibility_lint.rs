@@ -1598,6 +1598,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          retired link.",
     ),
     (
+        "agent_identity.rs",
+        "register",
+        "WRITE through migration 161's `epigraph_register_agent_identity` SECURITY DEFINER \
+         function, EXECUTE-able by the `epigraph_identity_attestor` role ONLY (PUBLIC, \
+         epigraph_app and its owner revoked): the CONNECTION's role is the authorisation, \
+         precisely because a session principal is forgeable, so there is nothing for a Viewer \
+         to filter. Writes agents, agent_succession, agent_prompt_snapshots, \
+         agent_prompt_blobs, agent_keys and an inherited link; returns only the outcome for the \
+         named identity.",
+    ),
+    (
+        "agent_identity.rs",
+        "prompt_history",
+        "READ through migration 161's `epigraph_agent_prompt_history` SECURITY DEFINER function, \
+         the only reader of agent_prompt_snapshots / agent_prompt_blobs / agent_succession \
+         (FORCE RLS, no application policy). It gates on the SESSION principal itself (the \
+         agent's operator or an admin, else AID06) and withholds content of lineage members \
+         the principal does not operate, so the caller's stamped connection is what is spent; \
+         a Viewer splice has no tenancy column to act on.",
+    ),
+    (
         "agent.rs",
         "require_bound_author",
         "CHECK through migration 122's `epigraph_require_bound_author` SECURITY DEFINER \
