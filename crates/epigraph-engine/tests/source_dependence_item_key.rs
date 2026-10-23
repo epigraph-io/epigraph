@@ -230,17 +230,12 @@ proptest! {
             ],
             0.9,
         ).unwrap().0;
-        let (strong_id, strong_key, strong_w) = if w_attr >= w_ingest {
-            (r_cite.id, k_cite, w_attr)
-        } else {
-            (r_ingest.id, k_ingest, w_ingest)
-        };
-        let strongest_alone = combine_by_item(vec![(strong_id, strong_key, bba(strong_w, 0.0, 0.0))], 0.9)
-            .unwrap().0;
+        prop_assert_eq!(&k_ingest, &k_cite);
+        let strongest = w_ingest.max(w_attr);
         prop_assert!(
-            (m_t(&both) - m_t(&strongest_alone)).abs() < EPS,
-            "one paper must fold to its strongest reading: {} vs {}",
-            m_t(&both), m_t(&strongest_alone)
+            (m_t(&both) - strongest).abs() < EPS,
+            "one paper must fold to its strongest reading: {} vs {strongest}",
+            m_t(&both)
         );
     }
 }
@@ -595,16 +590,159 @@ proptest! {
 fn a_lineages_support_and_refutation_are_two_items() {
     let atom = Uuid::new_v4();
     let key = ItemKey::Doi("10.5555/lineage".into());
+    // The weaker row of each side comes first AND has the smaller row id, so
+    // neither "keep the first row" nor "keep the smaller id" can pass.
+    let at = |id: u128, m: MassFunction| KeyedBba {
+        row_id: uuid_of(id),
+        atom_id: atom,
+        key: key.clone(),
+        bba: m,
+    };
     let items = item_partition(vec![
-        keyed(atom, &key, bba(0.64, 0.0, 0.0)),
-        keyed(atom, &key, bba(0.5, 0.0, 0.0)),
-        keyed(atom, &key, bba(0.0, 0.41, 0.0)),
-        keyed(atom, &key, bba(0.0, 0.2, 0.0)),
+        at(1, bba(0.5, 0.0, 0.0)),
+        at(3, bba(0.0, 0.2, 0.0)),
+        at(2, bba(0.64, 0.0, 0.0)),
+        at(4, bba(0.0, 0.41, 0.0)),
     ]);
     let sides: BTreeSet<ItemSide> = items.iter().map(|i| i.id.side.clone()).collect();
     assert_eq!(sides, BTreeSet::from([ItemSide::Support, ItemSide::Refute]));
     for it in &items {
         assert!(it.id.key == key);
+    }
+    let side = |s: ItemSide| {
+        items
+            .iter()
+            .find(|i| i.id.side == s)
+            .and_then(|i| i.on(atom))
+            .unwrap()
+            .clone()
+    };
+    let support = side(ItemSide::Support);
+    let refute = side(ItemSide::Refute);
+    assert!((m_t(&support) - 0.64).abs() < EPS, "{:?}", support.masses());
+    assert_eq!(m_f(&support), 0.0);
+    assert!((m_f(&refute) - 0.41).abs() < EPS, "{:?}", refute.masses());
+    assert_eq!(m_t(&refute), 0.0);
+}
+
+proptest! {
+    #[test]
+    fn one_keys_rows_keep_the_max_per_literal(
+        ts in prop::collection::vec(0.01f64..0.95, 1..6),
+        fs in prop::collection::vec(0.01f64..0.95, 1..6),
+        interleave in any::<bool>(),
+    ) {
+        let atom = uuid_of(1);
+        let key = ItemKey::Evidence(uuid_of(9));
+        let support = ts.iter().map(|&t| bba(t, 0.0, 0.0));
+        let refute = fs.iter().map(|&f| bba(0.0, f, 0.0));
+        let masses: Vec<MassFunction> = if interleave {
+            let mut v = Vec::new();
+            let (mut a, mut b) = (support, refute);
+            loop {
+                match (a.next(), b.next()) {
+                    (None, None) => break,
+                    (x, y) => v.extend(x.into_iter().chain(y)),
+                }
+            }
+            v
+        } else {
+            refute.chain(support).collect()
+        };
+        let rows: Vec<KeyedBba> = masses
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| KeyedBba { row_id: uuid_of(100 + i as u128), atom_id: atom, key: key.clone(), bba: m })
+            .collect();
+        let t_max = ts.iter().copied().fold(0.0, f64::max);
+        let f_max = fs.iter().copied().fold(0.0, f64::max);
+
+        let items = item_partition(rows.clone());
+        prop_assert_eq!(items.len(), 2);
+        for it in &items {
+            let m = it.on(atom).unwrap();
+            match it.id.side {
+                ItemSide::Support => prop_assert!((m_t(m) - t_max).abs() < EPS && m_f(m) == 0.0),
+                ItemSide::Refute => prop_assert!((m_f(m) - f_max).abs() < EPS && m_t(m) == 0.0),
+                ItemSide::Own(_) => prop_assert!(false, "no mixed row was given"),
+            }
+        }
+        // SPEC §3.3 / plan (6): the folded atom keeps the refutation and its
+        // Bel never exceeds the strongest support row of the lineage.
+        let (folded, _) = combine_by_item(
+            rows.into_iter().map(|r| (r.row_id, r.key, r.bba)).collect(),
+            0.9,
+        ).unwrap();
+        prop_assert!(m_f(&folded) > 0.0);
+        prop_assert!(m_t(&folded) <= t_max + EPS, "Bel {} above max support {t_max}", m_t(&folded));
+    }
+}
+
+// ── rows the within-group rule cannot read are their own items ─────────────
+
+fn ternary() -> FrameOfDiscernment {
+    FrameOfDiscernment::new("ternary", vec!["A".into(), "B".into(), "C".into()]).unwrap()
+}
+
+#[test]
+fn a_row_the_rule_cannot_read_is_its_own_item_with_its_exact_bba() {
+    let atom = Uuid::new_v4();
+    let key = ItemKey::Doi("10.5555/odd".into());
+    let fr = binary();
+    let t = FocalElement::positive(BTreeSet::from([0]));
+    let theta = FocalElement::theta(&fr);
+    // Conflict (∅) mass carried by a stored row.
+    let with_conflict = MassFunction::new(
+        fr.clone(),
+        BTreeMap::from([
+            (t.clone(), 0.5),
+            (FocalElement::conflict(), 0.1),
+            (theta.clone(), 0.4),
+        ]),
+    )
+    .unwrap();
+    // A CDST complement element other than `~`.
+    let with_complement = MassFunction::new(
+        fr.clone(),
+        BTreeMap::from([
+            (t.clone(), 0.3),
+            (FocalElement::negative(BTreeSet::from([0])), 0.2),
+            (theta, 0.5),
+        ]),
+    )
+    .unwrap();
+    // A row on a frame of another size: index 0 is not "the claim holds".
+    let tf = ternary();
+    let three = MassFunction::new(
+        tf.clone(),
+        BTreeMap::from([
+            (FocalElement::positive(BTreeSet::from([0])), 0.5),
+            (FocalElement::theta(&tf), 0.5),
+        ]),
+    )
+    .unwrap();
+    for odd in [with_conflict, with_complement, three] {
+        let odd_row = KeyedBba {
+            row_id: Uuid::new_v4(),
+            atom_id: atom,
+            key: key.clone(),
+            bba: odd.clone(),
+        };
+        // Next to a weaker plain support row of the same key, which it would
+        // replace if it were read as support.
+        let items = item_partition(vec![keyed(atom, &key, bba(0.2, 0.0, 0.0)), odd_row.clone()]);
+        assert_eq!(items.len(), 2, "{:?}", odd.masses());
+        let own = items
+            .iter()
+            .find(|i| i.id.side == ItemSide::Own(odd_row.row_id))
+            .unwrap_or_else(|| panic!("not its own item: {:?}", odd.masses()));
+        assert_eq!(own.on(atom).unwrap().masses(), odd.masses());
+        let support = items
+            .iter()
+            .find(|i| i.id.side == ItemSide::Support)
+            .and_then(|i| i.on(atom))
+            .unwrap();
+        assert!((m_t(support) - 0.2).abs() < EPS);
     }
 }
 
