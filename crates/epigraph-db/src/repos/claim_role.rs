@@ -532,6 +532,53 @@ mod tests {
         assert_eq!(role_max_depth!().parse::<i32>().unwrap(), ROLE_MAX_DEPTH);
     }
 
+    /// `concat!` cannot interpolate [`super::super::edge::EDGE_IN_FORCE`], so
+    /// the templates spell the in-force test by hand. Every spelling must be
+    /// exactly `EDGE_IN_FORCE` over its own alias, and no other `valid_to`
+    /// test may appear, so a change to the shared predicate turns this red
+    /// instead of leaving role and closure reads on the old rule.
+    #[test]
+    fn every_in_force_spelling_is_edge_in_force_over_its_alias() {
+        use super::super::edge::EDGE_IN_FORCE;
+        let leaf_walk = leaf_walk_ctes!("SELECT 1, 1, 0");
+        let mut aliases = std::collections::BTreeSet::new();
+        for (name, t) in [
+            ("IS_COMPOUND_SQL", IS_COMPOUND_SQL),
+            ("IS_PROCEDURAL_SQL", IS_PROCEDURAL_SQL),
+            ("CLAIM_ROLE_SQL", CLAIM_ROLE_SQL),
+            ("leaf_walk_ctes", leaf_walk),
+        ] {
+            let needle = ".valid_to IS NULL";
+            let mut checked = 0;
+            for (at, _) in t.match_indices(needle) {
+                let start = t[..at]
+                    .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .map_or(0, |i| i + 1);
+                let alias = &t[start..at];
+                let expected = EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
+                assert!(
+                    t[start.saturating_sub(1)..].starts_with(&expected),
+                    "{name}: the in-force test over {alias:?} is not EDGE_IN_FORCE \
+                     ({expected}) in:\n{t}"
+                );
+                aliases.insert(alias.to_string());
+                checked += 1;
+            }
+            assert!(checked > 0, "{name} has no in-force test");
+            assert_eq!(
+                t.matches("valid_to").count(),
+                2 * checked,
+                "{name} tests valid_to outside an EDGE_IN_FORCE spelling:\n{t}"
+            );
+        }
+        // Every edge alias the templates walk is covered.
+        for alias in [
+            "role_out", "role_in", "role_ue", "role_rc", "role_d", "role_x",
+        ] {
+            assert!(aliases.contains(alias), "no in-force test over {alias}");
+        }
+    }
+
     #[test]
     fn every_template_carries_the_placeholder_and_no_bind() {
         for t in [IS_COMPOUND_SQL, IS_PROCEDURAL_SQL, CLAIM_ROLE_SQL] {
