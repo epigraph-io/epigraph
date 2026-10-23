@@ -23,6 +23,7 @@ pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
+pub mod compound_valuation;
 pub mod conflict_density;
 pub mod context;
 pub mod corpus_stats;
