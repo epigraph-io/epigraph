@@ -572,3 +572,157 @@ async fn a_full_run_writes_nothing(pool: PgPool) {
         "the report wrote to the database"
     );
 }
+
+// ── the sheaf shadow and the conflict set ───────────────────────────────────
+
+async fn single_writer(pool: &PgPool, viewer: &Viewer, ids: &[Uuid]) {
+    let mut conn = pool.acquire().await.expect("conn");
+    for id in ids {
+        recompute_atom_cache_with(
+            &mut conn,
+            viewer,
+            *id,
+            CacheWriteCause::Organic,
+            LegacyFold::OwnerFrame,
+            aef(),
+        )
+        .await
+        .expect("single writer");
+    }
+}
+
+async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', $3)",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("edge");
+}
+
+/// The sheaf shadow reads each endpoint's candidate interval, not its cache.
+/// `s -supports-> t` between two atoms whose caches the single writer set
+/// to their folds, and `k -supports-> s` from a compound. With every cache
+/// equal to its fold the shadow's cohomology is the served one. A writer
+/// outside the plan then rewrites t's interval: the served cohomology moves
+/// and the shadow's does not. Strict drops the compound-ended edge: one of
+/// two edges, coverage .5.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_sheaf_shadow_reads_the_folds_and_strict_drops_compound_ended_edges(pool: PgPool) {
+    let author = agent(&pool).await;
+    let s = claim(&pool, author, "s").await;
+    let t = claim(&pool, author, "t").await;
+    support(&pool, s, 0.9).await;
+    support(&pool, t, 0.2).await;
+    refute(&pool, t, 0.6).await;
+    let (k, leaves) = compound(&pool, author, "k", &[&[0.7], &[0.7]]).await;
+    set_cache(&pool, k, 0.5, 0.9, 0.7).await;
+    edge(&pool, s, t, "supports").await;
+    edge(&pool, k, s, "supports").await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    single_writer(&pool, &maint, &[s, t]).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let mut ids = vec![s, t, k];
+    ids.extend(&leaves);
+    let scope = Scope::Ids(ids);
+    let (before, _) = report(&pool, &public, &maint, &opts(scope.clone())).await;
+    let sh = &before.sheaf;
+    assert_eq!(
+        (
+            sh.served.edge_count,
+            sh.progressive.edge_count,
+            sh.strict.edge_count
+        ),
+        (2, 2, 1),
+        "strict drops the compound-ended edge"
+    );
+    assert!(
+        (sh.strict.coverage - 0.5).abs() < 1e-12,
+        "1 of 2 edges kept"
+    );
+    assert!(
+        sh.served.h1 > 0.0,
+        "the fixture is inconsistent somewhere: {sh:?}"
+    );
+
+    // The served side of s -> t alone, against the shadow's, with k's edge
+    // out of the way: the strict pass holds exactly that edge.
+    let (served_st, strict_st) = (before.sheaf.served.h1, before.sheaf.strict.h1);
+    set_cache(&pool, t, 0.0, 0.05, 0.025).await;
+    let (after, _) = report(&pool, &public, &maint, &opts(scope)).await;
+    assert!(
+        (after.sheaf.strict.h1 - strict_st).abs() < 1e-12,
+        "the shadow reads t's fold, which did not change ({strict_st} -> {})",
+        after.sheaf.strict.h1
+    );
+    assert!(
+        (after.sheaf.served.h1 - served_st).abs() > 1e-6,
+        "control: the served cohomology reads t's cache, which did change"
+    );
+}
+
+/// The conflict set (per-claim K at least .3): today from the stored rows'
+/// `conflict_k`, under strict from each atom's fold K, with compounds out.
+///
+/// * `c_keep`: a stored K .5 and folds support .8 + refutation .8 (K .64):
+///   in both.
+/// * `c_drop`: a stored K .5 and a lone support (K 0): removed.
+/// * `l`: a leaf of `k_leaf` with the same .8 / .8 rows and no stored K:
+///   added.
+/// * `k_leaf`: a compound with a stored K .6: dropped, explained by `l`.
+/// * `k_bare`: a compound with a stored K .6 whose leaves are quiet: dropped,
+///   unexplained.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_conflict_set_moves_from_stored_k_to_the_folds_and_drops_compounds(pool: PgPool) {
+    let author = agent(&pool).await;
+    let c_keep = claim(&pool, author, "c_keep").await;
+    let c_drop = claim(&pool, author, "c_drop").await;
+    let keep_row = support(&pool, c_keep, 0.8).await;
+    refute(&pool, c_keep, 0.8).await;
+    let drop_row = support(&pool, c_drop, 0.8).await;
+    let (k_leaf, leaf_ids) = compound(&pool, author, "k_leaf", &[&[0.8], &[0.6]]).await;
+    let l = leaf_ids[0];
+    refute(&pool, l, 0.8).await;
+    let k_leaf_row = support(&pool, k_leaf, 0.5).await;
+    let (k_bare, bare_leaves) = compound(&pool, author, "k_bare", &[&[0.6], &[0.6]]).await;
+    let k_bare_row = support(&pool, k_bare, 0.5).await;
+    for (row, k) in [
+        (keep_row, 0.5),
+        (drop_row, 0.5),
+        (k_leaf_row, 0.6),
+        (k_bare_row, 0.6),
+    ] {
+        sqlx::query("UPDATE mass_functions SET conflict_k = $2 WHERE id = $1")
+            .bind(row)
+            .bind(k)
+            .execute(&pool)
+            .await
+            .expect("stored K");
+    }
+
+    let mut ids = vec![c_keep, c_drop, k_leaf, k_bare];
+    ids.extend(leaf_ids.iter().chain(&bare_leaves));
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, _) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+    let c = &summary.conflicts;
+    assert_eq!(
+        (c.served, c.shadow, c.atoms_added, c.atoms_removed),
+        (4, 2, 1, 1),
+        "today: c_keep, c_drop, k_leaf, k_bare; under strict: c_keep and l; got {c:?}"
+    );
+    assert_eq!(
+        (
+            c.compounds_dropped,
+            c.compounds_dropped_with_leaf_conflict,
+            c.compounds_dropped_unexplained
+        ),
+        (2, 1, 1),
+        "k_leaf's K shows on its leaf l; k_bare's shows nowhere"
+    );
+}
