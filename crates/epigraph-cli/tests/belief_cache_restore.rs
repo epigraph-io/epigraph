@@ -814,6 +814,15 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
     seed_edge_factor(&pool, outside_woken, targets[11], agent, frame, t0 + h).await;
     let _into_a = seed_edge(&pool, targets[3], a, t0 + h).await;
 
+    // Closed after the wave: its BBA may outlive the close, so it is listed.
+    let closed_at = t0 + h * 2;
+    sqlx::query("UPDATE edges SET valid_to = $2 WHERE id = $1")
+        .bind(after_a)
+        .bind(closed_at)
+        .execute(&pool)
+        .await
+        .expect("close an edge");
+
     let plan = plan_restore(&rec_a, None);
     assert_eq!(plan.broken_chain, vec![c], "fixture: c is held back");
     let listed = downstream_edges(&pool, &plan).await.expect("downstream");
@@ -831,6 +840,12 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
         ])
     );
     assert_eq!(listed.len(), got.len(), "no edge listed twice");
+    let closed = listed.iter().find(|e| e.edge_id == after_a).unwrap();
+    assert_eq!(
+        closed.valid_to,
+        Some(closed_at),
+        "a closed edge carries valid_to"
+    );
     for e in &listed {
         assert!(e.source_id == a || e.source_id == b || e.source_id == c);
     }
