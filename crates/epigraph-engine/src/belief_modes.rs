@@ -33,8 +33,8 @@
 //!
 //! A value is matched trimmed and case-insensitively against the spellings
 //! above. Unset or blank is the default. Anything else also reads as the
-//! default, and is returned in [`ModeRead::unrecognised`] so the process can
-//! warn at boot: a typo must not silently enable a mode, and the report on
+//! default, and is returned in [`ModeRead::unrecognised`] (for this process,
+//! [`unrecognised`]) so the process can warn at boot: a typo must not silently enable a mode, and the report on
 //! `/health` then shows the mode the process actually runs, which is what
 //! gate G0 compares.
 //!
@@ -421,28 +421,41 @@ impl BeliefModes {
     }
 }
 
-static CURRENT: OnceLock<BeliefModes> = OnceLock::new();
+impl fmt::Display for UnrecognisedFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}={:?} is not a recognised value; this process runs {}",
+            self.env, self.value, self.running
+        )
+    }
+}
+
+static CURRENT: OnceLock<ModeRead> = OnceLock::new();
+
+/// The one read of the process environment, made on first use.
+fn read_once() -> &'static ModeRead {
+    CURRENT.get_or_init(BeliefModes::from_env)
+}
 
 /// This process's belief modes, read from the environment the first time it
-/// is called and never again (SPEC §10.2: flags are read at startup; a flip
-/// takes a restart).
+/// (or [`unrecognised`]) is called and never again (SPEC §10.2: flags are read
+/// at startup; a flip takes a restart).
 ///
 /// A process should call this early in `main` and log [`BeliefModes::summary`]
-/// under its own log target, so the modes are fixed and journalled at boot
-/// rather than at the first request that happens to read them.
+/// and every [`unrecognised`] flag under its OWN log target, so the modes are
+/// fixed and journalled at boot rather than at the first request that happens
+/// to read them. This module logs nothing itself: a process's default log
+/// filter keeps its own target, not necessarily this crate's, and a typo the
+/// filter drops is a typo nobody sees.
 pub fn current() -> &'static BeliefModes {
-    CURRENT.get_or_init(|| {
-        let read = BeliefModes::from_env();
-        for flag in &read.unrecognised {
-            tracing::warn!(
-                env = flag.env,
-                value = %flag.value,
-                running = flag.running,
-                "belief-mode flag set to an unrecognised value: this process runs the default"
-            );
-        }
-        read.modes
-    })
+    &read_once().modes
+}
+
+/// The flags of the same read as [`current`] whose values none of their
+/// spellings match. Each runs its default; the process reports them at boot.
+pub fn unrecognised() -> &'static [UnrecognisedFlag] {
+    &read_once().unrecognised
 }
 
 #[cfg(test)]

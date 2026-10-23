@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use epigraph_engine::belief_modes::BeliefModes;
+use epigraph_engine::belief_modes::{BeliefModes, UnrecognisedFlag};
 
 /// The exit status of a run the mode check refused, distinct from a run that
 /// failed for any other reason.
@@ -95,24 +95,32 @@ pub async fn fetch_server_modes(
     })
 }
 
-/// The decision for a WRITING run, given this process's modes and what the
-/// server reported (or why it could not be read). Pure.
+/// The decision for a WRITING run, given this process's modes, the flags it
+/// read but did not recognise, and what the server reported (or why it could
+/// not be read). Pure.
 ///
 /// # Errors
 /// The refusal text: every differing mode with both values, or why the
-/// server's modes could not be read.
+/// server's modes could not be read; then every unrecognised flag of this
+/// process, since a typo that fell back to the default is the likeliest
+/// cause of a skew.
 pub fn check_writing_run(
     bin: &str,
     ours: &BeliefModes,
+    unrecognised: &[UnrecognisedFlag],
     server: Result<BeliefModes, String>,
     api_base: &str,
 ) -> Result<(), String> {
+    let typos: String = unrecognised
+        .iter()
+        .map(|flag| format!("\nNote: {flag}."))
+        .collect();
     let theirs = server.map_err(|why| {
         format!(
             "{bin}: refusing a writing run: cannot read the API's belief_modes ({why}). \
              A writing run must show that its belief modes match the API's (SPEC §10.2, gate G0). \
              Checked {api_base}: set EPIGRAPH_API (or EPIGRAPH_API_URL) to the API this run \
-             writes alongside, or run with --dry-run."
+             writes alongside, or run with --dry-run.{typos}"
         )
     })?;
     let skew = ours.skew(&theirs);
@@ -123,7 +131,7 @@ pub fn check_writing_run(
     Err(format!(
         "{bin}: refusing a writing run: this process's belief modes differ from the API's at \
          {api_base} (SPEC §10.2, gate G0):\n{}\n\
-         Start this run with the server's modes, or run with --dry-run.",
+         Start this run with the server's modes, or run with --dry-run.{typos}",
         lines.join("\n")
     ))
 }
@@ -138,6 +146,12 @@ pub fn check_writing_run(
 /// The refusal text; the caller prints it and exits with
 /// [`MODE_CHECK_REFUSED_EXIT`].
 pub async fn enforce(bin: &str, intent: RunIntent, allow_skew: bool) -> Result<(), String> {
+    // Every run reports a typo'd flag of its own, dry runs included: a CLI bin
+    // may install no log subscriber, so stderr is where the operator sees it.
+    let unrecognised = epigraph_engine::belief_modes::unrecognised();
+    for flag in unrecognised {
+        eprintln!("WARNING: {bin}: belief-mode flag ignored: {flag}");
+    }
     if intent == RunIntent::WritesNothing {
         return Ok(());
     }
@@ -147,7 +161,7 @@ pub async fn enforce(bin: &str, intent: RunIntent, allow_skew: bool) -> Result<(
     );
     let server = fetch_server_modes(&reqwest::Client::new(), &api_base).await;
     let ours = epigraph_engine::belief_modes::current();
-    match check_writing_run(bin, ours, server, &api_base) {
+    match check_writing_run(bin, ours, unrecognised, server, &api_base) {
         Ok(()) => Ok(()),
         Err(refusal) if allow_skew => {
             eprintln!("WARNING: --allow-mode-skew: proceeding despite:\n{refusal}");
@@ -175,7 +189,7 @@ mod tests {
     fn matching_modes_pass_and_any_difference_refuses_naming_every_differing_mode() {
         let server = BeliefModes::default();
         assert_eq!(
-            check_writing_run("bin", &server, Ok(server), "http://api"),
+            check_writing_run("bin", &server, &[], Ok(server), "http://api"),
             Ok(())
         );
 
@@ -184,7 +198,7 @@ mod tests {
             compound_write_guard: CompoundWriteGuard::Refuse,
             ..server
         };
-        let refusal = check_writing_run("bin", &ours, Ok(server), "http://api").unwrap_err();
+        let refusal = check_writing_run("bin", &ours, &[], Ok(server), "http://api").unwrap_err();
         for needle in [
             "atom_fold",
             "aef",
@@ -204,7 +218,7 @@ mod tests {
             bp_apply: BpApply::On,
             ..server
         };
-        assert!(check_writing_run("bin", &only_bp, Ok(server), "http://api").is_err());
+        assert!(check_writing_run("bin", &only_bp, &[], Ok(server), "http://api").is_err());
     }
 
     #[test]
@@ -213,12 +227,55 @@ mod tests {
         let refusal = check_writing_run(
             "bin",
             &ours,
+            &[],
             Err("GET http://api/health failed: connection refused".into()),
             "http://api",
         )
         .unwrap_err();
         assert!(refusal.contains("belief_modes"), "{refusal}");
         assert!(refusal.contains("connection refused"), "{refusal}");
+    }
+
+    /// A typo'd flag of this process is named in either refusal, with the
+    /// value as typed and the default it fell back to; a matching run is not
+    /// refused because of it.
+    #[test]
+    fn a_refusal_names_every_unrecognised_flag_of_this_process() {
+        let read = BeliefModes::from_lookup(|key| {
+            (key == AtomFold::ENV).then(|| "aef-standalone".to_string())
+        });
+        let server = BeliefModes {
+            atom_fold: AtomFold::AefStandalone,
+            ..BeliefModes::default()
+        };
+        for refusal in [
+            check_writing_run("bin", &read.modes, &read.unrecognised, Ok(server), "http://api")
+                .unwrap_err(),
+            check_writing_run(
+                "bin",
+                &read.modes,
+                &read.unrecognised,
+                Err("unreachable".into()),
+                "http://api",
+            )
+            .unwrap_err(),
+        ] {
+            assert!(
+                refusal.contains("EPIGRAPH_ATOM_FOLD=\"aef-standalone\"")
+                    && refusal.contains("runs legacy"),
+                "{refusal}"
+            );
+        }
+        assert_eq!(
+            check_writing_run(
+                "bin",
+                &read.modes,
+                &read.unrecognised,
+                Ok(BeliefModes::default()),
+                "http://api"
+            ),
+            Ok(())
+        );
     }
 
     #[test]
