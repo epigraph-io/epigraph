@@ -379,6 +379,36 @@ async fn a_manual_cycle_terminates_and_yields_no_duplicates(pool: PgPool) {
     assert_eq!(got[&l], ClaimRole::Atom);
 }
 
+/// A rootless cycle has no root, stamped or not, so a workflow stamp INSIDE
+/// one exempts nothing: `C -> D -> C` with C stamped `source_type: workflow`
+/// and `D -> leaf` is an ordinary pair of compounds over an atom. (The
+/// "every root is stamped" rule alone would pass a cycle, which reaches no
+/// unstamped root; the stamped node must itself be a root.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_stamp_inside_a_rootless_cycle_exempts_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+    let c = claim_with(
+        &pool,
+        &s,
+        "workflow-stamped cycle node",
+        serde_json::json!({"source_type": "workflow", "level": 0}),
+    )
+    .await;
+    let d = claim(&pool, &s, "unstamped cycle node").await;
+    let leaf = claim(&pool, &s, "leaf under the stamped cycle").await;
+    decomposes_to(&pool, c, d).await;
+    decomposes_to(&pool, d, c).await;
+    decomposes_to(&pool, d, leaf).await;
+
+    let ids = [c, d, leaf];
+    let got = roles(&pool, &viewer, &ids).await;
+    assert_eq!(got[&c], ClaimRole::Compound { spine: true }, "level 0");
+    assert_eq!(got[&d], ClaimRole::Compound { spine: false });
+    assert_eq!(got[&leaf], ClaimRole::Atom);
+    assert_one_spelling(&pool, &ids).await;
+}
+
 /// The walk stops at 6 hops: in a chain `n0 -> n1 -> ... -> n6 -> leaf`, the
 /// leaf is 7 hops below n0 and 6 below n1. n1 finds it; n0 finds nothing
 /// (n6 still has a child, so it is not a leaf either).
