@@ -658,7 +658,17 @@ async fn perspective_belief_for_claim(
 /// or rule claim, or a claim the viewer cannot see, has none.
 ///
 /// The shadow never changes or fails the served read: a computation error is
-/// logged and the view omitted.
+/// logged and the view omitted. It is always the `binary_truth` value under
+/// the global lens, whatever frame or lens the served read used.
+///
+/// **Known gap, carried from the atom reader** (`atom_axiom`'s module doc):
+/// on an application session row security can hide a compound's whole
+/// decomposition from a viewer; the role read then finds no compound, so that
+/// compound's own rows fold as an atom's and its frozen cache can be read as a
+/// `Legacy` leaf. The derivation is exact on a connection that bypasses row
+/// security. Per-request reads close this before any mode serves derived
+/// values (the read-dispatch PR fails closed or reads roles with definer
+/// rights); the shadow, off by default, is diagnostic only until then.
 pub async fn shadow_belief(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
