@@ -22,6 +22,7 @@ pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
+pub mod belief_modes;
 pub mod belief_query;
 pub mod bp;
 pub mod calibration;
