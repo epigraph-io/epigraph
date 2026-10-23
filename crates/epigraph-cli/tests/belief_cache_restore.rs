@@ -225,7 +225,11 @@ async fn a_restore_never_undoes_a_later_write_in_any_cache_column(pool: PgPool) 
             2 => {
                 let (b, p) = (c.belief.unwrap(), c.plausibility.unwrap());
                 let mid = (b + p) / 2.0;
-                c.pignistic_prob = Some(if c.pignistic_prob == Some(mid) { b } else { mid });
+                c.pignistic_prob = Some(if c.pignistic_prob == Some(mid) {
+                    b
+                } else {
+                    mid
+                });
             }
             3 => c.mass_on_empty = Some(c.mass_on_empty.unwrap() + 0.5),
             4 => c.mass_on_missing = Some(c.mass_on_missing.unwrap() + 0.5),
@@ -238,9 +242,7 @@ async fn a_restore_never_undoes_a_later_write_in_any_cache_column(pool: PgPool) 
     }
 
     let plan = plan_restore(&records, None);
-    let report = restore_wave(&pool, &plan, &opts(2))
-        .await
-        .expect("restore");
+    let report = restore_wave(&pool, &plan, &opts(2)).await.expect("restore");
 
     for (k, &id) in ids.iter().enumerate() {
         let now = cache_of(&pool, id).await;
@@ -250,7 +252,10 @@ async fn a_restore_never_undoes_a_later_write_in_any_cache_column(pool: PgPool) 
                 "claim with a later write to cache column #{k} was overwritten by the restore"
             );
         } else {
-            assert_eq!(now, befores[&id], "untouched control claim {k} was not restored");
+            assert_eq!(
+                now, befores[&id],
+                "untouched control claim {k} was not restored"
+            );
         }
     }
     assert_eq!(
@@ -287,7 +292,11 @@ async fn a_second_restore_writes_no_row_and_reports_already_restored(pool: PgPoo
     let plan = plan_restore(&records, None);
 
     let first = restore_wave(&pool, &plan, &opts(2)).await.expect("first");
-    assert_eq!(set_of(&first.restored), set_of(&ids), "first run restores all");
+    assert_eq!(
+        set_of(&first.restored),
+        set_of(&ids),
+        "first run restores all"
+    );
 
     let mut versions = HashMap::new();
     for &id in &ids {
@@ -389,10 +398,16 @@ async fn null_to_value_to_restore_round_trips_bit_for_bit(pool: PgPool) {
         befores.insert(id, cache_of(&pool, id).await);
         ids.push(id);
     }
-    assert_eq!(befores[&ids[0]], null_cache, "claim 0 really starts all-NULL");
+    assert_eq!(
+        befores[&ids[0]], null_cache,
+        "claim 0 really starts all-NULL"
+    );
 
     let at = db_now(&pool).await;
-    let records = run_wave(&pool, &ids, at, |_| random_cache(&mut rng, Some(frame), None)).await;
+    let records = run_wave(&pool, &ids, at, |_| {
+        random_cache(&mut rng, Some(frame), None)
+    })
+    .await;
     assert!(
         records.iter().all(|r| r.written.classification.is_none()),
         "fixture: the wave leaves classification NULL"
@@ -401,7 +416,11 @@ async fn null_to_value_to_restore_round_trips_bit_for_bit(pool: PgPool) {
     let report = restore_wave(&pool, &plan_restore(&records, None), &opts(5))
         .await
         .expect("restore");
-    assert_eq!(set_of(&report.restored), set_of(&ids), "every claim restored");
+    assert_eq!(
+        set_of(&report.restored),
+        set_of(&ids),
+        "every claim restored"
+    );
 
     for &id in &ids {
         let now = cache_of(&pool, id).await;
@@ -446,7 +465,12 @@ fn the_wave_file_preserves_every_float_bit() {
                 || float_bits(&s.written) != float_bits(&g.written)
         })
         .count();
-    assert_eq!(lossy, 0, "{lossy} of {} records changed a float bit", sent.len());
+    assert_eq!(
+        lossy,
+        0,
+        "{lossy} of {} records changed a float bit",
+        sent.len()
+    );
 }
 
 /// A non-finite value has no JSON number; writing it must fail rather than
@@ -507,9 +531,14 @@ async fn downstream_lists_exactly_the_edges_a_wave_claim_sourced_after_its_write
 
     let t0: DateTime<Utc> = "2031-03-01T12:00:00Z".parse().unwrap();
     let h = Duration::hours(1);
-    let mut rec_a = run_wave(&pool, &[a], t0, |_| random_cache(&mut rng, Some(frame), None)).await;
-    let mut rec_b =
-        run_wave(&pool, &[b], t0 + h * 2, |_| random_cache(&mut rng, Some(frame), None)).await;
+    let mut rec_a = run_wave(&pool, &[a], t0, |_| {
+        random_cache(&mut rng, Some(frame), None)
+    })
+    .await;
+    let mut rec_b = run_wave(&pool, &[b], t0 + h * 2, |_| {
+        random_cache(&mut rng, Some(frame), None)
+    })
+    .await;
     rec_a.append(&mut rec_b);
 
     let after_a = seed_edge(&pool, a, targets[0], t0 + h).await;
@@ -546,7 +575,12 @@ async fn the_snapshot_holds_every_current_claim_once_across_pages_bit_for_bit(po
     for i in 0..7 {
         let id = seed_claim(&pool, agent).await;
         if i % 3 != 0 {
-            set_cache(&pool, id, &random_cache(&mut rng, Some(frame), Some("supported"))).await;
+            set_cache(
+                &pool,
+                id,
+                &random_cache(&mut rng, Some(frame), Some("supported")),
+            )
+            .await;
         }
         seeded.insert(id, cache_of(&pool, id).await);
     }
@@ -575,11 +609,18 @@ async fn the_snapshot_holds_every_current_claim_once_across_pages_bit_for_bit(po
     .expect("snapshot");
     let rows = read_snapshot(file.as_slice()).expect("read snapshot");
 
-    assert_eq!(rows.len() as i64, current_total, "one line per current claim");
+    assert_eq!(
+        rows.len() as i64,
+        current_total,
+        "one line per current claim"
+    );
     assert_eq!(summary.rows as usize, rows.len());
     let ids: HashSet<Uuid> = rows.iter().map(|r| r.claim_id).collect();
     assert_eq!(ids.len(), rows.len(), "no claim appears twice");
-    assert!(!ids.contains(&superseded), "a superseded claim is not current");
+    assert!(
+        !ids.contains(&superseded),
+        "a superseded claim is not current"
+    );
     for r in &rows {
         if let Some(want) = seeded.get(&r.claim_id) {
             let got = r.cache();
@@ -666,7 +707,10 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
     let c = by_id[&chained];
     assert_eq!(c.before, cache_at(0.1));
     assert_eq!(c.written, cache_at(0.25));
-    assert_eq!(c.at, t, "the earliest write time bounds the downstream list");
+    assert_eq!(
+        c.at, t,
+        "the earliest write time bounds the downstream list"
+    );
     assert_eq!(by_id[&single].before, cache_at(0.6));
     assert!(!by_id.contains_key(&broken));
     assert_eq!(plan.broken_chain, vec![broken]);
@@ -674,7 +718,11 @@ fn a_claim_recorded_twice_chains_or_is_held_back() {
     let only = set_of(&[single, wanted_absent]);
     let filtered = plan_restore(&records, Some(&only));
     assert_eq!(
-        filtered.entries.iter().map(|e| e.claim_id).collect::<Vec<_>>(),
+        filtered
+            .entries
+            .iter()
+            .map(|e| e.claim_id)
+            .collect::<Vec<_>>(),
         vec![single]
     );
     assert_eq!(filtered.not_in_wave, vec![wanted_absent]);

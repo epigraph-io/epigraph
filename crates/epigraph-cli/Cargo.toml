@@ -21,6 +21,18 @@ name = "recompute_betp"
 path = "src/bin/recompute_betp.rs"
 required-features = ["db"]
 
+# SPEC §10.8 snapshot tooling: the belief-cache snapshot and its
+# compare-and-swap restore. Both run on the maintenance connection.
+[[bin]]
+name = "belief_snapshot"
+path = "src/bin/belief_snapshot.rs"
+required-features = ["db"]
+
+[[bin]]
+name = "restore_belief_cache"
+path = "src/bin/restore_belief_cache.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
@@ -138,6 +150,11 @@ required-features = ["db"]
 [[test]]
 name = "belief_cache_restore"
 path = "tests/belief_cache_restore.rs"
+required-features = ["db"]
+
+[[test]]
+name = "belief_cache_bins"
+path = "tests/belief_cache_bins.rs"
 required-features = ["db"]
 
 # Runs most of this crate's `db`-gated binaries' `--help`; without `db` their

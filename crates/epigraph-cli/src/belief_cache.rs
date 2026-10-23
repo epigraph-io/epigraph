@@ -1,8 +1,29 @@
 //! Belief-cache snapshot and compare-and-swap (CAS) restore (SPEC §10.8).
 //!
-//! SKELETON: the types and signatures the red tests pin. The bodies are the
-//! naive versions (plain serde floats, one snapshot page, an unconditional
-//! overwrite, no downstream list); the implementation commits replace them.
+//! Three files, all JSON lines, all bit-exact for the cache floats:
+//!
+//! * **snapshot** ([`SnapshotRow`], written by [`write_snapshot`], the
+//!   `belief_snapshot` binary): every current claim's cache columns at one
+//!   point in time. Snapshot S0 is the baseline each wave's drift report is
+//!   measured from.
+//! * **wave file** ([`WaveRecord`], appended by a writing run with
+//!   [`write_wave_record`]): per claim, the cache the run found (`before`),
+//!   what it wrote (`written`), the wave's name and when (`at`). A writer
+//!   should stamp `at` from the DATABASE clock after its write, because
+//!   [`downstream_edges`] compares it with `edges.created_at`.
+//! * **restore outputs** (the `restore_belief_cache` binary): per-claim
+//!   outcomes, and the downstream edges to re-wire.
+//!
+//! The restore puts `before` back only where the row still holds exactly
+//! `written` ([`restore_wave`]); everything else is reported, never
+//! overwritten. It restores `claims.*` only: per-frame `ds_combined_beliefs`
+//! rows, edge-factor BBAs and anything downstream are the follow-up re-wire's
+//! (SPEC §10.8, "only with the follow-up re-wire").
+//!
+//! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
+//! reason as `recompute_betp`'s: it is an operator binary's corpus-wide
+//! maintenance statement on the maintenance connection, with no request path
+//! and no viewer.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -196,6 +217,19 @@ pub struct SnapshotSummary {
     pub snapshot_at: DateTime<Utc>,
 }
 
+/// `(id, belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing,
+/// belief_frame_id, classification)`.
+type CacheTuple = (
+    Uuid,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<Uuid>,
+    Option<String>,
+);
+
 /// Read the cache columns of `ids`. Absent claims are absent from the map.
 ///
 /// # Errors
@@ -204,16 +238,7 @@ pub async fn read_cache_columns<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     ids: &[Uuid],
 ) -> anyhow::Result<HashMap<Uuid, CacheColumns>> {
-    let rows: Vec<(
-        Uuid,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<Uuid>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let rows: Vec<CacheTuple> = sqlx::query_as(
         "SELECT id, belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, \
                 belief_frame_id, classification \
            FROM claims WHERE id = ANY($1)",
@@ -256,12 +281,12 @@ pub fn write_wave_record<W: Write>(out: &mut W, rec: &WaveRecord) -> anyhow::Res
 /// I/O failure or a malformed line.
 pub fn read_wave<R: BufRead>(input: R) -> anyhow::Result<Vec<WaveRecord>> {
     let mut out = Vec::new();
-    for line in input.lines() {
+    for (i, line) in input.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str(&line)?);
+        out.push(serde_json::from_str(&line).map_err(|e| anyhow::anyhow!("line {}: {e}", i + 1))?);
     }
     Ok(out)
 }
@@ -272,12 +297,32 @@ pub fn read_wave<R: BufRead>(input: R) -> anyhow::Result<Vec<WaveRecord>> {
 /// I/O failure or a malformed line.
 pub fn read_snapshot<R: BufRead>(input: R) -> anyhow::Result<Vec<SnapshotRow>> {
     let mut out = Vec::new();
-    for line in input.lines() {
+    for (i, line) in input.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str(&line)?);
+        out.push(serde_json::from_str(&line).map_err(|e| anyhow::anyhow!("line {}: {e}", i + 1))?);
+    }
+    Ok(out)
+}
+
+/// Parse a `--claims` file: one claim id per line; blank lines and lines
+/// starting with `#` are ignored.
+///
+/// # Errors
+/// I/O failure, or a line that is not a UUID (with its line number).
+pub fn read_claim_ids<R: BufRead>(input: R) -> anyhow::Result<HashSet<Uuid>> {
+    let mut out = HashSet::new();
+    for (i, line) in input.lines().enumerate() {
+        let line = line?;
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let id = Uuid::parse_str(t)
+            .map_err(|e| anyhow::anyhow!("--claims line {}: not a claim id: {e}", i + 1))?;
+        out.insert(id);
     }
     Ok(out)
 }
@@ -380,7 +425,10 @@ fn bind_wave_rows<'q>(
     q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     chunk: &[RestoreEntry],
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    fn floats(chunk: &[RestoreEntry], f: impl Fn(&RestoreEntry) -> Option<f64>) -> Vec<Option<f64>> {
+    fn floats(
+        chunk: &[RestoreEntry],
+        f: impl Fn(&RestoreEntry) -> Option<f64>,
+    ) -> Vec<Option<f64>> {
         chunk.iter().map(f).collect()
     }
     let mut q = q.bind(chunk.iter().map(|e| e.claim_id).collect::<Vec<_>>());
