@@ -480,6 +480,10 @@ fn prepare<A: Ord + Clone>(query: &[Lit<A>], items: &[Item<A>]) -> Result<Prepar
 /// Settle a state carrying `not_all`: drop the flag once a literal is
 /// contradicted, turn it into ⊥ once every literal holds, and resolve it
 /// when exactly one literal is still open (that literal must fail).
+///
+/// A flagged state never holds O: the valuation starts every open position
+/// at Θ (touched), and Θ ∧ O = ⊥. So an open literal here is `*` or Θ, and
+/// forcing it to fail is always a meet, never a clash.
 fn settle(p: &Prepared, state: u64) -> Option<u64> {
     if state & NOT_ALL == 0 {
         return Some(state);
@@ -498,15 +502,7 @@ fn settle(p: &Prepared, state: u64) -> Option<u64> {
     }
     match (open_count, open_pos) {
         (0, _) => None,
-        (1, Some(pos)) => {
-            // The valuation is a closed-world set on L's atoms, so it meets
-            // O as ⊥; elsewhere the open literal is forced to fail.
-            if get(state, pos) == LO {
-                None
-            } else {
-                Some(put(state, pos, Prepared::fails(p.holds[pos])) & !NOT_ALL)
-            }
-        }
+        (1, Some(pos)) => Some(put(state, pos, Prepared::fails(p.holds[pos])) & !NOT_ALL),
         _ => Some(state),
     }
 }
