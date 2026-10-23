@@ -8,9 +8,11 @@
 //! - the served atom fold (`combination::dempster_combine` + `measures`), for
 //!   single-leaf queries (marginal consistency);
 //! - a brute-force oracle over explicit world sets, in which each atom takes
-//!   one of T, F or "outside the frame" (X). Focal sets are intersected as
-//!   sets, and Bel / Pl / Dis / Bel(OR) are subset or overlap tests. The
-//!   oracle never sees the DP's meet table;
+//!   one of T, F or "outside the frame" (X). It builds each item's focal sets
+//!   itself, from the raw per-atom masses and the quantile rule as the SPEC
+//!   states it (`spec_focals`), never through `Item::focal_elements`. Focal
+//!   sets are intersected as sets, and Bel / Pl / Dis / Bel(OR) are subset or
+//!   overlap tests. The oracle never sees the DP's meet table;
 //! - a closed-world 2ⁿ oracle for the product-frame `BetP` (standard
 //!   pignistic transform over complete assignments);
 //! - structural laws: independence (disjoint items factor), comonotone
@@ -169,16 +171,15 @@ struct Clause {
     positions: Vec<usize>,
 }
 
-fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle {
+fn oracle(query: &[Lit<u32>], raws: &[Raw], clauses: &[Clause]) -> Oracle {
     let n = query.len();
     let atoms: Vec<u32> = query.iter().map(|l| l.atom).collect();
     let mut bodies: Vec<Vec<(f64, Worlds)>> = Vec::new();
-    for item in items {
-        let fs: Vec<(f64, Worlds)> = item
-            .focal_elements()
+    for raw in raws {
+        let fs: Vec<(f64, Worlds)> = spec_focals(raw)
             .into_iter()
-            .filter(|f| f.letters.iter().any(|(a, _)| atoms.contains(a)))
-            .map(|f| (f.mass, focal_worlds(n, &atoms, &f.letters)))
+            .filter(|(_, letters)| letters.iter().any(|(a, _)| atoms.contains(a)))
+            .map(|(mass, letters)| (mass, focal_worlds(n, &atoms, &letters)))
             .collect();
         // An item that never touches the query is vacuous on it.
         if !fs.is_empty() {
@@ -294,7 +295,7 @@ fn oracle(query: &[Lit<u32>], items: &[Item<u32>], clauses: &[Clause]) -> Oracle
 /// returning (Bel, Pl, `BetP`, K) with `BetP` the pignistic share of the target world.
 fn closed_world_oracle(
     query: &[Lit<u32>],
-    items: &[Item<u32>],
+    raws: &[Raw],
     clauses: &[Clause],
 ) -> (f64, f64, f64, f64) {
     let n = query.len();
@@ -307,21 +308,20 @@ fn closed_world_oracle(
             .fold(0u64, |s, w| s | (1 << w))
     };
     let mut bodies: Vec<Vec<(f64, u64)>> = Vec::new();
-    for item in items {
-        let fs: Vec<(f64, u64)> = item
-            .focal_elements()
+    for raw in raws {
+        let fs: Vec<(f64, u64)> = spec_focals(raw)
             .into_iter()
-            .filter(|f| f.letters.iter().any(|(a, _)| atoms.contains(a)))
-            .map(|f| {
+            .filter(|(_, letters)| letters.iter().any(|(a, _)| atoms.contains(a)))
+            .map(|(mass, letters)| {
                 let set = mk(&|w| {
-                    (0..n).all(|p| match f.letters.iter().find(|(a, _)| *a == atoms[p]) {
+                    (0..n).all(|p| match letters.iter().find(|(a, _)| *a == atoms[p]) {
                         None | Some((_, Letter::Theta)) => true,
                         Some((_, Letter::T)) => bit(w, p) == 0,
                         Some((_, Letter::F)) => bit(w, p) == 1,
                         Some((_, Letter::O)) => panic!("closed-world oracle given `~` mass"),
                     })
                 });
-                (f.mass, set)
+                (mass, set)
             })
             .collect();
         if !fs.is_empty() {
@@ -403,6 +403,59 @@ fn build(raw: &Raw) -> Item<u32> {
         )
         .unwrap(),
         Raw::Mixed(a, t, f, o) => Item::mixed(*a, *t, *f, *o).unwrap(),
+    }
+}
+
+/// The focal elements of a raw item, built from the SPEC's statement of the
+/// coupling and not from `Item::focal_elements`: a mixed row is its own BBA
+/// {T t, F f, X o, Θ rest} on one atom; a coupled item draws one U on [0, 1]
+/// and says, on atom i, ℓᵢ for U < wᵢ, Θ for wᵢ ≤ U < 1 − oᵢ and "outside the
+/// frame" for U ≥ 1 − oᵢ. Each interval between consecutive breakpoints is one
+/// focal element (adjacent equal ones are not merged; the oracle does not care).
+fn spec_focals(raw: &Raw) -> Vec<(f64, Vec<(u32, Letter)>)> {
+    match raw {
+        Raw::Mixed(a, t, f, o) => [
+            (*t, Letter::T),
+            (*f, Letter::F),
+            (*o, Letter::O),
+            (1.0 - t - f - o, Letter::Theta),
+        ]
+        .into_iter()
+        .filter(|(m, _)| *m > 0.0)
+        .map(|(m, l)| (m, vec![(*a, l)]))
+        .collect(),
+        Raw::Coupled(es) => {
+            let mut cuts = vec![0.0, 1.0];
+            for (_, _, w, o) in es {
+                cuts.extend([*w, 1.0 - o]);
+            }
+            cuts.sort_by(f64::total_cmp);
+            cuts.dedup();
+            cuts.windows(2)
+                .filter(|c| c[1] > c[0])
+                .map(|c| {
+                    let u = 0.5 * (c[0] + c[1]);
+                    let letters = es
+                        .iter()
+                        .map(|(a, positive, w, o)| {
+                            let l = if u < *w {
+                                if *positive {
+                                    Letter::T
+                                } else {
+                                    Letter::F
+                                }
+                            } else if u < 1.0 - o {
+                                Letter::Theta
+                            } else {
+                                Letter::O
+                            };
+                            (*a, l)
+                        })
+                        .collect();
+                    (c[1] - c[0], letters)
+                })
+                .collect()
+        }
     }
 }
 
@@ -690,6 +743,40 @@ fn reference_case_counts_a_shared_paper_once() {
 }
 
 // ---------------------------------------------------------------------------
+// The coupling's joint structure with unequal `~` across atoms
+// ---------------------------------------------------------------------------
+
+/// Hand derivation of the quantile rule for one item that gives its two atoms
+/// different open-world weights: a {T .6, `~` .3}, b {T .2, `~` .5}. With U
+/// cut at .2, .5, .6, .7 its focal elements are (T,T) .2, (T,Θ) .3, (T,O) .1,
+/// (Θ,O) .1 and (O,O) .3.
+///
+/// - Alone: Bel .2, Pl .5 (no O on either atom), NR 1, Bel(∨) .6, K 0.
+/// - With an independent b {T .5}: every O state on b meets T or Θ on b as
+///   ⊥ (K .5); the survivors are (T,T) .35 and (T,Θ) .15, so Bel .7, Pl 1.
+/// - With an independent a {F .5} instead: K .6; the survivors are (T,T) .1,
+///   (T,Θ) .15, (T,O) .05, (F,O) .05 and (Θ,O) .05 over .4, so Bel .25,
+///   Pl .625, NR .875, Bel(∨) .75.
+#[test]
+fn coupling_with_unequal_open_world_matches_hand_derivation() {
+    let coupled = Item::new(vec![(Lit::pos(0u32), 0.6, 0.3), (Lit::pos(1u32), 0.2, 0.5)]).unwrap();
+    let q = positives(2);
+    let check = |items: &[Item<u32>], bel: f64, pl: f64, nr: f64, bel_or: f64, k: f64| {
+        let r = conj_belief(&q, items, 0.0).unwrap();
+        assert!(close(r.bel, bel), "bel {} vs {bel}", r.bel);
+        assert!(close(r.pl, pl), "pl {} vs {pl}", r.pl);
+        assert!(close(r.nr, nr), "nr {} vs {nr}", r.nr);
+        assert!(close(r.bel_or, bel_or), "bel_or {} vs {bel_or}", r.bel_or);
+        assert!(close(r.k, k), "k {} vs {k}", r.k);
+    };
+    check(std::slice::from_ref(&coupled), 0.2, 0.5, 1.0, 0.6, 0.0);
+    let b_support = Item::new(vec![(Lit::pos(1u32), 0.5, 0.0)]).unwrap();
+    check(&[coupled.clone(), b_support], 0.7, 1.0, 1.0, 1.0, 0.5);
+    let a_refute = Item::new(vec![(Lit::neg(0u32), 0.5, 0.0)]).unwrap();
+    check(&[coupled, a_refute], 0.25, 0.625, 0.875, 0.75, 0.6);
+}
+
+// ---------------------------------------------------------------------------
 // OR is computed directly, never by De Morgan
 // ---------------------------------------------------------------------------
 
@@ -724,7 +811,7 @@ proptest! {
         let clauses = if m > 0.0 {
             vec![Clause { m, positions: (0..query.len()).collect() }]
         } else { vec![] };
-        let o = oracle(&query, &items, &clauses);
+        let o = oracle(&query, &raws, &clauses);
         prop_assume!(o.k < NEAR_TOTAL);
         let r = conj(&query, &items, m).expect("oracle says not total conflict");
         prop_assert!(r.exact);
@@ -749,7 +836,7 @@ proptest! {
         let clauses = if m > 0.0 {
             vec![Clause { m, positions: (0..query.len()).collect() }]
         } else { vec![] };
-        let o = oracle(&query, &items, &clauses);
+        let o = oracle(&query, &raws, &clauses);
         prop_assume!(o.k < NEAR_TOTAL);
         let r = conj(&query, &items, m).expect("oracle says not total conflict");
         let n = o.leaf_bel.len() as f64;
@@ -773,7 +860,7 @@ proptest! {
         let clauses = if m > 0.0 {
             vec![Clause { m, positions: (0..query.len()).collect() }]
         } else { vec![] };
-        let (bel, pl, betp, k) = closed_world_oracle(&query, &items, &clauses);
+        let (bel, pl, betp, k) = closed_world_oracle(&query, &raws, &clauses);
         prop_assume!(k < NEAR_TOTAL);
         let r = conj(&query, &items, m).expect("oracle says not total conflict");
         prop_assert!((r.bel - bel).abs() < 1e-9, "bel {} vs {}", r.bel, bel);
@@ -819,13 +906,13 @@ proptest! {
         let items: Vec<Item<u32>> = raws.iter().map(build).collect();
         let m = f64::from(m_milli) / 1000.0;
         let Some(base) = conj(&query, &items, 0.0) else { return Ok(()); };
-        let plain = oracle(&query, &items, &[]);
+        let plain = oracle(&query, &raws, &[]);
         let pair_bel = joint_bel(&query, &items, 0.0, &[0, 1]).unwrap();
         prop_assert!((pair_bel - plain.bel_first_two).abs() < 1e-9, "pair {} vs {}", pair_bel, plain.bel_first_two);
         let clauses = [Clause { m, positions: vec![0, 1] }];
-        let o = oracle(&query, &items, &clauses);
+        let o = oracle(&query, &raws, &clauses);
         prop_assume!(o.k < NEAR_TOTAL);
-        let (_, _, betp, _) = closed_world_oracle(&query, &items, &clauses);
+        let (_, _, betp, _) = closed_world_oracle(&query, &raws, &clauses);
         let cf = single_negative_sibling(&base, pair_bel, m).unwrap();
         prop_assert!((cf.bel - o.bel).abs() < 1e-9, "bel {} vs {}", cf.bel, o.bel);
         prop_assert!((cf.pl - o.pl).abs() < 1e-9, "pl {} vs {}", cf.pl, o.pl);
