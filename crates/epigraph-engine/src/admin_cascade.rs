@@ -80,7 +80,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use epigraph_db::repos::admin_cascade::{
-    self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_FAILED,
+    self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_BELIEF_IDS, EVENT_FAILED,
 };
 use epigraph_db::repos::match_candidate::RetirementOutcome;
 use epigraph_db::visibility::Viewer;
@@ -640,6 +640,11 @@ macro_rules! repair_with_audit {
 type BeliefAudit = (Option<Uuid>, Option<String>);
 
 /// Write the belief re-derivation's row after the applied repair (best-effort).
+///
+/// The row names the triggering principal, who can read it
+/// (`security_events_read`), so it carries [`belief_counts`]; the claim ids
+/// and error texts go to an agent-less [`EVENT_BELIEF_IDS`] row, committed
+/// with it in one transaction.
 async fn record_belief(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
@@ -648,22 +653,42 @@ async fn record_belief(
 ) -> BeliefAudit {
     let mut details = trigger.audit_details();
     details["applied_event_id"] = serde_json::json!(applied_event_id);
-    details["belief"] = serde_json::json!({
+    details["belief"] = belief_counts(report);
+    let full = serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
         "errors": report.errors,
     });
-    match audit::record(
-        &mut *admin,
-        EVENT_BELIEF,
-        trigger.agent_id,
-        report.errors.is_empty(),
-        &details,
-    )
-    .await
-    {
+    let written: Result<Uuid, String> = async {
+        let mut tx = sqlx::Acquire::begin(&mut *admin)
+            .await
+            .map_err(|e| e.to_string())?;
+        let id = audit::record(
+            &mut *tx,
+            EVENT_BELIEF,
+            trigger.agent_id,
+            report.errors.is_empty(),
+            &details,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let ids = serde_json::json!({
+            "cause": trigger.cause.as_str(),
+            "applied_event_id": applied_event_id,
+            "belief_event_id": id,
+            "subject_id": trigger.subject_id,
+            "belief": full,
+        });
+        audit::record(&mut *tx, EVENT_BELIEF_IDS, None, true, &ids)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+    .await;
+    match written {
         Ok(id) => (Some(id), None),
         Err(e) => {
             tracing::error!(

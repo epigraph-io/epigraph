@@ -1455,6 +1455,30 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
         );
     }
 
+    // Nor does any cascade row the CALLER can read: `security_events_read`
+    // admits the rows naming it (its deferral, the applied row, the belief
+    // row), so those carry counts and the ids live on agent-less rows.
+    let readable = cascade_rows_readable_by(&pool, agent).await;
+    assert!(
+        readable
+            .iter()
+            .any(|(t, _)| t == "cascade.belief_rederived"),
+        "the caller reads its own belief row: {readable:?}"
+    );
+    for (event_type, d) in &readable {
+        for (id, what) in [
+            (hp1, "H's private claim"),
+            (hp2, "H's private downstream claim"),
+            (into_old, "the private edge into the retired claim"),
+            (out_of_old, "the private edge out of it"),
+        ] {
+            assert!(
+                !mentions(d, id),
+                "a `{event_type}` row the caller can read names {what} ({id}): {d}"
+            );
+        }
+    }
+
     let (event, _, _) = applied_row(&pool, "supersede", f.old).await;
     let (_, ids) = applied_ids_row(&pool, event).await;
     let touched = &ids["touched"];
@@ -1462,22 +1486,23 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
         mentions(touched, into_old) && mentions(touched, out_of_old),
         "the agent-less companion row keeps the ids: {touched}"
     );
-    let belief: serde_json::Value = sqlx::query_scalar(
-        "SELECT details->'belief' FROM security_events \
-          WHERE event_type = 'cascade.belief_rederived' \
+    let (belief_owner, belief): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT agent_id, details->'belief' FROM security_events \
+          WHERE event_type = 'cascade.belief_rederived_ids' \
             AND details->>'applied_event_id' = $1::text",
     )
     .bind(event)
     .fetch_one(&pool)
     .await
-    .expect("belief row");
+    .expect("the belief row's agent-less companion");
+    assert_eq!(belief_owner, None, "the belief companion row is agent-less");
     assert!(
         mentions(&belief, t),
         "the downstream claim the caller can read was re-derived: {belief}"
     );
     assert!(
         mentions(&belief, hp2),
-        "the belief audit row keeps it: {belief}"
+        "the belief companion row keeps it: {belief}"
     );
 }
 

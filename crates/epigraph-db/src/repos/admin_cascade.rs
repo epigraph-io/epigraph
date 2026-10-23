@@ -66,6 +66,14 @@ pub const EVENT_FAILED: &str = "cascade.admin_failed";
 /// names that row in `details.applied_event_id`.
 pub const EVENT_BELIEF: &str = "cascade.belief_rederived";
 
+/// `security_events.event_type` of the row that keeps what an
+/// [`EVENT_BELIEF`] row counts: the claim ids the re-derivation targeted,
+/// recomputed and left unbacked, and its error texts, which can name claims
+/// the triggering principal cannot read. Agent-less for the same reason as
+/// [`EVENT_APPLIED_IDS`]; names the belief row in `details.belief_event_id`
+/// and the applied row in `details.applied_event_id`.
+pub const EVENT_BELIEF_IDS: &str = "cascade.belief_rederived_ids";
+
 /// `security_events.event_type` of a pending cascade an operator retired
 /// instead of replaying (its act was undone, say, so its repair can never
 /// verify). Written on the maintenance connection only.
