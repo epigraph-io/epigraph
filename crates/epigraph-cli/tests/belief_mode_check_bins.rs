@@ -24,6 +24,8 @@ mod fixture;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -48,12 +50,21 @@ fn legacy_modes() -> serde_json::Value {
 /// Serve `body` as the JSON answer to every request, forever, on a loopback
 /// port. Returns the base URL.
 fn fixture_health(body: serde_json::Value) -> String {
+    fixture_health_counted(body).0
+}
+
+/// [`fixture_health`], also returning how many connections it has accepted, so
+/// a test can show a run never contacted the API at all.
+fn fixture_health_counted(body: serde_json::Value) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fixture");
     let addr = listener.local_addr().expect("fixture address");
     let payload = body.to_string();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, Ordering::SeqCst);
             // Read the request head; the fixture answers every path alike.
             let mut buf = [0u8; 4096];
             let mut head = Vec::new();
@@ -72,7 +83,7 @@ fn fixture_health(body: serde_json::Value) -> String {
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), hits)
 }
 
 /// A `/health` body as the API returns it, with the given modes.
@@ -195,10 +206,15 @@ async fn belief_state(pool: &PgPool) -> (String, String, String) {
     )
 }
 
+/// The exit status of a mode-check refusal, which an operator script keys on
+/// to tell a refusal from a crash. A literal on purpose: the contract is the
+/// number, not whatever the constant says.
+const REFUSED: Option<i32> = Some(3);
+
 fn assert_refused_for_atom_fold(r: &Run, what: &str) {
-    assert!(
-        r.code.is_some_and(|c| c != 0),
-        "{what}: a writing run whose modes differ from the server's must exit non-zero; \
+    assert_eq!(
+        r.code, REFUSED,
+        "{what}: a writing run whose modes differ from the server's must exit 3; \
          got {:?}\nstdout: {}\nstderr: {}",
         r.code,
         r.stdout,
@@ -276,7 +292,9 @@ async fn matching_modes_let_the_same_writing_run_proceed_and_write(pool: PgPool)
 /// The wave-review shape (SPEC §10.3): the server still runs `legacy`
 /// and the bin is asked for the fold the server will flip to. The bin's own
 /// environment is ALSO skewed (`aef`), the worst case; a dry run is exempt
-/// all the same, and writes nothing.
+/// all the same, never contacts the API (so it runs on a host with no API),
+/// and writes nothing. This build has no AEF fold, so the preview must not
+/// print a per-claim row: those would be legacy numbers under an AEF label.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_nothing(
     pool: PgPool,
@@ -284,7 +302,7 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
     let hub = seed_stale_hub(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(legacy_modes()));
+    let (api, hits) = fixture_health_counted(health_with(legacy_modes()));
 
     let r = run(
         RECOMPUTE_BETP,
@@ -303,6 +321,21 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
         r.stdout,
         r.stderr
     );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a dry run must not contact the API"
+    );
+    assert!(
+        r.stdout.contains("cannot compute the aef fold"),
+        "an AEF preview must say this build cannot compute it\nstdout: {}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains(&hub.to_string()),
+        "an AEF preview must print no per-claim row (they would be legacy numbers)\nstdout: {}",
+        r.stdout
+    );
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
     assert_eq!(
         belief_state(&pool).await,
@@ -311,27 +344,62 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
     );
 }
 
+/// Control for the AEF preview above: the same seed under `--target-fold
+/// legacy` DOES print the hub's per-claim row, so the AEF test's "no row"
+/// check is not passing on an empty cohort. Also exempt, and also silent
+/// towards the API, with a skewed environment.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_the_api(
+    pool: PgPool,
+) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let (api, hits) = fixture_health_counted(health_with(legacy_modes()));
+
+    let r = run(
+        RECOMPUTE_BETP,
+        &["--dry-run", "--target-fold", "legacy"],
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef"),
+        ],
+    );
+
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a dry run must not contact the API"
+    );
+    assert!(
+        r.stdout.contains(&hub.to_string()),
+        "a legacy preview prints the hub's row\nstdout: {}",
+        r.stdout
+    );
+    assert_eq!(belief_state(&pool).await, before, "a dry run writes nothing");
+}
+
 /// The check fails CLOSED: a writing run that cannot read the server's modes
 /// (nothing listening) does not proceed on the assumption that they agree.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_writing_run_refuses_when_the_server_modes_cannot_be_read(pool: PgPool) {
     let hub = seed_stale_hub(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    // A port that was free a moment ago and has no listener now.
-    let dead = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
-    };
+    // Port 1 is privileged and unbound: nothing a parallel test binds can
+    // land on it, unlike a just-released ephemeral port.
+    let dead = "http://127.0.0.1:1";
 
     let r = run(
         RECOMPUTE_BETP,
         &[],
-        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &dead)],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", dead)],
     );
 
-    assert!(
-        r.code.is_some_and(|c| c != 0),
-        "an unreachable API must refuse a writing run; got {:?}\nstderr: {}",
+    assert_eq!(
+        r.code, REFUSED,
+        "an unreachable API must refuse a writing run with exit 3; got {:?}\nstderr: {}",
         r.code,
         r.stderr
     );
@@ -361,9 +429,9 @@ async fn a_writing_run_refuses_a_server_that_does_not_report_belief_modes(pool: 
         &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
-    assert!(
-        r.code.is_some_and(|c| c != 0),
-        "a server without belief_modes must refuse a writing run; got {:?}\nstderr: {}",
+    assert_eq!(
+        r.code, REFUSED,
+        "a server without belief_modes must refuse a writing run with exit 3; got {:?}\nstderr: {}",
         r.code,
         r.stderr
     );
@@ -436,9 +504,52 @@ async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) 
 
 // ── backfill_factors and decompose_claims --retarget ───────────────────────
 
+/// A source with a cached interval `supports` a factorless target: exactly
+/// what `backfill_factors --phase edges` selects and wires, writing the
+/// target's first BBA. Returns the target.
+async fn seed_unwired_edge(pool: &PgPool) -> Uuid {
+    let author = seed_agent(pool).await;
+    let claim = |content: &'static str, interval: Option<(f64, f64)>| async move {
+        let (bel, pl) = interval.unzip();
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, belief, \
+                                 plausibility, pignistic_prob) \
+             VALUES ($1 || gen_random_uuid(), sha256(gen_random_uuid()::text::bytea), 0.5, $2, \
+                     $3, $4, $3) RETURNING id",
+        )
+        .bind(content)
+        .bind(author)
+        .bind(bel)
+        .bind(pl)
+        .fetch_one(pool)
+        .await
+        .expect("seed claim")
+    };
+    let source = claim("belief mode check edge source ", Some((0.8, 0.95))).await;
+    let target = claim("belief mode check edge target ", None).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports')",
+    )
+    .bind(source)
+    .bind(target)
+    .execute(pool)
+    .await
+    .expect("seed edge");
+    target
+}
+
+async fn bba_rows(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count BBA rows")
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn backfill_factors_refuses_a_writing_run_on_mode_skew(pool: PgPool) {
-    let _hub = seed_stale_hub(&pool).await;
+    let target = seed_unwired_edge(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
     let api = fixture_health(health_with(legacy_modes()));
@@ -454,11 +565,68 @@ async fn backfill_factors_refuses_a_writing_run_on_mode_skew(pool: PgPool) {
     );
 
     assert_refused_for_atom_fold(&r, "backfill_factors");
+    assert_eq!(bba_rows(&pool, target).await, 0, "the edge was not wired");
     assert_eq!(
         belief_state(&pool).await,
         before,
         "a refused run writes nothing"
     );
+}
+
+/// Control for the backfill refusal above: the same run with matching modes
+/// wires the edge, so that refusal's "writes nothing" bites.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_with_matching_modes_wires_the_same_edge(pool: PgPool) {
+    let target = seed_unwired_edge(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &["--phase", "edges"],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        bba_rows(&pool, target).await,
+        1,
+        "a real edge phase wires the edge's factor onto the target\nstdout: {}",
+        r.stdout
+    );
+}
+
+/// `backfill_factors --dry-run` writes nothing, so it is exempt: a skewed
+/// environment proceeds, and the API is never contacted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_dry_run_is_exempt_and_never_contacts_the_api(pool: PgPool) {
+    let target = seed_unwired_edge(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let (api, hits) = fixture_health_counted(health_with(legacy_modes()));
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &["--phase", "edges", "--dry-run"],
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
+    );
+
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a dry run must not contact the API"
+    );
+    assert!(
+        r.stdout.contains(&target.to_string()),
+        "the dry run lists the edge it would wire\nstdout: {}",
+        r.stdout
+    );
+    assert_eq!(belief_state(&pool).await, before, "a dry run writes nothing");
 }
 
 /// `--retarget --apply-plan` writes edges through the API: a writing run. It
