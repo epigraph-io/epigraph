@@ -586,14 +586,17 @@ fn within_group_side(row_id: Uuid, m: &MassFunction) -> (ItemSide, f64) {
 ///
 /// An item spans every atom its key has rows on. Items never merge across
 /// keys, so the item a row belongs to depends only on its own key and masses,
-/// never on which other rows or atoms are in the query. Ties keep the first
-/// row; items and their atoms are in first-appearance order. Callers pass one
-/// 2-hypothesis frame per atom (the atom fold coarsens first).
+/// never on which other rows or atoms are in the query. Rows that tie on
+/// weight can differ in their other masses (`~` vs Θ), so the tie goes to the
+/// smaller `row_id`: the item's BBA is a function of the rows, never of the
+/// order a read returned them in. Items and their atoms are listed in
+/// first-appearance order. Callers pass one 2-hypothesis frame per atom (the
+/// atom fold coarsens first).
 #[must_use]
 pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
     let mut items: Vec<KeyedItem> = Vec::new();
-    // Per item, per atom (same order as `atoms`): the kept row's weight.
-    let mut weights: Vec<Vec<f64>> = Vec::new();
+    // Per item, per atom (same order as `atoms`): the kept row's weight and id.
+    let mut kept: Vec<Vec<(f64, Uuid)>> = Vec::new();
     let mut index: HashMap<ItemId, usize> = HashMap::new();
     for r in rows {
         let (side, w) = within_group_side(r.row_id, &r.bba);
@@ -603,18 +606,23 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
                 id,
                 atoms: Vec::new(),
             });
-            weights.push(Vec::new());
+            kept.push(Vec::new());
             items.len() - 1
         });
         let item = &mut items[i];
         match item.atoms.iter().position(|(a, _)| *a == r.atom_id) {
             None => {
                 item.atoms.push((r.atom_id, r.bba));
-                weights[i].push(w);
+                kept[i].push((w, r.row_id));
             }
-            Some(j) if w > weights[i][j] => {
+            // A larger weight wins; on a tie, the smaller row id.
+            Some(j)
+                if w.total_cmp(&kept[i][j].0)
+                    .then_with(|| kept[i][j].1.cmp(&r.row_id))
+                    .is_gt() =>
+            {
                 item.atoms[j].1 = r.bba;
-                weights[i][j] = w;
+                kept[i][j] = (w, r.row_id);
             }
             Some(_) => {}
         }
