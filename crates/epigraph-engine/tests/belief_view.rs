@@ -806,6 +806,62 @@ async fn a_refuting_edge_into_a_compound_is_its_not_all_valuation_per_viewer(poo
     );
 }
 
+// ── negative siblings ───────────────────────────────────────────────────────
+
+/// SPEC §3.3 "One negative sibling edge" and the design note's negative-edge
+/// variant: two independent .8 leaves (R-DEP Bel .64, Pl 1) with a1
+/// contradicts a2 (m .9). The edge's own frozen BBA on a2 is dropped and the
+/// pair meets the closed form once: K' = .576, Bel .64·.1/.424 = .151,
+/// Pl .1/.424 = .236. Two negative siblings have no closed form: the value is
+/// the Fréchet envelope (floor .8·3 − 2 = .4, where R-DEP would give .512),
+/// labelled internally contested.
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_negative_sibling_uses_the_closed_form_and_two_serve_the_envelope(pool: PgPool) {
+    let author = agent(&pool).await;
+    let k = claim(&pool, author, "K").await;
+    let (a1, a2) = (
+        claim(&pool, author, "a1").await,
+        claim(&pool, author, "a2").await,
+    );
+    decompose(&pool, k, a1).await;
+    decompose(&pool, k, a2).await;
+    support(&pool, a1, 0.8).await;
+    support(&pool, a2, 0.8).await;
+    let e = edge(&pool, a1, a2, "contradicts").await;
+    // The frozen edge-factor BBA the edge wired onto its target.
+    store_edge_factor(&pool, e, a2, serde_json::json!({"1": 0.72, "0,1": 0.28})).await;
+
+    let v = derive(&pool, k).await;
+    assert!(near(v.bel, 0.151, 5e-4), "Bel must be .151, got {}", v.bel);
+    assert!(near(v.pl, 0.236, 5e-4), "Pl must be .236, got {}", v.pl);
+    assert!(!v.derived.as_ref().expect("derived").internally_contested);
+
+    let k2 = claim(&pool, author, "K2").await;
+    let (b1, b2, b3) = (
+        claim(&pool, author, "b1").await,
+        claim(&pool, author, "b2").await,
+        claim(&pool, author, "b3").await,
+    );
+    for b in [b1, b2, b3] {
+        decompose(&pool, k2, b).await;
+        support(&pool, b, 0.8).await;
+    }
+    edge(&pool, b1, b2, "contradicts").await;
+    edge(&pool, b2, b3, "refutes").await;
+    let v2 = derive(&pool, k2).await;
+    let d2 = v2.derived.as_ref().expect("derived");
+    assert!(
+        d2.internally_contested,
+        "two negative siblings are contested"
+    );
+    assert!(
+        near(v2.bel, 0.4, 1e-9) && near(v2.pl, 1.0, 1e-9),
+        "two siblings serve the envelope [.4, 1], got Bel {} Pl {}",
+        v2.bel,
+        v2.pl
+    );
+}
+
 // ── (7) lens ────────────────────────────────────────────────────────────────
 
 /// Plan test (7). A single-leaf compound under a lens equals the leaf's own
