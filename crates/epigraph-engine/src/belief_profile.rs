@@ -603,11 +603,11 @@ impl BeliefProfile {
                 // every evidence type the perspective names (a weight, or
                 // `null` to remove one) leaves that map and is answered by
                 // the merged table. Only on success: a rejected tier changes
-                // nothing.
+                // nothing. Exact key match: the frame map's keys are
+                // lowercase and the fold looks the table up lowercased, so a
+                // mis-cased perspective key is inert in both places.
                 for key in named_evidence_type_weights(o) {
-                    q.lens
-                        .frame_evidence_type_weights
-                        .remove(&key.to_lowercase());
+                    q.lens.frame_evidence_type_weights.remove(key);
                 }
                 p = q;
             }
