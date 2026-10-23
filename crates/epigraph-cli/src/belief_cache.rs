@@ -559,43 +559,86 @@ pub async fn downstream_edges(
     Ok(out)
 }
 
-/// Write every claim's cache columns as JSON lines.
+type SnapshotTuple = (
+    Uuid,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<Uuid>,
+    Option<String>,
+    DateTime<Utc>,
+);
+
+/// Write every current claim's cache columns as JSON lines (SPEC §10.8; the
+/// O3a snapshot S0 that every wave's drift report is measured from).
+///
+/// The whole export is ONE `REPEATABLE READ, READ ONLY` transaction, paged by
+/// keyset on `id` (`opts.page_size` rows per round trip, so memory stays
+/// bounded): every page sees the same database state, so a claim written
+/// while the export runs is recorded either entirely before or not at all,
+/// and no claim is skipped or repeated at a page boundary. `snapshot_at` is
+/// that state's transaction time. Superseded claims are included only with
+/// `include_superseded`.
 ///
 /// # Errors
-/// Any database or I/O error.
+/// Any database or I/O error. Rows already written to `out` stay written; the
+/// binary writes to a temporary path and renames only on success.
 pub async fn write_snapshot<W: Write>(
     pool: &PgPool,
     out: &mut W,
     opts: &SnapshotOptions,
 ) -> anyhow::Result<SnapshotSummary> {
-    let snapshot_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(pool).await?;
-    let rows: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, updated_at FROM claims WHERE ($1 OR is_current) ORDER BY id LIMIT $2",
-    )
-    .bind(opts.include_superseded)
-    .bind(opts.page_size)
-    .fetch_all(pool)
-    .await?;
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
-    let caches = read_cache_columns(pool, &ids).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let snapshot_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let page = opts.page_size.max(1);
+    let mut after: Option<Uuid> = None;
     let mut n = 0u64;
-    for (id, updated_at) in rows {
-        let c = &caches[&id];
-        let row = SnapshotRow {
-            claim_id: id,
-            belief: c.belief,
-            plausibility: c.plausibility,
-            pignistic_prob: c.pignistic_prob,
-            mass_on_empty: c.mass_on_empty,
-            mass_on_missing: c.mass_on_missing,
-            belief_frame_id: c.belief_frame_id,
-            classification: c.classification.clone(),
-            updated_at,
-        };
-        serde_json::to_writer(&mut *out, &row)?;
-        out.write_all(b"\n")?;
-        n += 1;
+    loop {
+        let rows: Vec<SnapshotTuple> = sqlx::query_as(
+            "SELECT id, belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, \
+                    belief_frame_id, classification, updated_at \
+               FROM claims \
+              WHERE ($1::uuid IS NULL OR id > $1) AND ($2 OR is_current) \
+              ORDER BY id \
+              LIMIT $3",
+        )
+        .bind(after)
+        .bind(opts.include_superseded)
+        .bind(page)
+        .fetch_all(&mut *tx)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = Some(last.0);
+        let full_page = rows.len() as i64 == page;
+        for (claim_id, b, p, bp, me, mm, f, c, updated_at) in rows {
+            let row = SnapshotRow {
+                claim_id,
+                belief: b,
+                plausibility: p,
+                pignistic_prob: bp,
+                mass_on_empty: me,
+                mass_on_missing: mm,
+                belief_frame_id: f,
+                classification: c,
+                updated_at,
+            };
+            serde_json::to_writer(&mut *out, &row)?;
+            out.write_all(b"\n")?;
+            n += 1;
+        }
+        if !full_page {
+            break;
+        }
     }
+    tx.rollback().await?;
     Ok(SnapshotSummary {
         rows: n,
         snapshot_at,
