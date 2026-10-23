@@ -1,0 +1,574 @@
+//! The belief shadow report (atom-level belief program; SPEC §1.3 one atom
+//! value on the served cache, §3.2 statistics, §7.1 readiness, §8 T2 floor
+//! viewer, §10.4 recall replay and strict-entry replay).
+//!
+//! Every expected value is an absolute number from a fixture whose masses
+//! are written here, a twin fixture, or a value another path serves for the
+//! same rows; none is computed here by the code under test.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use std::collections::HashMap;
+
+use chrono::{Duration, Utc};
+use epigraph_cli::shadow_report::{
+    run_report, ClaimLine, ReportOptions, Scope, Summary, DEFAULT_MIN_TRUTH,
+};
+use epigraph_db::repos::recall_event::{NewRecallEvent, RecallEventRepository};
+use epigraph_db::{FrameRepository, MassFunctionRepository, Viewer};
+use epigraph_engine::atom_items::{AtomFoldMode, CompoundSourceEdges};
+use epigraph_engine::edge_factor::{
+    recompute_atom_cache_with, AtomCacheOutcome, AtomCacheSettings, CacheWriteCause, LegacyFold,
+};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// ── fixtures ────────────────────────────────────────────────────────────────
+
+async fn agent(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key) VALUES (sha256(gen_random_uuid()::text::bytea)) \
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("agent")
+}
+
+/// A public claim. Its `truth_value` is the fixture's .8.
+async fn claim(pool: &PgPool, author: Uuid, what: &str) -> Uuid {
+    fixture::seed_public_claim(pool, author, &format!("sr {what} {}", Uuid::new_v4())).await
+}
+
+async fn group_claim(pool: &PgPool, author: Uuid, group: Uuid, what: &str) -> Uuid {
+    fixture::seed_group_claim(
+        pool,
+        author,
+        group,
+        &format!("sr {what} {}", Uuid::new_v4()),
+    )
+    .await
+}
+
+async fn binary(pool: &PgPool) -> Uuid {
+    let viewer = fixture::public_viewer(pool).await;
+    if let Some(f) = FrameRepository::get_by_name(pool, &viewer, "binary_truth")
+        .await
+        .expect("frame lookup")
+    {
+        return f.id;
+    }
+    FrameRepository::create(
+        pool,
+        "binary_truth",
+        None,
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id
+}
+
+/// One BBA row on `binary_truth` from a fresh agent: an independent item.
+/// With no `evidence_type` and `source_strength` 1.0 its reliability is
+/// exactly 1 whatever the calibration.
+async fn bba(pool: &PgPool, claim: Uuid, masses: serde_json::Value) -> Uuid {
+    let b = binary(pool).await;
+    let a = agent(pool).await;
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        b,
+        Some(a),
+        None,
+        &masses,
+        None,
+        None,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store BBA")
+}
+
+async fn support(pool: &PgPool, claim: Uuid, t: f64) -> Uuid {
+    bba(pool, claim, serde_json::json!({"0": t, "0,1": 1.0 - t})).await
+}
+
+async fn refute(pool: &PgPool, claim: Uuid, f: f64) -> Uuid {
+    bba(pool, claim, serde_json::json!({"1": f, "0,1": 1.0 - f})).await
+}
+
+async fn decompose(pool: &PgPool, parent: Uuid, child: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(parent)
+    .bind(child)
+    .execute(pool)
+    .await
+    .expect("decomposes_to edge");
+}
+
+/// A compound over fresh public leaves, each carrying the given supports
+/// (one independent item per value). Returns (compound, leaves).
+async fn compound(pool: &PgPool, author: Uuid, what: &str, leaves: &[&[f64]]) -> (Uuid, Vec<Uuid>) {
+    let k = claim(pool, author, what).await;
+    let mut out = Vec::with_capacity(leaves.len());
+    for (i, supports) in leaves.iter().enumerate() {
+        let l = claim(pool, author, &format!("{what} leaf {i}")).await;
+        decompose(pool, k, l).await;
+        for &t in *supports {
+            support(pool, l, t).await;
+        }
+        out.push(l);
+    }
+    (k, out)
+}
+
+/// Write a cache on a claim directly: the shape a writer outside the single
+/// atom-cache writer leaves.
+async fn set_cache(pool: &PgPool, id: Uuid, bel: f64, pl: f64, betp: f64) {
+    sqlx::query(
+        "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
+         mass_on_empty = 0, mass_on_missing = 0 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(bel)
+    .bind(pl)
+    .bind(betp)
+    .execute(pool)
+    .await
+    .expect("set cache");
+}
+
+/// Log one recall event returning `returned` in that order, with
+/// `params.min_truth` when given.
+async fn recall_event(pool: &PgPool, min_truth: Option<f64>, returned: &[Uuid]) -> Uuid {
+    let params = match min_truth {
+        Some(m) => serde_json::json!({"limit": 10, "min_truth": m}),
+        None => serde_json::json!({"limit": 10}),
+    };
+    RecallEventRepository::log(
+        pool,
+        NewRecallEvent {
+            id: Uuid::new_v4(),
+            agent_id: None,
+            tool: "recall".to_string(),
+            query_text: "shadow report fixture".to_string(),
+            query_pgvector: None,
+            params,
+            returned_claim_ids: returned.to_vec(),
+            owner_group_id: None,
+        },
+    )
+    .await
+    .expect("recall event")
+}
+
+fn opts(scope: Scope) -> ReportOptions {
+    ReportOptions::new(scope, Utc::now() - Duration::days(30))
+}
+
+async fn report(
+    pool: &PgPool,
+    viewer: &Viewer,
+    events: &Viewer,
+    o: &ReportOptions,
+) -> (Summary, HashMap<Uuid, ClaimLine>) {
+    let mut lines = HashMap::new();
+    let summary = run_report(pool, viewer, events, o, |l: &ClaimLine| {
+        lines.insert(l.claim_id, l.clone());
+        Ok(())
+    })
+    .await
+    .expect("report");
+    (summary, lines)
+}
+
+/// A line as JSON with every `claim_id` removed: everything it discloses
+/// apart from which claim it is about.
+fn disclosed(l: &ClaimLine) -> serde_json::Value {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.remove("claim_id");
+                m.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut j = serde_json::to_value(l).expect("serialize");
+    strip(&mut j);
+    j
+}
+
+/// Two disclosures are the same: the same keys and non-float values, floats
+/// within 1e-12 (a twin's items carry other ids, so sums may run in another
+/// order).
+fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Number, Object};
+    match (a, b) {
+        (Number(x), Number(y)) if x.is_f64() || y.is_f64() => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-12,
+            _ => false,
+        },
+        (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+        (Object(x), Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+// ── (1) the recall replay counts a gate loss ────────────────────────────────
+
+/// Plan test (1). Atom `a` serves a cache of `BetP` .7 that a writer outside
+/// the plan left, while its only evidence is a refutation f .8 (the fold:
+/// Bel 0, Pl .2, `BetP` .1). Atom `b` serves .95 over a support .9 (fold
+/// .95). An event at `min_truth` .5 that returned both loses exactly `a`;
+/// the same event at .05 loses nothing; an event with no `min_truth` reads
+/// the default .3 and loses `a`; an event at .9 already failed `a` today, so
+/// it is no loss of the cutover's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_returned_claim_that_falls_below_its_min_truth_counts_one_loss(pool: PgPool) {
+    let author = agent(&pool).await;
+    let a = claim(&pool, author, "a").await;
+    let b = claim(&pool, author, "b").await;
+    refute(&pool, a, 0.8).await;
+    set_cache(&pool, a, 0.6, 0.8, 0.7).await;
+    support(&pool, b, 0.9).await;
+    set_cache(&pool, b, 0.9, 1.0, 0.95).await;
+
+    let e_half = recall_event(&pool, Some(0.5), &[a, b]).await;
+    let e_low = recall_event(&pool, Some(0.05), &[a, b]).await;
+    let e_default = recall_event(&pool, None, &[b, a]).await;
+    let e_high = recall_event(&pool, Some(0.9), &[a]).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, events) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &events, &opts(Scope::Ids(vec![a, b]))).await;
+
+    let line_a = lines.get(&a).expect("a line for a");
+    assert!(
+        (line_a.served.score - 0.7).abs() < 1e-12 && (line_a.strict.gate - 0.1).abs() < 1e-9,
+        "a passes today at .7 and gates at its fold's .1 under the candidate, got {} / {}",
+        line_a.served.score,
+        line_a.strict.gate
+    );
+
+    for (mode, replay) in [
+        ("progressive", &summary.replay.progressive),
+        ("strict", &summary.replay.strict),
+    ] {
+        let by_id: HashMap<Uuid, _> = replay.per_event.iter().map(|e| (e.event_id, e)).collect();
+        assert_eq!(
+            by_id.len(),
+            4,
+            "{mode}: every event in the window is replayed"
+        );
+        let half = by_id[&e_half];
+        assert_eq!(
+            (half.lost, half.lost_in_first_10, half.resolved),
+            (1, 1, 2),
+            "{mode}: at min_truth .5 exactly a is lost"
+        );
+        assert_eq!(by_id[&e_low].lost, 0, "{mode}: at .05 a still passes (.1)");
+        let default = by_id[&e_default];
+        assert!(
+            (default.min_truth - DEFAULT_MIN_TRUTH).abs() < 1e-12 && default.lost == 1,
+            "{mode}: an event with no min_truth gates at .3 and loses a, got {default:?}"
+        );
+        let high = by_id[&e_high];
+        assert_eq!(
+            (high.lost, high.already_failing),
+            (0, 1),
+            "{mode}: a claim that fails today is no loss of the cutover's"
+        );
+        assert_eq!(replay.lost, 2, "{mode}: two losses in all");
+        assert!(
+            (replay.mean_share_lost - (0.5 + 0.0 + 0.5 + 0.0) / 4.0).abs() < 1e-12,
+            "{mode}: mean share lost over the four events, got {}",
+            replay.mean_share_lost
+        );
+    }
+}
+
+// ── (2) a compound crossing Bel .75 is one confirmed flip ───────────────────
+
+/// Plan test (2). Three two-leaf compounds, each leaf with its own
+/// independent support, no refutation anywhere (NR 1, uncontested):
+///
+/// * `k_down`: leaves .8 and .8, so R-DEP Bel .64; it serves a cache of
+///   `BetP` .85, `confirmed` today. Strict serves Bel .64: one flip FROM.
+/// * `k_up`: leaves .95 and .95, Bel .9025; it serves .5 today: one flip TO.
+/// * `k_stay`: leaves .95 and .95, serving .85: `confirmed` both ways.
+///
+/// Every leaf is evidenced, so each compound is ready and progressive
+/// agrees with strict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_crossing_bel_075_counts_one_confirmed_flip(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (k_down, down) = compound(&pool, author, "down", &[&[0.8], &[0.8]]).await;
+    let (k_up, up) = compound(&pool, author, "up", &[&[0.95], &[0.95]]).await;
+    let (k_stay, stay) = compound(&pool, author, "stay", &[&[0.95], &[0.95]]).await;
+    set_cache(&pool, k_down, 0.8, 0.9, 0.85).await;
+    set_cache(&pool, k_up, 0.4, 0.6, 0.5).await;
+    set_cache(&pool, k_stay, 0.8, 0.9, 0.85).await;
+    recall_event(&pool, Some(0.3), &[k_down, k_up, k_stay]).await;
+
+    let mut ids = vec![k_down, k_up, k_stay];
+    ids.extend(down.iter().chain(&up).chain(&stay));
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, events) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &events, &opts(Scope::Ids(ids))).await;
+
+    let down_line = lines.get(&k_down).expect("a line for k_down");
+    assert!(
+        down_line.served.confirmed
+            && !down_line.strict.confirmed
+            && (down_line.strict.rank - 0.64).abs() < 1e-9,
+        "k_down: confirmed today, Bel .64 under strict, got {down_line:?}"
+    );
+    assert_eq!(
+        (
+            summary.strict_entry.compounds,
+            summary.strict_entry.confirmed.from,
+            summary.strict_entry.confirmed.to
+        ),
+        (3, 1, 1),
+        "one compound leaves confirmed (k_down) and one enters it (k_up); k_stay does not flip"
+    );
+    assert_eq!(
+        summary.strict_entry.confirmed_recall_weighted, summary.strict_entry.confirmed,
+        "each flipped compound was returned by exactly one event"
+    );
+    assert_eq!(
+        (
+            summary.compound_confirmed_set.strict,
+            summary.compound_confirmed_set.progressive
+        ),
+        (2, 2),
+        "k_up and k_stay are confirmed under the candidate; every leaf is evidenced, so \
+         progressive serves the derived value too"
+    );
+    for (mode, replay) in [
+        ("progressive", &summary.replay.progressive),
+        ("strict", &summary.replay.strict),
+    ] {
+        assert_eq!(
+            (replay.confirmed.from, replay.confirmed.to),
+            (1, 1),
+            "{mode}: the event that returned all three sees one flip each way"
+        );
+        assert_eq!(replay.lost, 0, "{mode}: NR is 1, nothing fails the gate");
+    }
+    assert!(
+        summary.strict_entry.confirmed_graph_view_weighted.is_none(),
+        "graph-view exposure is not measured in this run: null, never 0"
+    );
+}
+
+// ── (3) the anonymous run is the public floor ───────────────────────────────
+
+/// Plan test (3). `k` is public over a public leaf `a` (support .8) and a
+/// leaf `p` private to a group (support .3); its twin `t` is public over one
+/// public leaf (support .8) and nothing else. As the anonymous viewer the
+/// report's lines for `k` and `a` are exactly its lines for `t` and its
+/// leaf, `p` has no line and is in no count, and the event that returned
+/// `p` resolves nothing for it. As the maintenance viewer `k` reads `p` too,
+/// so its value differs from the twin's: the comparison can fail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anonymous_run_equals_the_public_floor(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "sr-owner").await;
+    let author = agent(&pool).await;
+    let (k, leaves) = compound(&pool, author, "k", &[&[0.8]]).await;
+    let a = leaves[0];
+    let p = group_claim(&pool, member, group, "p").await;
+    decompose(&pool, k, p).await;
+    support(&pool, p, 0.3).await;
+    let (t, twin_leaves) = compound(&pool, author, "t", &[&[0.8]]).await;
+    let a2 = twin_leaves[0];
+    recall_event(&pool, Some(0.3), &[k, p]).await;
+    recall_event(&pool, Some(0.3), &[t]).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (s_k, l_k) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![k, a, p]))).await;
+    let (s_t, l_t) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![t, a2]))).await;
+
+    assert!(
+        l_k.contains_key(&k) && l_k.contains_key(&a),
+        "k and a have lines"
+    );
+    assert!(
+        !l_k.contains_key(&p),
+        "the private leaf has no line for the anonymous viewer"
+    );
+    for (ours, twin) in [(k, t), (a, a2)] {
+        let (x, y) = (disclosed(&l_k[&ours]), disclosed(&l_t[&twin]));
+        assert!(
+            same(&x, &y),
+            "the anonymous line must be the public floor's:\n{x}\n{y}"
+        );
+    }
+    assert_eq!(
+        (s_k.claims, s_k.fold_mismatch.p1_atoms, s_k.residue),
+        (s_t.claims, s_t.fold_mismatch.p1_atoms, s_t.residue),
+        "the private leaf is in no count"
+    );
+    assert_eq!(s_k.claims, 2, "k and a");
+    assert_eq!(
+        (s_k.replay.strict.resolved, s_k.replay.strict.unresolved),
+        (1, 2),
+        "of the returned ids only k resolves: p is hidden from the anonymous viewer and t \
+         is outside this run's scope"
+    );
+
+    let (_, l_m) = report(&pool, &maint, &maint, &opts(Scope::Ids(vec![k, a, p]))).await;
+    let m = l_m.get(&k).expect("the maintenance run has a line for k");
+    assert!(
+        (m.strict.rank - l_t[&t].strict.rank).abs() > 0.1,
+        "control: the maintenance run reads p (Bel .8 x .3), the twin does not ({} vs {})",
+        m.strict.rank,
+        l_t[&t].strict.rank
+    );
+}
+
+// ── (4) the served value against the atom's own fold ────────────────────────
+
+fn aef() -> AtomCacheSettings {
+    AtomCacheSettings {
+        fold: AtomFoldMode::Aef,
+        compound_source_edges: CompoundSourceEdges::Frozen,
+        vacate_on_evidence_removal: true,
+    }
+}
+
+/// Plan test (4). Atoms `x` (support .7, refutation .2) and `y` (support .6)
+/// are written through the single atom-cache writer under the AEF; `z` has
+/// no evidence and a kept cache (the residue). The mismatch is 0 of 2 (`z`
+/// is not P1, so not in the denominator). A writer outside the plan then
+/// raises `y`'s `BetP` by .03 and leaves Bel and Pl alone, as the
+/// monotonicity clamp does: 1 of 2.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_fold_mismatch_is_zero_after_the_single_writer_and_one_after_a_clamp(pool: PgPool) {
+    let author = agent(&pool).await;
+    let x = claim(&pool, author, "x").await;
+    let y = claim(&pool, author, "y").await;
+    let z = claim(&pool, author, "z").await;
+    support(&pool, x, 0.7).await;
+    refute(&pool, x, 0.2).await;
+    support(&pool, y, 0.6).await;
+    set_cache(&pool, z, 0.64, 1.0, 0.82).await;
+
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    {
+        let mut conn = pool.acquire().await.expect("conn");
+        for id in [x, y] {
+            let out = recompute_atom_cache_with(
+                &mut conn,
+                &maint,
+                id,
+                CacheWriteCause::Organic,
+                LegacyFold::OwnerFrame,
+                aef(),
+            )
+            .await
+            .expect("single writer");
+            assert!(
+                matches!(out, AtomCacheOutcome::Folded { written: true, .. }),
+                "the writer folds and writes {id}: {out:?}"
+            );
+        }
+    }
+
+    let public = fixture::public_viewer(&pool).await;
+    let scope = Scope::Ids(vec![x, y, z]);
+    let (before, _) = report(&pool, &public, &maint, &opts(scope.clone())).await;
+    assert_eq!(
+        (
+            before.fold_mismatch.p1_atoms,
+            before.fold_mismatch.mismatched,
+            before.residue
+        ),
+        (2, 0, 1),
+        "after the single writer every P1 atom serves its fold; z is residue"
+    );
+
+    sqlx::query("UPDATE claims SET pignistic_prob = pignistic_prob + 0.03 WHERE id = $1")
+        .bind(y)
+        .execute(&pool)
+        .await
+        .expect("clamp-shaped write");
+    let (after, lines) = report(&pool, &public, &maint, &opts(scope)).await;
+    assert_eq!(
+        (after.fold_mismatch.p1_atoms, after.fold_mismatch.mismatched),
+        (2, 1),
+        "a BetP the fold did not produce is one mismatch"
+    );
+    assert!((after.fold_mismatch.share - 0.5).abs() < 1e-12, "1 of 2");
+    let y_gap = lines[&y].served_vs_fold.expect("y is P1");
+    assert!(
+        (y_gap - 0.03).abs() < 1e-9,
+        "y's gap is the .03 the clamp added, got {y_gap}"
+    );
+    assert!(
+        lines[&z].served_vs_fold.is_none(),
+        "z has no fold to compare"
+    );
+}
+
+// ── the report writes nothing ───────────────────────────────────────────────
+
+/// Everything a run could write, as one value.
+async fn fingerprint(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT concat_ws('|', \
+           (SELECT md5(coalesce(string_agg(concat_ws(',', id, belief, plausibility, \
+                pignistic_prob, mass_on_missing, mass_on_empty, belief_frame_id, \
+                truth_value, updated_at), ';' ORDER BY id), '')) FROM claims), \
+           (SELECT count(*) FROM mass_functions), \
+           (SELECT count(*) FROM frames), \
+           (SELECT count(*) FROM edges), \
+           (SELECT count(*) FROM ds_combined_beliefs), \
+           (SELECT count(*) FROM recall_events), \
+           (SELECT count(*) FROM perspectives))",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("fingerprint")
+}
+
+/// A whole-corpus run under both viewers, with the owner-rule stage on,
+/// leaves the database exactly as it found it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_full_run_writes_nothing(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (k, leaves) = compound(&pool, author, "k", &[&[0.8], &[0.6]]).await;
+    refute(&pool, leaves[1], 0.3).await;
+    set_cache(&pool, k, 0.5, 0.9, 0.7).await;
+    recall_event(&pool, Some(0.3), &[k, leaves[0]]).await;
+
+    let before = fingerprint(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let mut o = opts(Scope::All);
+    o.owner_preview = true;
+    let (s_pub, _) = report(&pool, &public, &maint, &o).await;
+    let (s_maint, _) = report(&pool, &maint, &maint, &o).await;
+    assert!(
+        s_pub.claims >= 3 && s_maint.claims >= 3,
+        "the run covered the fixture"
+    );
+    assert_eq!(
+        fingerprint(&pool).await,
+        before,
+        "the report wrote to the database"
+    );
+}

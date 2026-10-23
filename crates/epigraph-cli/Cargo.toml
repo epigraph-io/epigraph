@@ -140,6 +140,11 @@ name = "bulk_recompute_guard"
 path = "tests/bulk_recompute_guard.rs"
 required-features = ["db"]
 
+[[test]]
+name = "belief_shadow_report"
+path = "tests/belief_shadow_report.rs"
+required-features = ["db"]
+
 # Runs most of this crate's `db`-gated binaries' `--help`; without `db` their
 # `CARGO_BIN_EXE_*` do not exist and the test would not compile.
 [[test]]
