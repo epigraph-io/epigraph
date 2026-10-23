@@ -767,6 +767,12 @@ pub fn create_router_with_extensions(
             "/api/v1/agents/:id/prompt-history",
             get(agent_prompt_history::get_prompt_history),
         )
+        // One file named in that history, for the same callers, served only
+        // when a snapshot the caller may read names it.
+        .route(
+            "/api/v1/agents/:id/prompt-history/blobs/:hash",
+            get(agent_prompt_history::get_prompt_history_blob),
+        )
         .route(
             "/api/v1/agents/:id/timeline",
             get(timeline::get_agent_timeline),

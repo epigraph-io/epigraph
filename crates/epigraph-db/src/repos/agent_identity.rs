@@ -17,6 +17,14 @@
 //!   WITHHELD (named in [`PromptSnapshot::withheld_files`]), never returned as
 //!   someone else's text; and since blobs are shared across agents, one bad
 //!   blob withholds that one file, not every history that names it.
+//! * [`AgentIdentityRepository::prompt_history_index`] and
+//!   [`AgentIdentityRepository::prompt_history_blob`] split that read for a
+//!   server: the first projects only the hashes and metadata out of the same
+//!   definer, so no file content crosses the connection; the second fetches,
+//!   decompresses and verifies the ONE file a readable snapshot in that
+//!   history names. A server's memory then grows with the number of snapshots
+//!   and with one file, not with the sum of every file. (The definer itself
+//!   still builds its whole result, content included, inside the database.)
 
 use std::borrow::Cow;
 
@@ -169,6 +177,79 @@ pub struct PromptHistoryEntry {
     pub snapshot: Option<PromptSnapshot>,
 }
 
+/// One prompt snapshot as the content-free index names it: every file by the
+/// BLAKE3 of its raw bytes, none of its content.
+#[derive(Debug, Clone)]
+pub struct PromptSnapshotIndex {
+    pub id: Uuid,
+    pub group_folder: String,
+    pub model: String,
+    pub prompt_hash: String,
+    pub identity_md: Option<[u8; 32]>,
+    pub global_claude_md: Option<[u8; 32]>,
+    pub group_claude_md: Option<[u8; 32]>,
+    pub learned_md: Option<[u8; 32]>,
+    pub in_prompt: Value,
+    /// Files the host refused to store, by name.
+    pub blob_refused: Vec<String>,
+    /// As in [`PromptSnapshot`]: the FIRST start in this state.
+    pub runner_version: Option<String>,
+    pub host_sha: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// One row of [`AgentIdentityRepository::prompt_history_index`]: as
+/// [`PromptHistoryEntry`], with the snapshot named by hash only.
+#[derive(Debug, Clone)]
+pub struct PromptHistoryIndexEntry {
+    pub agent_id: Uuid,
+    /// `self`, `ancestor` or `descendant`.
+    pub relation: String,
+    /// 0 for the agent asked about, negative up the lineage, positive down it.
+    pub depth: i32,
+    /// False for a lineage member the caller does not operate: listed by id,
+    /// with no snapshot.
+    pub readable: bool,
+    /// None when unreadable, or when the agent has no snapshot.
+    pub snapshot: Option<PromptSnapshotIndex>,
+}
+
+/// The outcome of [`AgentIdentityRepository::prompt_history_blob`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptBlobRead {
+    /// No snapshot the caller may read in that history names the hash.
+    NotNamed,
+    /// The file, decompressed and re-hashed to its key.
+    Verified(PromptBlob),
+    /// A readable snapshot names it, but the stored blob failed verification
+    /// (it did not decompress, exceeded the size bound, or no longer hashes to
+    /// its key); the reason, for the log. Its bytes are never returned.
+    Withheld(String),
+}
+
+#[derive(sqlx::FromRow)]
+struct IndexRow {
+    agent_id: Uuid,
+    relation: String,
+    depth: i32,
+    readable: bool,
+    snapshot_id: Option<Uuid>,
+    group_folder: Option<String>,
+    model: Option<String>,
+    prompt_hash: Option<String>,
+    in_prompt: Option<Value>,
+    blob_refused: Option<Vec<String>>,
+    runner_version: Option<String>,
+    host_sha: Option<String>,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    identity_md_hash: Option<Vec<u8>>,
+    global_claude_md_hash: Option<Vec<u8>>,
+    group_claude_md_hash: Option<Vec<u8>>,
+    learned_md_hash: Option<Vec<u8>>,
+}
+
 #[derive(sqlx::FromRow)]
 struct HistoryRow {
     agent_id: Uuid,
@@ -311,6 +392,122 @@ impl AgentIdentityRepository {
         .await?;
         Ok(rows.into_iter().map(history_entry).collect())
     }
+
+    /// [`Self::prompt_history`] without any file content: the same definer,
+    /// the same gate and the same rows, each file named by its key only. No
+    /// blob crosses the connection.
+    ///
+    /// # Errors
+    /// As [`Self::prompt_history`]; and [`DbError::InvalidData`] for a stored
+    /// key that is not 32 bytes (the blob table's CHECK makes that
+    /// unreachable).
+    pub async fn prompt_history_index(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Vec<PromptHistoryIndexEntry>, DbError> {
+        let rows = sqlx::query_as::<_, IndexRow>(
+            "SELECT agent_id, relation, depth, readable, snapshot_id, group_folder, model, \
+                    prompt_hash, in_prompt, blob_refused, runner_version, host_sha, first_seen, \
+                    last_seen, identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
+                    learned_md_hash \
+               FROM public.epigraph_agent_prompt_history($1)",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter().map(index_entry).collect()
+    }
+
+    /// One file of an agent's prompt history, by key: fetched only when a
+    /// snapshot the caller may READ in `agent_id`'s history (its own, or a
+    /// lineage member's the definer marks readable) names `blob_hash`, then
+    /// decompressed and re-hashed. Only that file's content crosses the
+    /// connection.
+    ///
+    /// The gate is the definer's: the connection must be stamped with the
+    /// caller's principal, exactly as for [`Self::prompt_history`].
+    ///
+    /// # Errors
+    /// As [`Self::prompt_history`]: `AID06` ([`PROMPT_HISTORY_REFUSED`]) for a
+    /// caller who is neither the operator nor an admin.
+    pub async fn prompt_history_blob(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        blob_hash: &[u8; 32],
+    ) -> Result<PromptBlobRead, DbError> {
+        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+            "SELECT CASE $2 WHEN identity_md_hash      THEN identity_md \
+                            WHEN global_claude_md_hash THEN global_claude_md \
+                            WHEN group_claude_md_hash  THEN group_claude_md \
+                            ELSE learned_md END \
+               FROM public.epigraph_agent_prompt_history($1) \
+              WHERE readable \
+                AND $2 IN (identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
+                           learned_md_hash) \
+              LIMIT 1",
+        )
+        .bind(agent_id)
+        .bind(blob_hash.as_slice())
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((content,)) = row else {
+            return Ok(PromptBlobRead::NotNamed);
+        };
+        Ok(
+            match verified_blob("blob", Some(blob_hash.to_vec()), content) {
+                Ok(Some(blob)) => PromptBlobRead::Verified(blob),
+                // Unreachable: a key was given.
+                Ok(None) => PromptBlobRead::NotNamed,
+                Err(reason) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        blob = %hex::encode(blob_hash),
+                        %reason,
+                        "prompt history: withholding a stored file that failed verification"
+                    );
+                    PromptBlobRead::Withheld(reason)
+                }
+            },
+        )
+    }
+}
+
+fn blob_key(file: &str, hash: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, DbError> {
+    hash.map(|h| {
+        <[u8; 32]>::try_from(h.as_slice()).map_err(|_| DbError::InvalidData {
+            reason: format!("prompt history: the {file} key is not 32 bytes"),
+        })
+    })
+    .transpose()
+}
+
+fn index_entry(r: IndexRow) -> Result<PromptHistoryIndexEntry, DbError> {
+    let snapshot = match r.snapshot_id {
+        None => None,
+        Some(id) => Some(PromptSnapshotIndex {
+            id,
+            group_folder: r.group_folder.unwrap_or_default(),
+            model: r.model.unwrap_or_default(),
+            prompt_hash: r.prompt_hash.unwrap_or_default(),
+            identity_md: blob_key("identity_md", r.identity_md_hash)?,
+            global_claude_md: blob_key("global_claude_md", r.global_claude_md_hash)?,
+            group_claude_md: blob_key("group_claude_md", r.group_claude_md_hash)?,
+            learned_md: blob_key("learned_md", r.learned_md_hash)?,
+            in_prompt: r.in_prompt.unwrap_or(Value::Null),
+            blob_refused: r.blob_refused.unwrap_or_default(),
+            runner_version: r.runner_version,
+            host_sha: r.host_sha,
+            first_seen: r.first_seen.unwrap_or_default(),
+            last_seen: r.last_seen.unwrap_or_default(),
+        }),
+    };
+    Ok(PromptHistoryIndexEntry {
+        agent_id: r.agent_id,
+        relation: r.relation,
+        depth: r.depth,
+        readable: r.readable,
+        snapshot,
+    })
 }
 
 fn history_entry(r: HistoryRow) -> PromptHistoryEntry {

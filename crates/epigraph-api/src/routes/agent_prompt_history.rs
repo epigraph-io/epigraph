@@ -1,5 +1,7 @@
-//! `GET /api/v1/agents/:id/prompt-history` (agent identity lineage design D4):
-//! the prompt files an agent ran with, per group, and its succession lineage.
+//! `GET /api/v1/agents/:id/prompt-history` and
+//! `GET /api/v1/agents/:id/prompt-history/blobs/:hash` (agent identity lineage
+//! design D4): the prompt files an agent ran with, per group, and its
+//! succession lineage; then the content of one of those files.
 //!
 //! # Who may read it
 //!
@@ -21,17 +23,30 @@
 //!
 //! # Shape
 //!
-//! The definer returns one row per (lineage member, snapshot). This groups
-//! them: the agent's own snapshots, then `lineage.ancestors` (up the
+//! The definer returns one row per (lineage member, snapshot). The listing
+//! groups them: the agent's own snapshots, then `lineage.ancestors` (up the
 //! succession, `distance` 1 = a parent) and `lineage.descendants` (down it),
 //! one entry per agent carrying all of its snapshots. A lineage member the
 //! caller may not read is listed by id with `readable: false` and no
 //! snapshots.
 //!
-//! A file field is `null` for three different reasons, told apart by two
-//! lists: the file did not exist (named nowhere), the host refused to store it
-//! (named in `blob_refused`), or its stored blob failed verification on this
-//! read (named in `withheld_files`).
+//! The listing carries NO file content: each file is named by the BLAKE3 of
+//! its raw bytes (`{"blob_hash": ..}`), so the listing grows with the number of
+//! snapshots and never with the files (up to 8 MiB each, a LEARNED.md per
+//! generation, a shared CLAUDE.md once per snapshot). A file field is `null`
+//! when the file did not exist, or when the host refused to store it (then it
+//! is named in `blob_refused`).
+//!
+//! The content of one file is
+//! `GET /api/v1/agents/:id/prompt-history/blobs/:hash`: served only when a
+//! snapshot the caller may READ in `:id`'s history names that hash (the
+//! definer's gate, then its `readable` mark), decompressed and re-hashed to its
+//! key, as `{blob_hash, raw_size, text, lossy}`. A hash no readable snapshot
+//! names, an unreadable lineage member's included, is a 404; a stored blob that
+//! fails verification is WITHHELD, a 500 naming the failure, and its bytes are
+//! never served. The server holds at most one file's content per request. (The
+//! definer still builds its whole result, content included, inside the
+//! database; a content-free definer variant would bound that too.)
 //!
 //! # No registration route
 //!
@@ -49,8 +64,8 @@ use chrono::{DateTime, Utc};
 use epigraph_core::AgentId;
 use epigraph_db::agent_identity::PROMPT_HISTORY_REFUSED;
 use epigraph_db::{
-    AgentIdentityRepository, AgentRepository, DbError, PromptBlob, PromptHistoryEntry,
-    PromptSnapshot,
+    AgentIdentityRepository, AgentRepository, DbError, PromptBlob, PromptBlobRead,
+    PromptHistoryIndexEntry, PromptSnapshotIndex,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -108,8 +123,6 @@ pub struct SnapshotView {
     pub files: SnapshotFiles,
     /// Files the host refused to store (its capture-time scan), by name.
     pub blob_refused: Vec<String>,
-    /// Files whose stored blob failed verification on this read, by name.
-    pub withheld_files: Vec<String>,
     /// The runner version and host build of the FIRST start in this state.
     pub runner_version: Option<String>,
     pub host_sha: Option<String>,
@@ -117,18 +130,26 @@ pub struct SnapshotView {
     pub last_seen: DateTime<Utc>,
 }
 
-/// The four prompt files of a snapshot.
+/// The four prompt files of a snapshot, each by key only.
 #[derive(Debug, Serialize)]
 pub struct SnapshotFiles {
-    pub identity_md: Option<FileView>,
-    pub global_claude_md: Option<FileView>,
-    pub group_claude_md: Option<FileView>,
-    pub learned_md: Option<FileView>,
+    pub identity_md: Option<FileRef>,
+    pub global_claude_md: Option<FileRef>,
+    pub group_claude_md: Option<FileRef>,
+    pub learned_md: Option<FileRef>,
 }
 
-/// One stored prompt file, decompressed and verified against its hash.
+/// One stored prompt file, named; its content is the blob endpoint's.
 #[derive(Debug, Serialize)]
-pub struct FileView {
+pub struct FileRef {
+    /// BLAKE3 of the raw bytes, hex: the `:hash` of the blob endpoint.
+    pub blob_hash: String,
+}
+
+/// `GET /api/v1/agents/:id/prompt-history/blobs/:hash` response: one stored
+/// prompt file, decompressed and verified against its hash.
+#[derive(Debug, Serialize)]
+pub struct BlobView {
     /// BLAKE3 of the raw bytes, hex.
     pub blob_hash: String,
     /// The raw size in bytes.
@@ -140,7 +161,7 @@ pub struct FileView {
     pub lossy: bool,
 }
 
-impl From<PromptBlob> for FileView {
+impl From<PromptBlob> for BlobView {
     fn from(b: PromptBlob) -> Self {
         let lossy = std::str::from_utf8(&b.bytes).is_err();
         Self {
@@ -152,8 +173,14 @@ impl From<PromptBlob> for FileView {
     }
 }
 
-impl From<PromptSnapshot> for SnapshotView {
-    fn from(s: PromptSnapshot) -> Self {
+fn file_ref(key: Option<[u8; 32]>) -> Option<FileRef> {
+    key.map(|k| FileRef {
+        blob_hash: hex::encode(k),
+    })
+}
+
+impl From<PromptSnapshotIndex> for SnapshotView {
+    fn from(s: PromptSnapshotIndex) -> Self {
         Self {
             id: s.id,
             group_folder: s.group_folder,
@@ -161,13 +188,12 @@ impl From<PromptSnapshot> for SnapshotView {
             prompt_hash: s.prompt_hash,
             in_prompt: s.in_prompt,
             files: SnapshotFiles {
-                identity_md: s.identity_md.map(Into::into),
-                global_claude_md: s.global_claude_md.map(Into::into),
-                group_claude_md: s.group_claude_md.map(Into::into),
-                learned_md: s.learned_md.map(Into::into),
+                identity_md: file_ref(s.identity_md),
+                global_claude_md: file_ref(s.global_claude_md),
+                group_claude_md: file_ref(s.group_claude_md),
+                learned_md: file_ref(s.learned_md),
             },
             blob_refused: s.blob_refused,
-            withheld_files: s.withheld_files,
             runner_version: s.runner_version,
             host_sha: s.host_sha,
             first_seen: s.first_seen,
@@ -180,7 +206,7 @@ impl From<PromptSnapshot> for SnapshotView {
 /// depth, then first seen) into the response: one entry per agent, each
 /// carrying all of its snapshots in the order the definer gave them.
 #[must_use]
-pub fn group_history(agent_id: Uuid, rows: Vec<PromptHistoryEntry>) -> PromptHistoryResponse {
+pub fn group_history(agent_id: Uuid, rows: Vec<PromptHistoryIndexEntry>) -> PromptHistoryResponse {
     let mut own = Vec::new();
     let mut members: Vec<(i32, LineageMember)> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
@@ -278,7 +304,7 @@ pub async fn get_prompt_history(
         .read_as(&viewer)
         .await
         .map_err(|e| internal("acquire a viewer-stamped connection", &e))?;
-    let rows = match AgentIdentityRepository::prompt_history(&mut read, id).await {
+    let rows = match AgentIdentityRepository::prompt_history_index(&mut read, id).await {
         Ok(rows) => rows,
         Err(e) if is_refused(&e) => {
             tracing::info!(
@@ -304,4 +330,76 @@ pub async fn get_prompt_history(
         .await
         .map_err(|e| internal("finish the read", &e))?;
     Ok(Json(group_history(id, rows)))
+}
+
+/// `GET /api/v1/agents/:id/prompt-history/blobs/:hash`: one file named by a
+/// snapshot the caller may read in `:id`'s history (`claims:read`).
+///
+/// # Errors
+/// 401 without a principal; 403 without `claims:read`; 400 for a `:hash` that
+/// is not 64 hex digits; 404 for a caller who is neither the operator nor an
+/// admin (the history route's body), and for a hash no readable snapshot in
+/// that history names; 500 for a stored blob that failed verification, which
+/// is withheld.
+pub async fn get_prompt_history_blob(
+    State(state): State<AppState>,
+    auth_ctx: Option<Extension<AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
+    Path((id, hash)): Path<(Uuid, String)>,
+) -> Result<Json<BlobView>, ApiError> {
+    let Some(Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "prompt history requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &[REQUIRED_SCOPE])?;
+    let key: [u8; 32] = hex::decode(&hash)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "a prompt file is named by the 64-hex-digit BLAKE3 of its bytes".into(),
+        })?;
+
+    let mut read = state
+        .read_as(&viewer)
+        .await
+        .map_err(|e| internal("acquire a viewer-stamped connection", &e))?;
+    let found = match AgentIdentityRepository::prompt_history_blob(&mut read, id, &key).await {
+        Ok(found) => found,
+        Err(e) if is_refused(&e) => {
+            tracing::info!(
+                target: "agent.prompt_history",
+                principal = ?auth.agent_id,
+                agent = %id,
+                "prompt history blob refused: the caller is neither the operator nor an admin"
+            );
+            return Err(not_found(id));
+        }
+        Err(e) => return Err(internal("read the file", &e)),
+    };
+    read.commit()
+        .await
+        .map_err(|e| internal("finish the read", &e))?;
+    match found {
+        PromptBlobRead::Verified(blob) => Ok(Json(blob.into())),
+        PromptBlobRead::NotNamed => Err(ApiError::NotFound {
+            entity: "PromptBlob".to_string(),
+            id: hex::encode(key),
+        }),
+        PromptBlobRead::Withheld(reason) => {
+            tracing::error!(
+                target: "agent.prompt_history",
+                agent = %id,
+                blob = %hex::encode(key),
+                %reason,
+                "a stored prompt file failed verification; withheld"
+            );
+            Err(ApiError::InternalError {
+                message: format!(
+                    "prompt history: the stored file {} failed verification and is withheld",
+                    hex::encode(key)
+                ),
+            })
+        }
+    }
 }
