@@ -2480,6 +2480,15 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// What this call did to the caller's BBA for this (claim, frame,
+    /// perspective_id): `inserted` (none existed), `unchanged` (an identical
+    /// BBA was already stored, so nothing new was combined) or `replaced` (an
+    /// earlier, different BBA was overwritten in place, same id). Backlog
+    /// bcbe34b2.
+    pub write_outcome: String,
+    /// True iff `write_outcome` is `unchanged`: an identical resubmission is
+    /// stored once, not combined again.
+    pub deduplicated: bool,
     /// Human-readable notes about inputs that were ACCEPTED but do not do what
     /// their name suggests (e.g. a non-default `combination_method` or any
     /// `gamma`, neither of which changes the returned belief). Omitted when
