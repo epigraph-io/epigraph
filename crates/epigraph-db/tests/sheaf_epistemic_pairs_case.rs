@@ -104,12 +104,21 @@ async fn seed(pool: &PgPool) -> Seed {
 
     let mut epistemic = BTreeSet::new();
     let mut lower_control = None;
+    // The lower-case control, then every member of the epistemic list in a
+    // non-lower spelling (UPPER and Capitalised alternate), so the parity test
+    // below covers the whole list: dropping any one name from either query's
+    // list leaves an edge one query returns and the other does not.
     for rel in [
         "supports",
         "SUPPORTS",
-        "CORROBORATES",
         "Refutes",
         "CONTRADICTS",
+        "Corroborates",
+        "CORROBORATES",
+        "Elaborates",
+        "SPECIALIZES",
+        "Generalizes",
+        "FRAME_VALIDATES",
     ] {
         let (a, b) = pair().await;
         insert_edge(pool, a, b, rel, false).await;
