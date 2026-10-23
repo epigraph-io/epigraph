@@ -1008,43 +1008,54 @@ async fn a_registered_identity_records_its_model_and_refuses_a_mismatch(pool: Pg
 // Signing keys (D2) and stored blobs (D4).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The signing key is registered once per agent as an active `signing` key; a
-/// later registration with another key does not replace it; a key already
-/// bound to a different agent is refused; and the identity key itself can
-/// never be the signing key.
+/// The signing key is bound once per agent as an active `signing` key. The same
+/// key again is a no-op; a DIFFERENT key while one is active is refused AID08
+/// and changes nothing (the host must be told, not answered "not registered":
+/// review TC1/CR1); a key already bound to another agent is refused; a revoked
+/// key is never bound again, while a new key after the revoke is; and the
+/// identity key itself can never be the signing key.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_signing_key_is_registered_once_and_never_shared(pool: PgPool) {
+async fn the_signing_key_is_bound_once_and_a_different_one_is_refused_aid08(pool: PgPool) {
     let id = new_identity();
     let key = random32();
-    let r = try_register_as(
-        &pool,
-        ATTESTOR,
-        &id,
-        None,
-        "g-k",
-        Some(key.clone()),
-        snapshot("g", "l"),
-        None,
-    )
-    .await
-    .expect("first registration");
+    let register_with = |k: Vec<u8>, group: &'static str, learned: &'static str| {
+        let pool = pool.clone();
+        let id = Identity {
+            pubkey: id.pubkey.clone(),
+            prompt_hash: id.prompt_hash.clone(),
+            signing: k.clone(),
+        };
+        async move {
+            try_register_as(
+                &pool,
+                ATTESTOR,
+                &id,
+                None,
+                group,
+                Some(k),
+                snapshot("g", learned),
+                None,
+            )
+            .await
+        }
+    };
+    let r = register_with(key.clone(), "g-k", "l")
+        .await
+        .expect("first registration");
     assert!(r.signing_key_registered);
-    let again = try_register_as(
-        &pool,
-        ATTESTOR,
-        &id,
-        None,
-        "g-k",
-        Some(random32()),
-        snapshot("g", "l"),
-        None,
-    )
-    .await
-    .expect("second registration");
-    assert!(
-        !again.signing_key_registered,
-        "an active signing key is never replaced here"
-    );
+
+    let same = register_with(key.clone(), "g-k", "l2")
+        .await
+        .expect("CALIBRATION: the same key again registers");
+    assert!(!same.signing_key_registered, "the same key is already bound");
+
+    let before = footprint(&pool).await;
+    let err = register_with(random32(), "g-k", "l3")
+        .await
+        .expect_err("a different signing key while one is active must be refused");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID08"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID08 changes nothing");
+
     let keys: Vec<(Vec<u8>, String)> = sqlx::query_as(
         "SELECT public_key, status::text FROM agent_keys \
           WHERE agent_id = $1 AND key_type = 'signing'",
@@ -1062,13 +1073,41 @@ async fn the_signing_key_is_registered_once_and_never_shared(pool: PgPool) {
         &other,
         None,
         "g-k",
-        Some(key),
+        Some(key.clone()),
         snapshot("g", "l"),
         None,
     )
     .await
     .expect_err("a signing key bound to another agent must be refused");
     assert_eq!(sqlstate(&err).as_deref(), Some("22023"), "{err}");
+
+    // The operations path: the maintenance session revokes the bound key.
+    let kid: Uuid = sqlx::query_scalar(
+        "SELECT id FROM agent_keys WHERE agent_id = $1 AND key_type = 'signing'",
+    )
+    .bind(r.agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("key id");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "SELECT * FROM public.epigraph_agent_key_set_status($1, 'revoked', 'test', NULL)",
+        )
+        .bind(kid)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance role revokes a bound signing key");
+    let err = register_with(key, "g-k", "l4")
+        .await
+        .expect_err("a revoked signing key is never bound again");
+    assert_eq!(sqlstate(&err).as_deref(), Some("22023"), "{err}");
+    let fresh = register_with(random32(), "g-k", "l5")
+        .await
+        .expect("CALIBRATION: a new key after the revoke is bound");
+    assert!(fresh.signing_key_registered);
 
     let selfish = new_identity();
     let err = try_register_as(
@@ -1439,4 +1478,277 @@ async fn the_app_role_cannot_forge_a_registration_audit_row(pool: PgPool) {
         Some(INSUFFICIENT_PRIVILEGE),
         "{err}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review of the first cut (PR #661): attested keys (TC1/CR1, CR2, CR4b).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `f` as `epigraph_app` stamped as `principal` with `groups` as both its
+/// readable and writable set: what a container holding the application DSN
+/// can claim to be.
+async fn as_app_stamped<F, Fut, T>(pool: &PgPool, principal: Uuid, groups: &[Uuid], f: F) -> T
+where
+    F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+{
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, false), \
+                    set_config('epigraph.group_ids', $2, false), \
+                    set_config('epigraph.writable_group_ids', $2, false)",
+        )
+        .bind(principal.to_string())
+        .bind(&set)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp");
+        let (mut conn, out) = f(conn).await;
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', '', false), \
+                    set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        (conn, out)
+    })
+    .await
+}
+
+/// An agent seeded on the superuser connection, with no key rows.
+async fn plain_agent(pool: &PgPool, agent_type: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(random32())
+        .bind(agent_type)
+        .execute(pool)
+        .await
+        .expect("seed agent");
+    id
+}
+
+/// `epigraph_agent_key_set_status(key, status)` on `role`'s session.
+async fn set_key_status_as(
+    pool: &PgPool,
+    role: &str,
+    principal: Uuid,
+    key: Uuid,
+    status: &'static str,
+) -> Result<(), sqlx::Error> {
+    fixture::as_role(pool, role, |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(principal.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp");
+        let r = sqlx::query(
+            "SELECT * FROM public.epigraph_agent_key_set_status($1, $2, 'review test', NULL)",
+        )
+        .bind(key)
+        .bind(status)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ());
+        (conn, r)
+    })
+    .await
+}
+
+/// D2: "Agents cannot self-register it." A `signing` key (what S2's
+/// verify_claim will bind a claim to) and an `identity-legacy` key are
+/// attested state. An application session, stamped as the victim itself,
+/// can neither INSERT one for any agent (in any spelling of the type) nor move
+/// a bound one through 118's status definer (rotate or revoke); the bound key
+/// stays active. CALIBRATIONS: the same session still records and rotates a
+/// key of another type (so the refusal is not a blanket loss of INSERT or of
+/// the definer), the attestor's registration binds a signing key, and the
+/// maintenance session can revoke it (the operations path).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: PgPool) {
+    let victim = plain_agent(&pool, "software_agent").await;
+    let (signing, legacy, spelled, other) =
+        as_app_stamped(&pool, victim, &[], |mut conn| async move {
+            let ins = "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+                       VALUES ($1, $2, $3, 'active', '2020-01-01')";
+            let mut out = Vec::new();
+            for t in ["signing", "identity-legacy", " Signing", "encryption"] {
+                out.push(
+                    sqlx::query(ins)
+                        .bind(victim)
+                        .bind(random32())
+                        .bind(t)
+                        .execute(&mut *conn)
+                        .await
+                        .map(|_| ()),
+                );
+            }
+            let other = out.pop().expect("encryption");
+            let spelled = out.pop().expect("spelled");
+            let legacy = out.pop().expect("legacy");
+            let signing = out.pop().expect("signing");
+            (conn, (signing, legacy, spelled, other))
+        })
+        .await;
+    other.expect("CALIBRATION: the application role still records a key of another type");
+    for (what, r) in [
+        ("signing", signing),
+        ("identity-legacy", legacy),
+        (" Signing", spelled),
+    ] {
+        let err = r.expect_err("an application session bound an attested key type");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{what}: {err}"
+        );
+    }
+
+    // The attested path binds one (positive control for the type itself).
+    let id = new_identity();
+    let r = register(&pool, &id, None, "g-ak", snapshot("g", "l")).await;
+    assert!(r.signing_key_registered);
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, 'identity-legacy', 'active', '2020-01-01')",
+    )
+    .bind(victim)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed a legacy key on the harness connection");
+    let key_of = |agent: Uuid, t: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM agent_keys WHERE agent_id = $1 AND key_type = $2",
+            )
+            .bind(agent)
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .expect("key id")
+        }
+    };
+    let bound = key_of(r.agent_id, "signing").await;
+    let legacy_key = key_of(victim, "identity-legacy").await;
+    let other_key = key_of(victim, "encryption").await;
+
+    for (key, owner) in [(bound, r.agent_id), (legacy_key, victim)] {
+        for status in ["rotated", "revoked"] {
+            let err = set_key_status_as(&pool, "epigraph_app", owner, key, status)
+                .await
+                .expect_err("an application session moved an attested key");
+            assert_eq!(
+                sqlstate(&err).as_deref(),
+                Some(INSUFFICIENT_PRIVILEGE),
+                "{status}: {err}"
+            );
+        }
+    }
+    set_key_status_as(&pool, "epigraph_app", victim, other_key, "rotated")
+        .await
+        .expect("CALIBRATION: the application role still rotates a key of another type");
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "SELECT status::text FROM agent_keys WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(vec![bound, legacy_key])
+    .fetch_all(&pool)
+    .await
+    .expect("statuses");
+    assert_eq!(statuses, vec!["active".to_string(), "active".to_string()]);
+
+    set_key_status_as(&pool, "epigraph_maintenance", victim, bound, "revoked")
+        .await
+        .expect("CALIBRATION: the maintenance session revokes a bound signing key");
+}
+
+/// The rotate route's key lookup (`get_active_key`) returns the agent's active
+/// SIGNING key and never its `identity-legacy` key: after 161 every agent has
+/// an active legacy row whose private half is often computable from public
+/// inputs, and the route rotates whatever this returns (review CR2).
+/// CALIBRATION: a registered identity's signing key is found, even when a
+/// legacy row is newer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_active_key_lookup_never_returns_a_legacy_identity_key(pool: PgPool) {
+    let legacy_only = plain_agent(&pool, "software_agent").await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, 'identity-legacy', 'active', now())",
+    )
+    .bind(legacy_only)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed a legacy key");
+    let got = epigraph_db::AgentKeyRepository::get_active_key(
+        &pool,
+        epigraph_core::AgentId::from_uuid(legacy_only),
+    )
+    .await
+    .expect("lookup");
+    assert!(
+        got.is_none(),
+        "the lookup returned a {:?} key for an agent with no signing key",
+        got.map(|k| k.key_type)
+    );
+
+    let id = new_identity();
+    let r = register(&pool, &id, None, "g-lookup", snapshot("g", "l")).await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, created_at) \
+         VALUES ($1, $2, 'identity-legacy', 'active', now(), now() + interval '1 hour')",
+    )
+    .bind(r.agent_id)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed a NEWER legacy key on the registered identity");
+    let got = epigraph_db::AgentKeyRepository::get_active_key(
+        &pool,
+        epigraph_core::AgentId::from_uuid(r.agent_id),
+    )
+    .await
+    .expect("lookup")
+    .expect("the registered identity's signing key");
+    assert_eq!(got.key_type, "signing");
+    assert_eq!(got.public_key, id.signing);
+}
+
+/// A container that learns an identity's signing public key (it is on every
+/// claim the identity signs) and records it as a key of its own, of a type the
+/// application may still write, must not stop the host re-registering that
+/// identity with its own key (review CR4b). CALIBRATION: the squat itself
+/// lands, so the re-registration is not passing because nothing was planted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_signing_key_does_not_block_re_registration(pool: PgPool) {
+    let id = new_identity();
+    let first = register(&pool, &id, None, "g-squat", snapshot("g v1", "l")).await;
+    let squatter = plain_agent(&pool, "software_agent").await;
+    let signing = id.signing.clone();
+    as_app_stamped(&pool, squatter, &[], |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+             VALUES ($1, $2, 'encryption', 'active')",
+        )
+        .bind(squatter)
+        .bind(&signing)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: the squat lands");
+        (conn, ())
+    })
+    .await;
+    let again = try_register(&pool, &id, None, "g-squat", snapshot("g v2", "l"))
+        .await
+        .expect("a squatted copy of the bound key must not block the identity's own host");
+    assert_eq!(again.agent_id, first.agent_id);
+    assert!(again.snapshot_created);
 }
