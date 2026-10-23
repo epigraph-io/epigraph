@@ -1564,10 +1564,8 @@ pub enum VacateOutcome {
 ///
 /// The caller decides WHICH atoms (only ids on an operator-accepted list);
 /// this function refuses every claim the vacate is not for, whatever the
-/// list says: a compound, a procedural or rule claim, and an atom with AEF
-/// input (read as the single atom-cache writer reads it, under
-/// `compound_source_edges`). The PR-0 guard keeps every bulk recompute from
-/// writing this value, so this is the one bulk path to it.
+/// list says ([`vacate_refusal`]). The PR-0 guard keeps every bulk recompute
+/// from writing this value, so this is the one bulk path to it.
 ///
 /// # Errors
 /// A database read or write.
@@ -1577,18 +1575,53 @@ pub async fn vacate_atom_cache(
     claim_id: Uuid,
     compound_source_edges: crate::atom_items::CompoundSourceEdges,
 ) -> Result<VacateOutcome, String> {
+    if let Some(refused) =
+        vacate_refusal(&mut *conn, viewer, claim_id, compound_source_edges).await?
+    {
+        if refused == VacateOutcome::Compound {
+            COMPOUND_CACHE_WRITE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(refused);
+    }
+    let ctx = crate::belief_query::FramedBeliefContext::global();
+    let written = write_atom_cache(
+        conn,
+        viewer,
+        claim_id,
+        &crate::atom_items::EvidencedInterval::unproven(),
+        false,
+        &ctx.calibration,
+    )
+    .await?;
+    Ok(VacateOutcome::Vacated { written })
+}
+
+/// Why [`vacate_atom_cache`] refuses `claim_id` (the outcome it returns
+/// without writing), or `None` when it would write the vacuous cache. The
+/// ONE refusal ladder: the vacate and its dry run both read it. Writes
+/// nothing.
+///
+/// Refused: a claim the viewer cannot see, a compound, a procedural or rule
+/// claim, and an atom with AEF input (read as the single atom-cache writer
+/// reads it, under `compound_source_edges`).
+///
+/// # Errors
+/// A database read.
+pub async fn vacate_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    compound_source_edges: crate::atom_items::CompoundSourceEdges,
+) -> Result<Option<VacateOutcome>, String> {
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     let roles = roles_batch(&mut *conn, viewer, &[claim_id])
         .await
         .map_err(|e| format!("roles_batch: {e}"))?;
     match roles.get(&claim_id).copied() {
-        None => return Ok(VacateOutcome::NotVisible),
-        Some(ClaimRole::Compound { .. }) => {
-            COMPOUND_CACHE_WRITE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(VacateOutcome::Compound);
-        }
-        Some(ClaimRole::Procedural | ClaimRole::Rule) => return Ok(VacateOutcome::NotAnAtom),
+        None => return Ok(Some(VacateOutcome::NotVisible)),
+        Some(ClaimRole::Compound { .. }) => return Ok(Some(VacateOutcome::Compound)),
+        Some(ClaimRole::Procedural | ClaimRole::Rule) => return Ok(Some(VacateOutcome::NotAnAtom)),
         Some(ClaimRole::Standalone | ClaimRole::Atom) => {}
     }
     let ctx = crate::belief_query::FramedBeliefContext::global();
@@ -1603,19 +1636,7 @@ pub async fn vacate_atom_cache(
     .await?
     .get(&claim_id)
     .is_some_and(|rows| !rows.is_empty());
-    if has_input {
-        return Ok(VacateOutcome::HasAefInput);
-    }
-    let written = write_atom_cache(
-        conn,
-        viewer,
-        claim_id,
-        &crate::atom_items::EvidencedInterval::unproven(),
-        false,
-        &ctx.calibration,
-    )
-    .await?;
-    Ok(VacateOutcome::Vacated { written })
+    Ok(has_input.then_some(VacateOutcome::HasAefInput))
 }
 
 /// Write an AEF value to the claim's cache, stamped `binary_truth`, and its

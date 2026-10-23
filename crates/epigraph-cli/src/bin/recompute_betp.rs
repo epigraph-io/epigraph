@@ -456,39 +456,17 @@ async fn run_dry(
             accepted.sha256,
             accepted.rules
         );
-        // The same AEF-input read the vacate's own refusal uses.
-        let with_input: HashSet<Uuid> = {
-            let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-            epigraph_engine::atom_items::atom_axiom_rows_under(
+        // The vacate's own refusal ladder, read-only.
+        let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+        for &id in &accepted.ids {
+            let refusal = epigraph_engine::edge_factor::vacate_refusal(
                 &mut conn,
                 viewer,
-                &accepted.ids,
-                epigraph_engine::atom_items::AxiomMode::Display,
-                &epigraph_engine::belief_query::FramedBeliefContext::global(),
+                id,
                 settings.compound_source_edges,
             )
-            .await?
-            .into_iter()
-            .filter(|(_, rows)| !rows.is_empty())
-            .map(|(id, _)| id)
-            .collect()
-        };
-        let roles = epigraph_db::repos::claim_role::roles_batch(pool, viewer, &accepted.ids)
-            .await
-            .map_err(|e| format!("roles_batch: {e}"))?;
-        for id in &accepted.ids {
-            let verdict = match roles.get(id) {
-                None => "skipped: not found",
-                Some(epigraph_db::repos::claim_role::ClaimRole::Compound { .. }) => {
-                    "skipped: compound"
-                }
-                Some(
-                    epigraph_db::repos::claim_role::ClaimRole::Procedural
-                    | epigraph_db::repos::claim_role::ClaimRole::Rule,
-                ) => "skipped: not an atom",
-                Some(_) if with_input.contains(id) => "skipped: has AEF input",
-                Some(_) => "would vacate",
-            };
+            .await?;
+            let verdict = refusal.map_or("would_vacate", vacate_key);
             println!("{}", serde_json::json!({"claim_id": id, "vacate": verdict}));
         }
     }
@@ -776,6 +754,18 @@ async fn run_wave_batches(
     }
 }
 
+/// The report key of a vacate outcome, shared by the run and its dry run.
+const fn vacate_key(outcome: VacateOutcome) -> &'static str {
+    match outcome {
+        VacateOutcome::Vacated { written: true } => "vacated",
+        VacateOutcome::Vacated { written: false } => "not_taken_by_cache",
+        VacateOutcome::NotVisible => "skipped_not_found",
+        VacateOutcome::Compound => "skipped_compound",
+        VacateOutcome::NotAnAtom => "skipped_not_an_atom",
+        VacateOutcome::HasAefInput => "skipped_has_aef_input",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_vacate_batches(
     cli: &Cli,
@@ -800,14 +790,7 @@ async fn run_vacate_batches(
                 .await
             {
                 Ok(o) => {
-                    let key = match o {
-                        VacateOutcome::Vacated { written: true } => "vacated",
-                        VacateOutcome::Vacated { written: false } => "not_taken_by_cache",
-                        VacateOutcome::NotVisible => "skipped_not_found",
-                        VacateOutcome::Compound => "skipped_compound",
-                        VacateOutcome::NotAnAtom => "skipped_not_an_atom",
-                        VacateOutcome::HasAefInput => "skipped_has_aef_input",
-                    };
+                    let key = vacate_key(o);
                     *counts.entry(key).or_default() += 1;
                     if key != "vacated" {
                         println!("  {claim_id}: {key}");
