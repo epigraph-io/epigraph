@@ -1043,7 +1043,7 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
 /// The test harness connects as a superuser, where row security does not
 /// apply, so this pins the SQL: no `VISIBILITY` splice on the compound test.
 /// (On a connection where row security applies, the server's own filtering
-/// still hides the edge; see `frozen_compound_predicate`.) The two public
+/// still hides the edge; see the `claim_role` module doc.) The two public
 /// viewer callers are the arms that can see a splice; the MCP caller runs on a
 /// maintenance session and is kept for completeness.
 #[sqlx::test(migrations = "../../migrations")]
