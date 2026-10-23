@@ -1,17 +1,27 @@
-//! Backfill stale cached `claims.pignistic_prob` (and `belief`,
-//! `plausibility`, `conflict_k`, `mass_on_missing`) on the cohort of claims
-//! whose combined belief was last written under the superseded
-//! raw-`source_strength` model, before issue #197's dynamic
-//! `effective_source_strength` derivation (evidence_type + locality +
-//! per-frame override + calibration) existed.
+//! The `recompute_betp` operator binary's library half (atom-level belief
+//! program, SPEC §10.3-§10.8).
 //!
-//! Backlog claim f2521c53-86bb-4b3b-96b4-a5cc963f8015.
+//! * **Cohort v2, the waves** ([`select_wave_cohort`], [`write_wave_claim`]):
+//!   current standalone or leaf atoms with AEF input, each written through
+//!   the single atom-cache writer (`epigraph_engine::edge_factor::
+//!   recompute_atom_cache`) in its own transaction, recorded before commit in
+//!   a wave file ([`WaveLog`]) that `restore_belief_cache` undoes by
+//!   compare-and-swap, with the atom's per-scope rows resynced from the fold.
+//! * **The disk gate** ([`DiskGate`]) a writing run passes before every
+//!   batch.
+//! * **The accepted-vacate path** ([`parse_accept_list`],
+//!   [`vacate_listed_claim`]): the explicit vacuous cache, only for listed
+//!   residue atoms.
+//! * **The drift decomposition** ([`drift_decomposition`]) a wave's dry run
+//!   reports, from snapshot S0.
+//! * **Cohort v1** ([`select_cohort`], [`preview_claim`],
+//!   [`predict_cached_after`]): #197's arms (a) and (b) under the legacy owner
+//!   fold, kept as a dry-run report only (its apply is removed, SPEC §10.7).
 //!
-//! Reuses the canonical recompute entry point
-//! (`epigraph_engine::edge_factor::recompute_claim_belief_on_frame` /
-//! `preview_claim_belief_on_frame`) rather than re-deriving discount+combine
-//! logic — see `crates/epigraph-cli/src/bin/recompute_claim_belief.rs` for
-//! the established per-claim, per-frame pattern this module mirrors.
+//! Backlog claim f2521c53-86bb-4b3b-96b4-a5cc963f8015 (cohort v1). The SQL
+//! lives here, not in `epigraph-db/src/repos/`, for the same reason as
+//! `belief_cache`'s: corpus-wide maintenance statements of an operator
+//! binary, on the maintenance connection.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write as _;
