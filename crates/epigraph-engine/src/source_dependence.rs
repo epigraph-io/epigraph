@@ -383,34 +383,56 @@ fn is_bare_doi(t: &str) -> bool {
             .is_some_and(|suffix| !suffix.trim().is_empty())
 }
 
-/// The source a `source_url` names, if any. The column holds whatever the
-/// writer passed (MCP testimony stores a witness's name or a note there as
-/// often as a link), and `url:` is agent-free, so only a real link is a key:
-/// - a DOI link or a `doi:` label names its DOI or nothing (a resolver link
-///   with no DOI behind it is not a web page that rows could share);
-/// - a bare, well-formed DOI names that DOI;
-/// - an `http(s)://` link names its URL;
-/// - anything else (free text, a scheme-less host) names nothing, and the
-///   row keys on its evidence id.
-fn source_url_key(url: &str) -> Option<ItemKey> {
-    let t = url.trim();
-    if peel_doi_prefixes(t).is_some() || is_bare_doi(t) {
-        normalize_doi(t).map(ItemKey::Doi)
-    } else if is_web_url(t) {
+/// The source one identity value names, if any. `doi:` and `url:` are
+/// agent-free, so only a real identifier is a key:
+/// - a DOI link or a `doi:` label names the DOI behind it, or the web link it
+///   wraps (`doi:<uri>`, the label ingest builds for a document identified by
+///   its URI), or nothing (a resolver link with no DOI behind it is not a web
+///   page that rows could share);
+/// - an `http(s)://` link names its URL. Ingest stores a document's URI in
+///   `properties.doi` when it has no DOI and no arXiv id, and a citation of
+///   that document carries the same URI as its `source_url`; both must give
+///   one key;
+/// - a bare value names a DOI when `bare_is_doi` accepts it, else nothing.
+fn named_source(raw: &str, bare_is_doi: fn(&str) -> bool) -> Option<ItemKey> {
+    let t = raw.trim();
+    let (t, bare) = match peel_doi_prefixes(t) {
+        Some(inner) => (inner.trim(), false),
+        None => (t, true),
+    };
+    if is_web_url(t) {
         normalize_source_url(t).map(ItemKey::Url)
+    } else if !bare || bare_is_doi(t) {
+        normalize_doi(t).map(ItemKey::Doi)
     } else {
         None
     }
+}
+
+/// `properties.doi` is written by ingest (a DOI, an arXiv-style id, a
+/// synthesized document key or a URI), so any bare value is a document
+/// identifier unless it is a placeholder ([`normalize_doi`] rejects those).
+fn doi_field_key(doi: &str) -> Option<ItemKey> {
+    named_source(doi, |_| true)
+}
+
+/// `source_url` holds whatever the writer passed (MCP testimony stores a
+/// witness's name or a note there as often as a link), so a bare value is a
+/// DOI only in the well-formed `10.` shape, and free text or a scheme-less
+/// host names nothing: the row keys on its evidence id.
+fn source_url_key(url: &str) -> Option<ItemKey> {
+    named_source(url, is_bare_doi)
 }
 
 /// The canonical [`ItemKey`] of one BBA row (SPEC §3.3). The first rule that
 /// matches wins:
 ///
 /// 1. `doi:` — `evidence` carries a DOI in `properties.doi`, or its
-///    `source_url` is a DOI link ([`normalize_doi`]);
-/// 2. `url:` — `evidence` carries an `http(s)://` `source_url` that is not a
-///    DOI link ([`normalize_source_url`]); free text in that column names no
-///    source;
+///    `source_url` is a DOI link or a well-formed bare DOI ([`normalize_doi`];
+///    placeholders such as "unknown" are no DOI);
+/// 2. `url:` — `evidence` names an `http(s)://` link that is not a DOI link,
+///    in `source_url` or (for a document ingest identified by its URI) in
+///    `properties.doi` ([`normalize_source_url`]); free text names no source;
 /// 3. `ev:` — `evidence` carries neither;
 /// 4. `attr:` — an [`ATTRIBUTED_METHOD`] row citing no evidence (a textless
 ///    attribution; its perspective is the original BBA's id), or `edge:` — an
@@ -438,13 +460,18 @@ pub fn item_key(
     asserting_paper: Option<Uuid>,
 ) -> ItemKey {
     if let Some(ev) = evidence {
-        if let Some(doi) = ev.doi.as_deref().and_then(normalize_doi) {
-            return ItemKey::Doi(doi);
-        }
-        return ev
-            .source_url
-            .as_deref()
-            .and_then(source_url_key)
+        let named = [
+            ev.doi.as_deref().and_then(doi_field_key),
+            ev.source_url.as_deref().and_then(source_url_key),
+        ];
+        // A DOI from either column outranks a URL from either column.
+        let doi = named
+            .iter()
+            .flatten()
+            .find(|k| matches!(k, ItemKey::Doi(_)));
+        return doi
+            .or_else(|| named.iter().flatten().next())
+            .cloned()
             .unwrap_or(ItemKey::Evidence(ev.id));
     }
     let method = row.combination_method.as_deref();
