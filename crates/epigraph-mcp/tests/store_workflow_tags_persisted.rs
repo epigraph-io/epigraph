@@ -13,11 +13,10 @@
 //! # Verified to fail
 //!
 //! At origin/main 9af9db2a the three tag-carrying arms failed on the
-//! `metadata.tags`
-//! assertion. With no caller `metadata.tags`, the stored metadata had no `tags`
-//! key at all (only `prerequisites` and the submitter key); with a caller
-//! `metadata.tags: ["legacy"]`, it stayed `["legacy"]` and every `source.tags`
-//! entry was lost.
+//! `metadata.tags` assertion. With no caller `metadata.tags`, the stored
+//! metadata had no `tags` key at all (only `prerequisites` and the submitter
+//! key); with a caller `metadata.tags: ["legacy"]`, it stayed `["legacy"]` and
+//! every `source.tags` entry was lost.
 
 use epigraph_ingest::workflow::WorkflowExtraction;
 use epigraph_mcp::types::{IngestWorkflowParams, StoreWorkflowParams};

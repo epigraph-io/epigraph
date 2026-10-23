@@ -136,6 +136,8 @@ pub struct StoreWorkflowRequest {
     pub prerequisites: Option<Vec<String>>,
     pub expected_outcome: Option<String>,
     pub confidence: Option<f64>,
+    /// Stored on the workflows row as `metadata.tags` (trimmed, empties
+    /// dropped, de-duplicated); not added as claim labels.
     pub tags: Option<Vec<String>>,
 }
 
