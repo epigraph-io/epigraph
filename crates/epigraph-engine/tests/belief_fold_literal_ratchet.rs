@@ -33,12 +33,16 @@
 
 use std::path::PathBuf;
 
-/// Fold modules under the ratchet, relative to this crate's `src/`.
+/// Fold modules under the ratchet, relative to this crate's `src/`. The MCP
+/// DS write folds (`auto_wire_ds_for_claim`, `auto_wire_ds_update`) are the
+/// second production fold that writes the served cache, so they are scanned
+/// here too, by their path in the sibling crate.
 const FOLD_MODULES: &[&str] = &[
     "belief_query.rs",
     "edge_factor.rs",
     "source_dependence.rs",
     "belief_profile.rs",
+    "../../epigraph-mcp/src/tools/ds_auto.rs",
 ];
 
 const ALLOW_MARKER: &str = "belief-profile: allow-literal";
