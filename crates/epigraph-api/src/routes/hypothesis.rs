@@ -547,12 +547,35 @@ pub async fn promote_hypothesis(
 
     // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
     // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
+    //
+    // The promotion MOVES the BBA: the source row is retired in the same
+    // transaction (backlog 846b808e). Both frames are binary, so a copy left
+    // beside its source was read, and for an evidence-less row folded, twice.
+    // A caller who cannot retire the source is refused and nothing is written.
     if let Some(latest) = mass_rows.last() {
         epigraph_db::MassFunctionRepository::copy_to_frame(&mut *tx, latest, rv_frame.0)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to copy mass function: {e}"),
             })?;
+        let retired = epigraph_db::ExperimentRepository::retire_promoted_hypothesis_bba(
+            &mut *tx,
+            &viewer,
+            latest.id,
+            id,
+            hyp_frame.0,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to retire the promoted mass function: {e}"),
+        })?;
+        if !retired {
+            return Err(ApiError::Forbidden {
+                reason: "promotion moves the hypothesis_assessment BBA onto research_validity, \
+                         and this caller cannot retire that BBA; nothing was written"
+                    .to_string(),
+            });
+        }
     }
 
     // 2. Add to research_validity frame
