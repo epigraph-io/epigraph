@@ -15,9 +15,18 @@
 //!
 //! The restore puts `before` back only where the row still holds exactly
 //! `written` ([`restore_wave`]); everything else is reported, never
-//! overwritten. It restores `claims.*` only: per-frame `ds_combined_beliefs`
-//! rows, edge-factor BBAs and anything downstream are the follow-up re-wire's
-//! (SPEC §10.8, "only with the follow-up re-wire").
+//! overwritten. It restores the seven `claims` cache columns and nothing
+//! else:
+//!
+//! * edge-factor BBAs on the targets of a wave claim's edges, and what they
+//!   feed, are the follow-up targeted re-wire's ([`downstream_edges`] lists
+//!   them; SPEC §10.8, "only with the follow-up re-wire");
+//! * a wave claim's OWN per-frame `ds_combined_beliefs` rows are covered by
+//!   NOTHING here or in that re-wire: the re-wire rewrites edge-factor BBAs
+//!   and the target's `claims` cache, never `ds_combined_beliefs`, and a wave
+//!   claim is a source, not a target. A wave that rewrites those rows must
+//!   record their `before` and `written` values itself and have them restored
+//!   the same way; a [`WaveRecord`] does not carry them.
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `recompute_betp`'s: it is an operator binary's corpus-wide
