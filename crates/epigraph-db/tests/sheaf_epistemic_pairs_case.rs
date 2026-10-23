@@ -78,8 +78,10 @@ async fn insert_edge(pool: &PgPool, src: Uuid, tgt: Uuid, relationship: &str, re
 
 type Triple = (Uuid, Uuid, String);
 
-/// The seeded graph. Every edge has its own pair of endpoints, so a returned
-/// `(source, target)` identifies exactly one seeded edge.
+/// The seeded graph. Every edge has its own pair of endpoints except the
+/// dual-spelled pair, which carries `supports` and `SUPPORTS` between the same
+/// two claims; a returned `(source, target, relationship)` therefore identifies
+/// exactly one seeded edge.
 struct Seed {
     /// In-force edges whose relationship, folded to lower case, is epistemic.
     epistemic: BTreeSet<Triple>,
@@ -89,6 +91,9 @@ struct Seed {
     non_epistemic: Triple,
     /// A retracted upper-case `SUPPORTS` edge: must never be returned.
     retracted: Triple,
+    /// `supports` and `SUPPORTS` between ONE pair (also in `epistemic`): the
+    /// documented contract is two rows, one per stored spelling.
+    dual_spelled: [Triple; 2],
     /// Every claim the seed created.
     claims: BTreeSet<Uuid>,
 }
@@ -130,6 +135,18 @@ async fn seed(pool: &PgPool) -> Seed {
         epistemic.insert(t);
     }
 
+    // Both spellings between one pair. The non-authored uniqueness index is on
+    // the raw `(source_id, target_id, relationship)`, so writers can store both.
+    let (a, b) = pair().await;
+    insert_edge(pool, a, b, "supports", false).await;
+    insert_edge(pool, a, b, "SUPPORTS", false).await;
+    claims.extend([a, b]);
+    let dual_spelled = [
+        (a, b, "supports".to_string()),
+        (a, b, "SUPPORTS".to_string()),
+    ];
+    epistemic.extend(dual_spelled.iter().cloned());
+
     let (a, b) = pair().await;
     insert_edge(pool, a, b, "DERIVED_FROM", false).await;
     claims.extend([a, b]);
@@ -145,6 +162,7 @@ async fn seed(pool: &PgPool) -> Seed {
         lower_control: lower_control.expect("supports seeded"),
         non_epistemic,
         retracted,
+        dual_spelled,
         claims,
     }
 }
@@ -224,5 +242,59 @@ async fn pairs_query_sees_the_same_edges_as_the_neighbour_query(pool: PgPool) {
         from_pairs, from_neighbours,
         "cohomology and consistency must describe the same graph: \
          left = pairs query, right = neighbour query (outgoing rows)"
+    );
+}
+
+/// Two spellings of one relationship between the same pair are two rows in the
+/// pairs query, and the neighbour query agrees. Folding them into one (e.g. a
+/// `DISTINCT ON (source_id, target_id, lower(relationship))` in only one of the
+/// queries) would make cohomology and consistency describe different graphs;
+/// doing it in both is a deliberate change that must update this test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_spellings_between_one_pair_are_two_rows(pool: PgPool) {
+    let s = seed(&pool).await;
+    let (a, b, _) = &s.dual_spelled[0];
+
+    let stored: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT relationship FROM edges WHERE source_id = $1 AND target_id = $2",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .expect("read back")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        stored,
+        BTreeSet::from(["SUPPORTS".to_string(), "supports".to_string()]),
+        "PREMISE: both spellings are stored as two edges between one pair"
+    );
+
+    let pair_rows: BTreeSet<Triple> = edge_pairs(&pool, &s.claims)
+        .await
+        .into_iter()
+        .filter(|(src, tgt, _)| src == a && tgt == b)
+        .collect();
+    assert_eq!(
+        pair_rows,
+        BTreeSet::from(s.dual_spelled.clone()),
+        "the pairs query returns one row per stored spelling"
+    );
+
+    let neighbour_rows: BTreeSet<Triple> = SheafRepository::get_claim_neighbor_betp_pairs(
+        &pool,
+        &fixture::public_viewer(&pool).await,
+        None,
+    )
+    .await
+    .expect("get_claim_neighbor_betp_pairs")
+    .into_iter()
+    .filter(|r| r.direction == "outgoing" && r.claim_id == *a && r.neighbor_id == *b)
+    .map(|r| (r.claim_id, r.neighbor_id, r.relationship))
+    .collect();
+    assert_eq!(
+        neighbour_rows, pair_rows,
+        "the neighbour query reads the same two rows"
     );
 }
