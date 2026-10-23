@@ -125,9 +125,25 @@ async fn try_register_as(
     snap: Value,
     principal: Option<String>,
 ) -> Result<Registered, sqlx::Error> {
+    try_register_full(pool, role, id, MODEL, parent, group, signing, snap, principal).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_register_full(
+    pool: &PgPool,
+    role: &str,
+    id: &Identity,
+    model: &str,
+    parent: Option<Uuid>,
+    group: &str,
+    signing: Option<Vec<u8>>,
+    snap: Value,
+    principal: Option<String>,
+) -> Result<Registered, sqlx::Error> {
     let pubkey = id.pubkey.clone();
     let hash = id.prompt_hash.clone();
     let group = group.to_string();
+    let model = model.to_string();
     fixture::as_role(pool, role, |mut conn| async move {
         // ALWAYS set both, '' for "no principal": a session-level setting
         // survives on a pooled connection, so leaving it unset would inherit
@@ -148,7 +164,7 @@ async fn try_register_as(
         )
         .bind(&pubkey)
         .bind(parent)
-        .bind(MODEL)
+        .bind(&model)
         .bind(&hash)
         .bind(&group)
         .bind(signing)
@@ -1751,4 +1767,212 @@ async fn a_squatted_signing_key_does_not_block_re_registration(pool: PgPool) {
         .expect("a squatted copy of the bound key must not block the identity's own host");
     assert_eq!(again.agent_id, first.agent_id);
     assert!(again.snapshot_created);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Council review: what a registration inherits and reports (CR3, CR4a, CR4c,
+// CR8/TC10).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `(inherited, link_live, inherit_reason, operator_id)` of one attestor
+/// registration, read by NAME so a result that lacks a column fails here.
+async fn register_outcome(
+    pool: &PgPool,
+    id: &Identity,
+    parent: Option<Uuid>,
+    group: &str,
+    snap: Value,
+) -> (bool, bool, Option<String>, Option<Uuid>) {
+    let (pubkey, hash, signing, group) = (
+        id.pubkey.clone(),
+        id.prompt_hash.clone(),
+        id.signing.clone(),
+        group.to_string(),
+    );
+    fixture::as_role(pool, ATTESTOR, |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT inherited, link_live, inherit_reason, operator_id \
+               FROM public.epigraph_register_agent_identity($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&pubkey)
+        .bind(parent)
+        .bind(MODEL)
+        .bind(&hash)
+        .bind(&group)
+        .bind(&signing)
+        .bind(&snap)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the attestor registers")
+}
+
+/// One identity is shared by every group with the same model and files (the
+/// empty-files identity of a fresh group above all). An identity that is
+/// UNLINKED and already runs in another group must not take the operator of
+/// whichever group's parent names it first: a container controls its own
+/// LEARNED.md, so it controls which shared identity its group runs next, and
+/// every other group running that identity would then write as that operator
+/// (review CR3). The lineage is still recorded; the link is left to a manual
+/// act. CALIBRATIONS: an identity with no other group inherits from the same
+/// parent, and an identity that inherited in its first group says
+/// `already_linked` in its second.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unlinked_identity_running_in_another_group_inherits_nothing(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-own").await;
+
+    let shared = new_identity();
+    let fresh_group = register(&pool, &shared, None, "g-fresh", snapshot("template", "")).await;
+    assert_eq!(fresh_group.inherit_reason.as_deref(), Some("no_parent"));
+
+    let r = register(
+        &pool,
+        &shared,
+        Some(parent),
+        "g-own",
+        snapshot("template", ""),
+    )
+    .await;
+    assert!(r.succession_created, "the lineage is still recorded");
+    assert!(!r.inherited, "a shared unlinked identity must not inherit");
+    assert_eq!(r.inherit_reason.as_deref(), Some("shared_identity"));
+    assert_eq!(r.operator_id, None);
+    assert_eq!(human_of(&pool, r.agent_id, false).await, None);
+
+    let solo = register(&pool, &new_identity(), Some(parent), "g-own", snapshot("t", "x")).await;
+    assert!(
+        solo.inherited,
+        "CALIBRATION: an identity with no other group inherits"
+    );
+
+    let first = new_identity();
+    let a = register(&pool, &first, Some(parent), "g-own", snapshot("t", "y")).await;
+    assert!(a.inherited);
+    let b = register(&pool, &first, Some(parent), "g-other", snapshot("t", "y")).await;
+    assert_eq!(b.inherit_reason.as_deref(), Some("already_linked"));
+    assert_eq!(b.operator_id, Some(operator));
+}
+
+/// `agents.properties` is application-writable on the agent's own row (118's
+/// column grant, 077's `agents_self_update`), and the principal is a variable
+/// any login can set. So a container that rewrites an identity's recorded
+/// model must neither block the host's next registration of it (every group
+/// running it would fail to start) nor change what the identity is: the
+/// registration compares against the snapshots it alone writes and re-asserts
+/// the properties (review CR4a). CALIBRATION: the rewrite lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewriting_an_identitys_properties_neither_blocks_nor_redefines_it(pool: PgPool) {
+    let id = new_identity();
+    let r = register(&pool, &id, None, "g-props", snapshot("g", "l")).await;
+    let agent = r.agent_id;
+    let rewritten = as_app_stamped(&pool, agent, &[], |mut conn| async move {
+        let n = sqlx::query(
+            "UPDATE agents SET properties = properties || \
+                    jsonb_build_object('llm_model', 'forged-model', 'llm_prompt_hash', $2::text) \
+              WHERE id = $1",
+        )
+        .bind(agent)
+        .bind("0".repeat(64))
+        .execute(&mut *conn)
+        .await
+        .expect("an application session rewrites its own properties")
+        .rows_affected();
+        (conn, n)
+    })
+    .await;
+    assert_eq!(rewritten, 1, "CALIBRATION: the rewrite lands");
+
+    let again = try_register(&pool, &id, None, "g-props", snapshot("g", "l2"))
+        .await
+        .expect("a rewritten properties document must not block the host");
+    assert_eq!(again.agent_id, agent);
+    let props: Value = sqlx::query_scalar("SELECT properties FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("properties");
+    assert_eq!(props["llm_model"], json!(MODEL));
+    assert_eq!(props["llm_prompt_hash"], json!(id.prompt_hash));
+}
+
+/// OPERATED_BY edges are writable by any application session (122's own
+/// comment), and two of them from one agent are 107's shared-signer
+/// fingerprint, which the link body refuses with 55000. A container that
+/// forges that fingerprint on an unlinked identity must not abort the host's
+/// registration of it (the group could not start): the registration records
+/// the identity, inherits nothing and says why (review CR4c). CALIBRATION:
+/// the forged edges land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_shared_signer_fingerprint_does_not_abort_registration(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-fp").await;
+    let x = new_identity();
+    let first = register(&pool, &x, None, "g-fp", snapshot("g", "l1")).await;
+    let (forger, forger_group) = fixture::seed_agent_with_group(&pool, "forger").await;
+    let (p1, p2) = (
+        plain_agent(&pool, "system").await,
+        plain_agent(&pool, "system").await,
+    );
+    let target = first.agent_id;
+    as_app_stamped(&pool, forger, &[forger_group], |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY'), \
+                    ($1, 'agent', $3, 'agent', 'OPERATED_BY')",
+        )
+        .bind(target)
+        .bind(p1)
+        .bind(p2)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: an application session writes the forged edges");
+        (conn, ())
+    })
+    .await;
+
+    let r = try_register(&pool, &x, Some(parent), "g-fp", snapshot("g", "l2"))
+        .await
+        .expect("forged edges must not abort the host's registration");
+    assert!(r.snapshot_created && r.succession_created);
+    assert!(!r.inherited);
+    assert_eq!(r.inherit_reason.as_deref(), Some("link_refused"));
+    assert_eq!(human_of(&pool, r.agent_id, false).await, None);
+}
+
+/// The result says whether the child can write afterwards (`link_live`), and a
+/// child whose own link to the parent's operator is RETIRED is reported as
+/// such, not as `already_linked` (review TC10/CR8): the host alerts on it,
+/// because the identity will fail at boot. CALIBRATION: a live-linked child
+/// of the same operator is `already_linked` with `link_live`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_child_whose_own_link_is_retired_is_reported_retired(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let parent = live_linked_parent(&pool, operator, "g-ret").await;
+    let child = new_identity();
+    let c = register(&pool, &child, None, "g-ret", snapshot("g", "l")).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_retired_agent(&mut conn, c.agent_id, operator).await;
+        (conn, r)
+    })
+    .await
+    .expect("retire-link the child to the same operator");
+
+    let (inherited, live, reason, op) =
+        register_outcome(&pool, &child, Some(parent), "g-ret", snapshot("g", "l2")).await;
+    assert!(!inherited);
+    assert!(!live, "a retired link cannot write");
+    assert_eq!(reason.as_deref(), Some("child_link_retired"));
+    assert_eq!(op, Some(operator));
+
+    let sibling = new_identity();
+    let s = register(&pool, &sibling, None, "g-ret2", snapshot("g", "s")).await;
+    link(&pool, s.agent_id, operator).await;
+    let (inherited, live, reason, _) =
+        register_outcome(&pool, &sibling, Some(parent), "g-ret2", snapshot("g", "s2")).await;
+    assert!(!inherited);
+    assert!(live, "CALIBRATION: a live-linked child can write");
+    assert_eq!(reason.as_deref(), Some("already_linked"));
 }
