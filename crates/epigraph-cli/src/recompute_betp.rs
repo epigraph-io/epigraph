@@ -353,3 +353,89 @@ pub async fn select_wave_cohort(
     Ok(cohort)
 }
 
+// ── the disk gate (SPEC §10.4) ─────────────────────────────────────────────
+
+/// The disk gate a writing run passes before EVERY batch (SPEC §10.4): the
+/// free space on the data volume, less the batch's projected write volume,
+/// must stay at or above the headroom, and an optional operator command
+/// (backup and archive health, for example) must exit 0. A failure aborts the
+/// run before that batch writes anything.
+#[derive(Debug, Clone)]
+pub struct DiskGate {
+    /// A path on the volume to measure (the database's data volume).
+    pub path: std::path::PathBuf,
+    /// Headroom that must remain after the batch, in bytes.
+    pub min_free_bytes: u64,
+    /// Projected write volume per claim (WAL and archive), in bytes.
+    pub projected_bytes_per_claim: u64,
+    /// A shell command run before each batch; non-zero exit fails the gate.
+    pub check_cmd: Option<String>,
+}
+
+impl DiskGate {
+    /// Check the gate for a batch of `claims` claims.
+    ///
+    /// # Errors
+    /// Why the gate failed: the free space could not be read, the headroom
+    /// would be crossed, or the check command failed.
+    pub fn check(&self, claims: usize) -> Result<(), String> {
+        let free = free_bytes(&self.path)?;
+        let projected = self
+            .projected_bytes_per_claim
+            .saturating_mul(u64::try_from(claims).unwrap_or(u64::MAX));
+        let after = free.saturating_sub(projected);
+        if after < self.min_free_bytes {
+            return Err(format!(
+                "disk check failed on {}: {free} bytes free, {projected} projected for this \
+                 batch, leaves {after} < the {} byte headroom",
+                self.path.display(),
+                self.min_free_bytes
+            ));
+        }
+        if let Some(cmd) = &self.check_cmd {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .map_err(|e| format!("disk check command {cmd:?} could not run: {e}"))?;
+            if !status.success() {
+                return Err(format!("disk check command {cmd:?} failed: {status}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Free bytes on the volume holding `path`, from POSIX `df -P -k`.
+fn free_bytes(path: &std::path::Path) -> Result<u64, String> {
+    let out = std::process::Command::new("df")
+        .arg("-P")
+        .arg("-k")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("disk check: df could not run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "disk check: df {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_df_available_kib(&String::from_utf8_lossy(&out.stdout))
+        .map(|kib| kib.saturating_mul(1024))
+        .ok_or_else(|| {
+            format!(
+                "disk check: cannot read the available space for {} from df",
+                path.display()
+            )
+        })
+}
+
+/// The "Available" column (KiB) of `df -P -k` output's data line.
+fn parse_df_available_kib(out: &str) -> Option<u64> {
+    out.lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|v| v.parse().ok())
+}
+
