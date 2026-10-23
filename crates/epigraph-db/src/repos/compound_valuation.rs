@@ -120,7 +120,9 @@ pub struct CompoundOwnRow {
 /// ingest template rows, ordered by claim, then `created_at`, then id.
 ///
 /// The caller passes compounds; the classes that are not evidence about the
-/// claim (edge-factor, seed, propagated, `auto_cdst`) are the engine's to drop.
+/// claim (edge-factor, seed, propagated, `auto_cdst`) are the engine's to drop,
+/// and so is the side of a hypothesis' promotion it does not read
+/// (`hypothesis_promoted` is the claim's real flag, as the atom reader's).
 ///
 /// # Errors
 /// Returns [`DbError::QueryFailed`] if the query fails.
@@ -143,7 +145,8 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
                    f.name AS frame_name,
                    f.hypotheses AS frame_hypotheses,
                    cf.hypothesis_index,
-                   false AS hypothesis_promoted,
+                   COALESCE(c.properties->>'hypothesis_status' = 'promoted', false)
+                       AS hypothesis_promoted,
                    NULL::text AS edge_relationship,
                    NULL::uuid AS edge_source_id,
                    false AS edge_source_is_compound,
@@ -158,6 +161,7 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
                             /* {{VISIBILITY:ar}} */) AS refuting_citers
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
+            JOIN claims c ON c.id = mf.claim_id
             LEFT JOIN claim_frames cf
                    ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id
                   /* {{VISIBILITY:cf}} */
@@ -165,7 +169,7 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
               AND (array_length(f.hypotheses, 1) = 2 OR f.id = $2)
               AND NOT {cached}
               AND NOT {template}
-              /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */
+              /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */ /* {{VISIBILITY:c}} */
             ORDER BY mf.claim_id, mf.created_at, mf.id
             "#,
             cached = cached_combination_predicate("mf."),

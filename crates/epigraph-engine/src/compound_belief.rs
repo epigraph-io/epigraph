@@ -46,7 +46,8 @@ use epigraph_ds::conjunction::{
 use epigraph_ds::{DsError, FocalElement, MassFunction};
 
 use crate::atom_items::{
-    atom_axiom_rows, atom_fold, key_and_discount, read_rows, AxiomClass, AxiomMode, AxiomRow,
+    atom_axiom_rows, atom_fold, key_and_discount, read_rows, reads_this_side_of_promotion,
+    AxiomClass, AxiomMode, AxiomRow,
 };
 use crate::belief_query::FramedBeliefContext;
 use crate::belief_view::{
@@ -528,8 +529,9 @@ fn serve(
 /// max within a key), as the viewer sees them.
 ///
 /// Every visible row of the compound that is evidence about it (not an
-/// edge-factor, seed, propagated or `auto_cdst` row; cached combinations and
-/// the ingest template are never read) contributes its discounted
+/// edge-factor, seed, propagated or `auto_cdst` row, nor the side of a
+/// hypothesis' promotion its atom reader would not read; cached combinations
+/// and the ingest template are never read) contributes its discounted
 /// refutation mass α·f on ¬(∧ leaves): the f part of a textless (T2/T3) row,
 /// of a mixed row, and of a pure refutation left on the compound (a
 /// `conj_refute` decision writes no atom row).
@@ -559,10 +561,15 @@ async fn own_row_valuations(
         })
         .map(|r| r.input.row.id)
         .collect();
-    let evidence = read_rows(own.into_iter().map(|r| r.input).collect())?
-        .into_iter()
-        .filter(|(_, class, _)| *class == AxiomClass::Evidence)
-        .collect();
+    let evidence = read_rows(
+        own.into_iter()
+            .map(|r| r.input)
+            .filter(reads_this_side_of_promotion)
+            .collect(),
+    )?
+    .into_iter()
+    .filter(|(_, class, _)| *class == AxiomClass::Evidence)
+    .collect();
     let mut out: HashMap<Uuid, BTreeMap<ItemKey, f64>> = HashMap::new();
     for r in key_and_discount(conn, viewer, evidence, ctx).await? {
         let (_, f, _, _) = tfo(r.bba());

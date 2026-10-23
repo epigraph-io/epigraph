@@ -614,8 +614,9 @@ const HYPOTHESIS_FRAME_NAME: &str = "hypothesis_assessment";
 const PROMOTED_FRAME_NAME: &str = "research_validity";
 
 /// Step 1: a promoted hypothesis reads its promoted copy, any other claim its
-/// assessment; never both.
-fn reads_this_side_of_promotion(r: &AtomInputRow) -> bool {
+/// assessment; never both. A compound's own rows (`compound_belief`) follow
+/// the same rule.
+pub(crate) fn reads_this_side_of_promotion(r: &AtomInputRow) -> bool {
     if r.hypothesis_promoted {
         r.frame_name != HYPOTHESIS_FRAME_NAME
     } else {
