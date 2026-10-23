@@ -686,55 +686,103 @@ async fn edge_create_inserts_no_route_factor(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn bp_apply_skips_compounds(pool: PgPool) {
-    let (agent, group) = seed_agent_with_group(&pool, "bp-apply-compound").await;
-    let frame = binary_frame(&pool).await;
-    let k = claim(&pool, agent, group, "compound", 0.5).await;
-    let leaf = claim(&pool, agent, group, "leaf", 0.5).await;
-    let a = claim(&pool, agent, group, "evidenced atom", 0.5).await;
-    bba(&pool, a, frame, agent, 0.85).await;
-    // `k` is a compound by its in-force decomposes_to edge to `leaf`, and a
-    // BP variable through the evidential_support factor it shares with `a`.
-    decomposes_to(&pool, k, leaf).await;
-    evidential_factor(&pool, k, a, None).await;
+    apply_skips_compounds_case(&pool, "cdst").await;
+}
 
-    let k_before = stored(&pool, k).await;
-    let state = state_bp_apply_on(&pool).await;
+/// One BP apply over a small decomposition, checked claim by claim:
+///
+/// * `k` (a root: `k -> m`) and `m` (a mid node: `m -> leaf`) are compounds
+///   and must not be written (D4);
+/// * `leaf` (a decomposes_to TARGET), `r` (whose only decomposes_to out-edge
+///   is retracted) and the standalone `a` are atoms and must be written with
+///   BP's value.
+///
+/// Every claim is a BP variable through an `evidential_support` factor it
+/// shares with the evidenced atom `a`.
+async fn apply_skips_compounds_case(pool: &PgPool, mode: &str) {
+    // The case owns the factor graph, so `skipped_compounds` counts this
+    // case's compounds only.
+    sqlx::query("DELETE FROM factors")
+        .execute(pool)
+        .await
+        .expect("clear the factor graph");
+    let (agent, group) = seed_agent_with_group(pool, &format!("bp-apply-compound-{mode}")).await;
+    let frame = binary_frame(pool).await;
+    let k = claim(pool, agent, group, "root compound", 0.5).await;
+    let m = claim(pool, agent, group, "mid compound", 0.5).await;
+    let leaf = claim(pool, agent, group, "leaf", 0.5).await;
+    let r = claim(pool, agent, group, "retracted decomposition", 0.5).await;
+    let x = claim(pool, agent, group, "retracted part", 0.5).await;
+    let a = claim(pool, agent, group, "evidenced atom", 0.85).await;
+    bba(pool, a, frame, agent, 0.85).await;
+    decomposes_to(pool, k, m).await;
+    decomposes_to(pool, m, leaf).await;
+    let retracted = decomposes_to(pool, r, x).await;
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+        .bind(retracted)
+        .execute(pool)
+        .await
+        .expect("retract r's decomposition");
+    for c in [k, m, leaf, r] {
+        evidential_factor(pool, c, a, None).await;
+    }
+
+    let before: BTreeMap<Uuid, _> = {
+        let mut map = BTreeMap::new();
+        for c in [k, m, leaf, r] {
+            map.insert(c, stored(pool, c).await);
+        }
+        map
+    };
+    let state = state_bp_apply_on(pool).await;
     let body = propagate(
-        &pool,
+        pool,
         &state,
         agent,
-        json!({"mode": "cdst", "apply_updates": true, "max_iterations": 30}),
+        json!({"mode": mode, "apply_updates": true, "max_iterations": 30}),
     )
     .await
     .expect("with BP apply on, apply_updates:true runs");
     let result = betps(&body);
 
-    // The compound is in the result set with a value that differs from what
-    // it has stored, so a write would be visible.
-    let k_betp = *result
-        .get(&k)
-        .unwrap_or_else(|| panic!("the compound is a BP variable: {body}"));
-    assert!(
-        (k_betp - k_before.2.unwrap()).abs() > 1e-4,
-        "precondition: BP computed a new value for the compound ({k_betp} vs {:?})",
-        k_before.2
-    );
-    assert_eq!(
-        stored(&pool, k).await,
-        k_before,
-        "BP apply wrote the compound {k}: atoms only (D4)"
-    );
+    // Precondition: BP computed a new value for every claim checked below, so
+    // a write, or its absence, is visible in the stored row.
+    for (name, c) in [("k", k), ("m", m), ("leaf", leaf), ("r", r)] {
+        let betp = *result
+            .get(&c)
+            .unwrap_or_else(|| panic!("{mode}: {name} is a BP variable: {body}"));
+        let was = before[&c].2.unwrap();
+        assert!(
+            (betp - was).abs() > 1e-4,
+            "{mode} precondition: BP computed a new value for {name} ({betp} vs {was})"
+        );
+    }
+
+    for (name, c) in [("root k", k), ("mid m", m)] {
+        assert_eq!(
+            stored(pool, c).await,
+            before[&c],
+            "{mode}: BP apply wrote the {name} {c}: atoms only (D4)"
+        );
+    }
     assert_eq!(
         body["skipped_compounds"].as_u64(),
-        Some(1),
-        "the response counts the compound it did not write: {body}"
+        Some(2),
+        "{mode}: the response counts the two compounds it did not write: {body}"
     );
 
-    // Positive control: the atom in the same run IS written, with BP's value.
-    let a_after = stored(&pool, a).await.2.expect("the atom was written");
-    assert!(
-        (a_after - result[&a]).abs() < 1e-12,
-        "control: the atom's stored BetP is the value BP computed ({a_after} vs {})",
-        result[&a]
-    );
+    // Positive controls: every atom in the same run IS written, with BP's
+    // value: a leaf (a decomposes_to target is not a compound), a claim whose
+    // only decomposition is retracted, and the standalone atom.
+    for (name, c) in [("leaf", leaf), ("r", r), ("a", a)] {
+        let after = stored(pool, c)
+            .await
+            .2
+            .unwrap_or_else(|| panic!("{mode}: {name} has a stored BetP"));
+        assert!(
+            (after - result[&c]).abs() < 1e-12,
+            "{mode} control: {name}'s stored BetP is the value BP computed ({after} vs {})",
+            result[&c]
+        );
+    }
 }
