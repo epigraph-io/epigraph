@@ -682,6 +682,17 @@ fn envelope(
 /// it meets open-world states on those atoms as conflict, exactly as any
 /// positive BBA does in the served fold; with m = 0 it is absent.
 ///
+/// **Sign under `~`.** Without `~` on the query's atoms, Bel, Pl and NR are
+/// non-increasing in `not_all`. With `~`, a refutation can *raise* Bel and
+/// Pl: the annihilated O mass is renormalized away. A leaf {T .5, `~` .3,
+/// Θ .2} goes from Bel .5 / Pl .7 at m = 0 to ≈ .692 / ≈ .969 at m = .1, so
+/// the result is also discontinuous as m → 0⁺. The served fold does exactly
+/// the same with a refuting row on the atom; this is the exact-CDST reading
+/// of the valuation, not a separate rule. Over the cap the closed-world closed
+/// form is applied to the R-IND product instead, which always lowers them,
+/// so the sign can differ between 16 and 17 leaves (the latter is
+/// `exact: false`).
+///
 /// # Errors
 /// - `InsufficientSources` for an empty query;
 /// - `InvalidConjunction` if an atom appears twice in the query;
