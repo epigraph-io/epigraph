@@ -47,6 +47,13 @@ fn legacy_modes() -> serde_json::Value {
     })
 }
 
+/// [`legacy_modes`] with `atom_fold` set to `fold`.
+fn modes_with_atom_fold(fold: &str) -> serde_json::Value {
+    let mut modes = legacy_modes();
+    modes["atom_fold"] = serde_json::json!(fold);
+    modes
+}
+
 /// Serve `body` as the JSON answer to every request, forever, on a loopback
 /// port. Returns the base URL.
 fn fixture_health(body: serde_json::Value) -> String {
@@ -474,8 +481,11 @@ async fn a_target_fold_without_dry_run_is_refused_and_writes_nothing(pool: PgPoo
     );
 }
 
-/// The override: the same skewed writing run as the refusal test, with
-/// `--allow-mode-skew`, proceeds and writes, and says so on stderr.
+/// The override: a skewed writing run with `--allow-mode-skew` proceeds and
+/// writes, and says so on stderr. The skew is on a mode the run does not act
+/// on (`compound_write_guard`): an `atom_fold` skew would also meet the
+/// build's own fold refusal, which the override does not lift (see
+/// `a_writing_run_under_a_fold_this_build_cannot_write_refuses_even_when_the_server_agrees`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) {
     let hub = seed_stale_hub(&pool).await;
@@ -488,18 +498,60 @@ async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) 
         &[
             ("DATABASE_URL", &db),
             ("EPIGRAPH_API_URL", &api),
-            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+            ("EPIGRAPH_COMPOUND_WRITE_GUARD", "refuse"),
         ],
     );
 
     assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
     assert!(
-        r.stderr.contains("--allow-mode-skew") && r.stderr.contains("atom_fold"),
+        r.stderr.contains("--allow-mode-skew") && r.stderr.contains("compound_write_guard"),
         "the override must name what it overrode\nstderr: {}",
         r.stderr
     );
     let after = cached_betp(&pool, hub).await.expect("a cache");
     assert!((after - 0.5).abs() > 0.05, "the run wrote; got {after}");
+}
+
+/// This build's cache writers implement only the legacy fold. A writing run
+/// whose `EPIGRAPH_ATOM_FOLD` names another fold must refuse even when the
+/// server agrees: agreement compares flag values, not what the build can do,
+/// so a binary older than the server's fold would otherwise write
+/// legacy-fold caches under an AEF label. Not lifted by `--allow-mode-skew`,
+/// which overrides a skew, not this.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writing_run_under_a_fold_this_build_cannot_write_refuses_even_when_the_server_agrees(
+    pool: PgPool,
+) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+
+    for args in [&[][..], &["--allow-mode-skew"][..]] {
+        let r = run(
+            RECOMPUTE_BETP,
+            args,
+            &[
+                ("DATABASE_URL", &db),
+                ("EPIGRAPH_API_URL", &api),
+                ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+            ],
+        );
+        assert_eq!(
+            r.code, REFUSED,
+            "recompute_betp {args:?}: a writing run under a fold this build cannot write \
+             must exit 3\nstdout: {}\nstderr: {}",
+            r.stdout, r.stderr
+        );
+        assert!(
+            r.stderr.contains("writes only the legacy fold") && r.stderr.contains("aef_standalone"),
+            "recompute_betp {args:?}: the refusal must name the fold and what this build \
+             writes\nstderr: {}",
+            r.stderr
+        );
+    }
+    assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
+    assert_eq!(belief_state(&pool).await, before, "a refused run writes nothing");
 }
 
 // ── backfill_factors and decompose_claims --retarget ───────────────────────
@@ -596,6 +648,42 @@ async fn backfill_factors_with_matching_modes_wires_the_same_edge(pool: PgPool) 
     );
 }
 
+/// `backfill_factors` folds the targets it wires through the same legacy
+/// fold, so it too refuses a writing run under another fold, even when the
+/// server agrees.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_refuses_a_writing_run_under_a_fold_this_build_cannot_write(
+    pool: PgPool,
+) {
+    let target = seed_unwired_edge(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(modes_with_atom_fold("aef")));
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &["--phase", "edges"],
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef"),
+        ],
+    );
+
+    assert_eq!(
+        r.code, REFUSED,
+        "backfill_factors: must exit 3\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stderr.contains("writes only the legacy fold"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert_eq!(bba_rows(&pool, target).await, 0, "the edge was not wired");
+    assert_eq!(belief_state(&pool).await, before, "a refused run writes nothing");
+}
+
 /// `backfill_factors --dry-run` writes nothing, so it is exempt: a skewed
 /// environment proceeds, and the API is never contacted.
 #[sqlx::test(migrations = "../../migrations")]
@@ -651,4 +739,37 @@ fn retarget_apply_plan_refuses_on_mode_skew_before_touching_the_database() {
     );
 
     assert_refused_for_atom_fold(&r, "decompose_claims --retarget --apply-plan");
+}
+
+/// A typo in this process's own flag runs the default (SPEC §10.2), so a
+/// refusal that blames "this process runs legacy" without saying why sends
+/// the operator to the wrong fix. The refusal must name the unrecognised
+/// value. `decompose_claims` installs no log subscriber, so stderr is the
+/// only place the typo can surface.
+#[test]
+fn a_refusal_names_this_process_s_unrecognised_flag_value() {
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let manifest = std::env::temp_dir().join(format!("belief-mode-{}.jsonl", Uuid::new_v4()));
+
+    let r = run(
+        DECOMPOSE_CLAIMS,
+        &[
+            "--retarget",
+            "--apply-plan",
+            manifest.to_str().expect("utf-8 temp path"),
+        ],
+        &[
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef-standalone"),
+        ],
+    );
+
+    assert_eq!(r.code, REFUSED, "stderr: {}", r.stderr);
+    for needle in ["EPIGRAPH_ATOM_FOLD", "aef-standalone"] {
+        assert!(
+            r.stderr.contains(needle),
+            "the refusal must name the unrecognised value (missing {needle:?})\nstderr: {}",
+            r.stderr
+        );
+    }
 }
