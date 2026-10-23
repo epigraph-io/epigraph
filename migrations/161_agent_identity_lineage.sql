@@ -159,6 +159,10 @@
 --   * AID08: the child already has a different active signing key. Nothing
 --     changes; revoking a bound key is a maintenance act (section 7a), after
 --     which the host's new key is bound.
+--   * AID09: the identity already exists, was never registered, and is
+--     already BOUND (a registered human operator, either side of an operator
+--     link, an OAuth client's principal, a system agent, or an active
+--     non-legacy key). Claims or not, it is not EpiClaw's to adopt.
 --
 -- The event family `agent.identity_` is reserved for a privileged session or a
 -- maintenance-owned definer (RESTRICTIVE policy, 148's shape), so an
@@ -876,6 +880,27 @@ BEGIN
                             'not an EpiClaw identity to adopt', v_child
                 USING ERRCODE = 'AID05';
         END IF;
+        -- AID09: a never-registered agent that is already BOUND to something is
+        -- not EpiClaw's to adopt either, claims or not. Adoption would overwrite
+        -- its properties, bind a signing key and inherit an operator link onto
+        -- a human, an operated agent, an OAuth principal, a system agent or a
+        -- keyed agent.
+        IF NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = v_child)
+           AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                            WHERE s.agent_id = v_child)
+           AND (EXISTS (SELECT 1 FROM public.human_operators h WHERE h.agent_id = v_child)
+                OR EXISTS (SELECT 1 FROM public.operator_links l
+                            WHERE l.agent_id = v_child OR l.operator_id = v_child)
+                OR EXISTS (SELECT 1 FROM public.oauth_clients oc WHERE oc.agent_id = v_child)
+                OR EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = v_child)
+                OR EXISTS (SELECT 1 FROM public.agent_keys k
+                            WHERE k.agent_id = v_child AND k.status = 'active'
+                              AND k.key_type <> 'identity-legacy')) THEN
+            RAISE EXCEPTION 'AID09: agent % is already bound (a human operator, an operator link, '
+                            'an OAuth client, a system agent or an active key) and was never '
+                            'registered; it is not an EpiClaw identity to adopt', v_child
+                USING ERRCODE = 'AID09';
+        END IF;
         -- What the identity was registered under: its earliest snapshot.
         SELECT s.model, s.prompt_hash INTO v_rec_model, v_rec_hash
           FROM public.agent_prompt_snapshots s
@@ -1298,7 +1323,12 @@ BEGIN
        -- A host-registered identity's key never signs (D1): its signatures
        -- bind through its `signing` key, so it gets no legacy row.
        AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
-                        WHERE s.agent_id = a.id);
+                        WHERE s.agent_id = a.id)
+       -- A key already retired in agent_keys (rotated or revoked) never comes
+       -- back as an ACTIVE legacy key: rotation leaves agents.public_key as it
+       -- was, so this column alone would re-legitimise it for key binding.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_keys r
+                        WHERE r.public_key = a.public_key AND r.status <> 'active');
     GET DIAGNOSTICS n = ROW_COUNT;
     RETURN n;
 END $$;
