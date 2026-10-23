@@ -8,7 +8,7 @@
 //!
 //! | role | predicate |
 //! |---|---|
-//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge) stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`) |
+//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (`properties.source = 'git-history'`) |
 //! | [`ClaimRole::Rule`] | labelled `rule` AND an in-force `rule_conclusion` out-edge to a current claim |
 //! | [`ClaimRole::Compound`] | an in-force `decomposes_to` out-edge to a current claim |
 //! | [`ClaimRole::Atom`] | an in-force `decomposes_to` in-edge from a current claim, and none out |
@@ -102,17 +102,29 @@ macro_rules! has_decomposition {
     };
 }
 
+/// An in-force `decomposes_to` IN-edge to the claim id `$col` from a current
+/// claim. Its negation is the ONE root test: a claim is the root of its tree
+/// exactly when no current claim decomposes into it over an in-force edge.
+macro_rules! decomposed_from {
+    ($col:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM edges role_in \
+               JOIN claims role_parent ON role_parent.id = role_in.source_id \
+              WHERE role_in.target_id = ",
+            $col,
+            " AND role_in.source_type = 'claim' \
+                AND role_in.target_type = 'claim' \
+                AND role_in.relationship = 'decomposes_to' \
+                AND (role_in.valid_to IS NULL OR role_in.valid_to > now()) \
+                AND COALESCE(role_parent.is_current, true))"
+        )
+    };
+}
+
 /// An in-force `decomposes_to` IN-edge to `$alias` from a current claim.
 macro_rules! is_decomposed_from {
     () => {
-        "EXISTS (SELECT 1 FROM edges role_in \
-           JOIN claims role_parent ON role_parent.id = role_in.source_id \
-          WHERE role_in.target_id = $alias.id \
-            AND role_in.source_type = 'claim' \
-            AND role_in.target_type = 'claim' \
-            AND role_in.relationship = 'decomposes_to' \
-            AND (role_in.valid_to IS NULL OR role_in.valid_to > now()) \
-            AND COALESCE(role_parent.is_current, true))"
+        decomposed_from!("$alias.id")
     };
 }
 
@@ -128,7 +140,10 @@ macro_rules! procedural_root_stamp {
 }
 
 /// `$alias`, or an ancestor at most [`ROLE_MAX_DEPTH`] in-force
-/// `decomposes_to` hops above it, is a root carrying the procedural stamp. A
+/// `decomposes_to` hops above it, is a root carrying the procedural stamp. The
+/// walk climbs only to CURRENT parents, and "root" is the one root test
+/// (`decomposed_from!` negated), so a superseded parent neither hides a
+/// stamped root below it nor lends its own stamp to the claims under it. A
 /// cycle or a deeper tree finds no root, so the claim is not procedural.
 macro_rules! is_procedural {
     () => {
@@ -139,9 +154,12 @@ macro_rules! is_procedural {
                  SELECT role_ue.source_id, role_up.depth + 1 \
                    FROM role_up \
                    JOIN edges role_ue ON role_ue.target_id = role_up.id \
+                   JOIN claims role_upc ON role_upc.id = role_ue.source_id \
                   WHERE role_ue.relationship = 'decomposes_to' \
                     AND role_ue.source_type = 'claim' \
+                    AND role_ue.target_type = 'claim' \
                     AND (role_ue.valid_to IS NULL OR role_ue.valid_to > now()) \
+                    AND COALESCE(role_upc.is_current, true) \
                     AND role_up.depth < ",
             role_max_depth!(),
             ") \
@@ -149,10 +167,9 @@ macro_rules! is_procedural {
                JOIN claims role_root ON role_root.id = role_up.id \
               WHERE ",
             procedural_root_stamp!(),
-            " AND NOT EXISTS (SELECT 1 FROM edges role_re \
-                                WHERE role_re.target_id = role_up.id \
-                                  AND role_re.relationship = 'decomposes_to' \
-                                  AND (role_re.valid_to IS NULL OR role_re.valid_to > now())))"
+            " AND NOT ",
+            decomposed_from!("role_up.id"),
+            ")"
         )
     };
 }
