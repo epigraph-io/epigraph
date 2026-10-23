@@ -165,15 +165,31 @@ impl FactorRepository {
         ))
     }
 
-    /// Get all factors that reference a given claim (variable).
+    /// Get the BP-readable factors that reference a given claim (variable):
+    /// every factor naming it except a `decomposes_to` one
+    /// ([`bp_readable_factor_sql`], SPEC §6.2 D3).
     pub async fn get_for_claim(
         pool: &PgPool,
         claim_id: Uuid,
     ) -> Result<Vec<FactorRow>, crate::DbError> {
-        let rows = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>, JsonValue, Option<String>, Option<Uuid>, JsonValue, chrono::DateTime<chrono::Utc>)>(
-            "SELECT id, factor_type, variable_ids, potential, description, frame_id, properties, created_at \
-             FROM factors WHERE $1 = ANY(variable_ids)",
-        )
+        let rows = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Vec<Uuid>,
+                JsonValue,
+                Option<String>,
+                Option<Uuid>,
+                JsonValue,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(&format!(
+            "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description, f.frame_id, \
+                        f.properties, f.created_at \
+                 FROM factors f WHERE $1 = ANY(f.variable_ids) AND {}",
+            bp_readable_factor_sql()
+        ))
         .bind(claim_id)
         .fetch_all(pool)
         .await
@@ -207,27 +223,37 @@ impl FactorRepository {
             .collect())
     }
 
-    /// Get all factors, optionally filtered by frame.
+    /// Get every BP-readable factor, optionally filtered by frame: the
+    /// whole-graph BP load, so no `decomposes_to` factor
+    /// ([`bp_readable_factor_sql`], SPEC §6.2 D3).
     pub async fn get_all(
         pool: &PgPool,
         frame_id: Option<Uuid>,
     ) -> Result<Vec<FactorRow>, crate::DbError> {
-        let rows = if let Some(fid) = frame_id {
-            sqlx::query_as::<_, (Uuid, String, Vec<Uuid>, JsonValue, Option<String>, Option<Uuid>, JsonValue, chrono::DateTime<chrono::Utc>)>(
-                "SELECT id, factor_type, variable_ids, potential, description, frame_id, properties, created_at \
-                 FROM factors WHERE frame_id = $1 ORDER BY created_at",
-            )
-            .bind(fid)
-            .fetch_all(pool)
-            .await
-        } else {
-            sqlx::query_as::<_, (Uuid, String, Vec<Uuid>, JsonValue, Option<String>, Option<Uuid>, JsonValue, chrono::DateTime<chrono::Utc>)>(
-                "SELECT id, factor_type, variable_ids, potential, description, frame_id, properties, created_at \
-                 FROM factors ORDER BY created_at",
-            )
-            .fetch_all(pool)
-            .await
-        }.map_err(crate::DbError::from)?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Vec<Uuid>,
+                JsonValue,
+                Option<String>,
+                Option<Uuid>,
+                JsonValue,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(&format!(
+            "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description, f.frame_id, \
+                        f.properties, f.created_at \
+                 FROM factors f \
+                 WHERE ($1::uuid IS NULL OR f.frame_id = $1) AND {} \
+                 ORDER BY f.created_at",
+            bp_readable_factor_sql()
+        ))
+        .bind(frame_id)
+        .fetch_all(pool)
+        .await
+        .map_err(crate::DbError::from)?;
 
         Ok(rows
             .into_iter()
