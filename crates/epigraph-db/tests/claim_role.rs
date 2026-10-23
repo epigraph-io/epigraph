@@ -94,7 +94,13 @@ async fn claim_with(pool: &PgPool, s: &Seed, what: &str, properties: serde_json:
 
 /// An edge `source -> target` of `relationship`, tenancy as the trigger
 /// stamps it from the endpoints; `retired` puts it out of force.
-async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str, retired: bool) -> Uuid {
+async fn edge(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+    retired: bool,
+) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
                             valid_from, valid_to) \
@@ -200,7 +206,10 @@ async fn assert_one_spelling(pool: &PgPool, viewer: &Viewer, ids: &[Uuid]) {
             ClaimRole::Procedural => "procedural",
             ClaimRole::Rule => "rule",
         };
-        assert_eq!(rust_name, role, "roles_batch and CLAIM_ROLE_SQL disagree on {id}");
+        assert_eq!(
+            rust_name, role,
+            "roles_batch and CLAIM_ROLE_SQL disagree on {id}"
+        );
     }
 }
 
@@ -227,24 +236,56 @@ async fn a_mid_node_is_a_compound_and_its_leaves_are_its_flattened_leaves(pool: 
 
     let all = [r, m, l1, l2, shared, lone];
     let leaves = closure(&pool, &viewer, &all).await;
-    assert_eq!(set(&leaves[&r]), set(&[l1, l2, shared]), "root's leaves are flattened");
-    assert_eq!(leaves[&r].len(), 3, "the shared leaf is listed once: {:?}", leaves[&r]);
-    assert!(!leaves[&r].contains(&m), "a mid node is never a leaf of its parent");
-    assert_eq!(set(&leaves[&m]), set(&[l1, l2, shared]), "mid node's own leaves");
+    assert_eq!(
+        set(&leaves[&r]),
+        set(&[l1, l2, shared]),
+        "root's leaves are flattened"
+    );
+    assert_eq!(
+        leaves[&r].len(),
+        3,
+        "the shared leaf is listed once: {:?}",
+        leaves[&r]
+    );
+    assert!(
+        !leaves[&r].contains(&m),
+        "a mid node is never a leaf of its parent"
+    );
+    assert_eq!(
+        set(&leaves[&m]),
+        set(&[l1, l2, shared]),
+        "mid node's own leaves"
+    );
     for atom in [l1, l2, shared, lone] {
-        assert_eq!(leaves[&atom], Vec::<Uuid>::new(), "nothing lies below {atom}");
+        assert_eq!(
+            leaves[&atom],
+            Vec::<Uuid>::new(),
+            "nothing lies below {atom}"
+        );
     }
 
     let got = roles(&pool, &viewer, &all).await;
     assert_eq!(got[&r], ClaimRole::Compound { spine: false });
-    assert_eq!(got[&m], ClaimRole::Compound { spine: false }, "a mid node is a compound");
+    assert_eq!(
+        got[&m],
+        ClaimRole::Compound { spine: false },
+        "a mid node is a compound"
+    );
     for atom in [l1, l2, shared] {
-        assert_eq!(got[&atom], ClaimRole::Atom, "a decomposition target with no children is an atom");
+        assert_eq!(
+            got[&atom],
+            ClaimRole::Atom,
+            "a decomposition target with no children is an atom"
+        );
     }
     assert_eq!(got[&lone], ClaimRole::Standalone);
     // Every listed leaf is an atom, whatever the depth it was reached at.
     for leaf in &leaves[&r] {
-        assert_eq!(got[leaf], ClaimRole::Atom, "leaf {leaf} of the root is an atom");
+        assert_eq!(
+            got[leaf],
+            ClaimRole::Atom,
+            "leaf {leaf} of the root is an atom"
+        );
     }
 
     assert_one_spelling(&pool, &viewer, &all).await;
@@ -264,13 +305,29 @@ async fn only_in_force_edges_between_current_claims_assign_a_role(pool: PgPool) 
 
     // parent -> superseded child: the parent is no compound.
     let dangling_parent = claim(&pool, &s, "parent of a superseded claim").await;
-    let superseded_child =
-        claim_full(&pool, &s, "superseded child", serde_json::json!({}), &[], None, false).await;
+    let superseded_child = claim_full(
+        &pool,
+        &s,
+        "superseded child",
+        serde_json::json!({}),
+        &[],
+        None,
+        false,
+    )
+    .await;
     decomposes_to(&pool, dangling_parent, superseded_child).await;
 
     // superseded parent -> child: the child is no atom.
-    let superseded_parent =
-        claim_full(&pool, &s, "superseded parent", serde_json::json!({}), &[], None, false).await;
+    let superseded_parent = claim_full(
+        &pool,
+        &s,
+        "superseded parent",
+        serde_json::json!({}),
+        &[],
+        None,
+        false,
+    )
+    .await;
     let orphan = claim(&pool, &s, "child of a superseded parent").await;
     decomposes_to(&pool, superseded_parent, orphan).await;
 
@@ -292,8 +349,14 @@ async fn only_in_force_edges_between_current_claims_assign_a_role(pool: PgPool) 
         assert_eq!(got[&id], ClaimRole::Standalone, "{id} is a standalone");
     }
     let leaves = closure(&pool, &viewer, &[retired_parent, dangling_parent]).await;
-    assert!(leaves[&retired_parent].is_empty(), "a retired edge is not walked");
-    assert!(leaves[&dangling_parent].is_empty(), "a superseded child is not a leaf");
+    assert!(
+        leaves[&retired_parent].is_empty(),
+        "a retired edge is not walked"
+    );
+    assert!(
+        leaves[&dangling_parent].is_empty(),
+        "a superseded child is not a leaf"
+    );
 
     assert_one_spelling(&pool, &viewer, &ids).await;
 }
@@ -364,9 +427,7 @@ async fn the_leaf_closure_reaches_six_hops_and_no_further(pool: PgPool) {
 /// The anonymous viewer sees [open_leaf]; the owner group sees all three
 /// (over-suppression check). The role of K is the same for both.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_private_leaf_is_absent_for_the_anonymous_viewer_and_present_for_its_group(
-    pool: PgPool,
-) {
+async fn a_private_leaf_is_absent_for_the_anonymous_viewer_and_present_for_its_group(pool: PgPool) {
     let s = seed(&pool).await;
     let (member, group) = fixture::seed_agent_with_group(&pool, "claim-role-owner").await;
     let anonymous = fixture::public_viewer(&pool).await;
@@ -406,13 +467,26 @@ async fn a_private_leaf_is_absent_for_the_anonymous_viewer_and_present_for_its_g
     );
 
     // Role is structure: the same for both viewers.
-    assert_eq!(roles(&pool, &anonymous, &[k]).await[&k], ClaimRole::Compound { spine: false });
-    assert_eq!(roles(&pool, &owner, &[k]).await[&k], ClaimRole::Compound { spine: false });
+    assert_eq!(
+        roles(&pool, &anonymous, &[k]).await[&k],
+        ClaimRole::Compound { spine: false }
+    );
+    assert_eq!(
+        roles(&pool, &owner, &[k]).await[&k],
+        ClaimRole::Compound { spine: false }
+    );
 
     // A claim the viewer cannot read is absent from both maps.
-    assert!(!closure(&pool, &anonymous, &[private_leaf]).await.contains_key(&private_leaf));
-    assert!(!roles(&pool, &anonymous, &[private_leaf]).await.contains_key(&private_leaf));
-    assert_eq!(roles(&pool, &owner, &[private_leaf]).await[&private_leaf], ClaimRole::Atom);
+    assert!(!closure(&pool, &anonymous, &[private_leaf])
+        .await
+        .contains_key(&private_leaf));
+    assert!(!roles(&pool, &anonymous, &[private_leaf])
+        .await
+        .contains_key(&private_leaf));
+    assert_eq!(
+        roles(&pool, &owner, &[private_leaf]).await[&private_leaf],
+        ClaimRole::Atom
+    );
 }
 
 /// A public compound whose ONLY child is private (edge and claim both
@@ -439,7 +513,10 @@ async fn role_is_structural_while_the_closure_is_spliced(pool: PgPool) {
     .await;
     decomposes_to(&pool, k, child).await;
 
-    assert_eq!(roles(&pool, &anonymous, &[k]).await[&k], ClaimRole::Compound { spine: false });
+    assert_eq!(
+        roles(&pool, &anonymous, &[k]).await[&k],
+        ClaimRole::Compound { spine: false }
+    );
     assert!(closure(&pool, &anonymous, &[k]).await[&k].is_empty());
     assert_eq!(closure(&pool, &owner, &[k]).await[&k], vec![child]);
 }
@@ -487,7 +564,11 @@ async fn a_workflow_rooted_tree_is_procedural(pool: PgPool) {
     let tree = [thesis, phase, step, unstamped];
     let got = roles(&pool, &viewer, &tree).await;
     for id in tree {
-        assert_eq!(got[&id], ClaimRole::Procedural, "{id} of a workflow tree is procedural");
+        assert_eq!(
+            got[&id],
+            ClaimRole::Procedural,
+            "{id} of a workflow tree is procedural"
+        );
     }
 
     // Control: the same tree under an unstamped root.
@@ -570,7 +651,11 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     let ids = [repo, pr, commit, ordinary, stamped, below];
     let got = roles(&pool, &viewer, &ids).await;
     for id in [repo, pr, commit] {
-        assert_eq!(got[&id], ClaimRole::Procedural, "{id} of a git tree is procedural");
+        assert_eq!(
+            got[&id],
+            ClaimRole::Procedural,
+            "{id} of a git tree is procedural"
+        );
     }
     assert!(matches!(got[&ordinary], ClaimRole::Compound { .. }));
     assert!(matches!(got[&stamped], ClaimRole::Compound { .. }));
@@ -590,33 +675,79 @@ async fn a_rule_needs_its_label_and_its_conclusion_edge_and_outranks_compound(po
     let s = seed(&pool).await;
     let conclusion = claim(&pool, &s, "conclusion").await;
 
-    let rule = claim_full(&pool, &s, "rule", serde_json::json!({}), &["rule"], None, true).await;
+    let rule = claim_full(
+        &pool,
+        &s,
+        "rule",
+        serde_json::json!({}),
+        &["rule"],
+        None,
+        true,
+    )
+    .await;
     edge(&pool, rule, conclusion, "rule_conclusion", false).await;
 
-    let decomposed_rule =
-        claim_full(&pool, &s, "decomposed rule", serde_json::json!({}), &["rule"], None, true)
-            .await;
+    let decomposed_rule = claim_full(
+        &pool,
+        &s,
+        "decomposed rule",
+        serde_json::json!({}),
+        &["rule"],
+        None,
+        true,
+    )
+    .await;
     edge(&pool, decomposed_rule, conclusion, "rule_conclusion", false).await;
     let part = claim(&pool, &s, "part of the decomposed rule").await;
     decomposes_to(&pool, decomposed_rule, part).await;
 
-    let label_only =
-        claim_full(&pool, &s, "label only", serde_json::json!({}), &["rule"], None, true).await;
+    let label_only = claim_full(
+        &pool,
+        &s,
+        "label only",
+        serde_json::json!({}),
+        &["rule"],
+        None,
+        true,
+    )
+    .await;
     let edge_only = claim(&pool, &s, "edge only").await;
     edge(&pool, edge_only, conclusion, "rule_conclusion", false).await;
-    let retired_rule =
-        claim_full(&pool, &s, "retired conclusion", serde_json::json!({}), &["rule"], None, true)
-            .await;
+    let retired_rule = claim_full(
+        &pool,
+        &s,
+        "retired conclusion",
+        serde_json::json!({}),
+        &["rule"],
+        None,
+        true,
+    )
+    .await;
     edge(&pool, retired_rule, conclusion, "rule_conclusion", true).await;
 
-    let ids = [rule, decomposed_rule, label_only, edge_only, retired_rule, conclusion];
+    let ids = [
+        rule,
+        decomposed_rule,
+        label_only,
+        edge_only,
+        retired_rule,
+        conclusion,
+    ];
     let got = roles(&pool, &viewer, &ids).await;
     assert_eq!(got[&rule], ClaimRole::Rule);
-    assert_eq!(got[&decomposed_rule], ClaimRole::Rule, "rule outranks compound");
+    assert_eq!(
+        got[&decomposed_rule],
+        ClaimRole::Rule,
+        "rule outranks compound"
+    );
     assert_eq!(got[&label_only], ClaimRole::Standalone);
     assert_eq!(got[&edge_only], ClaimRole::Standalone);
     assert_eq!(got[&retired_rule], ClaimRole::Standalone);
-    assert_eq!(got[&conclusion], ClaimRole::Standalone, "a conclusion is not decomposed");
+    assert_eq!(
+        got[&conclusion],
+        ClaimRole::Standalone,
+        "a conclusion is not decomposed"
+    );
 
     assert_one_spelling(&pool, &viewer, &ids).await;
 }
@@ -643,13 +774,26 @@ async fn spine_is_level_zero_or_one_or_more_than_sixteen_flattened_leaves(pool: 
     let viewer = fixture::public_viewer(&pool).await;
     let s = seed(&pool).await;
 
-    let thesis = compound_with_leaves(&pool, &s, "thesis", serde_json::json!({"level": 0}), 2).await;
+    let thesis =
+        compound_with_leaves(&pool, &s, "thesis", serde_json::json!({"level": 0}), 2).await;
     let section =
         compound_with_leaves(&pool, &s, "section", serde_json::json!({"level": "1"}), 2).await;
-    let para16 =
-        compound_with_leaves(&pool, &s, "paragraph 16", serde_json::json!({"level": 2}), 16).await;
-    let para17 =
-        compound_with_leaves(&pool, &s, "paragraph 17", serde_json::json!({"level": 2}), 17).await;
+    let para16 = compound_with_leaves(
+        &pool,
+        &s,
+        "paragraph 16",
+        serde_json::json!({"level": 2}),
+        16,
+    )
+    .await;
+    let para17 = compound_with_leaves(
+        &pool,
+        &s,
+        "paragraph 17",
+        serde_json::json!({"level": 2}),
+        17,
+    )
+    .await;
     let plain16 = compound_with_leaves(&pool, &s, "plain 16", serde_json::json!({}), 16).await;
     let plain17 = compound_with_leaves(&pool, &s, "plain 17", serde_json::json!({}), 17).await;
     // A level-0 claim with no children is no compound, so no spine.
@@ -701,9 +845,21 @@ async fn spine_is_level_zero_or_one_or_more_than_sixteen_flattened_leaves(pool: 
     ];
     let got = roles(&pool, &viewer, &ids).await;
     assert_eq!(got[&thesis], ClaimRole::Compound { spine: true }, "level 0");
-    assert_eq!(got[&section], ClaimRole::Compound { spine: true }, "level \"1\"");
-    assert_eq!(got[&para16], ClaimRole::Compound { spine: false }, "16 leaves");
-    assert_eq!(got[&para17], ClaimRole::Compound { spine: true }, "17 leaves");
+    assert_eq!(
+        got[&section],
+        ClaimRole::Compound { spine: true },
+        "level \"1\""
+    );
+    assert_eq!(
+        got[&para16],
+        ClaimRole::Compound { spine: false },
+        "16 leaves"
+    );
+    assert_eq!(
+        got[&para17],
+        ClaimRole::Compound { spine: true },
+        "17 leaves"
+    );
     assert_eq!(got[&plain16], ClaimRole::Compound { spine: false });
     assert_eq!(got[&plain17], ClaimRole::Compound { spine: true });
     assert_eq!(got[&lone_thesis], ClaimRole::Standalone);
@@ -713,7 +869,11 @@ async fn spine_is_level_zero_or_one_or_more_than_sixteen_flattened_leaves(pool: 
         "16 distinct flattened leaves (two shared): not spine"
     );
     assert_eq!(got[&m1], ClaimRole::Compound { spine: false });
-    assert_eq!(got[&root17], ClaimRole::Compound { spine: true }, "17 distinct leaves");
+    assert_eq!(
+        got[&root17],
+        ClaimRole::Compound { spine: true },
+        "17 distinct leaves"
+    );
 }
 
 /// Spine counts the leaves the VIEWER can see: a compound with 15 public and
@@ -742,7 +902,10 @@ async fn spine_counts_only_the_leaves_the_viewer_can_see(pool: PgPool) {
         decomposes_to(&pool, k, p).await;
     }
 
-    assert_eq!(roles(&pool, &owner, &[k]).await[&k], ClaimRole::Compound { spine: true });
+    assert_eq!(
+        roles(&pool, &owner, &[k]).await[&k],
+        ClaimRole::Compound { spine: true }
+    );
     assert_eq!(
         roles(&pool, &anonymous, &[k]).await[&k],
         ClaimRole::Compound { spine: false }
