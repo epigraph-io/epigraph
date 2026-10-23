@@ -970,6 +970,13 @@ async fn adopting_an_agent_with_claims_and_no_registration_is_refused_aid05(pool
     let adopted = register(&pool, &quiet, None, "g-adopt", snapshot("g", "l")).await;
     assert_eq!(adopted.agent_id, quiet_id);
     assert!(!adopted.agent_created);
+    let props: Value = sqlx::query_scalar("SELECT properties FROM agents WHERE id = $1")
+        .bind(quiet_id)
+        .fetch_one(&pool)
+        .await
+        .expect("adopted properties");
+    assert_eq!(props["llm_model"], json!(MODEL), "adoption records the model");
+    assert_eq!(props["llm_prompt_hash"], json!(quiet.prompt_hash));
 
     // CALIBRATION 2: registered earlier, then wrote claims, re-registers.
     let ours = new_identity();
@@ -981,25 +988,55 @@ async fn adopting_an_agent_with_claims_and_no_registration_is_refused_aid05(pool
 }
 
 /// AID03: the parent must be an LLM agent (a derived identity, or one whose
-/// properties carry `llm_model`). A human operator is refused, and the call
-/// changes nothing. CALIBRATIONS: an `ed25519` agent carrying `llm_model` (the
-/// shape epigraph-mcp's legacy path creates) and a registered (derived)
-/// identity are both accepted as parents.
+/// properties carry `llm_model`) and must not be a human. Each arm of the
+/// refusal is driven by a parent that ONLY that arm catches (review TC4), and
+/// each refusal changes nothing:
+///
+/// * a plain `ed25519` software agent with no `llm_model` (the LLM arm);
+/// * a REGISTERED human operator whose key is `derived` (a keyless OAuth
+///   human) and whose `agent_type` is not `human` (the human-operator arm);
+/// * an `agent_type 'human'` agent with a `derived` key that is not a
+///   registered operator (the agent-type arm).
+///
+/// CALIBRATIONS: an `ed25519` agent carrying `llm_model` (the shape
+/// epigraph-mcp's legacy path creates) and a registered (derived) identity are
+/// both accepted as parents.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_parent_that_is_not_an_llm_agent_is_refused_aid03(pool: PgPool) {
-    let human = human_operator(&pool).await;
-    let before = footprint(&pool).await;
-    let err = try_register(
-        &pool,
-        &new_identity(),
-        Some(human),
-        "g-h",
-        snapshot("g", "l"),
-    )
-    .await
-    .expect_err("a human parent must be refused");
-    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
-    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+    let seed = |agent_type: &'static str, kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO agents (id, public_key, agent_type, key_kind) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(random32())
+            .bind(agent_type)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .expect("seed parent");
+            id
+        }
+    };
+    let plain = seed("software_agent", "ed25519").await;
+    let keyless_operator = seed("system", "derived").await;
+    fixture::make_human_operator(&pool, keyless_operator).await;
+    let human_typed = seed("human", "derived").await;
+
+    for (parent, what) in [
+        (plain, "an ed25519 software agent with no llm_model"),
+        (keyless_operator, "a registered human operator with a derived key"),
+        (human_typed, "an agent_type 'human' agent with a derived key"),
+    ] {
+        let before = footprint(&pool).await;
+        let err = try_register(&pool, &new_identity(), Some(parent), "g-h", snapshot("g", "l"))
+            .await
+            .expect_err(what);
+        assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{what}: {err}");
+        assert_eq!(footprint(&pool).await, before, "{what}: AID03 changes nothing");
+    }
 
     let legacy = Uuid::new_v4();
     sqlx::query(
@@ -1064,6 +1101,23 @@ async fn a_registered_identity_records_its_model_and_refuses_a_mismatch(pool: Pg
     let err = try_register(&pool, &wrong, None, "g-m", snapshot("g", "l"))
         .await
         .expect_err("a different prompt hash for the same key must be refused");
+    assert_eq!(sqlstate(&err).as_deref(), Some("22023"), "{err}");
+    assert_eq!(footprint(&pool).await, before);
+
+    // The other arm: the same key and prompt hash under another MODEL.
+    let err = try_register_full(
+        &pool,
+        ATTESTOR,
+        &id,
+        "test-model-2",
+        None,
+        "g-m",
+        Some(id.signing.clone()),
+        snapshot("g", "l"),
+        None,
+    )
+    .await
+    .expect_err("a different model for the same key must be refused");
     assert_eq!(sqlstate(&err).as_deref(), Some("22023"), "{err}");
     assert_eq!(footprint(&pool).await, before);
 }
