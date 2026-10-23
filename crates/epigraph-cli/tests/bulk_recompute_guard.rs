@@ -761,3 +761,188 @@ async fn a_template_only_frame_cannot_own_a_claim_with_real_input_elsewhere(pool
         }
     }
 }
+
+// ── (7) the procedural exemption's edges ────────────────────────────────────
+
+/// `claim` (carrying a real row) keeps its sentinel cache under `caller`.
+async fn assert_frozen(pool: &PgPool, caller: Caller, claim: Uuid, frame: Uuid, what: &str) {
+    let before = set_sentinel_cache(pool, claim, frame).await;
+    assert!(
+        !recompute_via(pool, caller, claim).await,
+        "{caller:?}: {what} must stay frozen, but a write was reported"
+    );
+    assert_eq!(
+        cache(pool, claim).await,
+        before,
+        "{caller:?}: {what} must stay frozen"
+    );
+}
+
+/// `claim` is recomputed under `caller` to exactly the cache of `twin`, a
+/// standalone carrying the same row (recomputed first, from a sentinel).
+async fn assert_recomputed_like_twin(
+    pool: &PgPool,
+    caller: Caller,
+    claim: Uuid,
+    twin: Uuid,
+    frame: Uuid,
+    what: &str,
+) {
+    set_sentinel_cache(pool, twin, frame).await;
+    assert!(recompute_via(pool, caller, twin).await, "{caller:?} twin");
+    let expected = cache(pool, twin).await;
+    assert_ne!(expected.pignistic_prob, Some(0.741), "twin recomputed");
+
+    set_sentinel_cache(pool, claim, frame).await;
+    assert!(
+        recompute_via(pool, caller, claim).await,
+        "{caller:?}: {what} must be recomputed"
+    );
+    assert_eq!(
+        cache(pool, claim).await,
+        expected,
+        "{caller:?}: {what} must fold its own row exactly as a standalone does"
+    );
+}
+
+async fn workflow_claim(pool: &PgPool, owner: Uuid, what: &str) -> Uuid {
+    claim_with_properties(
+        pool,
+        owner,
+        what,
+        serde_json::json!({ "source_type": "workflow", "level": 0 }),
+    )
+    .await
+}
+
+/// A workflow stamp makes a tree procedural only on its ROOT, reached over
+/// IN-FORCE edges. Each of these compounds stays frozen:
+///
+/// * a workflow-stamped compound that is itself the child of an ordinary
+///   compound (it is not a root, and the real root is not a workflow);
+/// * a compound whose only link up to a workflow root was retired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_stamp_off_the_root_or_behind_a_retired_edge_exempts_nothing(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        // ordinary -> stamped -> leaf
+        let ordinary = claim(&pool, owner, "ordinary paragraph").await;
+        let stamped = workflow_claim(&pool, owner, "workflow-stamped, not a root").await;
+        let leaf = claim(&pool, owner, "leaf").await;
+        decomposes_to(&pool, ordinary, stamped, false).await;
+        decomposes_to(&pool, stamped, leaf, false).await;
+        insert_row(&pool, stamped, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(
+            &pool,
+            caller,
+            stamped,
+            bt,
+            "a workflow-stamped compound under an ordinary compound",
+        )
+        .await;
+
+        // workflow root -(retired)-> compound -> leaf
+        let root = workflow_claim(&pool, owner, "workflow thesis").await;
+        let compound = claim(&pool, owner, "compound cut off from the workflow").await;
+        let leaf = claim(&pool, owner, "leaf").await;
+        decomposes_to(&pool, root, compound, true).await;
+        decomposes_to(&pool, compound, leaf, false).await;
+        insert_row(&pool, compound, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(
+            &pool,
+            caller,
+            compound,
+            bt,
+            "a compound whose only path to a workflow root is retired",
+        )
+        .await;
+    }
+}
+
+/// The upward search for a workflow root reaches exactly 6 in-force hops: in a
+/// chain `W -> n1 -> ... -> n7 -> leaf` under a workflow root W, n6 is
+/// procedural (recomputed like a standalone twin) and n7 is frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let mut chain = vec![workflow_claim(&pool, owner, "workflow thesis").await];
+        for i in 1..=8 {
+            chain.push(claim(&pool, owner, &format!("chain node {i}")).await);
+        }
+        for pair in chain.windows(2) {
+            decomposes_to(&pool, pair[0], pair[1], false).await;
+        }
+        let twin = claim(&pool, owner, "standalone twin").await;
+        for c in [chain[6], chain[7], twin] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+
+        assert_recomputed_like_twin(
+            &pool,
+            caller,
+            chain[6],
+            twin,
+            bt,
+            "a compound 6 hops below a workflow root",
+        )
+        .await;
+        assert_frozen(
+            &pool,
+            caller,
+            chain[7],
+            bt,
+            "a compound 7 hops below a workflow root",
+        )
+        .await;
+    }
+}
+
+/// A manual `decomposes_to` cycle `A -> B -> A` has no root, so neither node
+/// is procedural, and the owner lookup must terminate. The lookup is run first
+/// under a statement timeout, so an unbounded walk fails here with a timeout
+/// instead of hanging the run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    let a = claim(&pool, owner, "cycle node A").await;
+    let b = claim(&pool, owner, "cycle node B").await;
+    decomposes_to(&pool, a, b, false).await;
+    decomposes_to(&pool, b, a, false).await;
+    for c in [a, b] {
+        insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+    }
+
+    {
+        let viewer = fixture::public_viewer(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::query("SET statement_timeout = '10s'")
+            .execute(&mut *conn)
+            .await
+            .expect("set statement_timeout");
+        let owner_frame =
+            epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, &viewer, a)
+                .await
+                .expect("the owner lookup on a cycle must terminate");
+        assert_eq!(owner_frame, None, "a node of a cycle is a frozen compound");
+        sqlx::query("RESET statement_timeout")
+            .execute(&mut *conn)
+            .await
+            .expect("reset statement_timeout");
+    }
+
+    for caller in CALLERS {
+        for (what, c) in [("cycle node A", a), ("cycle node B", b)] {
+            assert_frozen(&pool, caller, c, bt, what).await;
+        }
+    }
+}
