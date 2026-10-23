@@ -225,11 +225,18 @@ fn assert_refused_for_atom_fold(r: &Run, what: &str) {
          got {:?}\nstdout: {}\nstderr: {}",
         r.code, r.stdout, r.stderr
     );
-    for needle in ["atom_fold", "legacy", "aef_standalone"] {
+    // "differ from the API's" pins the SKEW refusal, not the build's own fold
+    // refusal, whose text also names `atom_fold` and `legacy`.
+    for needle in [
+        "differ from the API's",
+        "atom_fold",
+        "legacy",
+        "aef_standalone",
+    ] {
         assert!(
             r.stderr.contains(needle),
-            "{what}: the refusal must name the differing mode and both values \
-             (missing {needle:?})\nstderr: {}",
+            "{what}: the refusal must be the skew refusal, naming the differing mode and \
+             both values (missing {needle:?})\nstderr: {}",
             r.stderr
         );
     }
@@ -242,16 +249,14 @@ async fn a_writing_run_refuses_when_its_atom_fold_differs_from_the_server(pool: 
     let hub = seed_stale_hub(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(legacy_modes()));
+    // The server is the one ahead: this process runs `legacy`, so the build's
+    // own fold refusal cannot fire and only the skew check can refuse.
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
 
     let r = run(
         RECOMPUTE_BETP,
         &[],
-        &[
-            ("DATABASE_URL", &db),
-            ("EPIGRAPH_API_URL", &api),
-            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
-        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
     assert_refused_for_atom_fold(&r, "recompute_betp");
@@ -614,16 +619,14 @@ async fn backfill_factors_refuses_a_writing_run_on_mode_skew(pool: PgPool) {
     let target = seed_unwired_edge(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(legacy_modes()));
+    // The server is the one ahead: this process runs `legacy`, so the build's
+    // own fold refusal cannot fire and only the skew check can refuse.
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
 
     let r = run(
         BACKFILL_FACTORS,
         &["--phase", "edges"],
-        &[
-            ("DATABASE_URL", &db),
-            ("EPIGRAPH_API_URL", &api),
-            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
-        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
     assert_refused_for_atom_fold(&r, "backfill_factors");
