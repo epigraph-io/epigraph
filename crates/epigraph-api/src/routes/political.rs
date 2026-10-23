@@ -45,10 +45,12 @@
 //!
 //! Two further limits, stated so the conversion is not over-read. `compare_agents`
 //! acquires ONCE above its loop rather than per iteration; the raw-pool alias it
-//! replaced was rebound inside the loop body. And `claim_genealogy`'s inline
-//! `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)` had its EXECUTOR changed
-//! and nothing else: it is still viewer-less in the statement, and that shape
-//! remains open under `F-aggregate-existence-oracles`, which owns it.
+//! replaced was rebound inside the loop body. And `claim_genealogy`'s
+//! existence probe, once an inline viewer-less
+//! `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)`, now reads through the
+//! viewer-spliced `ClaimRepository::visible_claim_ids`, so a claim the caller
+//! cannot read is a 404 exactly like a missing one (the genealogy site of
+//! `F-aggregate-existence-oracles`; that finding's other sites are elsewhere).
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -654,32 +656,15 @@ pub async fn claim_genealogy(
         }
     })?;
 
-    // Verify claim exists. Conversion shard 5 stamped this statement's
-    // connection; it did NOT add a visibility predicate, and does not claim to
-    // have. A handler does not own its SQL and cannot carry a marker -- the
-    // statement would have to move into `src/repos/` first, which is a
-    // repo-signature change rather than an executor swap. The existence-oracle
-    // shape of this probe and of its siblings remains open under
-    // `F-aggregate-existence-oracles`, which owns it.
-    //
-    // THE UNCHANGED RESULT IS CONDITIONAL, UNLIKE `graph_neighborhood.rs::expand`'s.
-    // That sibling earned a PERMANENT conclusion by measuring `relrowsecurity =
-    // false` on the relations it probes, so stamping there can never narrow
-    // anything. `claims` is the opposite case: it carries FORCE row-level
-    // security, and what holds today is only that the application still connects
-    // as the owning superuser. When that stops (§9.2 step 11d), this probe's
-    // verdict is EXPECTED to change for a claim the viewer cannot see, turning
-    // today's 200-with-an-empty-tree into a 404. Measured vs reasoned, kept
-    // apart deliberately: the executor change is measured, the durability is not.
-    let claim_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
-            .bind(claim_id)
-            .fetch_one(&mut *read)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("DB check failed: {e}"),
-            })?;
-    if !claim_exists {
+    // Verify the claim exists AS THIS VIEWER SEES IT. A claim the viewer cannot
+    // read must answer exactly like one that does not exist, or the 404-vs-200
+    // verdict is an existence oracle (`F-aggregate-existence-oracles`). The
+    // probe is the viewer-spliced repo read rather than an inline
+    // `SELECT EXISTS(...)`, so the verdict comes from the in-query visibility
+    // predicate and does not depend on which role the application connects as.
+    let visible =
+        epigraph_db::ClaimRepository::visible_claim_ids(&mut *read, &viewer, &[claim_id]).await?;
+    if !visible.contains(&claim_id) {
         return Err(ApiError::NotFound {
             entity: "Claim".to_string(),
             id: claim_id.to_string(),

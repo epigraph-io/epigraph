@@ -2074,7 +2074,8 @@
       "pr23_disposition": "STILL OPEN, and its files (routes/belief.rs 17, routes/political.rs 12, routes/graph_neighborhood.rs 2) are all in the unconverted register above, so a shard cannot close them without touching it. Not taken here: it is inline-SQL relocation into the repo layer, a different change from plumbing the GUCs.",
       "disposition": "CONVERSION-TAIL",
       "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
-      "disposition_date": "2026-09-12"
+      "disposition_date": "2026-09-12",
+      "genealogy_site_2026_10_23": "CLOSED FOR ONE OF THE THREE SITES. routes/political.rs::claim_genealogy's existence probe now reads through the viewer-spliced ClaimRepository::visible_claim_ids on the stamped connection, so a claim the viewer cannot read answers 404 exactly like a missing one. Pinned by epigraph-api/tests/dense_routes_scoped_read.rs::claim_genealogy_private_claim_is_404_like_a_missing_one, which is red on the inline probe. STILL OPEN: routes/belief.rs::frame_conflict (its natural repo home is mass_function.rs, held behind other open work) and routes/graph_neighborhood.rs::claim_compound_neighborhood's two decomposes_to COUNTs (to be taken with the graph-projection unit that already carries a repo replacement). The entry's status stays open."
     },
     {
       "id": "F-write-authz-reads-unfiltered",
