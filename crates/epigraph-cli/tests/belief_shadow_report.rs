@@ -611,19 +611,24 @@ async fn the_fold_mismatch_is_zero_after_the_single_writer_and_one_after_a_clamp
 
 // ── the report writes nothing ───────────────────────────────────────────────
 
-/// Everything a run could write, as one value.
+/// Everything a run could write, as one value: every column of every row of
+/// the tables a belief path writes, so an UPDATE shows as well as an INSERT.
 async fn fingerprint(pool: &PgPool) -> String {
     sqlx::query_scalar(
         "SELECT concat_ws('|', \
            (SELECT md5(coalesce(string_agg(concat_ws(',', id, belief, plausibility, \
                 pignistic_prob, mass_on_missing, mass_on_empty, belief_frame_id, \
                 truth_value, updated_at), ';' ORDER BY id), '')) FROM claims), \
-           (SELECT count(*) FROM mass_functions), \
-           (SELECT count(*) FROM frames), \
-           (SELECT count(*) FROM edges), \
-           (SELECT count(*) FROM ds_combined_beliefs), \
-           (SELECT count(*) FROM recall_events), \
-           (SELECT count(*) FROM perspectives))",
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) \
+              FROM mass_functions t), \
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) FROM frames t), \
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) FROM edges t), \
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) \
+              FROM ds_combined_beliefs t), \
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) \
+              FROM recall_events t), \
+           (SELECT md5(coalesce(string_agg(t::text, ';' ORDER BY t::text), '')) \
+              FROM perspectives t))",
     )
     .fetch_one(pool)
     .await
@@ -814,10 +819,14 @@ async fn the_conflict_set_moves_from_stored_k_to_the_folds_and_drops_compounds(p
 
 // ── the binary ──────────────────────────────────────────────────────────────
 
-/// The binary, driven as a process over a claims file: under a fresh
-/// UTC-stamped directory it writes, for each viewer, one JSON line per claim
-/// in scope, a summary and one replay line per event, every directory mode
-/// 0700; and the database is exactly as it was.
+/// The binary, driven as a process over a claims file, a snapshot and a
+/// graph-view exposure file: under a fresh UTC-stamped directory it writes,
+/// for each viewer, one JSON line per claim in scope (the snapshot starting
+/// a leaf's decomposition, the exposure on the compound's line), a summary
+/// recording what it ran under, and one replay line per event and mode,
+/// every directory mode 0700; and the database is exactly as it was. A
+/// second run straight after writes a second directory, never into the
+/// first.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: PgPool) {
     use std::os::unix::fs::PermissionsExt;
@@ -839,22 +848,40 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
             .join("\n"),
     )
     .expect("ids file");
+    let s0 = tmp.join("s0.jsonl");
+    std::fs::write(
+        &s0,
+        format!(
+            "{{\"claim_id\": \"{}\", \"pignistic_prob\": 0.42}}\n",
+            leaves[0]
+        ),
+    )
+    .expect("s0 file");
+    let gv = tmp.join("gv.jsonl");
+    std::fs::write(&gv, format!("{{\"claim_id\": \"{k}\", \"count\": 4}}\n")).expect("gv file");
     let out = tmp.join("out");
 
     let before = fingerprint(&pool).await;
     let url = fixture::database_url_for(&pool).await;
-    let run = std::process::Command::new(env!("CARGO_BIN_EXE_belief_shadow_report"))
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("DATABASE_URL", &url)
-        .env("RUST_LOG", "warn")
-        .arg("--out")
-        .arg(&out)
-        .arg("--claims")
-        .arg(&ids)
-        .current_dir(&tmp)
-        .output()
-        .expect("run the binary");
+    let run_binary = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_belief_shadow_report"))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .arg("--out")
+            .arg(&out)
+            .arg("--claims")
+            .arg(&ids)
+            .arg("--s0")
+            .arg(&s0)
+            .arg("--graph-view-exposure")
+            .arg(&gv)
+            .current_dir(&tmp)
+            .output()
+            .expect("run the binary")
+    };
+    let run = run_binary();
     assert!(
         run.status.success(),
         "exit {:?}\n{}",
@@ -872,6 +899,11 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
         .map(|e| e.expect("entry").path())
         .collect();
     assert_eq!(stamped.len(), 1, "one stamped run directory");
+    let root_mode = std::fs::metadata(&stamped[0])
+        .expect("stamped dir")
+        .permissions()
+        .mode();
+    assert_eq!(root_mode & 0o777, 0o700, "the stamped directory is private");
     for viewer in ["maintenance", "anonymous"] {
         let dir = stamped[0].join(viewer);
         let mode = std::fs::metadata(&dir)
@@ -884,15 +916,25 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
             "{viewer}: the report directory is private"
         );
         let lines = std::fs::read_to_string(dir.join("claims.jsonl")).expect("claims.jsonl");
-        let seen: Vec<Uuid> = lines
+        let parsed: HashMap<Uuid, serde_json::Value> = lines
             .lines()
             .map(|l| {
                 let v: serde_json::Value = serde_json::from_str(l).expect("a JSON line");
-                Uuid::parse_str(v["claim_id"].as_str().expect("claim_id")).expect("uuid")
+                let id = Uuid::parse_str(v["claim_id"].as_str().expect("claim_id")).expect("uuid");
+                (id, v)
             })
             .collect();
-        assert_eq!(seen.len(), 3, "{viewer}: one line per claim in scope");
-        assert!(seen.contains(&k), "{viewer}: the compound has its line");
+        assert_eq!(parsed.len(), 3, "{viewer}: one line per claim in scope");
+        assert_eq!(
+            parsed.get(&k).map(|v| v["graph_view_exposure"].clone()),
+            Some(serde_json::json!(4)),
+            "{viewer}: the compound's line carries its graph-view exposure"
+        );
+        assert_eq!(
+            parsed[&leaves[0]]["drift"]["stages"]["0"],
+            serde_json::json!(0.42),
+            "{viewer}: the snapshot starts the leaf's decomposition"
+        );
         let summary: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("summary.json")).expect("summary.json"),
         )
@@ -906,18 +948,36 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
             (
                 &settings["target_fold"],
                 &settings["scope"],
-                &settings["scope_ids"]
+                &settings["scope_ids"],
+                &settings["s0_given"],
+                &settings["graph_view_exposure_given"]
             ),
             (
                 &serde_json::json!("aef"),
                 &serde_json::json!("ids"),
-                &serde_json::json!(3)
+                &serde_json::json!(3),
+                &serde_json::json!(true),
+                &serde_json::json!(true)
             ),
             "{viewer}: the summary records what it ran under"
         );
-        let replay = std::fs::read_to_string(dir.join("replay_strict.jsonl")).expect("replay");
-        assert_eq!(replay.lines().count(), 1, "{viewer}: one line per event");
+        for mode in ["replay_progressive.jsonl", "replay_strict.jsonl"] {
+            let replay = std::fs::read_to_string(dir.join(mode)).expect("replay");
+            assert_eq!(
+                replay.lines().count(),
+                1,
+                "{viewer}: {mode} has one line per event"
+            );
+        }
     }
+
+    let again = run_binary();
+    assert!(again.status.success(), "the second run");
+    let stamped_after = std::fs::read_dir(&out).expect("out dir").count();
+    assert_eq!(
+        stamped_after, 2,
+        "a second run writes its own directory, never into the first"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -1393,4 +1453,40 @@ async fn the_owner_rule_stage_is_the_owner_frame_combination(pool: PgPool) {
         (one - 0.9).abs() < 1e-9,
         "the owner-frame combination of .6 and .5 is BetP .9, got {one}"
     );
+}
+
+// ── every recall event in the window is replayed ────────────────────────────
+
+/// Recall events logged in one statement share `created_at`. Six hundred of
+/// them span two pages of the event read; every one is replayed once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_events_with_one_timestamp_across_pages_are_each_replayed(pool: PgPool) {
+    let author = agent(&pool).await;
+    let a = claim(&pool, author, "a").await;
+    support(&pool, a, 0.9).await;
+    sqlx::query(
+        "INSERT INTO recall_events (tool, query_text, params, returned_claim_ids, visibility) \
+         SELECT 'recall', 'tied', '{\"min_truth\": 0.3}'::jsonb, ARRAY[$1]::uuid[], 'public' \
+           FROM generate_series(1, 600)",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .expect("tied events");
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![a]))).await;
+    let ids: std::collections::HashSet<Uuid> = summary
+        .replay
+        .strict
+        .per_event
+        .iter()
+        .map(|e| e.event_id)
+        .collect();
+    assert_eq!(
+        (summary.replay.strict.events, ids.len()),
+        (600, 600),
+        "each tied event once"
+    );
+    assert_eq!(lines[&a].recall_exposure, 600, "a's exposure is 600");
 }
