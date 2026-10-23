@@ -1799,3 +1799,81 @@ async fn scoped_rows_resync_per_frame_and_keep_what_the_aef_does_not_fold(pool: 
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── a claim whose role changed after the cohort was selected ───────────────
+
+/// A wave writes only claims of its own role (SPEC §10.7: the standalone and
+/// leaf waves are reviewed and applied separately). A claim selected as a
+/// standalone that is a leaf by the time its write runs (a decomposition
+/// landed in between) is skipped: written neither with the legacy owner fold
+/// (under `aef_standalone`, which does not fold leaves) nor with the AEF
+/// (under `aef`, in a wave nobody reviewed it in), and nothing is recorded.
+/// The same claim in a leaf wave under `aef` is written (the control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_wave_write_skips_a_claim_whose_role_changed(pool: PgPool) {
+    use epigraph_cli::recompute_betp::{write_wave_claim, WaveLog, WaveRole};
+    use epigraph_engine::atom_items::{AtomFoldMode, CompoundSourceEdges};
+    use epigraph_engine::edge_factor::AtomCacheSettings;
+
+    let dir = scratch_dir();
+    let owner = agent(&pool, "role-owner").await;
+    let source = agent(&pool, "role-source").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let parent = claim(&pool, owner, "the decomposition that landed").await;
+    let leaf = claim(&pool, owner, "selected as a standalone, now a leaf").await;
+    decomposes_to(&pool, parent, leaf).await;
+    insert_row(&pool, leaf, &evidence_row(bin, source, 0.7, None)).await;
+    let before = set_sentinel(&pool, leaf, bin, 0.0).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let settings = |fold| AtomCacheSettings {
+        fold,
+        compound_source_edges: CompoundSourceEdges::Frozen,
+        vacate_on_evidence_removal: true,
+    };
+    let wave_file = dir.join("wave.jsonl");
+    let log = WaveLog::open(&wave_file, "test-wave", chrono::Utc::now()).expect("open the log");
+
+    for fold in [AtomFoldMode::AefStandalone, AtomFoldMode::Aef] {
+        let o = write_wave_claim(
+            &pool,
+            &viewer,
+            leaf,
+            WaveRole::Standalone,
+            settings(fold),
+            &log,
+        )
+        .await
+        .expect("write_wave_claim");
+        assert!(
+            !o.changed,
+            "a standalone wave under {fold:?} changed a leaf: {o:?}"
+        );
+        assert_eq!(
+            cache(&pool, leaf).await,
+            before,
+            "a standalone wave under {fold:?} wrote a leaf's cache"
+        );
+    }
+    assert!(
+        std::fs::read(&wave_file).unwrap_or_default().is_empty(),
+        "a skipped claim is not recorded"
+    );
+
+    let o = write_wave_claim(
+        &pool,
+        &viewer,
+        leaf,
+        WaveRole::Leaf,
+        settings(AtomFoldMode::Aef),
+        &log,
+    )
+    .await
+    .expect("write_wave_claim");
+    assert!(o.changed, "control: the leaf wave writes the leaf: {o:?}");
+    assert_ne!(
+        cache(&pool, leaf).await,
+        before,
+        "control: the leaf wave wrote"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
