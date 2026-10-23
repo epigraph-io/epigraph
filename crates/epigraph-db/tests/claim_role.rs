@@ -664,6 +664,94 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     assert_one_spelling(&pool, &viewer, &ids).await;
 }
 
+/// Decomposition is a DAG, not a tree: a claim can sit under a stamped root
+/// AND an ordinary one. It is procedural only when EVERY root above it is
+/// stamped. Otherwise one edge from a stamped claim (whose stamp is a
+/// caller-set property) onto a node of an ordinary tree would turn that node
+/// and its subtree procedural for every reader and every bulk recompute,
+/// which is the refold the unspliced role exists to prevent.
+///
+/// * `shared`: under a workflow thesis and under an ordinary root.
+/// * `m`: a mid node of a paper (`paper -> section -> m -> atoms`) with a
+///   foreign git repository root attached above it.
+///
+/// The stamped roots themselves stay procedural (calibration: the exemption
+/// is narrowed, not removed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_node_under_an_ordinary_root_is_not_procedural_whatever_else_is_above_it(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+
+    // workflow thesis -> shared -> leaf, and ordinary root -> shared
+    let thesis = claim_with(
+        &pool,
+        &s,
+        "workflow thesis",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
+    )
+    .await;
+    let ordinary = claim(&pool, &s, "ordinary root").await;
+    let shared = claim(&pool, &s, "node under both").await;
+    let shared_leaf = claim(&pool, &s, "leaf of the shared node").await;
+    decomposes_to(&pool, thesis, shared).await;
+    decomposes_to(&pool, ordinary, shared).await;
+    decomposes_to(&pool, shared, shared_leaf).await;
+
+    // paper -> section -> m -> {a1, a2}, and a foreign repository root -> m
+    let paper = claim_with(&pool, &s, "paper thesis", serde_json::json!({"level": 0})).await;
+    let section = claim_with(&pool, &s, "paper section", serde_json::json!({"level": 1})).await;
+    let m = claim(&pool, &s, "paragraph").await;
+    let a1 = claim(&pool, &s, "atom 1").await;
+    let a2 = claim(&pool, &s, "atom 2").await;
+    decomposes_to(&pool, paper, section).await;
+    decomposes_to(&pool, section, m).await;
+    decomposes_to(&pool, m, a1).await;
+    decomposes_to(&pool, m, a2).await;
+    let foreign = claim_with(
+        &pool,
+        &s,
+        "foreign repository root",
+        serde_json::json!({"source": "git-history", "node": "repo"}),
+    )
+    .await;
+    decomposes_to(&pool, foreign, m).await;
+
+    let ids = [
+        thesis,
+        ordinary,
+        shared,
+        shared_leaf,
+        paper,
+        section,
+        m,
+        a1,
+        a2,
+        foreign,
+    ];
+    let got = roles(&pool, &viewer, &ids).await;
+    assert_eq!(
+        got[&shared],
+        ClaimRole::Compound { spine: false },
+        "a node under an ordinary root is not procedural"
+    );
+    assert_eq!(got[&shared_leaf], ClaimRole::Atom);
+    assert_eq!(
+        got[&m],
+        ClaimRole::Compound { spine: false },
+        "a foreign stamped root attached above a paper's mid node exempts nothing"
+    );
+    assert_eq!(got[&a1], ClaimRole::Atom);
+    assert_eq!(got[&a2], ClaimRole::Atom);
+    assert!(matches!(got[&ordinary], ClaimRole::Compound { .. }));
+    assert!(matches!(got[&paper], ClaimRole::Compound { .. }));
+    assert!(matches!(got[&section], ClaimRole::Compound { .. }));
+    // Calibration: each stamped root has no ordinary root above it.
+    assert_eq!(got[&thesis], ClaimRole::Procedural);
+    assert_eq!(got[&foreign], ClaimRole::Procedural);
+
+    assert_one_spelling(&pool, &viewer, &ids).await;
+}
+
 /// The procedural root search is over in-force edges between CURRENT claims,
 /// like every other role predicate (SPEC §2.1). `ClaimRepository::supersede`
 /// flips `is_current` and leaves the claim's edges in force, so a superseded
