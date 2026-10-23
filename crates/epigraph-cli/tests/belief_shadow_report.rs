@@ -821,3 +821,86 @@ async fn the_binary_writes_its_report_files_and_nothing_to_the_database(pool: Pg
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ── the drift decomposition ─────────────────────────────────────────────────
+
+/// One `attributed_v1` row from a fresh agent, citing nothing.
+async fn attributed_support(pool: &PgPool, claim: Uuid, t: f64) -> Uuid {
+    let b = binary(pool).await;
+    let a = agent(pool).await;
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        b,
+        Some(a),
+        None,
+        &serde_json::json!({"0": t, "0,1": 1.0 - t}),
+        None,
+        Some("attributed_v1"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store attributed BBA")
+}
+
+/// An atom with a plain support .6 and an `attributed_v1` support .5 (two
+/// independent items), serving a hand-set cache of `BetP` .7, with S0 at .55.
+/// Its AEF without attribution is the plain row alone: Bel .6, `BetP` .8;
+/// with it, Bel 1 - .4 x .5 = .8, `BetP` .9. The decomposition starts at S0,
+/// its stages are those values in order, the stages it cannot separate are
+/// null, and its components sum to the total, with and without the
+/// owner-rule stage.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_drift_decomposition_telescopes_from_s0_through_attribution(pool: PgPool) {
+    let author = agent(&pool).await;
+    let a = claim(&pool, author, "drift").await;
+    support(&pool, a, 0.6).await;
+    attributed_support(&pool, a, 0.5).await;
+    set_cache(&pool, a, 0.4, 1.0, 0.7).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    for owner_preview in [false, true] {
+        let mut o = opts(Scope::Ids(vec![a]));
+        o.s0 = Some(HashMap::from([(a, 0.55)]));
+        o.owner_preview = owner_preview;
+        let (_, lines) = report(&pool, &public, &maint, &o).await;
+        let d = lines[&a]
+            .drift
+            .clone()
+            .expect("a P1 atom has a decomposition");
+        let stage = |k: &str| d.stages[k];
+        let near = |x: Option<f64>, y: f64| x.is_some_and(|x| (x - y).abs() < 1e-9);
+        assert!(
+            near(stage("0"), 0.55) && (d.start - 0.55).abs() < 1e-12,
+            "S0 starts it: {d:?}"
+        );
+        assert!(near(stage("0b"), 0.7), "0b is today's served score: {d:?}");
+        assert!(
+            near(stage("3c"), 0.8),
+            "3c folds the plain row alone: {d:?}"
+        );
+        assert!(near(stage("4"), 0.9), "4 folds both items: {d:?}");
+        assert!((d.final_value - 0.9).abs() < 1e-9 && (d.total - 0.35).abs() < 1e-9);
+        for k in ["1'", "2", "3", "3a", "3b"] {
+            assert!(
+                stage(k).is_none() && d.components[k].is_none(),
+                "{k} is not separable"
+            );
+        }
+        assert_eq!(
+            stage("1").is_some(),
+            owner_preview,
+            "1 only with the owner preview"
+        );
+        let sum: f64 = d.components.values().flatten().sum();
+        assert!(
+            (sum - d.total).abs() < 1e-12,
+            "the components sum to the total ({sum} vs {}), owner_preview {owner_preview}",
+            d.total
+        );
+    }
+}
