@@ -1044,6 +1044,8 @@ pub struct PromoteStagedEdgesRequest {
 /// POST /api/v1/edges-staging/promote
 ///
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
+/// Refuses (400, nothing written) when a selected row's `properties` carry
+/// the reserved `dedup` key.
 #[cfg(feature = "db")]
 pub async fn promote_staged_edges(
     State(state): State<AppState>,
@@ -1057,8 +1059,15 @@ pub async fn promote_staged_edges(
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
-    // Build the query based on whether specific IDs were provided
-    let promoted_count: i64 = if let Some(ref ids) = request.edge_ids {
+    // Build the query based on whether specific IDs were provided. Each arm is
+    // ONE statement ($1 = the reserved dedup key), so the reserved-key check and
+    // the copy read the same snapshot. `reserved` lists the selected rows whose
+    // `properties` carry `dedup`; when any does, `to_promote` is empty and
+    // nothing is written. That key marks a dedup act's identity edge, which only
+    // the act writes (create and patch refuse it too); a staged row is copied
+    // verbatim, so promoting it would publish a forged dedup record. The whole
+    // request is refused rather than silently promoting the rest.
+    let (promoted_count, reserved): (i64, Vec<Uuid>) = if let Some(ref ids) = request.edge_ids {
         if ids.is_empty() {
             return Err(ApiError::ValidationError {
                 field: "edge_ids".to_string(),
@@ -1067,12 +1076,18 @@ pub async fn promote_staged_edges(
         }
 
         // Promote specific IDs (must be 'approved')
-        let result = sqlx::query_scalar::<_, i64>(
-            "WITH to_promote AS (
+        sqlx::query_as::<_, (i64, Vec<Uuid>)>(
+            "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
                 FROM edges_staging
-                WHERE id = ANY($1) AND review_status = 'approved'
+                WHERE id = ANY($2) AND review_status = 'approved'
+            ),
+            reserved AS (
+                SELECT id FROM selected WHERE properties ? $1
+            ),
+            to_promote AS (
+                SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1086,23 +1101,30 @@ pub async fn promote_staged_edges(
                 SET review_status = 'promoted', reviewed_at = NOW()
                 WHERE id IN (SELECT id FROM to_promote)
             )
-            SELECT COUNT(*) FROM to_promote",
+            SELECT (SELECT COUNT(*) FROM to_promote),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
+        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
         .bind(ids)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to promote staged edges: {e}"),
-        })?;
-        result
+        })?
     } else {
         // Promote all approved
-        let result = sqlx::query_scalar::<_, i64>(
-            "WITH to_promote AS (
+        sqlx::query_as::<_, (i64, Vec<Uuid>)>(
+            "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
                 FROM edges_staging
                 WHERE review_status = 'approved'
+            ),
+            reserved AS (
+                SELECT id FROM selected WHERE properties ? $1
+            ),
+            to_promote AS (
+                SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1116,15 +1138,28 @@ pub async fn promote_staged_edges(
                 SET review_status = 'promoted', reviewed_at = NOW()
                 WHERE id IN (SELECT id FROM to_promote)
             )
-            SELECT COUNT(*) FROM to_promote",
+            SELECT (SELECT COUNT(*) FROM to_promote),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
+        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to promote staged edges: {e}"),
-        })?;
-        result
+        })?
     };
+
+    if !reserved.is_empty() {
+        let ids: Vec<String> = reserved.iter().map(Uuid::to_string).collect();
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: format!(
+                "{} (staged edges carrying it: {})",
+                epigraph_db::DEDUP_IDENTITY_KEY_RESERVED,
+                ids.join(", ")
+            ),
+        });
+    }
 
     Ok(Json(serde_json::json!({
         "promoted_count": promoted_count,
