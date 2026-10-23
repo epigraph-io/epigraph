@@ -143,6 +143,10 @@ pub struct PromptSnapshot {
     /// by name. Their field above is `None`: a blob that is not what its key
     /// says is never returned.
     pub withheld_files: Vec<String>,
+    /// The runner version and host build of the FIRST start in this state:
+    /// a snapshot is one per (agent, group, model, files, `in_prompt`,
+    /// refused files), and a later start that differs only in these two
+    /// bumps `last_seen` without recording them (design D4's key).
     pub runner_version: Option<String>,
     pub host_sha: Option<String>,
     pub first_seen: DateTime<Utc>,

@@ -75,7 +75,12 @@
 --     read, never another file's text.
 --   * `agent_prompt_snapshots`: one row per distinct (agent, group, model,
 --     files, in_prompt, refused files); a repeat start bumps `last_seen` and
---     changes nothing else. `in_prompt` records which files actually reached
+--     changes nothing else. `runner_version` and `host_sha` are NOT in that
+--     key (design D4) and never change on a row: they are those of the FIRST
+--     start in the state, and a runner or host upgrade with the same files
+--     only moves `last_seen`. Attributing a behaviour change to a host build
+--     inside one [first_seen, last_seen] window needs the host's own deploy
+--     record. `in_prompt` records which files actually reached
 --     the prompt. `blob_refused` names a file the host refused to store
 --     (a secret was found in it) and that file's column is NULL.
 --
