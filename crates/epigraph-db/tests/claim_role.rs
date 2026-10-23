@@ -664,6 +664,79 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     assert_one_spelling(&pool, &viewer, &ids).await;
 }
 
+/// The procedural root search is over in-force edges between CURRENT claims,
+/// like every other role predicate (SPEC §2.1). `ClaimRepository::supersede`
+/// flips `is_current` and leaves the claim's edges in force, so a superseded
+/// parent is a real state, and it counts for nothing in either direction:
+///
+/// * a superseded UNSTAMPED claim above a workflow thesis does not stop the
+///   thesis from being the root, so the workflow tree stays procedural;
+/// * a superseded workflow thesis lends no procedural root to the claims it
+///   decomposed into: the current claim below it is the root of an ordinary
+///   tree.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_superseded_parent_neither_hides_nor_lends_a_procedural_root(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+    // superseded X -> thesis T (workflow) -> step -> leaf
+    let x = claim_full(
+        &pool,
+        &s,
+        "superseded unstamped parent",
+        serde_json::json!({}),
+        &[],
+        None,
+        false,
+    )
+    .await;
+    let thesis = claim_with(
+        &pool,
+        &s,
+        "workflow thesis under a superseded parent",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
+    )
+    .await;
+    let step = claim(&pool, &s, "workflow step").await;
+    let step_leaf = claim(&pool, &s, "workflow leaf").await;
+    decomposes_to(&pool, x, thesis).await;
+    decomposes_to(&pool, thesis, step).await;
+    decomposes_to(&pool, step, step_leaf).await;
+
+    // superseded workflow thesis W -> C -> L
+    let w = claim_full(
+        &pool,
+        &s,
+        "superseded workflow thesis",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
+        &[],
+        None,
+        false,
+    )
+    .await;
+    let c = claim(&pool, &s, "current claim below a superseded workflow").await;
+    let l = claim(&pool, &s, "its leaf").await;
+    decomposes_to(&pool, w, c).await;
+    decomposes_to(&pool, c, l).await;
+
+    let ids = [thesis, step, step_leaf, c, l];
+    let got = roles(&pool, &viewer, &ids).await;
+    for id in [thesis, step, step_leaf] {
+        assert_eq!(
+            got[&id],
+            ClaimRole::Procedural,
+            "{id}: a superseded parent above the workflow thesis must not hide its root"
+        );
+    }
+    assert_eq!(
+        got[&c],
+        ClaimRole::Compound { spine: false },
+        "a superseded workflow thesis lends no procedural root"
+    );
+    assert_eq!(got[&l], ClaimRole::Atom);
+
+    assert_one_spelling(&pool, &viewer, &ids).await;
+}
+
 // ── rules ──────────────────────────────────────────────────────────────────
 
 /// A rule claim (label `rule` AND an in-force `rule_conclusion` out-edge) is
