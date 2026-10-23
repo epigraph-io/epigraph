@@ -704,6 +704,33 @@ pub async fn derive_compound_belief_batch(
     ids: &[Uuid],
     ctx: &FramedBeliefContext,
 ) -> Result<HashMap<Uuid, BeliefView>, String> {
+    derive_batch(conn, viewer, ids, ctx, true).await
+}
+
+/// [`derive_compound_belief_batch`] without the `not_all` valuation: the
+/// same leaves, items, sibling edges and spine profiles, with no refutation
+/// of the whole read (`not_all` is [`NotAll::NONE`]). This is stage (c) of a
+/// compound's drift decomposition (SPEC §10.4), the conjunction before its
+/// `not_all`; it is never a value to serve.
+///
+/// # Errors
+/// A database read, or a conjunction that cannot be evaluated.
+pub async fn derive_compound_conjunction_batch(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    ctx: &FramedBeliefContext,
+) -> Result<HashMap<Uuid, BeliefView>, String> {
+    derive_batch(conn, viewer, ids, ctx, false).await
+}
+
+async fn derive_batch(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    ctx: &FramedBeliefContext,
+    with_not_all: bool,
+) -> Result<HashMap<Uuid, BeliefView>, String> {
     let compounds = compounds_of(conn, viewer, ids).await?;
     if compounds.is_empty() {
         return Ok(HashMap::new());
@@ -765,7 +792,11 @@ pub async fn derive_compound_belief_batch(
         .filter(|(_, spine)| !**spine)
         .map(|(id, _)| *id)
         .collect();
-    let own = own_row_valuations(conn, viewer, &non_spine, &closures, ctx).await?;
+    let own = if with_not_all {
+        own_row_valuations(conn, viewer, &non_spine, &closures, ctx).await?
+    } else {
+        HashMap::new()
+    };
 
     // Bel(X) for every edge source, as this derivation reads it.
     let mut x_bel: HashMap<Uuid, f64> = HashMap::new();
@@ -801,6 +832,13 @@ pub async fn derive_compound_belief_batch(
             profile_view(id, &leaves, &batch, &inputs)?
         } else {
             let leaf_set: BTreeSet<Uuid> = leaves.iter().copied().collect();
+            if !with_not_all {
+                out.insert(
+                    id,
+                    derived_view(id, &leaves, &batch, &inputs, &edges, NotAll::NONE)?,
+                );
+                continue;
+            }
             // not_all: own rows, then edges into the compound.
             let mut masses: Vec<f64> = own
                 .get(&id)
