@@ -18,6 +18,7 @@ pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
 pub mod claim_encryption;
+pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
