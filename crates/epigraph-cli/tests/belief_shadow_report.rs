@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
 use epigraph_cli::shadow_report::{
-    run_report, ClaimLine, ReportOptions, Scope, Summary, DEFAULT_MIN_TRUTH,
+    run_report, ClaimLine, Flips, ReportOptions, Scope, Summary, DEFAULT_MIN_TRUTH,
 };
 use epigraph_db::repos::recall_event::{NewRecallEvent, RecallEventRepository};
 use epigraph_db::{FrameRepository, MassFunctionRepository, Viewer};
@@ -376,23 +376,36 @@ async fn a_compound_crossing_bel_075_counts_one_confirmed_flip(pool: PgPool) {
 
 // ── (3) the anonymous run is the public floor ───────────────────────────────
 
-/// Plan test (3). `k` is public over a public leaf `a` (support .8) and a
-/// leaf `p` private to a group (support .3); its twin `t` is public over one
-/// public leaf (support .8) and nothing else. As the anonymous viewer the
-/// report's lines for `k` and `a` are exactly its lines for `t` and its
-/// leaf, `p` has no line and is in no count, and the event that returned
-/// `p` resolves nothing for it. As the maintenance viewer `k` reads `p` too,
-/// so its value differs from the twin's: the comparison can fail.
+/// Plan test (3). `k` is public over a public leaf `a` (support .6: Bel .6,
+/// `BetP` .8, so only the single-leaf partition makes `k` confirmed) and a
+/// leaf `p` private to a group (support .3, a stored K .6, and a public
+/// claim's `refutes` edge into it); its twin `t` is public over one public
+/// leaf (support .6) and nothing else. As the anonymous viewer the report's
+/// lines for `k` and `a` are exactly its lines for `t` and its leaf, `p` has
+/// no line and is in no count (claims, P1, residue, the conflict set, the
+/// confirmed sets, vacates, the sheaf, the replay's resolution and flips),
+/// and the event that returned `p` resolves nothing for it. Were `p` read
+/// into `k` (its leaf set, its dispute, its K), `k` would be contested or
+/// partitioned on Bel, and its line would differ. As the maintenance viewer
+/// `k` reads `p` too, so its value differs from the twin's: the comparison
+/// can fail.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_anonymous_run_equals_the_public_floor(pool: PgPool) {
     let (member, group) = fixture::seed_agent_with_group(&pool, "sr-owner").await;
     let author = agent(&pool).await;
-    let (k, leaves) = compound(&pool, author, "k", &[&[0.8]]).await;
+    let (k, leaves) = compound(&pool, author, "k", &[&[0.6]]).await;
     let a = leaves[0];
     let p = group_claim(&pool, member, group, "p").await;
     decompose(&pool, k, p).await;
-    support(&pool, p, 0.3).await;
-    let (t, twin_leaves) = compound(&pool, author, "t", &[&[0.8]]).await;
+    let p_row = support(&pool, p, 0.3).await;
+    sqlx::query("UPDATE mass_functions SET conflict_k = 0.6 WHERE id = $1")
+        .bind(p_row)
+        .execute(&pool)
+        .await
+        .expect("p's stored K");
+    let x = claim(&pool, author, "x refutes p").await;
+    edge(&pool, x, p, "refutes").await;
+    let (t, twin_leaves) = compound(&pool, author, "t", &[&[0.6]]).await;
     let a2 = twin_leaves[0];
     recall_event(&pool, Some(0.3), &[k, p]).await;
     recall_event(&pool, Some(0.3), &[t]).await;
@@ -422,6 +435,48 @@ async fn the_anonymous_run_equals_the_public_floor(pool: PgPool) {
         (s_t.claims, s_t.fold_mismatch.p1_atoms, s_t.residue),
         "the private leaf is in no count"
     );
+    assert!(
+        l_k[&k].served.confirmed && l_k[&k].strict.confirmed && !l_k[&k].strict.contested,
+        "k takes a's partition (BetP .8) and is not contested: {:?}",
+        l_k[&k].strict
+    );
+    assert_eq!(
+        (
+            &s_k.conflicts,
+            &s_k.compound_confirmed_set,
+            &s_k.vacate,
+            &s_k.sheaf,
+        ),
+        (
+            &s_t.conflicts,
+            &s_t.compound_confirmed_set,
+            &s_t.vacate,
+            &s_t.sheaf,
+        ),
+        "the private leaf's K, refuting edge and value are in no corpus statistic"
+    );
+    for (ours, twin) in [
+        (&s_k.replay.progressive, &s_t.replay.progressive),
+        (&s_k.replay.strict, &s_t.replay.strict),
+    ] {
+        assert_eq!(
+            (
+                ours.resolved,
+                ours.unresolved,
+                ours.lost,
+                ours.confirmed,
+                ours.contested
+            ),
+            (
+                twin.resolved,
+                twin.unresolved,
+                twin.lost,
+                twin.confirmed,
+                twin.contested
+            ),
+            "the replay resolves and flips the same for k as for its twin"
+        );
+    }
     assert_eq!(s_k.claims, 2, "k and a");
     assert_eq!(
         (s_k.replay.strict.resolved, s_k.replay.strict.unresolved),
@@ -434,7 +489,7 @@ async fn the_anonymous_run_equals_the_public_floor(pool: PgPool) {
     let m = l_m.get(&k).expect("the maintenance run has a line for k");
     assert!(
         (m.strict.rank - l_t[&t].strict.rank).abs() > 0.1,
-        "control: the maintenance run reads p (Bel .8 x .3), the twin does not ({} vs {})",
+        "control: the maintenance run reads p (Bel .6 x .3), the twin does not ({} vs {})",
         m.strict.rank,
         l_t[&t].strict.rank
     );
@@ -521,6 +576,36 @@ async fn the_fold_mismatch_is_zero_after_the_single_writer_and_one_after_a_clamp
     assert!(
         lines[&z].served_vs_fold.is_none(),
         "z has no fold to compare"
+    );
+
+    // A Bel the fold did not produce, Pl and BetP untouched: x mismatches too.
+    sqlx::query("UPDATE claims SET belief = belief + 0.02 WHERE id = $1")
+        .bind(x)
+        .execute(&pool)
+        .await
+        .expect("bel-only write");
+    // `w` has a row and no cache at all: each missing column is the full gap.
+    let w = claim(&pool, author, "w").await;
+    support(&pool, w, 0.6).await;
+    let (bel_only, lines) =
+        report(&pool, &public, &maint, &opts(Scope::Ids(vec![x, y, z, w]))).await;
+    assert_eq!(
+        (
+            bel_only.fold_mismatch.p1_atoms,
+            bel_only.fold_mismatch.mismatched
+        ),
+        (3, 3),
+        "x (Bel), y (BetP) and w (no cache) all mismatch; z is not P1"
+    );
+    let x_gap = lines[&x].served_vs_fold.expect("x is P1");
+    assert!(
+        (x_gap - 0.02).abs() < 1e-9,
+        "x's gap is the .02 added to Bel alone, got {x_gap}"
+    );
+    assert_eq!(
+        lines[&w].served_vs_fold,
+        Some(1.0),
+        "a NULL cache column is a gap of 1"
     );
 }
 
@@ -953,4 +1038,359 @@ async fn the_vacate_count_keeps_atoms_and_compounds_apart(pool: PgPool) {
         "v is an atom vacate and k a compound one; r is residue, not a vacate"
     );
     assert_eq!(summary.residue, 1, "r");
+}
+
+// ── readiness: a Legacy leaf holds progressive at today's value ─────────────
+
+/// Readiness (SPEC §7.1 P2) is what separates progressive from strict.
+///
+/// * `kl`: a compound over `e` (support .95) and `g`, a leaf with no rows and
+///   a kept cache (Bel .9, Pl 1, `BetP` .95): `g` is served `Legacy`, so `kl`
+///   is not ready. It serves .5 today (not confirmed). Strict derives R-DEP
+///   over `e`'s item and `g`'s pseudo-item: Bel .95 x .9 = .855, confirmed.
+///   Progressive keeps today's .5.
+/// * `kr`: a compound over two evidenced leaves (.95, .95), serving .5: ready,
+///   so progressive serves its derivation (Bel .9025) as strict does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_over_a_legacy_leaf_is_not_ready_and_progressive_keeps_today(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (kl, kl_leaves) = compound(&pool, author, "kl", &[&[0.95], &[]]).await;
+    let g = kl_leaves[1];
+    set_cache(&pool, g, 0.9, 1.0, 0.95).await;
+    set_cache(&pool, kl, 0.4, 0.6, 0.5).await;
+    let (kr, kr_leaves) = compound(&pool, author, "kr", &[&[0.95], &[0.95]]).await;
+    set_cache(&pool, kr, 0.4, 0.6, 0.5).await;
+    recall_event(&pool, Some(0.3), &[kl]).await;
+    recall_event(&pool, Some(0.3), &[kr]).await;
+
+    let mut ids = vec![kl, kr];
+    ids.extend(kl_leaves.iter().chain(&kr_leaves));
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+
+    assert_eq!(
+        lines[&g].strict.basis, "legacy",
+        "g is served from its kept cache"
+    );
+    let l = &lines[&kl];
+    assert_eq!(
+        l.ready,
+        Some(false),
+        "a visible Legacy leaf blocks readiness"
+    );
+    assert_eq!(
+        (l.progressive.basis, l.strict.basis),
+        ("legacy", "derived"),
+        "progressive keeps today's value; strict serves the derivation"
+    );
+    assert!(
+        (l.progressive.gate - 0.5).abs() < 1e-12
+            && (l.progressive.rank - 0.5).abs() < 1e-12
+            && !l.progressive.confirmed,
+        "progressive gates and ranks on today's .5: {:?}",
+        l.progressive
+    );
+    assert!(
+        (l.strict.rank - 0.855).abs() < 1e-9 && l.strict.confirmed,
+        "strict ranks on Bel .95 x .9 = .855 and is confirmed: {:?}",
+        l.strict
+    );
+    let r = &lines[&kr];
+    assert!(
+        r.ready == Some(true)
+            && r.progressive.basis == "derived"
+            && (r.progressive.rank - 0.9025).abs() < 1e-9,
+        "control: a compound over evidenced leaves is ready, progressive serves Bel .9025: {r:?}"
+    );
+    assert_eq!(
+        (
+            summary.compound_confirmed_set.progressive,
+            summary.compound_confirmed_set.strict
+        ),
+        (1, 2),
+        "progressive: kr only; strict: kl and kr"
+    );
+    assert_eq!(
+        (
+            summary.replay.progressive.confirmed,
+            summary.replay.strict.confirmed
+        ),
+        (Flips { to: 1, from: 0 }, Flips { to: 2, from: 0 }),
+        "kl enters confirmed only under strict; kr under both"
+    );
+}
+
+// ── contested: each disjunct of the roll-up ─────────────────────────────────
+
+/// A compound is contested (SPEC §3.2) when a visible leaf is, when NR is
+/// under .5, when its `not_all` valuation is at least .5, or on a live
+/// refuting edge of its own. Each compound here trips exactly one of the
+/// first three; every compound serves .5 today, uncontested:
+///
+/// * `k_own`: leaves .95 and .95 and a refutation row .6 of its own: `not_all`
+///   .6; NR = .4 / (1 - .6 x .9025) = .87, above .5.
+/// * `k_leaf`: leaves .95 and .95; a standalone `x` refutes leaf `l1` (an edge
+///   with no BBA, so no value moves).
+/// * `k_nr`: a leaf refuted .8 (Pl .2) and a leaf .95: NR .2.
+/// * `c`: an atom a standalone contradicts: contested today and under the
+///   candidate, so no flip.
+/// * `u`: leaves .95 and .95, nothing against it: the uncontested control.
+///
+/// One event returns all five: three flips into contested under each mode.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_contested_disjunct_flips_a_compound_into_contested(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (k_own, own_leaves) = compound(&pool, author, "k_own", &[&[0.95], &[0.95]]).await;
+    refute(&pool, k_own, 0.6).await;
+    let (k_leaf, leaf_leaves) = compound(&pool, author, "k_leaf", &[&[0.95], &[0.95]]).await;
+    let x = claim(&pool, author, "x").await;
+    edge(&pool, x, leaf_leaves[0], "refutes").await;
+    let (k_nr, nr_leaves) = compound(&pool, author, "k_nr", &[&[], &[0.95]]).await;
+    refute(&pool, nr_leaves[0], 0.8).await;
+    let c = claim(&pool, author, "c").await;
+    support(&pool, c, 0.9).await;
+    let y = claim(&pool, author, "y").await;
+    edge(&pool, y, c, "contradicts").await;
+    let (u, u_leaves) = compound(&pool, author, "u", &[&[0.95], &[0.95]]).await;
+    for k in [k_own, k_leaf, k_nr, u] {
+        set_cache(&pool, k, 0.4, 0.6, 0.5).await;
+    }
+    recall_event(&pool, Some(0.3), &[k_own, k_leaf, k_nr, c, u]).await;
+
+    let mut ids = vec![k_own, k_leaf, k_nr, c, u];
+    for l in [&own_leaves, &leaf_leaves, &nr_leaves, &u_leaves] {
+        ids.extend(l.iter());
+    }
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, lines) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+
+    let not_all = |id: Uuid| {
+        lines[&id]
+            .derived
+            .as_ref()
+            .and_then(|v| v.derived.as_ref())
+            .map(|d| d.not_all.m)
+    };
+    let own = &lines[&k_own];
+    assert!(
+        not_all(k_own).is_some_and(|m| (m - 0.6).abs() < 1e-9)
+            && own.strict.gate > 0.5
+            && own.strict.contested,
+        "k_own: its own refutation row is a not_all of .6, NR stays above .5, contested: {own:?}"
+    );
+    let leaf = &lines[&k_leaf];
+    assert!(
+        lines[&leaf_leaves[0]].strict.contested
+            && not_all(k_leaf) == Some(0.0)
+            && (leaf.strict.gate - 1.0).abs() < 1e-9
+            && leaf.strict.contested,
+        "k_leaf: contested through its refuted leaf alone: {leaf:?}"
+    );
+    let nr = &lines[&k_nr];
+    assert!(
+        (nr.strict.gate - 0.2).abs() < 1e-9 && not_all(k_nr) == Some(0.0) && nr.strict.contested,
+        "k_nr: NR .2 alone makes it contested: {nr:?}"
+    );
+    assert!(
+        lines[&c].served.contested && lines[&c].strict.contested,
+        "c is contested both ways"
+    );
+    assert!(
+        !lines[&u].served.contested && !lines[&u].strict.contested,
+        "control: u is contested neither way"
+    );
+    for (mode, replay) in [
+        ("progressive", &summary.replay.progressive),
+        ("strict", &summary.replay.strict),
+    ] {
+        assert_eq!(
+            replay.contested,
+            Flips { to: 3, from: 0 },
+            "{mode}: k_own, k_leaf and k_nr flip into contested; c and u do not flip"
+        );
+        assert_eq!(
+            replay.lost, 1,
+            "{mode}: k_nr gates at NR .2 under the event's .3"
+        );
+    }
+}
+
+// ── the strict-entry replay's rank moves and exposure weights ───────────────
+
+/// The strict-entry replay (SPEC §10.4): `confirmed` flips and rank moves of
+/// compounds, each also weighted by recall and graph-view exposure. Leaves
+/// serve their `truth_value` .8 today and their fold's `BetP` under strict.
+///
+/// * `k_down`: leaves .8 / .8 (`BetP` .9 each), serving .85: Bel .64, a flip
+///   FROM confirmed. Places 2 -> 9.
+/// * `k_up`: leaves .95 / .95 (`BetP` .975), serving .5: Bel .9025, a flip TO.
+///   Places 9 -> 5.
+/// * `k_stay`: leaves .9 / .9 (`BetP` .95), serving .86: Bel .81, confirmed
+///   both ways. Places 1 -> 8.
+///
+/// Today's order: `k_stay` .86, `k_down` .85, six leaves at .8, `k_up` .5.
+/// Strict's: two leaves .975, two .95, `k_up` .9025, two .9, `k_stay` .81,
+/// `k_down` .64. Moves 4, 7 and 7; over a threshold of 5, `k_stay` and
+/// `k_down`. Recall exposure: `k_down` 2 (two events), the others 1.
+/// Graph-view exposure: `k_down` 3, `k_up` 5, `k_stay` 7.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_strict_entry_replay_weights_flips_and_rank_moves_by_exposure(pool: PgPool) {
+    let author = agent(&pool).await;
+    let (k_down, down) = compound(&pool, author, "down", &[&[0.8], &[0.8]]).await;
+    let (k_up, up) = compound(&pool, author, "up", &[&[0.95], &[0.95]]).await;
+    let (k_stay, stay) = compound(&pool, author, "stay", &[&[0.9], &[0.9]]).await;
+    set_cache(&pool, k_down, 0.8, 0.9, 0.85).await;
+    set_cache(&pool, k_up, 0.4, 0.6, 0.5).await;
+    set_cache(&pool, k_stay, 0.85, 0.9, 0.86).await;
+    recall_event(&pool, Some(0.3), &[k_down, k_up, k_stay]).await;
+    recall_event(&pool, Some(0.3), &[k_down]).await;
+
+    let mut ids = vec![k_down, k_up, k_stay];
+    ids.extend(down.iter().chain(&up).chain(&stay));
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let mut o = opts(Scope::Ids(ids));
+    o.rank_threshold = 5;
+    o.graph_view_exposure = Some(HashMap::from([(k_down, 3), (k_up, 5), (k_stay, 7)]));
+    let (summary, _) = report(&pool, &public, &maint, &o).await;
+    let se = &summary.strict_entry;
+
+    assert_eq!(se.compounds, 3, "three compounds");
+    assert_eq!(
+        se.confirmed,
+        Flips { to: 1, from: 1 },
+        "k_up in, k_down out"
+    );
+    assert_eq!(
+        se.confirmed_recall_weighted,
+        Flips { to: 1, from: 2 },
+        "k_down was returned by two events"
+    );
+    assert_eq!(
+        se.confirmed_graph_view_weighted,
+        Some(Flips { to: 5, from: 3 }),
+        "weighted by k_up's 5 and k_down's 3 graph views"
+    );
+    assert_eq!(
+        (
+            se.rank_moves_over_threshold,
+            se.rank_moves_recall_weighted,
+            se.rank_moves_graph_view_weighted
+        ),
+        (2, 3, Some(10)),
+        "k_stay and k_down move 7 places, over 5; k_up moves 4"
+    );
+    let moves: Vec<(Uuid, usize, usize)> = se
+        .top_rank_moves
+        .iter()
+        .map(|m| (m.claim_id, m.from, m.to))
+        .collect();
+    assert_eq!(
+        moves,
+        vec![(k_down, 2, 9), (k_stay, 1, 8), (k_up, 9, 5)],
+        "largest move first, a tie broken by recall exposure"
+    );
+    assert_eq!(
+        (
+            se.rank_move_quantiles.n,
+            se.rank_move_quantiles.p50,
+            se.rank_move_quantiles.max
+        ),
+        (3, 7.0, 7.0),
+        "moves 4, 7, 7"
+    );
+}
+
+// ── the first-10 metric ─────────────────────────────────────────────────────
+
+/// SPEC §10.4: no event may lose more than one of its first ten. Losers (a
+/// cache of .7 over a refutation .8, so the fold's .1) sit at positions 0, 1
+/// and 10 of an 11-id event at `min_truth` .5, with eight passing atoms
+/// (.9 support, served .95) between them: 3 lost, 2 of them in the first ten.
+/// A second event loses one of its first ten: not over the bound.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_event_losing_two_of_its_first_ten_is_counted_once(pool: PgPool) {
+    let author = agent(&pool).await;
+    let mut losers = Vec::new();
+    for i in 0..3 {
+        let l = claim(&pool, author, &format!("loser {i}")).await;
+        refute(&pool, l, 0.8).await;
+        set_cache(&pool, l, 0.6, 0.8, 0.7).await;
+        losers.push(l);
+    }
+    let mut passers = Vec::new();
+    for i in 0..8 {
+        let p = claim(&pool, author, &format!("passer {i}")).await;
+        support(&pool, p, 0.9).await;
+        set_cache(&pool, p, 0.9, 1.0, 0.95).await;
+        passers.push(p);
+    }
+    let mut returned = vec![losers[0], losers[1]];
+    returned.extend(&passers);
+    returned.push(losers[2]);
+    assert_eq!(returned.len(), 11);
+    let wide = recall_event(&pool, Some(0.5), &returned).await;
+    let narrow = recall_event(&pool, Some(0.5), &[losers[0], passers[0]]).await;
+
+    let mut ids = losers.clone();
+    ids.extend(&passers);
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let (summary, _) = report(&pool, &public, &maint, &opts(Scope::Ids(ids))).await;
+    for (mode, replay) in [
+        ("progressive", &summary.replay.progressive),
+        ("strict", &summary.replay.strict),
+    ] {
+        let by_id: HashMap<Uuid, _> = replay.per_event.iter().map(|e| (e.event_id, e)).collect();
+        assert_eq!(
+            (by_id[&wide].lost, by_id[&wide].lost_in_first_10),
+            (3, 2),
+            "{mode}: the loser at position 10 is not in the first ten"
+        );
+        assert_eq!(
+            (by_id[&narrow].lost, by_id[&narrow].lost_in_first_10),
+            (1, 1),
+            "{mode}: one loss in the first ten"
+        );
+        assert_eq!(
+            (
+                replay.max_lost_in_first_10,
+                replay.events_losing_more_than_one_in_first_10
+            ),
+            (2, 1),
+            "{mode}: only the wide event loses more than one of its first ten"
+        );
+    }
+}
+
+// ── the owner-rule stage ────────────────────────────────────────────────────
+
+/// Stage (1) of the drift decomposition is what the owner-rule recompute
+/// would write: the combination of every row on the owner frame. The atom
+/// has a plain support .6 and an `attributed_v1` support .5 on `binary_truth`
+/// (no conflict): m(TRUE) = 1 - .4 x .5 = .8, `BetP` .9.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owner_rule_stage_is_the_owner_frame_combination(pool: PgPool) {
+    let author = agent(&pool).await;
+    let a = claim(&pool, author, "owner").await;
+    support(&pool, a, 0.6).await;
+    attributed_support(&pool, a, 0.5).await;
+    set_cache(&pool, a, 0.4, 1.0, 0.7).await;
+
+    let public = fixture::public_viewer(&pool).await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    let mut o = opts(Scope::Ids(vec![a]));
+    o.owner_preview = true;
+    let (_, lines) = report(&pool, &public, &maint, &o).await;
+    let d = lines[&a]
+        .drift
+        .clone()
+        .expect("a P1 atom has a decomposition");
+    let one = d.stages["1"].expect("owner preview on");
+    assert!(
+        (one - 0.9).abs() < 1e-9,
+        "the owner-frame combination of .6 and .5 is BetP .9, got {one}"
+    );
 }
