@@ -663,3 +663,159 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
         "min_truth=0.0 must include both live and deprecated; got {ids:?}"
     );
 }
+
+// ── resolve_to_latest must surface the TRUE lineage head ────────────────
+//
+// Bridge 37d65fe0 / 00132b1d / 8e78eb29, backlog ed6a953e / 21574bd2: with
+// resolve_to_latest=true the tool returned a max generation below the one
+// `improve_workflow_hierarchy` resolves (`max_generation_by_canonical`, no
+// filter), and different phrasings of one query surfaced disjoint generation
+// subsets. Both searches filter on each row's OWN goal text / embedding before
+// ordering, so a head whose goal diverged from the query never reaches the
+// `ORDER BY generation DESC`. Seeded here: gens 0-2 share a goal phrase, the
+// head (gen 3) was reworded, and the query is the old phrase.
+async fn seed_generation(
+    pool: &PgPool,
+    canonical: &str,
+    generation: i32,
+    goal: &str,
+    truth: f64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value) \
+         VALUES ($1, $2, $3, $4, NULL, '{}', NOW(), $5)",
+    )
+    .bind(id)
+    .bind(canonical)
+    .bind(generation)
+    .bind(goal)
+    .bind(truth)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn search(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    query: &str,
+    resolve_to_latest: Option<bool>,
+    min_truth: Option<f64>,
+) -> serde_json::Value {
+    let result = find_workflow_hierarchical(
+        server,
+        viewer,
+        FindWorkflowHierarchicalParams {
+            query: query.to_string(),
+            limit: Some(10),
+            resolve_to_latest,
+            min_truth,
+        },
+    )
+    .await
+    .expect("find_workflow_hierarchical");
+    parse_body(&result)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_to_latest_returns_true_lineage_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let canonical = "design-or-improve-a-workflow";
+    let old_phrase = "consider all available tools";
+    let mut ids = Vec::new();
+    for g in 0..3 {
+        ids.push(seed_generation(&pool, canonical, g, old_phrase, 1.0).await);
+    }
+    let head = seed_generation(&pool, canonical, 3, "rewrite the plan from scratch", 1.0).await;
+    let max = epigraph_db::WorkflowRepository::max_generation_by_canonical(&pool, canonical)
+        .await
+        .unwrap();
+    assert_eq!(
+        max,
+        Some(3),
+        "precondition: improve's head definition says 3"
+    );
+
+    let body = search(&server, &viewer, "available tools", Some(true), Some(0.0)).await;
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let head_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&head.to_string()))
+        .unwrap_or_else(|| {
+            panic!("resolve_to_latest=true must include the true lineage head (gen 3); got {body}")
+        });
+    assert_eq!(head_entry["generation"], serde_json::json!(3));
+    assert_eq!(head_entry["is_lineage_head"], serde_json::json!(true));
+    assert_eq!(
+        workflows[0]["workflow_id"].as_str(),
+        Some(head.to_string().as_str()),
+        "the head leads its canonical group"
+    );
+    assert!(
+        head_entry["resolved_steps"].is_array(),
+        "the injected head gets step resolution like every other entry"
+    );
+    for w in workflows {
+        assert_eq!(
+            w["lineage_head_generation"],
+            serde_json::json!(3),
+            "every entry of the lineage names the head generation: {w}"
+        );
+        assert_eq!(w["lineage_head_deprecated"], serde_json::json!(false));
+        if w["workflow_id"].as_str() != Some(&head.to_string()) {
+            assert_eq!(
+                w["is_lineage_head"],
+                serde_json::json!(false),
+                "only the head is flagged: {w}"
+            );
+        }
+    }
+    for id in &ids {
+        assert!(
+            workflows
+                .iter()
+                .any(|w| w["workflow_id"].as_str() == Some(&id.to_string())),
+            "the matched generations are still returned"
+        );
+    }
+
+    // Default (frozen) mode is unchanged: no head injection, no annotations.
+    let body = search(&server, &viewer, "available tools", None, Some(0.0)).await;
+    let workflows = body["workflows"].as_array().unwrap();
+    assert_eq!(workflows.len(), 3, "default mode returns only matched rows");
+    assert!(workflows.iter().all(|w| w.get("is_lineage_head").is_none()));
+}
+
+/// A deprecated head (truth 0.05, below the default min_truth 0.3) is still
+/// the head `improve_workflow_hierarchy` builds on, so hiding it would make
+/// the guard and improve disagree again. It is disclosed and flagged instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_to_latest_discloses_a_deprecated_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let canonical = "deprecated-head-probe";
+    let live = seed_generation(&pool, canonical, 0, "send the weekly digest", 1.0).await;
+    let dead = seed_generation(&pool, canonical, 1, "send the weekly digest v2", 0.05).await;
+
+    let body = search(&server, &viewer, "weekly digest", Some(true), None).await;
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let dead_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&dead.to_string()))
+        .unwrap_or_else(|| panic!("the deprecated head must be disclosed; got {body}"));
+    assert_eq!(dead_entry["is_lineage_head"], serde_json::json!(true));
+    let live_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&live.to_string()))
+        .expect("live gen 0 still returned");
+    assert_eq!(live_entry["is_lineage_head"], serde_json::json!(false));
+    assert_eq!(live_entry["lineage_head_generation"], serde_json::json!(1));
+    assert_eq!(
+        live_entry["lineage_head_deprecated"],
+        serde_json::json!(true),
+        "the head's truth is below min_truth, and every entry says so"
+    );
+}

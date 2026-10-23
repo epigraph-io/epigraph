@@ -122,8 +122,17 @@ pub async fn find_workflow_hierarchical(
         .map_err(internal_error)?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name (the row `improve_workflow_hierarchy` builds on), so the
+    // highest generation per group in `rows` IS the lineage head.
+    let heads = resolve_to_latest.then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
+
     let mut workflows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for r in rows {
+        let lineage = heads
+            .as_ref()
+            .and_then(|h| h.get(&r.canonical_name))
+            .copied();
         let mut entry = serde_json::json!({
             "workflow_id": r.id,
             "canonical_name": r.canonical_name,
@@ -134,6 +143,13 @@ pub async fn find_workflow_hierarchical(
             "created_at": r.created_at,
             "truth_value": r.truth_value,
         });
+
+        if let Some((head_id, head_generation, head_truth)) = lineage {
+            entry["is_lineage_head"] = serde_json::json!(head_id == r.id);
+            entry["lineage_head_generation"] = serde_json::json!(head_generation);
+            // A deprecated head is still the head; it is disclosed, not hidden.
+            entry["lineage_head_deprecated"] = serde_json::json!(head_truth < min_truth);
+        }
 
         if resolve_to_latest {
             let resolved =

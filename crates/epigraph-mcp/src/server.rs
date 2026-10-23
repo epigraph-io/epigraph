@@ -2051,7 +2051,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps."
+        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps. With resolve_to_latest=true the true lineage head (highest generation of each matched canonical_name) is always present and flagged `is_lineage_head`, even when its goal no longer matches the query or it is deprecated (`lineage_head_deprecated`)."
     )]
     async fn find_workflow_hierarchical(
         &self,

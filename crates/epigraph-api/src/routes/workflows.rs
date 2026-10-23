@@ -228,6 +228,18 @@ pub struct HierarchicalWorkflowResult {
     pub truth_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_steps: Option<Vec<ResolvedStepResult>>,
+    /// `resolve_to_latest` only: this row is its lineage's head, the highest
+    /// `generation` of its `canonical_name` (what `improve_workflow_hierarchy`
+    /// builds on). The head of every matched lineage is always returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_lineage_head: Option<bool>,
+    /// `resolve_to_latest` only: the head's generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_generation: Option<i32>,
+    /// `resolve_to_latest` only: the head's `truth_value` is below
+    /// `min_truth` (deprecated). It is returned anyway, so this says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_deprecated: Option<bool>,
 }
 
 /// Per-step resolution result within [`HierarchicalWorkflowResult`].
@@ -1103,6 +1115,13 @@ pub async fn report_outcome(
 /// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
 /// ordered newest first. Limit defaults to 10, max 50.
 ///
+/// With `resolve_to_latest=true` the lineage head (highest `generation`) of
+/// every matched `canonical_name` is always returned, even when its goal does
+/// not match `q`, it has no goal embedding, or its truth is below `min_truth`;
+/// each entry carries `is_lineage_head`, `lineage_head_generation` and
+/// `lineage_head_deprecated`. The result can then exceed `limit` by one head
+/// per matched lineage.
+///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -1197,18 +1216,33 @@ pub async fn find_workflow_hierarchical(
         })?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name, so the highest generation per group in `rows` IS the
+    // lineage head (`lineage_heads_in`).
+    let heads = params
+        .resolve_to_latest
+        .then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
     let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()
-        .map(|r| HierarchicalWorkflowResult {
-            workflow_id: r.id,
-            canonical_name: r.canonical_name,
-            generation: r.generation,
-            goal: r.goal,
-            parent_id: r.parent_id,
-            metadata: r.metadata,
-            created_at: r.created_at,
-            truth_value: r.truth_value,
-            resolved_steps: None,
+        .map(|r| {
+            let lineage = heads
+                .as_ref()
+                .and_then(|h| h.get(&r.canonical_name))
+                .copied();
+            HierarchicalWorkflowResult {
+                is_lineage_head: lineage.map(|(id, _, _)| id == r.id),
+                lineage_head_generation: lineage.map(|(_, generation, _)| generation),
+                lineage_head_deprecated: lineage.map(|(_, _, truth)| truth < min_truth),
+                workflow_id: r.id,
+                canonical_name: r.canonical_name,
+                generation: r.generation,
+                goal: r.goal,
+                parent_id: r.parent_id,
+                metadata: r.metadata,
+                created_at: r.created_at,
+                truth_value: r.truth_value,
+                resolved_steps: None,
+            }
         })
         .collect();
 
