@@ -660,10 +660,43 @@ async fn perspective_belief_for_claim(
 /// The shadow never changes or fails the served read: a computation error is
 /// logged and the view omitted.
 pub async fn shadow_belief(
-    _pool: &PgPool,
-    _viewer: &epigraph_db::visibility::Viewer,
-    _claim_id: Uuid,
-    _mode: crate::belief_view::CompoundBeliefMode,
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    mode: crate::belief_view::CompoundBeliefMode,
 ) -> Option<crate::belief_view::BeliefView> {
-    None
+    if mode != crate::belief_view::CompoundBeliefMode::Shadow {
+        return None;
+    }
+    match shadow_view(pool, viewer, claim_id).await {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(claim = %claim_id, %error, "shadow belief omitted");
+            None
+        }
+    }
+}
+
+/// [`shadow_belief`]'s computation: the compound derivation first, then the
+/// atom view.
+async fn shadow_view(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<crate::belief_view::BeliefView>, String> {
+    let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
+    let ctx = FramedBeliefContext::global();
+    let ids = [claim_id];
+    if let Some(view) =
+        crate::compound_belief::derive_compound_belief_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id)
+    {
+        return Ok(Some(view));
+    }
+    Ok(
+        crate::compound_belief::atom_belief_view_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id),
+    )
 }
