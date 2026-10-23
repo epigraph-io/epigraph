@@ -125,9 +125,9 @@ Items:
 
 /// The spelling a retargeted atom edge is sent (and therefore stored) with:
 /// the lower-case conflict relationship, the spelling every exact-case reader
-/// matches (`ClaimRepository::dispute_batch`, `repos/sheaf.rs`,
-/// `routes/computation.rs`, `repos/alternative_set.rs`, and
-/// `create_symmetric_if_absent_oriented`'s dedup). A relationship this
+/// matches (`ClaimRepository::dispute_batch`, `routes/computation.rs`,
+/// `repos/alternative_set.rs`, and `create_symmetric_if_absent_oriented`'s
+/// dedup). A relationship this
 /// function does not know is returned unchanged and left to the API to judge.
 ///
 /// This is NOT always a spelling `POST /api/v1/edges` accepts: see
