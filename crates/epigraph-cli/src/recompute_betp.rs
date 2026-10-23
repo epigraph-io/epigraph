@@ -749,3 +749,95 @@ async fn resync_scoped_rows(
     Ok((rewritten, kept))
 }
 
+// ── the accepted-vacate path (SPEC §10.5) ──────────────────────────────────
+
+/// An operator-accepted vacate list: the claim ids in file order (duplicates
+/// dropped), the class rule(s) it was generated from, and the file's SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptList {
+    pub ids: Vec<Uuid>,
+    pub rules: Vec<String>,
+    pub sha256: String,
+}
+
+/// Parse an accept list: JSON lines, each either `{"claim_id": "<uuid>", ...}`
+/// (one accepted claim; other fields are carried by the file, not read) or
+/// `{"rule": "<the accepted class rule>", ...}` (stored with the list). Blank
+/// lines are skipped; anything else is an error naming its line.
+///
+/// # Errors
+/// A malformed line.
+pub fn parse_accept_list(bytes: &[u8]) -> Result<AcceptList, String> {
+    use sha2::Digest as _;
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("accept list is not UTF-8: {e}"))?;
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut rules = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("accept list line {}: {e}", i + 1))?;
+        if let Some(id) = v.get("claim_id") {
+            let id: Uuid = id
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| format!("accept list line {}: claim_id is not a uuid", i + 1))?;
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        } else if let Some(rule) = v.get("rule").and_then(serde_json::Value::as_str) {
+            rules.push(rule.to_string());
+        } else {
+            return Err(format!(
+                "accept list line {}: neither a claim_id nor a rule",
+                i + 1
+            ));
+        }
+    }
+    Ok(AcceptList {
+        ids,
+        rules,
+        sha256: hex::encode(sha2::Sha256::digest(bytes)),
+    })
+}
+
+/// One accepted vacate (SPEC §10.5), in one transaction: lock the claim,
+/// read its cache, `vacate_atom_cache` (which refuses a compound, a
+/// procedural or rule claim and an atom with AEF input), read back, record
+/// `before`/`written` when it changed, commit.
+///
+/// # Errors
+/// A database read or write, or a record write.
+pub async fn vacate_listed_claim(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    compound_source_edges: CompoundSourceEdges,
+    log: &WaveLog,
+    wave: &str,
+) -> Result<VacateOutcome, String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let Some(before) = lock_cache(&mut tx, claim_id).await? else {
+        return Ok(VacateOutcome::NotVisible);
+    };
+    let outcome = epigraph_engine::edge_factor::vacate_atom_cache(
+        &mut tx,
+        viewer,
+        claim_id,
+        compound_source_edges,
+    )
+    .await?;
+    let after = read_cache_columns(&mut *tx, &[claim_id])
+        .await
+        .map_err(|e| format!("read cache: {e}"))?
+        .remove(&claim_id)
+        .ok_or_else(|| format!("claim {claim_id} vanished inside its own transaction"))?;
+    if after != before {
+        log.record(wave, claim_id, before, after)?;
+    }
+    tx.commit().await.map_err(|e| format!("commit: {e}"))?;
+    Ok(outcome)
+}
+
