@@ -93,9 +93,11 @@
 --      prompt hash is refused (22023: the key is a function of both);
 --   2. stores the blobs and finds or creates the snapshot (D4);
 --   3. records the succession and, if unset, `parent_agent_id`;
---   4. registers the signing key when the agent has no active one (a key
---      already bound to another agent, or equal to the identity key, is
---      refused 22023);
+--   4. binds the signing key when the agent has no active one (a key already
+--      bound as a signing or legacy key anywhere, including a key of this agent
+--      that was rotated or revoked, or one equal to an identity key, is
+--      refused 22023); the same key again is a no-op, and a DIFFERENT key
+--      while one is active is refused AID08, never skipped in silence;
 --   5. inherits the link: no link on the child and a LIVE-linked parent ->
 --      the link body with the parent's operator. An unlinked or retired parent
 --      links nothing (`inherited = false`, with a reason);
@@ -114,6 +116,9 @@
 --     registered in a new group (no parent) re-registers after it has written;
 --   * AID07: the child is already linked to a different operator than the
 --     live-linked parent's. Nothing changes; the host alerts.
+--   * AID08: the child already has a different active signing key. Nothing
+--     changes; revoking a bound key is a maintenance act (section 7a), after
+--     which the host's new key is bound.
 --
 -- The event family `agent.identity_` is reserved for a privileged session or a
 -- maintenance-owned definer (RESTRICTIVE policy, 148's shape), so an
@@ -148,6 +153,28 @@
 -- after this migration gets no such row from it.
 --
 -- ===================================================================
+-- 7a. ATTESTED KEYS (D2: "Agents cannot self-register it")
+--
+-- A `signing` key is what S2's claim verification binds a signature to, and
+-- an `identity-legacy` key keeps a pre-cut-over signature bound. Both are
+-- attested state. 118 left `agent_keys` application-INSERTable with no row
+-- security and its status definer callable by the application role with no
+-- caller check, so a container holding the application DSN could plant a key
+-- for any agent or rotate one away. Now:
+--   * a BEFORE INSERT OR UPDATE guard refuses a row of either type (in any
+--     spelling: the type is compared trimmed and lower-cased) unless the
+--     session is privileged or the write comes from a maintenance-owned
+--     definer frame (118's `epigraph_lockdown_privileged()`); other key types
+--     are unchanged;
+--   * `epigraph_agent_key_set_status` (118) refuses to move a key of either
+--     type unless the SESSION is a maintenance (or superuser) session: inside
+--     that definer the frame is always maintenance-owned, so the frame test
+--     alone would admit every caller.
+-- So the HTTP rotate and revoke routes, which run on the application role,
+-- can no longer touch these keys: rotating or revoking a bound signing key is
+-- a maintenance act, and the host then registers its new key.
+--
+-- ===================================================================
 -- 8. UNDO
 --
 --   DROP FUNCTION public.epigraph_agent_prompt_history(uuid);
@@ -157,6 +184,9 @@
 --   DROP POLICY security_events_agent_identity_privileged ON public.security_events;
 --   DROP TABLE public.agent_succession, public.agent_prompt_snapshots, public.agent_prompt_blobs;
 --   DROP FUNCTION public.epigraph_agent_lineage_append_only(), public.epigraph_agent_prompt_snapshots_guard();
+--   DROP TRIGGER agent_keys_attested_guard ON public.agent_keys;
+--   DROP FUNCTION public.epigraph_agent_keys_attested_guard();
+--   -- re-run 118's CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status(...), then
 --   DELETE FROM public.agent_keys WHERE key_type = 'identity-legacy';
 --   DROP ROLE epigraph_identity_attestor;   -- cluster-wide: only once no database uses it
 -- Linked agents keep their links (operator_links rows are permanent by 107's rule).
@@ -519,6 +549,65 @@ BEGIN
 END $$;
 
 -- ===================================================================
+-- ATTESTED KEYS (section 7a). The guard's trigger is created LAST, after the
+-- legacy backfill, so the migration's own insert never depends on which role
+-- runs it.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_agent_keys_attested_guard()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF (lower(btrim(NEW.key_type)) IN ('signing', 'identity-legacy')
+        OR (TG_OP = 'UPDATE' AND lower(btrim(OLD.key_type)) IN ('signing', 'identity-legacy')))
+       AND NOT public.epigraph_lockdown_privileged() THEN
+        RAISE EXCEPTION 'AK02: a % agent key is attested state, written by the identity '
+                        'registration or a maintenance session only (migration 161)', NEW.key_type
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_agent_keys_attested_guard() FROM PUBLIC;
+
+-- 118's status definer, unchanged but for the attested-type gate. CREATE OR
+-- REPLACE keeps its owner and ACL.
+CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status(
+    p_key_id uuid, p_status text, p_revocation_reason text, p_revoked_by uuid)
+RETURNS SETOF public.agent_keys
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE v_cur text;
+        v_type text;
+BEGIN
+    SELECT k.status, k.key_type INTO v_cur, v_type
+      FROM public.agent_keys k WHERE k.id = p_key_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF lower(btrim(v_type)) IN ('signing', 'identity-legacy')
+       AND NOT (public.epigraph_bypass()
+                OR COALESCE((SELECT r.rolsuper OR r.rolbypassrls
+                               FROM pg_catalog.pg_roles r
+                              WHERE r.rolname = session_user), false)) THEN
+        RAISE EXCEPTION 'AK02: agent key % is a % key, attested state; only a maintenance '
+                        'session changes its status (migration 161)', p_key_id, v_type
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT ((p_status = 'rotated' AND v_cur = 'active')
+            OR (p_status = 'revoked' AND v_cur IS DISTINCT FROM 'revoked')) THEN
+        RAISE EXCEPTION 'AK01: agent key % cannot move from % to %', p_key_id, v_cur, p_status
+            USING ERRCODE = '22023';
+    END IF;
+    RETURN QUERY
+        UPDATE public.agent_keys
+           SET status = p_status,
+               revocation_reason = COALESCE(p_revocation_reason, revocation_reason),
+               revoked_by = COALESCE(p_revoked_by, revoked_by)
+         WHERE id = p_key_id
+        RETURNING *;
+END $$;
+
+-- ===================================================================
 -- REGISTRATION (section 5)
 -- ===================================================================
 CREATE OR REPLACE FUNCTION public.epigraph_register_agent_identity(
@@ -565,6 +654,7 @@ DECLARE
     v_stored     integer;
     v_unknown    text[];
     v_live       boolean;
+    v_bound      bytea;
     i            integer;
 BEGIN
     -- Inputs.
@@ -753,21 +843,33 @@ BEGIN
          WHERE a.id = v_child AND a.parent_agent_id IS NULL;
     END IF;
 
-    -- 4. The signing key (D2).
+    -- 4. The signing key (D2). The same key again is a no-op and is checked
+    -- against nothing else, so a copy of it that someone records elsewhere
+    -- once it is public cannot block the identity. A fresh binding must be
+    -- bound nowhere as an attested key (this agent's rotated or revoked keys
+    -- included: a key is never re-activated) and be no agent's identity key.
     IF p_signing_pubkey IS NOT NULL THEN
-        IF EXISTS (SELECT 1 FROM public.agent_keys k
-                    WHERE k.public_key = p_signing_pubkey AND k.agent_id <> v_child)
-           OR EXISTS (SELECT 1 FROM public.agents a WHERE a.public_key = p_signing_pubkey) THEN
-            RAISE EXCEPTION 'epigraph_register_agent_identity: the signing key is already bound '
-                            'to another agent'
-                USING ERRCODE = '22023';
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM public.agent_keys k
-                        WHERE k.agent_id = v_child AND k.key_type = 'signing'
-                          AND k.status = 'active') THEN
+        SELECT k.public_key INTO v_bound
+          FROM public.agent_keys k
+         WHERE k.agent_id = v_child AND k.key_type = 'signing' AND k.status = 'active';
+        IF v_bound IS NULL THEN
+            IF EXISTS (SELECT 1 FROM public.agent_keys k
+                        WHERE k.public_key = p_signing_pubkey
+                          AND lower(btrim(k.key_type)) IN ('signing', 'identity-legacy'))
+               OR EXISTS (SELECT 1 FROM public.agents a WHERE a.public_key = p_signing_pubkey) THEN
+                RAISE EXCEPTION 'epigraph_register_agent_identity: the signing key is already bound '
+                                '(to another agent, or to this one before a rotation or revocation)'
+                    USING ERRCODE = '22023';
+            END IF;
             INSERT INTO public.agent_keys (agent_id, public_key, key_type, status)
             VALUES (v_child, p_signing_pubkey, 'signing', 'active');
             v_key_new := true;
+        ELSIF v_bound <> p_signing_pubkey THEN
+            RAISE EXCEPTION 'AID08: agent % already has a different active signing key; nothing '
+                            'was recorded', v_child
+                USING ERRCODE = 'AID08',
+                      HINT = 'Revoking a bound signing key is a maintenance act; the host then '
+                             'registers its new key.';
         END IF;
     END IF;
 
@@ -986,3 +1088,9 @@ SELECT a.id, a.public_key, 'identity-legacy', 'active', a.created_at
   FROM public.agents a
  WHERE NOT EXISTS (SELECT 1 FROM public.agent_keys k
                     WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy');
+
+-- The attested-key guard (section 7a), after the backfill above.
+DROP TRIGGER IF EXISTS agent_keys_attested_guard ON public.agent_keys;
+CREATE TRIGGER agent_keys_attested_guard
+    BEFORE INSERT OR UPDATE ON public.agent_keys
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_agent_keys_attested_guard();

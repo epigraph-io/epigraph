@@ -33,6 +33,9 @@ pub const NOT_ADOPTABLE: &str = "AID05";
 pub const PROMPT_HISTORY_REFUSED: &str = "AID06";
 /// SQLSTATE: the child is linked to a different operator than its live parent's.
 pub const OPERATOR_CONFLICT: &str = "AID07";
+/// SQLSTATE: the identity already has a different active signing key.
+/// Revoking a bound key is a maintenance act; the host then registers anew.
+pub const SIGNING_KEY_CONFLICT: &str = "AID08";
 
 /// zstd level for stored prompt files (D4). Files are small and written once
 /// per identity change, so the slowest standard level costs nothing measurable.
@@ -65,7 +68,8 @@ pub struct IdentityRegistration {
     /// The identity prompt hash: 64 lowercase hex characters.
     pub prompt_hash: String,
     pub group_folder: String,
-    /// The agent's signing public key, registered if it has no active one.
+    /// The agent's signing public key: bound if it has no active one, a no-op
+    /// if it is the bound one, refused [`SIGNING_KEY_CONFLICT`] otherwise.
     pub signing_pubkey: Option<[u8; 32]>,
     pub identity_md: PromptFile,
     pub global_claude_md: PromptFile,
@@ -233,9 +237,10 @@ impl AgentIdentityRepository {
     ///
     /// # Errors
     /// `DbError::QueryFailed` carrying SQLSTATE [`PARENT_NOT_LLM_AGENT`],
-    /// [`NOT_ADOPTABLE`] or [`OPERATOR_CONFLICT`] for the refusals, 22023 for
-    /// malformed input, 42501 for a connection that is not the attestor; each
-    /// writes nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`].
+    /// [`NOT_ADOPTABLE`], [`OPERATOR_CONFLICT`] or [`SIGNING_KEY_CONFLICT`] for
+    /// the refusals, 22023 for malformed input (or a signing key already bound
+    /// elsewhere), 42501 for a connection that is not the attestor; each writes
+    /// nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`].
     pub async fn register(
         conn: &mut sqlx::PgConnection,
         reg: &IdentityRegistration,
