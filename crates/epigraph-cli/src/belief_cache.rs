@@ -933,7 +933,9 @@ pub struct ScopedRestoreReport {
 /// One row's restore: the `before` of the trailing CHAINED run of its
 /// records, compared against the last `written` (as [`plan_restore`] does
 /// for a claim recorded more than once).
-fn scoped_restore_entries(records: &[ScopedWaveRecord]) -> Vec<(Uuid, ScopedColumns, ScopedColumns)> {
+fn scoped_restore_entries(
+    records: &[ScopedWaveRecord],
+) -> Vec<(Uuid, ScopedColumns, ScopedColumns)> {
     let mut by_row: HashMap<Uuid, Vec<&ScopedWaveRecord>> = HashMap::new();
     let mut order: Vec<Uuid> = Vec::new();
     for r in records {

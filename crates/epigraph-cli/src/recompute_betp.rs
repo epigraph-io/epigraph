@@ -34,8 +34,8 @@ use uuid::Uuid;
 use epigraph_db::repos::claim_role::{claim_role_sql, ClaimRole};
 use epigraph_db::repos::mass_function::ingest_template_predicate;
 use epigraph_engine::atom_items::{
-    atom_drift_rows, drift_atom_fold, drift_legacy_grouping_betp, drift_scope_fold,
-    AtomFoldMode, AxiomMode, CompoundSourceEdges, EvidencedInterval,
+    atom_drift_rows, drift_atom_fold, drift_legacy_grouping_betp, drift_scope_fold, AtomFoldMode,
+    AxiomMode, CompoundSourceEdges, EvidencedInterval,
 };
 use epigraph_engine::edge_factor::{
     AtomCacheOutcome, AtomCacheSettings, CacheWriteCause, LegacyFold, VacateOutcome,
@@ -469,7 +469,11 @@ impl WaveLog {
     ///
     /// # Errors
     /// Either file cannot be opened.
-    pub fn open(wave_file: &std::path::Path, wave: &str, at: DateTime<Utc>) -> Result<Self, String> {
+    pub fn open(
+        wave_file: &std::path::Path,
+        wave: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Self, String> {
         let open = |p: &std::path::Path| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -491,8 +495,17 @@ impl WaveLog {
         self.at
     }
 
-    fn record(&self, wave: &str, claim_id: Uuid, before: CacheColumns, written: CacheColumns) -> Result<(), String> {
-        let mut f = self.claims.lock().map_err(|_| "wave file lock poisoned".to_string())?;
+    fn record(
+        &self,
+        wave: &str,
+        claim_id: Uuid,
+        before: CacheColumns,
+        written: CacheColumns,
+    ) -> Result<(), String> {
+        let mut f = self
+            .claims
+            .lock()
+            .map_err(|_| "wave file lock poisoned".to_string())?;
         let mut line = Vec::new();
         write_wave_record(
             &mut line,
@@ -512,7 +525,10 @@ impl WaveLog {
     }
 
     fn record_scoped(&self, rec: &ScopedWaveRecord) -> Result<(), String> {
-        let mut f = self.scoped.lock().map_err(|_| "scoped file lock poisoned".to_string())?;
+        let mut f = self
+            .scoped
+            .lock()
+            .map_err(|_| "scoped file lock poisoned".to_string())?;
         let mut line = Vec::new();
         write_scoped_record(&mut line, rec).map_err(|e| format!("scoped record: {e}"))?;
         f.write_all(&line)
@@ -787,8 +803,8 @@ pub fn parse_accept_list(bytes: &[u8]) -> Result<AcceptList, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("accept list line {}: {e}", i + 1))?;
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("accept list line {}: {e}", i + 1))?;
         if let Some(id) = v.get("claim_id") {
             let id: Uuid = id
                 .as_str()
@@ -854,8 +870,7 @@ pub async fn vacate_listed_claim(
 // ── the drift decomposition (SPEC §10.4) ───────────────────────────────────
 
 /// The decomposition's component keys, in telescoping order.
-pub const DRIFT_COMPONENTS: [&str; 10] =
-    ["0b", "0c", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
+pub const DRIFT_COMPONENTS: [&str; 10] = ["0b", "0c", "1", "1'", "2", "3", "3a", "3b", "3c", "4"];
 
 /// One atom's drift decomposition from S0 (SPEC §10.4), in BetP(TRUE).
 ///
@@ -960,11 +975,11 @@ pub async fn drift_decomposition(
     .await
     .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
     let owner_fold = match owner {
-        Some(f) => {
-            epigraph_engine::edge_factor::preview_claim_belief_on_frame(&mut conn, viewer, claim_id, f)
-                .await?
-                .map(|p| p.pignistic_prob)
-        }
+        Some(f) => epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+            &mut conn, viewer, claim_id, f,
+        )
+        .await?
+        .map(|p| p.pignistic_prob),
         None => None,
     };
     let v0b = served
@@ -1032,7 +1047,11 @@ pub async fn drift_decomposition(
                     viewer,
                     claim_id,
                     frame,
-                    |rows| rows.into_iter().filter(|r| !templates.contains(&r.id)).collect(),
+                    |rows| {
+                        rows.into_iter()
+                            .filter(|r| !templates.contains(&r.id))
+                            .collect()
+                    },
                 )
                 .await?
                 .map_or(v1p, |p| p.pignistic_prob)
@@ -1041,7 +1060,8 @@ pub async fn drift_decomposition(
         }
     };
 
-    let mut stages: Vec<(&'static str, f64)> = vec![("0b", v0b), ("0c", v0c), ("1", v1), ("1'", v1p)];
+    let mut stages: Vec<(&'static str, f64)> =
+        vec![("0b", v0b), ("0c", v0c), ("1", v1), ("1'", v1p)];
     if role.folded_by(target) {
         let frozen = atom_drift_rows(&mut conn, viewer, &[claim_id], CompoundSourceEdges::Frozen)
             .await?

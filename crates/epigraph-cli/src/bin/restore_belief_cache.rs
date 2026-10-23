@@ -223,7 +223,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(sc) = &scoped {
         println!("scoped_restored: {}", sc.restored.len());
         println!("scoped_already_restored: {}", sc.already_restored.len());
-        println!("scoped_superseded_since_wave: {}", sc.superseded_since_wave.len());
+        println!(
+            "scoped_superseded_since_wave: {}",
+            sc.superseded_since_wave.len()
+        );
         println!("scoped_missing: {}", sc.missing.len());
     }
     println!("downstream_edges: {}", downstream.len());

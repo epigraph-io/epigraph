@@ -420,12 +420,7 @@ fn report_ids(path: &Path) -> HashSet<Uuid> {
 /// Take a snapshot with the `belief_snapshot` binary.
 fn take_snapshot(db: &str, dir: &Path, name: &str) -> PathBuf {
     let out = dir.join(name);
-    let r = run(
-        SNAPSHOT,
-        dir,
-        &["--out", s(&out)],
-        &[("DATABASE_URL", db)],
-    );
+    let r = run(SNAPSHOT, dir, &["--out", s(&out)], &[("DATABASE_URL", db)]);
     r.ok("belief_snapshot");
     out
 }
@@ -473,7 +468,12 @@ async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
     insert_row(&pool, template_standalone, &template_row(rv, ingest)).await;
     set_sentinel(&pool, template_standalone, rv, 0.0).await;
     let evidenced_standalone = claim(&pool, owner, "evidenced standalone").await;
-    insert_row(&pool, evidenced_standalone, &evidence_row(bin, source, 0.7, None)).await;
+    insert_row(
+        &pool,
+        evidenced_standalone,
+        &evidence_row(bin, source, 0.7, None),
+    )
+    .await;
 
     let parent = claim(&pool, owner, "compound").await;
     let template_leaf = claim(&pool, owner, "template-only leaf").await;
@@ -510,8 +510,14 @@ async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
             );
         }
     }
-    assert!(!standalone.contains(&evidenced_leaf), "a leaf is not a standalone");
-    assert!(!leaf.contains(&evidenced_standalone), "a standalone is not a leaf");
+    assert!(
+        !standalone.contains(&evidenced_leaf),
+        "a leaf is not a standalone"
+    );
+    assert!(
+        !leaf.contains(&evidenced_standalone),
+        "a standalone is not a leaf"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -540,16 +546,26 @@ async fn seed_vacate_fixture(pool: &PgPool) -> VacateFixture {
     let unlisted_residue = claim(pool, owner, "unlisted residue").await;
     insert_row(pool, unlisted_residue, &template_row(rv, ingest)).await;
     let listed_evidenced = claim(pool, owner, "listed but evidenced").await;
-    insert_row(pool, listed_evidenced, &evidence_row(bin, source, 0.7, None)).await;
+    insert_row(
+        pool,
+        listed_evidenced,
+        &evidence_row(bin, source, 0.7, None),
+    )
+    .await;
     let listed_compound = claim(pool, owner, "listed compound").await;
     let child = claim(pool, owner, "the compound's leaf").await;
     decomposes_to(pool, listed_compound, child).await;
     insert_row(pool, listed_compound, &template_row(rv, ingest)).await;
 
     let mut before = HashMap::new();
-    for (i, id) in [listed_residue, unlisted_residue, listed_evidenced, listed_compound]
-        .into_iter()
-        .enumerate()
+    for (i, id) in [
+        listed_residue,
+        unlisted_residue,
+        listed_evidenced,
+        listed_compound,
+    ]
+    .into_iter()
+    .enumerate()
     {
         #[allow(clippy::cast_precision_loss)]
         let c = set_sentinel(pool, id, rv, 0.01 * i as f64).await;
@@ -668,7 +684,13 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
     );
 
     let s0 = take_snapshot(&env.db, &dir, "after-vacate.jsonl");
-    let cohort = report_ids(&dry_wave(&env.db, &dir, "standalone", "aef_standalone", &s0));
+    let cohort = report_ids(&dry_wave(
+        &env.db,
+        &dir,
+        "standalone",
+        "aef_standalone",
+        &s0,
+    ));
     assert!(
         !cohort.contains(&f.listed_residue),
         "a vacated atom has no AEF input, so it is not in a wave: {cohort:?}"
@@ -682,7 +704,11 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
         .iter()
         .filter(|r| r.claim_id == f.listed_residue)
         .collect();
-    assert_eq!(mine.len(), 1, "one record for the vacated claim: {records:?}");
+    assert_eq!(
+        mine.len(),
+        1,
+        "one record for the vacated claim: {records:?}"
+    );
     let stored = read_cache_columns(&pool, &[f.listed_residue])
         .await
         .expect("read cache columns");
@@ -785,7 +811,11 @@ async fn a_real_run_without_snapshot_refuses(pool: PgPool) {
         "the refusal must name --snapshot\nstderr: {}",
         no_snapshot.stderr
     );
-    assert_eq!(belief_state(&pool).await, state, "a refused run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a refused run writes nothing"
+    );
 
     let v1_apply = run(RECOMPUTE_BETP, &dir, &[], &env.vars());
     assert!(
@@ -795,7 +825,11 @@ async fn a_real_run_without_snapshot_refuses(pool: PgPool) {
         v1_apply.code,
         v1_apply.stderr
     );
-    assert_eq!(belief_state(&pool).await, state, "a refused run writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a refused run writes nothing"
+    );
 
     let wave_file = dir.join("wave.jsonl");
     run(
@@ -902,8 +936,18 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
     let one_paper = claim(&pool, owner, "one paper, two agents").await;
     let ev_a = evidence(&pool, one_paper, Some("10.1000/one-paper")).await;
     let ev_b = evidence(&pool, one_paper, Some("10.1000/one-paper")).await;
-    insert_row(&pool, one_paper, &evidence_row(bin, source, 0.7, Some(ev_a))).await;
-    insert_row(&pool, one_paper, &evidence_row(bin, other_source, 0.7, Some(ev_b))).await;
+    insert_row(
+        &pool,
+        one_paper,
+        &evidence_row(bin, source, 0.7, Some(ev_a)),
+    )
+    .await;
+    insert_row(
+        &pool,
+        one_paper,
+        &evidence_row(bin, other_source, 0.7, Some(ev_b)),
+    )
+    .await;
     set_sentinel(&pool, one_paper, bin, 0.02).await;
 
     // (4) an attributed_v1 row beside ordinary evidence.
@@ -993,9 +1037,17 @@ async fn the_drift_components_sum_to_the_change_the_wave_writes(pool: PgPool) {
         for id in seeded {
             let v = component(by_id[&id], key).unwrap_or(0.0);
             if id == cause {
-                assert!(v.abs() > 1e-9, "({key}) must be nonzero where its cause is: {}", by_id[&id]);
+                assert!(
+                    v.abs() > 1e-9,
+                    "({key}) must be nonzero where its cause is: {}",
+                    by_id[&id]
+                );
             } else {
-                assert!(v.abs() <= 1e-9, "({key}) must be zero without its cause: {}", by_id[&id]);
+                assert!(
+                    v.abs() <= 1e-9,
+                    "({key}) must be zero without its cause: {}",
+                    by_id[&id]
+                );
             }
         }
     }
@@ -1049,7 +1101,11 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
         "the abort must say the disk check failed\nstderr: {}",
         failing.stderr
     );
-    assert_eq!(belief_state(&pool).await, state, "a failed disk check writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a failed disk check writes nothing"
+    );
     let recorded = std::fs::read_to_string(&wave_file).unwrap_or_default();
     assert!(
         recorded.trim().is_empty(),
@@ -1072,7 +1128,11 @@ async fn a_run_whose_disk_check_fails_writes_nothing(pool: PgPool) {
         failing_cmd.code,
         failing_cmd.stderr
     );
-    assert_eq!(belief_state(&pool).await, state, "a failed disk check writes nothing");
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a failed disk check writes nothing"
+    );
 
     run(
         RECOMPUTE_BETP,
@@ -1133,7 +1193,10 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
     .await;
     let atom_before = set_sentinel(&pool, atom, bin, 0.0).await;
     set_sentinel(&pool, twin, bin, 0.04).await;
-    for (scope, scope_id, b) in [("global", None, 0.123), ("perspective", Some(perspective), 0.321)] {
+    for (scope, scope_id, b) in [
+        ("global", None, 0.123),
+        ("perspective", Some(perspective), 0.321),
+    ] {
         sqlx::query(
             "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, scope_id, belief, \
                  plausibility, mass_on_empty, mass_on_missing, pignistic_prob) \
@@ -1173,7 +1236,11 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
         .collect();
     assert_eq!(
         rows["global"],
-        (after.belief.unwrap(), after.plausibility.unwrap(), after.pignistic_prob),
+        (
+            after.belief.unwrap(),
+            after.plausibility.unwrap(),
+            after.pignistic_prob
+        ),
         "the global row is the atom's fold"
     );
     let (p_bel, p_pl, p_betp) = rows["perspective"];
@@ -1209,7 +1276,11 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
         &[("DATABASE_URL", env.db.as_str())],
     );
     restore.ok("restore_belief_cache");
-    assert_eq!(cache(&pool, atom).await, atom_before, "the claim cache is restored");
+    assert_eq!(
+        cache(&pool, atom).await,
+        atom_before,
+        "the claim cache is restored"
+    );
     assert_eq!(
         scoped(&pool, atom).await,
         scoped_before,

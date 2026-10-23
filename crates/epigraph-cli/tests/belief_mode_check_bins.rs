@@ -278,7 +278,11 @@ impl WaveArgs {
 
     /// The wave flags plus `extra`.
     fn with<'a>(&'a self, extra: &[&'a str]) -> Vec<&'a str> {
-        self.args.iter().map(String::as_str).chain(extra.iter().copied()).collect()
+        self.args
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .collect()
     }
 
     /// An empty snapshot S0, for a dry run (every claim then starts from its
@@ -405,7 +409,10 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
         .unwrap_or_else(|| panic!("the hub's decomposition line\nstdout: {}", r.stdout));
     let v: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
     assert_eq!(v["target_fold"], "aef", "{line}");
-    assert!(v["components"].get("4").is_some(), "an AEF target reaches (4): {line}");
+    assert!(
+        v["components"].get("4").is_some(),
+        "an AEF target reaches (4): {line}"
+    );
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
     assert_eq!(
         belief_state(&pool).await,

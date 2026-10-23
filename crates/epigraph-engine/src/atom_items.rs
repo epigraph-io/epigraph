@@ -521,7 +521,10 @@ pub fn drift_legacy_grouping_betp(
 ///
 /// # Errors
 /// As [`atom_fold`].
-pub fn drift_atom_fold(rows: &[DriftRow], with_attributed: bool) -> Result<EvidencedInterval, String> {
+pub fn drift_atom_fold(
+    rows: &[DriftRow],
+    with_attributed: bool,
+) -> Result<EvidencedInterval, String> {
     let axioms: Vec<AxiomRow> = rows
         .iter()
         .filter(|r| with_attributed || !r.attributed)

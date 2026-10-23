@@ -170,7 +170,8 @@ fn parse_target_fold(raw: &str) -> Result<AtomFoldMode, String> {
 }
 
 fn parse_role(raw: &str) -> Result<WaveRole, String> {
-    WaveRole::parse_value(raw).ok_or_else(|| format!("unknown role {raw:?}; one of standalone, leaf"))
+    WaveRole::parse_value(raw)
+        .ok_or_else(|| format!("unknown role {raw:?}; one of standalone, leaf"))
 }
 
 /// The usage rules clap cannot express. `Err` is the refusal text.
@@ -319,7 +320,8 @@ fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
 /// A manifest of `mass_functions` ids: one uuid per line, or JSON lines
 /// with an `id` field; blank and `#` lines skipped.
 fn read_row_manifest(path: &std::path::Path) -> Result<HashSet<Uuid>, String> {
-    let text = String::from_utf8(read_file(path)?).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        String::from_utf8(read_file(path)?).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = HashSet::new();
     for (i, line) in text.lines().enumerate() {
         let t = line.trim();
@@ -329,7 +331,11 @@ fn read_row_manifest(path: &std::path::Path) -> Result<HashSet<Uuid>, String> {
         let id = if t.starts_with('{') {
             serde_json::from_str::<serde_json::Value>(t)
                 .ok()
-                .and_then(|v| v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+                .and_then(|v| {
+                    v.get("id")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse().ok())
+                })
         } else {
             t.parse().ok()
         };
@@ -358,8 +364,7 @@ async fn run_dry(
             Some(p) => Some(read_row_manifest(p)?),
             None => None,
         };
-        let cohort =
-            select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
+        let cohort = select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
         println!(
             "wave cohort: {} {} atoms with AEF input; target fold {}",
             cohort.len(),
@@ -443,7 +448,10 @@ async fn run_dry(
 }
 
 fn print_drift_summary(lines: &[DriftLine]) {
-    println!("drift summary over {} atoms (|component| median, max):", lines.len());
+    println!(
+        "drift summary over {} atoms (|component| median, max):",
+        lines.len()
+    );
     for key in DRIFT_COMPONENTS {
         let mut v: Vec<f64> = lines
             .iter()
@@ -549,11 +557,13 @@ async fn run_real(
         .await
         .map_err(|e| format!("wave_at: {e}"))?;
     let log = WaveLog::open(wave_file, wave, wave_at)?;
-    println!("wave {wave}: wave_at {wave_at}; recording to {}", wave_file.display());
+    println!(
+        "wave {wave}: wave_at {wave_at}; recording to {}",
+        wave_file.display()
+    );
 
     if let Some(role) = cli.role {
-        let cohort =
-            select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
+        let cohort = select_wave_cohort(pool, viewer, role, settings.compound_source_edges).await?;
         println!(
             "wave cohort: {} {} atoms with AEF input; atom_fold {}",
             cohort.len(),
@@ -709,7 +719,10 @@ async fn run_vacate_batches(
             }
         }
     }
-    println!("vacate done: {counts:?}, {errors} errors (of {})", ids.len());
+    println!(
+        "vacate done: {counts:?}, {errors} errors (of {})",
+        ids.len()
+    );
     match errors {
         0 => Ok(()),
         n => Err(RunError::ClaimErrors(n)),
