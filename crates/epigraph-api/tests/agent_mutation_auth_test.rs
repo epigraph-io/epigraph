@@ -810,3 +810,97 @@ async fn revoke_agent_key_never_reopens_or_extends_a_closed_window() {
         "retiring a key may only shorten its window, never move an earlier end later"
     );
 }
+
+// ===========================================================================
+// rotate_agent_key rotates the SIGNING key, whatever else is active
+// ===========================================================================
+//
+// An agent can hold one active key per key_type (idx_agent_keys_active is
+// unique on (agent_id, key_type) WHERE status = 'active'). Rotation always
+// stores a 'signing' key, so the key it retires must be the active signing
+// key, not merely the newest active key of any type.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotate_agent_key_retires_the_signing_key_not_a_newer_key_of_another_type() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    // A second active key of another type, created explicitly LATER than the
+    // signing key (explicit timestamps; insert order is not relied on).
+    let other_key = epigraph_crypto::AgentSigner::generate();
+    let other_pk = other_key.public_key();
+    sqlx::query("UPDATE agent_keys SET created_at = now() - interval '1 hour' WHERE agent_id = $1")
+        .bind(agent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_keys (id, agent_id, public_key, key_type, status, valid_from, created_at) \
+         VALUES ($1, $2, $3, 'encryption', 'active', now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(agent.id)
+    .bind(other_pk.as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed a newer active key of another type");
+    let (_, other_until_before, _) = key_window(&pool, &other_pk).await;
+
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let token = token_as_agent(agent.id, &["agents:write"]);
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(
+        status, 200,
+        "rotation signed by the active signing key must succeed; got {status} — {text}"
+    );
+
+    assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
+    let (_, other_until, other_status) = key_window(&pool, &other_pk).await;
+    assert_eq!(
+        (other_status.as_str(), other_until),
+        ("active", other_until_before),
+        "the key of another type must be left exactly as it was"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotate_agent_key_is_404_when_only_a_key_of_another_type_is_active() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    // The agent's only active key is not a signing key; rotation signed by
+    // that key must not convert it into a signing key.
+    let agent = seed_derived_llm_agent(&pool).await;
+    sqlx::query("UPDATE agent_keys SET key_type = 'encryption' WHERE agent_id = $1")
+        .bind(agent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = key_rows(&pool, agent.id).await;
+
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let token = token_as_agent(agent.id, &["agents:write"]);
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(
+        status, 404,
+        "there is no active signing key to rotate; got {status} — {text}"
+    );
+    assert_eq!(
+        key_rows(&pool, agent.id).await,
+        before,
+        "nothing may change"
+    );
+}
