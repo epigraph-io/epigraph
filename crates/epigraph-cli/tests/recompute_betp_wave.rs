@@ -727,7 +727,7 @@ async fn a_vacated_atom_reads_back_unproven_with_a_non_null_cache(pool: PgPool) 
 // ── (4) compounds ───────────────────────────────────────────────────────────
 
 /// A compound is never written: not by a leaf wave, not by a standalone wave,
-/// and not when it is on the accept list. Its leaf in the same run is (the
+/// and not when it is on the accept list. Its leaf in the leaf wave is (the
 /// control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_compound_is_never_written(pool: PgPool) {
@@ -744,18 +744,36 @@ async fn a_compound_is_never_written(pool: PgPool) {
     let leaf_before = set_sentinel(&pool, leaf, bin, 0.02).await;
 
     let env = WaveEnv::new(&pool, "aef").await;
-    let list = write_accept_list(&dir, &[compound]);
     for role in ["leaf", "standalone"] {
         let wave_file = dir.join(format!("wave-{role}.jsonl"));
-        let mut args = real_run_args(role, s(&wave_file), s(&dir));
-        args.extend(["--accept-vacate", s(&list)]);
-        run(RECOMPUTE_BETP, &dir, &args, &env.vars()).ok(&format!("{role} wave"));
+        run(
+            RECOMPUTE_BETP,
+            &dir,
+            &real_run_args(role, s(&wave_file), s(&dir)),
+            &env.vars(),
+        )
+        .ok(&format!("{role} wave"));
         assert_eq!(
             cache(&pool, compound).await,
             compound_before,
             "the {role} wave wrote a compound's cache"
         );
     }
+    // The accept list, in a vacate run of its own (its own wave file).
+    let list = write_accept_list(&dir, &[compound]);
+    let vacate_file = dir.join("vacate.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &vacate_args(s(&list), s(&vacate_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("accept-vacate run");
+    assert_eq!(
+        cache(&pool, compound).await,
+        compound_before,
+        "a listed compound was vacated"
+    );
     assert_ne!(
         cache(&pool, leaf).await,
         leaf_before,
@@ -851,6 +869,103 @@ async fn a_real_run_without_snapshot_refuses(pool: PgPool) {
     );
     let stamps: HashSet<_> = records.iter().map(|r| r.at).collect();
     assert_eq!(stamps.len(), 1, "one wave_at for the whole run: {stamps:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SPEC §10.8 restores a wave, and §10.5 a vacate batch, from the run's own
+/// wave file. So one wave file holds one run: a real run refuses a wave file
+/// that already holds records (it would mix two runs, and a restore of either
+/// would undo both), and a wave and a vacate batch never share a run. Both
+/// refusals are usage refusals (exit 2) that write and record nothing; the
+/// first run into the fresh file is the control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_real_run_refuses_a_wave_file_that_already_holds_records(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "one-run-owner").await;
+    let source = agent(&pool, "one-run-source").await;
+    let ingest = agent(&pool, "one-run-ingest").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+    let rv = frame(&pool, "research_validity").await;
+    let atom = claim(&pool, owner, "evidenced standalone").await;
+    insert_row(&pool, atom, &evidence_row(bin, source, 0.8, None)).await;
+    let residue = claim(&pool, owner, "residue").await;
+    insert_row(&pool, residue, &template_row(rv, ingest)).await;
+    set_sentinel(&pool, residue, rv, 0.02).await;
+    let sentinel = set_sentinel(&pool, atom, bin, 0.0).await;
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+
+    let wave_file = dir.join("wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("control: the first run into a fresh wave file");
+    assert_ne!(cache(&pool, atom).await, sentinel, "control: the run wrote");
+    let recorded = std::fs::read(&wave_file).expect("the wave file exists");
+    assert!(!recorded.is_empty(), "control: the run recorded its write");
+
+    // The same atom moves again, so a second run WOULD write and record.
+    set_sentinel(&pool, atom, bin, 0.0).await;
+    let state = belief_state(&pool).await;
+    let again = run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    );
+    assert_eq!(
+        again.code,
+        Some(2),
+        "a real run into a wave file that already holds records must refuse (exit 2)\n\
+         stdout: {}\nstderr: {}",
+        again.stdout,
+        again.stderr
+    );
+    assert!(
+        again.stderr.contains(s(&wave_file)),
+        "the refusal must name the wave file\nstderr: {}",
+        again.stderr
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a refused run writes nothing"
+    );
+    assert_eq!(
+        std::fs::read(&wave_file).expect("the wave file"),
+        recorded,
+        "a refused run appends nothing to the wave file"
+    );
+
+    // A wave and a vacate batch in one run: refused, into a fresh file.
+    let list = write_accept_list(&dir, &[residue]);
+    let mixed_file = dir.join("mixed.jsonl");
+    let mut mixed_args = real_run_args("standalone", s(&mixed_file), s(&dir));
+    mixed_args.extend(["--accept-vacate", s(&list)]);
+    let mixed = run(RECOMPUTE_BETP, &dir, &mixed_args, &env.vars());
+    assert_eq!(
+        mixed.code,
+        Some(2),
+        "a wave and a vacate batch in one run must refuse (exit 2)\nstdout: {}\nstderr: {}",
+        mixed.stdout,
+        mixed.stderr
+    );
+    assert!(
+        mixed.stderr.contains("--accept-vacate") && mixed.stderr.contains("--role"),
+        "the refusal must name both flags\nstderr: {}",
+        mixed.stderr
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        state,
+        "a refused run writes nothing"
+    );
+    assert!(
+        std::fs::read(&mixed_file).unwrap_or_default().is_empty(),
+        "a refused run records nothing"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
