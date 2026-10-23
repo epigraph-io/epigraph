@@ -313,9 +313,13 @@ pub struct ConjResult {
     /// Mass of ⊥ before normalization (conflict, including `~` annihilated
     /// by touched states, as in the served fold).
     pub k: f64,
-    /// Fréchet envelope. In the exact case it is built from the leaves'
-    /// marginals in the same joint, so lo ≤ Bel ≤ Pl ≤ hi and NR ≤ `hi_nr`
-    /// always hold; over the cap it is built from each leaf queried alone.
+    /// Fréchet envelope; lo ≤ Bel ≤ Pl ≤ hi and NR ≤ `hi_nr` always hold.
+    /// From the DP it is built from the leaves' marginals in the same joint.
+    /// Over the cap it is built from each leaf queried alone. After a
+    /// closed-form negative valuation (including the over-cap `not_all`), lo
+    /// follows the valuation and hi, `hi_nr` keep their pre-valuation values,
+    /// which remain upper bounds because a negative valuation only shrinks
+    /// Pl and NR.
     pub frechet: Frechet,
     /// `false` when the cap was hit and the result is R-IND + R-FRE.
     pub exact: bool,
@@ -786,10 +790,15 @@ pub fn joint_bel<A: Ord + Clone>(
 /// Dis   = ((1 − m)·Dis + m·(1 − Bel(∧C)))/(1 − K'),  NR = 1 − Dis
 /// Bel(∨L) = (Bel(∨L) − K')/(1 − K')
 /// K     = K + (1 − K)·K'
+/// lo    = max(0, (lo − K')/(1 − K'))
 /// ```
 ///
-/// The envelope is left as it was: it describes the leaves before the
-/// valuation.
+/// The envelope floor follows the valuation. Each leaf's Bel inside the new
+/// joint is (Belᵢ − m·Bel(aᵢ ∧ ∧C))/(1 − K') ≥ (Belᵢ − K')/(1 − K'), with
+/// equality for the leaves of C, so the floor above is exact for `not_all`
+/// (C = L) and a sound floor for a sibling pair. `hi` and `hi_nr` are kept:
+/// Pl and NR only shrink, by (1 − m)/(1 − K') ≤ 1, so the pre-valuation
+/// bounds still hold, though they can be looser than the DP's.
 fn apply_negative_valuation(
     base: &ConjResult,
     covered_bel: f64,
@@ -816,7 +825,10 @@ fn apply_negative_valuation(
         betp: unit(base.betp * keep),
         bel_or: unit((base.bel_or - k_prime) / z),
         k: unit(base.k + (1.0 - base.k) * k_prime),
-        frechet: base.frechet,
+        frechet: Frechet {
+            lo: unit((base.frechet.lo - k_prime) / z),
+            ..base.frechet
+        },
         exact: base.exact,
     })
 }
