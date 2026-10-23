@@ -785,6 +785,139 @@ async fn the_snapshot_holds_every_current_claim_once_across_pages_bit_for_bit(po
     assert!(all_ids.contains(&superseded));
 }
 
+/// A sink that, on the snapshot's FIRST write, commits an update to a
+/// later-id claim and inserts a new last-id claim through a separate
+/// connection (its own thread and runtime), as an organic writer would while a
+/// long export runs.
+struct WriteMidExport {
+    buf: Vec<u8>,
+    fired: bool,
+    opts: sqlx::postgres::PgConnectOptions,
+    update: Uuid,
+    insert: Uuid,
+    agent: Uuid,
+}
+
+impl std::io::Write for WriteMidExport {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if !self.fired {
+            self.fired = true;
+            let (opts, update, insert, agent) =
+                (self.opts.clone(), self.update, self.insert, self.agent);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async move {
+                        use sqlx::Connection;
+                        let mut c = sqlx::PgConnection::connect_with(&opts)
+                            .await
+                            .expect("second connection");
+                        sqlx::query("UPDATE claims SET belief = 0.987654321 WHERE id = $1")
+                            .bind(update)
+                            .execute(&mut c)
+                            .await
+                            .expect("mid-export update");
+                        sqlx::query(
+                            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id) \
+                             VALUES ($1, $2, sha256($2::bytea), 0.5, $3)",
+                        )
+                        .bind(insert)
+                        .bind(format!("mid-export claim {insert}"))
+                        .bind(agent)
+                        .execute(&mut c)
+                        .await
+                        .expect("mid-export insert");
+                    });
+            })
+            .join()
+            .expect("mid-export writer");
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// S0 is the baseline every drift report is measured from, so it must be ONE
+/// database state: a write that commits while the export runs is in no page,
+/// whichever page its row falls on. Keyset paging alone guarantees no row is
+/// skipped or repeated; only the single REPEATABLE READ transaction makes the
+/// pages agree on WHEN.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_snapshot_is_one_point_in_time_while_writes_land(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let first: Uuid = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+    let later: Uuid = "ffffffff-ffff-4fff-bfff-fffffffffffe".parse().unwrap();
+    let inserted: Uuid = "ffffffff-ffff-4fff-bfff-ffffffffffff".parse().unwrap();
+    for id in [first, later] {
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, belief) \
+             VALUES ($1, $2, sha256($2::bytea), 0.5, $3, 0.25)",
+        )
+        .bind(id)
+        .bind(format!("snapshot point-in-time claim {id}"))
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("seed claim");
+    }
+
+    let mut sink = WriteMidExport {
+        buf: Vec::new(),
+        fired: false,
+        opts: (*pool.connect_options()).clone(),
+        update: later,
+        insert: inserted,
+        agent,
+    };
+    let summary = write_snapshot(
+        &pool,
+        &mut sink,
+        &SnapshotOptions {
+            page_size: 1,
+            include_superseded: false,
+        },
+    )
+    .await
+    .expect("snapshot");
+    assert!(sink.fired, "fixture: the mid-export writer ran");
+    assert_eq!(
+        cache_of(&pool, later).await.belief,
+        Some(0.987654321),
+        "fixture: the mid-export update committed"
+    );
+
+    let rows = read_snapshot(sink.buf.as_slice()).expect("read snapshot");
+    let row = rows
+        .iter()
+        .find(|r| r.claim_id == later)
+        .expect("the later-id claim is in the snapshot");
+    assert_eq!(
+        row.belief,
+        Some(0.25),
+        "a later page saw a write that committed after the export began"
+    );
+    assert!(
+        rows.iter().all(|r| r.claim_id != inserted),
+        "a claim inserted after the export began is in it"
+    );
+    let updated_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM claims WHERE id = $1")
+            .bind(later)
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at");
+    assert!(
+        summary.snapshot_at < updated_at,
+        "snapshot_at must predate the write it excluded"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the plan: a claim recorded twice, and the --claims filter
 // ---------------------------------------------------------------------------
