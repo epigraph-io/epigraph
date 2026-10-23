@@ -212,7 +212,7 @@ async fn a_revoked_access_token_is_refused_on_mcp(pool: PgPool) {
 
 /// The PRODUCTION store fails CLOSED when its database cannot answer: a valid,
 /// unrevoked token is refused, never passed through. The refusal is a 503 with
-/// `Retry-After` and NO `invalid_token` challenge (backlog d1e6e5cd, the REST
+/// `Retry-After` and NO `WWW-Authenticate` challenge (backlog d1e6e5cd, the REST
 /// middleware's answer too): an RFC 6750 `invalid_token` tells a connector to
 /// discard a token that is still good and re-run consent, over what is a
 /// transient outage. The closed listener serves `DbAccessTokenRevocation`
@@ -261,9 +261,10 @@ async fn an_unavailable_revocation_store_fails_closed() {
         retry_after.parse::<u64>().is_ok_and(|s| s > 0),
         "Retry-After is a positive delay in seconds, got {retry_after:?}"
     );
-    assert!(
-        !header("www-authenticate").is_some_and(|c| c.contains("invalid_token")),
-        "store unavailable: no invalid_token challenge, so the client keeps its token"
+    assert_eq!(
+        header("www-authenticate"),
+        None,
+        "store unavailable: no WWW-Authenticate challenge at all, so the client keeps its token"
     );
     assert!(
         header(SESSION_HEADER).is_none(),
