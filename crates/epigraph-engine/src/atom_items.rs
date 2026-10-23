@@ -29,7 +29,8 @@ use crate::edge_factor::{
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 use crate::source_dependence::{
-    item_key, item_partition, ItemEvidence, ItemKey, KeyedBba, EDGE_FACTOR_METHOD,
+    dempster_across_items, item_key, item_partition, ItemEvidence, ItemKey, KeyedBba,
+    EDGE_FACTOR_METHOD,
 };
 
 /// Which rows of an atom's input a read takes (SPEC §3.4, §11.4).
@@ -733,19 +734,11 @@ pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
             })
             .collect(),
     );
-    let mut for_fold: Vec<MassFunction> =
+    let for_fold: Vec<MassFunction> =
         items.iter().filter_map(|it| it.on(atom).cloned()).collect();
     let n = for_fold.len();
-    let (combined, conflict) = if n == 1 {
-        let only = for_fold.pop().expect("n == 1");
-        let k = only.mass_of_conflict();
-        (only, k)
-    } else {
-        let (combined, reports) =
-            combination::combine_multiple(&for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
-        let k = combination::fold_conflict(&combined, &reports);
-        (combined, k)
-    };
+    let (combined, conflict) =
+        dempster_across_items(for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
     let t = FocalElement::positive(BTreeSet::from([0]));
     Ok(EvidencedInterval {
         belief: measures::belief(&combined, &t),
