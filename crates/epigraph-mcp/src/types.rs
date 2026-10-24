@@ -2194,9 +2194,10 @@ pub struct LinkEpistemicResponse {
     pub belief_wired: bool,
     /// Why `belief_wired` is false (backlog 0a996437); omitted when it is
     /// true. One of `source_has_no_belief`, `structural_relationship`,
-    /// `vacuous_source_mass`, `already_wired`, `edge_retracted`,
-    /// `source_author_unresolved` or `refused_or_failed` (the wiring was
-    /// refused, e.g. a target this caller cannot write, or failed).
+    /// `vacuous_source_mass`, `already_wired` or `refused_or_failed` (the
+    /// wiring was refused, e.g. a target this caller cannot write, or failed);
+    /// `edge_retracted` and `source_author_unresolved` are defensive values
+    /// seen only under a concurrent retraction or removal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief_wired_reason: Option<&'static str>,
     /// The claim `target_belief` describes, and the one the belief wire

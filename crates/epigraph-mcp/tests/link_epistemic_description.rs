@@ -102,9 +102,13 @@ fn link_epistemic_description_names_the_belief_wired_reason_values() {
         "vacuous_source_mass",
         "already_wired",
         "structural_relationship",
-        "edge_retracted",
-        "source_author_unresolved",
-        "refused_or_failed",
+        "refused_or_failed (a refused or failed wiring)",
+        // Not producible by a single call (both dedup probes return only
+        // in-force rows, and every claims row has an author), so the contract
+        // names them as defensive rather than as ordinary outcomes.
+        "Two further values are defensive and appear only when the edge or its source \
+         changes underneath the call (a concurrent retraction or removal): edge_retracted \
+         and source_author_unresolved.",
     ] {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
     }

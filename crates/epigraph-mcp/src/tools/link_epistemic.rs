@@ -323,9 +323,10 @@ pub async fn do_link_epistemic(
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
     // Overwritten below when the wire is attempted. It stays this when the
-    // source's author cannot be resolved (both endpoints were viewer-checked
-    // above, so in practice a source row with no `agent_id`), and the wire is
-    // then skipped.
+    // source's author cannot be resolved and the wire is skipped. Defensive:
+    // `claims.agent_id` is NOT NULL and both endpoints were viewer-checked
+    // above, so the visibility-spliced author read finds no row only when the
+    // source is removed or hidden concurrently.
     let mut belief_wired_reason: Option<&'static str> = Some("source_author_unresolved");
     let source_agent_id: Option<uuid::Uuid> = {
         // PR-09: an authorship oracle over a uuid that derives from caller
@@ -374,6 +375,11 @@ pub async fn do_link_epistemic(
         // own order and with its `was_created` short-cut, under a savepoint
         // that is rolled back, so `belief_wired_reason` can name them. A failed
         // read leaves both unknown, which reports `refused_or_failed`.
+        // `edge_retracted` is defensive: the edge was just looked up or written
+        // in force on this transaction, so it reads false only under a
+        // concurrent retraction. Under READ COMMITTED a concurrent wire of the
+        // same edge between this probe and the engine's read reports
+        // `refused_or_failed` rather than `already_wired` (cosmetic).
         let (in_force, already_wired) = {
             let mut probe = tx.begin().await.map_err(internal_error)?;
             let in_force = EdgeRepository::is_in_force(&mut *probe, edge_id).await.ok();
