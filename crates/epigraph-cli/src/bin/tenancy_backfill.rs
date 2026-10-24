@@ -1917,6 +1917,25 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every keyed identity a legacy row it must never have (quiet, and in the
     // direction of binding a key that never signs).
     ("epigraph_backfill_legacy_agent_keys", 161),
+    // 166, role-attached agents. `role_agents` is FORCEd and admits only a
+    // privileged session or a maintenance-owned definer frame. The guards and
+    // the audit run in a definer frame: under a non-member owner the insert
+    // guard's overlap read sees no row (quiet: a duplicate attachment lands)
+    // and the audit's `platform.` row is refused (loud). The verbs' writes are
+    // refused by the policies (loud). The gate reads `role_agents` and
+    // `role_assignments` (both FORCEd) through the same arm: under a
+    // non-member owner it sees no attachment, so every role's agent reads as
+    // UNATTACHED -- ROL01 never fires and epigraph-mcp boots in a gap (quiet,
+    // and in the direction the ruling forbids). The question and the check
+    // only call the gate.
+    ("epigraph_role_agents_guard_insert", 166),
+    ("epigraph_role_agents_guard_update", 166),
+    ("epigraph_role_agents_audit", 166),
+    ("epigraph_attach_agent_to_role", 166),
+    ("epigraph_detach_agent_from_role", 166),
+    ("epigraph_role_agent_gate", 166),
+    ("epigraph_role_agent_may_run", 166),
+    ("epigraph_require_role_holder", 166),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2533,6 +2552,35 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_backfill_legacy_agent_keys",
             "public.epigraph_backfill_legacy_agent_keys()",
             false,
+        ),
+        // 166: attaching and detaching a role's agents is a maintenance act;
+        // the request DSN asks whether an agent may run and reaches the write
+        // check, never the gate's any-time form.
+        (
+            "epigraph_attach_agent_to_role",
+            "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
+             timestamp with time zone, text)",
+            false,
+        ),
+        (
+            "epigraph_detach_agent_from_role",
+            "public.epigraph_detach_agent_from_role(text, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_gate",
+            "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_may_run",
+            "public.epigraph_role_agent_may_run(uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_role_holder",
+            "public.epigraph_require_role_holder(uuid)",
+            true,
         ),
     ];
 
