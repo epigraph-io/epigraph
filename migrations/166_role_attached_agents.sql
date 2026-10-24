@@ -44,6 +44,13 @@
 --     `detached_by` = the detaching login, a reason, every other column
 --     unchanged), and any change to a detached row (a detach is final);
 --   * DELETE and TRUNCATE are refused outright.
+-- An attachment FOLLOWS THE LINEAGE forward: inserting one also attaches,
+-- with the same window, every registered successor of the agent (161's
+-- `agent_succession`, transitively), each naming the row in
+-- `inherited_from`. An operator who attaches an identity read from a stale
+-- list therefore still attaches the identity that runs now. A detach does
+-- not follow (a successor stays attached until it is detached itself: the
+-- direction that only refuses).
 -- Each attach and each detach writes one `security_events` row
 -- (`platform.role_agent_attached` / `platform.role_agent_detached`), whatever
 -- path wrote it. The `platform.` prefix is already reserved to a privileged
@@ -287,6 +294,51 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_audit() FROM PUBLIC;
 
+-- AFTER INSERT: an attachment follows the identity's LINEAGE forward. An
+-- identity changes whenever its prompt files or model do, so the identity an
+-- operator attaches may already have registered successors (161's
+-- `agent_succession`), one of which is the identity that runs now. Every
+-- registered successor down the lineage (transitively) gets the same window,
+-- naming this row in `inherited_from`, unless it already has an overlapping
+-- un-detached row for the role or has inherited this row before. One INSERT
+-- walks the whole lineage, so the copies' own firings find their
+-- descendants already attached and insert nothing (no deep recursion). A
+-- copy only ever refuses, so it never grants a successor anything; a
+-- succession registered LATER is covered by the registration's own copy
+-- (section 5).
+CREATE OR REPLACE FUNCTION public.epigraph_role_agents_follow_lineage()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    WITH RECURSIVE lineage(agent_id) AS (
+        SELECT s.child_agent_id FROM public.agent_succession s
+         WHERE s.parent_agent_id = NEW.agent_id
+        UNION
+        SELECT s.child_agent_id FROM public.agent_succession s
+          JOIN lineage l ON s.parent_agent_id = l.agent_id
+    )
+    INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
+                                    inherited_from)
+    SELECT NEW.role, l.agent_id, NEW.valid_from, NEW.valid_to,
+           'lineage of ' || NEW.agent_id::text || ' (attachment ' || NEW.id::text || ')',
+           NEW.id
+      FROM lineage l
+     WHERE l.agent_id <> NEW.agent_id
+       AND NOT EXISTS (
+               SELECT 1 FROM public.role_agents c
+                WHERE c.agent_id = l.agent_id AND c.role = NEW.role
+                  AND c.detached_at IS NULL
+                  AND (c.valid_to IS NULL OR c.valid_to > NEW.valid_from)
+                  AND (NEW.valid_to IS NULL OR NEW.valid_to > c.valid_from))
+       AND NOT EXISTS (
+               SELECT 1 FROM public.role_agents c
+                WHERE c.agent_id = l.agent_id AND c.inherited_from = NEW.id)
+     ORDER BY l.agent_id;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_follow_lineage() FROM PUBLIC;
+
 DROP TRIGGER IF EXISTS role_agents_guard_insert ON public.role_agents;
 CREATE TRIGGER role_agents_guard_insert
     BEFORE INSERT ON public.role_agents
@@ -303,6 +355,10 @@ DROP TRIGGER IF EXISTS role_agents_no_truncate ON public.role_agents;
 CREATE TRIGGER role_agents_no_truncate
     BEFORE TRUNCATE ON public.role_agents
     FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_role_agents_append_only();
+DROP TRIGGER IF EXISTS role_agents_follow_lineage ON public.role_agents;
+CREATE TRIGGER role_agents_follow_lineage
+    AFTER INSERT ON public.role_agents
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_agents_follow_lineage();
 DROP TRIGGER IF EXISTS role_agents_audit ON public.role_agents;
 CREATE TRIGGER role_agents_audit
     AFTER INSERT OR UPDATE ON public.role_agents
@@ -387,6 +443,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_role_agents_guard_update() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_role_agents_audit() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_agents_follow_lineage() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_attach_agent_to_role(text, uuid, timestamptz, '
                 'timestamptz, text) OWNER TO epigraph_maintenance';

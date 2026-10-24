@@ -577,6 +577,7 @@ DROP TABLE IF EXISTS public.role_agents;
 DROP FUNCTION IF EXISTS public.epigraph_role_agents_guard_insert();
 DROP FUNCTION IF EXISTS public.epigraph_role_agents_guard_update();
 DROP FUNCTION IF EXISTS public.epigraph_role_agents_audit();
+DROP FUNCTION IF EXISTS public.epigraph_role_agents_follow_lineage();
 DROP FUNCTION IF EXISTS public.epigraph_role_agents_append_only();
 
 COMMIT;

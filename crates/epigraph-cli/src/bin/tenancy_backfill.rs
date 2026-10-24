@@ -1921,7 +1921,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // privileged session or a maintenance-owned definer frame. The guards and
     // the audit run in a definer frame: under a non-member owner the insert
     // guard's overlap read sees no row (quiet: a duplicate attachment lands)
-    // and the audit's `platform.` row is refused (loud). The verbs' writes are
+    // and the audit's `platform.` row is refused (loud). The lineage copy
+    // reads FORCEd `agent_succession` through the same arm: under a
+    // non-member owner it sees no successor (quiet: the running successor
+    // of an attached identity stays unattached). The verbs' writes are
     // refused by the policies (loud). The gate reads `role_agents` and
     // `role_assignments` (both FORCEd) through the same arm: under a
     // non-member owner it sees no attachment, so every role's agent reads as
@@ -1931,6 +1934,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_role_agents_guard_insert", 166),
     ("epigraph_role_agents_guard_update", 166),
     ("epigraph_role_agents_audit", 166),
+    ("epigraph_role_agents_follow_lineage", 166),
     ("epigraph_attach_agent_to_role", 166),
     ("epigraph_detach_agent_from_role", 166),
     ("epigraph_role_agent_gate", 166),
