@@ -27,9 +27,10 @@
 -- and author, and nothing here can tell it from that identity's own write.
 -- So the database enforces the ruling only against a writer that does not
 -- choose its own principal (the API, which stamps the authenticated
--- viewer). A container that holds the application DSN directly is held by
--- the host's skip, not by this file. Section 3 says which claim writes the
--- rule covers.
+-- viewer). A container that holds the application DSN directly can stamp
+-- itself as another principal; it is held by the host's skip, not by this
+-- file. Section 3 says which writes the rule covers: every write an
+-- application session makes.
 --
 -- `role_agents` CONFERS NOTHING. It only adds a refusal. An attachment never
 -- grants an agent a group, a scope or a read; whatever the agent may do, it
@@ -84,13 +85,20 @@
 -- ===================================================================
 -- 3. THE RULE (`ROL01`)
 --
--- A claim INSERT (and a re-open or re-attribution, which 122/123 check as an
--- insert) is refused `ROL01` when the agent WRITING it (the stamped
--- principal) or the agent it is ATTRIBUTED to has a live attachment, unless,
--- for EVERY live attachment of that agent, at `clock_timestamp()`:
+-- Every write an application session makes (an INSERT, UPDATE, DELETE or
+-- TRUNCATE of any table it can write) is refused `ROL01` when the ACTING
+-- agent has a live attachment, unless, for EVERY live attachment of that
+-- agent, at `clock_timestamp()`:
 --   (a) the role has a live human holder (`epigraph_live_role_assignment`), and
 --   (b) the agent's live-linked human (`epigraph_human_of(agent, true)`) is
 --       that holder.
+-- The ACTING agents of a write: the stamped principal (the writer), always;
+-- and, for a claim, the agent it is ATTRIBUTED to (the author column), on an
+-- insert, a re-open and a re-attribution (the claims trigger, below) and on
+-- every UPDATE or DELETE of the row (the author arm), whoever writes it. A
+-- claim an attached agent authored is its output: after its holder's end no
+-- application session rewrites or deletes it, the human and a session with no
+-- principal included.
 -- (b) also refuses an agent still linked to the PREVIOUS holder after a
 -- handover. A link is permanent (107 refuses a second operator for an agent),
 -- so such an agent stays refused: the remedies are to grant the role back to
@@ -106,37 +114,75 @@
 -- older snapshot would still see it live. An unattached agent may use any
 -- isolation level.
 --
--- WHERE: in the operator-binding path, by re-stating 123's
--- `epigraph_require_writer_scope` (which the claims trigger calls on the
--- author when the writer is the author or no principal is stamped, and on
--- the writer otherwise) and `epigraph_require_attributable` (the author, when
--- the writer is someone else). No new trigger, and 153's trigger body is not
--- touched. A restatement of a RETIRED predecessor (the supersede act's
+-- WHERE: one shared check, `epigraph_require_role_holder(agent)`, reached
+-- three ways.
+--   * `epigraph_role_agent_write_check()`, a BEFORE INSERT OR UPDATE OR
+--     DELETE OR TRUNCATE ... FOR EACH STATEMENT trigger
+--     (`role_agent_write_check`) on every table the application role writes
+--     (the list below), on the stamped principal. A statement trigger fires
+--     once per statement, whatever rows it touches (none included).
+--   * The same function as a BEFORE UPDATE OR DELETE row trigger on
+--     `claims` (`claims_role_agent_author`), on the row's author (old and,
+--     on a re-attribution, new).
+--   * The operator-binding path, by re-stating 123's
+--     `epigraph_require_writer_scope` (which the claims trigger calls on the
+--     author when the writer is the author or no principal is stamped, and on
+--     the writer otherwise) and `epigraph_require_attributable` (the author,
+--     when the writer is someone else); 153's trigger body is not touched.
+--     These reach the author of an insert, a re-open and a re-attribution.
+-- THE ONE RELIEF on an author: a RETIRED identity (`epigraph_agent_is_retired`).
+-- A restatement of a RETIRED predecessor (the supersede act's
 -- inherited author) is relieved of the check on that author ONLY when the
 -- author identity is itself retired (`epigraph_agent_is_retired`: a retired
 -- operator link and no live one, so it can never run again and naming it is
 -- its human's act). An inherited author that is a live attached agent is
 -- checked like any other: otherwise a sibling of the same human, or the human,
 -- could restate the agent's claim under its name in the gap. The writer of a
--- restatement is checked either way.
+-- restatement is checked either way. The author arm grants the same relief:
+-- a retired identity's claim may be updated by its human.
 --
 -- EXEMPT: a privileged session (`epigraph_bypass()`: the maintenance role or a
--- superuser, i.e. the custodial path), as it is from OPL02. KEYED ON ARMING
--- like OPL02 (the claims trigger checks nothing on an unarmed database), and
--- NOT relieved by the valve, which relieves OPL01 only.
+-- superuser, i.e. the custodial path, and the system jobs that run on it),
+-- as it is from OPL02, whatever principal it stamps. KEYED ON ARMING like
+-- OPL02 (nothing is checked on an unarmed database), and NOT relieved by the
+-- valve, which relieves OPL01 only. An agent with no live attachment, and an
+-- attached agent while its human holds the role, write exactly as before.
 --
--- COVERAGE, SHORT OF THE RULING. The ruling refuses EVERY write a run makes
--- after its holder's assignment ends. This file refuses the claim writes
--- that the claims trigger checks: an INSERT, a re-open, a re-attribution.
--- It does NOT refuse, after the end:
---   * an attached agent's same-author retire of its own claim, or an UPDATE
---     of a claim's content, truth value or labels (the trigger fires only on
---     `agent_id`, `supersedes` and `is_current`, and returns before any check
---     on a same-author retire);
---   * evidence, edge, belief (mass function) or membership writes.
--- Extending the refusal to those is open follow-up work, not a decision that
--- they are acceptable. `role_attached_agents.rs` pins where the boundary is
--- today (`after_the_end_claim_inserts_are_refused_and_claim_updates_are_not_yet`).
+-- COVERAGE: COMPLETE for the application role. The ruling refuses EVERY
+-- write a run makes after its holder's assignment ends, and every table the
+-- application role can INSERT, UPDATE or DELETE carries the statement
+-- trigger: 79 tables on a database migrated to this file, measured from the
+-- catalog (table- and column-level grants after 118 and every later
+-- migration), with NO exemption. That includes `claims` (every column,
+-- `is_current` and a same-author retire included, and DELETE), `evidence`,
+-- `edges`, `mass_functions`, memberships and groups, the derived belief and
+-- cluster tables, the audit and ledger tables (`security_events`,
+-- `provenance_log`, `privatization_audit`: an audit row written for an
+-- attached agent in its gap belongs to an act this check refuses), and the
+-- OAuth, refresh-token and key tables (a token or a key minted for an
+-- attached agent in its gap is that agent running). The catalog ratchet in
+-- `role_attached_agents.rs` (`every_table_the_app_role_writes_carries_the_
+-- role_holder_write_check`) re-measures the set, so a table a later
+-- migration hands the application role (077's default privileges do) fails
+-- it until it carries the trigger or an exemption with a concrete harm.
+-- A write the application role makes THROUGH a maintenance-owned definer
+-- into one of these tables meets the trigger too (it reads the session's
+-- principal, not the role). The tables only such definers write, and the
+-- application role cannot (`elevation_sessions`, `elevation_tickets`,
+-- `elevated_access`, `pending_admin_acts`, `person_authenticators`,
+-- `passkey_enrollments`, `revoked_access_tokens`), are PERSON flows:
+-- elevation, passkeys, admin acts, token revocation. A person is never
+-- attached (ROL02), so no write there is a role agent's.
+-- THE REMAINING STATED LIMIT is section 1's: a container that holds the
+-- application DSN can stamp itself as another principal (or as none, for a
+-- table other than `claims`), and nothing here can tell that from the other
+-- identity's own write. The host's skip holds it.
+-- A write that touches a claim an attached agent authored fails as a whole
+-- in that agent's gap (a multi-row UPDATE included); a custodial correction
+-- runs on the maintenance DSN.
+-- DEPLOY: creating 80 triggers takes a SHARE ROW EXCLUSIVE lock on each
+-- table under this file's 3 s `lock_timeout`; on a busy database a timeout
+-- rolls the whole migration back, and it is re-run.
 --
 -- ===================================================================
 -- 4. THE QUESTION THE HOST AND EPIGRAPH-MCP ASK
@@ -607,6 +653,13 @@ BEGIN
         RETURN QUERY SELECT true, NULL::text, NULL::uuid, 'unattached'::text;
         RETURN;
     END IF;
+    -- Most agents were never attached: answer without the human lookup. After
+    -- the owner check above, so a misowned gate still fails closed.
+    IF NOT EXISTS (SELECT 1 FROM public.role_agents ra
+                    WHERE ra.agent_id = p_agent AND ra.detached_at IS NULL) THEN
+        RETURN QUERY SELECT true, NULL::text, NULL::uuid, 'unattached'::text;
+        RETURN;
+    END IF;
     v_human := public.epigraph_human_of(p_agent, true);
     FOR v_role IN
         SELECT DISTINCT ra.role FROM public.role_agents ra
@@ -810,6 +863,91 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) FROM PUBLIC;
 
+-- Section 3, EVERY WRITE: the one check every table the application role
+-- writes runs, as a BEFORE ... FOR EACH STATEMENT trigger on INSERT, UPDATE,
+-- DELETE and TRUNCATE (the acting agent is the stamped principal), and, on
+-- `claims` only, as a BEFORE UPDATE OR DELETE row trigger (the AUTHOR of the
+-- row, unless that identity is retired). Keyed on arming, a privileged
+-- session exempt, the verdict `epigraph_require_role_holder`'s.
+CREATE OR REPLACE FUNCTION public.epigraph_role_agent_write_check()
+RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_operator_binding_armed() AND NOT public.epigraph_bypass() THEN
+        IF TG_LEVEL = 'STATEMENT' THEN
+            PERFORM public.epigraph_require_role_holder(public.epigraph_principal_id());
+        ELSE
+            -- `claims`: a claim an attached agent authored is its output, so
+            -- no application session rewrites or deletes it in the agent's
+            -- gap, whoever is stamped (the claims trigger checks the author
+            -- of an insert, a re-open and a re-attribution).
+            IF NOT public.epigraph_agent_is_retired(OLD.agent_id) THEN
+                PERFORM public.epigraph_require_role_holder(OLD.agent_id);
+            END IF;
+            IF TG_OP = 'UPDATE' AND NEW.agent_id IS DISTINCT FROM OLD.agent_id
+               AND NOT public.epigraph_agent_is_retired(NEW.agent_id) THEN
+                PERFORM public.epigraph_require_role_holder(NEW.agent_id);
+            END IF;
+        END IF;
+    END IF;
+    IF TG_LEVEL = 'STATEMENT' THEN
+        RETURN NULL;
+    ELSIF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_write_check() FROM PUBLIC;
+
+-- Every public table the application role can INSERT, UPDATE or DELETE (at
+-- table or column level) on a database migrated to this file, measured from
+-- the catalog. `role_attached_agents.rs`
+-- (`every_table_the_app_role_writes_carries_the_role_holder_write_check`)
+-- re-measures it, so a table a later migration hands the application role
+-- fails that test until it carries this trigger. Guarded per table, so a
+-- database without one of them still migrates.
+DO $$
+DECLARE
+    v_table text;
+BEGIN
+    FOREACH v_table IN ARRAY ARRAY[
+        'activities', 'agent_keys', 'agent_spans', 'agent_state_history', 'agents', 'analyses',
+        'analysis_methods', 'behavioral_executions', 'bp_messages', 'challenges',
+        'claim_cluster_membership', 'claim_clusters', 'claim_encryption', 'claim_frames',
+        'claim_neighborhood_membership', 'claim_signature_revocations', 'claim_themes',
+        'claim_version_encryption', 'claim_versions', 'claims', 'cluster_centroids',
+        'cluster_edges', 'cluster_labels', 'communities', 'community_members', 'contexts',
+        'counterfactual_scenarios', 'ds_bayesian_divergence', 'ds_combined_beliefs',
+        'edge_encryption', 'edges', 'edges_staging', 'entities', 'entity_mentions',
+        'entity_types', 'events', 'evidence', 'evidence_encryption',
+        'experiment_entity_mentions', 'experiment_results', 'experiment_triples', 'experiments',
+        'factors', 'frames', 'gap_analyses', 'graph_cluster_runs', 'graph_clusters',
+        'graph_neighborhoods', 'group_key_epochs', 'group_memberships', 'groups',
+        'harvester_claim_provenance', 'harvester_fragments', 'jobs', 'learning_events',
+        'mass_functions', 'match_candidates', 'method_capabilities', 'methods',
+        'neighborhood_edges', 'oauth_authorization_codes', 'oauth_authorize_sessions',
+        'oauth_clients', 'papers', 'pattern_templates', 'perspectives', 'privatization_audit',
+        'provenance_log', 'reasoning_traces', 'recall_events', 'refresh_tokens', 'rls_canary',
+        'security_events', 'tasks', 'trace_parents', 'triples', 'webhook_subscriptions',
+        'workflow_executions', 'workflows'
+    ] LOOP
+        IF to_regclass('public.' || v_table) IS NOT NULL THEN
+            EXECUTE format('DROP TRIGGER IF EXISTS role_agent_write_check ON public.%I',
+                           v_table);
+            EXECUTE format('CREATE TRIGGER role_agent_write_check '
+                           'BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.%I '
+                           'FOR EACH STATEMENT '
+                           'EXECUTE FUNCTION public.epigraph_role_agent_write_check()',
+                           v_table);
+        END IF;
+    END LOOP;
+END $$;
+DROP TRIGGER IF EXISTS claims_role_agent_author ON public.claims;
+CREATE TRIGGER claims_role_agent_author
+    BEFORE UPDATE OR DELETE ON public.claims
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_agent_write_check();
+
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) '
@@ -819,6 +957,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_require_role_holder(uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_agent_is_retired(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_agent_write_check() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz), '
                 'public.epigraph_role_agent_may_run(uuid), '

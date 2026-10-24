@@ -7,11 +7,14 @@
 //!   append-only and maintenance-written (`epigraph_attach_agent_to_role` /
 //!   `epigraph_detach_agent_from_role`, each audited); the application role
 //!   reads no row and writes none.
-//! * A claim written or authored by an agent with a LIVE attachment is refused
-//!   `ROL01` unless, at the statement's clock, the role has a live human
-//!   holder AND the agent's live-linked human is that holder. The check sits in
-//!   the operator-binding path (the claims trigger's writer-scope and
-//!   attribution checks), so no write path skips it.
+//! * EVERY write an application session makes, stamped as an agent with a
+//!   LIVE attachment, and every claim insert, update or delete whose author
+//!   is one, is refused `ROL01` unless, at the statement's clock, the role
+//!   has a live human holder AND the agent's live-linked human is that
+//!   holder. One check, reached by a statement trigger on every table the
+//!   application role writes (a catalog ratchet pins the set), a row trigger
+//!   on `claims` for the author, and the claims trigger's writer-scope and
+//!   attribution checks.
 //! * "A run in progress finishes, but its writes after the end are refused":
 //!   a write inside an OPEN transaction after the assignment's `valid_to`
 //!   passes is refused, because the check reads `clock_timestamp()`, not the
@@ -20,7 +23,8 @@
 //!   without exposing the roster. Both the application role and the identity
 //!   attestor can EXECUTE it.
 //! * A succession registered by the attestor copies the parent's live
-//!   attachments to the child, once.
+//!   attachments to the child, once, over every gap the child's own rows
+//!   leave; a SHARED identity is copied nothing, and the audit says why.
 //! * POSITIVE CONTROL throughout: an agent with no attachment writes exactly as
 //!   before, during the same gap that refuses an attached agent.
 //!
@@ -2381,16 +2385,12 @@ async fn the_write_check_is_keyed_on_arming_and_spares_a_privileged_session(pool
 }
 
 /// The tables the application role can write that carry NO role-holder write
-/// check, each with the concrete harm the check would do there. Exact: a
-/// table that gains the check, or loses the application role's write, must
-/// leave this list.
-const WRITE_CHECK_EXEMPT: &[(&str, &str)] = &[(
-    "security_events",
-    "the audit record: the API records a refused or denied request in its own \
-     transaction stamped as the refused principal, so checking it would drop the \
-     record of the very refusal (and of authentication events) for a role agent in a \
-     gap; an audit row confers nothing",
-)];
+/// check, each with the concrete harm the check would do there. EMPTY: no
+/// table has one (an audit row, a token or a key written for an attached
+/// agent in its gap is that agent running, and every such write is part of,
+/// or follows, an act the same check refuses). Exact: an entry must name an
+/// app-writable table the check does not cover.
+const WRITE_CHECK_EXEMPT: &[(&str, &str)] = &[];
 
 /// THE COVERAGE RATCHET. Every public table the application role can INSERT,
 /// UPDATE or DELETE (at table or column level) carries the shared role-holder
