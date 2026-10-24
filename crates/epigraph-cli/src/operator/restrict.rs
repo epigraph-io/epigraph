@@ -29,7 +29,9 @@
 //! `epigraph_propagate_tenancy` then copies the claim's tenancy onto every row
 //! of its `derived[]` tables (evidence, reasoning traces, BBAs, versions, ...,
 //! other writers' rows included: a narrowing takes a writer-owned row into the
-//! claim's group and clears its `writer_owned` flag, migration 114), onto the
+//! claim's group and clears its `writer_owned` flag, migration 114, except an
+//! outsider's writer-owned challenge, which stays the challenger's, migration
+//! 168), onto the
 //! harvester fragments it is the provenance of, and re-meets every edge with
 //! the claim as an endpoint (migration 122's edges arm).
 //!
@@ -1014,6 +1016,15 @@ pub struct BatchOutcome {
 /// `audit = Some(details)`, writes the run's audit row in this transaction if
 /// the batch moves at least one claim.
 #[allow(clippy::too_many_lines)]
+/// A `challenges` row an OUTSIDER wrote on a public claim (migration 168,
+/// ruling R-CH1): owned by the challenger's group and never moved by the
+/// tenancy cascade, unlike 114's writer-owned evidence, BBAs and traces, which
+/// a narrowing hands to the claim. The prediction must say so, or the batch's
+/// own invariants roll back every restrict of a claim that carries one.
+fn is_outsider_challenge(table: &str, writer_owned: Option<bool>) -> bool {
+    table == "challenges" && writer_owned == Some(true)
+}
+
 async fn run_batch(
     conn: &mut PgConnection,
     ctx: &Ctx<'_>,
@@ -1129,6 +1140,9 @@ async fn run_batch(
                 }
             }),
             _ if k.0 == "evidence" && pinned.contains(&k.1) => Some(a.tenancy.clone()),
+            // Migration 168 (R-CH1): an outsider's challenge is the
+            // challenger's and the cascade never moves it.
+            _ if is_outsider_challenge(&k.0, a.writer_owned) => Some(a.tenancy.clone()),
             Kind::Fragments if !fragment_narrows(a, &cand_set) => Some(a.tenancy.clone()),
             _ => Some(Tenancy {
                 owner: ctx.target,
@@ -1322,6 +1336,7 @@ async fn run_batch(
                 },
             },
             _ if k.0 == "evidence" && pinned.contains(&k.1) => before.clone(),
+            _ if is_outsider_challenge(&k.0, a.writer_owned) => before.clone(),
             _ if kept_nodes.contains(k) => before.clone(),
             _ => RowState {
                 tenancy: Tenancy {
@@ -1604,8 +1619,8 @@ pub async fn run(
         out,
         "RULE: every derived row, fragment and edge of a moved claim follows it into the target \
          (other writers' rows included; a writer-owned row loses its flag, and the manifest \
-         records it); pinned evidence is unchanged; a claim carrying a non-public row that is not \
-         the target's is HELD"
+         records it); pinned evidence and an outsider's writer-owned challenge are unchanged; a \
+         claim carrying a non-public row that is not the target's is HELD"
     )?;
     if report.unenforced.is_empty() {
         writeln!(

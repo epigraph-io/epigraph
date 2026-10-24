@@ -682,6 +682,71 @@ async fn apply_then_reverse_restores_every_row_byte_for_byte(pool: PgPool) {
     assert_same(&before, &snapshot(&pool, true).await, "second reverse");
 }
 
+/// Migration 168 (ruling R-CH1): an OUTSIDER's challenge on A (the stranger's,
+/// owned by the stranger's group, public, writer-owned) is not dragged into the
+/// target when A is restricted: the cascade leaves it exactly as it was, the
+/// run's prediction must agree (or its invariants roll the batch back), and the
+/// claim-owned challenge on A (the fixture's) still follows. Reverse puts
+/// every row back byte for byte, the outsider's included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_outsiders_challenge_is_not_dragged_into_the_target(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let outsiders: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation) \
+         VALUES ($1, $2, 'factual_error', 'the outsider objects') RETURNING id",
+    )
+    .bind(fx.a)
+    .bind(fx.stranger)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the outsider's challenge");
+    // The shape 168's attach rule gives it (the harness is privileged, so it
+    // inherited; set it as the fixture sets the stranger's other rows).
+    sqlx::query(
+        "UPDATE challenges SET owner_group_id = $2, visibility = 'public', writer_owned = true \
+          WHERE id = $1",
+    )
+    .bind(outsiders)
+    .bind(fx.stranger_group)
+    .execute(&pool)
+    .await
+    .expect("make the challenge outsider-owned");
+
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.target));
+    assert_eq!(
+        row(&pool, "challenges", outsiders).await,
+        publ(fx.stranger_group),
+        "the outsider's challenge keeps its owner and visibility"
+    );
+    assert!(writer_owned(&pool, "challenges", outsiders).await);
+    assert_eq!(
+        row(&pool, "challenges", fx.challenge).await,
+        grp(fx.target),
+        "control: the claim-owned challenge follows A"
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
+}
+
 /// See `PrivatizationRepository::recompute_boundary_meet_conn` ("an edge DECLARED
 /// ('group', H) between two public claims widens on revert"). An edge DECLARED `('group', target)` between two public claims
 /// keeps exactly that tuple through apply AND reverse. A reverse that recomputed
