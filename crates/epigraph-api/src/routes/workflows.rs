@@ -157,6 +157,10 @@ pub struct ListWorkflowsQuery {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportOutcomeRequest {
+    /// `true` only if the workflow's goal or expected outcome was achieved:
+    /// every gate and check passed. A run that ran every step but a gate or
+    /// check failed is `success=false`; record what the steps did in
+    /// `outcome_details` / `step_executions` instead.
     pub success: bool,
     pub outcome_details: String,
     pub quality: Option<f64>,
@@ -200,6 +204,8 @@ pub struct HierarchicalSearchQuery {
 #[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
+    /// `true` only if the run's goal or expected outcome was achieved: every
+    /// gate and check passed. Running every step is not success.
     pub success: bool,
     pub step_beliefs: serde_json::Value,
     pub tool_pattern: Vec<String>,
@@ -3292,6 +3298,29 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// Backlog 563165f2 (HTTP twin of the MCP `success` definition): the
+    /// OpenAPI schema of the outcome body both outcome routes take must say
+    /// that `success` means the goal was achieved, not that the steps ran.
+    #[test]
+    fn report_outcome_success_is_defined_as_goal_achieved() {
+        let schema =
+            serde_json::to_value(<ReportOutcomeRequest as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let d = schema["properties"]["success"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`success` carries a description: {schema}"));
+        for needle in [
+            "goal or expected outcome was achieved",
+            "every gate and check passed",
+            "ran every step but a gate or",
+        ] {
+            assert!(
+                d.contains(needle),
+                "`success` must say {needle:?}; got: {d}"
+            );
+        }
+    }
 
     /// U032: a step-less new generation (or an empty plan) is the caller's
     /// payload error — 400 with the executor's reason, not a 500 that invites
