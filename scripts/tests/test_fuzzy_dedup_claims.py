@@ -123,12 +123,13 @@ class _Conn:
         self._cursor = cursor
         self.autocommit = False
         self.commits = 0
+        self.sessions: list = []
 
     def cursor(self):
         return self._cursor
 
     def set_session(self, **kwargs):
-        return None
+        self.sessions.append(kwargs)
 
     def commit(self):
         self.commits += 1
@@ -199,6 +200,10 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(self._writes(), [], "the script must not write SQL")
+        self.assertTrue(
+            self.conn.sessions and all(kw.get("readonly") is True for kw in self.conn.sessions),
+            f"the database session must be read-only: {self.conn.sessions}",
+        )
         posts = self._posts()
         self.assertEqual(
             sorted(p["path"] for p in posts),
@@ -236,6 +241,11 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
 
         self.assertEqual(self._posts(), [])
         self.assertEqual(self._writes(), [])
+        self.assertTrue(self.conn.sessions, "the session is configured before any read")
+        self.assertTrue(
+            all(kw.get("readonly") is True for kw in self.conn.sessions),
+            f"the database session must be read-only: {self.conn.sessions}",
+        )
         self.assertRegex(out, r"duplicates_would_mark:\s+2\b")
         self.assertEqual(rc, 0, out)
 
