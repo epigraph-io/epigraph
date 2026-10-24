@@ -1700,6 +1700,77 @@ async fn attaching_an_identity_fills_every_gap_in_a_successors_own_window(pool: 
     );
 }
 
+/// The latest registration audit row of `agent`: (`role_attachments_copied`,
+/// `role_attachments_skipped`).
+async fn registration_audit(pool: &PgPool, agent: Uuid) -> (Option<i64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT (details ->> 'role_attachments_copied')::bigint, \
+                details ->> 'role_attachments_skipped' \
+           FROM security_events \
+          WHERE event_type = 'agent.identity_registered' AND agent_id = $1 \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("a registration audit row")
+}
+
+/// A SHARED identity (it already runs in another group folder) inherits no
+/// role attachment from a succession, as it inherits no operator link (161
+/// step 5): an attachment ties every group's runs of the identity to the
+/// role, so one role's gap would stop the other groups too. The registration
+/// skips the copy and its audit row says why (`role_attachments_skipped =
+/// shared_identity`); attaching it remains a manual act, which still works.
+/// CONTROL: an unshared successor of the same parent, in the parent's folder,
+/// is copied and records no skip.
+///
+/// Verified to fail: the copy run whatever other folders the child runs in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_identity_inherits_no_attachment_and_the_audit_says_why(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-own").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    attach(&pool, ROLE, parent).await;
+
+    let shared_key = random32();
+    let shared = register(&pool, &shared_key, None, "g-166-elsewhere").await;
+    assert_eq!(register(&pool, &shared_key, Some(parent), "g-166-own").await, shared);
+    assert!(
+        live_attachments(&pool, shared).await.is_empty(),
+        "a shared identity inherits no attachment"
+    );
+    assert_eq!(
+        registration_audit(&pool, shared).await,
+        (Some(0), Some("shared_identity".to_string())),
+        "the registration records why it copied nothing"
+    );
+    attach(&pool, ROLE, shared).await;
+    assert_eq!(
+        live_attachments(&pool, shared).await,
+        vec![(ROLE.to_string(), None)],
+        "CONTROL: a manual attach of the shared identity still works"
+    );
+
+    let own = register(&pool, &random32(), Some(parent), "g-166-own").await;
+    assert_eq!(
+        live_attachments(&pool, own).await.len(),
+        1,
+        "CONTROL: an unshared successor is copied"
+    );
+    assert_eq!(
+        registration_audit(&pool, own).await,
+        (Some(1), None),
+        "CONTROL: an unshared successor records no skip"
+    );
+}
+
 /// The identity attestor runs the registration (whose succession copy writes
 /// `role_agents` in a maintenance-owned definer frame) but cannot write the
 /// table itself, nor call the attach / detach verbs.
