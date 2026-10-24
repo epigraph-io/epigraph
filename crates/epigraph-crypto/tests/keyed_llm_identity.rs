@@ -38,6 +38,36 @@ fn keyed_derivation_is_the_keyed_blake3_of_the_documented_seed() {
     );
 }
 
+/// A literal cross-implementation vector. The expected public key was
+/// computed OUTSIDE this crate (Python `blake3` for the keyed hash, OpenSSL
+/// for the Ed25519 seed-to-public step), so it also pins the Ed25519
+/// convention: `AgentSigner::from_bytes` must treat the 32 bytes as an
+/// RFC 8032 seed. The test above recomputes through the same functions as the
+/// implementation and cannot see a change there; this one can. The host's
+/// derivation (slice S4) asserts the same vector.
+///
+/// * secret: 32 bytes of 0x41
+/// * model: `test-model-7` (passed padded, to pin the trim)
+/// * prompt hash: BLAKE3 of `identity files, concatenated`
+/// * seed input: `llm-agent:test-model-7:<prompt hash>`
+#[test]
+fn keyed_derivation_matches_the_literal_cross_implementation_vector() {
+    const PROMPT_HASH: &str = "bf894787bd4ffd19eac89eb078b2e31fe03bb6c8a193812f6470745811153a91";
+    const PUBLIC_KEY: &str = "ec8e33c03e1a31e8bfd30adb6169d972facb953cd75c3891e17ebea89e5b4002";
+    assert_eq!(
+        prompt_hash("identity files, concatenated"),
+        PROMPT_HASH,
+        "calibration: the prompt hash input is the documented one"
+    );
+    let derived = keypair_from_llm_agent_keyed(&SECRET_A, " test-model-7\t", PROMPT_HASH);
+    let public_hex: String = derived
+        .public_key()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(public_hex, PUBLIC_KEY);
+}
+
 /// Keying changes the identity: the same (model, hash) gives a different key
 /// keyed than unkeyed, so a reader of the prompt files who computes the
 /// unkeyed key does not hold the keyed one.

@@ -199,7 +199,12 @@ pub fn keypair_from_llm_agent_prehashed(model_id: &str, prompt_hash_hex: &str) -
 /// `prompt_hash_hex` is the BLAKE3 lowercase-hex digest of the prompt files,
 /// with the same silent-orphan trap as [`keypair_from_llm_agent_prehashed`]:
 /// pass the digest, never the raw text. The host's implementation must match
-/// this seed byte for byte; `tests/keyed_llm_identity.rs` spells it out.
+/// this seed byte for byte; `tests/keyed_llm_identity.rs` spells it out and
+/// carries a literal vector computed outside this crate (secret 32 x `0x41`,
+/// model `test-model-7`, prompt hash
+/// `bf894787bd4ffd19eac89eb078b2e31fe03bb6c8a193812f6470745811153a91` gives
+/// public key
+/// `ec8e33c03e1a31e8bfd30adb6169d972facb953cd75c3891e17ebea89e5b4002`).
 #[must_use]
 pub fn keypair_from_llm_agent_keyed(
     secret: &[u8; 32],
