@@ -1095,6 +1095,126 @@ async fn armed_a_retired_linked_agent_is_refused_a_forged_write_with_the_valve_o
         .expect("POSITIVE CONTROL: the live-linked agent writes on the same valve setting");
 }
 
+/// One `('group', group)` claim authored by `author` on `conn` as it stands.
+async fn insert_group_claim(
+    conn: &mut sqlx::PgConnection,
+    author: Uuid,
+    group: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'group', $5)",
+    )
+    .bind(id)
+    .bind(format!("role membership probe {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(author)
+    .bind(group)
+    .execute(conn)
+    .await
+    .map(|_| id)
+}
+
+/// On one `epigraph_app` session stamped as `principal`'s resolved viewer
+/// (resolved now), one transaction: an INSERT into `group`, then a sleep of
+/// `sleep_s` seconds, then another INSERT. Rolled back. Returns both results.
+async fn one_transaction_across(
+    pool: &PgPool,
+    principal: Uuid,
+    group: Uuid,
+    sleep_s: f64,
+) -> (Result<Uuid, sqlx::Error>, Result<Uuid, sqlx::Error>) {
+    let viewer = Viewer::resolve(pool, principal).await.expect("resolve");
+    let read = viewer
+        .group_bind()
+        .unwrap_or_default()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let write = viewer
+        .writable_groups()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, false), \
+                    set_config('epigraph.group_ids', $2, false), \
+                    set_config('epigraph.writable_group_ids', $3, false)",
+        )
+        .bind(principal.to_string())
+        .bind(&read)
+        .bind(&write)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp");
+        let out = {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+            let first = insert_group_claim(&mut tx, principal, group).await;
+            let _ = sqlx::query("SELECT pg_sleep($1)")
+                .bind(sleep_s)
+                .execute(&mut *tx)
+                .await;
+            let second = insert_group_claim(&mut tx, principal, group).await;
+            let _ = tx.rollback().await;
+            (first, second)
+        };
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', '', false), \
+                    set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        (conn, out)
+    })
+    .await
+}
+
+/// Armed, a claim write lapses at `valid_to` STATEMENT by statement, not at
+/// the next transaction: a transaction opened inside the window, whose first
+/// INSERT lands, is refused OPL02 on an INSERT made after `valid_to`, for the
+/// human and for its agent (`now()` is the transaction's start, so the writer
+/// scope reads the clock instead).
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_a_transaction_opened_in_the_window_writes_nothing_after_it(pool: PgPool) {
+    let (h, _) = human(&pool, "txn-h").await;
+    let a = operated(&pool, h, "txn-a").await;
+    let (group, _) = bound_group(&pool, "Synthetic Transaction Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, Some(5)).await;
+    arm(&pool).await;
+
+    let (human_run, agent_run) = tokio::join!(
+        one_transaction_across(&pool, h, group, 8.0),
+        one_transaction_across(&pool, a, group, 8.0),
+    );
+    human_run
+        .0
+        .as_ref()
+        .expect("POSITIVE CONTROL: the human's INSERT inside the window lands");
+    agent_run
+        .0
+        .as_ref()
+        .expect("POSITIVE CONTROL: the agent's INSERT inside the window lands");
+    assert_refused(
+        &human_run.1,
+        OPL02,
+        HUMAN_SCOPE,
+        "the human, same transaction, after valid_to",
+    );
+    assert_refused(
+        &agent_run.1,
+        OPL02,
+        AGENT_SCOPE,
+        "the agent, same transaction, after valid_to",
+    );
+}
+
 /// A revoked registration, or a suspended human client, ends the human's and
 /// its agents' derived membership; the assignment row itself is untouched (the
 /// role function re-checks the human).
