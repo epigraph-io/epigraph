@@ -219,6 +219,12 @@ async fn staging_status(pool: &sqlx::PgPool, id: uuid::Uuid) -> String {
         .unwrap()
 }
 
+/// Serializes the two reserved-key promote tests. Both stage rows into the
+/// shared `edges_staging` table, and a promote-all request refuses while ANY
+/// approved row carries the key, so the promote-all positive control would
+/// otherwise race the other test's forged row.
+static PROMOTE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `properties.dedup` marks a dedup act's identity edge, which the un-mark,
 /// the index view and the revert planning trust; create and patch (HTTP and
 /// MCP) refuse it, and the promote route must too. A request naming a staged
@@ -227,6 +233,7 @@ async fn staging_status(pool: &sqlx::PgPool, id: uuid::Uuid) -> String {
 /// on its own promotes, so the refusal is the key's, not a broken route.
 #[tokio::test(flavor = "multi_thread")]
 async fn promote_staged_edges_refuses_a_reserved_dedup_key() {
+    let _serial = PROMOTE_SERIAL.lock().await;
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -298,9 +305,12 @@ async fn promote_staged_edges_refuses_a_reserved_dedup_key() {
 }
 
 /// The promote-all branch (no `edge_ids`) copies every approved row; a staged
-/// row carrying `properties.dedup` must refuse it the same way.
+/// row carrying `properties.dedup` must refuse it the same way. Once that row
+/// is gone, a clean approved row promotes through the same branch (positive
+/// control: the refusal is the key's, not a broken promote-all statement).
 #[tokio::test(flavor = "multi_thread")]
 async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
+    let _serial = PROMOTE_SERIAL.lock().await;
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -343,6 +353,24 @@ async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
         .execute(&pool)
         .await
         .unwrap();
+
+    // Positive control on the promote-all branch: with the forged row gone, a
+    // clean approved row promotes. Asserted on this row only, since other
+    // approved rows in the shared table may promote alongside it.
+    let (clean, c_src, c_tgt) =
+        stage_approved_edge(&pool, "CORROBORATES", serde_json::json!({"note": "ok"})).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+        .bearer_auth(admin_token())
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "clean promote-all: {status}: {body}");
+    assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+    assert_eq!(staging_status(&pool, clean).await, "promoted");
 }
 
 // ---------------------------------------------------------------------------
