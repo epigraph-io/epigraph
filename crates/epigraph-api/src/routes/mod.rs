@@ -21,6 +21,8 @@ pub mod admin_acts;
 #[cfg(feature = "db")]
 pub mod agent_keys;
 #[cfg(feature = "db")]
+pub mod agent_prompt_history;
+#[cfg(feature = "db")]
 pub mod agents;
 pub mod analyze;
 #[cfg(feature = "db")]
@@ -757,6 +759,20 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/agents/:id/claims", get(agents::agent_claims))
         .route("/api/v1/agents/:id/keys", get(agent_keys::list_agent_keys))
+        // The agent's prompt snapshots and lineage (design D4): its operator
+        // and admins only, decided by migration 161's definer on the caller's
+        // stamped connection; anyone else gets the 404 an absent agent gets.
+        // There is no registration route: that is the host's act (D3).
+        .route(
+            "/api/v1/agents/:id/prompt-history",
+            get(agent_prompt_history::get_prompt_history),
+        )
+        // One file named in that history, for the same callers, served only
+        // when a snapshot the caller may read names it.
+        .route(
+            "/api/v1/agents/:id/prompt-history/blobs/:hash",
+            get(agent_prompt_history::get_prompt_history_blob),
+        )
         .route(
             "/api/v1/agents/:id/timeline",
             get(timeline::get_agent_timeline),
