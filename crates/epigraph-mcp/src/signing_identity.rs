@@ -20,7 +20,8 @@
 //! host did not register would produce signatures that verify against nothing
 //! the database knows, and `verify_claim` would report them unbound forever.
 //! So [`check_signing_key`] refuses to start unless the signing key is an
-//! ACTIVE `signing` key of the identity's agent. It only reads: a refused boot
+//! ACTIVE `signing` key of the identity's agent whose validity window is open
+//! now (the window `verify_claim` binds by). It only reads: a refused boot
 //! leaves no agent row behind.
 
 use chrono::{DateTime, Utc};
@@ -68,13 +69,17 @@ pub async fn check_signing_key(
     let rows = AgentKeyRepository::rows_with_public_key(pool, signing_public_key)
         .await
         .map_err(|e| format!("could not read the signing key's agent_keys rows: {e}"))?;
-    signing_key_verdict(agent, signing_public_key, &rows)?;
+    // This process's clock, not the database's: it is the clock that stamps
+    // `created_at` on every claim this process will sign, so the question is
+    // exactly "would a claim signed now bind?".
+    signing_key_verdict(agent, signing_public_key, &rows, Utc::now())?;
     Ok(agent)
 }
 
 /// The pure half of [`check_signing_key`]: admit iff some row of `rows` (all
 /// of them carry the signing public key) is an active `signing` key of
-/// `agent`; otherwise say what the rows show instead.
+/// `agent` whose window admits `at` ([`window_admits`], as `verify_claim`
+/// binds); otherwise say what the rows show instead.
 ///
 /// `rows` come from `AgentKeyRepository::rows_with_public_key`, which spells
 /// `key_type` and `status` as migration 161's guard does (`lower(btrim(..))`),
@@ -84,11 +89,14 @@ fn signing_key_verdict(
     agent: Uuid,
     signing_public_key: &[u8; 32],
     rows: &[AgentKeyRow],
+    at: DateTime<Utc>,
 ) -> Result<(), String> {
-    if rows
-        .iter()
-        .any(|r| r.agent_id == agent && r.key_type == KEY_KIND_SIGNING && r.status == "active")
-    {
+    if rows.iter().any(|r| {
+        r.agent_id == agent
+            && r.key_type == KEY_KIND_SIGNING
+            && r.status == "active"
+            && window_admits(&r.status, r.valid_from, r.valid_until, at)
+    }) {
         return Ok(());
     }
     let signing_hex = hex::encode(signing_public_key);
@@ -102,7 +110,15 @@ fn signing_key_verdict(
                 } else {
                     format!("agent {}", r.agent_id)
                 };
-                format!("a {} key of {whose} with status {}", r.key_type, r.status)
+                let until = r
+                    .valid_until
+                    .map_or_else(|| "open".to_string(), |u| u.to_rfc3339());
+                format!(
+                    "a {} key of {whose} with status {}, valid from {} until {until}",
+                    r.key_type,
+                    r.status,
+                    r.valid_from.to_rfc3339()
+                )
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -148,13 +164,25 @@ pub const VALID_FROM_SKEW_SECS: i64 = 60;
 /// so it binds nothing). A REVOKED or PENDING key binds nothing: a revoked key
 /// is treated as compromised from the start.
 fn valid_at(row: &AttestedKeyRow, at: DateTime<Utc>) -> bool {
-    let opens = row.valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
-    if at < opens || row.valid_until.is_some_and(|until| at >= until) {
+    window_admits(&row.status, row.valid_from, row.valid_until, at)
+}
+
+/// [`valid_at`] over the fields alone, shared with the boot verdict so the
+/// boot check and `verify_claim` cannot disagree about a window. `status` is
+/// in the SQL spelling (`lower(btrim(..))`).
+fn window_admits(
+    status: &str,
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
+    at: DateTime<Utc>,
+) -> bool {
+    let opens = valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
+    if at < opens || valid_until.is_some_and(|until| at >= until) {
         return false;
     }
-    match row.status.as_str() {
+    match status {
         "active" => true,
-        "rotated" | "expired" => row.valid_until.is_some(),
+        "rotated" | "expired" => valid_until.is_some(),
         _ => false,
     }
 }
@@ -265,7 +293,7 @@ mod tests {
         let agent = Uuid::new_v4();
         let other = Uuid::new_v4();
         let pk = [7u8; 32];
-        assert!(signing_key_verdict(agent, &pk, &[key_row(agent, "signing", "active")]).is_ok());
+        assert!(signing_key_verdict(agent, &pk, &[key_row(agent, "signing", "active")], Utc::now()).is_ok());
         for rows in [
             // Normalising is the read's job (SQL `lower(btrim(..))`), so a
             // spelling the read would not produce is not admitted here.
@@ -277,9 +305,31 @@ mod tests {
             vec![key_row(agent, "signing", "revoked")],
             vec![key_row(agent, "encryption", "active")],
         ] {
-            let err = signing_key_verdict(agent, &pk, &rows).expect_err("refused");
+            let err = signing_key_verdict(agent, &pk, &rows, Utc::now()).expect_err("refused");
             assert!(err.contains("is not an active signing key of"), "{err}");
         }
+    }
+
+    /// The verdict's window is `verify_claim`'s: an active signing row of the
+    /// agent admits only while `[valid_from - skew, valid_until)` holds `at`.
+    #[test]
+    fn the_verdict_admits_only_inside_the_window() {
+        let agent = Uuid::new_v4();
+        let pk = [7u8; 32];
+        let now = Utc::now();
+        let with = |from: DateTime<Utc>, until: Option<DateTime<Utc>>| {
+            let mut row = key_row(agent, "signing", "active");
+            row.valid_from = from;
+            row.valid_until = until;
+            vec![row]
+        };
+        let ok = |rows: Vec<AgentKeyRow>| signing_key_verdict(agent, &pk, &rows, now).is_ok();
+        assert!(ok(with(now - Duration::days(1), None)), "open window");
+        assert!(ok(with(now - Duration::days(1), Some(now + Duration::days(1)))));
+        assert!(ok(with(now + Duration::seconds(1), None)), "within the skew");
+        assert!(!ok(with(now - Duration::days(2), Some(now - Duration::days(1)))), "closed");
+        assert!(!ok(with(now - Duration::days(1), Some(now))), "ends exactly now");
+        assert!(!ok(with(now + Duration::days(1), None)), "not yet open");
     }
 
     fn attested(
