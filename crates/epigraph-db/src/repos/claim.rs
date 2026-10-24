@@ -8295,7 +8295,7 @@ impl ClaimRepository {
     ///
     /// The function stays atomic on its own. The body opens `conn.begin()`, which
     /// is a real transaction on a bare connection and a SAVEPOINT inside a caller's
-    /// transaction. The FOR UPDATE read and the up-to-three UPDATEs therefore land
+    /// transaction. The FOR UPDATE read and the (at most two) UPDATEs therefore land
     /// together in both shapes. A `&mut Transaction` caller still compiles
     /// unchanged through deref coercion.
     pub async fn patch_claim_atomic_conn(
@@ -8319,22 +8319,28 @@ impl ClaimRepository {
         let before_props: serde_json::Value = row.get("properties");
         let before_trace: Option<Uuid> = row.get("trace_id");
 
-        let mut after_trace = before_trace;
-        if let Some(t) = patch.trace_id {
-            sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
-                .bind(t)
-                .bind(id_uuid)
-                .execute(&mut *tx)
-                .await?;
-            after_trace = Some(t);
-        }
-
+        // trace_id and properties land in ONE statement, issued only when the
+        // patch sets either. `PatchClaimInput::trace_id` is `Option<Uuid>` and
+        // `None` means "leave it", never "clear it", so `COALESCE($2, trace_id)`
+        // is exactly the old `if let Some(t)` write; the CASE keeps the column
+        // untouched when no properties were supplied and otherwise applies the
+        // same shallow `||` merge as before.
+        let after_trace = patch.trace_id.or(before_trace);
         let mut after_props = before_props.clone();
-        if let Some(p) = &patch.properties {
+        if patch.trace_id.is_some() || patch.properties.is_some() {
             sqlx::query(
-                "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2"
+                "UPDATE claims SET trace_id = COALESCE($2::uuid, trace_id), \
+                 properties = CASE WHEN $3::jsonb IS NULL THEN properties \
+                                   ELSE COALESCE(properties, '{}'::jsonb) || $3::jsonb END \
+                 WHERE id = $1",
             )
-            .bind(p).bind(id_uuid).execute(&mut *tx).await?;
+            .bind(id_uuid)
+            .bind(patch.trace_id)
+            .bind(patch.properties.as_ref())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(p) = &patch.properties {
             if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
                 for (k, v) in po {
                     merged.insert(k.clone(), v.clone());
