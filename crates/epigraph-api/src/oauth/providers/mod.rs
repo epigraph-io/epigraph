@@ -185,6 +185,27 @@ pub fn build_registry(
     Ok(Arc::new(registry))
 }
 
+/// The reason a client gets when an identity provider request failed upstream.
+#[cfg(feature = "db")]
+pub(crate) const UPSTREAM_FAILED_REASON: &str = "the identity provider request failed";
+
+/// The client's answer to a [`ProviderError::Upstream`]: a 502 with a fixed
+/// reason. The provider's text, which can be the IdP's error body or a
+/// transport error naming the token endpoint's URL, goes to the server log
+/// only (backlog 49863d2c). `flow` names the handler for that log line.
+#[cfg(feature = "db")]
+pub(crate) fn upstream_bad_gateway(flow: &'static str, detail: &str) -> crate::errors::ApiError {
+    tracing::warn!(
+        target: "oauth.provider",
+        flow,
+        error = %detail,
+        "identity provider request failed"
+    );
+    crate::errors::ApiError::BadGateway {
+        reason: UPSTREAM_FAILED_REASON.into(),
+    }
+}
+
 #[cfg(test)]
 mod posture_tests {
     use super::provisioning_posture_is_safe;
@@ -270,5 +291,45 @@ mod posture_tests {
     fn auto_provision_off_boots_with_an_empty_allowlist() {
         // Nothing can provision through it at all, so the allowlist is moot.
         assert!(provisioning_posture_is_safe(&[], &[], false, false, "production").is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod upstream_tests {
+    use super::{upstream_bad_gateway, UPSTREAM_FAILED_REASON};
+    use crate::errors::ApiError;
+
+    /// The helper behind every `ProviderError::Upstream` arm (the device
+    /// exchange, the device validate path and the external-grant validate
+    /// path): the 502's reason and rendered message are fixed text, and the
+    /// provider's text reaches the server log on the helper's own line. The
+    /// two validate-path arms cannot be reached through the providers that
+    /// exist today, so this is their coverage; the exchange arm is also driven
+    /// over HTTP in tests/oauth_authorization_code.rs.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_upstream_failure_answers_a_fixed_reason_and_logs_the_providers_text() {
+        const DETAIL: &str = "token POST failed: error sending request for url \
+                              (https://idp-internal-5c1d.corp/token)";
+        let e = upstream_bad_gateway("device_exchange", DETAIL);
+        let ApiError::BadGateway { reason } = &e else {
+            panic!("an upstream failure is a 502: {e:?}");
+        };
+        assert_eq!(reason, UPSTREAM_FAILED_REASON);
+        assert!(
+            !e.to_string().contains("idp-internal-5c1d"),
+            "the provider's text reached the response: {e}"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| {
+                    l.contains("identity provider request failed")
+                        && l.contains("device_exchange")
+                        && l.contains("idp-internal-5c1d")
+                })
+                .then_some(())
+                .ok_or_else(|| "no upstream warn line carries the provider's text".to_string())
+        });
     }
 }

@@ -1203,6 +1203,30 @@ async fn app_with_google_token_endpoint(
     (app, fx)
 }
 
+/// Drive `POST /oauth/google/exchange` (the device-style code exchange) against
+/// a Google provider whose token endpoint is `token_endpoint`; return
+/// `(status, body)`.
+async fn exchange_against(pool: &PgPool, token_endpoint: String) -> (StatusCode, String) {
+    let (app, _fx) = app_with_google_token_endpoint(pool, token_endpoint).await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/google/exchange")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "code": "google-code",
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Drive `GET /oauth/callback` for a fresh pending session against a Google
 /// provider whose token endpoint is `token_endpoint`; return `(status, body)`.
 async fn callback_against(pool: &PgPool, token_endpoint: String) -> (StatusCode, String) {
@@ -1343,6 +1367,51 @@ async fn the_callback_withholds_the_validators_error_text(pool: PgPool) {
     logs_assert(on_one_line(
         "id_token validation failed",
         "invalid assertion: bad header",
+    ));
+}
+
+// The same redaction on the device-style exchange, `POST
+// /oauth/:provider/exchange` (oauth/device.rs::exchange_endpoint), which maps
+// the provider's `Upstream` error itself rather than through the callback.
+
+/// The IdP answers the device exchange with an error body.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_device_exchange_withholds_the_identity_providers_error_body(pool: PgPool) {
+    let idp = misbehaving_idp().await;
+    let (status, body) = exchange_against(&pool, format!("{}/token-error", idp.uri())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("idp-internal-4b7e") && !body.contains("invalid_grant"),
+        "the IdP's error text reached the client: {body}"
+    );
+    assert!(
+        body.contains("the identity provider request failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line(
+        "identity provider request failed",
+        "idp-internal-4b7e",
+    ));
+}
+
+/// The token endpoint cannot be reached; the transport error names its URL.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_device_exchange_withholds_the_token_endpoints_transport_error(pool: PgPool) {
+    let (status, body) = exchange_against(&pool, UNREACHABLE_TOKEN_ENDPOINT.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("token-path-4b7e") && !body.contains("127.0.0.1"),
+        "the token endpoint's URL reached the client: {body}"
+    );
+    assert!(
+        body.contains("the identity provider request failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line(
+        "identity provider request failed",
+        "token-path-4b7e",
     ));
 }
 
