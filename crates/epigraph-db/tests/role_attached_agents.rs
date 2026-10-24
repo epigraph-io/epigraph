@@ -950,3 +950,43 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
         "a REPEATABLE READ run whose holder's assignment ended after its snapshot",
     );
 }
+
+/// A detach is final, and a repeat registration naming the same parent does
+/// not undo it: the succession copy skips a parent row the child already
+/// inherited, detached or not. CONTROL: a NEW child of the same parent is
+/// still copied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repeat_registration_does_not_reattach_a_detached_child(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-detach").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let row = attach(&pool, ROLE, parent).await;
+    let child_key = random32();
+    let child = register(&pool, &child_key, Some(parent), "g-166-detach").await;
+    assert_eq!(
+        live_attachments(&pool, child).await,
+        vec![(ROLE.to_string(), Some(row))]
+    );
+    assert_eq!(detach(&pool, ROLE, child).await, 1, "the child is detached");
+
+    let again = register(&pool, &child_key, Some(parent), "g-166-detach").await;
+    assert_eq!(again, child);
+    assert_eq!(
+        live_attachments(&pool, child).await,
+        Vec::<(String, Option<Uuid>)>::new(),
+        "a repeat registration re-attached a child an operator detached"
+    );
+
+    let second = register(&pool, &random32(), Some(parent), "g-166-detach").await;
+    assert_eq!(
+        live_attachments(&pool, second).await,
+        vec![(ROLE.to_string(), Some(row))],
+        "CONTROL: a new child of the attached parent is copied"
+    );
+}
