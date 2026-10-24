@@ -137,7 +137,9 @@ pub struct StoreWorkflowRequest {
     pub expected_outcome: Option<String>,
     pub confidence: Option<f64>,
     /// Stored on the workflows row as `metadata.tags` (trimmed, empties
-    /// dropped, de-duplicated); not added as claim labels.
+    /// dropped, de-duplicated) on the first store only: a re-store of the
+    /// same goal is a no-op that keeps the original tags. Not added as claim
+    /// labels.
     pub tags: Option<Vec<String>>,
 }
 
