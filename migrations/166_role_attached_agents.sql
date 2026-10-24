@@ -15,8 +15,21 @@
 -- time-windowed `role_assignments`. "Attached to a role" means the role's own
 -- agents: its curator and the fleet identities that run the role's schedules.
 -- Until now that attachment existed only on the host. This file records it
--- and enforces the ruling at write time, so a container that bypasses the
--- host still writes nothing in a gap.
+-- and enforces the ruling at write time, as a second control behind the
+-- host's skip.
+--
+-- WHAT THE DATABASE GUARANTEES, AND WHAT IT DOES NOT. The rule binds the
+-- STAMPED principal and the claim's AUTHOR column. An application session
+-- that writes as itself, stamped as the attached agent, is refused in a gap.
+-- But a session that can choose its own principal can stamp a DIFFERENT
+-- identity of the same human (the human itself, an unattached sibling agent,
+-- or an ancestor identity registered before the attachment) as both writer
+-- and author, and nothing here can tell it from that identity's own write.
+-- So the database enforces the ruling only against a writer that does not
+-- choose its own principal (the API, which stamps the authenticated
+-- viewer). A container that holds the application DSN directly is held by
+-- the host's skip, not by this file. Section 3 says which claim writes the
+-- rule covers.
 --
 -- `role_agents` CONFERS NOTHING. It only adds a refusal. An attachment never
 -- grants an agent a group, a scope or a read; whatever the agent may do, it
@@ -104,9 +117,18 @@
 -- like OPL02 (the claims trigger checks nothing on an unarmed database), and
 -- NOT relieved by the valve, which relieves OPL01 only.
 --
--- COVERAGE: attributed CLAIM writes, which is what the binding covers. An
--- attached agent's evidence, edge or membership writes after the end are not
--- refused by this file.
+-- COVERAGE, SHORT OF THE RULING. The ruling refuses EVERY write a run makes
+-- after its holder's assignment ends. This file refuses the claim writes
+-- that the claims trigger checks: an INSERT, a re-open, a re-attribution.
+-- It does NOT refuse, after the end:
+--   * an attached agent's same-author retire of its own claim, or an UPDATE
+--     of a claim's content, truth value or labels (the trigger fires only on
+--     `agent_id`, `supersedes` and `is_current`, and returns before any check
+--     on a same-author retire);
+--   * evidence, edge, belief (mass function) or membership writes.
+-- Extending the refusal to those is open follow-up work, not a decision that
+-- they are acceptable. `role_attached_agents.rs` pins where the boundary is
+-- today (`after_the_end_claim_inserts_are_refused_and_claim_updates_are_not_yet`).
 --
 -- ===================================================================
 -- 4. THE QUESTION THE HOST AND EPIGRAPH-MCP ASK
@@ -116,12 +138,23 @@
 -- `clock_timestamp()` by the same predicate as ROL01. EXECUTE-able by
 -- `epigraph_app` (epigraph-mcp refuses to boot on `may_run = false`) and by
 -- `epigraph_identity_attestor` (the host asks before starting a container or
--- a role-owned schedule), so neither reads the roster. DISCLOSURE, accepted:
--- for any agent id, an application session learns whether it is attached,
--- the role of the first failing (or first) attachment, and whether the role
--- has a holder; `holder` is returned only when it IS the agent's own linked
--- human (an `operator_links` fact the app role already reads, 107), never the
--- holder an agent of a previous holder is missing.
+-- a role-owned schedule). Neither reads the table; each asks about one agent
+-- at a time. That is still ENUMERABLE: `agents` is world-readable, so an
+-- application session can ask about every agent id and rebuild the roster
+-- (the first failing, or first, role per agent) and whether each role has a
+-- holder. DISCLOSURE, accepted on that basis: the app role needs the answer
+-- to refuse its own boot. `holder` is returned only when it IS the agent's
+-- own linked human (an `operator_links` fact the app role already reads,
+-- 107), never the holder an agent of a previous holder is missing.
+--
+-- THE ATTESTOR'S GRANT, OUT OF BAND. The grant to
+-- `epigraph_identity_attestor` below is made only when that role exists when
+-- this file runs. Where operations create (or re-create) the attestor login
+-- after it, as 161's section 2 describes for a database the migration cannot
+-- create roles on, run this together with 161's recipe:
+--   GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid)
+--       TO epigraph_identity_attestor;
+-- Without it the host's question is denied (42501).
 --
 -- ===================================================================
 -- 5. SUCCESSION
@@ -134,7 +167,15 @@
 -- aborts) or has inherited that parent row before, detached included (a
 -- detach is final: a repeat registration does not re-attach the child). The
 -- copy is a restriction, never a grant, so copying into an identity shared
--- with another group fails safe: it can only refuse.
+-- with another group fails safe: it can only refuse. Attaching an identity
+-- that ALREADY has registered successors attaches them too (section 2).
+--
+-- ORDER: REGISTER, THEN ATTACH. 161 adopts a never-registered identity only
+-- while it is FRESH (no reference into `agents` but its own personal group,
+-- legacy key, audit rows and claims). An attachment is such a reference, so
+-- attaching an identity before the host first registers it makes that
+-- registration abort `AID09` (fail closed: the identity stays refused). An
+-- operator link is one too, so this is not specific to `role_agents`.
 --
 -- ===================================================================
 -- 6. UNDO

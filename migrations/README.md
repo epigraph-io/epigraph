@@ -1493,6 +1493,38 @@ restart.
   been applied. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **166**: public `role_attached_agents` (agent identity lineage design D6:
+  role-attached agents run only while a human holds the role). Adds the
+  append-only, FORCE-RLS `role_agents` (role, agent, window), written only
+  by a maintenance session (`epigraph_attach_agent_to_role` /
+  `epigraph_detach_agent_from_role`) or a maintenance-owned definer frame,
+  each attach and detach audited `platform.role_agent_*`. An attachment
+  follows the identity's registered lineage forward (`agent_succession`),
+  and 161's registration copies a parent's live attachments to a new child
+  (re-stated with one marked step, 5b). Re-states 123's
+  `epigraph_require_writer_scope` and `epigraph_require_attributable` so
+  that an armed claim INSERT, re-open or re-attribution by, or attributed
+  to, an attached agent is refused `ROL01` unless every live attachment's
+  role is held now (`clock_timestamp()`, READ COMMITTED only) by the
+  agent's live-linked human. Adds `epigraph_role_agent_may_run(uuid)` for
+  `epigraph_app` (epigraph-mcp's boot check) and
+  `epigraph_identity_attestor` (the host). Coverage is SHORT of the ruling:
+  claim updates other than a re-open or re-attribution, and evidence, edge,
+  belief and membership writes, are not refused (header section 3; pinned
+  in `role_attached_agents.rs`). Behaviour in
+  `epigraph-db/tests/role_attached_agents.rs` and
+  `epigraph-mcp/tests/role_agent_boot_refusal.rs`. Undo:
+  `docs/runbooks/166-undo.sql`. Slot: 166 is free on `main` and on every
+  remote branch (164 is carried by another branch). Depends on
+  123, 153 and 161. **Deploy order:** the migration BEFORE any epigraph-mcp
+  built against it (that binary calls `epigraph_role_agent_may_run` at boot
+  and exits when it is absent), and an attached identity is attached only
+  AFTER the host has registered it (otherwise its registration aborts
+  `AID09`). Where the attestor login is created after this migration, add
+  `GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid) TO
+  epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
