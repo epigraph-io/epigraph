@@ -1552,6 +1552,56 @@ restart.
   refuse before applying. **Applied to throwaway databases only, NOT to any
   deployed database.**
 
+- **165**: public `group_role_membership`. Group membership DERIVED from 123's
+  time-windowed role assignments. Adds `group_role_bindings (group_id, role,
+  member_role reader|writer, include_agents, reason, created_*, revoked_*)`:
+  ENABLE+FORCE row security (read by a privileged session or a
+  maintenance-owned definer frame; written by a maintenance session; no
+  DELETE), the partial unique index `group_role_bindings_one_live`, and four
+  triggers: `_guard_insert` (`GRB01` the role elevates or reads the audit
+  trail; `GRB02` the group is personal, world, seed or not active; recorded
+  live, stamped by the database), `_guard_update` (only an end, once),
+  `_refuse_delete`, and `_audit` (`platform.group_role_bound` /
+  `platform.group_role_unbound`). Three maintenance-only definers:
+  `epigraph_define_group_role(text, text, uuid, text, boolean, text)` (a role
+  node, a catalog row with `elevates`/`reads_audit` forced false, and the
+  binding; `GRB03` on an existing key), `epigraph_bind_group_role(text, uuid,
+  text, boolean, text)` and `epigraph_end_group_role_binding(uuid, text)`. No
+  role or binding is seeded: a fresh database keeps 123's two catalog roles.
+  The derivation `epigraph_role_derived_memberships(uuid, timestamptz)`
+  (maintenance-owned, NOT app-executable): for each live binding, the
+  principal when it holds a live assignment of the role, and (with
+  `include_agents`) an agent whose ACTING live link (107's
+  `epigraph_operator_actor`) or live 149 allowance names such a human.
+  Re-states `epigraph_live_memberships(uuid)` as 164's body UNION the derived
+  rows at `now()` (signature, result, owner and app grant unchanged), and
+  123's `epigraph_require_writer_scope` (OPL02, armed only) to ask
+  `epigraph_writes_group_at(uuid, uuid, timestamptz, boolean)`: 122's direct
+  test or a live writer binding whose role the human holds then (on behalf of
+  an agent, only a binding that includes agents). 122's
+  `epigraph_operator_writes_group` (the membership door, the team-group
+  verbs) is NOT changed: it stays direct-only so no explicit row can outlive
+  a window. `epigraph_group_role_roster(uuid, timestamptz)` (maintenance only)
+  answers a group's derived members at an instant. Nothing is written for a
+  derived member; a membership lapses at `valid_to` on the next viewer
+  resolution (claim writes, armed: the next transaction). Callers:
+  `epigraph-operator define-group-role`, `bind-group-role`,
+  `end-group-role-binding`, `group-roster`; `grant-role` now reads the role
+  catalog. Pinned by `epigraph-db/tests/group_role_membership.rs`,
+  `schema_contract.rs::migration_165_role_membership_definers_are_owned_and_granted`
+  and `epigraph-cli/tests/operator_group_role.rs`; registered in
+  `tenancy_backfill.rs`, `locked_decisions.rs` (call needles, request-path
+  read bans, the FORCEd set), `rls_enforcement.rs`, `elevation_arms_census.rs`,
+  `app_role_table_lockdown.rs`, `epigraph_api::state::FORCE_PROTECTED_SET` and
+  `docs/runbooks/079-undo.sql`. Undo in the file's header. **Deploy order:**
+  after 164 (it re-states 164's `epigraph_live_memberships` body). A LATER
+  migration that re-states `epigraph_live_memberships` or
+  `epigraph_require_writer_scope` must start from 165's body, or the derived
+  arm is silently dropped (fail-closed: role members lose the group). No
+  binary change is needed for the derivation itself; the CLI subcommands need
+  the migration applied. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

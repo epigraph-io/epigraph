@@ -1262,6 +1262,48 @@ application session may do, for the reason "Arming, and the valve" gives: a
 holder of it can stamp any principal. That is why a verb-made group's roster
 is closed to every application session rather than to some principals.
 
+
+## Group membership that follows a role (migration 165)
+
+A group's membership can follow a platform role instead of a hand-kept list.
+The operator binds a NON-ELEVATING role to the group, then grants the role to
+humans for a window, on the maintenance DSN:
+
+```bash
+epigraph-operator define-group-role --key role:<key> --description "<what it is>" \
+    --group <group id> --member-role writer --include-agents --reason "<why>" [--apply]
+epigraph-operator grant-role --role role:<key> --holder <person agent id> \
+    (--valid-to <RFC3339> | --open-ended) --reason "<why>" [--apply]
+epigraph-operator group-roster --group <group id> [--at <RFC3339>]
+epigraph-operator end-group-role-binding --binding <binding id> --reason "<why>" [--apply]
+```
+
+While the binding is live, a registered human holding a live assignment of the
+role reads (and, at `writer`, writes) the group; with `--include-agents`, so
+does every agent registered to such a human: an agent with an ACTING live
+operator link, or a service client allowed for that human
+(`allow-author-binding-client`). A retired link, an agent whose acting row was
+revoked, and anyone whose human was revoked or whose human client was
+suspended never derive. A binding never confers `admin`, and a role that
+elevates or reads the audit trail cannot be bound.
+
+Nothing is written to the group's roster for these members. Membership is
+computed each time a viewer is resolved, so it LAPSES at the assignment's
+`valid_to` (or its `end-role-assignment`, or the binding's end) with no job:
+reads at the next request, tool call or worker job; claim writes, once the
+operator binding is armed, at the next transaction, whatever the session's
+stamp says (OPL02). A request already in flight finishes on its old stamp.
+
+Two consequences to know:
+
+* readers of the roster TABLE itself (the REST group routes, the consolidate
+  act's membership test, a profile's detail check) see explicit rows only, so
+  a derived member is refused there; use `group-roster` to see who holds a
+  group through its bindings;
+* an explicit membership is never granted on the strength of a derived one:
+  `group-member add` of a teammate's agent still requires the teammate's own
+  explicit writer row (GRP03), so no explicit row outlives a window.
+
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
 `ownership` was the pre-tenancy ACL table: one row per node, naming an agent and
