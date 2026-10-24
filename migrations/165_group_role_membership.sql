@@ -166,6 +166,45 @@
 SET LOCAL lock_timeout = '3s';
 
 -- -------------------------------------------------------------------
+-- Precondition: the two functions this file RE-STATES still carry the
+-- bodies it was written from (123's `epigraph_require_writer_scope`, 164's
+-- `epigraph_live_memberships`). CREATE OR REPLACE replaces a body whole, so
+-- applying this file over a later re-statement (another migration applied
+-- first, out of version order) would silently drop that migration's delta.
+-- Refuse instead, naming what was found; the fix is a reconciling migration
+-- that re-states each function with BOTH deltas. The md5 is of `prosrc`,
+-- i.e. the exact text between the predecessor's dollar quotes.
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    v_scope text;
+    v_live  text;
+BEGIN
+    SELECT md5(p.prosrc) INTO v_scope FROM pg_catalog.pg_proc p
+     WHERE p.oid = to_regprocedure('public.epigraph_require_writer_scope(uuid, uuid)');
+    SELECT md5(p.prosrc) INTO v_live FROM pg_catalog.pg_proc p
+     WHERE p.oid = to_regprocedure('public.epigraph_live_memberships(uuid)');
+    IF v_scope IS DISTINCT FROM 'b042f1fdfa7981af8fe5f8198ec8a6f0' THEN
+        RAISE EXCEPTION '165: epigraph_require_writer_scope(uuid, uuid) is not the body 165 '
+                        're-states (123''s, md5 b042f1fdfa7981af8fe5f8198ec8a6f0); found md5 %. '
+                        'Another migration re-bodied it; nothing was changed',
+                        COALESCE(v_scope, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Apply a reconciling migration that re-states the function with both '
+                         'deltas instead of this one.';
+    END IF;
+    IF v_live IS DISTINCT FROM '41e352e73aad477b2e8cfb91727a2b99' THEN
+        RAISE EXCEPTION '165: epigraph_live_memberships(uuid) is not the body 165 re-states '
+                        '(164''s, md5 41e352e73aad477b2e8cfb91727a2b99); found md5 %. Another '
+                        'migration re-bodied it; nothing was changed',
+                        COALESCE(v_live, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Apply a reconciling migration that re-states the function with both '
+                         'deltas instead of this one.';
+    END IF;
+END $$;
+
+-- -------------------------------------------------------------------
 -- The binding table
 -- -------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.group_role_bindings (

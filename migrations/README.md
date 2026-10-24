@@ -1598,8 +1598,15 @@ restart.
   after 164 (it re-states 164's `epigraph_live_memberships` body). A LATER
   migration that re-states `epigraph_live_memberships` or
   `epigraph_require_writer_scope` must start from 165's body, or the derived
-  arm is silently dropped (fail-closed: role members lose the group). No
-  binary change is needed for the derivation itself; the CLI subcommands need
+  arm is silently dropped (fail-closed: role members lose the group);
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head` fails if
+  it is. The other order is refused by 165 itself: it checks the md5 of both
+  functions' current bodies against 123's and 164's and RAISEs `55000`
+  (changing nothing) when another migration re-bodied either first, so an
+  out-of-order apply can never drop that migration's delta. A consequence:
+  any edit to 164's `epigraph_live_memberships` body or 123's writer scope
+  body must update 165's expected md5. No binary change is needed for the
+  derivation itself; the CLI subcommands need
   the migration applied. **Applied to throwaway databases only, NOT to any
   deployed database.**
 

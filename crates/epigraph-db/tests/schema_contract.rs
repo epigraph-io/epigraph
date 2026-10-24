@@ -3304,3 +3304,52 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
         );
     }
 }
+
+/// Migration 165's two re-stated functions still carry its arms AT HEAD.
+/// `CREATE OR REPLACE` replaces a body whole, so a later migration that
+/// re-states `epigraph_require_writer_scope` or `epigraph_live_memberships`
+/// from an older body silently drops the role-derived arm: role members lose
+/// the group (fail-closed, but quiet). 165 itself refuses to apply over a
+/// body it was not written from (its precondition block); this pin is the
+/// other order, a re-statement applied after 165. A reconciling migration
+/// keeps every fragment below (and adds its own to this list).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
+    for (signature, fragments) in [
+        (
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            &[
+                // 122's direct arm, checked first.
+                "public.epigraph_operator_writes_group(v_human, p_group)",
+                // 165's derived arm: the writing principal itself, at the
+                // statement's clock.
+                "public.epigraph_role_derived_memberships(p_agent, clock_timestamp())",
+                "d.role = 'writer'",
+            ][..],
+        ),
+        (
+            "public.epigraph_live_memberships(uuid)",
+            &[
+                // 164's verb-made-group conjunct.
+                "did:epigraph:group:%",
+                // 165's derived rows.
+                "public.epigraph_role_derived_memberships(p_agent, now())",
+            ][..],
+        ),
+    ] {
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT p.prosrc FROM pg_proc p WHERE p.oid = to_regprocedure($1)")
+                .bind(signature)
+                .fetch_optional(&pool)
+                .await
+                .expect("pg_proc lookup");
+        let body = body.unwrap_or_else(|| panic!("{signature} must exist"));
+        for fragment in fragments {
+            assert!(
+                body.contains(fragment),
+                "{signature} at head lost {fragment:?}: a later re-statement dropped an arm \
+                 (re-state it from the head body, keeping every delta)"
+            );
+        }
+    }
+}
