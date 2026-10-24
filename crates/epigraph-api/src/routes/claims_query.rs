@@ -206,9 +206,9 @@ pub struct ClaimListResponse {
 /// window — it understated the count, and it returned empty (indistinguishable
 /// from a true zero) for any filter matching only older claims.
 ///
-/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` is owed before the
-/// next WALK-shaped handler. This one is not walk-shaped and does not multiply
-/// it: the handle spans at most FOUR statements — zero to two prefetches, then
+/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` was owed before the
+/// next WALK-shaped handler; it is now closed by the lineage walk's own
+/// projection. This handler was never walk-shaped and did not multiply it: the handle spans at most FOUR statements — zero to two prefetches, then
 /// `count_filtered` and `list_filtered` — with no per-node loop and no unbounded
 /// `N`. Nothing is held after `finish_scoped_read`.
 ///
