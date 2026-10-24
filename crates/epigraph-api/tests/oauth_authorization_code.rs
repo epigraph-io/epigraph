@@ -1178,6 +1178,114 @@ async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
     assert_oauth_headers(&headers, "consent page");
 }
 
+/// Drive `GET /oauth/callback` for a fresh pending session against a Google
+/// provider whose token endpoint is `token_endpoint`; return `(status, body)`.
+async fn callback_against(pool: &PgPool, token_endpoint: String) -> (StatusCode, String) {
+    let fx = ProviderFixture::new().await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(token_endpoint);
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        pool,
+        &google_state,
+        "upstream-redaction-app",
+        REDIRECT_URI,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("claude-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The identity provider's error text stays on the server (backlog 49863d2c):
+/// a failed code exchange answers 502 with a fixed reason, whether the IdP
+/// answered with an error body or could not be reached at all (whose transport
+/// error names the token endpoint's URL), and a token that fails validation
+/// answers 401 with a fixed reason.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_callback_withholds_the_identity_providers_error_text(pool: PgPool) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let idp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token-error"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant from idp-internal-4b7e.corp"
+        })))
+        .mount(&idp)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token-garbage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "id_token": "not-a-jwt-4b7e-payload" })),
+        )
+        .mount(&idp)
+        .await;
+
+    // Arm 1: the IdP answers with an error body.
+    let (status, body) = callback_against(&pool, format!("{}/token-error", idp.uri())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("idp-internal-4b7e") && !body.contains("invalid_grant"),
+        "the IdP's error text reached the browser: {body}"
+    );
+    assert!(
+        body.contains("the identity provider's code exchange failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+
+    // Arm 2: the token endpoint cannot be reached; the transport error would
+    // name its URL.
+    let (status, body) =
+        callback_against(&pool, "http://127.0.0.1:9/token-path-4b7e".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("token-path-4b7e") && !body.contains("127.0.0.1"),
+        "the token endpoint's URL reached the browser: {body}"
+    );
+
+    // Arm 3: the exchange succeeds but the token does not validate.
+    let (status, body) = callback_against(&pool, format!("{}/token-garbage", idp.uri())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        !body.contains("InvalidAssertion") && !body.contains("4b7e"),
+        "the validator's error text reached the browser: {body}"
+    );
+    assert!(
+        body.contains("the identity provider's token could not be validated"),
+        "the 401 carries the fixed reason: {body}"
+    );
+}
+
 // ── Loopback (RFC 8252) redirect URIs: native MCP clients such as OpenAI Codex ──
 //
 // Codex's MCP OAuth (codex-rs/rmcp-client, perform_oauth_login.rs::resolve_redirect_uri
