@@ -75,6 +75,12 @@
 -- `clock_timestamp()`, not `now()`: `now()` is the transaction's start, so a
 -- long-running transaction opened inside the window would keep writing past
 -- `valid_to`. The ruling is "every write after the end is refused".
+-- READ COMMITTED only: an attached agent's write under REPEATABLE READ or
+-- SERIALIZABLE is refused `ROL01` even while its human holds the role. An
+-- assignment ended by a handover is REVOKED (123's
+-- `epigraph_end_role_assignment`), which is a visibility question, and an
+-- older snapshot would still see it live. An unattached agent may use any
+-- isolation level.
 --
 -- WHERE: in the operator-binding path, by re-stating 123's
 -- `epigraph_require_writer_scope` (which the claims trigger calls on the
@@ -481,6 +487,22 @@ BEGIN
         RETURN;
     END IF;
     SELECT g.* INTO v_gate FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g;
+    -- An attached agent writes only on a FRESH snapshot. Under REPEATABLE
+    -- READ or SERIALIZABLE every statement reads the transaction's first
+    -- snapshot, so an assignment ended (revoked) after it would still read as
+    -- live for as long as the transaction stays open (123's CUS06 refuses a
+    -- grant under REPEATABLE READ for the same reason). SERIALIZABLE does not
+    -- save it: the revoke reads no row this write writes, so no conflict is
+    -- detected. An unattached agent is untouched.
+    IF v_gate.may_run AND v_gate.reason = 'held'
+       AND current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'ROL01: agent % is attached to role %, and a role''s agent writes only '
+                        'under READ COMMITTED (this transaction is %): an older snapshot would '
+                        'still see an assignment that has since ended', p_agent, v_gate.role,
+                        current_setting('transaction_isolation')
+            USING ERRCODE = 'ROL01',
+                  HINT = 'Nothing was written. Write under READ COMMITTED (the default).';
+    END IF;
     IF v_gate.may_run THEN
         RETURN;
     END IF;
