@@ -120,9 +120,10 @@ pub async fn query_paper(
         .clamp(1, MAX_PAPER_CLAIM_LIMIT);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
-        .await
-        .map_err(internal_error)?;
+    // Canonical key first (a `https://doi.org/` spelling finds the bare-DOI
+    // row), then the key as given; see `find_paper_by_document_key`.
+    let paper =
+        crate::tools::ingestion::find_paper_by_document_key(&server.pool, &params.doi).await?;
 
     let Some(paper) = paper else {
         return success_json(&PaperResponse {

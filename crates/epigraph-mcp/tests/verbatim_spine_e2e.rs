@@ -79,7 +79,10 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
     let result = ingest_document_inline(
         &server,
         &viewer,
-        IngestDocumentInlineParams { extraction },
+        IngestDocumentInlineParams {
+            extraction,
+            wait: None,
+        },
         None,
     )
     .await

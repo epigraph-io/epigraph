@@ -11,8 +11,10 @@ use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
-use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
-use epigraph_mcp::types::{IngestDocumentInlineParams, RecomputeBeliefsParams};
+use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document, ingest_document_inline};
+use epigraph_mcp::types::{
+    IngestDocumentInlineParams, IngestDocumentParams, RecomputeBeliefsParams,
+};
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -659,6 +661,58 @@ fn inline_tool_wire_schema_is_self_contained() {
     }
 }
 
+/// `wait` is reachable only through the published schema and the wire
+/// payload: every handler test builds the params struct directly. Pin that
+/// both detached ingest tools publish a boolean `wait` and that a wire payload
+/// carrying it deserializes to `Some(true)`, so a serde or schemars change
+/// cannot silently drop it and bring back the queued-only contract.
+#[test]
+fn ingest_tools_publish_and_deserialize_the_wait_flag() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
+    let arr = tools.as_array().expect("tool array");
+    for name in ["ingest_document_inline", "ingest_document"] {
+        let tool = arr
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} registered in live tool router"));
+        let wait = &tool["inputSchema"]["properties"]["wait"];
+        let ty = &wait["type"];
+        let is_boolean = ty == "boolean"
+            || ty
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t == "boolean"));
+        assert!(
+            is_boolean,
+            "{name} must publish a boolean `wait`; got {wait}"
+        );
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|r| r == "wait"),
+            "{name}: `wait` is opt-in and must not be required: {required:?}"
+        );
+    }
+
+    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture, "wait": true }))
+            .expect("inline params with wait deserialize");
+    assert_eq!(inline.wait, Some(true));
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture }))
+            .expect("inline params without wait deserialize");
+    assert_eq!(
+        inline.wait, None,
+        "omitted `wait` keeps the queued contract"
+    );
+    let file: IngestDocumentParams =
+        serde_json::from_value(serde_json::json!({ "file_path": "x.json", "wait": true }))
+            .expect("file-path params with wait deserialize");
+    assert_eq!(file.wait, Some(true));
+}
+
 /// The discoverability fix: the typed inline param must expose the full
 /// hierarchical `DocumentExtraction` shape as a JSON schema, so an MCP client
 /// can introspect exactly what to produce — down to atoms — instead of
@@ -695,7 +749,10 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
-    let params = IngestDocumentInlineParams { extraction };
+    let params = IngestDocumentInlineParams {
+        extraction,
+        wait: None,
+    };
 
     let result = ingest_document_inline(&server, &viewer, params, None)
         .await
@@ -728,6 +785,425 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
         atom_count.0, 2,
         "both atoms persisted as claim nodes via the inline path"
     );
+}
+
+// ── Backlog b1924b39 / 417ab1c2 / 189d6d8f: `wait` reports the walk's outcome ──
+//
+// Detached, a walk that fails past the synchronous write-authority preflight
+// reaches only the server log: the caller holds `status: queued` and can infer
+// the failure only from `query_paper`'s claim_count staying 0. `wait: true` runs
+// the same walk in-request and returns its result or its error.
+
+/// A refusal no preflight can see: every `reasoning_traces` INSERT raises
+/// 42501, so the walk fails on its FIRST claim's trace, past the verbatim and
+/// axis guards and past `preflight_write_authority` (which writes nothing).
+async fn refuse_every_trace_insert(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refuse_trace_for_test() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             RAISE EXCEPTION 'refused reasoning_traces insert (test trigger)'
+                 USING ERRCODE = '42501';
+         END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_trace_for_test BEFORE INSERT ON reasoning_traces
+         FOR EACH ROW EXECUTE FUNCTION refuse_trace_for_test()",
+    )
+    .execute(pool)
+    .await
+    .expect("install the refusing trigger");
+}
+
+const SMOKE_DOI: &str = "10.1234/hierarchy-smoke";
+
+async fn claims_labelled(pool: &PgPool, label: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE $1 = ANY(labels)")
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("count labelled claims")
+}
+
+/// `processed_by` edges from the paper keyed on `doi` (0 when no row exists).
+async fn processed_by_edges(pool: &PgPool, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges e JOIN papers p ON p.id = e.source_id
+         WHERE p.doi = $1 AND e.relationship = 'processed_by'",
+    )
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count processed_by edges")
+}
+
+/// Asserts the failed walk's error reached the caller and that it wrote nothing.
+async fn assert_failed_walk_reported(
+    pool: &PgPool,
+    outcome: Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>,
+) {
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the walk's error, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("refused reasoning_traces insert"),
+        "the walk's own cause must reach the caller, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(SMOKE_DOI) && err.message.contains("retry"),
+        "the error must name the document key and say a retry is safe, got: {}",
+        err.message
+    );
+    assert_eq!(
+        claims_labelled(pool, &format!("doi:{SMOKE_DOI}")).await,
+        0,
+        "the walk is one transaction: a failed walk leaves no claim behind"
+    );
+    assert_eq!(
+        processed_by_edges(pool, SMOKE_DOI).await,
+        0,
+        "a failed walk must not stamp the paper as processed"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    assert_failed_walk_reported(&pool, outcome).await;
+}
+
+/// The file-path entry point is the second detached handler; same contract.
+#[sqlx::test(migrations = "../../migrations")]
+async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+
+    // Under the current directory: the handler refuses a path outside it.
+    let path = std::env::current_dir()
+        .expect("current dir")
+        .join(format!("wait-mode-fixture-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, FIXTURE).expect("write fixture");
+    let outcome = ingest_document(
+        &server,
+        &viewer,
+        IngestDocumentParams {
+            file_path: path.display().to_string(),
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+    assert_failed_walk_reported(&pool, outcome).await;
+}
+
+/// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the
+/// caller and leaves no `papers` row: the wait arm skips the handler's eager
+/// `ensure_paper_node`, and the walk's own get-or-create runs after its guards.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": "Wait Drift Doc",
+            "doi": "10.1/wait-drift",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "t",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "S",
+            "paragraphs": [{
+                "text": "TAMPERED",
+                "span": { "start": 0, "end": 5 },
+                "atoms": ["a"],
+                "generality": [0],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": [],
+        "source_text": "alpha beta"
+    }))
+    .unwrap();
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the guard refusal, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("verbatim guard"),
+        "the refusal must be the verbatim guard, got: {}",
+        err.message
+    );
+    let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
+        .bind("10.1/wait-drift")
+        .fetch_one(&pool)
+        .await
+        .expect("count papers");
+    assert_eq!(
+        papers, 0,
+        "a guard refusal in wait mode must leave no papers row"
+    );
+}
+
+/// Positive arm: with `wait: true` a walk that succeeds returns the walk's own
+/// counts (not a queue acknowledgement), and its claims exist the moment the
+/// call returns, with no sleep.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let result = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await
+    .expect("a valid document ingests in wait mode");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert!(
+        json.get("status").is_none(),
+        "wait mode returns the walk's result, not a queue acknowledgement: {json}"
+    );
+    assert_eq!(json["claims_ingested"], serde_json::json!(5), "{json}");
+    assert_eq!(json["doi"], SMOKE_DOI, "{json}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "every level is committed by the time the call returns"
+    );
+    assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
+}
+
+// ── DOI key canonicalization: a resolver-URL DOI keys the bare-DOI row ─────
+
+/// `check_already_ingested(doi, pipeline_version)`'s JSON answer.
+async fn gate_json(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    pipeline_version: Option<&str>,
+) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::ingestion::check_already_ingested(
+        server,
+        &viewer,
+        epigraph_mcp::types::CheckAlreadyIngestedParams {
+            doi: doi.to_string(),
+            pipeline_version: pipeline_version.map(str::to_string),
+        },
+    )
+    .await
+    .expect("check_already_ingested answers");
+    serde_json::from_str(&result_text(&result)).expect("check_already_ingested JSON")
+}
+
+/// Seed a paper row keyed VERBATIM on `key` (as the writer stored a
+/// resolver-URL DOI before keys were canonicalized), stamped `processed_by`
+/// the hierarchical pipeline by the server's agent. Returns the paper id.
+async fn seed_processed_paper(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    key: &str,
+    title: &str,
+) -> uuid::Uuid {
+    let paper_id = epigraph_db::PaperRepository::get_or_create(pool, key, Some(title), None)
+        .await
+        .expect("seed a paper row");
+    let agent = server.server_agent_id().await.expect("server agent");
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(
+        &mut conn,
+        paper_id,
+        agent,
+        "hierarchical_extraction_v2",
+        "ingest_document",
+    )
+    .await
+    .expect("stamp the seeded paper processed_by");
+    assert_eq!(
+        processed_by_edges(pool, key).await,
+        1,
+        "CALIBRATION: the seeded row carries one processed_by stamp"
+    );
+    paper_id
+}
+
+async fn query_paper_json(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::paper_queries::query_paper(
+        server,
+        &viewer,
+        epigraph_mcp::types::QueryPaperParams {
+            doi: doi.to_string(),
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("query_paper answers");
+    serde_json::from_str(&result_text(&result)).expect("query_paper JSON")
+}
+
+/// Observed: an agent ingested with `doi: "https://doi.org/10.1021/..."` and
+/// the URL was stored verbatim as the paper key, so `query_paper` on the bare
+/// DOI kept answering the zero-shaped "not in the graph" response. The ingest
+/// must key the bare DOI, and both probes (`query_paper`,
+/// `check_already_ingested`) must find it by the bare DOI.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let mut extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    extraction.source.doi = Some(format!("https://doi.org/{SMOKE_DOI}"));
+
+    do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest succeeds");
+
+    let paper = query_paper_json(&server, &pool, SMOKE_DOI).await;
+    assert_eq!(paper["title"], "Test Hierarchical Paper", "{paper}");
+    assert_eq!(paper["claim_count"], serde_json::json!(5), "{paper}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "the claims carry the bare-DOI label, not `doi:https://doi.org/...`"
+    );
+
+    let gate = gate_json(&server, &pool, SMOKE_DOI, None).await;
+    assert_eq!(gate["already_ingested"], serde_json::json!(true), "{gate}");
+    let stamp = gate["matched_pipeline_versions"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the walk wrote a processed_by stamp: {gate}"))
+        .to_string();
+
+    // The URL spelling, asked later, names the same paper: through query_paper
+    // and through BOTH arms of the dedup gate (the family arm, and the exact
+    // arm that runs through `paper_already_ingested`). A probe that asks with
+    // the URL form must not read "not ingested" and re-extract the paper.
+    let url = format!("https://doi.org/{SMOKE_DOI}");
+    let by_url = query_paper_json(&server, &pool, &url).await;
+    assert_eq!(by_url["claim_count"], serde_json::json!(5), "{by_url}");
+    for pipeline_version in [None, Some(stamp.as_str())] {
+        let gate = gate_json(&server, &pool, &url, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({url:?}, {pipeline_version:?}): {gate}"
+        );
+    }
+}
+
+/// A row written under a resolver-URL key BEFORE keys were canonicalized is
+/// still found by that spelling: the lookup falls back to the key as given.
+/// The not-found contract (a zero-shaped response, not an error) is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_still_finds_a_legacy_url_form_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let legacy = "https://doi.org/10.5555/legacy-url-key";
+    let paper_id = seed_processed_paper(&server, &pool, legacy, "Legacy URL-keyed").await;
+
+    let paper = query_paper_json(&server, &pool, legacy).await;
+    assert_eq!(paper["title"], "Legacy URL-keyed", "{paper}");
+    // The dedup gate falls back to the as-given spelling too, on both arms.
+    for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+        let gate = gate_json(&server, &pool, legacy, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({legacy:?}, {pipeline_version:?}): {gate}"
+        );
+        assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+    }
+
+    let unknown = query_paper_json(&server, &pool, "https://doi.org/10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
+}
+
+/// The filed probe: the row was written under `https://doi.org/<doi>` before
+/// keys were canonicalized, and the monitor asks by the BARE DOI. Both probes
+/// must find that legacy row, or the monitor reads "not ingested", re-extracts
+/// the paper, and the re-ingest mints a bare-keyed twin of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bare_doi_finds_a_legacy_resolver_url_keyed_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let bare = "10.5555/legacy-bare-probe";
+    for (n, prefix) in ["https://doi.org/", "http://dx.doi.org/"]
+        .iter()
+        .enumerate()
+    {
+        let bare = format!("{bare}-{n}");
+        let legacy = format!("{prefix}{bare}");
+        let paper_id = seed_processed_paper(&server, &pool, &legacy, "Legacy by bare").await;
+
+        let paper = query_paper_json(&server, &pool, &bare).await;
+        assert_eq!(
+            paper["title"], "Legacy by bare",
+            "query_paper({bare:?}): {paper}"
+        );
+        for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+            let gate = gate_json(&server, &pool, &bare, pipeline_version).await;
+            assert_eq!(
+                gate["already_ingested"],
+                serde_json::json!(true),
+                "check_already_ingested({bare:?}, {pipeline_version:?}) on {legacy:?}: {gate}"
+            );
+            assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+        }
+    }
+
+    // A bare DOI nobody ingested, under any spelling, is still the
+    // zero-shaped not-found answer.
+    let unknown = query_paper_json(&server, &pool, "10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
 }
 
 /// D9 writer-side guard: when an extraction carries `source_text`, every
