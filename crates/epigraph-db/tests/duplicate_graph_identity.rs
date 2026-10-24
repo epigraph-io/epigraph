@@ -1034,6 +1034,7 @@ async fn duplicates_listed_under(pool: &PgPool, canonical: Uuid) -> Vec<Uuid> {
     ClaimRepository::marked_duplicates_of(pool, &viewer, &[canonical], 50)
         .await
         .expect("index view")
+        .rows
         .into_iter()
         .map(|r| r.id)
         .collect()
