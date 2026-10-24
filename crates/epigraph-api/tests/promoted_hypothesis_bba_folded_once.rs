@@ -273,15 +273,44 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         .expect("seeding pool");
     // A public (world-owned) claim: readable by the promoter, so the gate
     // passes, but outside its writable set.
-    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-outsider").await;
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-outsider").await;
     let claim = viewer_fixture::seed_public_claim(&pool, agent, "846b808e public hypothesis").await;
     let r = make_promotable(&pool, &conn_opts, agent, claim).await;
     let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
 
-    let (status, body) = promote(r.addr, agent, r.claim).await;
+    // CALIBRATION: the premise of this arm is that the source BBA lies
+    // OUTSIDE the promoter's writable set. Without it the refusal below would
+    // have no explanation.
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
+            .bind(source.id)
+            .fetch_one(&pool)
+            .await
+            .expect("source owner");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("promoter viewer");
+    assert_ne!(
+        owner,
+        Some(group),
+        "CALIBRATION: the source BBA is not owned by the promoter's group"
+    );
     assert!(
-        !status.is_success(),
+        owner.is_none_or(|g| !viewer.writable_groups().contains(&g)),
+        "CALIBRATION: the source BBA's owner {owner:?} is outside the promoter's writable \
+         set {:?}",
+        viewer.writable_groups()
+    );
+
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
         "a promotion that cannot retire the source must be refused: {status} {body}"
+    );
+    assert!(
+        body.contains("cannot retire that BBA"),
+        "the refusal names the retire, not some other failure: {body}"
     );
     assert!(
         rows(&pool, r.claim, r.rv_frame).await.is_empty(),
