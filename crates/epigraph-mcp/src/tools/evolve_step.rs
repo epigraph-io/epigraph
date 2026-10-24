@@ -65,6 +65,19 @@ pub struct EvolveStepResponse {
     pub belief_cascade: Option<CascadeReport>,
 }
 
+/// `evolve_step_conn`'s refusals for the caller (backlog 769989ae): its
+/// `Conflict` (superseding a step that is no longer current) is the caller's
+/// to fix, INVALID_PARAMS as name-mode's retired-head refusal is, rather than
+/// the INTERNAL_ERROR [`crate::errors::db_caller_error`] gives a variant it
+/// does not know. Everything else, including `InvalidData` (an edge_type
+/// outside the vocabulary), maps as `db_caller_error` maps it.
+fn evolve_caller_error(e: epigraph_db::DbError) -> McpError {
+    match e {
+        epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
+        other => crate::errors::db_caller_error(other),
+    }
+}
+
 pub async fn evolve_step(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -142,7 +155,7 @@ pub async fn evolve_step(
             agent_id,
         )
         .await
-        .map_err(crate::errors::db_caller_error)?;
+        .map_err(evolve_caller_error)?;
         record_lineage_writes(&mut tx, auth, identity, &grants, write_details(&r)).await?;
         if params.edge_type != "supersedes" {
             tx.commit().await.map_err(internal_error)?;
@@ -207,7 +220,7 @@ pub async fn evolve_step(
             agent_id,
         )
         .await
-        .map_err(crate::errors::db_caller_error)?;
+        .map_err(evolve_caller_error)?;
         record_lineage_writes(&mut tx, auth, identity, &grants, write_details(&r)).await?;
         tx.commit().await.map_err(internal_error)?;
         (r, None, None)

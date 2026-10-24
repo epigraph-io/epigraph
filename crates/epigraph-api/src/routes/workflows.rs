@@ -1659,6 +1659,12 @@ pub struct EvolveStepResponse {
 /// refused 403 with nothing written. Each admitted write records one
 /// `workflows.caller_write` (or `workflows.admin_write`) row per workflow. A
 /// claim no workflow executes is unaffected.
+///
+/// Refusals write nothing: 400 for a `level` other than 2 or 3, blank
+/// `content` or an `edge_type` other than `supersedes` / `revises`; 404 for a
+/// parent that does not exist or that the caller cannot see; 409 for
+/// `supersedes` on a parent that is no longer current (`revises` may still
+/// branch from it).
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1671,6 +1677,7 @@ pub struct EvolveStepResponse {
         (status = 401),
         (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = [])),
     tag = "workflows"
@@ -1697,6 +1704,20 @@ pub async fn evolve_step(
             message: "parent_id in path and body must match".into(),
         });
     }
+    // The request checks MCP `evolve_step` makes before any write, with its
+    // wording (backlog 769989ae): without them a bad level was written as is
+    // and blank content reached the claims CHECK as a 500.
+    let level = req.level.unwrap_or(2);
+    if level != 2 && level != 3 {
+        return Err(ApiError::BadRequest {
+            message: format!("level must be 2 or 3 (got {level})"),
+        });
+    }
+    if req.content.trim().is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "content must not be empty".into(),
+        });
+    }
     // The step claim is AUTHORED by, and written on a transaction STAMPED
     // with, the authenticated caller: the viewer's principal (the token's
     // `agent_id`). NOT `owner_id` / `client_id`: those are `oauth_clients.id`
@@ -1708,7 +1729,6 @@ pub async fn evolve_step(
             reason: "evolve_step requires an authenticated principal".into(),
         });
     };
-    let level = req.level.unwrap_or(2);
     let mut tx = state.begin_claim_write(&viewer, "evolve_step").await?;
     // Workflow authority over every workflow executing the parent's
     // step lineage, checked for the SAME principal the step is authored as,
@@ -1729,6 +1749,14 @@ pub async fn evolve_step(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        // The repo's refusals are the caller's to act on (backlog 769989ae):
+        // `InvalidData` (an edge_type outside the vocabulary) is a 400,
+        // `Conflict` (superseding a non-current step) a 409, `WriteRefused`
+        // (row security let the caller see the parent but not retire it) a
+        // 403, as `From<DbError>` maps them everywhere else.
+        e @ (epigraph_db::DbError::InvalidData { .. }
+        | epigraph_db::DbError::Conflict { .. }
+        | epigraph_db::DbError::WriteRefused { .. }) => ApiError::from(e),
         e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {
             message: other.to_string(),
