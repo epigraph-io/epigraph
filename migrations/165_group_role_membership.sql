@@ -657,6 +657,10 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_live_memberships(uuid) '
                 'OWNER TO epigraph_maintenance';
+        -- Re-stated above: CREATE OR REPLACE keeps the owner, re-asserted
+        -- literally as every re-stating migration since 153 does.
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_bind_group_role(text, uuid, text, boolean, text) '
                 'TO epigraph_maintenance';
@@ -695,6 +699,9 @@ DO $$ BEGIN
                 'FROM epigraph_app';
         -- `Viewer::resolve` calls it on the application role (077, 164).
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) '
+                'TO epigraph_app';
+        -- The claims trigger calls it on the application role (122, 123).
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
                 'TO epigraph_app';
     END IF;
 END $$;
