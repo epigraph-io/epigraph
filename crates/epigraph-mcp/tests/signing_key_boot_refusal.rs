@@ -35,6 +35,11 @@ const NO_IDENTITY: &str = "no agent has the identity public key";
 const BOTH_OR_NEITHER: &str =
     "EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set together";
 
+const HTTP_REFUSED: &str = "the separate-signing-key mode is stdio-only";
+
+/// A test-only HMAC secret, long enough for the listener's secret check.
+const HTTP_TEST_JWT_SECRET: &str = "signing-key-boot-refusal-test-secret-not-for-any-deployment";
+
 const ATTESTOR: &str = "epigraph_identity_attestor";
 
 enum Outcome {
@@ -376,4 +381,49 @@ async fn a_refused_stdio_boot_with_an_operator_creates_no_agent(pool: PgPool) {
     }
     assert_eq!(operator_of(&pool, agent).await, None, "nothing was linked");
     assert_eq!(agent_count_with_key(&pool, &signing).await, 0);
+}
+
+/// The separate-signing-key mode is stdio-only: on an HTTP listener its
+/// attested signing key would sign `blake3(content)` for ANY caller, an oracle
+/// for signatures that bind to this agent. Refused before the database is
+/// touched (the URL is unreachable, so a missing gate fails on the connect
+/// with a different message), on a TCP and on a unix-socket listener.
+///
+/// The positive control is `the_binary_boots_only_on_a_registered_signing_key`:
+/// the same pair on stdio boots.
+#[test]
+fn the_separate_signing_key_mode_is_refused_on_an_http_listener() {
+    let identity = AgentSigner::from_bytes(&[0xC1; 32])
+        .expect("id")
+        .public_key();
+    let signing_secret = [0xC2u8; 32];
+    for listen in [
+        &["--listen", "127.0.0.1:0", "--jwt-secret", HTTP_TEST_JWT_SECRET][..],
+        &[
+            "--listen",
+            "unix:/tmp/epigraph-s2-never-bound.sock",
+            "--allow-unauthenticated-http",
+        ][..],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"))
+            .env_remove("EPIGRAPH_JWT_SECRET")
+            .env_remove("EPIGRAPH_OPERATOR_ID")
+            .env_remove("EPIGRAPH_MCP_AGENT_KEY")
+            .env_remove("EPIGRAPH_AGENT_MODEL")
+            .env_remove("MAINTENANCE_DATABASE_URL")
+            .env("EPIGRAPH_AGENT_IDENTITY_PUBKEY", hex::encode(identity))
+            .env("EPIGRAPH_AGENT_SIGNING_KEY", hex::encode(signing_secret))
+            .args(["--database-url", "postgres://invalid:invalid@127.0.0.1:1/nope"])
+            .args(listen)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run mcp bin");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{listen:?}: {stderr}");
+        assert!(stderr.contains(HTTP_REFUSED), "{listen:?}: {stderr}");
+        assert!(
+            !stderr.contains(&hex::encode(signing_secret)),
+            "the refusal must never echo the private key:\n{stderr}"
+        );
+    }
 }
