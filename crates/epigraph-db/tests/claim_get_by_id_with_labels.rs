@@ -186,20 +186,48 @@ fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
 /// constructible (every projected column exists and `claims.labels` is
 /// `NOT NULL`), so the property is pinned on the source. Scoped to these three
 /// bodies: other readers in the file use `row.get` and are out of scope here.
+///
+/// Each body is pinned POSITIVELY on the decode it must use (so deleting the
+/// decode cannot pass), and negatively on every spelling of a `Row` decode
+/// regardless of what the row variable is called: a bare `sqlx::query(` (which
+/// yields a `PgRow`), any `sqlx::Row` import or path call, and any `.get(` /
+/// `.get::<` call.
 #[test]
 fn single_claim_readers_decode_fallibly() {
-    for sig in [
-        "pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(",
-        "pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(",
-        "pub async fn get_by_id_conn(",
+    for (sig, required) in [
+        (
+            "pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(",
+            &[
+                "sqlx::query_as::<_, SingleClaimRow>(&sql)",
+                "row.map(SingleClaimRow::into_claim)",
+            ][..],
+        ),
+        (
+            "pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(",
+            &[
+                "sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql)",
+                "r.row.into_claim()?",
+            ][..],
+        ),
+        (
+            "pub async fn get_by_id_conn(",
+            &["Self::get_by_id(&mut *conn, viewer, id)"][..],
+        ),
     ] {
         let body = fn_body(CLAIM_RS, sig);
-        for forbidden in ["row.get(", "row.get::<", "use sqlx::Row"] {
+        for needle in required {
+            assert!(
+                body.contains(needle),
+                "`{sig}` must decode through `{needle}` (a `FromRow` decode that \
+                 returns Err on a drifted column).\nbody:\n{body}"
+            );
+        }
+        for forbidden in ["sqlx::Row", "sqlx::query(", ".get(", ".get::<"] {
             assert!(
                 !body.contains(forbidden),
-                "`{sig}` decodes with a panicking `{forbidden}`; decode through \
-                 `query_as` + `#[derive(sqlx::FromRow)]` so a drifted column is an \
-                 Err, not a panic.\nbody:\n{body}"
+                "`{sig}` decodes with a panicking `sqlx::Row` accessor (`{forbidden}`); \
+                 decode through `query_as` + `#[derive(sqlx::FromRow)]` so a drifted \
+                 column is an Err, not a panic.\nbody:\n{body}"
             );
         }
     }
@@ -223,15 +251,37 @@ async fn get_by_id_with_labels_matches_get_by_id_on_every_field(pool: PgPool) {
     // Signed, with a stored digest that is NOT blake3(content), and labelled.
     let signed_text = format!("with-labels signed {}", Uuid::new_v4());
     let signed_sig: Vec<u8> = (0u8..64).rev().collect();
-    let trace_id: Option<Uuid> = None;
+    // A NON-NULL trace_id, so its decode is pinned to a stored value rather
+    // than compared NULL to NULL. `claims.trace_id` references
+    // `reasoning_traces`, whose row names a claim: an anchor carries it.
+    let anchor_text = format!("with-labels trace anchor {}", Uuid::new_v4());
+    let anchor: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+    )
+    .bind(&anchor_text)
+    .bind(agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed trace anchor claim");
+    let trace: Uuid = sqlx::query_scalar(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, explanation) \
+         VALUES ($1, 'deductive', 'get_by_id_with_labels trace fixture') RETURNING id",
+    )
+    .bind(anchor)
+    .fetch_one(&pool)
+    .await
+    .expect("seed reasoning trace");
+    let trace_id: Option<Uuid> = Some(trace);
     let signed: Uuid = sqlx::query_scalar(
         "INSERT INTO claims (content, content_hash, truth_value, agent_id, \
-                             signature, signer_id, labels) \
-         VALUES ($1, sha256($1::bytea), 0.375, $2, $3, $2, ARRAY['sig','x']) RETURNING id",
+                             signature, signer_id, labels, trace_id) \
+         VALUES ($1, sha256($1::bytea), 0.375, $2, $3, $2, ARRAY['sig','x'], $4) RETURNING id",
     )
     .bind(&signed_text)
     .bind(agent_id)
     .bind(&signed_sig)
+    .bind(trace)
     .fetch_one(&pool)
     .await
     .expect("seed signed claim");
@@ -298,7 +348,18 @@ async fn get_by_id_with_labels_matches_get_by_id_on_every_field(pool: PgPool) {
     assert_eq!(s.signature.map(|x| x.to_vec()), Some(signed_sig));
     assert_eq!(s.public_key.to_vec(), agent_pk, "the signer's key");
     assert_eq!(s.truth_value.value(), 0.375);
-    assert_eq!(s.trace_id.map(Uuid::from), trace_id);
+    assert_eq!(s.trace_id.map(Uuid::from), trace_id, "the STORED trace_id");
+    let (created_at, updated_at): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT created_at, updated_at FROM claims WHERE id = $1")
+            .bind(signed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (s.created_at, s.updated_at),
+        (created_at, updated_at),
+        "the STORED timestamps"
+    );
     assert_eq!(s_labels, vec!["sig".to_string(), "x".to_string()]);
 
     let (r, _) = ClaimRepository::get_by_id_with_labels(
