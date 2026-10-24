@@ -439,7 +439,16 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let agent = seed_agent(&pool, &identity.public_key(), t0).await;
 
     let closing = signer(0x82);
-    seed_key(&pool, agent, &closing.public_key(), "signing", "active", t0, Some(t1)).await;
+    seed_key(
+        &pool,
+        agent,
+        &closing.public_key(),
+        "signing",
+        "active",
+        t0,
+        Some(t1),
+    )
+    .await;
     let at_end = seed_signed_claim(&pool, agent, agent, &closing, "D2: at valid_until", t1).await;
     let before_end = seed_signed_claim(
         &pool,
@@ -453,7 +462,11 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let resp = verify(&pool, at_end).await;
     assert_eq!(
         bound(&resp),
-        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        (
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::from("signing")
+        ),
         "valid_until is exclusive: {resp}"
     );
     let resp = verify(&pool, before_end).await;
@@ -464,7 +477,16 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     );
 
     let expired = signer(0x83);
-    seed_key(&pool, agent, &expired.public_key(), "signing", "expired", t0, Some(t1)).await;
+    seed_key(
+        &pool,
+        agent,
+        &expired.public_key(),
+        "signing",
+        "expired",
+        t0,
+        Some(t1),
+    )
+    .await;
     let inside = seed_signed_claim(
         &pool,
         agent,
@@ -482,7 +504,16 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     );
 
     let pending = signer(0x84);
-    seed_key(&pool, agent, &pending.public_key(), "signing", "pending", t0, None).await;
+    seed_key(
+        &pool,
+        agent,
+        &pending.public_key(),
+        "signing",
+        "pending",
+        t0,
+        None,
+    )
+    .await;
     let by_pending = seed_signed_claim(
         &pool,
         agent,
@@ -495,7 +526,11 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let resp = verify(&pool, by_pending).await;
     assert_eq!(
         bound(&resp),
-        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        (
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::from("signing")
+        ),
         "a pending key binds nothing: {resp}"
     );
 }
@@ -511,7 +546,16 @@ async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(po
     let identity = signer(0x91);
     let signing = signer(0x92);
     let agent = seed_agent(&pool, &identity.public_key(), t0).await;
-    seed_key(&pool, agent, &signing.public_key(), "signing", "active", t0, None).await;
+    seed_key(
+        &pool,
+        agent,
+        &signing.public_key(),
+        "signing",
+        "active",
+        t0,
+        None,
+    )
+    .await;
     let before = seed_signed_claim(
         &pool,
         agent,
@@ -524,14 +568,13 @@ async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(po
     let resp = verify(&pool, before).await;
     assert_eq!(resp["key_bound"], Value::Bool(true), "calibration: {resp}");
 
-    let key_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM agent_keys WHERE agent_id = $1 AND public_key = $2",
-    )
-    .bind(agent)
-    .bind(signing.public_key().as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("key id");
+    let key_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM agent_keys WHERE agent_id = $1 AND public_key = $2")
+            .bind(agent)
+            .bind(signing.public_key().as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("key id");
     fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let r = sqlx::query(
             "SELECT * FROM epigraph_agent_key_set_status($1, 'rotated', 'test rotation', NULL)",
@@ -563,7 +606,11 @@ async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(po
     let resp = verify(&pool, after).await;
     assert_eq!(
         bound(&resp),
-        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        (
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::from("signing")
+        ),
         "a claim signed after the rotation is not bound: {resp}"
     );
 }
@@ -583,13 +630,25 @@ async fn the_new_reads_work_on_the_application_role(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("read epigraph_app");
-    assert!(!bypassrls, "epigraph_app holds BYPASSRLS: this arm is vacuous");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: this arm is vacuous"
+    );
 
     let t0 = Utc::now() - Duration::days(10);
     let identity = signer(0xA1);
     let signing = signer(0xA2);
     let agent = seed_agent(&pool, &identity.public_key(), t0).await;
-    seed_key(&pool, agent, &signing.public_key(), "signing", "active", t0, None).await;
+    seed_key(
+        &pool,
+        agent,
+        &signing.public_key(),
+        "signing",
+        "active",
+        t0,
+        None,
+    )
+    .await;
     let claim = seed_signed_claim(
         &pool,
         agent,

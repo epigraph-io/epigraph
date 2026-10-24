@@ -284,7 +284,10 @@ async fn a_half_or_mixed_configuration_is_refused(pool: PgPool) {
 /// Logged by `self_link` once the operator link is recorded.
 const LINKED: &str = "operator link recorded";
 
-fn with_operator(mut env: Vec<(&'static str, String)>, operator: Uuid) -> Vec<(&'static str, String)> {
+fn with_operator(
+    mut env: Vec<(&'static str, String)>,
+    operator: Uuid,
+) -> Vec<(&'static str, String)> {
     env.push(("EPIGRAPH_OPERATOR_ID", operator.to_string()));
     env
 }
@@ -313,7 +316,11 @@ async fn the_stdio_boot_links_the_identity_agent_not_a_signing_key_agent(pool: P
         .public_key();
     let agent = register(&pool, identity, signing).await;
     let (operator, _) = fixture::seed_human_operator(&pool, "s2-stdio-operator").await;
-    assert_eq!(operator_of(&pool, agent).await, None, "calibration: unlinked");
+    assert_eq!(
+        operator_of(&pool, agent).await,
+        None,
+        "calibration: unlinked"
+    );
 
     let env = with_operator(new_mode_env(&identity, &signing_secret), operator);
     match run_until(&pool, env, &[], LINKED).await {
@@ -398,7 +405,12 @@ fn the_separate_signing_key_mode_is_refused_on_an_http_listener() {
         .public_key();
     let signing_secret = [0xC2u8; 32];
     for listen in [
-        &["--listen", "127.0.0.1:0", "--jwt-secret", HTTP_TEST_JWT_SECRET][..],
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--jwt-secret",
+            HTTP_TEST_JWT_SECRET,
+        ][..],
         &[
             "--listen",
             "unix:/tmp/epigraph-s2-never-bound.sock",
@@ -413,7 +425,10 @@ fn the_separate_signing_key_mode_is_refused_on_an_http_listener() {
             .env_remove("MAINTENANCE_DATABASE_URL")
             .env("EPIGRAPH_AGENT_IDENTITY_PUBKEY", hex::encode(identity))
             .env("EPIGRAPH_AGENT_SIGNING_KEY", hex::encode(signing_secret))
-            .args(["--database-url", "postgres://invalid:invalid@127.0.0.1:1/nope"])
+            .args([
+                "--database-url",
+                "postgres://invalid:invalid@127.0.0.1:1/nope",
+            ])
             .args(listen)
             .stdin(Stdio::null())
             .output()

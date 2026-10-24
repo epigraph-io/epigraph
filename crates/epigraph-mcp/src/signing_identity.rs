@@ -293,7 +293,13 @@ mod tests {
         let agent = Uuid::new_v4();
         let other = Uuid::new_v4();
         let pk = [7u8; 32];
-        assert!(signing_key_verdict(agent, &pk, &[key_row(agent, "signing", "active")], Utc::now()).is_ok());
+        assert!(signing_key_verdict(
+            agent,
+            &pk,
+            &[key_row(agent, "signing", "active")],
+            Utc::now()
+        )
+        .is_ok());
         for rows in [
             // Normalising is the read's job (SQL `lower(btrim(..))`), so a
             // spelling the read would not produce is not admitted here.
@@ -325,10 +331,22 @@ mod tests {
         };
         let ok = |rows: Vec<AgentKeyRow>| signing_key_verdict(agent, &pk, &rows, now).is_ok();
         assert!(ok(with(now - Duration::days(1), None)), "open window");
-        assert!(ok(with(now - Duration::days(1), Some(now + Duration::days(1)))));
-        assert!(ok(with(now + Duration::seconds(1), None)), "within the skew");
-        assert!(!ok(with(now - Duration::days(2), Some(now - Duration::days(1)))), "closed");
-        assert!(!ok(with(now - Duration::days(1), Some(now))), "ends exactly now");
+        assert!(ok(with(
+            now - Duration::days(1),
+            Some(now + Duration::days(1))
+        )));
+        assert!(
+            ok(with(now + Duration::seconds(1), None)),
+            "within the skew"
+        );
+        assert!(
+            !ok(with(now - Duration::days(2), Some(now - Duration::days(1)))),
+            "closed"
+        );
+        assert!(
+            !ok(with(now - Duration::days(1), Some(now))),
+            "ends exactly now"
+        );
         assert!(!ok(with(now + Duration::days(1), None)), "not yet open");
     }
 
@@ -425,11 +443,21 @@ mod tests {
         let row = attested(author, &key, "signing", "active", from, None);
         let edge = from - Duration::seconds(VALID_FROM_SKEW_SECS);
         let bound = |at| {
-            bind_signature(&digest, Some(&sig), &[0; 32], author, at, std::slice::from_ref(&row))
-                .key_bound
+            bind_signature(
+                &digest,
+                Some(&sig),
+                &[0; 32],
+                author,
+                at,
+                std::slice::from_ref(&row),
+            )
+            .key_bound
         };
         assert!(bound(edge), "the edge itself binds");
-        assert!(!bound(edge - Duration::milliseconds(1)), "past the edge does not");
+        assert!(
+            !bound(edge - Duration::milliseconds(1)),
+            "past the edge does not"
+        );
     }
 
     /// A signature only the signer's `agents.public_key` verifies is valid,

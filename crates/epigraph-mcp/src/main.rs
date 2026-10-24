@@ -200,7 +200,6 @@ struct Cli {
     /// in `agent_keys`, registered by the host before the container starts.
     #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
     agent_identity_pubkey: Option<String>,
-
 }
 
 /// Outcome of signer selection: the Ed25519 signer plus, when the identity was

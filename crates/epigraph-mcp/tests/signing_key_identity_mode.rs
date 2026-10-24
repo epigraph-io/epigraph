@@ -315,7 +315,10 @@ async fn the_boot_check_admits_only_inside_the_keys_window(pool: PgPool) {
     let identity = signer(0xB1).public_key();
     let signing = signer(0xB2).public_key();
     let agent = register(&pool, identity, signing, "g-s2-window").await;
-    assert_eq!(check_signing_key(&pool, &identity, &signing).await, Ok(agent));
+    assert_eq!(
+        check_signing_key(&pool, &identity, &signing).await,
+        Ok(agent)
+    );
 
     let set_window = |from: &'static str, until: &'static str| {
         let pool = pool.clone();
@@ -336,13 +339,19 @@ async fn the_boot_check_admits_only_inside_the_keys_window(pool: PgPool) {
     let closed = check_signing_key(&pool, &identity, &signing)
         .await
         .expect_err("an active key whose window has closed is refused");
-    assert!(closed.contains("is not an active signing key of"), "{closed}");
+    assert!(
+        closed.contains("is not an active signing key of"),
+        "{closed}"
+    );
 
     set_window("now() + interval '1 day'", "NULL").await;
     let future = check_signing_key(&pool, &identity, &signing)
         .await
         .expect_err("an active key whose window has not opened is refused");
-    assert!(future.contains("is not an active signing key of"), "{future}");
+    assert!(
+        future.contains("is not an active signing key of"),
+        "{future}"
+    );
 
     set_window("now()", "NULL").await;
     assert_eq!(
