@@ -24,10 +24,20 @@ pub struct PaperRow {
 pub struct PaperRepository;
 
 impl PaperRepository {
-    /// Insert a paper, or return the existing id if the DOI already exists.
+    /// Insert a paper, or return the existing id if the document key already
+    /// exists under any of its spellings.
     ///
-    /// On conflict (UNIQUE doi), updates `title` and `journal` to the
-    /// provided values when non-null. Idempotent for repeat ingestion.
+    /// The key is matched through [`document_key_spellings`], canonical
+    /// first, so a row an older writer stored under a resolver URL
+    /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
+    /// ingest (backlog 90756d26). The row found has `title` and `journal`
+    /// updated to the provided values when non-null. A new row is stored
+    /// under the [`canonical_document_key`]. Idempotent for repeat ingestion.
+    ///
+    /// One statement: when no spelling exists yet, the insert falls through
+    /// to `ON CONFLICT (doi)` on the canonical key, so a concurrent writer
+    /// that inserted the same document under another spelling makes this
+    /// call wait and then return that writer's row, not a unique violation.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -38,22 +48,48 @@ impl PaperRepository {
         title: Option<&str>,
         journal: Option<&str>,
     ) -> Result<Uuid, DbError> {
-        let row = sqlx::query!(
+        let canonical = canonical_document_key(doi);
+        let spellings = document_key_spellings(doi);
+        // Runtime-checked, not `query!`: CI's migration runner is built
+        // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
+        // before the schema it is checked against exists.
+        let id: Uuid = sqlx::query_scalar(
             r#"
-            INSERT INTO papers (doi, title, journal)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (doi) DO UPDATE SET
-                title = COALESCE(EXCLUDED.title, papers.title),
-                journal = COALESCE(EXCLUDED.journal, papers.journal)
-            RETURNING id
+            WITH found AS (
+                SELECT id FROM papers
+                WHERE doi = ANY($1::text[])
+                ORDER BY array_position($1::text[], doi)
+                LIMIT 1
+            ),
+            updated AS (
+                UPDATE papers p SET
+                    title = COALESCE($3::text, p.title),
+                    journal = COALESCE($4::text, p.journal)
+                FROM found
+                WHERE p.id = found.id
+                RETURNING p.id
+            ),
+            inserted AS (
+                INSERT INTO papers (doi, title, journal)
+                SELECT $2::text, $3::text, $4::text
+                WHERE NOT EXISTS (SELECT 1 FROM found)
+                ON CONFLICT (doi) DO UPDATE SET
+                    title = COALESCE(EXCLUDED.title, papers.title),
+                    journal = COALESCE(EXCLUDED.journal, papers.journal)
+                RETURNING id
+            )
+            SELECT id FROM updated
+            UNION ALL
+            SELECT id FROM inserted
             "#,
-            doi,
-            title,
-            journal,
         )
+        .bind(&spellings)
+        .bind(&canonical)
+        .bind(title)
+        .bind(journal)
         .fetch_one(pool)
         .await?;
-        Ok(row.id)
+        Ok(id)
     }
 
     /// Find a paper by DOI. Returns `None` if no paper has this DOI.
