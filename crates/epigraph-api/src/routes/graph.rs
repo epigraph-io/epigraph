@@ -745,19 +745,49 @@ fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
     }
 }
 
+/// A 500 for a failed statement. The driver's error is LOGGED, never sent:
+/// the body is [`crate::errors::INTERNAL_ERROR_BODY`], as for every
+/// `ApiError::InternalError` (F-route-error-text-remainder).
 fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(target: "api.internal_error", route = "graph", detail = %e, "internal error");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        crate::errors::INTERNAL_ERROR_BODY.to_string(),
+    )
 }
 
 /// `internal` for the repo layer, which surfaces `DbError` rather than a raw
 /// `sqlx::Error`.
 fn internal_db(e: epigraph_db::DbError) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(target: "api.internal_error", route = "graph", detail = %e, "internal error");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        crate::errors::INTERNAL_ERROR_BODY.to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every failed statement in this file answers through `internal` /
+    /// `internal_db`; neither may hand the driver's error text to the caller
+    /// (F-route-error-text-remainder).
+    #[test]
+    fn internal_answers_never_carry_the_driver_error() {
+        let driver = "relation \"graph_runs\" does not exist";
+        for (status, body) in [
+            internal(sqlx::Error::Protocol(driver.to_string())),
+            internal_db(epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::Protocol(driver.to_string()),
+            }),
+        ] {
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!body.contains("graph_runs"), "{body}");
+            assert!(!body.contains("does not exist"), "{body}");
+            assert_eq!(body, crate::errors::INTERNAL_ERROR_BODY);
+        }
+    }
 
     /// Relationship types we expect the graph view to traverse.
     /// Adding a row here without adding the matching string to
