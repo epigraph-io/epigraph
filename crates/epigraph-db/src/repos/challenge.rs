@@ -34,6 +34,43 @@ pub struct GapChallengeRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Where a challenge lands, per operator ruling R-CH1 (migration 168).
+///
+/// An OUTSIDER is a challenger that cannot write the challenged claim's owning
+/// group. [`ChallengeRepository::admission_of`] computes this from the
+/// session's stamp; the INSERT's triggers apply the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeAdmission {
+    /// The challenger writes the claim's group: the row inherits the claim's
+    /// tenancy (unchanged by R-CH1).
+    Insider,
+    /// A PUBLIC claim the challenger cannot write: the row is owned by the
+    /// challenger's own write `group`, public, and never follows the claim.
+    Outsider { group: Uuid },
+    /// A NON-public claim the challenger can read but not write. Refused: an
+    /// outsider-owned row about it would be hidden from the claim's owners.
+    NotWriter,
+    /// A PUBLIC claim the challenger cannot write, and no write group of its
+    /// own (`epigraph_writer_group()` is NULL) to own the row. Refused.
+    NoWriterGroup,
+}
+
+impl ChallengeAdmission {
+    /// The rule, from the three facts [`ChallengeRepository::admission_of`]
+    /// reads: does the session write the claim's group, the claim's
+    /// visibility, and the session's own write group.
+    #[must_use]
+    pub fn decide(insider: bool, claim_visibility: &str, writer_group: Option<Uuid>) -> Self {
+        if insider {
+            return Self::Insider;
+        }
+        if claim_visibility != "public" {
+            return Self::NotWriter;
+        }
+        writer_group.map_or(Self::NoWriterGroup, |group| Self::Outsider { group })
+    }
+}
+
 pub struct ChallengeRepository;
 
 impl ChallengeRepository {
@@ -54,18 +91,23 @@ impl ChallengeRepository {
     ///
     /// # Whose group the row lands in is NOT the caller's choice
     ///
-    /// `challenges` is claim-derived, so migration 074's
-    /// `epigraph_derived_require_tenancy` (BEFORE INSERT) fills
-    /// `(visibility, owner_group_id)` from the PARENT CLAIM, and 070 arm (c)
-    /// (AFTER INSERT STATEMENT) re-stamps it unconditionally — its own comment
-    /// says a BEFORE-row guard the statement trigger then overwrites would be a
-    /// control that reads green and does nothing. So the `WITH CHECK` this
-    /// INSERT must satisfy is about the CLAIM's owning group, not the
-    /// challenger's, and declaring the columns here would change nothing.
-    /// A challenger stamped with its own writable set can therefore write a
-    /// challenge against a claim in a group it can write, and is refused for one
-    /// it cannot. That refusal is a policy question about who may object to
-    /// whose claim; it is recorded rather than worked around here.
+    /// The database decides it, from the session's stamp (migrations 074, 070,
+    /// 114 and 168), so declaring the columns here would change nothing:
+    ///
+    /// * an INSIDER (the session can write the claim's owning group): the row
+    ///   inherits the CLAIM's `(visibility, owner_group_id)`, exactly as every
+    ///   claim-derived row does;
+    /// * an OUTSIDER on a PUBLIC claim (ruling R-CH1, migration 168): the row is
+    ///   owned by the challenger's own write group (`epigraph_writer_group()`),
+    ///   `visibility = 'public'`, `writer_owned = true`, and never follows the
+    ///   claim afterwards;
+    /// * anything else (a non-public claim the session cannot write, an
+    ///   unreadable claim, a challenger with no write group of its own): left to
+    ///   the inherit rule, which 077's `WITH CHECK` refuses (42501).
+    ///
+    /// The transports decide the same thing first, by name, with
+    /// [`Self::admission_of`] on the same stamped transaction, so the refusal a
+    /// caller sees is never the raw row-security error.
     pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         claim_id: Uuid,
@@ -86,6 +128,39 @@ impl ChallengeRepository {
         .execute(executor)
         .await?;
         Ok(id)
+    }
+
+    /// Where a challenge on `claim_id` would land for the session `executor`
+    /// is stamped as, decided BEFORE the INSERT so a transport can refuse by
+    /// name. `None` when the claim does not exist OR `viewer` cannot read it;
+    /// the two are deliberately indistinguishable (ruling R-CH1b), so a caller
+    /// that answers `None` with "not found" leaks nothing.
+    ///
+    /// Asks the database the questions the INSERT's triggers ask, with the
+    /// same functions and on the same stamp, so the preflight and the row
+    /// cannot disagree: is the claim's owner in `epigraph_writable_groups()`,
+    /// is the claim public, and what is `epigraph_writer_group()`. Run it on
+    /// the transaction the INSERT will use.
+    pub async fn admission_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<ChallengeAdmission>, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT c.owner_group_id = ANY (public.epigraph_writable_groups()), \
+                    c.visibility::text, public.epigraph_writer_group() \
+             FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (bool, String, Option<Uuid>)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor)
+            .await?
+            .map(|(insider, visibility, writer_group)| {
+                ChallengeAdmission::decide(insider, &visibility, writer_group)
+            }))
     }
 
     /// Get a single challenge by ID.
@@ -219,5 +294,46 @@ impl ChallengeRepository {
             q = q.bind(g);
         }
         q.fetch_all(executor).await
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::ChallengeAdmission;
+    use uuid::Uuid;
+
+    #[test]
+    fn an_insider_inherits_whatever_the_claims_visibility() {
+        let g = Some(Uuid::new_v4());
+        for vis in ["public", "group", "private"] {
+            assert_eq!(
+                ChallengeAdmission::decide(true, vis, g),
+                ChallengeAdmission::Insider
+            );
+            assert_eq!(
+                ChallengeAdmission::decide(true, vis, None),
+                ChallengeAdmission::Insider
+            );
+        }
+    }
+
+    #[test]
+    fn an_outsider_owns_its_challenge_only_on_a_public_claim() {
+        let g = Uuid::new_v4();
+        assert_eq!(
+            ChallengeAdmission::decide(false, "public", Some(g)),
+            ChallengeAdmission::Outsider { group: g }
+        );
+        assert_eq!(
+            ChallengeAdmission::decide(false, "public", None),
+            ChallengeAdmission::NoWriterGroup
+        );
+        for vis in ["group", "private"] {
+            assert_eq!(
+                ChallengeAdmission::decide(false, vis, Some(g)),
+                ChallengeAdmission::NotWriter,
+                "{vis}"
+            );
+        }
     }
 }
