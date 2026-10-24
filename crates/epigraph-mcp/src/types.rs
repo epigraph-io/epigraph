@@ -2386,6 +2386,10 @@ pub struct FindWorkflowResult {
 /// not listed, even when that claim is retired (it never evolved).
 #[derive(Debug, Serialize)]
 pub struct EvolvedStep {
+    /// The index `evolve_step` / `report_hierarchical_outcome` take. It counts
+    /// the `executes` edges the caller can see, so it is not guaranteed to be
+    /// the position of the same step in [`FindWorkflowResult::steps`]; match on
+    /// `frozen_claim_id` when that matters.
     pub step_index: usize,
     pub frozen_claim_id: String,
     /// The newest head with `is_current=true`, which is the claim name-mode
