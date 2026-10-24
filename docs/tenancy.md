@@ -1295,8 +1295,9 @@ Nothing is written to the group's roster for these members. Membership is
 computed each time a viewer is resolved, so it LAPSES at the assignment's
 `valid_to` (or its `end-role-assignment`, or the binding's end) with no job:
 reads at the next request, tool call or worker job; claim writes, once the
-operator binding is armed, at the next transaction, whatever the session's
-stamp says (OPL02). A request already in flight finishes on its old stamp.
+operator binding is armed, at the first statement after `valid_to`, even
+inside a transaction opened before it, whatever the session's stamp says
+(OPL02). A request already in flight reads on its old stamp.
 
 Two consequences to know:
 

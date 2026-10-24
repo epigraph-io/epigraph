@@ -1584,7 +1584,8 @@ restart.
   a window. `epigraph_group_role_roster(uuid, timestamptz)` (maintenance only)
   answers a group's derived members at an instant. Nothing is written for a
   derived member; a membership lapses at `valid_to` on the next viewer
-  resolution (claim writes, armed: the next transaction). Callers:
+  resolution (claim writes, armed: the first statement after it, at
+  `clock_timestamp()`, even inside an older transaction). Callers:
   `epigraph-operator define-group-role`, `bind-group-role`,
   `end-group-role-binding`, `group-roster`; `grant-role` now reads the role
   catalog. Pinned by `epigraph-db/tests/group_role_membership.rs`,

@@ -55,11 +55,16 @@
 --     linked to a role holder. (122's direct arm keeps its own semantics.)
 --
 -- So a membership lapses exactly at `valid_to`, with no job: a read at the
--- next viewer resolution (per request, per tool call, per worker job), a
--- claim write (armed) at the first statement of a transaction that starts at
--- or after `valid_to`. The time base is `now()`, the transaction's start,
--- like the stamp itself; a transaction opened inside the window finishes on
--- it. A materialized row could not represent a second interval (060's
+-- next viewer resolution (per request, per tool call, per worker job; the
+-- read time base is `now()`, like the stamp itself), a claim write (armed)
+-- at its first STATEMENT at or after `valid_to`. The write time base is
+-- `clock_timestamp()`, not `now()`: `now()` is the transaction's start, so a
+-- transaction opened inside the window would keep writing past its end, and
+-- every write after the end is refused (the same time base as the
+-- role-attached-agent holder check). Residual: under REPEATABLE READ or
+-- SERIALIZABLE, an assignment or binding ENDED after the transaction's
+-- snapshot is still seen live by it (a visibility question; a `valid_to` in
+-- the past is not). A materialized row could not represent a second interval (060's
 -- `UNIQUE (group_id, agent_id, epoch)`), would need a job at every
 -- transition, and a dead job over-grants; this under-grants instead.
 --
@@ -554,8 +559,11 @@ BEGIN
     IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
         RETURN;
     END IF;
-    -- 165: the principal's own derived membership, by the viewer's rule.
-    IF EXISTS (SELECT 1 FROM public.epigraph_role_derived_memberships(p_agent, now()) d
+    -- 165: the principal's own derived membership, by the viewer's rule, at
+    -- this statement's clock (a transaction opened in the window does not
+    -- keep writing past its end).
+    IF EXISTS (SELECT 1
+                 FROM public.epigraph_role_derived_memberships(p_agent, clock_timestamp()) d
                 WHERE d.group_id = p_group AND d.role = 'writer') THEN
         RETURN;
     END IF;
