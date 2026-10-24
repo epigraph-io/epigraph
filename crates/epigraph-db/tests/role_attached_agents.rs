@@ -2202,6 +2202,124 @@ async fn every_write_class_is_refused_after_the_end_and_allowed_before_it(pool: 
     );
 }
 
+const TRUTH_UPDATE: &str = "UPDATE claims SET truth_value = 0.9 WHERE id = $1";
+
+/// [`TRUTH_UPDATE`] of `claim` on an `epigraph_app` connection stamped as
+/// `who`, or, with `who = None`, carrying NO principal with the valve off
+/// (so the unbound-writer refusal is relieved and only ROL01 can refuse).
+async fn update_truth_as(
+    pool: &PgPool,
+    who: Option<Uuid>,
+    group: Uuid,
+    claim: Uuid,
+) -> Result<u64, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        match who {
+            Some(w) => stamp(&mut conn, w, &[group]).await,
+            None => {
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', '', false), \
+                            set_config('epigraph.group_ids', $1, false), \
+                            set_config('epigraph.writable_group_ids', $1, false), \
+                            set_config('epigraph.operator_link_enforcement', 'off', false)",
+                )
+                .bind(group.to_string())
+                .execute(&mut *conn)
+                .await
+                .expect("no principal, valve off");
+            }
+        }
+        let r = sqlx::query(TRUTH_UPDATE)
+            .bind(claim)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve reset");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// THE AUTHOR ARM. A claim an attached agent AUTHORED is the agent's output,
+/// so after its holder's assignment ends no application session rewrites it,
+/// whoever is stamped: the human, or a session with no principal at all.
+/// * POSITIVE CONTROL: the human's same UPDATE before the end lands.
+/// * CONTROLS after the end: the human updates its unattached agent's claim;
+///   the no-principal session updates the unattached agent's claim; the
+///   human updates a claim by a RETIRED identity attached to the same role
+///   (it can never run again: the one relief, shared with the attribution
+///   check); a privileged session updates the attached agent's claim.
+///
+/// Verified to fail: without the author arm the human's and the
+/// no-principal session's rewrites of the attached agent's claim land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agents_claim_is_not_rewritten_by_anyone_after_the_end(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    let (gone, _) = fixture::seed_agent_with_group(&pool, "retired-curator").await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_retired_agent(&mut conn, gone, h).await;
+        (conn, r)
+    })
+    .await
+    .expect("a retired link");
+    attach(&pool, ROLE, attached).await;
+    attach(&pool, ROLE, gone).await;
+    let gone_claim = insert_claim(&pool, gone, h_group)
+        .await
+        .expect("the retired identity's claim (unarmed setup)");
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let mut claims = Vec::new();
+    for _ in 0..4 {
+        claims.push(insert_claim(&pool, attached, h_group).await.expect("claim"));
+    }
+    let plain_claim = insert_claim(&pool, plain, h_group).await.expect("claim");
+
+    assert_eq!(
+        update_truth_as(&pool, Some(h), h_group, claims[0]).await.ok(),
+        Some(1),
+        "POSITIVE CONTROL: the human updates its attached agent's claim before the end"
+    );
+    end_assignment(&pool, assignment).await;
+
+    assert_rol01(
+        &update_truth_as(&pool, Some(h), h_group, claims[1]).await,
+        "the human rewriting the attached agent's claim after the end",
+    );
+    assert_rol01(
+        &update_truth_as(&pool, None, h_group, claims[2]).await,
+        "a no-principal session rewriting the attached agent's claim after the end",
+    );
+    for (who, claim, what) in [
+        (Some(h), plain_claim, "the human, its unattached agent's claim"),
+        (None, plain_claim, "a no-principal session, the unattached agent's claim"),
+        (Some(h), gone_claim, "the human, a retired identity's claim"),
+    ] {
+        assert_eq!(
+            update_truth_as(&pool, who, h_group, claim).await.ok(),
+            Some(1),
+            "CONTROL after the end: {what}"
+        );
+    }
+    let privileged = sqlx::query(TRUTH_UPDATE)
+        .bind(claims[3])
+        .execute(&pool)
+        .await
+        .map(|r| r.rows_affected());
+    assert_eq!(
+        privileged.ok(),
+        Some(1),
+        "CONTROL: a privileged session rewrites the attached agent's claim"
+    );
+}
+
 /// 161's registration adopts a never-registered identity only while it is
 /// FRESH, and an attachment is a reference into `agents`, so attaching an
 /// identity BEFORE the host first registers it makes that registration abort
