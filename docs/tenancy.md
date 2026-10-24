@@ -1244,8 +1244,11 @@ database functions these commands call:
   group's live row counts in a viewer's group set only while the member still
   belongs to a registered human operator, so revoking a client allowance or a
   human's registration (or suspending its human client) ends the member's
-  reads and writes at its next resolve. The row itself stays until
-  `group-member remove` revokes it;
+  claim reads and writes (everything decided from its resolved viewer) at its
+  next resolve. The row itself stays until `group-member remove` revokes it,
+  and the REST group routes that read the roster table directly (the
+  group-admin check, group info) still see it until then; the roster itself
+  stays closed to them;
 * the last-admin rule counts only admins that are still registered humans;
 * each audit row also carries `actor`: the CLI's tool, command, version and
   process identity (real and login uid), since `session_user` is a shared

@@ -157,7 +157,10 @@
 -- counts a live row of a verb-made group only while the member still belongs
 -- to a registered human operator (`epigraph_human_of(member, live)`): a
 -- revoked 149 allowance, a revoked registration or a suspended human client
--- ends the member's reads and writes at its next resolve, without a write.
+-- ends the member's claim reads and writes (everything decided from its
+-- resolved viewer) at its next resolve, without a write. Readers of the
+-- roster table itself (the REST group-admin check, group info) still see the
+-- row until `group-member remove` revokes it.
 -- Rows of every other group count exactly as before. The code block below
 -- says why this is computed rather than written.
 --
