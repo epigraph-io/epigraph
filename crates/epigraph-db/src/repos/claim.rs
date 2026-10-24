@@ -12052,20 +12052,24 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                JOIN claims t ON t.id = e.target_id
                CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
                -- 038's override: a cross-source matcher's evidential_support
-               -- edge carries its own strength in properties.score.
+               -- edge carries its own strength in properties.score, clamped
+               -- to [0, 1]. The trigger casts it at INSERT; properties can be
+               -- patched since, so a score that is not a decimal number falls
+               -- back to the constant (as a missing one does) instead of
+               -- failing the whole un-mark. Clamped as numeric, then cast, so
+               -- an out-of-range exponent cannot overflow the double either.
                CROSS JOIN LATERAL (
                  SELECT ft.factor_type AS ft,
-                        CASE WHEN ms.score IS NOT NULL
-                             THEN GREATEST(0.0, LEAST(1.0, ms.score))
-                             ELSE ft.forward_strength END AS fwd,
-                        CASE WHEN ms.score IS NOT NULL
-                             THEN GREATEST(0.0, LEAST(1.0, ms.score))
-                             ELSE ft.reverse_strength END AS rev
+                        COALESCE(ms.score, ft.forward_strength) AS fwd,
+                        COALESCE(ms.score, ft.reverse_strength) AS rev
                    FROM (SELECT CASE WHEN ft.factor_type = 'evidential_support'
                                       AND e.properties ? 'source'
                                       AND e.properties->>'source' = 'cross_source_matcher'
                                       AND e.properties ? 'score'
-                                     THEN (e.properties->>'score')::double precision
+                                      AND e.properties->>'score'
+                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?\s*$'
+                                     THEN GREATEST(0.0, LEAST(1.0,
+                                              (e.properties->>'score')::numeric))::double precision
                                 END AS score) ms
                ) m
               WHERE e.source_type = 'claim' AND e.target_type = 'claim'
