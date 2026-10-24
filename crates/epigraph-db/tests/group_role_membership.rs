@@ -1606,15 +1606,22 @@ async fn the_membership_door_stays_direct_only(pool: PgPool) {
 // Bindings and the roster.
 // =====================================================================
 
-/// The roster at an instant follows the window: nothing before it, the human
-/// and its agent inside it, nothing after it. Ending the binding lapses the
-/// members at once; a new binding of the same role derives again.
+/// The roster at an instant follows the window: nothing before the binding;
+/// at an instant AFTER the binding exists but BEFORE a holder's `valid_from`,
+/// that holder is absent while a holder whose window is open is present (so
+/// the window's start, not the binding's, is what excludes it); inside both
+/// windows, both holders (and the agent); after both, nobody. Ending the
+/// binding lapses the members at once; a new binding of the same role
+/// derives again.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_roster_follows_the_window_and_the_binding(pool: PgPool) {
     let (h, _) = human(&pool, "roster-h").await;
     let a = operated(&pool, h, "roster-a").await;
+    let (late, _) = human(&pool, "roster-late").await;
     let (group, binding) = bound_group(&pool, "Synthetic Roster Team", "writer", true).await;
     grant(&pool, ROLE, h, 0, Some(3600)).await;
+    // Bound already; this holder's window opens in 10 minutes.
+    grant(&pool, ROLE, late, 600, Some(4200)).await;
 
     let roster = |pool: PgPool, at: &'static str| async move {
         let mut c = maint(&pool).await;
@@ -1629,20 +1636,32 @@ async fn the_roster_follows_the_window_and_the_binding(pool: PgPool) {
         reset(c).await;
         rows
     };
-    let mut inside = vec![(h, "writer".to_string()), (a, "writer".to_string())];
-    inside.sort();
+    let sorted = |mut v: Vec<(Uuid, String)>| {
+        v.sort();
+        v
+    };
+    let w = |id: Uuid| (id, "writer".to_string());
     assert!(
         roster(pool.clone(), "now() - interval '1 hour'")
             .await
             .is_empty(),
-        "before"
+        "before the binding"
     );
-    assert_eq!(roster(pool.clone(), "now()").await, inside, "inside");
+    assert_eq!(
+        roster(pool.clone(), "now()").await,
+        sorted(vec![w(h), w(a)]),
+        "bound, and before the late holder's valid_from: the late holder is absent"
+    );
+    assert_eq!(
+        roster(pool.clone(), "now() + interval '20 minutes'").await,
+        sorted(vec![w(h), w(a), w(late)]),
+        "inside both windows"
+    );
     assert!(
         roster(pool.clone(), "now() + interval '2 hours'")
             .await
             .is_empty(),
-        "after"
+        "after both windows"
     );
 
     assert!(end_binding(&pool, binding).await.expect("end"));
