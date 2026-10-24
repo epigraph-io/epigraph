@@ -1518,3 +1518,72 @@ async fn lineage_max_nodes_trims_before_the_follow_up_queries(pool: PgPool) {
     );
     assert!(!two.cycle_detected);
 }
+
+/// When `max_nodes` cuts INSIDE one depth layer, the kept set is pinned
+/// explicitly: the target plus the nearest ancestors, and within the cut layer
+/// the claims that sort LAST in the walk's `ORDER BY id` (the stable
+/// descending-depth sort keeps that id order inside a layer, and the cap keeps
+/// the last `n` entries).
+///
+/// Every other `max_nodes` fixture is a single chain, where no layer holds
+/// more than one claim, so a change to tie-breaking at the cut would go
+/// unnoticed there. The expected sets are computed from the seeded ids, not
+/// from another call.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_max_nodes_cut_inside_a_depth_layer_is_pinned(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // Fan-in: three parents p -> root, all at depth 1.
+    let root = create_test_claim(&pool, "fan-in root", 0.5).await;
+    let mut parents = Vec::new();
+    for i in 0..3 {
+        let p = create_test_claim(&pool, &format!("fan-in parent {i}"), 0.6).await;
+        create_claim_edge(&pool, p, root, "supports").await;
+        parents.push(p);
+    }
+    parents.sort();
+
+    // Calibration: uncapped, the whole fan is returned, ancestors first.
+    let all = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
+        .await
+        .expect("uncapped lineage");
+    assert_eq!(
+        all.topological_order,
+        vec![parents[0], parents[1], parents[2], root]
+    );
+    assert!(!all.truncated);
+
+    let sorted_keys = |l: &epigraph_db::LineageResult| {
+        let mut k: Vec<Uuid> = l.claims.keys().copied().collect();
+        k.sort();
+        k
+    };
+    let sorted = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+
+    // max_nodes = 2 keeps the root and the highest-id parent only.
+    let two = LineageRepository::get_lineage(&pool, &viewer, root, None, Some(2))
+        .await
+        .expect("capped lineage, 2");
+    assert!(two.truncated);
+    assert_eq!(two.topological_order, vec![parents[2], root]);
+    assert_eq!(sorted_keys(&two), sorted(vec![parents[2], root]));
+    assert_eq!(two.claims[&root].parent_ids, vec![parents[2]]);
+
+    // max_nodes = 3 keeps the root and the two highest-id parents.
+    let three = LineageRepository::get_lineage(&pool, &viewer, root, None, Some(3))
+        .await
+        .expect("capped lineage, 3");
+    assert!(three.truncated);
+    assert_eq!(three.topological_order, vec![parents[1], parents[2], root]);
+    assert_eq!(
+        sorted_keys(&three),
+        sorted(vec![parents[1], parents[2], root])
+    );
+    assert_eq!(
+        sorted(three.claims[&root].parent_ids.clone()),
+        vec![parents[1], parents[2]],
+        "the dropped lowest-id parent must not be named as a parent"
+    );
+}
