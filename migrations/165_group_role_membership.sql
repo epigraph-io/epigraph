@@ -32,7 +32,43 @@
 -- guards) stays direct-only and correct.
 --
 -- ===================================================================
--- 2. WHO WRITES BINDINGS
+-- 2. COMPUTED, NEVER WRITTEN
+--
+-- No membership row is written for a derived member. The derivation runs
+-- when the viewer is resolved:
+--
+--   * `epigraph_live_memberships(uuid)` (077, re-stated by 164; the one
+--     source of every viewer's group set, and through it of every stamp-keyed
+--     row-security policy and every Rust read filter) becomes 164's direct
+--     rows UNION `epigraph_role_derived_memberships(p_agent, now())`.
+--     Signature, result, owner and grants are unchanged.
+--   * 123's claims-path writer scope, `epigraph_require_writer_scope`
+--     (OPL02, armed only), asks `epigraph_writes_group_at(human, group,
+--     now(), via_agent)`: 122's direct test OR a live writer binding whose
+--     role the human holds at that instant (and, when the subject is an
+--     agent, whose binding includes agents). So once armed, a write into the
+--     group by a principal outside the window is refused whatever the session
+--     stamp says.
+--
+-- So a membership lapses exactly at `valid_to`, with no job: a read at the
+-- next viewer resolution (per request, per tool call, per worker job), a
+-- claim write (armed) at the first statement of a transaction that starts at
+-- or after `valid_to`. The time base is `now()`, the transaction's start,
+-- like the stamp itself; a transaction opened inside the window finishes on
+-- it. A materialized row could not represent a second interval (060's
+-- `UNIQUE (group_id, agent_id, epoch)`), would need a job at every
+-- transition, and a dead job over-grants; this under-grants instead.
+--
+-- THE MEMBERSHIP DOOR STAYS DIRECT-ONLY. 122's
+-- `epigraph_operator_writes_group` (called by the membership door
+-- `epigraph_require_operator_scope`, by 164's team-group verbs, and by the
+-- legacy link tie) is NOT changed: if it answered the derived question, a
+-- group admin could give a role-holding teammate's agent an EXPLICIT row
+-- that outlives the window. An agent gets an explicit row only where its
+-- human holds one.
+--
+-- ===================================================================
+-- 3. WHO WRITES BINDINGS
 --
 -- Three maintenance-only SECURITY DEFINERs (the operator CLI's
 -- `define-group-role`, `end-group-role-binding`; `bind` for an existing
@@ -67,11 +103,48 @@
 -- a privileged session or a maintenance-owned definer frame).
 --
 -- ===================================================================
+-- 4. NO ROSTER ORACLE
+--
+-- `epigraph_role_derived_memberships(agent, at)`, `epigraph_writes_group_at`
+-- and the roster reader `epigraph_group_role_roster(group, at)` answer for
+-- ANY principal, so none is executable by the application role (123: "an
+-- unbound roster read is an oracle"). They are called from inside
+-- maintenance-owned definers (`epigraph_live_memberships`,
+-- `epigraph_require_writer_scope`) or on the maintenance DSN (the CLI's
+-- `group-roster`). The residual is 077's: `epigraph_live_memberships(uuid)`
+-- stays callable by the application role for any agent id, and now also
+-- answers derived membership for it (the parameterised read already
+-- accepted for direct membership).
+--
+-- The roster at an instant evaluates the BINDING and the ROLE WINDOW at that
+-- instant; link, allowance and registration state are read as they are now
+-- (those tables keep no history the derivation could read at t), and an
+-- assignment ENDED early counts at no instant (123's
+-- `epigraph_live_role_assignment`).
+--
+-- ===================================================================
+-- 5. WHAT THIS DOES NOT CHANGE
+--
+--   * Readers of `group_memberships` other than the two above (the REST
+--     roster routes, the consolidate act's membership test, the profile
+--     detail check) see explicit rows only: a derived member is refused
+--     there (fail-closed), never admitted wrongly.
+--   * 123's OCCUPIES projection of an assignment stays public.
+--   * A binding never changes `group_memberships`; 164's roster verbs and
+--     their rules are untouched.
+--
+-- ===================================================================
 -- UNDO
 --
+-- Re-state 164's `epigraph_live_memberships` body and 123's
+-- `epigraph_require_writer_scope` body (CREATE OR REPLACE keeps owner and
+-- grants), then:
+-- DROP FUNCTION IF EXISTS public.epigraph_group_role_roster(uuid, timestamptz);
 -- DROP FUNCTION IF EXISTS public.epigraph_end_group_role_binding(uuid, text);
 -- DROP FUNCTION IF EXISTS public.epigraph_bind_group_role(text, uuid, text, boolean, text);
 -- DROP FUNCTION IF EXISTS public.epigraph_define_group_role(text, text, uuid, text, boolean, text);
+-- DROP FUNCTION IF EXISTS public.epigraph_writes_group_at(uuid, uuid, timestamptz, boolean);
+-- DROP FUNCTION IF EXISTS public.epigraph_role_derived_memberships(uuid, timestamptz);
 -- DROP TABLE IF EXISTS public.group_role_bindings;   -- its triggers with it
 -- DROP FUNCTION IF EXISTS public.epigraph_group_role_bindings_audit();
 -- DROP FUNCTION IF EXISTS public.epigraph_group_role_bindings_refuse_delete();
@@ -374,6 +447,156 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_end_group_role_binding(uuid, text) FROM PUBLIC;
 
 -- -------------------------------------------------------------------
+-- The derivation
+-- -------------------------------------------------------------------
+-- The groups `p_agent` holds through a live binding at `p_at` (section 1's
+-- rule). The candidate humans are the principal itself (arm 1; the role
+-- function answers NULL unless it is a registered human that is nobody's
+-- agent), and, for a binding that includes agents, the operator of its ACTING
+-- live link and the human of its live client allowance (arm 2).
+CREATE OR REPLACE FUNCTION public.epigraph_role_derived_memberships(
+    p_agent uuid, p_at timestamptz)
+RETURNS TABLE (group_id uuid, role text)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    WITH candidates (human, via_agent) AS (
+        SELECT p_agent, false
+        UNION ALL
+        SELECT o.operator_id, true FROM public.epigraph_operator_actor(p_agent) o
+        UNION ALL
+        SELECT a.h, true FROM public.epigraph_allowlisted_operator(p_agent) AS a(h)
+         WHERE a.h IS NOT NULL
+    )
+    SELECT DISTINCT b.group_id, b.member_role
+      FROM public.group_role_bindings b
+      JOIN public.groups g ON g.id = b.group_id AND g.status = 'active'
+      JOIN candidates c ON (NOT c.via_agent OR b.include_agents)
+     WHERE p_agent IS NOT NULL AND p_at IS NOT NULL
+       AND b.created_at <= p_at AND (b.revoked_at IS NULL OR p_at < b.revoked_at)
+       AND public.epigraph_live_role_assignment(c.human, b.role, p_at) IS NOT NULL
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_derived_memberships(uuid, timestamptz)
+    FROM PUBLIC;
+
+-- Does `p_human` WRITE `p_group` at `p_at`: 122's direct test, or a live
+-- writer binding whose role it holds then. `p_for_agent`: the question is
+-- asked on behalf of one of its agents, so only a binding that includes
+-- agents counts on the derived arm (a human-only binding admits the human,
+-- not its agents, here as in the viewer's group set).
+CREATE OR REPLACE FUNCTION public.epigraph_writes_group_at(
+    p_human uuid, p_group uuid, p_at timestamptz, p_for_agent boolean)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT p_human IS NOT NULL AND p_group IS NOT NULL AND p_at IS NOT NULL
+       AND (public.epigraph_operator_writes_group(p_human, p_group)
+            OR EXISTS (
+                SELECT 1 FROM public.group_role_bindings b
+                  JOIN public.groups g ON g.id = b.group_id AND g.status = 'active'
+                 WHERE b.group_id = p_group AND b.member_role = 'writer'
+                   AND (NOT COALESCE(p_for_agent, true) OR b.include_agents)
+                   AND b.created_at <= p_at AND (b.revoked_at IS NULL OR p_at < b.revoked_at)
+                   AND public.epigraph_live_role_assignment(p_human, b.role, p_at)
+                       IS NOT NULL))
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_writes_group_at(uuid, uuid, timestamptz, boolean)
+    FROM PUBLIC;
+
+-- Who holds `p_group` through its bindings at `p_at`: every role holder and
+-- every agent registered to one, each answered by the derivation itself, so
+-- the roster and the viewer can never disagree. Maintenance only.
+CREATE OR REPLACE FUNCTION public.epigraph_group_role_roster(p_group uuid, p_at timestamptz)
+RETURNS TABLE (out_agent_id uuid, out_role text, out_holder uuid)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_group_role_roster: only a maintenance session reads a role '
+                        'roster' USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY
+    WITH holders AS (
+        SELECT DISTINCT ra.holder_person_id AS h
+          FROM public.role_assignments ra
+          JOIN public.group_role_bindings b ON b.role = ra.role AND b.group_id = p_group
+         WHERE ra.holder_person_id IS NOT NULL
+    ), candidates AS (
+        SELECT hs.h AS agent, hs.h AS holder FROM holders hs
+        UNION
+        SELECT l.agent_id, l.operator_id
+          FROM public.operator_links l JOIN holders hs ON hs.h = l.operator_id
+        UNION
+        SELECT r.agent_id, r.operator_id
+          FROM public.author_binding_clients r JOIN holders hs ON hs.h = r.operator_id
+    )
+    SELECT DISTINCT c.agent, d.role, c.holder
+      FROM candidates c
+     CROSS JOIN LATERAL public.epigraph_role_derived_memberships(c.agent, p_at) d
+     WHERE d.group_id = p_group
+     ORDER BY 1, 2;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_group_role_roster(uuid, timestamptz) FROM PUBLIC;
+
+-- 164's viewer group-set read (077's body plus 164's verb-made-group
+-- conjunct), UNION the derived rows. Signature, result, owner and grants
+-- unchanged (CREATE OR REPLACE keeps them; both are re-asserted below).
+CREATE OR REPLACE FUNCTION public.epigraph_live_memberships(p_agent uuid)
+RETURNS TABLE (group_id uuid, role text) LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT m.group_id, m.role::text
+      FROM public.group_memberships m
+      JOIN public.groups g ON g.id = m.group_id
+     WHERE m.agent_id = p_agent AND m.revoked_at IS NULL
+       AND (g.did_key NOT LIKE 'did:epigraph:group:%'
+            OR public.epigraph_is_human_operator(public.epigraph_human_of(p_agent, true)))
+    UNION
+    SELECT d.group_id, d.role
+      FROM public.epigraph_role_derived_memberships(p_agent, now()) d
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) FROM PUBLIC;
+
+-- 123's claims-path writer scope (122's body, 123's HINT); delta: the
+-- effective test `epigraph_writes_group_at(human, group, now(), via agent)`
+-- in place of 122's direct one. Signature, owner and grants unchanged.
+CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    v_human := public.epigraph_human_of(p_agent, false);
+    IF v_human IS NULL
+       OR public.epigraph_writes_group_at(v_human, p_group, now(), v_human <> p_agent) THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_operator_scope_exempt() THEN
+        RETURN;
+    END IF;
+    IF v_human = p_agent THEN
+        RAISE EXCEPTION 'OPL02: human operator % holds no writer/admin membership in group %; '
+                        'a human writes only where it writes', p_agent, p_group
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Write into a group you write (your personal group is the default). '
+                         'A custodial revision is made on the maintenance DSN with '
+                         'epigraph-operator custodial-supersede.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % is linked to operator %, which holds no writer/admin '
+                    'membership in group %; a linked agent writes only where its own operator '
+                    'writes', p_agent, v_human, p_group
+        USING ERRCODE = 'OPL02',
+              HINT = 'Write into a group the operator writes (its personal group is the '
+                     'default), or have the operator join the group first. No application '
+                     'session crosses humans, a custodian''s included.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
+
+-- -------------------------------------------------------------------
 -- Ownership and grants, guarded as every such block since 060 is. Each
 -- ALTER/GRANT names its function literally (tenancy_backfill.rs's static
 -- re-own scan reads these statements).
@@ -396,6 +619,16 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_group_role_binding(uuid, text) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION '
+                'public.epigraph_role_derived_memberships(uuid, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION '
+                'public.epigraph_writes_group_at(uuid, uuid, timestamptz, boolean) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_group_role_roster(uuid, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_live_memberships(uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_bind_group_role(text, uuid, text, boolean, text) '
                 'TO epigraph_maintenance';
@@ -403,6 +636,14 @@ DO $$ BEGIN
                 'public.epigraph_define_group_role(text, text, uuid, text, boolean, text) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_end_group_role_binding(uuid, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_role_derived_memberships(uuid, timestamptz) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_writes_group_at(uuid, uuid, timestamptz, boolean) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_group_role_roster(uuid, timestamptz) '
                 'TO epigraph_maintenance';
         -- The definers run as this role, so it holds the DML they issue; the
         -- table's own triggers hold a direct write to the same rules.
@@ -423,5 +664,15 @@ DO $$ BEGIN
                 'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_end_group_role_binding(uuid, text) '
                 'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_role_derived_memberships(uuid, timestamptz) FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_writes_group_at(uuid, uuid, timestamptz, boolean) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_group_role_roster(uuid, timestamptz) '
+                'FROM epigraph_app';
+        -- `Viewer::resolve` calls it on the application role (077, 164).
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) '
+                'TO epigraph_app';
     END IF;
 END $$;
