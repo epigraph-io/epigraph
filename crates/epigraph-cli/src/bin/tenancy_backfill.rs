@@ -1931,6 +1931,17 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // agent as UNATTACHED, so it checks its own frame first and fails CLOSED
     // (loud: every armed claim write is refused ROL01 and epigraph-mcp
     // refuses to boot). The question and the check only call the gate.
+    // The lineage copy also reads FORCEd `agent_prompt_snapshots` to skip a
+    // SHARED successor: under a non-member owner it sees no snapshot and
+    // attaches the shared successor (quiet, but only ever a refusal). The
+    // registration's shared-identity skip reads `security_events` to audit
+    // each withheld row once. `epigraph_role_agent_write_check` (the
+    // statement trigger on every app-writable table, and the claims author
+    // arm) calls the maintenance-only check: under a non-member owner it is
+    // denied EXECUTE and every armed application write fails 42501 (loud).
+    // `epigraph_agent_is_retired` calls `epigraph_human_of`, whose EXECUTE is
+    // the maintenance role's: under a non-member owner every armed claim
+    // update, delete or restatement that reaches it fails 42501 (loud).
     ("epigraph_role_agents_guard_insert", 166),
     ("epigraph_role_agents_guard_update", 166),
     ("epigraph_role_agents_audit", 166),
@@ -1940,6 +1951,8 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_role_agent_gate", 166),
     ("epigraph_role_agent_may_run", 166),
     ("epigraph_require_role_holder", 166),
+    ("epigraph_agent_is_retired", 166),
+    ("epigraph_role_agent_write_check", 166),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2585,6 +2598,19 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_require_role_holder",
             "public.epigraph_require_role_holder(uuid)",
+            false,
+        ),
+        // The author relief and the write trigger are reached only from
+        // maintenance-owned definers and triggers; the application role
+        // EXECUTEs neither.
+        (
+            "epigraph_agent_is_retired",
+            "public.epigraph_agent_is_retired(uuid)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_write_check",
+            "public.epigraph_role_agent_write_check()",
             false,
         ),
     ];
