@@ -37,6 +37,7 @@ use rmcp::ServiceExt;
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::EpiGraphMcpFull;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -190,16 +191,16 @@ struct Cli {
     /// found by it; nothing is signed with it. Requires
     /// `EPIGRAPH_AGENT_SIGNING_KEY`, and excludes `--agent-model` and
     /// `--agent-key`. Stdio only: refused with `--listen`.
+    ///
+    /// The SIGNING private key (64 hex chars) is read from
+    /// `EPIGRAPH_AGENT_SIGNING_KEY` in the environment ONLY, never from the
+    /// command line, where `ps` and `/proc/<pid>/cmdline` would show it (see
+    /// [`signing_key_from_env`]). Every signature this process makes is by it;
+    /// its public half must be an ACTIVE `signing` key of the identity's agent
+    /// in `agent_keys`, registered by the host before the container starts.
     #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
     agent_identity_pubkey: Option<String>,
 
-    /// The agent's SIGNING private key (64 hex chars), in the
-    /// separate-signing-key mode. Every signature this process makes is by
-    /// it. Its public half must be an ACTIVE `signing` key of the identity's
-    /// agent in `agent_keys` (registered by the host before the container
-    /// starts), or the process refuses to start. Never printed.
-    #[arg(long, env = "EPIGRAPH_AGENT_SIGNING_KEY", hide_env_values = true)]
-    agent_signing_key: Option<String>,
 }
 
 /// Outcome of signer selection: the Ed25519 signer plus, when the identity was
@@ -280,7 +281,8 @@ fn select_signer(
                 );
             }
             let identity = parse_hex32(identity, "agent-identity-pubkey")?;
-            let signing = parse_hex32(signing, "agent-signing-key")?;
+            // Wiped on drop: the signer keeps its own copy.
+            let signing = Zeroizing::new(parse_hex32(signing, "agent-signing-key")?);
             let signer =
                 AgentSigner::from_bytes(&signing).map_err(|e| format!("agent-signing-key: {e}"))?;
             if signer.public_key() == identity {
@@ -357,6 +359,38 @@ fn select_signer(
         identity_declared: false,
         identity_public_key: None,
     })
+}
+
+/// The environment variable the signing PRIVATE key is read from.
+const SIGNING_KEY_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY";
+
+/// Read the separate-signing-key mode's signing PRIVATE key from
+/// [`SIGNING_KEY_ENV`], and only from there: it is deliberately not a clap
+/// argument, so it cannot be passed on the command line (visible in `ps` and
+/// `/proc/<pid>/cmdline` to every process in the container). An empty value
+/// counts as unset, as clap treats the other env-backed arguments. The value
+/// is held in a [`Zeroizing`] string, wiped when dropped.
+///
+/// The variable itself is left in place: removing it would not clear
+/// `/proc/<pid>/environ` (that shows the environment the process was started
+/// with) and would race the runtime's worker threads.
+///
+/// # Errors
+/// The variable is set but is not valid UTF-8 (refused rather than read as
+/// unset, which would fall through to another identity). The message does not
+/// include the value.
+fn signing_key_from_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<Zeroizing<String>>, String> {
+    match value {
+        Ok(v) if v.is_empty() => Ok(None),
+        Ok(v) => Ok(Some(Zeroizing::new(v))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{SIGNING_KEY_ENV} is not valid UTF-8; expected exactly 64 hex chars (32 bytes); \
+             the value is not shown"
+        )),
+    }
 }
 
 /// The separate-signing-key mode (rung 0) is stdio-only.
@@ -564,6 +598,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it runs here, before the DB connect, and only its side effects (printing a
     // generated key) stay below; that lets the gate read the rung off
     // `select_signer`'s own answer instead of re-deriving it.
+    let agent_signing_key = match signing_key_from_env(std::env::var(SIGNING_KEY_ENV)) {
+        Ok(key) => key,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
     let selected_signer = match select_signer(
         cli.agent_model.as_deref(),
         cli.agent_system_prompt.as_deref(),
@@ -571,7 +612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.agent_key.as_deref(),
         SeparateSigningKey {
             identity_pubkey: cli.agent_identity_pubkey.as_deref(),
-            signing_key: cli.agent_signing_key.as_deref(),
+            signing_key: agent_signing_key.as_deref().map(String::as_str),
         },
     ) {
         Ok(selected) => selected,
@@ -1267,7 +1308,8 @@ mod unauthenticated_writes_gate_tests {
 #[cfg(test)]
 mod signer_selection_tests {
     use super::{
-        check_separate_key_transport, select_signer, SelectedSigner, SeparateSigningKey,
+        check_separate_key_transport, select_signer, signing_key_from_env, SelectedSigner,
+        SeparateSigningKey,
     };
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1666,6 +1708,35 @@ mod signer_selection_tests {
             !msg.contains(&bad[..20]),
             "the value must not be echoed: {msg}"
         );
+    }
+
+    /// The signing key's env read: a value is kept, an unset or empty
+    /// variable is "not configured", and a non-UTF-8 value is refused (never
+    /// read as unset, which would fall through to another identity) without
+    /// naming its bytes.
+    #[test]
+    fn the_signing_key_env_read() {
+        use std::env::VarError;
+        let hex = "0b".repeat(32);
+        assert_eq!(
+            signing_key_from_env(Ok(hex.clone()))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some(hex.as_str())
+        );
+        assert!(signing_key_from_env(Ok(String::new())).unwrap().is_none());
+        assert!(signing_key_from_env(Err(VarError::NotPresent))
+            .unwrap()
+            .is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![0x30, 0xff, 0x31]);
+            let err = signing_key_from_env(Err(VarError::NotUnicode(raw)))
+                .expect_err("a non-UTF-8 key is refused");
+            assert!(err.contains("not valid UTF-8"), "{err}");
+        }
     }
 
     /// The separate-signing-key mode is refused on every listener kind and
