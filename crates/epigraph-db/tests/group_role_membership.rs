@@ -807,7 +807,7 @@ async fn nothing_is_derived_before_the_window_opens(pool: PgPool) {
     let (h, _) = human(&pool, "start-h").await;
     let a = operated(&pool, h, "start-a").await;
     let (group, _) = bound_group(&pool, "Synthetic Start Team", "writer", true).await;
-    grant(&pool, ROLE, h, 3, None).await;
+    grant(&pool, ROLE, h, 5, None).await;
     arm(&pool).await;
 
     assert_eq!(resolves(&pool, h, group).await, (false, false), "human");
@@ -825,7 +825,7 @@ async fn nothing_is_derived_before_the_window_opens(pool: PgPool) {
         "agent",
     );
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(resolves(&pool, h, group).await, (true, true), "human, open");
     assert_eq!(resolves(&pool, a, group).await, (true, true), "agent, open");
     write_honest(&pool, h, group)
@@ -847,7 +847,7 @@ async fn membership_lapses_at_valid_to_with_no_job(pool: PgPool) {
     let (h, personal) = human(&pool, "end-h").await;
     let a = operated(&pool, h, "end-a").await;
     let (group, _) = bound_group(&pool, "Synthetic End Team", "writer", true).await;
-    grant(&pool, ROLE, h, 0, Some(3)).await;
+    grant(&pool, ROLE, h, 0, Some(5)).await;
     arm(&pool).await;
 
     assert_eq!(resolves(&pool, h, group).await, (true, true), "human, in");
@@ -864,7 +864,7 @@ async fn membership_lapses_at_valid_to_with_no_job(pool: PgPool) {
         "derived membership is never written: {before:?}"
     );
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     assert_eq!(
         resolves(&pool, h, group).await,
         (false, false),
