@@ -122,8 +122,17 @@ pub async fn find_workflow_hierarchical(
         .map_err(internal_error)?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name (the row `improve_workflow_hierarchy` builds on), so the
+    // highest generation per group in `rows` IS the lineage head.
+    let heads = resolve_to_latest.then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
+
     let mut workflows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for r in rows {
+        let lineage = heads
+            .as_ref()
+            .and_then(|h| h.get(&r.canonical_name))
+            .copied();
         let mut entry = serde_json::json!({
             "workflow_id": r.id,
             "canonical_name": r.canonical_name,
@@ -134,6 +143,13 @@ pub async fn find_workflow_hierarchical(
             "created_at": r.created_at,
             "truth_value": r.truth_value,
         });
+
+        if let Some((head_id, head_generation, head_truth)) = lineage {
+            entry["is_lineage_head"] = serde_json::json!(head_id == r.id);
+            entry["lineage_head_generation"] = serde_json::json!(head_generation);
+            // A deprecated head is still the head; it is disclosed, not hidden.
+            entry["lineage_head_deprecated"] = serde_json::json!(head_truth < min_truth);
+        }
 
         if resolve_to_latest {
             let resolved =
@@ -297,9 +313,19 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
 /// rows. This used to run on a plain `pool.begin()`, so for a workflow whose
 /// steps are group-private EVERY reporter, the group's own members included,
 /// had each row written with a NULL `step_claim_id`, silently. Stamped, a
-/// member resolves its group's steps; a non-member records the run, gets NULL
-/// ids, and is told which indices did not resolve
-/// ([`unresolved_steps_warning`], plus a WARN log line per report).
+/// member resolves its group's steps, and a step_index it cannot resolve is
+/// recorded with a NULL id and disclosed ([`unresolved_steps_warning`], plus a
+/// WARN log line per report).
+///
+/// # A reporter that reads none of the plan is refused
+///
+/// `workflows` has no row security, so the counter write cannot be scoped by
+/// the database. A reporter that reads none of the workflow's `executes`
+/// edges (`WorkflowRepository::viewer_reads_any_executes_edge`, on the
+/// stamped transaction) gets the same [`not_found`] error as an unknown id,
+/// and nothing is written. It used to record the run with every step NULL,
+/// so any `claims:write` holder could move the counters of a workflow it
+/// cannot read.
 ///
 /// Refuses, rather than falling back to an unstamped transaction, when this
 /// process has no [`epigraph_db::ScopedPool`]: a fallback would be the
@@ -347,8 +373,9 @@ pub async fn do_report_hierarchical_outcome_as(
     // neither `visibility` nor `owner_group_id`, so no predicate can be written
     // for them (same category as `workflows.rs::report_workflow_outcome`'s
     // routing probe). The viewer IS spent where there is something to filter:
-    // the step lookup, `WorkflowRepository::plan_step_claim_ids`, splices the
-    // edge and claim predicates, on this transaction stamped with the viewer.
+    // the plan reads below (`viewer_reads_any_executes_edge`, which refuses a
+    // reporter that reads none of the plan, and `plan_step_claim_ids`) splice
+    // the edge and claim predicates, on this transaction stamped with the viewer.
     let row: Option<(serde_json::Value,)> =
         sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
@@ -359,6 +386,18 @@ pub async fn do_report_hierarchical_outcome_as(
         Some((m,)) => m,
         None => return Err(not_found(workflow_id)),
     };
+    // A reporter that reads none of the plan's `executes` edges cannot read
+    // this workflow: refused exactly like a missing id, before any write.
+    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
+        &mut tx,
+        viewer,
+        workflow_id,
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        return Err(not_found(workflow_id));
+    }
 
     // 2. Compute deltas.
     let variance = if step_executions.is_empty() {

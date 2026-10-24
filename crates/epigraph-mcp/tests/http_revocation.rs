@@ -211,10 +211,14 @@ async fn a_revoked_access_token_is_refused_on_mcp(pool: PgPool) {
 }
 
 /// The PRODUCTION store fails CLOSED when its database cannot answer: a valid,
-/// unrevoked token is refused with the same uniform `invalid_token`, never
-/// passed through. The closed listener serves `DbAccessTokenRevocation` itself
-/// on a dead pool, so what is pinned is the adapter's error mapping, not a
-/// test double that already returns `Err`.
+/// unrevoked token is refused, never passed through. The refusal is a 503 with
+/// `Retry-After` and NO `WWW-Authenticate` challenge (backlog d1e6e5cd, the REST
+/// middleware's answer too): an RFC 6750 `invalid_token` tells a connector to
+/// discard a token that is still good and re-run consent, over what is a
+/// transient outage. The closed listener serves `DbAccessTokenRevocation`
+/// itself on a dead pool, so what is pinned is the adapter's error mapping,
+/// not a test double that already returns `Err`. A REVOKED token stays 401
+/// `invalid_token` (`a_revoked_access_token_is_refused_on_mcp`).
 #[tokio::test]
 async fn an_unavailable_revocation_store_fails_closed() {
     // A dead pool: nothing below the middleware may be reached anyway (the
@@ -232,6 +236,38 @@ async fn an_unavailable_revocation_store_fails_closed() {
     assert_eq!(status, 200, "control: the token is valid");
 
     let closed = spawn_listener(pool.clone(), Arc::new(DbAccessTokenRevocation::new(pool))).await;
-    let (status, challenge, _) = post(&http, &closed, &token, None, initialize_body()).await;
-    assert_invalid_token(status, challenge.as_deref(), "store unavailable");
+    let resp = http
+        .post(&closed)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", ACCEPT)
+        .header("Content-Type", "application/json")
+        .json(&initialize_body())
+        .send()
+        .await
+        .expect("POST");
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "store unavailable: refused as a transient outage, not as a bad token"
+    );
+    let retry_after = header("retry-after").expect("store unavailable: a 503 carries Retry-After");
+    assert!(
+        retry_after.parse::<u64>().is_ok_and(|s| s > 0),
+        "Retry-After is a positive delay in seconds, got {retry_after:?}"
+    );
+    assert_eq!(
+        header("www-authenticate"),
+        None,
+        "store unavailable: no WWW-Authenticate challenge at all, so the client keeps its token"
+    );
+    assert!(
+        header(SESSION_HEADER).is_none(),
+        "store unavailable: the request never reached the MCP service"
+    );
 }

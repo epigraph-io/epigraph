@@ -1007,6 +1007,45 @@ impl WorkflowRepository {
         Ok(provable_plan_steps(&rows))
     }
 
+    /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
+    /// edges (any level: thesis, phase, step or operation), through the same
+    /// edge and claim predicates as [`Self::plan_step_claim_ids`].
+    ///
+    /// This is the outcome reports' authority predicate. `workflows` has no
+    /// row security, so a report's counter write cannot be scoped by the
+    /// database; the plan's claims and edges can. The ingest executor gives
+    /// every plan claim an `executes` edge, so a caller that reads none of
+    /// them cannot read the workflow at all, and the reports answer it as
+    /// for an id that does not exist. It deliberately does NOT require a
+    /// resolvable step prefix: a member whose first ordinal edge was
+    /// re-owned still reads the rest of the plan and may report.
+    ///
+    /// Run it on the caller's STAMPED transaction, as
+    /// [`Self::plan_step_claim_ids`] must be.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn viewer_reads_any_executes_edge(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM edges e \
+               JOIN claims c ON c.id = e.target_id \
+               WHERE e.source_id = $1 AND e.relationship = 'executes' \
+                 /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
@@ -1021,8 +1060,17 @@ impl WorkflowRepository {
     /// Returns `Ok(None)` when the workflow name is unknown or `step_index` is
     /// out of range.
     ///
+    /// "Current head" means a head with `is_current` (newest first): a head
+    /// is structural (no incoming `supersedes` edge), so a claim retired
+    /// without one is still listed as a head, and superseding it is refused
+    /// by `evolve_step_conn` with an opaque guard error (bridge 00132b1d).
+    /// When the lineage has heads and NONE is current, this refuses with
+    /// [`DbError::InvalidData`] naming the retired head, rather than handing
+    /// back a claim the caller cannot evolve or should not attach evidence to.
+    ///
     /// # Errors
-    /// Returns `DbError` if a database query fails.
+    /// Returns `DbError` if a database query fails, and
+    /// `DbError::InvalidData` when every head of the step's lineage is retired.
     pub async fn resolve_step_claim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -1047,10 +1095,17 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let target = if prefer_head {
-            step.heads
-                .first()
-                .map(|h| h.id)
-                .unwrap_or(step.frozen_claim_id)
+            let current = step.heads.iter().find(|h| h.is_current);
+            if let (None, Some(retired)) = (current, step.heads.first()) {
+                let reason = format!(
+                    "step {step_index} of workflow '{canonical_name}': its lineage head {} is \
+                     retired (is_current=false, with no supersedes edge), so it cannot be \
+                     evolved or take evidence; revive or re-ingest the step first",
+                    retired.id
+                );
+                return Err(DbError::InvalidData { reason });
+            }
+            current.map_or(step.frozen_claim_id, |h| h.id)
         } else {
             step.frozen_claim_id
         };
@@ -1184,12 +1239,14 @@ impl WorkflowRepository {
                 content: String,
                 truth_value: f64,
                 created_at: chrono::DateTime<chrono::Utc>,
+                is_current: bool,
             }
 
             // The `NOT EXISTS` over `edges` is an exclusion test, left
             // unfiltered for the same reason as `latest_in_lineage`'s.
             let head_sql = viewer.splice(
-                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at \
+                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at, \
+                        COALESCE(c.is_current, true) AS is_current \
                  FROM claims c \
                  WHERE c.step_lineage_id = ANY($1) \
                    AND NOT EXISTS ( \
@@ -1216,6 +1273,7 @@ impl WorkflowRepository {
                         content: row.content,
                         truth_value: row.truth_value,
                         created_at: row.created_at,
+                        is_current: row.is_current,
                     });
             }
         }
@@ -1259,6 +1317,19 @@ impl WorkflowRepository {
     /// generation DESC, created_at DESC)` so callers can dedup by walking
     /// the head of each canonical group without a sort.
     ///
+    /// **`resolve_to_latest` also guarantees the lineage head is present.** The
+    /// ILIKE predicate matches each row's OWN goal text, and sibling
+    /// generations carry different goals, so the head of a matched lineage
+    /// could be filtered out before ordering ran (bridge 37d65fe0, backlog
+    /// ed6a953e). So for every `canonical_name` among the matched rows, its
+    /// highest-generation row (the head `max_generation_by_canonical` and
+    /// `improve_workflow_hierarchy` use) is added when it was not matched,
+    /// regardless of its goal or `truth_value`: a deprecated head is still the
+    /// head, and the caller sees its truth. The result can therefore hold up
+    /// to `limit` matched rows plus one head per matched lineage, and the
+    /// highest generation of each canonical group in it IS the lineage head
+    /// ([`lineage_heads_in`]).
+    ///
     /// Used by `GET /api/v1/workflows/hierarchical/search` and the MCP
     /// `find_workflow_hierarchical` tool.
     ///
@@ -1283,19 +1354,39 @@ impl WorkflowRepository {
         // shared lineage signal. Likewise, a caller that sends the slug
         // verbatim should still match a goal that wrote out the words.
         let pattern = format!("%{}%", query.trim().replace('-', " "));
-        let order_clause = if resolve_to_latest {
-            "ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC"
+        let sql = if resolve_to_latest {
+            // `matched` is the old statement, LIMIT included; `heads` adds the
+            // highest generation of each matched canonical_name with no goal
+            // or truth filter. Both read `workflows` alone.
+            "WITH matched AS ( \
+                 SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
+                 FROM workflows \
+                 WHERE (replace(canonical_name, '-', ' ') || ' ' || replace(goal, '-', ' ')) ILIKE $1 \
+                   AND truth_value >= $2 \
+                 ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC \
+                 LIMIT $3 \
+             ), heads AS ( \
+                 SELECT DISTINCT ON (w.canonical_name) \
+                        w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                        w.created_at, w.truth_value \
+                 FROM workflows w \
+                 WHERE w.canonical_name IN (SELECT canonical_name FROM matched) \
+                 ORDER BY w.canonical_name, w.generation DESC \
+             ) \
+             SELECT * FROM matched \
+             UNION ALL \
+             SELECT * FROM heads h WHERE h.id NOT IN (SELECT id FROM matched) \
+             ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC"
+                .to_string()
         } else {
-            "ORDER BY created_at DESC, id ASC"
-        };
-        let sql = format!(
             "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
              FROM workflows \
              WHERE (replace(canonical_name, '-', ' ') || ' ' || replace(goal, '-', ' ')) ILIKE $1 \
                AND truth_value >= $2 \
-             {order_clause} \
+             ORDER BY created_at DESC, id ASC \
              LIMIT $3"
-        );
+                .to_string()
+        };
         sqlx::query_as::<_, HierarchicalWorkflowRow>(&sql)
             .bind(&pattern)
             .bind(min_truth)
@@ -1312,10 +1403,16 @@ impl WorkflowRepository {
     ///
     /// `similarity_threshold` filters by `(1 - cosine_distance) >=
     /// threshold`. `min_truth` filters out deprecated rows
-    /// (`deprecate_workflow` writes 0.05). When `resolve_to_latest` is
-    /// true, ordering is `(canonical_name ASC, generation DESC,
-    /// distance ASC)` so heads-of-lineage surface first; otherwise
-    /// `distance ASC, created_at DESC`.
+    /// (`deprecate_workflow` writes 0.05). Ordering is by distance; when
+    /// `resolve_to_latest` is true a higher generation breaks ties, and
+    /// otherwise `created_at DESC` does.
+    ///
+    /// With `resolve_to_latest`, as in [`Self::search_hierarchical_by_text`],
+    /// the lineage head of every matched `canonical_name` is guaranteed
+    /// present: a head with no `goal_embedding`, below the similarity floor,
+    /// below `min_truth` or past the LIMIT is added. An added head sorts at its
+    /// group's best match distance, ahead of that match, so the matched rows
+    /// keep their relative order.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
@@ -1345,11 +1442,52 @@ impl WorkflowRepository {
         // resolve_to_latest is requested, prefer higher generation as a
         // tiebreaker so newer variants of an equally-close lineage surface
         // first.
-        let order_clause = if resolve_to_latest {
-            "ORDER BY distance ASC, generation DESC, created_at DESC"
-        } else {
-            "ORDER BY distance ASC, created_at DESC, id ASC"
-        };
+        if resolve_to_latest {
+            // `matched` is the old statement, LIMIT included; `heads` adds the
+            // highest generation of each matched canonical_name with no
+            // embedding, similarity or truth filter. All three CTEs read
+            // `workflows` alone. The final ORDER BY sits on the outermost
+            // SELECT: an injected head (no distance) takes its group's best
+            // distance and sorts ahead of that row.
+            let sql = "WITH q AS (SELECT $1::vector AS v), \
+                 matched AS ( \
+                     SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                            w.created_at, w.truth_value, (w.goal_embedding <=> q.v) AS distance \
+                     FROM workflows w, q \
+                     WHERE w.goal_embedding IS NOT NULL \
+                       AND w.truth_value >= $3 \
+                       AND (1 - (w.goal_embedding <=> q.v)) >= $2 \
+                     ORDER BY distance ASC, generation DESC, created_at DESC \
+                     LIMIT $4 \
+                 ), heads AS ( \
+                     SELECT DISTINCT ON (w.canonical_name) \
+                            w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                            w.created_at, w.truth_value, NULL::float8 AS distance \
+                     FROM workflows w \
+                     WHERE w.canonical_name IN (SELECT canonical_name FROM matched) \
+                     ORDER BY w.canonical_name, w.generation DESC \
+                 ), combined AS ( \
+                     SELECT m.*, false AS injected FROM matched m \
+                     UNION ALL \
+                     SELECT h.*, true AS injected FROM heads h \
+                     WHERE h.id NOT IN (SELECT id FROM matched) \
+                 ), ranked AS ( \
+                     SELECT c.*, COALESCE(c.distance, \
+                                MIN(c.distance) OVER (PARTITION BY c.canonical_name)) AS sort_distance \
+                     FROM combined c \
+                 ) \
+                 SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
+                 FROM ranked \
+                 ORDER BY sort_distance ASC, injected DESC, generation DESC, created_at DESC, id ASC";
+            return sqlx::query_as::<_, HierarchicalWorkflowRow>(sql)
+                .bind(&vec_str)
+                .bind(similarity_threshold)
+                .bind(min_truth)
+                .bind(limit)
+                .fetch_all(executor)
+                .await;
+        }
+        let order_clause = "ORDER BY distance ASC, created_at DESC, id ASC";
         let sql = format!(
             "WITH q AS (SELECT $1::vector AS v) \
              SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value, \
@@ -1909,6 +2047,29 @@ impl WorkflowRepository {
     }
 }
 
+/// The lineage head of each `canonical_name` in `rows`: its highest
+/// generation, as `(id, generation, truth_value)`.
+///
+/// Exact for the result of [`WorkflowRepository::search_hierarchical_by_text`]
+/// or [`WorkflowRepository::find_hierarchical_by_embedding`] with
+/// `resolve_to_latest = true`, which add each matched lineage's head, and
+/// `UNIQUE (canonical_name, generation)` makes the highest generation a single
+/// row. On any other row set it is only the highest generation PRESENT.
+#[must_use]
+pub fn lineage_heads_in(rows: &[HierarchicalWorkflowRow]) -> HashMap<String, (Uuid, i32, f64)> {
+    let mut heads: HashMap<String, (Uuid, i32, f64)> = HashMap::new();
+    for r in rows {
+        let entry =
+            heads
+                .entry(r.canonical_name.clone())
+                .or_insert((r.id, r.generation, r.truth_value));
+        if r.generation > entry.1 {
+            *entry = (r.id, r.generation, r.truth_value);
+        }
+    }
+    heads
+}
+
 /// The `workflows` row of [`WorkflowRepository::frozen_plan`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FrozenPlanRow {
@@ -2317,8 +2478,12 @@ mod tests {
 
         // With only gen 0 embedded, the embedding search must return exactly one
         // row (gen 0). Gen 1 is invisible because its goal_embedding IS NULL.
+        // Default mode: with `resolve_to_latest` the unembedded head is ADDED
+        // as its lineage's head (see
+        // `find_hierarchical_by_embedding_resolve_to_latest_includes_unembedded_head`),
+        // so the ANN predicate itself is observed with it off.
         let hits =
-            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, false)
                 .await
                 .unwrap();
         assert_eq!(
@@ -2344,5 +2509,207 @@ mod tests {
             hits[0].generation, 1,
             "higher generation surfaces first with resolve_to_latest ordering"
         );
+    }
+
+    /// Bridge 37d65fe0 / backlog ed6a953e, embedding path: the ANN predicate
+    /// (`goal_embedding IS NOT NULL`, similarity floor) runs BEFORE ordering,
+    /// so a lineage head with no embedding, or one whose goal moved away from
+    /// the query, never reached `generation DESC`. With `resolve_to_latest`
+    /// the head of every matched `canonical_name` must be present and lead its
+    /// group. Here the head (gen 2) has no embedding at all, and an unrelated
+    /// lineage with a CLOSER match keeps its rank ahead of it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_resolve_to_latest_includes_unembedded_head(
+        pool: sqlx::PgPool,
+    ) {
+        let canonical = "embed-head-test";
+        let mut ids = Vec::new();
+        for g in 0..3 {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                &pool,
+                id,
+                canonical,
+                g,
+                "Send daily digest email",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let other = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            other,
+            "other-lineage",
+            0,
+            "Unrelated but closer",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        // gens 0 and 1 embedded (similarity 0.8); gen 2 (the head) has none.
+        for id in &ids[..2] {
+            WorkflowRepository::set_goal_embedding(&pool, *id, &near)
+                .await
+                .unwrap();
+        }
+        WorkflowRepository::set_goal_embedding(&pool, other, &qvec)
+            .await
+            .unwrap();
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 10, true)
+                .await
+                .unwrap();
+        let order: Vec<(String, i32)> = hits
+            .iter()
+            .map(|h| (h.canonical_name.clone(), h.generation))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("other-lineage".to_string(), 0),
+                (canonical.to_string(), 2),
+                (canonical.to_string(), 1),
+                (canonical.to_string(), 0),
+            ],
+            "the unembedded head must be injected ahead of its matched siblings, \
+             and the closer lineage keeps its rank"
+        );
+
+        // Default mode is unchanged: the unembedded head stays invisible.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 10, false)
+                .await
+                .unwrap();
+        assert!(hits.iter().all(|h| h.id != ids[2]));
+    }
+
+    /// Embedding path, the LIMIT drop: the head is embedded and above the
+    /// similarity floor but farther than a sibling, so with `limit = 1` only
+    /// the sibling survives the matched LIMIT. `resolve_to_latest` must still
+    /// return the head, ahead of that sibling; default mode returns the
+    /// sibling alone.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_resolve_to_latest_includes_head_past_the_limit(
+        pool: sqlx::PgPool,
+    ) {
+        let canonical = "limit-head-test";
+        let mut ids = Vec::new();
+        for g in 0..2 {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                &pool,
+                id,
+                canonical,
+                g,
+                "Rotate the signing keys",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        // gen 0 is the exact match; the head (gen 1) is above the 0.5 floor
+        // (similarity 0.8) but farther.
+        WorkflowRepository::set_goal_embedding(&pool, ids[0], &qvec)
+            .await
+            .unwrap();
+        WorkflowRepository::set_goal_embedding(&pool, ids[1], &near)
+            .await
+            .unwrap();
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, true)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[0]],
+            "the head cut by the LIMIT must be added, leading its group"
+        );
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, false)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(order, vec![ids[0]], "default mode keeps the plain LIMIT");
+    }
+
+    /// Text path: the head of a matched `canonical_name` is returned even when
+    /// its goal does not match and its truth is below `min_truth`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_resolve_to_latest_includes_head(pool: sqlx::PgPool) {
+        let canonical = "text-head-test";
+        for g in 0..2 {
+            WorkflowRepository::insert_root(
+                &pool,
+                uuid::Uuid::new_v4(),
+                canonical,
+                g,
+                "consider all available tools",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        let head = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            head,
+            canonical,
+            2,
+            "rewrite the plan",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::set_truth_value(&pool, head, 0.05)
+            .await
+            .unwrap();
+
+        let hits = WorkflowRepository::search_hierarchical_by_text(
+            &pool,
+            "available tools",
+            10,
+            0.3,
+            true,
+        )
+        .await
+        .unwrap();
+        let gens: Vec<i32> = hits.iter().map(|h| h.generation).collect();
+        assert_eq!(gens, vec![2, 1, 0], "head injected first in its group");
+        assert_eq!(hits[0].id, head);
+
+        let hits = WorkflowRepository::search_hierarchical_by_text(
+            &pool,
+            "available tools",
+            10,
+            0.3,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 2, "default mode unchanged");
     }
 }

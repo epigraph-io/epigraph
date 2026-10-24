@@ -506,6 +506,8 @@ mod tests {
                     id,
                     content: "x".repeat(content_len),
                     truth_value: 0.5,
+                    agent_id: Uuid::nil(),
+                    created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
                     depth,
                     parent_ids: ps,
                     evidence_ids: ev,

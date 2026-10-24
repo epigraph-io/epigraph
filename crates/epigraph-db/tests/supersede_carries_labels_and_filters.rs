@@ -153,3 +153,43 @@ async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: 
         "search MUST return the replacement v2 ({v2}); returned {hit_ids:?}"
     );
 }
+
+/// `near-duplicate` is the novelty gate's flag on ONE submission (its content
+/// was near another claim's); the replacement has new content, and carried
+/// over the flag would read as pointing at its own predecessor. Every other
+/// label still carries (find_workflow depends on `workflow`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_carries_labels_but_not_near_duplicate(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let v1 = seed_workflow_claim(&pool, agent, r#"{"goal":"g","steps":["a"]}"#).await;
+    sqlx::query(
+        "UPDATE claims SET labels = ARRAY['workflow','near-duplicate','plan'] WHERE id = $1",
+    )
+    .bind(v1)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (v2, _) = ClaimRepository::supersede(
+        &pool,
+        ClaimId::from_uuid(v1),
+        r#"{"goal":"g","steps":["b"]}"#,
+        TruthValue::clamped(0.85),
+        "plan rev 2",
+    )
+    .await
+    .unwrap();
+
+    let new_labels = labels_of(&pool, v2).await;
+    assert_eq!(
+        new_labels,
+        vec!["workflow".to_string(), "plan".to_string()],
+        "every label but the per-submission near-duplicate flag carries, in order"
+    );
+    assert!(
+        labels_of(&pool, v1)
+            .await
+            .contains(&"near-duplicate".to_string()),
+        "the predecessor keeps its own flag"
+    );
+}

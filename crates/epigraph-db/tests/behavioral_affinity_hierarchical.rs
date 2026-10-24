@@ -30,6 +30,9 @@ async fn hier_affinity(pool: &PgPool, q: &str, min_executions: i64) -> Vec<(Uuid
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "support/statement_log.rs"]
+mod statement_log;
+
 const DIM: usize = 1536;
 
 /// A unit vector along axis `axis`, as a pgvector literal.
@@ -311,5 +314,232 @@ async fn flat_roots_keep_their_affinity_when_more_than_limit_hierarchical_roots_
     assert!(
         (flat_hit.1 - 0.9).abs() < 1e-3,
         "the flat root's similarity is the tilted vector's 0.9: {flat_hit:?}"
+    );
+}
+
+// ============================================================================
+// behavioral_affinity_lineage walks once per WORKFLOW, and terminates
+// ============================================================================
+
+async fn seed_flat_agent(pool: &PgPool, label: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id")
+        .bind(blake3::hash(label.as_bytes()).as_bytes().as_slice())
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("seed agent")
+}
+
+/// A flat (claim-rooted) workflow claim.
+async fn seed_flat_workflow(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, agent_id, truth_value) \
+         VALUES ($1, $2, $3, 0.8) RETURNING id",
+    )
+    .bind(content)
+    .bind(blake3::hash(content.as_bytes()).as_bytes().as_slice())
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("seed workflow claim")
+}
+
+/// `child -[relationship]-> parent`, the direction the lineage walk climbs.
+async fn seed_lineage_edge(pool: &PgPool, child: Uuid, parent: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', $3)",
+    )
+    .bind(child)
+    .bind(parent)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed lineage edge");
+}
+
+/// `n` successful one-row reports on `workflow`, all with goal `pgvec`.
+async fn seed_successes(pool: &PgPool, workflow: Uuid, n: usize, pgvec: &str) {
+    let t0 = Utc::now();
+    for i in 0..n {
+        insert_report(
+            pool,
+            workflow,
+            true,
+            1,
+            t0 + Duration::seconds(i as i64),
+            pgvec,
+        )
+        .await;
+    }
+}
+
+/// Sum of `Actual Rows` over every `Recursive Union` node in an
+/// `EXPLAIN (ANALYZE, FORMAT JSON)` plan.
+fn recursive_union_rows(plan: &serde_json::Value) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => {
+                if map.get("Node Type").and_then(|v| v.as_str()) == Some("Recursive Union") {
+                    total += map.get("Actual Rows").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+                stack.extend(map.values());
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// The lineage walk is computed once per distinct WORKFLOW, not once per
+/// execution: 50 executions of one leaf workflow with a 2-hop lineage must
+/// cost 3 recursion rows (leaf, parent, root), not 150.
+///
+/// The statement is captured from the real call and re-run under `EXPLAIN
+/// (ANALYZE)` with the same binds, so the plan measured is the shipped SQL.
+/// The results are pinned to fixed values, including a diamond lineage whose
+/// every path is counted, so the rewrite cannot change what is returned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_walk_is_per_workflow_not_per_execution(pool: PgPool) {
+    const EXECUTIONS: usize = 50;
+    let agent = seed_flat_agent(&pool, "affinity-walk-agent").await;
+    let q = axis_vec(7);
+
+    // leaf -variant_of-> mid -supersedes-> root
+    let root = seed_flat_workflow(&pool, agent, "affinity walk root").await;
+    let mid = seed_flat_workflow(&pool, agent, "affinity walk mid").await;
+    let leaf = seed_flat_workflow(&pool, agent, "affinity walk leaf").await;
+    seed_lineage_edge(&pool, leaf, mid, "variant_of").await;
+    seed_lineage_edge(&pool, mid, root, "supersedes").await;
+    seed_successes(&pool, leaf, EXECUTIONS, &q).await;
+
+    let viewer = public_viewer(&pool).await;
+    let (hits, statements) = statement_log::capture(
+        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 1, 20),
+    )
+    .await;
+    let hits = hits.expect("affinity query");
+
+    // ---- semantics: one root, every execution counted once ----
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].0, root, "the lineage root scores: {hits:?}");
+    assert!((hits[0].1 - 1.0).abs() < 1e-9, "same goal: {hits:?}");
+    assert_eq!(hits[0].2, EXECUTIONS as i64, "{hits:?}");
+
+    // ---- cost: the recursion is per workflow ----
+    let sql = statements
+        .iter()
+        .find(|s| s.normalized().starts_with("WITH RECURSIVE lineage"))
+        .unwrap_or_else(|| {
+            panic!(
+                "CALIBRATION: the capture must see the lineage statement:\n{}",
+                statement_log::describe(&statements)
+            )
+        })
+        .text()
+        .to_string();
+    let explain_sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}");
+    let mut explain = sqlx::query_scalar::<_, serde_json::Value>(&explain_sql)
+        .bind(&q)
+        .bind(0.5_f64)
+        .bind(1_i64)
+        .bind(20_i64);
+    if let Some(g) = viewer.group_bind() {
+        explain = explain.bind(g);
+    }
+    let plan = explain
+        .fetch_one(&pool)
+        .await
+        .expect("explain the lineage statement");
+    let rows = recursive_union_rows(&plan);
+    assert!(
+        rows > 0,
+        "CALIBRATION: the plan must contain the recursive union: {plan}"
+    );
+    assert!(
+        rows <= 3,
+        "the lineage walk must run once per distinct workflow (1 workflow x 3 lineage \
+         nodes = 3 rows), not once per execution ({EXECUTIONS} x 3 = {}); got {rows}",
+        EXECUTIONS * 3
+    );
+}
+
+/// Results are unchanged by the per-workflow walk, including path
+/// multiplicity: an execution under a DIAMOND lineage (two paths to one root)
+/// is counted once per path, exactly as the per-execution walk counted it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_affinity_counts_are_unchanged_by_the_per_workflow_walk(pool: PgPool) {
+    let agent = seed_flat_agent(&pool, "affinity-equivalence-agent").await;
+    let q = axis_vec(8);
+
+    // Diamond: leaf -> a -> root, leaf -> b -> root; 4 executions on leaf,
+    // 1 on a. Separate standalone workflow with 2 executions.
+    let root = seed_flat_workflow(&pool, agent, "diamond root").await;
+    let a = seed_flat_workflow(&pool, agent, "diamond a").await;
+    let b = seed_flat_workflow(&pool, agent, "diamond b").await;
+    let leaf = seed_flat_workflow(&pool, agent, "diamond leaf").await;
+    seed_lineage_edge(&pool, leaf, a, "variant_of").await;
+    seed_lineage_edge(&pool, leaf, b, "variant_of").await;
+    seed_lineage_edge(&pool, a, root, "supersedes").await;
+    seed_lineage_edge(&pool, b, root, "variant_of").await;
+    seed_successes(&pool, leaf, 4, &q).await;
+    seed_successes(&pool, a, 1, &q).await;
+    let solo = seed_flat_workflow(&pool, agent, "standalone workflow").await;
+    seed_successes(&pool, solo, 2, &q).await;
+
+    let viewer = public_viewer(&pool).await;
+    let mut hits =
+        BehavioralExecutionRepository::behavioral_affinity_lineage(&pool, &viewer, &q, 0.5, 1, 20)
+            .await
+            .expect("affinity query");
+    hits.sort_by_key(|(id, _, n)| (std::cmp::Reverse(*n), *id));
+    let got: Vec<(Uuid, i64)> = hits.iter().map(|(id, _, n)| (*id, *n)).collect();
+    // root: 4 leaf executions x 2 paths + 1 execution of a = 9.
+    assert_eq!(got, vec![(root, 9), (solo, 2)], "{hits:?}");
+    assert!(
+        hits.iter().all(|(_, sim, _)| (sim - 1.0).abs() < 1e-9),
+        "{hits:?}"
+    );
+}
+
+/// A `supersedes` cycle must not make the walk run forever. Neither claim in
+/// the cycle is a root (each has an outgoing lineage edge), so neither scores,
+/// and an unrelated workflow still does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_walk_terminates_on_a_supersedes_cycle(pool: PgPool) {
+    let agent = seed_flat_agent(&pool, "affinity-cycle-agent").await;
+    let q = axis_vec(9);
+
+    let a = seed_flat_workflow(&pool, agent, "cycle a").await;
+    let b = seed_flat_workflow(&pool, agent, "cycle b").await;
+    seed_lineage_edge(&pool, a, b, "supersedes").await;
+    seed_lineage_edge(&pool, b, a, "supersedes").await;
+    seed_successes(&pool, a, 2, &q).await;
+    let solo = seed_flat_workflow(&pool, agent, "cycle control").await;
+    seed_successes(&pool, solo, 1, &q).await;
+
+    let viewer = public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    // Fail rather than hang if the walk does not terminate.
+    sqlx::query("SET statement_timeout = '5s'")
+        .execute(&mut *conn)
+        .await
+        .expect("set statement_timeout");
+    let hits = BehavioralExecutionRepository::behavioral_affinity_lineage(
+        &mut *conn, &viewer, &q, 0.5, 1, 20,
+    )
+    .await
+    .expect("the lineage walk must terminate on a cycle instead of timing out");
+
+    assert!(
+        hits.iter().all(|(id, _, _)| *id != a && *id != b),
+        "no claim inside the cycle is a root: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|(id, _, n)| *id == solo && *n == 1),
+        "CALIBRATION: an unrelated workflow still scores: {hits:?}"
     );
 }

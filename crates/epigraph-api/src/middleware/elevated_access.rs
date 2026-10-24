@@ -179,8 +179,8 @@ fn withheld(reason: &str) -> Response {
         reason = %reason,
         "an elevated response could not be recorded; withheld"
     );
-    ApiError::InternalError {
-        message: "ELEVATED ACCESS NOT RECORDED: the response is withheld".to_string(),
+    ApiError::InternalErrorStatic {
+        message: "ELEVATED ACCESS NOT RECORDED: the response is withheld",
     }
     .into_response()
 }

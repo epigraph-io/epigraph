@@ -46,8 +46,11 @@
 //! above would otherwise carry further:
 //! * `a_caller_cannot_submit_as_another_agent`: the body's `agent_id` must be
 //!   the caller's own (403 otherwise); a writer member of HG naming H can
-//!   neither attribute evidence to H nor overwrite H's BBA. Controls: naming
-//!   itself, and naming no one, are stored.
+//!   neither attribute evidence to H nor overwrite H's BBA. Control: naming
+//!   itself is stored.
+//! * `an_omitted_agent_id_is_the_callers_own`: every BBA has an author. An
+//!   omitted `agent_id` is the caller's, so two callers' agent-less
+//!   submissions are two BBAs, and neither replaces the other.
 //! * `a_perspective_the_caller_cannot_read_is_refused`: another group's
 //!   private perspective is a 404 with nothing written;
 //!   `the_callers_own_private_perspective_calibrates_its_evidence`: the
@@ -576,7 +579,7 @@ async fn a_caller_cannot_submit_as_another_agent(pool: PgPool) {
     assert_eq!(bba_count(&w, &t).await, 1, "no BBA was added");
     assert_eq!(bba_of(&w, &t, writer).await, None);
 
-    // Control: W naming itself, and W naming nobody, are stored.
+    // Control: W naming itself is stored.
     let own = serde_json::json!({
         "claim_id": t.claim, "agent_id": writer, "reliability": 1.0,
         "masses": {"0": 0.5, "0,1": 0.5},
@@ -585,14 +588,69 @@ async fn a_caller_cannot_submit_as_another_agent(pool: PgPool) {
         .await
         .expect("W submits as itself");
     assert!(bba_of(&w, &t, writer).await.is_some(), "W's own BBA landed");
-    let anonymous = serde_json::json!({
+    assert_eq!(bba_count(&w, &t).await, 2);
+}
+
+/// Every BBA has an author (operator ruling 2026-10-22: "Evidence shouldn't
+/// be able to have no agent_id"). An omitted `agent_id` is the caller's own,
+/// so it lands in the caller's slot. Before, every agent-less submission on
+/// one (claim, frame, perspective) shared ONE row under the `NULLS NOT
+/// DISTINCT` key, and a second caller's agent-less submission replaced the
+/// first's (backlog 5a3ba157).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_omitted_agent_id_is_the_callers_own(pool: PgPool) {
+    let w = armed_world(pool).await;
+    let t = target(&w, "public").await;
+    let (writer, _) = seed_agent_with_group(&w.pool, "fb9-writer").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(w.hg)
+    .bind(writer)
+    .execute(&w.pool)
+    .await
+    .expect("a writer membership in HG");
+
+    let h_body = serde_json::json!({
         "claim_id": t.claim, "reliability": 1.0,
-        "masses": {"0": 0.5, "0,1": 0.5},
+        "masses": {"0": 0.6, "0,1": 0.4},
     });
-    submit_body(&w, t.frame, writer, anonymous)
+    submit_body(&w, t.frame, w.human, h_body)
         .await
-        .expect("an agent-less BBA is still accepted");
-    assert_eq!(bba_count(&w, &t).await, 3);
+        .expect("H submits with no agent_id");
+    let h_bba = bba_of(&w, &t, w.human)
+        .await
+        .expect("H's omitted agent_id is H's own: the BBA is authored by H");
+
+    let w_body = serde_json::json!({
+        "claim_id": t.claim, "reliability": 1.0,
+        "masses": {"0": 0.1, "1": 0.9},
+    });
+    submit_body(&w, t.frame, writer, w_body)
+        .await
+        .expect("W submits with no agent_id");
+
+    assert_eq!(
+        bba_of(&w, &t, w.human).await,
+        Some(h_bba),
+        "W's agent-less submission must not replace H's BBA"
+    );
+    assert!(
+        bba_of(&w, &t, writer).await.is_some(),
+        "W's omitted agent_id is W's own"
+    );
+    let authorless: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id IS NULL",
+    )
+    .bind(t.claim)
+    .bind(t.frame)
+    .fetch_one(&w.pool)
+    .await
+    .expect("read mass_functions");
+    assert_eq!(authorless, 0, "no BBA is stored without an author");
+    assert_eq!(bba_count(&w, &t).await, 2, "two authors, two BBAs");
 }
 
 /// A perspective seeded `visibility = 'group'` in `group`, with

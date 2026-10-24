@@ -1,8 +1,9 @@
 //! Reasoning analysis endpoint for the epistemic knowledge graph.
 //!
 //! Exposes the Ascent-based reasoning engine via `POST /api/v1/reasoning/analyze`.
-//! The endpoint is **read-only** — it consumes graph data (claims from the in-memory
-//! store plus caller-supplied edges) and returns analytical insights: transitive
+//! The endpoint is **read-only** — it consumes graph data (persisted claims read
+//! as the caller, plus caller-supplied or auto-loaded edges) and returns
+//! analytical insights: transitive
 //! support chains, contradictions, support clusters, connected components, and
 //! unsupported claims.
 //!
@@ -32,8 +33,9 @@ use uuid::Uuid;
 /// claims via `claim_ids`. Parameter overrides tune engine thresholds.
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
-    /// Optional subset of claim IDs to include. When absent, all claims
-    /// from the in-memory store are loaded.
+    /// Optional subset of claim IDs to include. When absent (or empty), the
+    /// endpoints of the analysed edges are loaded; without the `db` feature,
+    /// all claims from the in-memory store.
     pub claim_ids: Option<Vec<Uuid>>,
     /// Edges to analyze. When empty (the default), edges are auto-loaded
     /// from the database — all claim-to-claim edges whose source or target
@@ -123,9 +125,11 @@ pub struct StatsDto {
 
 /// `POST /api/v1/reasoning/analyze`
 ///
-/// Loads claims from the in-memory claim store (optionally filtered by
-/// `claim_ids`), combines them with caller-supplied edges, and delegates
-/// to `ReasoningEngine::analyze()` for Datalog-based graph analysis.
+/// Loads the claims the caller can read (the request's `claim_ids`, or the
+/// endpoints of the analysed edges when it names none) with their effective
+/// belief, combines them with caller-supplied or auto-loaded edges, and
+/// delegates to `ReasoningEngine::analyze()` for Datalog-based graph analysis.
+/// Without the `db` feature, claims come from the in-memory claim store.
 ///
 /// Returns transitive supports, contradictions, support clusters, connected
 /// components, indirect challenges, and unsupported claims.
@@ -185,43 +189,20 @@ pub async fn analyze(
         }
     }
 
-    // Load claims from the in-memory store
-    let store = state.claim_store.read().await;
-    let reasoning_claims: Vec<ReasoningClaim> = match &request.claim_ids {
-        Some(ids) => {
-            let mut claims = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(claim) = store.get(id) {
-                    claims.push(ReasoningClaim {
-                        id: claim.id.as_uuid(),
-                        truth_value: claim.truth_value.value(),
-                    });
-                }
-                // Silently skip missing IDs — partial analysis is acceptable
-            }
-            claims
-        }
-        None => store
-            .values()
-            .map(|claim| ReasoningClaim {
-                id: claim.id.as_uuid(),
-                truth_value: claim.truth_value.value(),
-            })
-            .collect(),
-    };
-    // Release the read lock before doing computation (and before any await
-    // below).
-    drop(store);
-
     // Both reads below run on ONE viewer-stamped connection.
     //
-    // 1. The stored claims are kept only where they name a claim the caller can
-    //    read: an entry for another group's private claim contributes neither
-    //    its id nor its truth value. An entry naming no `claims` row is dropped
-    //    too, which is the fail-closed reading of "cannot decide".
-    // 2. If no edges were supplied, claim-to-claim edges are auto-loaded, so
-    //    callers need not pre-fetch them. The fallback is behind
-    //    `#[cfg(feature = "db")]` so the non-DB build path is unaffected.
+    // 1. If no edges were supplied, claim-to-claim edges are auto-loaded, so
+    //    callers need not pre-fetch them.
+    // 2. The claims analysed are PERSISTED claims, read as the caller: the
+    //    request's `claim_ids`, or, when it names none, the endpoints of the
+    //    edges being analysed. Each enters with its effective belief
+    //    (`ClaimRepository::effective_belief_batch`: the pignistic probability
+    //    when the DS state is complete, the truth value otherwise). A claim the
+    //    caller cannot read, or an id naming no `claims` row, is absent from
+    //    that read and so contributes neither its id nor its score.
+    //
+    // The in-memory `claim_store` is written by nothing in a database build,
+    // so it is read only by the non-DB arm below.
     #[cfg(feature = "db")]
     let (reasoning_claims, request_edges) = {
         let mut read = state.read_as(&viewer).await.map_err(|e| {
@@ -236,29 +217,65 @@ pub async fn analyze(
             }
         })?;
 
-        let stored_ids: Vec<Uuid> = reasoning_claims.iter().map(|c| c.id).collect();
-        let readable =
-            epigraph_db::ClaimRepository::visible_claim_ids(&mut *read, &viewer, &stored_ids)
-                .await?;
-        let reasoning_claims: Vec<ReasoningClaim> = reasoning_claims
-            .into_iter()
-            .filter(|c| readable.contains(&c.id))
-            .collect();
-
         let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
             load_edges_from_db(&mut read, &viewer, &request.claim_ids).await?
         } else {
             request.edges
         };
+
+        let claim_ids: Vec<Uuid> = match request.claim_ids.as_deref() {
+            Some(ids) if !ids.is_empty() => ids.to_vec(),
+            _ => request_edges
+                .iter()
+                .flat_map(|e| [e.source_id, e.target_id])
+                .collect(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let claim_ids: Vec<Uuid> = claim_ids
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .collect();
+
+        let scores =
+            epigraph_db::ClaimRepository::effective_belief_batch(&mut *read, &viewer, &claim_ids)
+                .await?;
+        let reasoning_claims: Vec<ReasoningClaim> = claim_ids
+            .into_iter()
+            .filter_map(|id| {
+                scores
+                    .get(&id)
+                    .map(|&truth_value| ReasoningClaim { id, truth_value })
+            })
+            .collect();
         (reasoning_claims, request_edges)
     };
 
     #[cfg(not(feature = "db"))]
-    let request_edges: Vec<EdgeInput> = {
+    let (reasoning_claims, request_edges) = {
         // No database, so no tenancy-bearing read: the viewer has nothing to
-        // filter. Its extraction still enforced authentication.
+        // filter. Its extraction still enforced authentication. Claims come
+        // from the in-memory store (optionally filtered by `claim_ids`).
         let _ = &viewer;
-        request.edges
+        let store = state.claim_store.read().await;
+        let reasoning_claims: Vec<ReasoningClaim> = match &request.claim_ids {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| store.get(id))
+                .map(|claim| ReasoningClaim {
+                    id: claim.id.as_uuid(),
+                    truth_value: claim.truth_value.value(),
+                })
+                .collect(),
+            None => store
+                .values()
+                .map(|claim| ReasoningClaim {
+                    id: claim.id.as_uuid(),
+                    truth_value: claim.truth_value.value(),
+                })
+                .collect(),
+        };
+        drop(store);
+        (reasoning_claims, request.edges)
     };
 
     // Convert input edges to engine types
@@ -1128,26 +1145,7 @@ mod db_tests {
         // DB has src → other, but caller will supply src → tgt explicitly.
         insert_edge(&pool, src_id, other_id, "supports", 0.9).await;
 
-        let mut store = std::collections::HashMap::new();
-        for (id, truth) in [(src_id, 0.8_f64), (tgt_id, 0.7), (other_id, 0.6)] {
-            let claim_id = epigraph_core::ClaimId::from_uuid(id);
-            let now = chrono::Utc::now();
-            let claim = epigraph_core::Claim::with_id(
-                claim_id,
-                format!("claim {id}"),
-                epigraph_core::AgentId::new(),
-                [0u8; 32],
-                [0u8; 32],
-                None,
-                None,
-                epigraph_core::TruthValue::new(truth).unwrap(),
-                now,
-                now,
-            );
-            store.insert(id, claim);
-        }
-        let mut state = scoped_state().await;
-        state.claim_store = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        let state = scoped_state().await;
 
         let request = AnalyzeRequest {
             claim_ids: None,

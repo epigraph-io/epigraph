@@ -758,10 +758,9 @@ async fn extract_viewer(
                     "an elevated viewer was resolved for a route the per-access recorder does \
                      not wrap; refused"
                 );
-                return Err(ApiError::InternalError {
+                return Err(ApiError::InternalErrorStatic {
                     message: "ELEVATED ACCESS NOT RECORDED: this route is not recorded; the \
-                              request is refused"
-                        .to_string(),
+                              request is refused",
                 });
             };
             slot.mark(crate::middleware::elevated_access::ElevatedMark {

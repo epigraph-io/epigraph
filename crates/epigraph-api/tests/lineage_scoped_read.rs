@@ -69,6 +69,9 @@
 
 mod viewer_fixture;
 
+#[path = "../../epigraph-db/tests/support/statement_log.rs"]
+mod statement_log;
+
 use axum::extract::{Path, Query, State};
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::lineage::{
@@ -266,7 +269,7 @@ async fn the_walk_does_not_serve_a_strangers_group_private_ancestor(pool: PgPool
 /// The shard converts both, and the register's own rule is that one function
 /// being correct does not cover its twin. The two are also deliberately NOT
 /// unified: the descendant walk sorts depth ASCENDING where the ancestor walk
-/// sorts DESCENDING, has no `max_nodes` cap and hardcodes `truncated: false`.
+/// sorts DESCENDING and has no `max_nodes` cap.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_descendant_walk_does_not_serve_a_strangers_group_private_descendant(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "lineage-desc-mine").await;
@@ -454,5 +457,247 @@ async fn the_descendant_walk_does_not_traverse_an_edge_outside_the_viewers_group
         !ids.contains(&blocked),
         "the descendant walk must not traverse an edge owned by a group the viewer is \
          not in, for the same reason the ancestor walk must not; got {ids:?}"
+    );
+}
+
+/// Seed `root` with `k` derivation PARENTS and `k` derivation CHILDREN, all
+/// readable by `agent`. The parents are public claims written by a SECOND
+/// author, so a node whose `agent_id` came from the wrong row is visible as a
+/// mismatch; every claim gets a distinct `created_at` for the same reason.
+async fn seed_fan(pool: &PgPool, agent: Uuid, group: Uuid, other: Uuid, k: usize) -> Uuid {
+    let root = seed_group_claim(pool, agent, group, "footprint root").await;
+    for i in 0..k {
+        let parent = seed_public_claim(pool, other, &format!("footprint parent {i}")).await;
+        seed_edge(pool, parent, root).await;
+        let child = seed_group_claim(pool, agent, group, &format!("footprint child {i}")).await;
+        seed_edge(pool, root, child).await;
+    }
+    // Distinct, deliberately non-`now()` timestamps: one per claim in the fan.
+    sqlx::query(
+        "UPDATE claims c SET created_at = TIMESTAMPTZ '2020-01-01 00:00:00+00' \
+                + (n.rn * INTERVAL '1 day') \
+           FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM claims \
+                  WHERE id = $1 \
+                     OR id IN (SELECT source_id FROM edges WHERE target_id = $1) \
+                     OR id IN (SELECT target_id FROM edges WHERE source_id = $1)) n \
+          WHERE c.id = n.id",
+    )
+    .bind(root)
+    .execute(pool)
+    .await
+    .expect("spread created_at");
+    root
+}
+
+/// One `GET /lineage/:root?direction=both` call for an already-resolved viewer.
+async fn both_walks(
+    state: AppState,
+    viewer: epigraph_db::visibility::Viewer,
+    root: Uuid,
+) -> LineageResponse {
+    get_lineage(
+        ViewerExtractor(viewer),
+        State(state),
+        Path(root),
+        Query(params(Some(LineageDirection::Both))),
+    )
+    .await
+    .expect("the viewer can read every claim in the fan, so the walk must serve")
+    .0
+}
+
+/// THE CONNECTION FOOTPRINT (`F-PR26-lineage-holds-one-connection-for-n-round-trips`).
+///
+/// The handler holds ONE viewer-stamped connection for the whole request, so
+/// the number of statements it runs on that connection is how long it pins a
+/// pool slot. That number must not grow with the size of the lineage: a root
+/// with 20 parents and 20 children must cost exactly as many statements as a
+/// root with 2 of each. `direction=both` runs both walks, so both per-node
+/// loops (ancestor and descendant) are exercised.
+///
+/// The second half pins what the per-node fetch used to supply: each node's
+/// `agent_id` and `created_at` must still be THAT claim's stored values.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_statement_count_does_not_grow_with_the_lineage(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-footprint").await;
+    let (other, _other_group) = seed_agent_with_group(&pool, "lineage-footprint-other").await;
+
+    let narrow = seed_fan(&pool, agent, group, other, 2).await;
+    let wide = seed_fan(&pool, agent, group, other, 20).await;
+
+    let state = split_state(&pool).await;
+    // `Viewer` is deliberately not `Clone`: resolve one per call, OUTSIDE the
+    // capture, so `Viewer::resolve`'s own statements are not counted.
+    let resolve = || async {
+        epigraph_db::visibility::Viewer::resolve(&pool, agent)
+            .await
+            .expect("resolve")
+    };
+
+    // Warm-up: the first request on a fresh pool also opens its connection.
+    let _ = both_walks(state.clone(), resolve().await, narrow).await;
+
+    let viewer = resolve().await;
+    let (narrow_out, narrow_stmts) =
+        statement_log::capture(both_walks(state.clone(), viewer, narrow)).await;
+    let viewer = resolve().await;
+    let (wide_out, wide_stmts) =
+        statement_log::capture(both_walks(state.clone(), viewer, wide)).await;
+
+    // CALIBRATION: the two walks really differ in size, and the capture sees
+    // the walk's own statements, so equal counts below are about the handler.
+    assert_eq!(
+        narrow_out.nodes.len(),
+        1 + 2 * 2,
+        "narrow fan: {:?}",
+        node_ids(&narrow_out)
+    );
+    assert_eq!(
+        wide_out.nodes.len(),
+        1 + 2 * 20,
+        "wide fan: {:?}",
+        node_ids(&wide_out)
+    );
+    assert!(
+        wide_stmts
+            .iter()
+            .any(|s| s.normalized().contains("WITH RECURSIVE lineage")),
+        "CALIBRATION: the capture must see the ancestor walk's CTE, or the counts \
+         below compare two empty logs:\n{}",
+        statement_log::describe(&wide_stmts)
+    );
+
+    assert_eq!(
+        wide_stmts.len(),
+        narrow_stmts.len(),
+        "the lineage handler must run a FIXED number of statements on its one \
+         connection, independent of how many claims the walk returns. 41 nodes ran \
+         {} statements, 5 nodes ran {}.\nwide:\n{}\nnarrow:\n{}",
+        wide_stmts.len(),
+        narrow_stmts.len(),
+        statement_log::describe(&wide_stmts),
+        statement_log::describe(&narrow_stmts)
+    );
+
+    // Every node's author and creation time are its OWN stored values.
+    for node in &wide_out.nodes {
+        let (stored_agent, stored_created): (Uuid, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT agent_id, created_at FROM claims WHERE id = $1")
+                .bind(node.claim_id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored claim");
+        assert_eq!(
+            node.agent_id, stored_agent,
+            "node {} must carry its own claim's agent_id",
+            node.claim_id
+        );
+        assert_eq!(
+            node.created_at, stored_created,
+            "node {} must carry its own claim's created_at",
+            node.claim_id
+        );
+    }
+    // The fan has two authors, so the per-node check above can fail.
+    let authors: std::collections::HashSet<Uuid> =
+        wide_out.nodes.iter().map(|n| n.agent_id).collect();
+    assert_eq!(
+        authors,
+        [agent, other].into_iter().collect(),
+        "CALIBRATION: the wide fan mixes two authors"
+    );
+}
+
+/// One lineage call with an explicit `max_depth`, for an already-seeded root.
+async fn walk_to_depth(
+    pool: &PgPool,
+    agent: Uuid,
+    root: Uuid,
+    max_depth: u32,
+    direction: LineageDirection,
+) -> LineageResponse {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve");
+    get_lineage(
+        ViewerExtractor(viewer),
+        State(split_state(pool).await),
+        Path(root),
+        Query(LineageParams {
+            max_depth: Some(max_depth),
+            direction: Some(direction),
+            include_evidence: None,
+            include_traces: None,
+        }),
+    )
+    .await
+    .expect("the viewer can read every claim in the chain, so the walk must serve")
+    .0
+}
+
+/// `truncated` on `GET /lineage/:claim_id` is EXACT, in every direction: a chain
+/// that ends exactly at `max_depth` is complete, and one with a claim beyond it
+/// is cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_truncated_flag_is_exact_at_max_depth(pool: PgPool) {
+    const CUT: u32 = 3;
+    let (agent, _group) = seed_agent_with_group(&pool, "lineage-trunc").await;
+
+    // c0 -> c1 -> ... -> c{CUT + 1}. Ascending, c{CUT}'s ancestry ends at
+    // exactly CUT and c{CUT + 1}'s runs one past it; descending, the same holds
+    // for c1 and c0.
+    let mut chain = Vec::new();
+    for i in 0..=(CUT + 1) {
+        let c = seed_public_claim(&pool, agent, &format!("trunc chain {i}")).await;
+        if let Some(prev) = chain.last() {
+            seed_edge(&pool, *prev, c).await;
+        }
+        chain.push(c);
+    }
+    let at_cut = chain[CUT as usize];
+    let past_cut = chain[CUT as usize + 1];
+
+    for (direction, complete_root, cut_root) in [
+        (LineageDirection::Ancestors, at_cut, past_cut),
+        (LineageDirection::Descendants, chain[1], chain[0]),
+    ] {
+        let complete = walk_to_depth(&pool, agent, complete_root, CUT, direction).await;
+        assert_eq!(
+            complete.depth_reached,
+            CUT,
+            "{direction:?}: {:?}",
+            node_ids(&complete)
+        );
+        assert!(
+            !complete.truncated,
+            "{direction:?}: a lineage ending exactly at max_depth is complete and must \
+             not be reported truncated"
+        );
+
+        let cut = walk_to_depth(&pool, agent, cut_root, CUT, direction).await;
+        assert!(
+            cut.truncated,
+            "{direction:?}: a claim lies past max_depth, so the response must say it was cut"
+        );
+        assert_eq!(
+            cut.nodes.len(),
+            CUT as usize + 1,
+            "{direction:?}: {:?}",
+            node_ids(&cut)
+        );
+    }
+
+    // `both`: complete only when NEITHER side is cut.
+    let both_complete = walk_to_depth(&pool, agent, at_cut, CUT, LineageDirection::Both).await;
+    assert!(
+        !both_complete.truncated,
+        "both: from c{CUT} the ancestors end exactly at max_depth and the descendants \
+         before it, so the merged response is complete"
+    );
+    let both_cut = walk_to_depth(&pool, agent, chain[0], CUT, LineageDirection::Both).await;
+    assert!(
+        both_cut.truncated,
+        "both: from c0 the descendants run past max_depth, so the merged response is cut \
+         even though the ancestor side is empty"
     );
 }

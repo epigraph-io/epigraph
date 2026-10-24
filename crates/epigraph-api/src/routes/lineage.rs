@@ -77,7 +77,8 @@ pub struct LineageResponse {
     pub edges: Vec<LineageEdge>,
     /// Maximum depth reached during traversal
     pub depth_reached: u32,
-    /// Whether traversal was truncated due to depth limit
+    /// Whether a claim the viewer can read lies past `max_depth` (in either
+    /// direction, for `both`), i.e. the lineage shown is not complete
     pub truncated: bool,
     /// Direction of traversal performed
     pub direction: LineageDirection,
@@ -191,31 +192,24 @@ pub struct TraceNode {
 /// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
 /// advertises to operators.
 ///
-/// # Footprint — a recorded trade-off, not a free win
+/// # Footprint — a FIXED number of statements
 ///
-/// The handle is held across `1 + 5 + N` statements: the existence probe, the
-/// walk's five statements, and one `get_by_id_conn` per returned claim. `N` is
-/// the size of the visible walk result, and this handler passes
-/// `max_nodes: None`, so `max_depth`'s `.min(MAX_LINEAGE_DEPTH)` clamp bounds
-/// the walk's DEPTH and nothing bounds its BRANCHING — `N` is not capped.
+/// The handle is held across `1 + 5` statements on `ancestors` and on
+/// `descendants` (the existence probe, then the walk's five), and `1 + 10` on
+/// `both`, which runs both walks on the same handle. The count does not depend
+/// on how many claims the walk returns: each node's `agent_id` and
+/// `created_at` come from the walk's own projection, which the visibility
+/// predicate already filtered, rather than from one `get_by_id_conn` per node.
+/// `tests/lineage_scoped_read.rs::the_lineage_statement_count_does_not_grow_with_the_lineage`
+/// pins that.
 ///
-/// The total number of checkouts went DOWN (`1 + 5 + N` transient ones became
-/// one), but the duration of a single checkout went UP, and that is the axis
-/// that matters for a shared pool. `bin/server.rs` builds the request pool at
-/// `max_connections: 8` (the second, 2-connection pool is maintenance), and it
-/// serves every route, so concurrent deep-lineage requests can hold handles
-/// that unrelated handlers then wait for at `acquire_timeout`. Under
-/// `SessionGucMode::Transaction` the hold is an OPEN READ TRANSACTION for all
-/// `N` round trips — idle-in-transaction, which also pins the vacuum horizon.
-/// `direction=both` doubles the walk on the same handle.
-///
-/// Deliberately NOT mitigated in this shard, and the reasons are recorded in
-/// `docs/tenancy/progress.json` as `F-PR26-lineage-holds-one-connection-for-n-round-trips`:
-/// passing a node cap here would truncate the response while `truncated` is
-/// computed from depth alone, i.e. it would under-serve SILENTLY, which is the
-/// same fail-quiet class this series exists to remove. The real repair is to
-/// collapse the per-node `get_by_id_conn` loop into one batched viewer-scoped
-/// fetch, which is new repo surface and its own evidence.
+/// This closes `F-PR26-lineage-holds-one-connection-for-n-round-trips` in
+/// `docs/tenancy/progress.json`. What remains is the walk's own cost: the
+/// recursive statement's runtime still grows with the lineage, and this
+/// handler passes `max_nodes: None`. The response's `truncated` is now the
+/// walks' own exact flag (a visible claim lies past `max_depth`), which is the
+/// signal a future node cap would need so it never cuts the response silently;
+/// no cap is added here.
 pub async fn get_lineage(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -266,7 +260,9 @@ pub async fn get_lineage(
             })?;
 
     // Get lineage based on direction
-    let (nodes, edges, max_depth_reached) = match direction {
+    // `truncated` comes from the walks themselves, which decide it exactly (a
+    // visible claim lies past `max_depth`), and is OR-ed across the `both` arm.
+    let (nodes, edges, max_depth_reached, truncated) = match direction {
         LineageDirection::Ancestors => {
             get_ancestor_lineage(
                 &mut read,
@@ -295,26 +291,28 @@ pub async fn get_lineage(
             // Get both ancestors and descendants, then merge. BOTH walks run on
             // the SAME connection: that is what makes the merged graph a single
             // consistent read rather than two.
-            let (ancestor_nodes, ancestor_edges, ancestor_depth) = get_ancestor_lineage(
-                &mut read,
-                &viewer,
-                &root_claim,
-                claim_id,
-                max_depth,
-                include_evidence,
-                include_traces,
-            )
-            .await?;
-            let (descendant_nodes, descendant_edges, descendant_depth) = get_descendant_lineage(
-                &mut read,
-                &viewer,
-                &root_claim,
-                claim_id,
-                max_depth,
-                include_evidence,
-                include_traces,
-            )
-            .await?;
+            let (ancestor_nodes, ancestor_edges, ancestor_depth, ancestor_truncated) =
+                get_ancestor_lineage(
+                    &mut read,
+                    &viewer,
+                    &root_claim,
+                    claim_id,
+                    max_depth,
+                    include_evidence,
+                    include_traces,
+                )
+                .await?;
+            let (descendant_nodes, descendant_edges, descendant_depth, descendant_truncated) =
+                get_descendant_lineage(
+                    &mut read,
+                    &viewer,
+                    &root_claim,
+                    claim_id,
+                    max_depth,
+                    include_evidence,
+                    include_traces,
+                )
+                .await?;
 
             // Merge nodes, avoiding duplicates using HashSet for O(1) lookup
             let existing_ids: HashSet<Uuid> = ancestor_nodes.iter().map(|n| n.claim_id).collect();
@@ -345,6 +343,7 @@ pub async fn get_lineage(
                 merged_nodes,
                 merged_edges,
                 ancestor_depth.max(descendant_depth),
+                ancestor_truncated || descendant_truncated,
             )
         }
     };
@@ -369,9 +368,6 @@ pub async fn get_lineage(
             message: "Failed to finish the scoped read".to_string(),
         }
     })?;
-
-    // Determine if truncated (there might be more nodes beyond max_depth)
-    let truncated = max_depth_reached >= max_depth as u32 && nodes.len() > 1;
 
     let response = LineageResponse {
         root_claim_id: claim_id,
@@ -404,7 +400,7 @@ async fn get_ancestor_lineage(
     max_depth: i32,
     include_evidence: bool,
     include_traces: bool,
-) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
+) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32, bool), ApiError> {
     // Use LineageRepository for ancestor traversal
     let lineage_result =
         LineageRepository::get_lineage_conn(&mut *conn, viewer, claim_id, Some(max_depth), None)
@@ -430,7 +426,7 @@ async fn get_ancestor_lineage(
             trace: None,
         };
 
-        return Ok((vec![node], vec![], 0));
+        return Ok((vec![node], vec![], 0, false));
     }
 
     // Build nodes from lineage claims
@@ -438,17 +434,9 @@ async fn get_ancestor_lineage(
     let mut edges = Vec::new();
 
     for (id, lineage_claim) in &lineage_result.claims {
-        // Get full claim data to include agent_id and created_at.
-        // Reborrowed INSIDE the loop: `lineage_result` is owned, so the walk's
-        // result does not hold the connection, and one acquire serves all N
-        // iterations.
-        let claim = ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(*id))
-            .await?
-            .ok_or_else(|| ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: id.to_string(),
-            })?;
-
+        // `agent_id` and `created_at` come from the walk's own projection,
+        // which the viewer predicate already filtered. No per-node point read:
+        // the connection's statement count does not grow with the lineage.
         // Build evidence list if requested
         let evidence = if include_evidence {
             lineage_claim
@@ -462,7 +450,7 @@ async fn get_ancestor_lineage(
                             id: ev.id,
                             evidence_type: ev.evidence_type.clone(),
                             content_hash: hex::encode(&ev.content_hash),
-                            created_at: claim.created_at, // Use claim created_at as proxy
+                            created_at: lineage_claim.created_at, // Use claim created_at as proxy
                         })
                 })
                 .collect()
@@ -490,8 +478,8 @@ async fn get_ancestor_lineage(
             content: lineage_claim.content.clone(),
             truth_value: lineage_claim.truth_value,
             depth: lineage_claim.depth as u32,
-            agent_id: claim.agent_id.into(),
-            created_at: claim.created_at,
+            agent_id: lineage_claim.agent_id,
+            created_at: lineage_claim.created_at,
             evidence,
             trace,
         };
@@ -512,7 +500,7 @@ async fn get_ancestor_lineage(
     nodes.sort_by_key(|n| n.depth);
 
     let max_depth_reached = lineage_result.max_depth_reached as u32;
-    Ok((nodes, edges, max_depth_reached))
+    Ok((nodes, edges, max_depth_reached, lineage_result.truncated))
 }
 
 /// Get descendant lineage (claims that depend on this claim)
@@ -530,7 +518,7 @@ async fn get_descendant_lineage(
     max_depth: i32,
     include_evidence: bool,
     include_traces: bool,
-) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32), ApiError> {
+) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32, bool), ApiError> {
     // Use LineageRepository for descendant traversal
     let lineage_result =
         LineageRepository::get_descendants_conn(&mut *conn, viewer, claim_id, Some(max_depth))
@@ -556,7 +544,7 @@ async fn get_descendant_lineage(
             trace: None,
         };
 
-        return Ok((vec![node], vec![], 0));
+        return Ok((vec![node], vec![], 0, false));
     }
 
     // Build nodes from lineage claims
@@ -564,17 +552,9 @@ async fn get_descendant_lineage(
     let mut edges = Vec::new();
 
     for (id, lineage_claim) in &lineage_result.claims {
-        // Get full claim data to include agent_id and created_at.
-        // Reborrowed INSIDE the loop: `lineage_result` is owned, so the walk's
-        // result does not hold the connection, and one acquire serves all N
-        // iterations.
-        let claim = ClaimRepository::get_by_id_conn(&mut *conn, viewer, ClaimId::from_uuid(*id))
-            .await?
-            .ok_or_else(|| ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: id.to_string(),
-            })?;
-
+        // `agent_id` and `created_at` come from the walk's own projection,
+        // which the viewer predicate already filtered. No per-node point read:
+        // the connection's statement count does not grow with the lineage.
         // Build evidence list if requested
         let evidence = if include_evidence {
             lineage_claim
@@ -588,7 +568,7 @@ async fn get_descendant_lineage(
                             id: ev.id,
                             evidence_type: ev.evidence_type.clone(),
                             content_hash: hex::encode(&ev.content_hash),
-                            created_at: claim.created_at, // Use claim created_at as proxy
+                            created_at: lineage_claim.created_at, // Use claim created_at as proxy
                         })
                 })
                 .collect()
@@ -616,8 +596,8 @@ async fn get_descendant_lineage(
             content: lineage_claim.content.clone(),
             truth_value: lineage_claim.truth_value,
             depth: lineage_claim.depth as u32,
-            agent_id: claim.agent_id.into(),
-            created_at: claim.created_at,
+            agent_id: lineage_claim.agent_id,
+            created_at: lineage_claim.created_at,
             evidence,
             trace,
         };
@@ -639,7 +619,7 @@ async fn get_descendant_lineage(
 
     let max_depth_reached = lineage_result.max_depth_reached as u32;
 
-    Ok((nodes, edges, max_depth_reached))
+    Ok((nodes, edges, max_depth_reached, lineage_result.truncated))
 }
 
 #[cfg(test)]
