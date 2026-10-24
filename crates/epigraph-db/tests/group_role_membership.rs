@@ -513,7 +513,11 @@ async fn the_app_role_has_no_roster_oracle(pool: PgPool) {
           WHERE group_id = $2",
         "SELECT count(*) FROM public.epigraph_group_role_roster($2, now()) WHERE true \
             AND $1::uuid IS NOT NULL",
-        "SELECT count(*) FROM (SELECT public.epigraph_writes_group_at($1, $2, now(), false)) x",
+        // The boolean is CONSUMED: a `count(*)` over a subquery whose column
+        // is unused lets the planner drop the call, and an uncalled function
+        // meets no EXECUTE check.
+        "SELECT CASE WHEN public.epigraph_writes_group_at($1, $2, now(), false) \
+                THEN 1::bigint ELSE 0::bigint END",
     ];
     for sql in calls {
         let r: Result<i64, _> = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
