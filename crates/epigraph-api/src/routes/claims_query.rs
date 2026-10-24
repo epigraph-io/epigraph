@@ -457,6 +457,32 @@ pub async fn list_claims_query(
     }))
 }
 
+/// Query keys `GET /api/v1/claims` receives but has no predicate for: labels.
+/// [`ClaimQueryParams`] has no label field and no `deny_unknown_fields`, so
+/// `?labels=x` used to be dropped and the unfiltered page returned as if
+/// filtered. Label filtering lives at `GET /api/v1/claims/by-labels`.
+#[cfg(feature = "db")]
+const UNHONORED_LABEL_FILTERS: &[&str] = &["label", "labels", "tags", "exclude_labels"];
+
+/// The handler `GET /api/v1/claims` is routed to: [`list_claims_query`]
+/// behind a refusal of the label filters it cannot honour. A wrapper so the
+/// inner handler's signature, which tests call directly, is unchanged.
+#[cfg(feature = "db")]
+pub async fn list_claims_query_route(
+    viewer: crate::middleware::bearer::ViewerExtractor,
+    state: State<AppState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    params: Query<ClaimQueryParams>,
+) -> Result<Json<ClaimListResponse>, ApiError> {
+    crate::routes::claims::refuse_unhonored_filters(
+        raw_query.as_deref(),
+        UNHONORED_LABEL_FILTERS,
+        "GET /api/v1/claims has no label filter; use GET \
+         /api/v1/claims/by-labels?labels=… instead.",
+    )?;
+    list_claims_query(viewer, state, params).await
+}
+
 /// Log a failed statement on the viewer-stamped connection in full, and answer
 /// with an opaque `500`.
 ///

@@ -59,7 +59,12 @@ pub async fn supersede_claim(
         &params.reason,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| match e {
+        // Readable as current but not retirable by this session: a denial of
+        // authority (INVALID_REQUEST), with nothing written.
+        e @ epigraph_db::DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
+        other => internal_error(other),
+    })?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Supersede,
