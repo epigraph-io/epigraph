@@ -109,6 +109,23 @@ pub struct AuthorOperator {
     pub retired: bool,
 }
 
+/// Whether an agent attached to a role may run now (migration 166's
+/// `epigraph_role_agent_may_run`): the answer epigraph-mcp checks at boot and
+/// the host checks before it starts a role's container or schedule.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RoleAgentRunGate {
+    /// `false` only for an agent with a live attachment whose role has no live
+    /// holder, or whose linked human is not that holder.
+    pub may_run: bool,
+    /// The role of the first failing attachment, else of the first live one;
+    /// `None` for an unattached agent.
+    pub role: Option<String>,
+    /// The holder, only when it is the agent's own linked human (`held`).
+    pub holder: Option<Uuid>,
+    /// `unattached`, `held`, `no_holder` or `not_holder`.
+    pub reason: String,
+}
+
 /// What one [`AgentRepository::link_operator`] call did, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct OperatorLinkOutcome {
@@ -1560,6 +1577,29 @@ impl AgentRepository {
                 .fetch_one(&mut *conn)
                 .await?,
         )
+    }
+
+    /// May `agent_id` run now? Migration 166's `epigraph_role_agent_may_run`,
+    /// EXECUTE-able on the request DSN (and by the identity attestor). An
+    /// unattached agent always may; an attached one only while its linked
+    /// human holds every role it is attached to.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database that has
+    /// not applied migration 166) or the read fails. Deliberately NOT mapped to
+    /// "may run": a binary that cannot ask must not start as if the answer
+    /// were yes.
+    pub async fn role_agent_may_run(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<RoleAgentRunGate, DbError> {
+        Ok(sqlx::query_as::<_, RoleAgentRunGate>(
+            "SELECT may_run, role, holder, reason \
+               FROM public.epigraph_role_agent_may_run($1)",
+        )
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await?)
     }
 
     /// [`Self::operator_actor`] for a caller holding a pool.

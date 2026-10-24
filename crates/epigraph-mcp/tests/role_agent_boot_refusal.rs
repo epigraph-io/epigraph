@@ -226,7 +226,10 @@ fn expect_refused(outcome: Outcome, reason: &str, what: &str) {
         Outcome::Exited { code, stderr } => {
             assert_eq!(code, Some(1), "{what}: {stderr}");
             assert!(stderr.contains(REFUSED), "{what}: {stderr}");
-            assert!(stderr.contains(ROLE), "{what}: the refusal names the role: {stderr}");
+            assert!(
+                stderr.contains(ROLE),
+                "{what}: the refusal names the role: {stderr}"
+            );
             assert!(stderr.contains(reason), "{what}: {stderr}");
         }
         Outcome::PastTheCheck { stderr } => panic!("{what} must not boot:\n{stderr}"),
@@ -251,7 +254,10 @@ async fn an_attached_agent_boots_only_while_its_human_holds_the_role(pool: PgPoo
     attach(&pool, attached).await;
 
     expect_refused(run(&pool, attached_env.clone()).await, NO_HOLDER, "a gap");
-    expect_booted(run(&pool, plain_env).await, "an unattached agent in the gap");
+    expect_booted(
+        run(&pool, plain_env).await,
+        "an unattached agent in the gap",
+    );
 
     grant(&pool, h).await;
     expect_booted(

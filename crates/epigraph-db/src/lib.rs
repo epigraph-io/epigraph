@@ -67,7 +67,7 @@ pub mod visibility;
 // below from where PR-08 actually put it.
 pub use errors::{
     DbError, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
-    PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED,
+    PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED, ROLE_HOLDER_REQUIRED,
 };
 pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
@@ -122,14 +122,15 @@ pub use repos::{
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
     RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
     RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
-    RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
-    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SupersedeEdgeMigration,
-    SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
-    TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
-    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
+    StructuralRepository, SupersedeEdgeMigration, SweepCandidate, TaskRepository, TaskRow,
+    TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep, TripleRepository,
+    TripleRow, UnmarkedDuplicate, WebhookSubscriptionRepository, WebhookSubscriptionRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    PRUNABLE_EVENT_TYPES,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
