@@ -1576,6 +1576,94 @@ async fn a_succession_copy_keeps_the_parents_window(pool: PgPool) {
     );
 }
 
+/// Attach `agent` to `role` from `from` to `to` (SQL expressions), through the
+/// maintenance definer.
+async fn attach_window(pool: &PgPool, role: &str, agent: Uuid, from: &str, to: &str) -> Uuid {
+    let role = role.to_string();
+    let sql = format!(
+        "SELECT public.epigraph_attach_agent_to_role($1, $2, {from}, {to}, 'test window')"
+    );
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(&sql)
+            .bind(&role)
+            .bind(agent)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the maintenance role attaches with a window");
+        (conn, id)
+    })
+    .await
+}
+
+/// What of `parent_row`'s window, from now on, `agent`'s un-detached
+/// attachments to the same role leave UNCOVERED (`{}` when none), and how many
+/// of those attachments name `parent_row` in `inherited_from`.
+async fn uncovered_by(pool: &PgPool, parent_row: Uuid, agent: Uuid) -> (String, i64) {
+    sqlx::query_as(
+        "SELECT (tstzmultirange(tstzrange(GREATEST(now(), p.valid_from), p.valid_to)) \
+                 - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to)) \
+                               FROM role_agents c \
+                              WHERE c.agent_id = $2 AND c.role = p.role \
+                                AND c.detached_at IS NULL), \
+                            '{}'::tstzmultirange))::text, \
+                (SELECT count(*) FROM role_agents c \
+                  WHERE c.agent_id = $2 AND c.inherited_from = p.id) \
+           FROM role_agents p WHERE p.id = $1",
+    )
+    .bind(parent_row)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("coverage")
+}
+
+/// The succession copy covers the parent's WHOLE window: a child that already
+/// holds its own attachment to the role for a short stretch INSIDE the
+/// parent's window inherits every part of the parent's window that stretch
+/// leaves uncovered (one row per gap: here before and after it), so its own
+/// short row never ends its coverage early. CONTROL: a repeat registration
+/// copies nothing more.
+///
+/// Verified to fail: the copy skipping a parent row whenever the child has
+/// ANY overlapping row (the child keeps only its own hour, and is
+/// unattached, so unconstrained, for the rest of the parent's window).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_succession_copy_fills_every_gap_in_the_childs_own_window(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-gaps").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let child_key = random32();
+    let child = register(&pool, &child_key, None, "g-166-gaps").await;
+    let parent_row = attach(&pool, ROLE, parent).await;
+    attach_window(
+        &pool,
+        ROLE,
+        child,
+        "now() + interval '1 hour'",
+        "now() + interval '2 hours'",
+    )
+    .await;
+
+    assert_eq!(register(&pool, &child_key, Some(parent), "g-166-gaps").await, child);
+    assert_eq!(
+        uncovered_by(&pool, parent_row, child).await,
+        ("{}".to_string(), 2),
+        "the child's own hour leaves two gaps in the parent's window; both are copied"
+    );
+    register(&pool, &child_key, Some(parent), "g-166-gaps").await;
+    assert_eq!(
+        uncovered_by(&pool, parent_row, child).await.1,
+        2,
+        "CONTROL: a repeat registration copies nothing more"
+    );
+}
+
 /// The identity attestor runs the registration (whose succession copy writes
 /// `role_agents` in a maintenance-owned definer frame) but cannot write the
 /// table itself, nor call the attach / detach verbs.
