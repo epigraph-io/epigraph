@@ -6,7 +6,10 @@
 //! Driven through the COMPILED BINARY, so the tests prove `main` reads the two
 //! variables and runs the check, not only that a check function exists. The
 //! binary runs on stdio with stdin closed: a server past the check logs
-//! "Agent identity ready" and then exits on EOF.
+//! "Agent identity ready" and then exits on EOF. With `EPIGRAPH_OPERATOR_ID`
+//! set, `self_link` resolves (and could create) the server's agent BEFORE
+//! serving, which is the boot path that shows which agent `main` wired the
+//! identity key to, and that the check runs before anything creates a row.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -39,19 +42,18 @@ enum Outcome {
     PastTheCheck { stderr: String },
 }
 
-fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str]) -> Outcome {
+/// Spawn the binary and wait until its log contains `until` (then kill it) or
+/// it exits.
+fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str], until: &str) -> Outcome {
     let mut args = vec!["--database-url", db_url];
     args.extend_from_slice(extra_args);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"));
     // The separate-signing-key pair may be exported on the runner (by a host
-    // in that mode); cleared FIRST, so only what this test sets reaches the child.
-    cmd.env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
-        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd
-        .args(&args)
+    // in that mode): cleared with the rest, so only what the test sets below
+    // reaches the child.
+    cmd.args(&args)
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .env_remove("EPIGRAPH_MCP_AGENT_KEY")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")
@@ -63,7 +65,13 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str]) -> Outcome
         .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("OPENAI_API_KEY")
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "info");
+    // The caller's variables last, so a test may set one the list above clears
+    // (EPIGRAPH_OPERATOR_ID).
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -85,7 +93,7 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str]) -> Outcome
             log.push_str(&line);
             log.push('\n');
         }
-        if log.contains(PAST_THE_CHECK) {
+        if log.contains(until) {
             let _ = child.kill();
             let _ = child.wait();
             return Outcome::PastTheCheck { stderr: log };
@@ -95,7 +103,7 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str]) -> Outcome
                 log.push_str(&line);
                 log.push('\n');
             }
-            if log.contains(PAST_THE_CHECK) {
+            if log.contains(until) {
                 return Outcome::PastTheCheck { stderr: log };
             }
             return Outcome::Exited {
@@ -117,8 +125,17 @@ async fn run(
     env: Vec<(&'static str, String)>,
     extra_args: &'static [&'static str],
 ) -> Outcome {
+    run_until(pool, env, extra_args, PAST_THE_CHECK).await
+}
+
+async fn run_until(
+    pool: &PgPool,
+    env: Vec<(&'static str, String)>,
+    extra_args: &'static [&'static str],
+    until: &'static str,
+) -> Outcome {
     let url = fixture::database_url_for(pool).await;
-    tokio::task::spawn_blocking(move || run_mcp(&url, &env, extra_args))
+    tokio::task::spawn_blocking(move || run_mcp(&url, &env, extra_args, until))
         .await
         .expect("join")
 }
@@ -257,4 +274,106 @@ async fn a_half_or_mixed_configuration_is_refused(pool: PgPool) {
             panic!("the new mode with --agent-key must not boot:\n{stderr}")
         }
     }
+}
+
+/// Logged by `self_link` once the operator link is recorded.
+const LINKED: &str = "operator link recorded";
+
+fn with_operator(mut env: Vec<(&'static str, String)>, operator: Uuid) -> Vec<(&'static str, String)> {
+    env.push(("EPIGRAPH_OPERATOR_ID", operator.to_string()));
+    env
+}
+
+async fn operator_of(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT operator_id FROM operator_links WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_optional(pool)
+        .await
+        .expect("operator link")
+}
+
+/// `main`'s stdio wiring, observed on the path that RESOLVES the agent at
+/// boot: with `EPIGRAPH_OPERATOR_ID` set, `self_link` finds (or creates) the
+/// server's agent before serving. In the separate-signing-key mode that must
+/// be the agent the IDENTITY key names, so the link lands on the registered
+/// agent and no agent is ever keyed by the signing key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stdio_boot_links_the_identity_agent_not_a_signing_key_agent(pool: PgPool) {
+    let identity = AgentSigner::from_bytes(&[0xD1; 32])
+        .expect("id")
+        .public_key();
+    let signing_secret = [0xD2u8; 32];
+    let signing = AgentSigner::from_bytes(&signing_secret)
+        .expect("sk")
+        .public_key();
+    let agent = register(&pool, identity, signing).await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "s2-stdio-operator").await;
+    assert_eq!(operator_of(&pool, agent).await, None, "calibration: unlinked");
+
+    let env = with_operator(new_mode_env(&identity, &signing_secret), operator);
+    match run_until(&pool, env, &[], LINKED).await {
+        Outcome::PastTheCheck { .. } => {}
+        Outcome::Exited { code, stderr } => {
+            panic!("the registered pair with an operator must link; exited {code:?}:\n{stderr}")
+        }
+    }
+    assert_eq!(
+        operator_of(&pool, agent).await,
+        Some(operator),
+        "the link lands on the agent the identity key names"
+    );
+    assert_eq!(
+        agent_count_with_key(&pool, &signing).await,
+        0,
+        "no agent is keyed by the signing key"
+    );
+}
+
+/// The boot check runs BEFORE `self_link`, the stdio step that would create
+/// the server's agent row: an identity no agent carries, booted with an
+/// operator, exits 1 and leaves no agent for the identity (or the signing
+/// key) behind. So does a registered identity with a stray signing key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refused_stdio_boot_with_an_operator_creates_no_agent(pool: PgPool) {
+    let (operator, _) = fixture::seed_human_operator(&pool, "s2-refused-operator").await;
+    let signing_secret = [0xE2u8; 32];
+    let signing = AgentSigner::from_bytes(&signing_secret)
+        .expect("sk")
+        .public_key();
+
+    let unknown = AgentSigner::from_bytes(&[0xE1; 32])
+        .expect("id")
+        .public_key();
+    let env = with_operator(new_mode_env(&unknown, &signing_secret), operator);
+    match run_until(&pool, env, &[], LINKED).await {
+        Outcome::Exited { code, stderr } => {
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(stderr.contains(NO_IDENTITY), "{stderr}");
+        }
+        Outcome::PastTheCheck { stderr } => {
+            panic!("an unregistered identity must not link:\n{stderr}")
+        }
+    }
+    assert_eq!(agent_count_with_key(&pool, &unknown).await, 0);
+    assert_eq!(agent_count_with_key(&pool, &signing).await, 0);
+
+    let identity = AgentSigner::from_bytes(&[0xE3; 32])
+        .expect("id")
+        .public_key();
+    let registered_signing = AgentSigner::from_bytes(&[0xE4; 32])
+        .expect("sk")
+        .public_key();
+    let agent = register(&pool, identity, registered_signing).await;
+    let env = with_operator(new_mode_env(&identity, &signing_secret), operator);
+    match run_until(&pool, env, &[], LINKED).await {
+        Outcome::Exited { code, stderr } => {
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(stderr.contains(NOT_ACTIVE), "{stderr}");
+        }
+        Outcome::PastTheCheck { stderr } => {
+            panic!("a stray signing key must not link:\n{stderr}")
+        }
+    }
+    assert_eq!(operator_of(&pool, agent).await, None, "nothing was linked");
+    assert_eq!(agent_count_with_key(&pool, &signing).await, 0);
 }
