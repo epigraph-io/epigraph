@@ -218,6 +218,31 @@ pub struct MarkedDuplicateRow {
 /// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
 pub const MAX_DUPLICATE_CHAIN_DEPTH: i32 = 16;
 
+/// What [`ClaimRepository::marked_duplicates_of`] read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkedDuplicates {
+    /// At most `cap + 1` rows, none deeper than [`MAX_DUPLICATE_CHAIN_DEPTH`].
+    pub rows: Vec<MarkedDuplicateRow>,
+    /// Whether some chain went on past [`MAX_DUPLICATE_CHAIN_DEPTH`]: the
+    /// duplicates beyond it are not in `rows`, so the read is incomplete.
+    pub chain_truncated: bool,
+}
+
+/// One row of the walk behind [`ClaimRepository::marked_duplicates_of`]: the
+/// truncation flag, and a duplicate when there is one (the statement always
+/// returns at least the flag row).
+#[derive(sqlx::FromRow)]
+struct MarkedDuplicateWalkRow {
+    chain_truncated: bool,
+    canonical: Option<Uuid>,
+    id: Option<Uuid>,
+    content: Option<String>,
+    labels: Option<Vec<String>>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    agent_id: Option<Uuid>,
+    canonical_agent_id: Option<Uuid>,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -4866,6 +4891,53 @@ impl ClaimRepository {
         Ok(live as usize == distinct.len())
     }
 
+    /// Each of `ids` the viewer reads, with whether it is current, LOCKED
+    /// `FOR NO KEY UPDATE` (in id order) until the caller's transaction ends.
+    ///
+    /// The locking twin of [`Self::are_all_current`], for a check that a later
+    /// write in the same transaction relies on (a dedup mark onto a canonical
+    /// that must stay current). Supersede, deprecate, consolidate and mark
+    /// retire a claim with a plain `UPDATE` (itself a `FOR NO KEY UPDATE`
+    /// lock), which this conflicts with: a retirement that has not committed
+    /// when this runs is waited for and its result read; one that starts
+    /// afterwards waits for the caller's commit. `FOR KEY SHARE` would not
+    /// conflict with it at all. `FOR SHARE` would, but two callers would then
+    /// both hold the row and deadlock when each goes on to `UPDATE` it (a
+    /// label-dedup unit relabels its canonical after marking onto it), where
+    /// `FOR NO KEY UPDATE` makes the second wait for the first and then read
+    /// its result. It does not conflict with `FOR KEY SHARE`, so a foreign-key
+    /// check against the row is not blocked.
+    ///
+    /// `is_current` is returned, not filtered on: under READ COMMITTED a row
+    /// retired while this waited is re-read and comes back `false`, rather
+    /// than vanishing. An id absent from the result is missing, invisible, or
+    /// not lockable by the session (a locking read takes the UPDATE row
+    /// policy, which admits only rows in the session's writable groups).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn current_state_locked<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, COALESCE(is_current, true) FROM claims \
+             WHERE id = ANY($1) \
+             /* {VISIBILITY:claims} */ \
+             ORDER BY id FOR NO KEY UPDATE OF claims",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, bool)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Fetch `(id, content)` for a batch of claim ids, current rows only.
     ///
     /// Lightweight companion to the structural enrichment in
@@ -5313,6 +5385,10 @@ impl ClaimRepository {
     /// retracted edge of an un-marked duplicate, is not followed). Only
     /// non-current claims are returned (a marked duplicate is retired).
     ///
+    /// The walk looks one step past the bound: a duplicate found there is not
+    /// returned, and [`MarkedDuplicates::chain_truncated`] says the chain went
+    /// on, so a caller never takes a cut-off chain for a whole one.
+    ///
     /// Filtered by `viewer` on every edge and claim it reads: a duplicate the
     /// viewer cannot read is not returned, so a caller that needs every
     /// duplicate must use a viewer that reads them all.
@@ -5327,15 +5403,18 @@ impl ClaimRepository {
         viewer: &crate::visibility::Viewer,
         canonicals: &[Uuid],
         cap: i64,
-    ) -> Result<Vec<MarkedDuplicateRow>, DbError> {
+    ) -> Result<MarkedDuplicates, DbError> {
         if cap < 0 {
             return Err(DbError::InvalidData {
                 reason: format!("an index-view read needs a non-negative cap, got {cap}"),
             });
         }
         if canonicals.is_empty() {
-            return Ok(Vec::new());
+            return Ok(MarkedDuplicates::default());
         }
+        // `walk` goes to depth $4 + 1; `hits` keeps what the viewer reads and
+        // marks the rows past the bound; `kept` is the capped answer. The
+        // final LEFT JOIN returns the flag even when nothing is kept.
         let sql = viewer.splice(
             r#"
             WITH RECURSIVE walk(canonical, dup, depth) AS (
@@ -5351,24 +5430,39 @@ impl ClaimRepository {
                   JOIN edges e ON e.target_id = w.dup
                  WHERE e.target_type = 'claim' AND e.source_type = 'claim'
                    AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
-                   AND w.depth < $4
+                   AND w.depth <= $4
                    /* {EDGE_VISIBILITY:e} */
+            ),
+            hits AS (
+                SELECT w.canonical, c.id, c.content,
+                       COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
+                       c.agent_id, k.agent_id AS canonical_agent_id,
+                       w.depth > $4 AS beyond
+                  FROM walk w
+                  JOIN claims c ON c.id = w.dup
+                  JOIN claims k ON k.id = w.canonical
+                 WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
+                   /* {VISIBILITY:c} */
+                   /* {VISIBILITY:k} */
+            ),
+            kept AS (
+                SELECT DISTINCT canonical, id, content, labels, created_at,
+                       agent_id, canonical_agent_id
+                  FROM hits
+                 WHERE NOT beyond
+                 ORDER BY canonical, id
+                 LIMIT $5
             )
-            SELECT DISTINCT w.canonical, c.id, c.content,
-                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
-                   c.agent_id, k.agent_id AS canonical_agent_id
-              FROM walk w
-              JOIN claims c ON c.id = w.dup
-              JOIN claims k ON k.id = w.canonical
-             WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
-               /* {VISIBILITY:c} */
-               /* {VISIBILITY:k} */
-             ORDER BY w.canonical, c.id
-             LIMIT $5
+            SELECT EXISTS (SELECT 1 FROM hits WHERE beyond) AS chain_truncated,
+                   kept.canonical, kept.id, kept.content, kept.labels, kept.created_at,
+                   kept.agent_id, kept.canonical_agent_id
+              FROM (SELECT 1) AS one
+              LEFT JOIN kept ON true
+             ORDER BY kept.canonical, kept.id
             "#,
             6,
         );
-        let mut q = sqlx::query_as::<_, MarkedDuplicateRow>(&sql)
+        let mut q = sqlx::query_as::<_, MarkedDuplicateWalkRow>(&sql)
             .bind(canonicals)
             .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
             .bind(DUPLICATE_IDENTITY_PROPERTY)
@@ -5377,7 +5471,26 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+        let walked = q.fetch_all(executor).await?;
+        let chain_truncated = walked.first().is_some_and(|r| r.chain_truncated);
+        let rows = walked
+            .into_iter()
+            .filter_map(|r| {
+                Some(MarkedDuplicateRow {
+                    canonical: r.canonical?,
+                    id: r.id?,
+                    content: r.content?,
+                    labels: r.labels?,
+                    created_at: r.created_at?,
+                    agent_id: r.agent_id?,
+                    canonical_agent_id: r.canonical_agent_id?,
+                })
+            })
+            .collect();
+        Ok(MarkedDuplicates {
+            rows,
+            chain_truncated,
+        })
     }
 
     /// The in-force dedup identity edge out of `dup` (`same_as` carrying

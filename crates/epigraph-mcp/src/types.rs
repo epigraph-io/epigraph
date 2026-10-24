@@ -3567,4 +3567,8 @@ pub struct LabelDedupIndexViewParams {
         description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
     )]
     pub max_claims: Option<i64>,
+    #[schemars(
+        description = "Leave out a duplicate whose author has another owner than the canonical's, as the plan does (default true); each one left out is listed in foreign_duplicates_ignored. false returns every duplicate"
+    )]
+    pub same_owner_only: Option<bool>,
 }

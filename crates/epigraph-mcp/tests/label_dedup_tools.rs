@@ -1831,6 +1831,129 @@ async fn a_strangers_duplicate_never_moves_a_members_dates(pool: PgPool) {
     assert_eq!(due["due"], "2026-10-01", "{plan}");
 }
 
+/// The index view applies the plan's owner rule by default: a duplicate a
+/// stranger (another owner) marked onto a member's public canonical, carrying
+/// a later deadline, is left out of `duplicates` and listed in
+/// `foreign_duplicates_ignored`, so a digest that takes dates from the view
+/// cannot be moved by it. The member's own duplicate is listed (control), and
+/// `same_owner_only: false` returns both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_duplicate_is_left_out_of_the_index_view(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-squatter").await;
+    let member = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station rehab | Acme Water Authority | due: 2026-10-01 | ref ACME-123456",
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let own = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Pump station rehab works | Acme Water Authority | due: 2026-10-15 | ref ACME-123456",
+        &["elsewhere"],
+        "2026-09-02T00:00:00Z",
+    )
+    .await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "public",
+        "Pump station rehab | Acme Water Authority | due: 2027-12-31 | ref ACME-123456",
+        &["elsewhere"],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    for dup in [own, theirs] {
+        epigraph_db::ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(member),
+            &epigraph_db::DuplicateProvenance::new("mark_duplicate", "caller_asserted"),
+        )
+        .await
+        .expect("mark");
+    }
+    drop(conn);
+
+    let view = |params: Value| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            first_text(
+                &label_dedup_index_view(
+                    server,
+                    viewer,
+                    serde_json::from_value::<LabelDedupIndexViewParams>(params).expect("params"),
+                    None,
+                )
+                .await
+                .expect("index view"),
+            )
+        }
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        sorted(
+            v["views"][0]["duplicates"]
+                .as_array()
+                .expect("duplicates")
+                .iter()
+                .map(|d| d["id"].as_str().expect("id").to_string())
+                .collect(),
+        )
+    };
+
+    let default = view(json!({"claim_ids": [member.to_string()]})).await;
+    assert_eq!(ids(&default), vec![own.to_string()], "{default}");
+    assert_eq!(
+        default["foreign_duplicates_ignored"],
+        json!([{"canonical": member.to_string(), "id": theirs.to_string()}]),
+        "{default}"
+    );
+    assert_eq!(default["truncated"], false, "{default}");
+
+    let all = view(json!({"claim_ids": [member.to_string()], "same_owner_only": false})).await;
+    assert_eq!(
+        ids(&all),
+        sorted(vec![own.to_string(), theirs.to_string()]),
+        "{all}"
+    );
+    assert_eq!(all["foreign_duplicates_ignored"], json!([]), "{all}");
+
+    // The owner rule runs AFTER the `max_claims` cap, so `truncated` keeps its
+    // meaning (more marked duplicates exist than were read) whichever owner
+    // the cut-off row has. With a cap of one, the row read is the first in id
+    // order: if it is the stranger's, nothing is listed and it is reported
+    // ignored; if it is the member's, it is listed. Either way the second
+    // duplicate was not read, so the view is truncated. Filtering before the
+    // cap would leave one row, within the cap, and report it whole.
+    let capped = view(json!({"claim_ids": [member.to_string()], "max_claims": 1})).await;
+    assert_eq!(capped["truncated"], true, "{capped}");
+    let first = std::cmp::min(own, theirs);
+    if first == theirs {
+        assert!(ids(&capped).is_empty(), "{capped}");
+        assert_eq!(
+            capped["foreign_duplicates_ignored"],
+            json!([{"canonical": member.to_string(), "id": theirs.to_string()}]),
+            "{capped}"
+        );
+    } else {
+        assert_eq!(ids(&capped), vec![own.to_string()], "{capped}");
+        assert_eq!(capped["foreign_duplicates_ignored"], json!([]), "{capped}");
+    }
+}
+
 /// The duplicates read is capped like the family read: a family whose one
 /// member fits `max_claims` but whose marked duplicates do not is TRUNCATED
 /// (apply refuses, nothing written), so a plan never closes a canonical on a
@@ -1898,6 +2021,347 @@ async fn duplicates_over_the_cap_truncate_the_read(pool: PgPool) {
         Some(1),
         "{view}"
     );
+}
+
+/// The duplicates walk stops at `MAX_DUPLICATE_CHAIN_DEPTH`; a chain that goes
+/// deeper must say so, not lose its tail silently. A chain of 17 marks
+/// (d17 -> d16 -> ... -> d1 -> canonical): read from d1 it is 16 deep and
+/// whole; read from the canonical it is TRUNCATED in the index view and in the
+/// plan (so apply refuses, nothing written), and d17 is never returned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_duplicate_chain_deeper_than_the_walk_bound_is_reported_truncated(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let canonical = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let bound =
+        usize::try_from(epigraph_db::repos::claim::MAX_DUPLICATE_CHAIN_DEPTH).expect("bound");
+    // chain[0] = d1 (marked onto the canonical) .. chain[bound] = d17.
+    let mut chain = Vec::with_capacity(bound + 1);
+    for i in 1..=bound + 1 {
+        chain.push(
+            seed(
+                &pool,
+                agent,
+                group,
+                "public",
+                &format!(
+                    "Pump station rehab link {i} | Acme Water Authority | due: 2026-11-20 \
+                     | ref ACME-9{i:05}"
+                ),
+                &["chain-link"],
+                "2026-09-01T00:00:00Z",
+            )
+            .await,
+        );
+    }
+    // Deepest first, so every mark's canonical is current when it is marked.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let mut marks: Vec<(Uuid, Uuid)> = (1..=bound)
+        .rev()
+        .map(|k| (chain[k], chain[k - 1]))
+        .collect();
+    marks.push((chain[0], canonical));
+    for (dup, canon) in marks {
+        epigraph_db::ClaimRepository::mark_duplicate_act_attributed_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canon),
+            &epigraph_db::DuplicateProvenance::new("test", "strong_id"),
+        )
+        .await
+        .expect("mark");
+    }
+    drop(conn);
+
+    let view_of = |id: Uuid| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            first_text(
+                &label_dedup_index_view(
+                    server,
+                    viewer,
+                    serde_json::from_value::<LabelDedupIndexViewParams>(
+                        json!({"claim_ids": [id.to_string()]}),
+                    )
+                    .expect("params"),
+                    None,
+                )
+                .await
+                .expect("index view"),
+            )
+        }
+    };
+    let dup_ids = |view: &Value| -> Vec<String> {
+        view["views"][0]["duplicates"]
+            .as_array()
+            .expect("duplicates")
+            .iter()
+            .map(|d| d["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+
+    // Control: exactly the bound deep, from d1. Whole, not truncated.
+    let whole = view_of(chain[0]).await;
+    assert_eq!(whole["truncated"], false, "{whole}");
+    assert_eq!(dup_ids(&whole).len(), bound, "{whole}");
+    assert!(
+        dup_ids(&whole).contains(&chain[bound].to_string()),
+        "d17 is 16 deep from d1: {whole}"
+    );
+
+    // One past the bound, from the canonical.
+    let deep = view_of(canonical).await;
+    assert_eq!(deep["truncated"], true, "{deep}");
+    assert_eq!(dup_ids(&deep).len(), bound, "{deep}");
+    assert!(
+        !dup_ids(&deep).contains(&chain[bound].to_string()),
+        "a duplicate past the bound is not returned: {deep}"
+    );
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    assert_eq!(plan["coverage"]["truncated"], true, "{plan}");
+    let mut ids = chain.clone();
+    ids.push(canonical);
+    let before = snapshot(&pool, &ids).await;
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(out["status"], "refused", "{out}");
+    assert_eq!(out["refusal"]["code"], "TRUNCATED", "{out}");
+    assert_eq!(snapshot(&pool, &ids).await, before, "nothing written");
+}
+
+/// apply's canonical check holds its answer to the unit's commit. A
+/// retirement of the canonical that is in flight (uncommitted) when apply
+/// checks it is waited for and read, so the unit refuses ("no longer
+/// current") instead of marking onto a claim that is retired a moment later,
+/// a chain the plan never showed. The other unit of the same apply, whose
+/// canonical nobody touches, applies (positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_canonical_retired_while_apply_checks_it_is_never_marked_onto(pool: PgPool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let pump = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let roof = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF,
+        &[FAMILY],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        ROOF_B,
+        &[FAMILY],
+        "2026-08-02T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let mark_of = |member: Uuid| -> (String, Uuid, Uuid) {
+        for u in unit_writes(&plan) {
+            for m in u["marks"].as_array().cloned().unwrap_or_default() {
+                if m["dup"] == member.to_string() || m["canonical"] == member.to_string() {
+                    let id = |k: &str| m[k].as_str().expect(k).parse::<Uuid>().expect(k);
+                    return (
+                        u["unit"].as_str().expect("unit").to_string(),
+                        id("dup"),
+                        id("canonical"),
+                    );
+                }
+            }
+        }
+        panic!("no mark for {member}: {plan}")
+    };
+    let (raced_unit, raced_dup, raced_canonical) = mark_of(pump);
+    let (calm_unit, calm_dup, calm_canonical) = mark_of(roof);
+    assert_ne!(raced_unit, calm_unit, "two units: {plan}");
+
+    // The retirement, in flight: the row is updated and the transaction open.
+    let mut retire = pool.begin().await.expect("begin");
+    let retire_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *retire)
+        .await
+        .expect("pid");
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(raced_canonical)
+    .execute(&mut *retire)
+    .await
+    .expect("retire the canonical");
+
+    let done = AtomicBool::new(false);
+    let apply = async {
+        let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+        done.store(true, Ordering::SeqCst);
+        out
+    };
+    // Commit the retirement once apply has finished, or is waiting on it.
+    let race = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(retire_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("blocked backends");
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "apply neither finished nor waited on the in-flight retirement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        retire.commit().await.expect("commit the retirement");
+    };
+    let (out, ()) = tokio::join!(apply, race);
+
+    let raced = result_for(&out, &raced_unit);
+    assert_eq!(raced["ok"], false, "{out}");
+    assert_eq!(raced["code"], "MARK_REFUSED", "{out}");
+    assert!(
+        raced["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no longer current")),
+        "{out}"
+    );
+    assert!(!is_marked_onto(&pool, raced_dup, raced_canonical).await);
+    assert_eq!(identity_edges(&pool, raced_dup).await, 0, "no chain built");
+    assert!(
+        snapshot(&pool, &[raced_dup]).await[&raced_dup].is_current,
+        "the raced duplicate stays current"
+    );
+
+    assert_eq!(result_for(&out, &calm_unit)["ok"], true, "{out}");
+    assert!(is_marked_onto(&pool, calm_dup, calm_canonical).await);
+}
+
+/// The plan is a prediction and takes no row lock on a canonical: with a
+/// write to the canonical in flight (uncommitted), `plan_label_dedup` returns
+/// promptly and predicts from the committed state (the canonical still
+/// current, the unit applies), instead of queueing behind that write or
+/// holding a lock that would block it. Only apply locks the canonical, on the
+/// unit's own transaction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_plan_neither_waits_on_nor_locks_a_canonical_being_written(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let pump = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let before = plan_ok(&server, &viewer, p.clone(), None).await;
+    let (unit, canonical) = unit_writes(&before)
+        .iter()
+        .find_map(|u| {
+            u["marks"].as_array().and_then(|ms| {
+                ms.iter()
+                    .find(|m| m["dup"] == pump.to_string() || m["canonical"] == pump.to_string())
+                    .map(|m| {
+                        (
+                            u["unit"].as_str().expect("unit").to_string(),
+                            m["canonical"]
+                                .as_str()
+                                .expect("canonical")
+                                .parse::<Uuid>()
+                                .expect("uuid"),
+                        )
+                    })
+            })
+        })
+        .unwrap_or_else(|| panic!("no mark for the pump family: {before}"));
+    assert_eq!(unit_check(&before, &unit)["applies"], true, "{before}");
+
+    // A write to the canonical, in flight: the row is updated, not committed.
+    let mut writer = pool.begin().await.expect("begin");
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&mut *writer)
+    .await
+    .expect("write the canonical");
+
+    let during = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        plan_ok(&server, &viewer, p.clone(), None),
+    )
+    .await
+    .expect("the plan waited on an uncommitted write to a canonical: it took a row lock");
+    assert_eq!(
+        unit_check(&during, &unit)["applies"],
+        true,
+        "the prediction reads the committed state: {during}"
+    );
+    writer.rollback().await.expect("rollback the write");
 }
 
 /// The index view reads through the caller's viewer: a stranger asking for a
