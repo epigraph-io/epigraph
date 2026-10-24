@@ -32,18 +32,32 @@ async fn get(addr: &std::net::SocketAddr, token: &str, path: &str) -> (u16, Valu
     (status, body)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn claim_listings_refuse_filters_they_cannot_honor() {
+async fn app_and_token(
+    scopes: &[&str],
+) -> (
+    sqlx::PgPool,
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    String,
+    Uuid,
+) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&url)
         .await
         .unwrap();
-    let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let (token, client) = common::test_bearer_token_with_seeded_client(&pool, scopes).await;
+    (pool, addr, shutdown, token, client)
+}
 
-    // Legacy /claims: each of these used to answer 200 with an unfiltered page.
+/// Legacy `GET /claims`: each of these used to answer 200 with an unfiltered
+/// page.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_claims_refuses_filters_it_cannot_honor() {
+    let (_pool, addr, _shutdown, token, _) = app_and_token(&["claims:read"]).await;
+
     for (path, field) in [
         (
             "/claims?created_after=2999-01-01T00:00:00Z",
@@ -67,8 +81,13 @@ async fn claim_listings_refuse_filters_they_cannot_honor() {
             "{path}: the refusal must name the endpoint that honours it; got {reason}"
         );
     }
+}
 
-    // /api/v1/claims has no label predicate: refuse rather than drop.
+/// `GET /api/v1/claims` has no label predicate: refuse rather than drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_claims_refuses_label_filters_it_cannot_honor() {
+    let (_pool, addr, _shutdown, token, _) = app_and_token(&["claims:read"]).await;
+
     for (path, field) in [
         ("/api/v1/claims?labels=backlog", "labels"),
         ("/api/v1/claims?limit=5&label=backlog", "label"),
@@ -78,6 +97,7 @@ async fn claim_listings_refuse_filters_they_cannot_honor() {
             status, 400,
             "GET {path} must refuse a label filter it cannot honour; got {status} body={body}"
         );
+        assert_eq!(body["error"], "ValidationError", "{path}: {body}");
         assert_eq!(body["details"]["field"], field, "{path}: {body}");
         let reason = body["details"]["reason"].as_str().unwrap_or_default();
         assert!(
@@ -88,17 +108,18 @@ async fn claim_listings_refuse_filters_they_cannot_honor() {
 }
 
 /// Controls: the parameters each endpoint DOES accept still answer 200, so the
-/// refusal above is a targeted list, not a blanket deny.
+/// refusals above are a targeted list, not a blanket deny. And the time filter
+/// `/api/v1/claims` keeps is really applied, calibrated in both directions on a
+/// claim this token's viewer can see.
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_listings_still_accept_the_parameters_they_honor() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-    let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
+    let (pool, addr, _shutdown, token, client) = app_and_token(&["claims:read"]).await;
+    common::seed_claim_writable_by_client(
+        &pool,
+        &format!("filter params visible claim {}", Uuid::new_v4()),
+        client,
+    )
+    .await;
 
     let agent = Uuid::new_v4();
     for path in [
@@ -112,15 +133,32 @@ async fn claim_listings_still_accept_the_parameters_they_honor() {
         assert_eq!(status, 200, "GET {path} must still succeed; body={body}");
     }
 
-    // The honoured time filter really filters: nothing is created after 2999.
-    let (_, body) = get(
+    let total = |body: &Value| body["total"].as_i64().unwrap_or(-1);
+    let (_, unfiltered) = get(&addr, &token, "/api/v1/claims?limit=5").await;
+    assert!(
+        total(&unfiltered) >= 1,
+        "CALIBRATION: the seeded public claim is visible unfiltered: {unfiltered}"
+    );
+    let (_, since_1970) = get(
+        &addr,
+        &token,
+        "/api/v1/claims?created_after=1970-01-01T00:00:00Z&limit=5",
+    )
+    .await;
+    assert!(
+        total(&since_1970) >= 1,
+        "CALIBRATION: a created_after every claim satisfies keeps it: {since_1970}"
+    );
+    let (_, since_2999) = get(
         &addr,
         &token,
         "/api/v1/claims?created_after=2999-01-01T00:00:00Z&limit=5",
     )
     .await;
     assert_eq!(
-        body["total"], 0,
-        "created_after is honoured on /api/v1/claims: {body}"
+        total(&since_2999),
+        0,
+        "created_after is honoured on /api/v1/claims: nothing is created after 2999: \
+         {since_2999}"
     );
 }
