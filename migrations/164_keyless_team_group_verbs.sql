@@ -1,0 +1,559 @@
+-- 164: maintenance-only, audited verbs for KEYLESS team groups.
+--
+-- ===================================================================
+-- 1. WHAT THIS ADDS
+--
+-- Four SECURITY DEFINER functions, owned by `epigraph_maintenance` and
+-- executable by that role alone (the operator CLI's `create-group` and
+-- `group-member add|remove|set-role`, on the maintenance DSN):
+--
+--   epigraph_create_team_group(name, admin, reason)            -> group id
+--   epigraph_team_group_add_member(group, agent, role, reason)
+--   epigraph_team_group_remove_member(group, agent, reason)
+--   epigraph_team_group_set_member_role(group, agent, role, reason)
+--
+-- Before this file the only way to create a non-personal group was the keyed
+-- REST route: a 32-byte group public key, a key epoch, a 60-byte wrapped share
+-- per member, and a standing admin-only scope for every roster change. The seal
+-- that key material served is retired; a team group is now a visibility
+-- boundary, not an encryption one ("invisible, not encrypted").
+--
+-- KEYLESS, in the shape 105's personal groups already have: `public_key` is
+-- empty, NO `group_key_epochs` row is written, and every membership carries an
+-- empty `wrapped_key_share`. `did_key` is `did:epigraph:group:<id>` (the
+-- community precedent, `did:epigraph:community:<id>`), so it is unique by
+-- construction and claims nothing about a key. `groups_public_key_shape` (060)
+-- required exactly 32 bytes for `kind = 'team'`; section 2 relaxes it to 0 OR
+-- 32, so existing keyed team groups stay valid.
+--
+-- The keyed REST member routes refuse a keyless group ("no current key
+-- epoch"); that is intended. A keyless group's roster changes only through
+-- these verbs.
+--
+-- ===================================================================
+-- 2. THE RULES EACH VERB HOLDS ITSELF
+--
+-- Every verb runs on a maintenance session, so `epigraph_bypass()` is true for
+-- every row it writes. That switches off three guards that protect this table
+-- on every other path: 109's retired-writer trigger and identity trigger,
+-- 122's `group_memberships_operator_scope` trigger (its exemption admits a
+-- privileged session; it is also quiet on an unarmed database), and 092's
+-- roster-bounded creator arm (a policy, which a bypass session never meets).
+-- So the verbs restate the rules in their own bodies, armed or not:
+--
+--   * THE ADMIN IS A HUMAN. The creator, and anyone made `admin`, must be a
+--     registered human operator (`epigraph_is_human_operator`: a live registry
+--     row AND its recorded human client active). `groups.created_by_agent_id`
+--     is that Person. (GRP01)
+--   * A MEMBER BELONGS TO A LIVE HUMAN. `epigraph_human_of(agent, live)` must
+--     name a registered human operator: the agent itself, the operator of its
+--     LIVE link, or the operator of its 149 client allowance. An unbound agent,
+--     a RETIRED-linked identity (zero authority, 107 section 7) and an agent
+--     whose operator was revoked from the registry are refused. (GRP04)
+--   * AN OPERATED AGENT IS A MEMBER ONLY WHERE ITS OPERATOR WRITES, at any
+--     role: its human must hold a live `writer`/`admin` row in the group
+--     (`epigraph_operator_writes_group`). 122 refuses only writer/admin rows;
+--     a reader row is held to the same rule here because reading a group the
+--     operator cannot read is the same cross-human leak in the read direction.
+--     An operated agent is never an `admin`. (GRP03 / GRP01)
+--   * NO STRANDED AGENTS. A human cannot be removed, nor demoted to `reader`,
+--     while an agent of theirs is a live member: remove the agents first. The
+--     alternative (revoke them in the same act) was not taken because it turns
+--     one audited act into several unannounced ones. (GRP03)
+--   * THE LAST LIVE ADMIN STAYS. Removing or demoting the group's only live
+--     `admin` is refused, decided under a `FOR UPDATE` lock on the `groups`
+--     row that every verb takes first, so two concurrent removals of two
+--     admins cannot both pass. (GRP02)
+--   * ONLY KEYLESS TEAM GROUPS. The member verbs refuse any group that is not
+--     `kind = 'team'` with an empty key and status `active`: personal groups
+--     (107's link path), community groups (106), world and seed, and keyed
+--     team groups each have their own roster path. (GRP05)
+--   * ONE ACTIVE TEAM GROUP PER NAME (case and surrounding space ignored),
+--     so a repeated `create-group --apply` cannot mint a second group. (GRP06)
+--
+-- 109's identity rule holds by construction: no verb changes a row's
+-- `group_id` or `agent_id`.
+--
+-- ===================================================================
+-- 3. THE ROSTER IS A LEDGER
+--
+-- A removal is `UPDATE ... SET revoked_at = now()`, never a DELETE (106 took
+-- DELETE from the application role; the maintenance role never had it, 070).
+-- A re-add after a removal INSERTS A NEW ROW at the next `epoch` for that
+-- (group, agent) pair: `UNIQUE (group_id, agent_id, epoch)` would collide with
+-- the revoked epoch-0 row, and reviving that row would erase when the member
+-- left. The epoch carries no key meaning on a keyless group; it is the row's
+-- sequence number. A role change updates the live row in place; the prior role
+-- is in its audit row.
+--
+-- ===================================================================
+-- 4. AUDIT
+--
+-- Every applied act writes one `security_events` row, attributed to the
+-- member (or the admin, for a creation): `group.team_created`,
+-- `group.member_added`, `group.member_removed`, `group.member_role_set`, with
+-- the group, member, roles, epoch, reason and `session_user` in `details`. A
+-- no-op (re-adding a member at its current role, removing a non-member,
+-- setting the role it already has) writes nothing. The `group.` event family
+-- is reserved (a RESTRICTIVE insert policy in the 123 / 148 shape), so the
+-- application role cannot forge a roster act.
+--
+-- ===================================================================
+-- 5. GRANTS
+--
+-- EXECUTE is revoked from PUBLIC and from `epigraph_app` and granted to
+-- `epigraph_maintenance` only; each body also refuses a session that is not a
+-- maintenance member or a superuser (defence in depth if a later migration
+-- grants too widely). The owner (`epigraph_maintenance`) already holds
+-- SELECT/INSERT/UPDATE on the three tables written (070) and EXECUTE on the
+-- helpers read (122 and 149 own them by the same role). The `OWNER TO` block
+-- is role-guarded like every such block since 060 and can silently no-op;
+-- `tenancy_backfill.rs`'s register and `schema_contract.rs` pin the owner.
+--
+-- ===================================================================
+-- UNDO
+--
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_set_member_role(uuid, uuid, text, text);
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_remove_member(uuid, uuid, text);
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_add_member(uuid, uuid, text, text);
+-- DROP FUNCTION IF EXISTS public.epigraph_create_team_group(text, uuid, text);
+-- DROP POLICY IF EXISTS security_events_group_roster_privileged ON public.security_events;
+-- and, ONLY when no keyless team group exists, restore 060's
+-- `groups_public_key_shape` text. Groups and memberships the verbs wrote stay
+-- (060 refuses deleting groups; the roster is a ledger), as do their audit
+-- rows (082: immutable).
+-- **Applied to throwaway databases only, NOT to any deployed database.**
+-- ===================================================================
+
+SET LOCAL lock_timeout = '3s';
+
+-- Section 1: a team group may be keyless.
+ALTER TABLE public.groups DROP CONSTRAINT IF EXISTS groups_public_key_shape;
+ALTER TABLE public.groups ADD CONSTRAINT groups_public_key_shape CHECK (
+       (kind = 'team' AND octet_length(public_key) IN (0, 32))
+    OR (kind <> 'team' AND octet_length(public_key) = 0));
+
+-- Section 4: the `group.` audit family is written only by a privileged session
+-- or a definer frame. The row-only arm says WHICH rows the restriction applies
+-- to and grants nothing. length('group.') = 6.
+DROP POLICY IF EXISTS security_events_group_roster_privileged ON public.security_events;
+CREATE POLICY security_events_group_roster_privileged ON public.security_events
+    AS RESTRICTIVE FOR INSERT TO PUBLIC
+    WITH CHECK (
+        lower(left(btrim(event_type), 6)) <> 'group.'
+        OR (((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()))
+            AND created_at = now()));
+
+-- -------------------------------------------------------------------
+-- create
+-- -------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.epigraph_create_team_group(
+    p_name text, p_admin uuid, p_reason text)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_group uuid := gen_random_uuid();
+    v_name  text := btrim(p_name);
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_create_team_group: only a maintenance session creates a team '
+                        'group' USING ERRCODE = '42501';
+    END IF;
+    IF v_name IS NULL OR v_name = '' OR p_admin IS NULL
+       OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'epigraph_create_team_group: a name, an admin and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF length(v_name) > 255 THEN
+        RAISE EXCEPTION 'epigraph_create_team_group: the name is longer than 255 characters'
+            USING ERRCODE = '22001';
+    END IF;
+    IF NOT public.epigraph_is_human_operator(p_admin) THEN
+        RAISE EXCEPTION 'GRP01: agent % is not a registered human operator; a team group''s '
+                        'admin is a Person', p_admin
+            USING ERRCODE = 'GRP01',
+                  HINT = 'Register the human first: epigraph-operator register-human-operator.';
+    END IF;
+    -- Serialise two creations of the same name; the check below then sees the
+    -- first one's committed row.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.team_group_name:' || lower(v_name)));
+    IF EXISTS (SELECT 1 FROM public.groups g
+                WHERE g.kind = 'team' AND g.status = 'active'
+                  AND lower(btrim(g.display_name)) = lower(v_name)) THEN
+        RAISE EXCEPTION 'GRP06: an active team group named % already exists; nothing was '
+                        'created', v_name
+            USING ERRCODE = 'GRP06';
+    END IF;
+
+    INSERT INTO public.groups (id, display_name, did_key, public_key, kind, created_by_agent_id)
+    VALUES (v_group, v_name, 'did:epigraph:group:' || v_group::text, ''::bytea, 'team',
+            p_admin);
+    INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
+    VALUES (v_group, p_admin, ''::bytea, 0, 'admin');
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('group.team_created', p_admin, true,
+            jsonb_build_object('group_id', v_group, 'display_name', v_name, 'kind', 'team',
+                               'admin', p_admin, 'reason', p_reason,
+                               'session_user', session_user::text));
+    RETURN v_group;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) FROM PUBLIC;
+
+-- -------------------------------------------------------------------
+-- add
+-- -------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_add_member(
+    p_group uuid, p_agent uuid, p_role text, p_reason text)
+RETURNS TABLE (out_membership_id uuid, out_applied boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_kind      text;
+    v_key_len   integer;
+    v_status    text;
+    v_human     uuid;
+    v_live_id   uuid;
+    v_live_role text;
+    v_epoch     integer;
+    v_id        uuid;
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_team_group_add_member: only a maintenance session changes a '
+                        'team group roster' USING ERRCODE = '42501';
+    END IF;
+    IF p_group IS NULL OR p_agent IS NULL OR p_role IS NULL
+       OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'epigraph_team_group_add_member: a group, an agent, a role and a '
+                        'reason are required' USING ERRCODE = '22004';
+    END IF;
+    IF p_role NOT IN ('reader', 'writer', 'admin') THEN
+        RAISE EXCEPTION 'epigraph_team_group_add_member: role % is not reader, writer or admin',
+                        p_role USING ERRCODE = '22023';
+    END IF;
+
+    -- The group row lock first: every roster verb takes it, so roster
+    -- decisions on one group are serialised.
+    SELECT g.kind::text, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_key_len, v_status
+      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'epigraph_team_group_add_member: group % does not exist', p_group
+            USING ERRCODE = '22023';
+    END IF;
+    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
+                        'bytes, status %); its roster has its own path', p_group, v_kind,
+                        v_key_len, v_status
+            USING ERRCODE = 'GRP05';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_team_group_add_member: agent % does not exist', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Serialised with every link write (107 section 10), so a link or retire
+    -- cannot change the answer below between the read and the INSERT.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    v_human := public.epigraph_human_of(p_agent, true);
+    IF v_human IS NULL OR NOT public.epigraph_is_human_operator(v_human) THEN
+        RAISE EXCEPTION 'GRP04: agent % belongs to no live human operator (it is unbound, '
+                        'retired-linked, or its operator''s registration is revoked); it '
+                        'cannot be a member', p_agent
+            USING ERRCODE = 'GRP04';
+    END IF;
+    IF v_human <> p_agent THEN
+        IF p_role = 'admin' THEN
+            RAISE EXCEPTION 'GRP01: agent % is operated by %, and a team group''s admin is a '
+                            'Person', p_agent, v_human
+                USING ERRCODE = 'GRP01';
+        END IF;
+        IF NOT public.epigraph_operator_writes_group(v_human, p_group) THEN
+            RAISE EXCEPTION 'GRP03: agent % is operated by %, which holds no live writer or '
+                            'admin membership in group %; an operated agent is a member only '
+                            'where its operator writes', p_agent, v_human, p_group
+                USING ERRCODE = 'GRP03',
+                      HINT = 'Add the operator as a writer first.';
+        END IF;
+    END IF;
+
+    SELECT m.id, m.role::text INTO v_live_id, v_live_role
+      FROM public.group_memberships m
+     WHERE m.group_id = p_group AND m.agent_id = p_agent AND m.revoked_at IS NULL;
+    IF v_live_id IS NOT NULL THEN
+        IF v_live_role = p_role THEN
+            RETURN QUERY SELECT v_live_id, false;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'epigraph_team_group_add_member: agent % is already a live % of group '
+                        '%; change the role with set-role', p_agent, v_live_role, p_group
+            USING ERRCODE = '55000';
+    END IF;
+
+    -- Section 3: a new row at the next epoch, never a revival.
+    SELECT COALESCE(max(m.epoch) + 1, 0) INTO v_epoch
+      FROM public.group_memberships m
+     WHERE m.group_id = p_group AND m.agent_id = p_agent;
+    INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
+    VALUES (p_group, p_agent, ''::bytea, v_epoch, p_role)
+    RETURNING id INTO v_id;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('group.member_added', p_agent, true,
+            jsonb_build_object('group_id', p_group, 'member', p_agent, 'role', p_role,
+                               'epoch', v_epoch, 'membership_id', v_id,
+                               'operator', CASE WHEN v_human <> p_agent THEN v_human END,
+                               'reason', p_reason, 'session_user', session_user::text));
+    RETURN QUERY SELECT v_id, true;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_add_member(uuid, uuid, text, text)
+    FROM PUBLIC;
+
+-- -------------------------------------------------------------------
+-- remove (a revoke)
+-- -------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_remove_member(
+    p_group uuid, p_agent uuid, p_reason text)
+RETURNS TABLE (out_membership_id uuid, out_applied boolean, out_prior_role text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_kind      text;
+    v_key_len   integer;
+    v_status    text;
+    v_live_id   uuid;
+    v_live_role text;
+    v_operated  integer;
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_team_group_remove_member: only a maintenance session changes '
+                        'a team group roster' USING ERRCODE = '42501';
+    END IF;
+    IF p_group IS NULL OR p_agent IS NULL OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'epigraph_team_group_remove_member: a group, an agent and a reason are '
+                        'required' USING ERRCODE = '22004';
+    END IF;
+
+    SELECT g.kind::text, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_key_len, v_status
+      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'epigraph_team_group_remove_member: group % does not exist', p_group
+            USING ERRCODE = '22023';
+    END IF;
+    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
+                        'bytes, status %); its roster has its own path', p_group, v_kind,
+                        v_key_len, v_status
+            USING ERRCODE = 'GRP05';
+    END IF;
+
+    SELECT m.id, m.role::text INTO v_live_id, v_live_role
+      FROM public.group_memberships m
+     WHERE m.group_id = p_group AND m.agent_id = p_agent AND m.revoked_at IS NULL;
+    IF v_live_id IS NULL THEN
+        RETURN QUERY SELECT NULL::uuid, false, NULL::text;
+        RETURN;
+    END IF;
+
+    IF v_live_role = 'admin' AND NOT EXISTS (
+           SELECT 1 FROM public.group_memberships m
+            WHERE m.group_id = p_group AND m.agent_id <> p_agent
+              AND m.role = 'admin' AND m.revoked_at IS NULL) THEN
+        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group %; add another admin '
+                        'first', p_agent, p_group
+            USING ERRCODE = 'GRP02';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    SELECT count(*) INTO v_operated
+      FROM public.group_memberships m
+     WHERE m.group_id = p_group AND m.agent_id <> p_agent AND m.revoked_at IS NULL
+       AND public.epigraph_human_of(m.agent_id, true) = p_agent;
+    IF v_operated > 0 THEN
+        RAISE EXCEPTION 'GRP03: % agent(s) operated by % are live members of group %; remove '
+                        'them first, an operated agent is a member only where its operator '
+                        'writes', v_operated, p_agent, p_group
+            USING ERRCODE = 'GRP03';
+    END IF;
+
+    UPDATE public.group_memberships SET revoked_at = now() WHERE id = v_live_id;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('group.member_removed', p_agent, true,
+            jsonb_build_object('group_id', p_group, 'member', p_agent,
+                               'prior_role', v_live_role, 'membership_id', v_live_id,
+                               'reason', p_reason, 'session_user', session_user::text));
+    RETURN QUERY SELECT v_live_id, true, v_live_role;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_remove_member(uuid, uuid, text)
+    FROM PUBLIC;
+
+-- -------------------------------------------------------------------
+-- set-role
+-- -------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_set_member_role(
+    p_group uuid, p_agent uuid, p_role text, p_reason text)
+RETURNS TABLE (out_membership_id uuid, out_applied boolean, out_prior_role text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_kind      text;
+    v_key_len   integer;
+    v_status    text;
+    v_live_id   uuid;
+    v_live_role text;
+    v_human     uuid;
+    v_operated  integer;
+    v_rank_old  integer;
+    v_rank_new  integer;
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_team_group_set_member_role: only a maintenance session '
+                        'changes a team group roster' USING ERRCODE = '42501';
+    END IF;
+    IF p_group IS NULL OR p_agent IS NULL OR p_role IS NULL
+       OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'epigraph_team_group_set_member_role: a group, an agent, a role and a '
+                        'reason are required' USING ERRCODE = '22004';
+    END IF;
+    IF p_role NOT IN ('reader', 'writer', 'admin') THEN
+        RAISE EXCEPTION 'epigraph_team_group_set_member_role: role % is not reader, writer or '
+                        'admin', p_role USING ERRCODE = '22023';
+    END IF;
+
+    SELECT g.kind::text, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_key_len, v_status
+      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'epigraph_team_group_set_member_role: group % does not exist', p_group
+            USING ERRCODE = '22023';
+    END IF;
+    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
+                        'bytes, status %); its roster has its own path', p_group, v_kind,
+                        v_key_len, v_status
+            USING ERRCODE = 'GRP05';
+    END IF;
+
+    SELECT m.id, m.role::text INTO v_live_id, v_live_role
+      FROM public.group_memberships m
+     WHERE m.group_id = p_group AND m.agent_id = p_agent AND m.revoked_at IS NULL;
+    IF v_live_id IS NULL THEN
+        RAISE EXCEPTION 'epigraph_team_group_set_member_role: agent % is not a live member of '
+                        'group %; add it instead', p_agent, p_group
+            USING ERRCODE = '55000';
+    END IF;
+    IF v_live_role = p_role THEN
+        RETURN QUERY SELECT v_live_id, false, v_live_role;
+        RETURN;
+    END IF;
+
+    v_rank_old := CASE v_live_role WHEN 'reader' THEN 1 WHEN 'writer' THEN 2 ELSE 3 END;
+    v_rank_new := CASE p_role WHEN 'reader' THEN 1 WHEN 'writer' THEN 2 ELSE 3 END;
+
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    v_human := public.epigraph_human_of(p_agent, true);
+    -- A PROMOTION meets add's eligibility rules again: the member must still
+    -- belong to a live human, an operated agent may rise only where its
+    -- operator writes, and only a Person is an admin. A demotion is always
+    -- eligible (it is how a stale row is narrowed), subject to the two
+    -- roster rules below.
+    IF v_rank_new > v_rank_old THEN
+        IF v_human IS NULL OR NOT public.epigraph_is_human_operator(v_human) THEN
+            RAISE EXCEPTION 'GRP04: agent % belongs to no live human operator; it cannot be '
+                            'promoted', p_agent
+                USING ERRCODE = 'GRP04';
+        END IF;
+        IF p_role = 'admin' AND v_human <> p_agent THEN
+            RAISE EXCEPTION 'GRP01: agent % is operated by %, and a team group''s admin is a '
+                            'Person', p_agent, v_human
+                USING ERRCODE = 'GRP01';
+        END IF;
+        IF v_human <> p_agent
+           AND NOT public.epigraph_operator_writes_group(v_human, p_group) THEN
+            RAISE EXCEPTION 'GRP03: agent % is operated by %, which holds no live writer or '
+                            'admin membership in group %; an operated agent is a member only '
+                            'where its operator writes', p_agent, v_human, p_group
+                USING ERRCODE = 'GRP03';
+        END IF;
+    END IF;
+
+    IF v_live_role = 'admin' AND NOT EXISTS (
+           SELECT 1 FROM public.group_memberships m
+            WHERE m.group_id = p_group AND m.agent_id <> p_agent
+              AND m.role = 'admin' AND m.revoked_at IS NULL) THEN
+        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group %; add another admin '
+                        'first', p_agent, p_group
+            USING ERRCODE = 'GRP02';
+    END IF;
+
+    IF p_role = 'reader' THEN
+        SELECT count(*) INTO v_operated
+          FROM public.group_memberships m
+         WHERE m.group_id = p_group AND m.agent_id <> p_agent AND m.revoked_at IS NULL
+           AND public.epigraph_human_of(m.agent_id, true) = p_agent;
+        IF v_operated > 0 THEN
+            RAISE EXCEPTION 'GRP03: % agent(s) operated by % are live members of group %; '
+                            'remove them before demoting their operator to reader',
+                            v_operated, p_agent, p_group
+                USING ERRCODE = 'GRP03';
+        END IF;
+    END IF;
+
+    UPDATE public.group_memberships SET role = p_role WHERE id = v_live_id;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('group.member_role_set', p_agent, true,
+            jsonb_build_object('group_id', p_group, 'member', p_agent,
+                               'prior_role', v_live_role, 'role', p_role,
+                               'membership_id', v_live_id, 'reason', p_reason,
+                               'session_user', session_user::text));
+    RETURN QUERY SELECT v_live_id, true, v_live_role;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_set_member_role(uuid, uuid, text, text)
+    FROM PUBLIC;
+
+-- Section 5: ownership and grants, guarded as every such block since 060.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_create_team_group(text, uuid, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_team_group_add_member(uuid, uuid, text, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_team_group_remove_member(uuid, uuid, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION '
+                'public.epigraph_team_group_set_member_role(uuid, uuid, text, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_add_member(uuid, uuid, text, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_remove_member(uuid, uuid, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_set_member_role(uuid, uuid, text, text) '
+                'TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_add_member(uuid, uuid, text, text) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_remove_member(uuid, uuid, text) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_team_group_set_member_role(uuid, uuid, text, text) '
+                'FROM epigraph_app';
+    END IF;
+END $$;

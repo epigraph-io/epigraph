@@ -1917,6 +1917,20 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every keyed identity a legacy row it must never have (quiet, and in the
     // direction of binding a key that never signs).
     ("epigraph_backfill_legacy_agent_keys", 161),
+    // 164, the keyless team-group verbs. Each body refuses any session that is
+    // not a maintenance member (or a superuser), and the FORCEd reads it makes
+    // (`groups`, `group_memberships`) are admitted by the CALLER's
+    // `epigraph_bypass()` arm, which keys on `session_user`, so a wrong owner
+    // does not filter them. The owner decides the table privileges the writes
+    // run with: under an application-role owner the `groups` /
+    // `group_memberships` / `security_events` writes fail CLOSED (42501, loud);
+    // under the migrating superuser (a no-opped `OWNER TO`) they keep working
+    // with more authority than intended (083's case). Registered so the re-own
+    // ratchet sees every 164 definer.
+    ("epigraph_create_team_group", 164),
+    ("epigraph_team_group_add_member", 164),
+    ("epigraph_team_group_remove_member", 164),
+    ("epigraph_team_group_set_member_role", 164),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2532,6 +2546,28 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_backfill_legacy_agent_keys",
             "public.epigraph_backfill_legacy_agent_keys()",
+            false,
+        ),
+        // 164: creating a team group and changing its roster are maintenance
+        // acts; the request DSN must never call them.
+        (
+            "epigraph_create_team_group",
+            "public.epigraph_create_team_group(text, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_add_member",
+            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_remove_member",
+            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_set_member_role",
+            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
             false,
         ),
     ];

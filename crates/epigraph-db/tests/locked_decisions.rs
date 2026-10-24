@@ -1507,6 +1507,15 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO public.system_agents",
         "UPDATE system_agents",
         "DELETE FROM system_agents",
+        // Migration 164: a keyless team group is created, and its roster
+        // changed, ONLY by the operator CLI (`create-group` / `group-member`,
+        // its library module allowed below), on the maintenance DSN where the
+        // definers SUCCEED. The bind-call shapes, not the bare names, because
+        // `tenancy_backfill.rs` names the definers in its registers.
+        "epigraph_create_team_group($",
+        "epigraph_team_group_add_member($",
+        "epigraph_team_group_remove_member($",
+        "epigraph_team_group_set_member_role($",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1598,6 +1607,8 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         // 148: the operator's system-agent registration, on the maintenance
         // DSN.
         "epigraph-cli/src/operator/system_agent.rs",
+        // 164: the operator's team-group verbs, on the maintenance DSN.
+        "epigraph-cli/src/operator/team_group.rs",
     ];
 
     let mut offenders: Vec<String> = Vec::new();

@@ -1557,6 +1557,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or 161's registration definer.",
         ),
+        (
+            "security_events_group_roster_privileged",
+            "group.",
+            "164's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 6) <> \
+             'group.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             other row still needs 077's attribution arms; a `group.*` row needs one of the two \
+             session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the \
+             maintenance session or one of 164's team-group definers.",
+        ),
     ];
 
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
