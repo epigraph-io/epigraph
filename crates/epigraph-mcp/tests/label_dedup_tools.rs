@@ -1930,6 +1930,7 @@ async fn a_strangers_duplicate_is_left_out_of_the_index_view(pool: PgPool) {
         "{all}"
     );
     assert_eq!(all["foreign_duplicates_ignored"], json!([]), "{all}");
+
 }
 
 /// The duplicates read is capped like the family read: a family whose one
@@ -2260,6 +2261,86 @@ async fn a_canonical_retired_while_apply_checks_it_is_never_marked_onto(pool: Pg
 
     assert_eq!(result_for(&out, &calm_unit)["ok"], true, "{out}");
     assert!(is_marked_onto(&pool, calm_dup, calm_canonical).await);
+}
+
+/// The plan is a prediction and takes no row lock on a canonical: with a
+/// write to the canonical in flight (uncommitted), `plan_label_dedup` returns
+/// promptly and predicts from the committed state (the canonical still
+/// current, the unit applies), instead of queueing behind that write or
+/// holding a lock that would block it. Only apply locks the canonical, on the
+/// unit's own transaction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_plan_neither_waits_on_nor_locks_a_canonical_being_written(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let pump = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let before = plan_ok(&server, &viewer, p.clone(), None).await;
+    let (unit, canonical) = unit_writes(&before)
+        .iter()
+        .find_map(|u| {
+            u["marks"].as_array().and_then(|ms| {
+                ms.iter()
+                    .find(|m| m["dup"] == pump.to_string() || m["canonical"] == pump.to_string())
+                    .map(|m| {
+                        (
+                            u["unit"].as_str().expect("unit").to_string(),
+                            m["canonical"]
+                                .as_str()
+                                .expect("canonical")
+                                .parse::<Uuid>()
+                                .expect("uuid"),
+                        )
+                    })
+            })
+        })
+        .unwrap_or_else(|| panic!("no mark for the pump family: {before}"));
+    assert_eq!(unit_check(&before, &unit)["applies"], true, "{before}");
+
+    // A write to the canonical, in flight: the row is updated, not committed.
+    let mut writer = pool.begin().await.expect("begin");
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&mut *writer)
+    .await
+    .expect("write the canonical");
+
+    let during = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        plan_ok(&server, &viewer, p.clone(), None),
+    )
+    .await
+    .expect("the plan waited on an uncommitted write to a canonical: it took a row lock");
+    assert_eq!(
+        unit_check(&during, &unit)["applies"],
+        true,
+        "the prediction reads the committed state: {during}"
+    );
+    writer.rollback().await.expect("rollback the write");
 }
 
 /// The index view reads through the caller's viewer: a stranger asking for a

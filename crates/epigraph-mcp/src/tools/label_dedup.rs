@@ -894,18 +894,36 @@ async fn member_not_owned(
     )
 }
 
+/// How [`canonical_refusal`] reads whether the canonical is still current.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CanonicalCheck {
+    /// The plan's prediction: a plain read, no row lock.
+    Predict,
+    /// Apply's check before marking onto the canonical: a locking read held
+    /// to the unit's commit.
+    HoldForMark,
+}
+
 /// Why the write identity may not mark a duplicate onto `canonical`, or
 /// `None`: `mark_duplicate`'s own rule for the canonical (its owning group
 /// must be one the caller writes, since the cascade moves other writers'
 /// edges and mass functions onto it), and the canonical must still be
 /// current (a mark onto a retired claim would build a chain the plan never
-/// showed), checked under a `FOR SHARE` lock held to the unit's commit. Without it a label-dedup apply could make a mark that
+/// showed). Without it a label-dedup apply could make a mark that
 /// `mark_duplicate` refuses, and that `unmark_duplicate` (the revert) then
 /// refuses too.
+///
+/// `check` says how currency is read. [`CanonicalCheck::Predict`] (the
+/// plan's `write_check`) reads it plainly: a prediction takes no row lock, so
+/// a read-scoped plan never blocks a concurrent write to a canonical nor
+/// waits behind one. [`CanonicalCheck::HoldForMark`] (apply, on the unit's
+/// transaction) reads it under a row lock held to the unit's commit, so the
+/// canonical cannot be retired between this check and the mark.
 async fn canonical_refusal(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     canonical: Uuid,
+    check: CanonicalCheck,
 ) -> Result<Option<String>, McpError> {
     let Some((_, group)) = ClaimRepository::write_target_of(&mut *conn, viewer, canonical)
         .await
@@ -921,10 +939,18 @@ async fn canonical_refusal(
              mark_duplicate (and its un-mark) would refuse the mark"
         )));
     }
-    // Locked FOR SHARE on the unit's transaction, so the canonical cannot be
-    // retired (marked, superseded, deprecated) between this check and the
-    // mark: a retirement in flight is waited for and read, a later one waits
-    // for this unit's commit.
+    if check == CanonicalCheck::Predict {
+        return Ok(
+            (!ClaimRepository::are_all_current(&mut *conn, viewer, &[canonical])
+                .await
+                .map_err(db_caller_error)?)
+            .then(|| format!("canonical {canonical} is no longer current")),
+        );
+    }
+    // Locked on the unit's transaction, so the canonical cannot be retired
+    // (marked, superseded, deprecated) between this check and the mark: a
+    // retirement in flight is waited for and read, a later one waits for this
+    // unit's commit.
     match ClaimRepository::current_state_locked(&mut *conn, viewer, &[canonical])
         .await
         .map_err(db_caller_error)?
@@ -1046,21 +1072,25 @@ async fn write_check(
         for m in &unit.marks {
             let why = match act.as_mut() {
                 None => act_refusal.clone(),
-                Some(tx) => match canonical_refusal(tx, viewer, m.canonical).await? {
-                    Some(why) => Some(why),
-                    None => (!ClaimRepository::session_may_mark_conn(
-                        tx,
-                        ClaimId::from_uuid(m.dup),
-                        ClaimId::from_uuid(m.canonical),
-                    )
-                    .await
-                    .map_err(db_caller_error)?)
-                    .then(|| {
-                        "this identity's own write predicates refuse the dedup act (it must \
+                Some(tx) => {
+                    match canonical_refusal(tx, viewer, m.canonical, CanonicalCheck::Predict)
+                        .await?
+                    {
+                        Some(why) => Some(why),
+                        None => (!ClaimRepository::session_may_mark_conn(
+                            tx,
+                            ClaimId::from_uuid(m.dup),
+                            ClaimId::from_uuid(m.canonical),
+                        )
+                        .await
+                        .map_err(db_caller_error)?)
+                        .then(|| {
+                            "this identity's own write predicates refuse the dedup act (it must \
                          write the duplicate)"
-                            .to_string()
-                    }),
-                },
+                                .to_string()
+                        }),
+                    }
+                }
             };
             applies &= why.is_none();
             mark_checks.push(json!({
@@ -1434,7 +1464,9 @@ async fn apply_unit(
     canonicals.sort();
     canonicals.dedup();
     for canonical in canonicals {
-        if let Some(why) = canonical_refusal(&mut tx, viewer, canonical).await? {
+        if let Some(why) =
+            canonical_refusal(&mut tx, viewer, canonical, CanonicalCheck::HoldForMark).await?
+        {
             return Err(refusal(
                 codes::MARK_REFUSED,
                 format!("{}: {why}. Nothing of the unit was written", unit.unit),
