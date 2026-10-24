@@ -353,9 +353,9 @@ async fn the_sweep_revokes_only_old_dcr_clients_that_never_authorized(pool: PgPo
 
 /// After the sweep, `/oauth/authorize` refuses the swept client id. The
 /// control shows the same request got past the client lookup before: it fails
-/// later, with the 500 "google provider not configured" that only a request
-/// whose client, redirect URI and PKCE were all accepted can reach (this test
-/// configures no provider). So the `invalid_client` afterwards is the sweep's.
+/// later, at the (deliberately unconfigured) provider step, with a 500, where
+/// every client, redirect-URI and PKCE refusal is a 400. So the
+/// `invalid_client` afterwards is the sweep's.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_swept_client_is_refused_by_authorize(pool: PgPool) {
     let fx = seed_fixture(&pool).await;
@@ -378,7 +378,11 @@ async fn a_swept_client_is_refused_by_authorize(pool: PgPool) {
 }
 
 /// `/oauth/authorize` accepted the client and failed only at the (deliberately
-/// unconfigured) Google provider, the step after every client check.
+/// unconfigured) Google provider, the step after every client check. That
+/// step's "google provider not configured" is an `InternalError`, whose body
+/// carries only [`epigraph_api::errors::INTERNAL_ERROR_BODY`] (the detail goes
+/// to the server log), so the oracle is a redacted 500 that is not a client
+/// refusal; the client checks answer 400 (`invalid_client`, `invalid_request`).
 fn assert_past_client_lookup(status: StatusCode, body: &str, what: &str) {
     assert_eq!(
         status,
@@ -386,8 +390,10 @@ fn assert_past_client_lookup(status: StatusCode, body: &str, what: &str) {
         "{what}: expected the provider step's 500, got {status}: {body}"
     );
     assert!(
-        body.contains("google provider not configured"),
-        "{what}: the 500 must be the provider step's: {body}"
+        body.contains(epigraph_api::errors::INTERNAL_ERROR_BODY)
+            && !body.contains("invalid_client")
+            && !body.contains("invalid_request"),
+        "{what}: the 500 must be the provider step's redacted internal error: {body}"
     );
 }
 
