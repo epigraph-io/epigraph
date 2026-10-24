@@ -1442,6 +1442,176 @@ async fn an_allowlisted_client_derives_until_its_allowance_is_revoked(pool: PgPo
     );
 }
 
+/// `Err` with one of the SQLSTATEs in `codes` (the write is refused by the
+/// operator-binding layer, whichever of its checks reaches it first).
+fn assert_refused_by<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, codes: &[&str], what: &str) {
+    let code = code_of(r);
+    assert!(
+        code.as_deref().is_some_and(|c| codes.contains(&c)),
+        "{what}: expected a refusal with one of {codes:?}, got {r:?}"
+    );
+}
+
+/// Armed, ENDING THE BINDING ends claim writes into the group at once, for
+/// the role holder and for its agent, whatever the stamp says; both wrote the
+/// same way while the binding was live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_ending_the_binding_ends_writes_at_once(pool: PgPool) {
+    let (h, _) = human(&pool, "bend-h").await;
+    let a = operated(&pool, h, "bend-a").await;
+    let (group, binding) = bound_group(&pool, "Synthetic Binding End Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+    write_forged(&pool, h, group)
+        .await
+        .expect("POSITIVE CONTROL: the holder writes while the binding is live");
+    write_forged(&pool, a, group)
+        .await
+        .expect("POSITIVE CONTROL: its agent writes while the binding is live");
+
+    assert!(end_binding(&pool, binding).await.expect("end"));
+    assert_refused(
+        &write_forged(&pool, h, group).await,
+        OPL02,
+        HUMAN_SCOPE,
+        "the holder, binding ended",
+    );
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "its agent, binding ended",
+    );
+}
+
+/// Armed, a role holder whose registration is revoked, or whose human client
+/// is suspended, and that human's agent, write nothing into the group with a
+/// forged stamp; each wrote the same way before. (The refusing check may be
+/// the link binding, OPL01, for a principal that is no longer a registered
+/// human, or the writer scope, OPL02; either refuses.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_a_revoked_or_suspended_human_and_its_agent_write_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "wstatus-h").await;
+    let a = operated(&pool, h, "wstatus-a").await;
+    let (s, _) = human(&pool, "wstatus-s").await;
+    let sa = operated(&pool, s, "wstatus-sa").await;
+    let (group, _) = bound_group(&pool, "Synthetic Write Status Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    grant(&pool, ROLE, s, 0, None).await;
+    arm(&pool).await;
+    for (who, what) in [(h, "h"), (a, "a"), (s, "s"), (sa, "sa")] {
+        write_forged(&pool, who, group)
+            .await
+            .unwrap_or_else(|e| panic!("POSITIVE CONTROL: {what} writes before: {e}"));
+    }
+
+    let mut c = maint(&pool).await;
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, $2)")
+            .bind(h)
+            .bind("role membership test")
+            .fetch_one(&mut *c)
+            .await
+            .expect("revoke the registration");
+    reset(c).await;
+    assert!(revoked);
+    sqlx::query(
+        "UPDATE oauth_clients SET status = 'suspended' WHERE agent_id = $1 \
+            AND client_type = 'human'",
+    )
+    .bind(s)
+    .execute(&pool)
+    .await
+    .expect("suspend the human client");
+
+    for (who, what) in [
+        (h, "revoked human"),
+        (a, "its agent"),
+        (s, "suspended human"),
+        (sa, "its agent"),
+    ] {
+        assert_refused_by(
+            &write_forged(&pool, who, group).await,
+            &["OPL01", OPL02],
+            what,
+        );
+    }
+}
+
+/// A group that is no longer ACTIVE is neither read nor written through its
+/// binding: after the group is suspended, the holder and its agent no longer
+/// resolve it, and (armed) their forged writes are refused; both read and
+/// wrote it while it was active.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_a_suspended_group_is_neither_read_nor_written_through_its_binding(pool: PgPool) {
+    let (h, _) = human(&pool, "gsusp-h").await;
+    let a = operated(&pool, h, "gsusp-a").await;
+    let (group, _) = bound_group(&pool, "Synthetic Suspended Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+    for (who, what) in [(h, "holder"), (a, "agent")] {
+        assert_eq!(
+            resolves(&pool, who, group).await,
+            (true, true),
+            "PREMISE {what}"
+        );
+        write_forged(&pool, who, group)
+            .await
+            .unwrap_or_else(|e| panic!("POSITIVE CONTROL: the {what} writes while active: {e}"));
+    }
+
+    sqlx::query("UPDATE groups SET status = 'suspended' WHERE id = $1")
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("suspend the group (a privileged session)");
+    for (who, what) in [(h, "holder"), (a, "agent")] {
+        assert_eq!(
+            resolves(&pool, who, group).await,
+            (false, false),
+            "{what}, group suspended"
+        );
+        assert!(
+            code_of(&write_forged(&pool, who, group).await).is_some(),
+            "{what}: a forged write into a suspended group is refused"
+        );
+    }
+}
+
+/// A 149-allowlisted client agent lapses with its HUMAN's window, not only
+/// with its allowance: inside the window it resolves and (armed) writes the
+/// group; after `valid_to` it resolves nothing and a forged write is refused
+/// OPL02.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowlisted_agent_lapses_at_its_humans_valid_to(pool: PgPool) {
+    let (h, _) = human(&pool, "allow-end-h").await;
+    let (svc, _) = allowance_bound(&pool, h, "allow-end-svc").await;
+    let (group, _) = bound_group(&pool, "Synthetic Allowance End Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, Some(5)).await;
+    arm(&pool).await;
+    assert_eq!(
+        resolves(&pool, svc, group).await,
+        (true, true),
+        "in the window"
+    );
+    write_forged(&pool, svc, group)
+        .await
+        .expect("POSITIVE CONTROL: the allowlisted agent writes in the window");
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, svc, group).await,
+        (false, false),
+        "after valid_to"
+    );
+    assert_refused(
+        &write_forged(&pool, svc, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the allowlisted agent after its human's valid_to",
+    );
+}
+
 /// A human with no assignment of the role, and its agent, never derive; with
 /// a forged stamp (armed) each is refused OPL02, while a role-holding human
 /// and its agent write the same group.
