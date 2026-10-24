@@ -6,19 +6,23 @@
 //! Challenges allow agents to dispute existing claims with counter-evidence.
 //! This is a core epistemic mechanism: truth must be contestable to be trustworthy.
 //!
-//! # Tenancy: 1 of this file's 3 raw-pool sites is converted
+//! # Tenancy: every site is converted
 //!
 //! Conversion shard 7. `list_challenges` reads
-//! `ChallengeRepository::list_for_claim` — which already carried
-//! `/* {VISIBILITY:challenges} */` — on a viewer-stamped connection from
+//! `ChallengeRepository::list_for_claim` — which carries
+//! `/* {VISIBILITY:challenges} */` and, since ruling R-CH1b, the claim's own
+//! `/* {VISIBILITY:c} */` — on a viewer-stamped connection from
 //! [`AppState::read_as`]. `challenges` is RLS and FORCE with a narrowing policy
 //! at migration head 92, so this is one of the sites where the stamp and the
 //! in-query predicate must agree about the same group set.
 //!
-//! The other 2 sites are `submit_challenge`, which WRITES and holds no `Viewer`.
-//! Its owner is `D-PR16-claim-authorship-is-not-a-credential`, an open operator
-//! decision.
+//! `submit_challenge` (backlog 2f2eeaea) writes on ONE transaction stamped
+//! with the caller's viewer ([`AppState::write_as`]); it used to write on the
+//! raw pool, so a challenge row security refused surfaced as a redacted 500.
+//! Who owns the row is operator ruling R-CH1 (it resolved
+//! `D-PR16-claim-authorship-is-not-a-credential`): see the handler's doc.
 //!
+//! [`AppState::write_as`]: crate::AppState::write_as
 //! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
@@ -55,8 +59,11 @@ const MAX_EXPLANATION_LENGTH: usize = 32_768;
 /// Request body for submitting a challenge against a claim
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SubmitChallengeRequest {
-    /// The agent raising the challenge
-    pub challenger_id: Uuid,
+    /// The agent raising the challenge. With the database, the challenger is
+    /// the authenticated caller: omit this, or name the caller's own agent id
+    /// (any other id is refused, 403).
+    #[serde(default)]
+    pub challenger_id: Option<Uuid>,
 
     /// Type of challenge (snake_case string matching ChallengeType variants)
     pub challenge_type: String,
@@ -143,16 +150,42 @@ fn format_challenge_type(ct: ChallengeType) -> String {
 ///
 /// POST /api/v1/claims/:id/challenge
 ///
-/// This is a protected endpoint requiring Ed25519 signature verification.
-/// Agents must provide a valid challenge type and non-empty explanation
-/// to dispute a claim's truth value.
+/// Requires a bearer token with `claims:write` (the MCP twin's scope). The
+/// challenger is the authenticated principal; a body `challenger_id` naming
+/// anyone else is refused.
+///
+/// # Whose row it is (operator ruling R-CH1, migration 168)
+///
+/// One transaction stamped with the caller's viewer. Before the INSERT,
+/// `ChallengeRepository::admission_of` reads, on that transaction and with the
+/// functions the INSERT's triggers use, where the row would land:
+///
+/// * the caller writes the claim's group (an INSIDER): the row inherits the
+///   claim's tenancy, as before;
+/// * a PUBLIC claim the caller cannot write (an OUTSIDER): the row is owned by
+///   the caller's own write group, public, and never follows the claim;
+/// * a NON-public claim the caller can read but not write, or an outsider with
+///   no write group of its own: 403, nothing written.
+///
+/// A claim the caller cannot read answers exactly as a nonexistent claim id
+/// (ruling R-CH1b): the same 404 and body, decided by the same one read, so
+/// the route is no existence oracle for private claims. The INSERT never gets
+/// to discover a missing claim (its foreign-key error would differ).
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Invalid challenge type, empty explanation, or duplicate challenge
-/// - 401 Unauthorized: Missing or invalid signature (handled by middleware)
+/// - 400 Bad Request: Invalid challenge type or empty / oversized explanation
+/// - 401 Unauthorized: Missing or invalid bearer token (middleware)
+/// - 403 Forbidden: no `claims:write`, a `challenger_id` that is not the
+///   caller, an elevated (read-only) request, or no authority to challenge a
+///   claim the caller can read
+/// - 404 Not Found: the claim does not exist or the caller cannot read it
 /// - 201 Created: Challenge submitted successfully
 pub async fn submit_challenge(
+    #[cfg(feature = "db")] ViewerExtractor(viewer): ViewerExtractor,
+    #[cfg(feature = "db")] auth_ctx: Option<
+        axum::Extension<crate::middleware::bearer::AuthContext>,
+    >,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Json(request): Json<SubmitChallengeRequest>,
@@ -206,23 +239,92 @@ pub async fn submit_challenge(
     // Otherwise, use the in-memory ChallengeService.
     #[cfg(feature = "db")]
     let response = {
+        use epigraph_db::repos::challenge::ChallengeAdmission;
+
+        // 4a. Who is asking. Nothing here depends on the claim, so none of it
+        //     distinguishes a private claim from a missing one.
+        let auth = auth_ctx
+            .ok_or(ApiError::Unauthorized {
+                reason: "challenge requires authentication".into(),
+            })?
+            .0;
+        crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+        let Some(caller) = viewer.principal() else {
+            return Err(ApiError::Forbidden {
+                reason: "a challenge needs an authenticated challenger".to_string(),
+            });
+        };
+        if request.challenger_id.is_some_and(|named| named != caller) {
+            return Err(ApiError::Forbidden {
+                reason: "challenger_id must be the authenticated caller's own agent id, or \
+                         omitted"
+                    .to_string(),
+            });
+        }
+
+        // 4b. ONE transaction stamped with the caller's viewer, and where the
+        //     row would land, read on it (R-CH1). An unreadable claim is the
+        //     same 404 as a missing one (R-CH1b).
+        let mut tx = state.write_as(&viewer, "submit_challenge").await?;
+        let admission = epigraph_db::ChallengeRepository::admission_of(&mut *tx, &viewer, claim_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to read the challenged claim: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id.to_string(),
+            })?;
+        match admission {
+            ChallengeAdmission::Insider | ChallengeAdmission::Outsider { .. } => {}
+            ChallengeAdmission::NotWriter => {
+                return Err(ApiError::Forbidden {
+                    reason: "this claim is not public and the caller cannot write its group, \
+                             so it cannot challenge it; nothing was written"
+                        .to_string(),
+                })
+            }
+            ChallengeAdmission::NoWriterGroup => {
+                return Err(ApiError::Forbidden {
+                    reason: "a challenge from outside the claim's group is owned by the \
+                             challenger's own personal (or operator's) group, and the caller \
+                             can write neither; nothing was written"
+                        .to_string(),
+                })
+            }
+        }
+
         let challenge_id = epigraph_db::ChallengeRepository::create(
-            &state.db_pool,
+            &mut *tx,
             claim_id,
-            Some(request.challenger_id),
+            Some(caller),
             &request.challenge_type,
             &request.explanation,
         )
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to persist challenge: {e}"),
+        .map_err(|e| {
+            if crate::errors::is_insufficient_privilege(&e) {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "submit_challenge",
+                    claim = %claim_id,
+                    error = %e,
+                    "the database refused the challenge after the admission read admitted it"
+                );
+                crate::errors::write_refused("challenge")
+            } else {
+                ApiError::InternalError {
+                    message: format!("Failed to persist challenge: {e}"),
+                }
+            }
         })?;
 
-        // Also emit a DB event
-        let _ = epigraph_db::EventRepository::insert(
-            &state.db_pool,
+        // The event rides the challenge's fate, SAVEPOINT-wrapped so a refused
+        // event cannot abort the challenge (the MCP twin's construction).
+        epigraph_db::EventRepository::publish_or_log_conn(
+            &mut tx,
             "claim.challenged",
-            Some(request.challenger_id),
+            Some(caller),
             &serde_json::json!({
                 "challenge_id": challenge_id,
                 "claim_id": claim_id,
@@ -231,10 +333,14 @@ pub async fn submit_challenge(
         )
         .await;
 
+        tx.commit().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to commit the challenge: {e}"),
+        })?;
+
         ChallengeResponse {
             id: challenge_id,
             claim_id,
-            challenger_id: request.challenger_id,
+            challenger_id: caller,
             challenge_type: request.challenge_type.clone(),
             explanation: request.explanation.clone(),
             state: "pending".to_string(),
@@ -246,9 +352,15 @@ pub async fn submit_challenge(
 
     #[cfg(not(feature = "db"))]
     let response = {
+        let challenger_id = request
+            .challenger_id
+            .ok_or_else(|| ApiError::ValidationError {
+                field: "challenger_id".to_string(),
+                reason: "challenger_id is required".to_string(),
+            })?;
         let challenge = Challenge::new(
             ClaimId::from_uuid(claim_id),
-            AgentId::from_uuid(request.challenger_id),
+            AgentId::from_uuid(challenger_id),
             challenge_type,
             request.explanation,
         );
@@ -276,7 +388,7 @@ pub async fn submit_challenge(
             .event_bus
             .publish(EpiGraphEvent::ClaimChallenged {
                 claim_id: ClaimId::from_uuid(claim_id),
-                challenger_id: AgentId::from_uuid(request.challenger_id),
+                challenger_id: AgentId::from_uuid(challenger_id),
                 challenge_id: epigraph_events::events::ChallengeId::from_uuid(
                     challenge.id.as_uuid(),
                 ),
