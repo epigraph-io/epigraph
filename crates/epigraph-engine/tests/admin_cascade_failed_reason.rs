@@ -8,6 +8,8 @@
 //! is a driver error: it can spell SQL, a constraint, or a row of another
 //! writer's. It belongs in the server log, not on that row.
 //!
+//! The error goes to the server log instead, which the test asserts too.
+//!
 //! The failure is forced with a trigger on `edges` that raises a marker, the
 //! technique `epigraph-mcp/tests/challenge_claim_refusal.rs` uses: the dedup
 //! repair re-points the duplicate's incoming edge, so its UPDATE hits the
@@ -24,6 +26,8 @@ use epigraph_engine::admin_cascade::{
 use uuid::Uuid;
 
 const MARKER: &str = "forced-repair-failure-9d6f-relation-secret_edges_shadow";
+/// [`MARKER`] with its middle word left for plpgsql to fill in.
+const MARKER_TEMPLATE: &str = "forced-repair-%-9d6f-relation-secret_edges_shadow";
 
 async fn new_agent(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
@@ -47,6 +51,7 @@ async fn new_claim(pool: &PgPool, agent: Uuid, tag: &str) -> Uuid {
     .expect("claim")
 }
 
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_failed_repair_records_a_static_reason_not_the_error_text(pool: PgPool) {
     let (_scoped, viewer) = fixture::bypass(&pool).await;
@@ -75,9 +80,15 @@ async fn a_failed_repair_records_a_static_reason_not_the_error_text(pool: PgPool
 
     // After the act (which writes its own identity edge): every further write
     // to `edges` raises the marker, so the repair fails and rolls back.
+    //
+    // The marker is ASSEMBLED by plpgsql (`%` takes 'failure'), so its full
+    // text appears only in the raised error and never in this statement:
+    // sqlx logs each statement it runs, and the traced test captures that log,
+    // so a marker written out here would satisfy the log assertion below on its
+    // own.
     sqlx::query(&format!(
         "CREATE FUNCTION test_force_repair_failure() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN RAISE EXCEPTION '{MARKER}'; END $$"
+         BEGIN RAISE EXCEPTION '{MARKER_TEMPLATE}', 'failure'; END $$"
     ))
     .execute(&pool)
     .await
@@ -132,6 +143,17 @@ async fn a_failed_repair_records_a_static_reason_not_the_error_text(pool: PgPool
         !text.contains("forced-repair-failure-9d6f") && !text.contains("secret_edges_shadow"),
         "the database's error text reached an audit row the triggering agent can read: {text}"
     );
+    // The withheld error reaches the server log ON `failed()`'s OWN LINE: a
+    // line naming the step's failure and carrying the database's text. A bare
+    // substring check would also accept any other line that happens to hold
+    // the marker.
+    logs_assert(|lines: &[&str]| {
+        lines
+            .iter()
+            .any(|l| l.contains("failed on the maintenance connection") && l.contains(MARKER))
+            .then_some(())
+            .ok_or_else(|| "no failed() warn line carries the database's error text".to_string())
+    });
     assert_eq!(
         details["reason_code"], "repair_failed",
         "the row carries a static reason code: {details}"
