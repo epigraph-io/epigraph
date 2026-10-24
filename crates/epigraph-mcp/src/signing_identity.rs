@@ -314,6 +314,44 @@ mod tests {
         assert!(b.signature_valid && !b.key_bound, "{b:?}");
     }
 
+    /// `claims.created_at` is stamped by the WRITER's clock (`Claim::new`)
+    /// and `valid_from` by the DATABASE's (`now()` at registration), so the
+    /// first claims after registration can read a little earlier than the
+    /// window opens. A small skew still binds; a claim dated well before the
+    /// key existed does not.
+    #[test]
+    fn a_claim_a_moment_before_valid_from_still_binds() {
+        let author = Uuid::new_v4();
+        let key = AgentSigner::from_bytes(&[5; 32]).expect("key");
+        let digest = [2u8; 32];
+        let sig = key.sign(&digest);
+        let from = Utc::now() - Duration::hours(1);
+        let row = attested(author, &key, "signing", "active", from, None);
+        for skew in [Duration::milliseconds(1), Duration::seconds(1)] {
+            let b = bind_signature(
+                &digest,
+                Some(&sig),
+                &[0; 32],
+                author,
+                from - skew,
+                std::slice::from_ref(&row),
+            );
+            assert!(b.key_bound, "{skew:?} before valid_from must bind: {b:?}");
+        }
+        let b = bind_signature(
+            &digest,
+            Some(&sig),
+            &[0; 32],
+            author,
+            from - Duration::minutes(10),
+            std::slice::from_ref(&row),
+        );
+        assert!(
+            b.signature_valid && !b.key_bound,
+            "ten minutes early is not skew: {b:?}"
+        );
+    }
+
     /// A signature only the signer's `agents.public_key` verifies is valid,
     /// unbound and `unattested`; with no signature at all, nothing is.
     #[test]
