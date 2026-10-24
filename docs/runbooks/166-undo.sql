@@ -14,6 +14,10 @@
 --     `epigraph_require_attributable`, and migration 161's body of
 --     `epigraph_register_agent_identity`, byte for byte (CREATE OR REPLACE
 --     keeps their owners and ACLs).
+--   * Drops the role-holder write check: the `role_agent_write_check`
+--     statement trigger on every table that carries it and the
+--     `claims_role_agent_author` row trigger, found from the catalog by
+--     their function, then the function.
 --   * Revokes the attestor's EXECUTE on the question, then drops 166's
 --     functions, triggers and `role_agents` (its rows go with it; export them
 --     first if the attachment history is wanted).
@@ -565,12 +569,34 @@ DO $$ BEGIN
     END IF;
 END $$;
 
+-- The write check's triggers, wherever they are (the list 166 attached them
+-- to was measured from the catalog), then its function.
+DO $$
+DECLARE
+    v_trigger record;
+BEGIN
+    IF to_regprocedure('public.epigraph_role_agent_write_check()') IS NOT NULL THEN
+        FOR v_trigger IN
+            SELECT t.tgname, t.tgrelid::regclass AS rel
+              FROM pg_trigger t
+             WHERE NOT t.tgisinternal
+               AND t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure
+             ORDER BY t.tgrelid::regclass::text, t.tgname
+        LOOP
+            EXECUTE format('DROP TRIGGER %I ON %s', v_trigger.tgname, v_trigger.rel);
+        END LOOP;
+    END IF;
+END $$;
+DROP FUNCTION IF EXISTS public.epigraph_role_agent_write_check();
+
 DROP FUNCTION IF EXISTS public.epigraph_require_role_holder(uuid);
 DROP FUNCTION IF EXISTS public.epigraph_role_agent_may_run(uuid);
 DROP FUNCTION IF EXISTS public.epigraph_role_agent_gate(uuid, timestamptz);
 DROP FUNCTION IF EXISTS public.epigraph_attach_agent_to_role(text, uuid, timestamptz,
                                                              timestamptz, text);
 DROP FUNCTION IF EXISTS public.epigraph_detach_agent_from_role(text, uuid, text);
+-- Called by 123's restored bodies no more (restored above).
+DROP FUNCTION IF EXISTS public.epigraph_agent_is_retired(uuid);
 -- The append-only triggers refuse a TRUNCATE, not a DROP TABLE; drop the table
 -- (and with it its triggers and policies), then the trigger functions.
 DROP TABLE IF EXISTS public.role_agents;
