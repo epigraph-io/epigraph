@@ -1493,6 +1493,26 @@ restart.
   been applied. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **168**: public `outsider_owned_challenges` (operator rulings R-CH1 and
+  R-CH1b, backlog 2f2eeaea). An OUTSIDER's challenge (a challenger that
+  cannot write the claim's owning group) on a PUBLIC claim is owned by the
+  outsider. Adds `challenges.writer_owned` (114's marker, default false, no
+  row re-owned) and two triggers on 114's unchanged functions:
+  `challenges_attach_writer` (`epigraph_attach_writer_owner()`, BEFORE INSERT)
+  and `challenges_writer_owner_guard` (`epigraph_writer_owner_guard()`, 114's
+  WHEN clause). Re-states `epigraph_inherit_tenancy_stmt` (114's body,
+  `challenges` added to the writer-owned skip) and `epigraph_propagate_tenancy`
+  (122's body plus one `IF` skipping writer-owned challenges; `challenges` is
+  not in `writer_tables`, so privatizing a claim never drags an outsider's
+  challenge along). Adds `challenges_claim_readable`, a RESTRICTIVE `FOR SELECT`
+  policy: a challenge is readable only with its claim (R-CH1b), so the
+  outsider's public row is no existence oracle for a privatized claim. Pinned
+  by `epigraph-db/tests/challenge_ownership.rs`. Undo: drop the policy and the
+  two triggers, re-run 114 section 3b and 122 section 8, then drop the column.
+  **Deploy order:** after 114, 115 and 122, independent of 154 and later; apply
+  before a binary with the matching repo/route changes serves. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
