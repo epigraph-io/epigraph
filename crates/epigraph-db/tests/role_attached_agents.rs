@@ -2346,6 +2346,94 @@ async fn an_attached_agents_claim_is_not_rewritten_by_anyone_after_the_end(pool:
     );
 }
 
+/// The DS belief cache on `claim` written by `epigraph_db`'s own
+/// `MassFunctionRepository::update_claim_belief` (the write every evidence
+/// submission makes on its claim), on an `epigraph_app` connection stamped as
+/// `who`.
+async fn refresh_belief_cache_as(
+    pool: &PgPool,
+    who: Uuid,
+    group: Uuid,
+    claim: Uuid,
+) -> Result<bool, epigraph_db::DbError> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, who, &[group]).await;
+        let r = epigraph_db::MassFunctionRepository::update_claim_belief(
+            &mut *conn,
+            claim,
+            epigraph_db::CachedBelief {
+                belief: 0.4,
+                plausibility: 0.8,
+                mass_on_empty: 0.0,
+                pignistic_prob: Some(0.6),
+                mass_on_missing: 0.0,
+                belief_frame_id: None,
+            },
+        )
+        .await;
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// THE AUTHOR ARM'S BOUNDARY, DECIDED. The author arm refuses another
+/// principal's change to what an attached agent SAID (any column but the
+/// derived caches); it does not refuse the DERIVED caches the database keeps
+/// on the claim row from everyone's evidence (the DS belief cache, the
+/// classification, the beta parameters, embeddings, theme, match-scan
+/// bookkeeping, `updated_at`). Otherwise, in a role's gap, nobody could submit
+/// evidence on any of its agents' claims (every submission refreshes the
+/// claim's cache in the same transaction), which the ruling does not ask:
+/// that is another principal acting, not the agent running.
+/// * After the end, the human's belief-cache refresh of the attached agent's
+///   claim (the real repository write) lands.
+/// * The attached agent's OWN refresh is refused (it is the principal).
+/// * A human statement that changes the cache AND an authored column is
+///   refused.
+///
+/// Verified to fail: the author arm applied to every column (the human's
+/// cache refresh is refused ROL01).
+#[sqlx::test(migrations = "../../migrations")]
+async fn others_refresh_an_attached_agents_derived_caches_in_its_gap(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let claim = insert_claim(&pool, attached, h_group).await.expect("claim");
+    end_assignment(&pool, assignment).await;
+
+    let by_human = refresh_belief_cache_as(&pool, h, h_group, claim).await;
+    assert!(
+        matches!(by_human, Ok(true)),
+        "the human's belief-cache refresh of the attached agent's claim lands: {by_human:?}"
+    );
+    let by_agent = refresh_belief_cache_as(&pool, attached, h_group, claim).await;
+    assert!(
+        matches!(by_agent, Err(epigraph_db::DbError::RoleHolderRequired { .. })),
+        "the attached agent's own refresh after the end: {by_agent:?}"
+    );
+    let mixed = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, h, &[h_group]).await;
+        let r = sqlx::query(
+            "UPDATE claims SET belief = 0.3, content = content || ' (edited)' WHERE id = $1",
+        )
+        .bind(claim)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await;
+    assert_rol01(
+        &mixed,
+        "the human changing the cache and the content of the attached agent's claim",
+    );
+}
+
 /// The write check is keyed on ARMING, like OPL02 and the claims path's
 /// ROL01, and spares a PRIVILEGED session (the maintenance role: the custodial
 /// path), whatever principal it stamps. In a gap, an attached agent:
