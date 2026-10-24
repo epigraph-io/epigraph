@@ -803,7 +803,7 @@ async fn binding_audit_rows_name_the_acting_process_and_a_define_is_recorded(poo
         Some(r#"{"tool":"synthetic-define-probe"}"#),
         "SELECT public.epigraph_define_group_role($1, 'synthetic team role', $2::uuid, \
                 'writer', true, 'audit test')::text",
-        &[ROLE, &g],
+        &[ROLE, g.as_str()],
     )
     .await
     .parse()
@@ -838,7 +838,7 @@ async fn binding_audit_rows_name_the_acting_process_and_a_define_is_recorded(poo
         &pool,
         Some(r#"{"tool":"synthetic-end-probe"}"#),
         "SELECT public.epigraph_end_group_role_binding($1::uuid, 'audit test end')::text",
-        &[&binding.to_string()],
+        &[binding.to_string().as_str()],
     )
     .await;
     assert_eq!(ended, "true", "ended");
@@ -856,7 +856,7 @@ async fn binding_audit_rows_name_the_acting_process_and_a_define_is_recorded(poo
         &pool,
         None,
         "SELECT public.epigraph_bind_group_role($1, $2::uuid, 'writer', true, 'audit test')::text",
-        &[ROLE, &g],
+        &[ROLE, g.as_str()],
     )
     .await
     .parse()
