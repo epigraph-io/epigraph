@@ -901,6 +901,26 @@ async fn no_binding_escalates(pool: PgPool) {
     let r = define(&pool, ROLE, group, "writer", true).await;
     assert_refused(&r, ROLE_KEY_TAKEN, "", "the key is taken");
 
+    // GRB02 beyond a personal group: the world group, the seed group, and a
+    // team group that is no longer active.
+    let suspended = team_group(&pool, "Synthetic Suspended Escalation Team", owner).await;
+    sqlx::query("UPDATE groups SET status = 'suspended' WHERE id = $1")
+        .bind(suspended)
+        .execute(&pool)
+        .await
+        .expect("suspend a team group (a privileged session)");
+    let seed: Uuid = "00000000-0000-0000-0000-00000000dead"
+        .parse()
+        .expect("the seed group id");
+    for (g, what) in [
+        (Uuid::nil(), "the world group"),
+        (seed, "the seed group"),
+        (suspended, "a suspended team group"),
+    ] {
+        let r = bind(&pool, ROLE, g, "writer", true).await;
+        assert_refused(&r, NOT_BINDABLE_GROUP, "", what);
+    }
+
     let mut c = maint(&pool).await;
     let direct = sqlx::query(
         "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, reason) \
@@ -943,6 +963,30 @@ async fn no_binding_escalates(pool: PgPool) {
     })
     .await;
     assert!(!is_admin, "a derived member never administers the group");
+
+    // A derived member holds no ELEVATING role through its binding; the same
+    // read is true for a custodian holder (bootstrap grant, no grantor yet).
+    let mut conn = pool.acquire().await.expect("acquire");
+    let derived_elevates =
+        epigraph_db::RoleAssignmentRepository::holds_elevating_role(&mut conn, h)
+            .await
+            .expect("holds_elevating_role");
+    drop(conn);
+    assert!(
+        !derived_elevates,
+        "a derived member holds no elevating role"
+    );
+    let (c, _) = human(&pool, "esc-custodian").await;
+    grant(&pool, "role:platform-custodian", c, 0, None).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let custodian_elevates =
+        epigraph_db::RoleAssignmentRepository::holds_elevating_role(&mut conn, c)
+            .await
+            .expect("holds_elevating_role");
+    assert!(
+        custodian_elevates,
+        "POSITIVE CONTROL: the custodian holder does"
+    );
     let _ = binding;
 }
 
