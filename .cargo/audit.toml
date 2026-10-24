@@ -62,3 +62,30 @@ ignore = [
     # MCP HTTP endpoint still relies on bearer-token checks at the proxy; that
     # control does not depend on this entry.
 ]
+
+# ── GitHub advisories with no RustSec ID (Dependabot only) ─────────────────
+# `cargo audit` reads only the RustSec DB, so these advisories never reach the
+# ignore list above. Dependabot still raises them, so their triage is recorded
+# here, as comments only, to keep one place that explains every open
+# dependency alert.
+#
+# GHSA-w9wp-h8wv-79jx / CVE-2026-48504, opentelemetry_sdk <=0.32.0 (Cargo.lock:
+#   0.27.1). Unbounded allocation in `BaggagePropagator::extract_with_context`
+#   on an oversized inbound `baggage` header (availability only). NOT REACHABLE:
+#   - opentelemetry_sdk is pulled only by epigraph-api's optional `otel`
+#     feature, which is not a default feature. `cargo tree -i opentelemetry_sdk
+#     --workspace -e normal` matches no package without `--features
+#     epigraph-api/otel`.
+#   - With the feature on, the server.rs `otel` block calls no OpenTelemetry
+#     API (the pipeline is a commented-out TODO). No crate constructs a
+#     BaggagePropagator or TextMapPropagator, or calls
+#     set_text_map_propagator / extract_with_context.
+#   - epigraph-mcp/src/otel.rs is not in the module tree (no `mod otel`), and
+#     it builds an exporter only, not a propagator.
+#   Fix = opentelemetry/opentelemetry_sdk/opentelemetry-otlp 0.27 -> >=0.32.1
+#   plus the matching tracing-opentelemetry. That is a breaking API move, not
+#   a lockfile bump. Revisit this entry when the `otel` pipeline is wired up,
+#   or when anything starts extracting inbound trace context.
+#
+# GHSA-7gcf-g7xr-8hxj, serde_with <3.21.0 (KeyValueMap panic). FIXED: Cargo.lock
+#   resolves serde_with 3.21.0. Do not let it fall back below that version.
