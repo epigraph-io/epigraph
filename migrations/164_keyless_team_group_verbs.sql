@@ -140,6 +140,17 @@
 -- `tenancy_backfill.rs`'s register and `schema_contract.rs` pin the owner.
 --
 -- ===================================================================
+-- 6. A MEMBERSHIP LAPSES WITH ITS BINDING
+--
+-- `epigraph_live_memberships` (077, the source of every viewer's group set)
+-- counts a live row of a verb-made group only while the member still belongs
+-- to a registered human operator (`epigraph_human_of(member, live)`): a
+-- revoked 149 allowance, a revoked registration or a suspended human client
+-- ends the member's reads and writes at its next resolve, without a write.
+-- Rows of every other group count exactly as before. The code block below
+-- says why this is computed rather than written.
+--
+-- ===================================================================
 -- UNDO
 --
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_set_member_role(uuid, uuid, text, text);
@@ -152,6 +163,8 @@
 -- DROP TRIGGER IF EXISTS group_memberships_team_roster_verbs_only ON public.group_memberships;
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_row_verbs_only();
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_roster_verbs_only();
+-- and re-state 077's `epigraph_live_memberships` body (without the verb-made
+-- group conjunct; owner and grants unchanged).
 -- and, ONLY when no keyless team group exists, restore 060's
 -- `groups_public_key_shape` text. Groups and memberships the verbs wrote stay
 -- (060 refuses deleting groups; the roster is a ledger), as do their audit
@@ -247,6 +260,36 @@ CREATE TRIGGER groups_team_verbs_only_update
           OR NEW.did_key LIKE 'did:epigraph:group:%'
           OR (NEW.kind = 'team' AND octet_length(NEW.public_key) = 0))
     EXECUTE FUNCTION public.epigraph_team_group_row_verbs_only();
+
+-- Section 6: a membership of a verb-made group LAPSES with the binding that
+-- admitted it.
+--
+-- The verbs check GRP03/GRP04 when a member is added or promoted, but nothing
+-- revokes the row when that binding later ends: a 149 client allowance is
+-- revoked, the human's registration is revoked, or its human client is
+-- suspended (107 refuses to retire a LIVE link, so that is not a path). The
+-- row stays live, and `Viewer::resolve` read it, so the agent kept reading
+-- (and, unarmed, writing) the group. Revoking the rows in each of those acts
+-- would mean re-stating three definers from other migrations and turning one
+-- audited act into several; instead the membership is COMPUTED at stamp time,
+-- in the one function every viewer's group set comes from: a live row of a
+-- verb-made group counts only while `epigraph_human_of(member, live)` names a
+-- registered human operator. Every other group's rows count exactly as before.
+-- The row itself is untouched; `group-member remove` still cleans it up.
+--
+-- 077's body plus the conjunct. Re-owned (section 5), so it moves out of the
+-- re-own ratchet's frozen pre-register list and into its register.
+CREATE OR REPLACE FUNCTION public.epigraph_live_memberships(p_agent uuid)
+RETURNS TABLE (group_id uuid, role text) LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT m.group_id, m.role::text
+      FROM public.group_memberships m
+      JOIN public.groups g ON g.id = m.group_id
+     WHERE m.agent_id = p_agent AND m.revoked_at IS NULL
+       AND (g.did_key NOT LIKE 'did:epigraph:group:%'
+            OR public.epigraph_is_human_operator(public.epigraph_human_of(p_agent, true)))
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) FROM PUBLIC;
 
 -- -------------------------------------------------------------------
 -- create
@@ -650,6 +693,8 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_team_group_roster_verbs_only() '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_live_memberships(uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
@@ -663,6 +708,9 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        -- Section 6: `Viewer::resolve` calls it on the application role (077).
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) '
+                'TO epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
                 'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION '

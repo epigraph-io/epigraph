@@ -1939,6 +1939,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // to any stamped admin or creator). The gate itself keys on
     // `session_user`, which no owner changes.
     ("epigraph_team_group_roster_verbs_only", 164),
+    // 077's viewer group-set read, re-stated by 164 (a verb-made group's row
+    // counts only while its member belongs to a registered human). It reads
+    // `group_memberships` and `groups` (FORCEd) for a caller that has no
+    // principal stamped yet (`Viewer::resolve` runs before the stamp exists):
+    // under a non-member owner both reads are filtered to nothing, and every
+    // viewer resolves to public-only (loud, fail-closed).
+    ("epigraph_live_memberships", 164),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2556,6 +2563,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_backfill_legacy_agent_keys()",
             false,
         ),
+        // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
+        // it on the request DSN.
+        (
+            "epigraph_live_memberships",
+            "public.epigraph_live_memberships(uuid)",
+            true,
+        ),
         // 164: creating a team group and changing its roster are maintenance
         // acts; the request DSN must never call them.
         (
@@ -3100,7 +3114,8 @@ mod definer_register_tests {
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
         "epigraph_is_group_admin",
-        "epigraph_live_memberships",
+        // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
+        // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",
         "epigraph_ensure_personal_group",
         "epigraph_provision_oauth_agent",
