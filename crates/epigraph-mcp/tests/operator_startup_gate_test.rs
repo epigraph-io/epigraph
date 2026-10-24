@@ -45,6 +45,8 @@ const TEST_JWT_SECRET: &str = "operator-startup-gate-test-secret-not-for-any-dep
 #[test]
 fn an_http_listener_refuses_an_operator_flag() {
     let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -74,6 +76,8 @@ fn an_http_listener_refuses_an_operator_flag() {
 #[test]
 fn an_http_listener_refuses_the_operator_env_var() {
     let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -100,6 +104,8 @@ fn an_http_listener_refuses_the_operator_env_var() {
 #[test]
 fn an_operator_without_a_declared_identity_is_refused() {
     let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -128,6 +134,8 @@ enum Outcome {
 /// it either exits or logs that it is serving. Kills it in the second case.
 fn spawn_listener(db_url: &str, key_hex: &str) -> Outcome {
     let mut child = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             db_url,
@@ -321,6 +329,8 @@ fn spawn_stdio_with_operator(
     operator: Uuid,
 ) -> String {
     let mut child = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             db_url,

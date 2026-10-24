@@ -23,6 +23,11 @@
 //!   `mcp-agent`, then the LLM provenance properties), so the process adopts
 //!   the same row. A changed prompt file is a changed hash, i.e. a NEW agent
 //!   that needs its own link: run this at every spawn, it is idempotent.
+//! * `--identity-pubkey <hex>`: a KEYED identity (agent identity lineage design
+//!   D1), which cannot be recomputed from (model, prompt hash) without the
+//!   host's secret, named by its identity PUBLIC key. The agent must already
+//!   exist: the host's registration creates it (with its signing key, which
+//!   `epigraph-mcp` refuses to start without), so this never creates one.
 //!
 //! # Refusals of its own, before anything is written
 //!
@@ -64,21 +69,39 @@ pub enum AgentSpec {
     Id(Uuid),
     /// A stdio `epigraph-mcp` identity: `(model, lowercase-hex BLAKE3 hash)`.
     Llm { model: String, prompt_hash: String },
+    /// A registered identity, by its identity public key (design D1).
+    IdentityPubkey([u8; 32]),
 }
 
 impl AgentSpec {
-    /// Build from the three optional flags, refusing every combination but
+    /// Build from the four optional flags, refusing every combination but
     /// exactly one naming.
     ///
     /// # Errors
-    /// Neither or both namings; a model without a hash (or the reverse); an
+    /// None or several namings; a model without a hash (or the reverse); an
     /// empty model; a hash that is not 64 lowercase hex characters (what
-    /// `blake3::Hash::to_hex` renders, and so what `epigraph-mcp` seeds with).
+    /// `blake3::Hash::to_hex` renders, and so what `epigraph-mcp` seeds with);
+    /// an identity public key that is not 64 hex characters.
     pub fn from_flags(
         agent: Option<Uuid>,
         model: Option<String>,
         prompt_hash: Option<String>,
+        identity_pubkey: Option<String>,
     ) -> anyhow::Result<Self> {
+        if let Some(key) = identity_pubkey {
+            if agent.is_some() || model.is_some() || prompt_hash.is_some() {
+                bail!(
+                    "name the agent ONE way: --identity-pubkey alone, or --agent <uuid>, or \
+                     --agent-model together with --agent-system-prompt-hash"
+                );
+            }
+            let key = key.trim();
+            let mut bytes = [0u8; 32];
+            if key.len() != 64 || hex::decode_to_slice(key, &mut bytes).is_err() {
+                bail!("--identity-pubkey must be the agent's 32-byte identity public key as 64 hex characters");
+            }
+            return Ok(Self::IdentityPubkey(bytes));
+        }
         match (agent, model, prompt_hash) {
             (Some(id), None, None) => Ok(Self::Id(id)),
             (None, Some(model), Some(prompt_hash)) => {
@@ -101,7 +124,8 @@ impl AgentSpec {
                 })
             }
             (None, None, None) => bail!(
-                "name the agent: --agent <uuid>, or --agent-model with --agent-system-prompt-hash"
+                "name the agent: --agent <uuid>, --agent-model with --agent-system-prompt-hash, \
+                 or --identity-pubkey"
             ),
             _ => bail!(
                 "name the agent ONE way: --agent <uuid>, or --agent-model together with \
@@ -110,12 +134,14 @@ impl AgentSpec {
         }
     }
 
-    /// The public key a stdio `epigraph-mcp` would sign with, for an LLM
-    /// identity.
+    /// The agent's public key (`agents.public_key`): for an unkeyed LLM
+    /// identity, the key a stdio `epigraph-mcp` derives and signs with; for a
+    /// keyed identity, its identity key (which signs nothing).
     #[must_use]
     pub fn public_key(&self) -> Option<[u8; 32]> {
         match self {
             Self::Id(_) => None,
+            Self::IdentityPubkey(key) => Some(*key),
             Self::Llm { model, prompt_hash } => Some(
                 epigraph_crypto::keypair_from_llm_agent_prehashed(model, prompt_hash).public_key(),
             ),
@@ -175,6 +201,17 @@ async fn resolve_agent(conn: &mut PgConnection, spec: &AgentSpec) -> anyhow::Res
                 bail!("agent {id} does not exist");
             }
             Ok((*id, false))
+        }
+        AgentSpec::IdentityPubkey(key) => {
+            match AgentRepository::get_by_public_key(&mut *conn, key).await? {
+                Some(a) => Ok((a.id.as_uuid(), false)),
+                None => bail!(
+                    "no agent has the identity public key {}: a keyed identity is created by the \
+                     host's registration (with its signing key), never by this command; register \
+                     it first",
+                    hex::encode(key)
+                ),
+            }
         }
         AgentSpec::Llm { .. } => {
             let key = spec.public_key().expect("an LLM spec has a key");
@@ -355,11 +392,11 @@ mod tests {
         let id = Uuid::new_v4();
         let h = "ab".repeat(32);
         assert_eq!(
-            AgentSpec::from_flags(Some(id), None, None).unwrap(),
+            AgentSpec::from_flags(Some(id), None, None, None).unwrap(),
             AgentSpec::Id(id)
         );
         assert!(matches!(
-            AgentSpec::from_flags(None, Some(" m ".into()), Some(h.clone())).unwrap(),
+            AgentSpec::from_flags(None, Some(" m ".into()), Some(h.clone()), None).unwrap(),
             AgentSpec::Llm { ref model, .. } if model == "m"
         ));
         for (a, m, p) in [
@@ -372,7 +409,7 @@ mod tests {
             (None, Some("m".to_string()), Some("ab".repeat(31))),
         ] {
             assert!(
-                AgentSpec::from_flags(a, m.clone(), p.clone()).is_err(),
+                AgentSpec::from_flags(a, m.clone(), p.clone(), None).is_err(),
                 "{a:?} {m:?} {p:?} must be refused"
             );
         }
@@ -381,10 +418,40 @@ mod tests {
     #[test]
     fn an_llm_identity_derives_the_key_epigraph_mcp_signs_with() {
         let h = "cd".repeat(32);
-        let spec = AgentSpec::from_flags(None, Some("model-x".into()), Some(h.clone())).unwrap();
+        let spec =
+            AgentSpec::from_flags(None, Some("model-x".into()), Some(h.clone()), None).unwrap();
         assert_eq!(
             spec.public_key().unwrap(),
             epigraph_crypto::keypair_from_llm_agent_prehashed("model-x", &h).public_key()
         );
+    }
+
+    /// `--identity-pubkey` names the agent alone: it parses to the exact key,
+    /// and is refused with any other naming or when it is not 32 hex bytes.
+    #[test]
+    fn an_identity_pubkey_names_the_agent_alone() {
+        let key = "5d".repeat(32);
+        let spec = AgentSpec::from_flags(None, None, None, Some(format!(" {key}\n"))).unwrap();
+        assert_eq!(spec, AgentSpec::IdentityPubkey([0x5d; 32]));
+        assert_eq!(spec.public_key(), Some([0x5d; 32]));
+        let id = Uuid::new_v4();
+        let h = "ab".repeat(32);
+        for (a, m, p, k) in [
+            (Some(id), None, None, Some(key.clone())),
+            (
+                None,
+                Some("m".to_string()),
+                Some(h.clone()),
+                Some(key.clone()),
+            ),
+            (None, None, Some(h.clone()), Some(key.clone())),
+            (None, None, None, Some("5d".repeat(31))),
+            (None, None, None, Some("zz".repeat(32))),
+        ] {
+            assert!(
+                AgentSpec::from_flags(a, m.clone(), p.clone(), k.clone()).is_err(),
+                "{a:?} {m:?} {p:?} {k:?} must be refused"
+            );
+        }
     }
 }

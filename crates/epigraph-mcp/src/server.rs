@@ -49,7 +49,16 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The key every signature this server makes is by. In the legacy modes
+    /// it is also the agent's identity (`agents.public_key`); in the
+    /// separate-signing-key mode (agent identity lineage design D2) it is the
+    /// agent's registered `agent_keys` signing key and names no agent.
     pub(crate) signer: Arc<AgentSigner>,
+    /// The agent's IDENTITY public key when it is not the signer's
+    /// ([`Self::with_identity_public_key`]): [`Self::agent_id`] finds the agent
+    /// by this key, and the signer only signs. `None` in every constructor,
+    /// which keeps the legacy behaviour (the signer's key is the identity).
+    pub(crate) identity_public_key: Option<[u8; 32]>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
     pub(crate) read_only: bool,
@@ -437,7 +446,9 @@ impl EpiGraphMcpFull {
         if let Some(id) = *cached {
             return Ok(id);
         }
-        let pub_key = self.signer.public_key();
+        // The identity key names the agent; the signer only signs (D2). In the
+        // legacy modes the two are one key.
+        let pub_key = self.identity_key();
         let agent = if let Some(a) =
             epigraph_db::AgentRepository::get_by_public_key(&self.pool, &pub_key)
                 .await
@@ -1080,6 +1091,7 @@ impl EpiGraphMcpFull {
             scoped: None,
             privileged_pool: None,
             signer: Arc::new(signer),
+            identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
             read_only,
@@ -1218,6 +1230,7 @@ impl EpiGraphMcpFull {
             scoped: None,
             privileged_pool: None,
             signer,
+            identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,
             read_only,
@@ -1254,6 +1267,30 @@ impl EpiGraphMcpFull {
     pub fn with_generated_signer_identity(mut self) -> Self {
         self.signer_identity_declared = false;
         self
+    }
+
+    /// Name this server's agent by a separate IDENTITY public key (agent
+    /// identity lineage design D1, D2): [`Self::agent_id`] finds or creates the
+    /// agent by `key`, while every signature is still the signer's. Used by
+    /// `main` in the separate-signing-key mode, which is stdio-only, after
+    /// [`crate::signing_identity::check_signing_key`] has confirmed that the
+    /// signer is an active `signing` key of that agent.
+    ///
+    /// Consumed-self builder, for the same reason as
+    /// [`Self::with_generated_signer_identity`]. Sessions of a
+    /// [`SessionFactory`] are clones of the template, so they carry it.
+    #[must_use]
+    pub fn with_identity_public_key(mut self, key: [u8; 32]) -> Self {
+        self.identity_public_key = Some(key);
+        self
+    }
+
+    /// The public key this server's agent is found by: the declared identity
+    /// key, else the signer's own.
+    #[must_use]
+    pub fn identity_key(&self) -> [u8; 32] {
+        self.identity_public_key
+            .unwrap_or_else(|| self.signer.public_key())
     }
 
     /// Inject a deployment's own write-authorization gate (builder pattern).
@@ -1342,7 +1379,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false."
+        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false. The signature is also checked against the attested agent_keys rows (signing, identity-legacy) of the claim's signer and author, because a server running with a separate signing key records its IDENTITY key as agents.public_key and signs with a registered signing key. key_bound says whether the verifying key is an attested key of the claim's AUTHOR that was valid when the claim was created; key_kind names it (signing, identity-legacy, or unattested when only the signer's agents.public_key verifies; null when nothing verifies). A claim authored by an HTTP caller and signed by the server reports key_bound=false: the key is the server's, not the author's. An identity-legacy key is derived from public inputs, so a signature under it is forgeable even when bound. key_bound covers only blake3(content): the signature names no author or date, and created_at is writer-set, so a direct database write can copy a bound signature onto another row with the same content."
     )]
     async fn verify_claim(
         &self,

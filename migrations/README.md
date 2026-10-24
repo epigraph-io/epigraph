@@ -1475,6 +1475,24 @@ restart.
   the migration. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **163**: public `agent_key_set_status_closes_window` (agent identity
+  lineage design D2, slice S2). Re-states `epigraph_agent_key_set_status`
+  from 161's body (the AK02 attested-key gate included) so that both
+  transitions, to `rotated` and to `revoked`, also set
+  `valid_until = LEAST(valid_until, now())`: a rotated signing key then keeps
+  binding, in `verify_claim`, the claims it signed while active, and binds
+  nothing dated after the rotation. Owner and ACL unchanged. Pinned by
+  `epigraph-mcp/tests/verify_claim_key_binding.rs`
+  (`a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation`).
+  The rotate-route caller-check slice carries a `162` making the same window
+  change to 118's body without the AK02 gate; 163 is the union and, as the
+  higher number, applies last in either order, so every database converges
+  on both. Undo: re-run 161's `CREATE OR REPLACE FUNCTION` block. Slot: 162 is
+  carried by that slice's branch; 163 is free on `main` and on every remote
+  branch. **Deploy order:** with or after 161, and after that 162 if it has
+  been applied. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

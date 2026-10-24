@@ -1416,8 +1416,11 @@ pub enum HashCheck {
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
-    /// Whether the stored Ed25519 signature verifies against the signer's
-    /// `agents.public_key` over the **stored** `content_hash`.
+    /// Whether the stored Ed25519 signature verifies over the **stored**
+    /// `content_hash`, under the signer's `agents.public_key` or under an
+    /// attested `agent_keys` key (`signing`, `identity-legacy`) of the claim's
+    /// signer or author. See [`Self::key_bound`] for whether that key vouches
+    /// for the author.
     ///
     /// `false` covers two very different states — read it together with
     /// [`Self::signed`]: `signed = false` means the claim carries no signature
@@ -1438,6 +1441,39 @@ pub struct VerifyResponse {
     /// `signed = true, signature_valid = true`. Claims written before that, and
     /// by paths that store no signature, report `signed = false`.
     pub signed: bool,
+    /// Whether the key that verifies the signature is BOUND to the claim's
+    /// AUTHOR (agent identity lineage design D2): an attested `agent_keys` key
+    /// of `claims.agent_id` (`signing`, or migration 161's `identity-legacy`)
+    /// whose window holds the claim's `created_at` (`[valid_from - 60 s,
+    /// valid_until)`, the 60 s absorbing clock skew; active, or rotated /
+    /// expired with a recorded `valid_until`; never revoked or pending).
+    ///
+    /// `false` with `signature_valid = true` is a real signature by a key that
+    /// does not vouch for the author: a key no attested row carries, a key of
+    /// the SIGNER that is not the author's (an HTTP claim authored by its
+    /// caller and signed by the server), a revoked key, or a claim dated
+    /// outside the key's window.
+    ///
+    /// What `true` does NOT prove:
+    /// * that the author asserted THIS claim. The signature covers
+    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
+    ///   evidence distinction (evidence rows are signed the same way). Someone
+    ///   who can write the database directly can copy the author's signature
+    ///   from any claim or evidence row with the same bytes onto a row naming
+    ///   that author, and it reports bound.
+    /// * the date. `created_at` is set by the writer and is not signed, so the
+    ///   window test trusts it: a backdated row passes it.
+    /// * anything, under an `identity-legacy` key: its private half is
+    ///   computable from public inputs, so such a signature, bound or not, is
+    ///   never evidence of authorship.
+    pub key_bound: bool,
+    /// Which kind of key verified the signature: `"signing"` (a registered
+    /// random signing key), `"identity-legacy"` (an agent's pre-existing
+    /// identity key; under the unkeyed scheme its private half is computable
+    /// from public inputs, so such a signature is forgeable), or
+    /// `"unattested"` (only the signer's `agents.public_key` verifies it, and
+    /// no attested row carries that key). `null` when no key verifies.
+    pub key_kind: Option<&'static str>,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
     pub hash_check: HashCheck,

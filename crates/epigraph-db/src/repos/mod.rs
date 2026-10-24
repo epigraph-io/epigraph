@@ -99,7 +99,7 @@ pub use agent_identity::{
     AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
     PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
 };
-pub use agent_key::{AgentKeyRepository, AgentKeyRow};
+pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};

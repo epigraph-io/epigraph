@@ -89,6 +89,10 @@ fn start_mcp(
         args.extend(["--listen", "127.0.0.1:0", "--jwt-secret", TEST_JWT_SECRET]);
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"));
+    // The separate-signing-key pair may be exported on the runner (by a host
+    // in that mode); cleared FIRST, so only what this test sets reaches the child.
+    cmd.env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

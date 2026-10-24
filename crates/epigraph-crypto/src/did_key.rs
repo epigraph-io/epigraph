@@ -182,6 +182,42 @@ pub fn keypair_from_llm_agent_prehashed(model_id: &str, prompt_hash_hex: &str) -
     keypair_from_seed(&seed_input)
 }
 
+/// Derive an LLM agent's IDENTITY keypair, keyed with a host-held secret
+/// (agent identity lineage design D1).
+///
+/// The seed is `blake3::keyed_hash(secret, "llm-agent:{model_id.trim()}:{prompt_hash_hex}")`:
+/// the same string [`keypair_from_llm_agent_prehashed`] hashes, but under a
+/// 32-byte key. The unkeyed seed is built from public inputs (the model and
+/// the hash of the prompt files), so anyone who can read those files can
+/// recompute the agent's private key; the keyed one needs the secret as well.
+///
+/// The identity key this yields names the agent (`agents.public_key`) and
+/// signs nothing: signatures come from a separate random signing key
+/// registered in `agent_keys` (design D2). The host computes it and gives a
+/// container only the PUBLIC key.
+///
+/// `prompt_hash_hex` is the BLAKE3 lowercase-hex digest of the prompt files,
+/// with the same silent-orphan trap as [`keypair_from_llm_agent_prehashed`]:
+/// pass the digest, never the raw text. The host's implementation must match
+/// this seed byte for byte; `tests/keyed_llm_identity.rs` spells it out and
+/// carries a literal vector computed outside this crate (secret 32 x `0x41`,
+/// model `test-model-7`, prompt hash
+/// `bf894787bd4ffd19eac89eb078b2e31fe03bb6c8a193812f6470745811153a91` gives
+/// public key
+/// `ec8e33c03e1a31e8bfd30adb6169d972facb953cd75c3891e17ebea89e5b4002`).
+#[must_use]
+pub fn keypair_from_llm_agent_keyed(
+    secret: &[u8; 32],
+    model_id: &str,
+    prompt_hash_hex: &str,
+) -> AgentSigner {
+    let model_id = model_id.trim();
+    let seed_input = format!("llm-agent:{model_id}:{prompt_hash_hex}");
+    let hash = blake3::keyed_hash(secret, seed_input.as_bytes());
+    // Any 32 bytes are a valid Ed25519 secret key.
+    AgentSigner::from_bytes(hash.as_bytes()).expect("BLAKE3 output is always 32 bytes")
+}
+
 /// Generate a `did:key` for an LLM-driven agent.
 ///
 /// Same `(model_id, system_prompt)` inputs produce the same DID across

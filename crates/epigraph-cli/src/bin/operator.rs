@@ -395,6 +395,11 @@ enum Command {
         /// The lowercase-hex BLAKE3 prompt hash (`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`).
         #[arg(long)]
         agent_system_prompt_hash: Option<String>,
+        /// A keyed identity's 32-byte identity public key, as 64 hex chars
+        /// (`EPIGRAPH_AGENT_IDENTITY_PUBKEY`). The agent must already exist
+        /// (the host's registration creates it); it is never created here.
+        #[arg(long)]
+        identity_pubkey: Option<String>,
         /// The human operator's agent id.
         #[arg(long)]
         operator: Uuid,
@@ -1210,11 +1215,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             agent,
             agent_model,
             agent_system_prompt_hash,
+            identity_pubkey,
             operator: op,
             revoke_foreign_writes,
             apply,
         } => {
-            let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
+            let spec = bind::AgentSpec::from_flags(
+                agent,
+                agent_model,
+                agent_system_prompt_hash,
+                identity_pubkey,
+            )?;
             let outcome = bind::run(
                 db.pool(),
                 &mut conn,
