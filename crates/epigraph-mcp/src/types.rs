@@ -1442,15 +1442,28 @@ pub struct VerifyResponse {
     /// Whether the key that verifies the signature is BOUND to the claim's
     /// AUTHOR (agent identity lineage design D2): an attested `agent_keys` key
     /// of `claims.agent_id` (`signing`, or migration 161's `identity-legacy`)
-    /// that was valid when the claim was created (inside `[valid_from,
-    /// valid_until)`; active, or rotated / expired with a recorded
-    /// `valid_until`; never revoked or pending).
+    /// whose window holds the claim's `created_at` (`[valid_from - 60 s,
+    /// valid_until)`, the 60 s absorbing clock skew; active, or rotated /
+    /// expired with a recorded `valid_until`; never revoked or pending).
     ///
     /// `false` with `signature_valid = true` is a real signature by a key that
     /// does not vouch for the author: a key no attested row carries, a key of
     /// the SIGNER that is not the author's (an HTTP claim authored by its
-    /// caller and signed by the server), a revoked key, or a key used outside
-    /// its window (a legacy identity key after the cut-over).
+    /// caller and signed by the server), a revoked key, or a claim dated
+    /// outside the key's window.
+    ///
+    /// What `true` does NOT prove:
+    /// * that the author asserted THIS claim. The signature covers
+    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
+    ///   evidence distinction (evidence rows are signed the same way). Someone
+    ///   who can write the database directly can copy the author's signature
+    ///   from any claim or evidence row with the same bytes onto a row naming
+    ///   that author, and it reports bound.
+    /// * the date. `created_at` is set by the writer and is not signed, so the
+    ///   window test trusts it: a backdated row passes it.
+    /// * anything, under an `identity-legacy` key: its private half is
+    ///   computable from public inputs, so such a signature, bound or not, is
+    ///   never evidence of authorship.
     pub key_bound: bool,
     /// Which kind of key verified the signature: `"signing"` (a registered
     /// random signing key), `"identity-legacy"` (an agent's pre-existing
