@@ -1040,3 +1040,59 @@ async fn attaching_an_identity_attaches_its_registered_successors(pool: PgPool) 
         .await
         .expect("the newest identity writes while its human holds the role");
 }
+
+/// The gate reads `role_agents` (FORCEd: a maintenance session or a
+/// maintenance-owned definer frame only). Under any other owner it would see
+/// no attachment and read every agent as unattached: ROL01 would never fire
+/// and epigraph-mcp would boot in a gap. It fails CLOSED instead: every write
+/// in the binding path and every may-run question is refused until the owner
+/// is restored. CONTROL: restoring the owner restores both answers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_misowned_gate_fails_closed(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    arm(&pool).await;
+
+    for stmt in [
+        "ALTER FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) OWNER TO epigraph_app",
+        // So the refusal measured is the gate's own, not a missing grant: the
+        // owner change rewrites the gate's ACL (the maintenance-owned callers
+        // lose EXECUTE), and the new owner must be able to run what it calls.
+        "GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) \
+         TO epigraph_maintenance",
+        "GRANT EXECUTE ON FUNCTION public.epigraph_human_of(uuid, boolean), \
+                public.epigraph_live_role_assignment(uuid, text, timestamptz) TO epigraph_app",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    assert_rol01(
+        &write_as(&pool, attached, attached, h_group).await,
+        "an attached agent under a misowned gate",
+    );
+    assert_rol01(
+        &write_as(&pool, plain, plain, h_group).await,
+        "any agent under a misowned gate (the gate cannot tell)",
+    );
+    assert!(
+        may_run_as(&pool, "epigraph_app", plain).await.is_err(),
+        "the may-run question is refused under a misowned gate"
+    );
+
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) \
+         OWNER TO epigraph_maintenance",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the owner");
+    write_as(&pool, plain, plain, h_group)
+        .await
+        .expect("CONTROL: with the owner restored an unattached agent writes");
+    assert_rol01(
+        &write_as(&pool, attached, attached, h_group).await,
+        "CONTROL: with the owner restored the attached agent is refused in the gap",
+    );
+}
