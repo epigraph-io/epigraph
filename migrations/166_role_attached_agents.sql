@@ -58,9 +58,11 @@
 --     unchanged), and any change to a detached row (a detach is final);
 --   * DELETE and TRUNCATE are refused outright.
 -- An attachment FOLLOWS THE LINEAGE forward: inserting one also attaches,
--- with the same window, every registered successor of the agent (161's
+-- over the same window, every registered successor of the agent (161's
 -- `agent_succession`, transitively), each naming the row in
--- `inherited_from`. An operator who attaches an identity read from a stale
+-- `inherited_from`. A successor that already holds its own un-detached rows
+-- for the role gets one row per GAP those rows leave in the window, so the
+-- whole window is covered and no row the guard would refuse is written. An operator who attaches an identity read from a stale
 -- list therefore still attaches the identity that runs now. A detach does
 -- not follow (a successor stays attached until it is detached itself: the
 -- direction that only refuses).
@@ -166,10 +168,13 @@
 -- 161's `epigraph_register_agent_identity` is re-stated with its body
 -- unchanged except for one step (5b): when a parent is named, the parent's
 -- live (or not yet started) attachments are copied to the child, each with
--- `inherited_from`, unless the child already has an overlapping un-detached
--- row for that role (so a repeat registration copies nothing and never
--- aborts) or has inherited that parent row before, detached included (a
--- detach is final: a repeat registration does not re-attach the child). The
+-- `inherited_from`: the parent row's window from the registration on, minus
+-- what the child's own un-detached rows for that role already cover, one row
+-- per gap (so the child is attached for ALL of the parent's window, a repeat
+-- registration finds nothing uncovered, and the guard's overlap test never
+-- aborts the registration). A parent row the child has inherited before,
+-- detached included, is not copied again (a detach is final: a repeat
+-- registration does not re-attach the child). The
 -- copy is a restriction, never a grant, so copying into an identity shared
 -- with another group fails safe: it can only refuse. Attaching an identity
 -- that ALREADY has registered successors attaches them too (section 2).
@@ -190,6 +195,14 @@
 -- `epigraph_role_agent_may_run` at boot and fails closed without it.
 
 SET LOCAL lock_timeout = '3s';
+
+-- The copies below compute uncovered windows as multiranges (PostgreSQL 14+).
+DO $$ BEGIN
+    IF current_setting('server_version_num')::integer < 140000 THEN
+        RAISE EXCEPTION '166 needs PostgreSQL 14 or later (multiranges); this server is %',
+                        current_setting('server_version');
+    END IF;
+END $$;
 
 -- ===================================================================
 -- THE RECORD (section 2)
@@ -344,8 +357,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_audit() FROM PUBLIC;
 -- operator attaches may already have registered successors (161's
 -- `agent_succession`), one of which is the identity that runs now. Every
 -- registered successor down the lineage (transitively) gets the same window,
--- naming this row in `inherited_from`, unless it already has an overlapping
--- un-detached row for the role or has inherited this row before. One INSERT
+-- naming this row in `inherited_from`: one row per gap its own un-detached
+-- rows for the role leave in that window (none when they cover it), unless it
+-- has inherited this row before. One INSERT
 -- walks the whole lineage, so the copies' own firings find their
 -- descendants already attached and insert nothing (no deep recursion). A
 -- copy only ever refuses, so it never grants a successor anything; a
@@ -365,21 +379,22 @@ BEGIN
     )
     INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
                                     inherited_from)
-    SELECT NEW.role, l.agent_id, NEW.valid_from, NEW.valid_to,
+    SELECT NEW.role, l.agent_id, lower(g.gap), upper(g.gap),
            'lineage of ' || NEW.agent_id::text || ' (attachment ' || NEW.id::text || ')',
            NEW.id
       FROM lineage l
+     CROSS JOIN LATERAL unnest(
+               tstzmultirange(tstzrange(NEW.valid_from, NEW.valid_to))
+               - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                             FROM public.role_agents c
+                            WHERE c.agent_id = l.agent_id AND c.role = NEW.role
+                              AND c.detached_at IS NULL),
+                          '{}'::tstzmultirange)) AS g(gap)
      WHERE l.agent_id <> NEW.agent_id
        AND NOT EXISTS (
                SELECT 1 FROM public.role_agents c
-                WHERE c.agent_id = l.agent_id AND c.role = NEW.role
-                  AND c.detached_at IS NULL
-                  AND (c.valid_to IS NULL OR c.valid_to > NEW.valid_from)
-                  AND (NEW.valid_to IS NULL OR NEW.valid_to > c.valid_from))
-       AND NOT EXISTS (
-               SELECT 1 FROM public.role_agents c
                 WHERE c.agent_id = l.agent_id AND c.inherited_from = NEW.id)
-     ORDER BY l.agent_id;
+     ORDER BY l.agent_id, lower(g.gap);
     RETURN NULL;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_follow_lineage() FROM PUBLIC;
@@ -1219,35 +1234,38 @@ BEGIN
 
     -- 5b (166). The parent's role attachments: every un-detached attachment
     -- of the parent that has not ended (live, or not yet started) is copied
-    -- to the child, from now (or its own later start) to its own end, naming
-    -- the row it came from, unless the child already has an overlapping
-    -- un-detached attachment to that role, or has ever inherited that row
-    -- (detached included: a detach is final, so a repeat registration naming
-    -- the same parent never undoes an operator's detach). So a LEARNED.md
-    -- edit or a model change does not detach an agent from its role, and a
-    -- repeat registration copies nothing (the first NOT EXISTS is the insert
-    -- guard's own overlap test, so the guard never aborts the registration).
-    -- Each copy
-    -- meets the table's guards and writes its own audit row. An attachment
-    -- only ever refuses, so a copy never grants the child anything.
+    -- to the child over its window from now (or its own later start) to its
+    -- own end, naming the row it came from: ONE ROW PER GAP the child's own
+    -- un-detached rows for that role leave in that window, none where they
+    -- cover it. So the child is attached for the whole of the parent's
+    -- window (a short row of its own never ends its coverage early), a
+    -- repeat registration finds nothing uncovered, and no copy overlaps a
+    -- live row (the guard never aborts the registration). A parent row the
+    -- child has ever inherited is not copied again (detached included: a
+    -- detach is final, so a repeat registration naming the same parent never
+    -- undoes an operator's detach). So a LEARNED.md edit or a model change
+    -- does not detach an agent from its role. Each copy meets the table's
+    -- guards and writes its own audit row. An attachment only ever refuses,
+    -- so a copy never grants the child anything.
     IF v_parent IS NOT NULL THEN
         INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
                                         inherited_from)
-        SELECT pr.role, v_child, GREATEST(now(), pr.valid_from), pr.valid_to,
+        SELECT pr.role, v_child, lower(g.gap), upper(g.gap),
                'succession from ' || v_parent::text || ' in ' || p_group_folder, pr.id
           FROM public.role_agents pr
+         CROSS JOIN LATERAL unnest(
+                   tstzmultirange(tstzrange(GREATEST(now(), pr.valid_from), pr.valid_to))
+                   - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                                 FROM public.role_agents c
+                                WHERE c.agent_id = v_child AND c.role = pr.role
+                                  AND c.detached_at IS NULL),
+                              '{}'::tstzmultirange)) AS g(gap)
          WHERE pr.agent_id = v_parent AND pr.detached_at IS NULL
            AND (pr.valid_to IS NULL OR pr.valid_to > now())
            AND NOT EXISTS (
                    SELECT 1 FROM public.role_agents c
-                    WHERE c.agent_id = v_child AND c.role = pr.role
-                      AND c.detached_at IS NULL
-                      AND (c.valid_to IS NULL OR c.valid_to > GREATEST(now(), pr.valid_from))
-                      AND (pr.valid_to IS NULL OR pr.valid_to > c.valid_from))
-           AND NOT EXISTS (
-                   SELECT 1 FROM public.role_agents c
                     WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
-         ORDER BY pr.role, pr.valid_from;
+         ORDER BY pr.role, lower(g.gap);
         GET DIAGNOSTICS v_roles_new = ROW_COUNT;
     END IF;
 
