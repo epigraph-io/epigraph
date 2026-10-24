@@ -152,6 +152,25 @@ pub async fn list_agent_keys(
     })
 }
 
+/// Since migration 161 a `signing` (or `identity-legacy`) key is attested
+/// state: the host's identity registration binds it and a maintenance session
+/// retires it. On an application session its status change or a new signing
+/// row is refused with SQLSTATE 42501 (AK02). Answer that as a 403 naming the
+/// right path, not as an opaque 500. Nothing was written: the refusal comes
+/// from the first statement of each act.
+#[cfg(feature = "db")]
+fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        ApiError::Forbidden {
+            reason: "this is an attested signing key: it is rotated through the host's \
+                     identity registration, and revoked by a maintenance session"
+                .to_string(),
+        }
+    } else {
+        e.into()
+    }
+}
+
 /// Rotate the agent's active signing key
 ///
 /// POST /api/v1/agents/:id/keys/rotate
@@ -297,7 +316,8 @@ pub async fn rotate_agent_key(
     // validity window (`valid_until`) on the database clock.
     let retired =
         AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None)
-            .await?;
+            .await
+            .map_err(attested_key_refusal)?;
 
     // Store the new active key. Its window opens no earlier than the old one
     // closed, so the two never overlap even if this host's clock is behind
@@ -316,7 +336,8 @@ pub async fn rotate_agent_key(
         None,
         now,
     )
-    .await?;
+    .await
+    .map_err(attested_key_refusal)?;
 
     Ok(Json(new_key_row.into()))
 }
@@ -403,7 +424,8 @@ pub async fn revoke_agent_key(
         Some(request.reason.as_str()),
         caller_is_agent.then_some(id),
     )
-    .await?;
+    .await
+    .map_err(attested_key_refusal)?;
 
     Ok(Json(updated.into()))
 }
