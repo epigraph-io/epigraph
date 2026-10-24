@@ -53,7 +53,8 @@ async fn app_and_token(
 }
 
 /// Legacy `GET /claims`: each of these used to answer 200 with an unfiltered
-/// page.
+/// page. The key is matched after trimming a trailing `[]` and ignoring ASCII
+/// case, so `label[]=` and `Label=` are refused like `label=`.
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_claims_refuses_filters_it_cannot_honor() {
     let (_pool, addr, _shutdown, token, _) = app_and_token(&["claims:read"]).await;
@@ -66,6 +67,8 @@ async fn legacy_claims_refuses_filters_it_cannot_honor() {
         ("/claims?label=backlog&limit=5", "label"),
         ("/claims?limit=5&date=2026-09-07", "date"),
         ("/claims?is_current=false", "is_current"),
+        ("/claims?labels[]=backlog", "labels"),
+        ("/claims?Label=backlog", "label"),
     ] {
         let (status, body) = get(&addr, &token, path).await;
         assert_eq!(
@@ -91,6 +94,7 @@ async fn v1_claims_refuses_label_filters_it_cannot_honor() {
     for (path, field) in [
         ("/api/v1/claims?labels=backlog", "labels"),
         ("/api/v1/claims?limit=5&label=backlog", "label"),
+        ("/api/v1/claims?tags[]=backlog", "tags"),
     ] {
         let (status, body) = get(&addr, &token, path).await;
         assert_eq!(

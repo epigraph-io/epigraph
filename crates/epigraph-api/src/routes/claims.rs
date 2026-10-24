@@ -1515,6 +1515,9 @@ pub(crate) fn refuse_unhonored_filters(
         return Ok(());
     };
     for (key, _) in url::form_urlencoded::parse(raw.as_bytes()) {
+        // `labels[]=x` and `Label=x` are the same intent as `labels=x`; serde
+        // drops them just as silently, so they are refused the same way.
+        let key = key.strip_suffix("[]").unwrap_or(&key).to_ascii_lowercase();
         if let Some(name) = unhonored.iter().find(|name| **name == key) {
             return Err(ApiError::ValidationError {
                 field: (*name).to_string(),
