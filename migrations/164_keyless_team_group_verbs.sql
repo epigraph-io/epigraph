@@ -85,7 +85,10 @@
 --     alternative (revoke them in the same act) was not taken because it turns
 --     one audited act into several unannounced ones. (GRP03)
 --   * THE LAST LIVE ADMIN STAYS. Removing or demoting the group's only live
---     `admin` is refused, decided under a `FOR UPDATE` lock on the `groups`
+--     `admin` that is still a registered human operator is refused (an admin
+--     row of a human whose registration or human client has since lapsed
+--     does not count, so the group cannot be left administered only by a
+--     revoked identity), decided under a `FOR UPDATE` lock on the `groups`
 --     row that every verb takes first, so two concurrent removals of two
 --     admins cannot both pass. (GRP02)
 --   * ONLY VERB-MADE TEAM GROUPS. The member verbs refuse any group that is
@@ -522,9 +525,10 @@ BEGIN
     IF v_live_role = 'admin' AND NOT EXISTS (
            SELECT 1 FROM public.group_memberships m
             WHERE m.group_id = p_group AND m.agent_id <> p_agent
-              AND m.role = 'admin' AND m.revoked_at IS NULL) THEN
-        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group %; add another admin '
-                        'first', p_agent, p_group
+              AND m.role = 'admin' AND m.revoked_at IS NULL
+              AND public.epigraph_is_human_operator(m.agent_id)) THEN
+        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group % that is a registered '
+                        'human operator; add another admin first', p_agent, p_group
             USING ERRCODE = 'GRP02';
     END IF;
 
@@ -648,9 +652,10 @@ BEGIN
     IF v_live_role = 'admin' AND NOT EXISTS (
            SELECT 1 FROM public.group_memberships m
             WHERE m.group_id = p_group AND m.agent_id <> p_agent
-              AND m.role = 'admin' AND m.revoked_at IS NULL) THEN
-        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group %; add another admin '
-                        'first', p_agent, p_group
+              AND m.role = 'admin' AND m.revoked_at IS NULL
+              AND public.epigraph_is_human_operator(m.agent_id)) THEN
+        RAISE EXCEPTION 'GRP02: agent % is the last live admin of group % that is a registered '
+                        'human operator; add another admin first', p_agent, p_group
             USING ERRCODE = 'GRP02';
     END IF;
 
