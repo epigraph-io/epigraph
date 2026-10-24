@@ -1751,6 +1751,28 @@ async fn a_shared_identity_inherits_no_attachment_and_the_audit_says_why(pool: P
         (Some(0), Some("shared_identity".to_string())),
         "the registration records why it copied nothing"
     );
+    let skips_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
+            AND details ->> 'role_attachments_skipped' = 'shared_identity'",
+    )
+    .bind(shared)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    register(&pool, &shared_key, Some(parent), "g-166-own").await;
+    let skips_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
+            AND details ->> 'role_attachments_skipped' = 'shared_identity'",
+    )
+    .bind(shared)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        (skips_before, skips_after),
+        (1, 1),
+        "a repeat registration withholds nothing new and audits no second skip"
+    );
     attach(&pool, ROLE, shared).await;
     assert_eq!(
         live_attachments(&pool, shared).await,

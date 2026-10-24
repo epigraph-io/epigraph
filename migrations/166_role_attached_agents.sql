@@ -62,7 +62,9 @@
 -- `agent_succession`, transitively), each naming the row in
 -- `inherited_from`. A successor that already holds its own un-detached rows
 -- for the role gets one row per GAP those rows leave in the window, so the
--- whole window is covered and no row the guard would refuse is written. An operator who attaches an identity read from a stale
+-- whole window is covered and no row the guard would refuse is written. A
+-- SHARED successor (one that runs in more than one group folder) is skipped
+-- and the skip audited (section 5). An operator who attaches an identity read from a stale
 -- list therefore still attaches the identity that runs now. A detach does
 -- not follow (a successor stays attached until it is detached itself: the
 -- direction that only refuses).
@@ -174,10 +176,19 @@
 -- registration finds nothing uncovered, and the guard's overlap test never
 -- aborts the registration). A parent row the child has inherited before,
 -- detached included, is not copied again (a detach is final: a repeat
--- registration does not re-attach the child). The
--- copy is a restriction, never a grant, so copying into an identity shared
--- with another group fails safe: it can only refuse. Attaching an identity
--- that ALREADY has registered successors attaches them too (section 2).
+-- registration does not re-attach the child).
+--
+-- A SHARED identity inherits no attachment, as it inherits no link (161 step
+-- 5, `shared_identity`): when the child already runs in another group folder,
+-- an attachment would tie every group's runs of it to the role, so one
+-- role's gap would stop the other groups too. The registration copies
+-- nothing; its audit row records `role_attachments_skipped =
+-- 'shared_identity'` and the withheld parent rows (once per parent row, so a
+-- repeat start writes no new row). Attaching a shared identity is a manual
+-- act (`epigraph_attach_agent_to_role`). The lineage follow (section 2) skips
+-- a shared successor alike, with one `platform.role_agent_copy_skipped`
+-- security event per skipped successor. Attaching an identity that ALREADY
+-- has registered successors attaches the unshared ones too (section 2).
 --
 -- ORDER: REGISTER, THEN ATTACH. 161 adopts a never-registered identity only
 -- while it is FRESH (no reference into `agents` but its own personal group,
@@ -359,7 +370,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_audit() FROM PUBLIC;
 -- registered successor down the lineage (transitively) gets the same window,
 -- naming this row in `inherited_from`: one row per gap its own un-detached
 -- rows for the role leave in that window (none when they cover it), unless it
--- has inherited this row before. One INSERT
+-- has inherited this row before or is SHARED (it runs in more than one group
+-- folder: section 5), which is skipped with one
+-- `platform.role_agent_copy_skipped` security event. One INSERT
 -- walks the whole lineage, so the copies' own firings find their
 -- descendants already attached and insert nothing (no deep recursion). A
 -- copy only ever refuses, so it never grants a successor anything; a
@@ -394,7 +407,29 @@ BEGIN
        AND NOT EXISTS (
                SELECT 1 FROM public.role_agents c
                 WHERE c.agent_id = l.agent_id AND c.inherited_from = NEW.id)
+       AND (SELECT count(DISTINCT s.group_folder) FROM public.agent_prompt_snapshots s
+             WHERE s.agent_id = l.agent_id) <= 1
      ORDER BY l.agent_id, lower(g.gap);
+    -- The shared successors skipped above, each audited once.
+    WITH RECURSIVE lineage(agent_id) AS (
+        SELECT s.child_agent_id FROM public.agent_succession s
+         WHERE s.parent_agent_id = NEW.agent_id
+        UNION
+        SELECT s.child_agent_id FROM public.agent_succession s
+          JOIN lineage l ON s.parent_agent_id = l.agent_id
+    )
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    SELECT 'platform.role_agent_copy_skipped', l.agent_id, true,
+           jsonb_build_object('attachment_id', NEW.id, 'role', NEW.role,
+                              'from_agent', NEW.agent_id, 'reason', 'shared_identity')
+      FROM lineage l
+     WHERE l.agent_id <> NEW.agent_id
+       AND NOT EXISTS (
+               SELECT 1 FROM public.role_agents c
+                WHERE c.agent_id = l.agent_id AND c.inherited_from = NEW.id)
+       AND (SELECT count(DISTINCT s.group_folder) FROM public.agent_prompt_snapshots s
+             WHERE s.agent_id = l.agent_id) > 1
+     ORDER BY l.agent_id;
     RETURN NULL;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_follow_lineage() FROM PUBLIC;
@@ -811,8 +846,9 @@ END $$;
 -- SUCCESSION (section 5): 161's registration, re-stated. Signature, owner and
 -- ACL unchanged (CREATE OR REPLACE keeps both; the ACL stays the attestor's
 -- alone). The body is 161's with exactly three deltas, each marked `166`:
--- the `v_roles_new` variable, step 5b, and the audit row's trigger and
--- `role_attachments_copied` detail. A later migration that re-bodies the
+-- the `v_roles_new` and `v_withheld` variables, step 5b, and the audit row's
+-- trigger and `role_attachments_copied` / `role_attachments_skipped` /
+-- `role_attachments_withheld` details. A later migration that re-bodies the
 -- registration starts from this body.
 -- ===================================================================
 CREATE OR REPLACE FUNCTION public.epigraph_register_agent_identity(
@@ -869,6 +905,7 @@ DECLARE
     v_rec_model  text;
     v_rec_hash   text;
     v_roles_new  integer := 0;  -- 166
+    v_withheld   uuid[] := '{}';  -- 166
     i            integer;
 BEGIN
     -- Inputs.
@@ -1247,7 +1284,35 @@ BEGIN
     -- does not detach an agent from its role. Each copy meets the table's
     -- guards and writes its own audit row. An attachment only ever refuses,
     -- so a copy never grants the child anything.
-    IF v_parent IS NOT NULL THEN
+    -- A SHARED child (it already runs in another group folder: step 5's
+    -- `shared_identity`) is copied nothing: an attachment would tie every
+    -- group's runs of it to the role. The parent rows a copy would have
+    -- written are WITHHELD and named in the audit row below, each once (a
+    -- repeat start withholds nothing new and writes no audit row for it).
+    IF v_parent IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                    WHERE s.agent_id = v_child AND s.group_folder <> p_group_folder) THEN
+        SELECT COALESCE(array_agg(pr.id ORDER BY pr.role, pr.valid_from), '{}'::uuid[])
+          INTO v_withheld
+          FROM public.role_agents pr
+         WHERE pr.agent_id = v_parent AND pr.detached_at IS NULL
+           AND (pr.valid_to IS NULL OR pr.valid_to > now())
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+           AND NOT isempty(
+                   tstzmultirange(tstzrange(GREATEST(now(), pr.valid_from), pr.valid_to))
+                   - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                                 FROM public.role_agents c
+                                WHERE c.agent_id = v_child AND c.role = pr.role
+                                  AND c.detached_at IS NULL),
+                              '{}'::tstzmultirange))
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.security_events e
+                    WHERE e.event_type = 'agent.identity_registered'
+                      AND e.agent_id = v_child
+                      AND e.details -> 'role_attachments_withheld' ? pr.id::text);
+    ELSIF v_parent IS NOT NULL THEN
         INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
                                         inherited_from)
         SELECT pr.role, v_child, lower(g.gap), upper(g.gap),
@@ -1271,7 +1336,7 @@ BEGIN
 
     -- 6. The audit row, when something new was recorded.
     IF v_created OR v_succ_rows > 0 OR v_snap_new OR v_key_new OR v_inherited
-       OR v_roles_new > 0 THEN
+       OR v_roles_new > 0 OR cardinality(v_withheld) > 0 THEN
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('agent.identity_registered', v_child, true,
                 jsonb_build_object('parent_agent_id', v_parent,
@@ -1288,6 +1353,10 @@ BEGIN
                                    'link_live', v_link_live,
                                    'inherit_reason', v_reason,
                                    'role_attachments_copied', v_roles_new,
+                                   'role_attachments_skipped',
+                                   CASE WHEN cardinality(v_withheld) > 0
+                                        THEN 'shared_identity' END,
+                                   'role_attachments_withheld', to_jsonb(v_withheld),
                                    'recorded_by', session_user));
     END IF;
 
