@@ -3020,8 +3020,23 @@ async fn linked_author_personal_residue(
 /// Print up to 20 offending ids. Tables without an `id` column
 /// (`claim_frames`, `claim_cluster_membership`, `claim_neighborhood_membership`)
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
-/// acceptance line implies.
+/// acceptance line implies. `harvester_claim_provenance` has no `id` and no
+/// single-column key (its PK is `(claim_id, fragment_id)`), so its rows are
+/// listed by both key columns.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
+    if table == "harvester_claim_provenance" {
+        let keys: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT claim_id, fragment_id FROM harvester_claim_provenance \
+              WHERE owner_group_id = $1 ORDER BY claim_id, fragment_id LIMIT 20",
+        )
+        .bind(WORLD)
+        .fetch_all(pool)
+        .await?;
+        for (claim_id, fragment_id) in keys {
+            eprintln!("    {table}.(claim_id, fragment_id) = ({claim_id}, {fragment_id})");
+        }
+        return Ok(());
+    }
     if table == "harvester_fragments" {
         // Strict mode only (the caller skips this under `platform`): list the
         // rows `harvester_fragment_residual` counted, seed-owned repairable
