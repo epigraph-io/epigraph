@@ -217,6 +217,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          only the one revoke.",
     ),
     (
+        "group_role_bindings",
+        "DELETE",
+        "A role-to-group binding (165) is ended by its `revoked_at` stamp, never deleted: \
+         the row is the record that a role conferred a group's membership, from when to \
+         when. The bypass-only INSERT and UPDATE pair stops short of FOR ALL on purpose \
+         (123's role_assignments pair is the template), 165 grants DELETE to nobody, its \
+         update guard admits only the one end, and its delete guard refuses every role.",
+    ),
+    (
         "passkey_enrollments",
         "DELETE",
         "An enrollment ticket (124) is never deleted: it ends by expiring or by its one \
@@ -386,6 +395,7 @@ const PROTECTED: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "group_role_bindings",
 ];
 
 // ===========================================================================
