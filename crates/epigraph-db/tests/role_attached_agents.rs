@@ -1771,6 +1771,57 @@ async fn a_shared_identity_inherits_no_attachment_and_the_audit_says_why(pool: P
     );
 }
 
+/// The lineage follow obeys the same rule: attaching an identity attaches
+/// its registered successors, except a SHARED one (it runs in more than one
+/// group folder), which is skipped with one `platform.role_agent_copy_skipped`
+/// audit row naming the role, the attachment and `shared_identity`. CONTROL:
+/// an unshared successor of the same identity is attached.
+///
+/// Verified to fail: the lineage copy run whatever other folders the
+/// successor runs in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn attaching_an_identity_skips_a_shared_successor_and_the_audit_says_why(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-ln-own").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let shared_key = random32();
+    let shared = register(&pool, &shared_key, Some(parent), "g-166-ln-own").await;
+    assert_eq!(register(&pool, &shared_key, None, "g-166-ln-elsewhere").await, shared);
+    let own = register(&pool, &random32(), Some(parent), "g-166-ln-own").await;
+
+    let row = attach(&pool, ROLE, parent).await;
+    assert!(
+        live_attachments(&pool, shared).await.is_empty(),
+        "a shared successor is not attached with its ancestor"
+    );
+    let skipped: Vec<(String, String, Uuid)> = sqlx::query_as(
+        "SELECT details ->> 'role', details ->> 'reason', \
+                (details ->> 'attachment_id')::uuid \
+           FROM security_events \
+          WHERE event_type = 'platform.role_agent_copy_skipped' AND agent_id = $1",
+    )
+    .bind(shared)
+    .fetch_all(&pool)
+    .await
+    .expect("skip rows");
+    assert_eq!(
+        skipped,
+        vec![(ROLE.to_string(), "shared_identity".to_string(), row)],
+        "one audit row says why the shared successor was skipped"
+    );
+    assert_eq!(
+        live_attachments(&pool, own).await,
+        vec![(ROLE.to_string(), Some(row))],
+        "CONTROL: an unshared successor is attached"
+    );
+}
+
 /// The identity attestor runs the registration (whose succession copy writes
 /// `role_agents` in a maintenance-owned definer frame) but cannot write the
 /// table itself, nor call the attach / detach verbs.
