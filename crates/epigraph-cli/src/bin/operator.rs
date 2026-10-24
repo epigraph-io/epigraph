@@ -108,7 +108,8 @@ enum Command {
     /// explicit window. Agents never hold a role (CUS01); once a custodian
     /// exists every grant names a live custodian as --granted-by (CUS03).
     GrantRole {
-        /// `role:platform-custodian` or `role:auditor`.
+        /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
+        /// `define-group-role` added (migration 165).
         #[arg(long)]
         role: String,
         /// The human's own agent id (a registered human operator).
