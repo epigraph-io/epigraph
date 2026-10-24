@@ -218,3 +218,102 @@ async fn a_revoked_acting_agent_is_refused_as_a_denial(pool: PgPool) {
     .unwrap();
     assert_eq!(live, 0, "the personal revocation must stand");
 }
+
+// ── merged_content size cap (backlog b76e284b) ─────────────────────────────
+//
+// `consolidate_claims` creates a claim through its own act, so it must apply
+// the 65,536-byte content cap the other claim-writing tools apply
+// (`claim_content_size_cap.rs`). The contract is the same one that file pins:
+// an INVALID_PARAMS error AND nothing written. Here "nothing written" is two
+// facts: no claim carries the merged content, and both sources are still
+// current. The at-cap case is the other half of the pair: without it, a
+// refusal could be the harness failing rather than the cap.
+//
+// The cap is spelled as a literal so the file states the contract
+// independently of the constant it tests.
+
+const CONTENT_CAP: usize = 65_536;
+
+/// Content of exactly `len` bytes, unique per call. ASCII only, so the cut
+/// never splits a character.
+fn merged_of_len(tag: &str, len: usize) -> String {
+    let mut s = format!("consolidate size cap {tag} {} ", Uuid::new_v4());
+    while s.len() < len {
+        s.push_str("lorem ipsum ");
+    }
+    s.truncate(len);
+    assert_eq!(s.len(), len, "fixture: exact byte length");
+    s
+}
+
+async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn current_count(pool: &PgPool, ids: &[Uuid]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1) AND is_current")
+        .bind(ids)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn oversize_merged_content_is_refused_and_writes_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "size cap src one", 0.6).await;
+    let s2 = seed_claim(&pool, agent, "size cap src two", 0.7).await;
+    let merged = merged_of_len("over", CONTENT_CAP + 1);
+
+    let server = build_server(pool.clone(), false).await;
+    let result = consolidate_claims(&server, &viewer, params(&[s1, s2], &merged, None), None).await;
+
+    // The write half first: an over-cap merge must leave no trace at all.
+    assert_eq!(
+        claims_with_content(&pool, &merged).await,
+        0,
+        "a merged claim with {} bytes of content was written (result: {result:?})",
+        merged.len()
+    );
+    assert_eq!(
+        current_count(&pool, &[s1, s2]).await,
+        2,
+        "the sources must not be retired by a refused merge (result: {result:?})"
+    );
+    let err = result.expect_err("merged_content over 65,536 bytes must be refused");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "an oversize body is the caller's error: {err:?}"
+    );
+    assert!(
+        err.message.contains("65536"),
+        "the refusal must name the cap: {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn merged_content_of_exactly_the_cap_is_accepted(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "at cap src one", 0.6).await;
+    let s2 = seed_claim(&pool, agent, "at cap src two", 0.7).await;
+    let merged = merged_of_len("at cap", CONTENT_CAP);
+
+    let server = build_server(pool.clone(), false).await;
+    consolidate_claims(&server, &viewer, params(&[s1, s2], &merged, None), None)
+        .await
+        .expect("merged_content of exactly 65,536 bytes must be accepted");
+
+    assert_eq!(claims_with_content(&pool, &merged).await, 1);
+    assert_eq!(
+        current_count(&pool, &[s1, s2]).await,
+        0,
+        "an accepted merge retires its sources"
+    );
+}
