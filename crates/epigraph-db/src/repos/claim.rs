@@ -11705,6 +11705,29 @@ async fn repair_marked_duplicate(
     .fetch_all(&mut *conn)
     .await?;
     let resourced_rows_ids: Vec<Uuid> = resourced_rows.iter().map(|r| r.0).collect();
+
+    // The BP factor graph (backlog ddb231b7). The act's retirement of the
+    // duplicate deleted every factor naming it (`claims_deactivate_factors`),
+    // and the two re-points above are UPDATEs, which `edges_auto_factor`
+    // (INSERT only) never sees: without this, belief propagation never sees
+    // an edge the canonical inherited. Mint each moved edge's factor as the
+    // trigger would now, and only those (an existing `(type, pair)` slot on
+    // the canonical is kept, as the trigger's ON CONFLICT keeps it). The
+    // un-mark's stale-factor DELETE removes these again by `source_edge_id`.
+    let moved_edges: Vec<Uuid> = retargeted_ids
+        .iter()
+        .chain(resourced_rows_ids.iter())
+        .copied()
+        .collect();
+    if !moved_edges.is_empty() {
+        sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+            .bind(canon_uuid)
+            .bind(canon_uuid)
+            .bind(Vec::<String>::new())
+            .bind(Some(&moved_edges))
+            .execute(&mut *conn)
+            .await?;
+    }
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
         .into_iter()
         .filter(|(_, _, _, target_type)| target_type == "claim")
@@ -11935,6 +11958,7 @@ async fn reverse_marked_duplicate(
         .bind(dup_uuid)
         .bind(canon_uuid)
         .bind(&freed_slots)
+        .bind(None::<Vec<Uuid>>)
         .execute(&mut *conn)
         .await?;
 
@@ -12112,10 +12136,18 @@ async fn reverse_marked_duplicate(
 /// each edge were inserted now, for every in-force claim-claim edge whose
 /// endpoints are both current and that either touches the claim `$1` or
 /// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
-/// (as `type:lo,hi`). For the un-mark, which puts edges back by UPDATE (which
-/// that INSERT trigger never sees) onto a claim made current again: `$1` is
-/// the duplicate, `$2` its canonical and `$3` the slots the stale-factor
-/// DELETE freed there.
+/// (as `type:lo,hi`), and, when `$4` (`uuid[]`) is not NULL, is one of the
+/// edges it lists. Both dedup directions move edges by UPDATE, which that
+/// INSERT trigger never sees:
+///
+/// * the un-mark puts edges back onto a claim made current again: `$1` is the
+///   duplicate, `$2` its canonical, `$3` the slots the stale-factor DELETE
+///   freed there, `$4` NULL;
+/// * the mark's repair ([`repair_marked_duplicate`]) re-points the retired
+///   duplicate's edges onto the canonical, whose factors the retirement
+///   deleted (`claims_deactivate_factors`): `$1` and `$2` are the canonical,
+///   `$3` empty and `$4` the edges it moved, so only those are minted and a
+///   canonical edge whose factor something else removed stays without one.
 ///
 /// It is the body of migration 038's `auto_create_factor_from_edge`, over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
@@ -12174,6 +12206,7 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                 -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
                 AND (e.valid_to IS NULL OR e.valid_to > now())
                 AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
+                AND ($4::uuid[] IS NULL OR e.id = ANY($4::uuid[]))
                 AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
                 AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
                 AND m.ft IS NOT NULL
