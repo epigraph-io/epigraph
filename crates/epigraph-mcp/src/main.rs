@@ -189,7 +189,7 @@ struct Cli {
     /// the agent under this key, and passes only the public half. The agent is
     /// found by it; nothing is signed with it. Requires
     /// `EPIGRAPH_AGENT_SIGNING_KEY`, and excludes `--agent-model` and
-    /// `--agent-key`.
+    /// `--agent-key`. Stdio only: refused with `--listen`.
     #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
     agent_identity_pubkey: Option<String>,
 
@@ -357,6 +357,28 @@ fn select_signer(
         identity_declared: false,
         identity_public_key: None,
     })
+}
+
+/// The separate-signing-key mode (rung 0) is stdio-only.
+///
+/// An HTTP listener signs for EVERY caller. In this mode its key is an
+/// attested `signing` key of its agent, so it would hand any caller a
+/// signature over `blake3(content)` that `verify_claim` binds to that agent,
+/// and a caller who can also write the database directly (the principal
+/// settings are self-settable) could plant a claim "by" the listener's agent
+/// that verifies as bound. The mode exists for one agent's own container,
+/// which serves stdio. Pure, so it runs before the database connect.
+fn check_separate_key_transport(listen: Option<&str>, separate: bool) -> Result<(), String> {
+    if separate && listen.is_some() {
+        return Err(
+            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY: the separate-signing-key \
+             mode is stdio-only, and is refused on an HTTP listener (--listen): a listener signs \
+             for every caller, and its signatures would bind to this agent. Run the listener \
+             with its own --agent-key or --agent-model identity."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Parse an `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` value into its 32 bytes.
@@ -558,6 +580,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    if let Err(reason) = check_separate_key_transport(
+        cli.listen.as_deref(),
+        selected_signer.identity_public_key.is_some(),
+    ) {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(1);
+    }
     if let Err(reason) = epigraph_mcp::operator::check_operator_transport(
         cli.listen.as_deref(),
         cli.operator_id,
@@ -704,8 +733,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Separate-signing-key mode (agent identity lineage design D2): refuse to
     // serve unless the signing key is an ACTIVE `signing` key of the agent the
     // identity key names. Read-only and BEFORE anything resolves (and so may
-    // create) the server's agent row: the HTTP warm-up, `self_link` and the
-    // first tool call all do, and a refused boot must leave no row behind.
+    // create) the server's agent row: `self_link` and the first tool call both
+    // do, and a refused boot must leave no row behind. (The mode is stdio-only:
+    // `check_separate_key_transport` refused `--listen` before the connect.)
     if let Some(identity) = &identity_public_key {
         match epigraph_mcp::signing_identity::check_signing_key(
             &pool,
@@ -896,10 +926,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             template
         } else {
             template.with_generated_signer_identity()
-        };
-        let template = match identity_public_key {
-            Some(identity) => template.with_identity_public_key(identity),
-            None => template,
         };
         let sessions = epigraph_mcp::SessionFactory::new(template);
 
@@ -1240,7 +1266,9 @@ mod unauthenticated_writes_gate_tests {
 
 #[cfg(test)]
 mod signer_selection_tests {
-    use super::{select_signer, SelectedSigner, SeparateSigningKey};
+    use super::{
+        check_separate_key_transport, select_signer, SelectedSigner, SeparateSigningKey,
+    };
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -1638,6 +1666,20 @@ mod signer_selection_tests {
             !msg.contains(&bad[..20]),
             "the value must not be echoed: {msg}"
         );
+    }
+
+    /// The separate-signing-key mode is refused on every listener kind and
+    /// admitted on stdio; the legacy rungs are untouched by this gate.
+    #[test]
+    fn the_separate_key_mode_is_stdio_only() {
+        for listen in ["127.0.0.1:3100", "unix:/run/epigraph-mcp.sock"] {
+            let err = check_separate_key_transport(Some(listen), true)
+                .expect_err("the new mode on a listener is refused");
+            assert!(err.contains("stdio-only"), "{err}");
+            assert!(check_separate_key_transport(Some(listen), false).is_ok());
+        }
+        assert!(check_separate_key_transport(None, true).is_ok());
+        assert!(check_separate_key_transport(None, false).is_ok());
     }
 }
 

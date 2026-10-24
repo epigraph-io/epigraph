@@ -1272,7 +1272,7 @@ impl EpiGraphMcpFull {
     /// Name this server's agent by a separate IDENTITY public key (agent
     /// identity lineage design D1, D2): [`Self::agent_id`] finds or creates the
     /// agent by `key`, while every signature is still the signer's. Used by
-    /// `main` in the separate-signing-key mode, after
+    /// `main` in the separate-signing-key mode, which is stdio-only, after
     /// [`crate::signing_identity::check_signing_key`] has confirmed that the
     /// signer is an active `signing` key of that agent.
     ///
