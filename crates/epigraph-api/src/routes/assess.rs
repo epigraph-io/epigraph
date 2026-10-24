@@ -305,17 +305,46 @@ pub async fn assess_claim(
     };
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
     epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
+    // The slot read and the slot upsert are ONE unit per (claim, frame, slot):
+    // a transaction holding a transaction-scoped advisory lock on that key.
+    // Unserialized, two concurrent calls by one owner could both read "no
+    // row" before either upsert landed and both report nothing replaced
+    // (backlog 4a7f90f8). The key is hashed in SQL so every server process
+    // derives the same lock. READ COMMITTED (the default) gives the read
+    // below a snapshot taken AFTER the lock is granted, so it sees the
+    // previous holder's committed row. The transaction commits before the
+    // fold below, which reads on other connections.
+    let mut slot_tx = pool.begin().await.map_err(|e| ApiError::InternalError {
+        message: format!("begin assessment slot transaction: {e}"),
+    })?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended( \
+             'epigraph/assess-slot/' || $1::text || '/' || $2::text || '/' || $3::text, 0))",
+    )
+    .bind(claim_id)
+    .bind(frame_id)
+    .bind(slot)
+    .execute(&mut *slot_tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("lock assessment slot: {e}"),
+    })?;
     // The owner's assessment this call replaces: exactly the row the upsert
     // below overwrites.
     let replaced_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
-            .await?
-            .into_iter()
-            .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
-            .map(|row| (row.id, row.source_agent_id, row.masses))
-            .collect();
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *slot_tx,
+            &viewer,
+            claim_id,
+            frame_id,
+        )
+        .await?
+        .into_iter()
+        .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
+        .map(|row| (row.id, row.source_agent_id, row.masses))
+        .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *slot_tx,
         claim_id,
         frame_id,
         owner,
@@ -332,6 +361,12 @@ pub async fn assess_claim(
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
+    slot_tx
+        .commit()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("commit assessment slot: {e}"),
+        })?;
 
     // Ensure claim is assigned to frame + create WITHIN_FRAME edge
     let _ = sqlx::query(

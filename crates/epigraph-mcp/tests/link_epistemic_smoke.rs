@@ -1322,3 +1322,133 @@ fn the_contract_advertises_qualifies_as_a_belief_neutral_scope_caveat() {
         );
     }
 }
+
+// ── belief_wired=false names its reason (backlog 0a996437) ──────────────────
+
+/// Call `link_epistemic` and return the raw response JSON, so the reason field
+/// is read as a key (absent on a pre-fix build, which then fails on the
+/// assertion rather than on the build).
+async fn link_raw(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+) -> serde_json::Value {
+    let result = do_link_epistemic(
+        server,
+        viewer,
+        LinkEpistemicParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: relationship.to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("link_epistemic {relationship}: {e:?}"));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    serde_json::from_str(&text).expect("response JSON")
+}
+
+/// Every `belief_wired=false` used to look the same. Each cause the tool can
+/// tell apart now comes back as `belief_wired_reason`; a successful wire
+/// carries none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn belief_wired_false_names_its_reason(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    // 1. A source with a truth_value but NULL belief columns.
+    let factorless = seed_claim(&pool, "0a996437 factorless source", 0.63).await;
+    let t1 = seed_claim(&pool, "0a996437 target 1", 0.5).await;
+    let r = link_raw(&server, &viewer, factorless, t1, "supports").await;
+    assert_eq!(r["belief_wired"], false, "{r}");
+    assert_eq!(r["belief_wired_reason"], "source_has_no_belief", "{r}");
+
+    // 2. A successful wire carries no reason; its re-hit is `already_wired`.
+    let believed = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let t2 = seed_claim(&pool, "0a996437 target 2", 0.5).await;
+    let wired = link_raw(&server, &viewer, believed, t2, "supports").await;
+    assert_eq!(wired["belief_wired"], true, "{wired}");
+    assert!(
+        wired
+            .get("belief_wired_reason")
+            .is_none_or(serde_json::Value::is_null),
+        "a successful wire names no failure reason: {wired}"
+    );
+    let rehit = link_raw(&server, &viewer, believed, t2, "supports").await;
+    assert_eq!(rehit["was_created"], false, "{rehit}");
+    assert_eq!(rehit["belief_wired"], false, "{rehit}");
+    assert_eq!(rehit["belief_wired_reason"], "already_wired", "{rehit}");
+
+    // 3. A structural relationship never wires.
+    let t3 = seed_claim(&pool, "0a996437 target 3", 0.5).await;
+    let cites = link_raw(&server, &viewer, believed, t3, "cites").await;
+    assert_eq!(cites["belief_wired"], false, "{cites}");
+    assert_eq!(
+        cites["belief_wired_reason"], "structural_relationship",
+        "{cites}"
+    );
+
+    // 4. A refuted contradictor restricts to the vacuous interval.
+    let refuted = seed_claim_with_belief(&pool, 0.0, 0.0, Some(0.0)).await;
+    let t4 = seed_claim(&pool, "0a996437 target 4", 0.5).await;
+    let vac = link_raw(&server, &viewer, refuted, t4, "contradicts").await;
+    assert_eq!(vac["belief_wired"], false, "{vac}");
+    assert_eq!(vac["belief_wired_reason"], "vacuous_source_mass", "{vac}");
+
+    // 5. A wiring that FAILS inside the engine is `refused_or_failed`, not
+    // `already_wired`: the edge is new, so the pre-read knows it was not
+    // wired, and the engine's own write of the edge's mass function is made
+    // to raise. The engine rolls back to its savepoint, so the edge itself
+    // still commits.
+    sqlx::query(
+        "CREATE FUNCTION test_0a996437_refuse_bba() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test: BBA write refused'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_0a996437_refuse_bba BEFORE INSERT ON mass_functions \
+         FOR EACH ROW EXECUTE FUNCTION test_0a996437_refuse_bba()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create refusing trigger");
+    let t5 = seed_claim(&pool, "0a996437 target 5", 0.5).await;
+    let failed = link_raw(&server, &viewer, believed, t5, "supports").await;
+    assert_eq!(failed["was_created"], true, "{failed}");
+    assert_eq!(failed["belief_wired"], false, "{failed}");
+    assert_eq!(
+        failed["belief_wired_reason"], "refused_or_failed",
+        "{failed}"
+    );
+    let edge_id: Uuid = failed["edge_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("edge_id: {failed}"));
+    let edge_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = $1")
+        .bind(edge_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count edge");
+    assert_eq!(
+        edge_rows, 1,
+        "a failed wiring leaves the edge committed: {failed}"
+    );
+    let bba_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edge BBA");
+    assert_eq!(bba_rows, 0, "the failed wiring stored no BBA: {failed}");
+}
