@@ -31,7 +31,8 @@ use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::challenges::{challenge_claim, list_challenges};
-use epigraph_mcp::types::{ChallengeclaimParams, ListChallengesParams};
+use epigraph_mcp::tools::events::list_events;
+use epigraph_mcp::types::{ChallengeclaimParams, ListChallengesParams, ListEventsParams};
 use rmcp::model::ErrorCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -295,6 +296,23 @@ async fn listing_a_privatized_claims_challenges_is_no_existence_oracle(pool: PgP
         1,
         "control: a public claim's challenge is listed"
     );
+    // The `claim.challenged` event names the claim: the event surface must
+    // hide it with the claim too.
+    let events_naming_claim = |r: rmcp::model::CallToolResult| {
+        ok_json(&r).to_string().matches(&claim.to_string()).count()
+    };
+    let challenged = || ListEventsParams {
+        event_type: Some("claim.challenged".to_string()),
+        actor_id: None,
+        limit: Some(100),
+    };
+    let ev_before = list_events(&server, &stranger_viewer, challenged())
+        .await
+        .expect("list events");
+    assert!(
+        events_naming_claim(ev_before) > 0,
+        "control: the challenge's event is listed while the claim is public"
+    );
 
     sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
         .bind(claim)
@@ -311,6 +329,14 @@ async fn listing_a_privatized_claims_challenges_is_no_existence_oracle(pool: PgP
         ok_json(&on_private),
         ok_json(&on_random),
         "a privatized claim's challenges answer a non-member exactly as a random id does"
+    );
+    let ev_after = list_events(&server, &stranger_viewer, challenged())
+        .await
+        .expect("list events");
+    assert_eq!(
+        events_naming_claim(ev_after),
+        0,
+        "no event names the privatized claim to a non-member"
     );
 }
 

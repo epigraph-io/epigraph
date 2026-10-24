@@ -60,10 +60,9 @@
 -- evidence, BBAs and traces to the claim's owner when the claim narrows does
 -- not touch an outsider's challenge: privatizing (or re-owning) the claim
 -- never drags it into the claim's group (orchestrator ruling under R-CH1).
--- It stays the outsider's and stays public. The read side keeps that from
--- becoming an existence oracle for the now private claim:
--- `ChallengeRepository::{get, list_for_claim}` return a challenge only with a
--- claim the viewer can read (same change set).
+-- It stays the outsider's and stays public; section 6 keeps that from
+-- becoming an existence oracle for the now private claim (R-CH1b): reading a
+-- challenge requires reading its claim, in row security and in-query.
 --
 -- Byte-for-byte otherwise: the `derived text[]` literal (read by
 -- `epigraph_cli::operator::tables::parse_derived_array`), the pin and
@@ -80,7 +79,8 @@
 --     `writer_owned = false` (the column default) and keep their tenancy. A
 --     backfill, if one is ever ruled, is an operator script.
 --   * It does not touch 126's elevated arms on `challenges` (read arm and the
---     three write refusals), 077's policy or 115's DELETE and owner guards.
+--     three write refusals), 077's policy or 115's DELETE and owner guards; it
+--     ADDS one restrictive read policy (section 6).
 --   * It does not give the claim's owner a way to RESOLVE an outsider's
 --     challenge: `ChallengeRepository::update_state` on a row the owner cannot
 --     write is refused by 077 like any other cross-group UPDATE. No route
@@ -381,3 +381,42 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_propagate_tenancy() OWNER TO epigraph_maintenance';
     END IF;
 END $$;
+
+-- ===================================================================
+-- 6. READS FOLLOW THE CLAIM (ruling R-CH1b)
+-- ===================================================================
+--
+-- Section 2 keeps an outsider's challenge where it is when its claim is
+-- privatized: owned by the outsider, public. On its own that makes the row an
+-- existence oracle for the now private claim: its `claim_id`, its explanation
+-- and its mere presence in a per-claim list or count tell every reader that
+-- this id names a claim, which must be indistinguishable from a random id to
+-- anyone who cannot read the claim (R-CH1b). So OWNERSHIP stays with the
+-- outsider, and READING a challenge additionally requires reading its claim.
+--
+-- Enforced here, in the database, so every reader is covered (the repo
+-- functions, the corpus counts, and any query written later), not only the
+-- reads that remember the predicate. `ChallengeRepository::{get,
+-- list_for_claim, get_gap_challenges}` and `CorpusStatsRepository` carry the
+-- same claim predicate in-query as well (`/* {VISIBILITY:c} */`), which is what
+-- protects a privileged (row-security-bypassing) connection.
+--
+-- RESTRICTIVE, FOR SELECT: AND-ed with 077's `challenges_tenancy` and with
+-- 126's `challenges_elevated_read`, it grants nothing and only narrows reads.
+-- The claim arm is an EXISTS over `claims` evaluated with the reader's own
+-- rights, so "can read the claim" is exactly the claims policies' answer for
+-- that session, 126's `claims_elevated_read` included (an elevated session
+-- that reads every claim keeps reading every challenge). The two session arms
+-- keep the maintenance session and the definers (arm (d)'s propagation, the
+-- operator CLI, the seal) unaffected. No policy on `claims` reads
+-- `challenges`, so there is no recursion. Writes: PostgreSQL applies SELECT
+-- policies to an UPDATE or DELETE that reads the row, so a challenge on a
+-- claim the session cannot read is also not updatable or deletable by it,
+-- which is the same fence; an INSERT without RETURNING is unaffected.
+DROP POLICY IF EXISTS challenges_claim_readable ON public.challenges;
+CREATE POLICY challenges_claim_readable ON public.challenges
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (
+        (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass())
+        OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = challenges.claim_id));

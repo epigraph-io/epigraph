@@ -654,6 +654,20 @@
 //! * **No `ROW_ONLY_BY_DESIGN` entry goes stale.** None of the four needles
 //!   (`true`, `key_kind`, `privatization_apply`, `agent_id IS NULL`) matches an
 //!   arm 092 rewrites, and that register is exact in both directions.
+//!
+//! ## Status at migration 168
+//!
+//! **168 changes an RLS policy set, so this file is touched deliberately.** It
+//! ADDS one policy, `challenges_claim_readable`: RESTRICTIVE, `FOR SELECT`,
+//! `TO PUBLIC`, so it grants nothing and only narrows reads of `challenges` to
+//! rows whose claim the reader can read (ruling R-CH1b; the reason is that 168
+//! also lets an outsider's challenge stay public when its claim is privatized).
+//! No permissive policy, route split or tenancy column of D1-D4 moves: the new
+//! `challenges.writer_owned` flag is 114's marker on one more table, not a
+//! tenancy column, and `owner_group_id` / `visibility` keep their meaning.
+//! `rls_enforcement.rs` registers the policy's subquery arm in
+//! `ROW_ONLY_BY_DESIGN` with its reason; the per-command coverage table counts
+//! only permissive policies and is unchanged.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;

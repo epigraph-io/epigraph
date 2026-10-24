@@ -28,7 +28,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::repos::ChallengeRepository;
+use epigraph_db::repos::{ChallengeRepository, CorpusStatsRepository};
 use epigraph_db::visibility::Viewer;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
@@ -402,4 +402,164 @@ async fn a_non_public_claim_the_challenger_cannot_write_is_still_refused(pool: P
         .await
         .expect("count");
     assert_eq!(n, 0, "nothing written");
+}
+
+/// Ruling R-CH1b, enforced in the DATABASE and in the repo layer. The
+/// outsider's challenge stays the outsider's when the claim is privatized
+/// (owner unchanged), but it is readable only by a session that can read the
+/// claim: to a stranger, and to the outsider itself once it loses the claim,
+/// the challenge id reads exactly like a nonexistent one; the claim's group
+/// members (owner and a reader member) still see it.
+///
+/// Two layers, each measured on its own:
+/// * row security (migration 168's restrictive read policy), as `epigraph_app`
+///   with the stamp of each reader;
+/// * the in-query predicate of `ChallengeRepository::{get, list_for_claim,
+///   get_gap_challenges}`, on the superuser harness pool, which bypasses row
+///   security, so only the repo's own claim predicate can hide the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privatized_claims_outsider_challenge_reads_only_with_the_claim(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-read-owner").await;
+    let (outsider, outsider_group) = fixture::seed_agent_with_group(&pool, "ch-read-out").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "ch-read-stranger").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "ch-read-member").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(owner_group)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("reader membership");
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "read gate").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "outsider, then privatized").await;
+        (conn, t)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    // An outsider-owned GAP challenge on the same claim, for
+    // `get_gap_challenges` (no transport writes gap types from outside; the
+    // shape is set on the harness as 168's attach rule would set it).
+    let gap: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'epistemic_gap_structural', 'gap fixture', 'pending') RETURNING id",
+    )
+    .bind(claim)
+    .bind(outsider)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a gap challenge");
+    sqlx::query(
+        "UPDATE challenges SET owner_group_id = $2, visibility = 'public', writer_owned = true \
+          WHERE id = $1",
+    )
+    .bind(gap)
+    .bind(outsider_group)
+    .execute(&pool)
+    .await
+    .expect("make the gap challenge outsider-owned");
+
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("the owner privatizes the claim");
+    assert_eq!(
+        tenancy(&pool, theirs).await,
+        (outsider_group, "public".to_string(), true),
+        "ownership stays with the outsider"
+    );
+
+    // Layer 1: row security.
+    let p = pool.clone();
+    let missing = Uuid::new_v4();
+    let seen = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let mut out = Vec::new();
+        for (who, agent) in [
+            ("stranger", stranger),
+            ("outsider", outsider),
+            ("owner", owner),
+            ("member", member),
+        ] {
+            stamp(&mut conn, &p, agent).await;
+            let by_id: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM challenges WHERE id = $1")
+                .bind(theirs)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("read by id");
+            let by_missing: Vec<Uuid> =
+                sqlx::query_scalar("SELECT id FROM challenges WHERE id = $1")
+                    .bind(missing)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .expect("read a missing id");
+            let on_claim: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM challenges WHERE claim_id = $1")
+                    .bind(claim)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("count on the claim");
+            out.push((who, by_id, by_missing, on_claim));
+        }
+        (conn, out)
+    })
+    .await;
+    for (who, by_id, by_missing, on_claim) in seen {
+        match who {
+            "stranger" | "outsider" => {
+                assert_eq!(
+                    by_id, by_missing,
+                    "{who}: the challenge reads exactly like a nonexistent id"
+                );
+                assert!(by_id.is_empty(), "{who}");
+                assert_eq!(on_claim, 0, "{who}: nothing hangs off the private claim");
+            }
+            _ => {
+                assert_eq!(by_id, vec![theirs], "{who}: a claim reader still sees it");
+                assert_eq!(on_claim, 2, "{who}: both challenges");
+            }
+        }
+    }
+
+    // Layer 2: the repo's own predicate, with row security bypassed.
+    for (who, agent, visible) in [
+        ("stranger", stranger, false),
+        ("outsider", outsider, false),
+        ("owner", owner, true),
+        ("member", member, true),
+    ] {
+        let v = Viewer::resolve(&pool, agent).await.expect("viewer");
+        let got = ChallengeRepository::get(&pool, &v, theirs)
+            .await
+            .expect("get");
+        assert_eq!(got.is_some(), visible, "{who}: get");
+        let listed = ChallengeRepository::list_for_claim(&pool, &v, claim)
+            .await
+            .expect("list_for_claim");
+        assert_eq!(listed.len(), if visible { 2 } else { 0 }, "{who}: list");
+        let gaps = ChallengeRepository::get_gap_challenges(&pool, &v, None, None, 100)
+            .await
+            .expect("get_gap_challenges");
+        assert_eq!(
+            gaps.iter().any(|g| g.id == gap),
+            visible,
+            "{who}: get_gap_challenges"
+        );
+        // `system_stats`' corpus count: both challenges are public, so only
+        // the claim's predicate keeps them out of a non-reader's count.
+        let counts = CorpusStatsRepository::tenant_counts(&pool, &v, true)
+            .await
+            .expect("tenant_counts");
+        assert_eq!(
+            counts.challenges,
+            Some(if visible { 2 } else { 0 }),
+            "{who}: corpus challenge count"
+        );
+    }
 }

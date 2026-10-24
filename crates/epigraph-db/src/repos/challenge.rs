@@ -169,6 +169,16 @@ impl ChallengeRepository {
     /// the surface plan §2.4 / §4.9 #23 flags: it leaks the substance of a claim
     /// the caller may not be able to read. `challenges` carries its own tenancy
     /// columns (migration 062), so the predicate applies to the row directly.
+    ///
+    /// AND to its claim (ruling R-CH1b). Since migration 168 an outsider's
+    /// challenge is public and stays public when its claim is privatized, so a
+    /// challenge row alone no longer implies a readable claim: without the
+    /// claim's predicate the row would tell a caller that this id names a
+    /// claim, which must read exactly like a random id to anyone who cannot
+    /// read the claim. 168's `challenges_claim_readable` policy enforces the
+    /// same rule in row security; this in-query predicate is what protects a
+    /// privileged connection, which row security does not filter. Every read
+    /// of `challenges` in this file carries both markers.
     pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -177,7 +187,9 @@ impl ChallengeRepository {
         let sql = viewer.splice(
             "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
                     resolved_by, resolution_details, resolved_at, created_at \
-             FROM challenges WHERE id = $1 /* {VISIBILITY:challenges} */",
+             FROM challenges WHERE id = $1 /* {VISIBILITY:challenges} */ \
+               AND EXISTS (SELECT 1 FROM claims c WHERE c.id = challenges.claim_id \
+                           /* {VISIBILITY:c} */)",
             2,
         );
         let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(id);
@@ -188,6 +200,9 @@ impl ChallengeRepository {
     }
 
     /// List all challenges for a given claim.
+    ///
+    /// Only for a claim the viewer can read: see [`Self::get`]. A claim the
+    /// viewer cannot read lists exactly as a nonexistent one (empty).
     pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -198,6 +213,8 @@ impl ChallengeRepository {
                     resolved_by, resolution_details, resolved_at, created_at \
              FROM challenges WHERE claim_id = $1 \
              /* {VISIBILITY:challenges} */ \
+               AND EXISTS (SELECT 1 FROM claims c WHERE c.id = challenges.claim_id \
+                           /* {VISIBILITY:c} */) \
              ORDER BY created_at DESC",
             2,
         );
@@ -264,8 +281,9 @@ impl ChallengeRepository {
     }
 
     /// Query gap-originated challenges with optional filters.
-    /// The change inventory expected this to join `claims`; it does not — the
-    /// query reads `challenges` alone. One alias, one marker.
+    /// The change inventory expected this to join `claims`; it did not until
+    /// ruling R-CH1b: a gap challenge is listed only with a claim the viewer can
+    /// read (see [`Self::get`]), so the query carries two markers.
     pub async fn get_gap_challenges<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -283,6 +301,8 @@ impl ChallengeRepository {
              FROM challenges \
              WHERE challenge_type LIKE $1 AND state LIKE $2 \
              /* {VISIBILITY:challenges} */ \
+               AND EXISTS (SELECT 1 FROM claims c WHERE c.id = challenges.claim_id \
+                           /* {VISIBILITY:c} */) \
              ORDER BY created_at DESC LIMIT $3",
             4,
         );
