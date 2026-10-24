@@ -928,7 +928,9 @@ async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool:
     let msg = err.message.to_string();
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{msg}");
     assert!(
-        msg.contains(&retired.to_string()) && msg.contains("retired"),
+        msg.contains(&retired.to_string())
+            && msg.contains("is_current=false")
+            && msg.contains("revive or re-ingest"),
         "the error must name the retired head and the retirement; got {msg}"
     );
     assert!(
@@ -952,9 +954,20 @@ async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool:
         .await
         .expect_err("evidence must not silently land on a retired head");
     let msg = err.message.to_string();
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "a retired step head is the caller's error: {msg}"
+    );
     assert!(
-        msg.contains(&retired.to_string()) && msg.contains("retired"),
-        "update_with_evidence must name the retired head; got {msg}"
+        msg.contains(&retired.to_string())
+            && msg.contains("is_current=false")
+            && msg.contains("revive or re-ingest"),
+        "update_with_evidence must name the retired head and the retirement; got {msg}"
+    );
+    assert!(
+        !msg.contains("cannot supersede a non-current step"),
+        "the opaque guard message must not be what the caller sees; got {msg}"
     );
 
     // A lineage whose newest head is retired but an older head is current:
