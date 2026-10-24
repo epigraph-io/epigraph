@@ -642,6 +642,7 @@ async fn analyze_drops_a_readable_edge_whose_endpoint_claim_is_hidden(pool: PgPo
     let owner_token = common::mint_token_with_agent(&["analysis:reasoning"], owner);
     let stranger_token = common::mint_token_with_agent(&["analysis:reasoning"], stranger);
 
+    let mut leaks = Vec::new();
     for (arm, body) in [
         ("claim_ids", json!({ "claim_ids": [a, b, c] })),
         ("edge endpoints", json!({})),
@@ -661,15 +662,20 @@ async fn analyze_drops_a_readable_edge_whose_endpoint_claim_is_hidden(pool: PgPo
             status, 200,
             "[{arm}] stranger analyze must succeed: {theirs}"
         );
-        assert!(
-            !theirs.to_string().contains(&b.to_string()),
-            "[{arm}] another group's private claim {b} reached a stranger's \
-             analysis through a public edge: {theirs}"
-        );
-        assert!(
-            !support_pairs(&theirs).contains(&(a, c)),
-            "[{arm}] a support derived through the hidden claim reached the \
-             stranger: {theirs}"
-        );
+        // Collected, not asserted in place, so a leak in either arm is
+        // reported even when the other arm leaks too.
+        if theirs.to_string().contains(&b.to_string()) {
+            leaks.push(format!(
+                "[{arm}] another group's private claim {b} reached a stranger's analysis \
+                 through a public edge: {theirs}"
+            ));
+        }
+        if support_pairs(&theirs).contains(&(a, c)) {
+            leaks.push(format!(
+                "[{arm}] a support derived through the hidden claim reached the stranger: \
+                 {theirs}"
+            ));
+        }
     }
+    assert!(leaks.is_empty(), "{}", leaks.join("\n"));
 }
