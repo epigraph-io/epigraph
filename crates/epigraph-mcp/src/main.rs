@@ -538,17 +538,9 @@ fn unauthenticated_writes(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // `tenancy=info` so the default filter carries the D9 boot line
-                // below (target `tenancy.maintenance`), which is what an
-                // operator greps the journal for after a deploy.
-                .unwrap_or_else(|_| "epigraph_mcp=info,tenancy=info".parse().unwrap()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode).
+    // RUST_LOG, with rmcp held at INFO so tool bodies never reach the journal.
+    epigraph_mcp::log_filter::init_stderr();
 
     let cli = Cli::parse();
 
