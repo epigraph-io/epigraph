@@ -747,6 +747,133 @@ async fn only_maintenance_writes_bindings_and_a_binding_is_only_ever_ended(pool:
     );
 }
 
+/// On a maintenance session in one transaction: set the acting-process
+/// setting (164's `epigraph.operator_actor`) to `actor`, when given, then run
+/// `sql` (one text-valued column) with `binds`, and commit. Returns the value.
+async fn maint_with_actor(pool: &PgPool, actor: Option<&str>, sql: &str, binds: &[&str]) -> String {
+    let mut c = maint(pool).await;
+    let out = {
+        let mut tx = sqlx::Connection::begin(&mut *c).await.expect("begin");
+        if let Some(actor) = actor {
+            sqlx::query("SELECT set_config('epigraph.operator_actor', $1, true)")
+                .bind(actor)
+                .execute(&mut *tx)
+                .await
+                .expect("set the actor");
+        }
+        let mut q = sqlx::query_scalar::<_, String>(sql);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        let v = q.fetch_one(&mut *tx).await.expect("the verb");
+        tx.commit().await.expect("commit");
+        v
+    };
+    reset(c).await;
+    out
+}
+
+/// `details` of the one `event_type` row whose `details->>key` is `id`.
+async fn event_details(pool: &PgPool, event_type: &str, key: &str, id: &str) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = $1 AND details->>$2 = $3",
+    )
+    .bind(event_type)
+    .bind(key)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("one {event_type} row with {key} = {id}: {e}"))
+}
+
+/// Every binding audit row names the ACTING PROCESS, not only the shared
+/// maintenance login (164's `actor`, read from the transaction-local
+/// `epigraph.operator_actor` the operator CLI sets), and defining a role
+/// writes its own `platform.role_defined` row naming the role, its graph node
+/// and the group it was defined for. With no actor set, the key is present
+/// and null, so the row says "not recorded" rather than omitting it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn binding_audit_rows_name_the_acting_process_and_a_define_is_recorded(pool: PgPool) {
+    let (owner, _) = human(&pool, "audit-owner").await;
+    let group = team_group(&pool, "Synthetic Audit Team", owner).await;
+    let g = group.to_string();
+
+    let binding: Uuid = maint_with_actor(
+        &pool,
+        Some(r#"{"tool":"synthetic-define-probe"}"#),
+        "SELECT public.epigraph_define_group_role($1, 'synthetic team role', $2::uuid, \
+                'writer', true, 'audit test')::text",
+        &[ROLE, &g],
+    )
+    .await
+    .parse()
+    .expect("a binding id");
+    let bound = event_details(
+        &pool,
+        "platform.group_role_bound",
+        "binding_id",
+        &binding.to_string(),
+    )
+    .await;
+    assert_eq!(
+        bound["actor"]["tool"], "synthetic-define-probe",
+        "the bound row names the acting process: {bound}"
+    );
+    let node: Uuid = sqlx::query_scalar("SELECT role_node_id FROM platform_roles WHERE key = $1")
+        .bind(ROLE)
+        .fetch_one(&pool)
+        .await
+        .expect("the defined role");
+    let defined = event_details(&pool, "platform.role_defined", "role", ROLE).await;
+    assert_eq!(defined["role_node_id"], node.to_string(), "{defined}");
+    assert_eq!(defined["group_id"], g, "{defined}");
+    assert_eq!(
+        defined["actor"]["tool"], "synthetic-define-probe",
+        "{defined}"
+    );
+    assert_eq!(defined["elevates"], false, "{defined}");
+    assert_eq!(defined["reads_audit"], false, "{defined}");
+
+    let ended = maint_with_actor(
+        &pool,
+        Some(r#"{"tool":"synthetic-end-probe"}"#),
+        "SELECT public.epigraph_end_group_role_binding($1::uuid, 'audit test end')::text",
+        &[&binding.to_string()],
+    )
+    .await;
+    assert_eq!(ended, "true", "ended");
+    let unbound = event_details(
+        &pool,
+        "platform.group_role_unbound",
+        "binding_id",
+        &binding.to_string(),
+    )
+    .await;
+    assert_eq!(unbound["actor"]["tool"], "synthetic-end-probe", "{unbound}");
+
+    // No actor set: the key is present and null.
+    let again: Uuid = maint_with_actor(
+        &pool,
+        None,
+        "SELECT public.epigraph_bind_group_role($1, $2::uuid, 'writer', true, 'audit test')::text",
+        &[ROLE, &g],
+    )
+    .await
+    .parse()
+    .expect("a binding id");
+    let bare = event_details(
+        &pool,
+        "platform.group_role_bound",
+        "binding_id",
+        &again.to_string(),
+    )
+    .await;
+    assert!(
+        bare.as_object().is_some_and(|o| o.contains_key("actor")) && bare["actor"].is_null(),
+        "no actor set: recorded as null, not omitted: {bare}"
+    );
+}
+
 /// No binding rides on a role that elevates or reads the audit trail
 /// (GRB01), none binds a personal group (GRB02), none confers `admin` (the
 /// definer refuses it, and so does the table's CHECK on a direct maintenance

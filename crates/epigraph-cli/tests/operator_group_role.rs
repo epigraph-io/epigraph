@@ -118,6 +118,21 @@ async fn binding_audit(pool: &PgPool) -> Vec<String> {
     .expect("audit")
 }
 
+/// `details.actor.command` of the one `event_type` row whose `details->>key`
+/// is `value`: which operator command the audit row says acted.
+async fn audit_command(pool: &PgPool, event_type: &str, key: &str, value: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT details->'actor'->>'command' FROM security_events \
+          WHERE event_type = $1 AND details->>$2 = $3",
+    )
+    .bind(event_type)
+    .bind(key)
+    .bind(value)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("one {event_type} row with {key} = {value}: {e}"))
+}
+
 /// `binding=<uuid>` from a verb's output.
 fn binding_of(run: &Run) -> Uuid {
     run.stdout
@@ -168,6 +183,13 @@ async fn define_grant_roster_and_end_on_a_maintenance_login(pool: PgPool) {
         "a dry run binds nothing"
     );
     assert!(binding_audit(&pool).await.is_empty(), "nor audits");
+    let defined_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'platform.role_defined'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("role_defined rows");
+    assert_eq!(defined_rows, 0, "a dry run records no definition either");
 
     let applied = define(true);
     assert_eq!(applied.code, 0, "apply: {}", applied.show());
@@ -175,6 +197,25 @@ async fn define_grant_roster_and_end_on_a_maintenance_login(pool: PgPool) {
     assert!(catalog_has(&pool, ROLE).await, "defined");
     assert_eq!(bindings(&pool, group).await, [(binding, true)]);
     assert_eq!(binding_audit(&pool).await, ["platform.group_role_bound"]);
+    assert_eq!(
+        audit_command(
+            &pool,
+            "platform.group_role_bound",
+            "binding_id",
+            &binding.to_string()
+        )
+        .await
+        .as_deref(),
+        Some("define-group-role"),
+        "the bound row names the acting command, not only the shared login"
+    );
+    assert_eq!(
+        audit_command(&pool, "platform.role_defined", "role", ROLE)
+            .await
+            .as_deref(),
+        Some("define-group-role"),
+        "defining the role is recorded, with its acting command"
+    );
 
     let holder = h.to_string();
     let grant = run_with(
@@ -230,6 +271,13 @@ async fn define_grant_roster_and_end_on_a_maintenance_login(pool: PgPool) {
     let ended = end(true);
     assert_eq!(ended.code, 0, "{}", ended.show());
     assert!(ended.stdout.contains("ENDED"), "{}", ended.show());
+    assert_eq!(
+        audit_command(&pool, "platform.group_role_unbound", "binding_id", &b)
+            .await
+            .as_deref(),
+        Some("end-group-role-binding"),
+        "the unbound row names the acting command"
+    );
     assert_eq!(bindings(&pool, group).await, [(binding, false)]);
     let again = end(true);
     assert_eq!(again.code, 0, "{}", again.show());
