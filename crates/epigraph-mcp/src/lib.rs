@@ -10,6 +10,7 @@ pub mod host_guard;
 pub mod http_listener;
 pub mod maintenance;
 pub mod operator;
+pub mod role_gate;
 pub mod scope_map;
 pub mod server;
 pub mod session_status;
