@@ -1958,74 +1958,248 @@ async fn with_no_principal_and_the_valve_off_the_author_is_still_checked(pool: P
         .expect("CONTROL: an unattached author on the same session writes");
 }
 
-/// THE CURRENT LIMIT, PINNED, NOT ENDORSED. The ruling refuses every write a
-/// run makes after its holder's assignment ends. ROL01 sits in the claims
-/// operator-binding path, so it refuses a claim INSERT, a re-open and a
-/// re-attribution; it does NOT (yet) refuse an attached agent's same-author
-/// retire of its own claim or an UPDATE of a claim's truth value or labels
-/// (the claims trigger never runs the binding checks for those), nor its
-/// evidence, edge, belief or membership writes. Extending the refusal is
-/// open follow-up work; that change is expected to turn the "still admitted"
-/// assertions below into refusals, and this test with them.
-#[sqlx::test(migrations = "../../migrations")]
-async fn after_the_end_claim_inserts_are_refused_and_claim_updates_are_not_yet(pool: PgPool) {
-    seed_role(&pool, ROLE).await;
-    let (h, h_group) = human(&pool, "holder").await;
-    let attached = agent_of(&pool, h, "curator").await;
-    attach(&pool, ROLE, attached).await;
-    let assignment = grant(&pool, ROLE, h, None).await;
-    arm(&pool).await;
-    let to_retire = write_as(&pool, attached, attached, h_group)
-        .await
-        .expect("written while held");
-    let to_patch = write_as(&pool, attached, attached, h_group)
-        .await
-        .expect("written while held");
-    end_assignment(&pool, assignment).await;
+// ─────────────────────────────────────────────────────────────────────────────
+// Every write a run makes, not only a claim insert
+// ─────────────────────────────────────────────────────────────────────────────
 
-    assert_rol01(
-        &write_as(&pool, attached, attached, h_group).await,
-        "a new claim after the end",
-    );
-    let (retire, patch, reopen) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, attached, &[h_group]).await;
-        let retire = sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
-              WHERE id = $1",
+/// What a write class writes against.
+#[derive(Clone, Copy, Debug)]
+enum Target {
+    /// A claim authored by the writer.
+    Claim,
+    /// An evidence row on a claim authored by the writer.
+    Evidence,
+    /// An edge between two claims authored by the writer, owned by its group.
+    Edge,
+    /// A mass function on a claim authored by the writer.
+    MassFunction,
+    /// The writer's own agent row.
+    Agent,
+}
+
+/// One class of write: `$1` is the target row, `$2` the writing agent. Every
+/// statement touches exactly one row when it is admitted.
+struct WriteClass {
+    what: &'static str,
+    target: Target,
+    sql: &'static str,
+}
+
+const PROBE_FRAME: &str = "rol01-probe-frame";
+
+const WRITE_CLASSES: &[WriteClass] = &[
+    WriteClass {
+        what: "claim content UPDATE",
+        target: Target::Claim,
+        sql: "UPDATE claims SET content = content || ' (edited)' \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "claim truth_value UPDATE",
+        target: Target::Claim,
+        sql: "UPDATE claims SET truth_value = 0.9 WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "claim labels UPDATE",
+        target: Target::Claim,
+        sql: "UPDATE claims SET labels = array_append(COALESCE(labels, '{}'), 'after-the-end') \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "claim properties UPDATE",
+        target: Target::Claim,
+        sql: "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"probe\": 1}' \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "same-author claim retire (is_current = false)",
+        target: Target::Claim,
+        sql: "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "claim DELETE",
+        target: Target::Claim,
+        sql: "DELETE FROM claims WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "evidence INSERT",
+        target: Target::Claim,
+        sql: "INSERT INTO evidence (claim_id, evidence_type, content_hash) \
+              SELECT $1, 'observation', \
+                     decode(md5($2::text || clock_timestamp()::text) || md5(random()::text), 'hex')",
+    },
+    WriteClass {
+        what: "evidence UPDATE",
+        target: Target::Evidence,
+        sql: "UPDATE evidence SET raw_content = 'edited' WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "edge INSERT",
+        target: Target::Claim,
+        sql: "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+              SELECT $1, 'claim', c.id, 'claim', 'supports' FROM claims c \
+               WHERE c.agent_id = $2 AND c.id <> $1 ORDER BY c.id LIMIT 1",
+    },
+    WriteClass {
+        what: "edge UPDATE",
+        target: Target::Edge,
+        sql: "UPDATE edges SET properties = properties || '{\"probe\": 1}' \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "edge DELETE",
+        target: Target::Edge,
+        sql: "DELETE FROM edges WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "mass function INSERT",
+        target: Target::Claim,
+        sql: "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
+              SELECT $1, f.id, $2, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb FROM frames f \
+               WHERE f.name = 'rol01-probe-frame'",
+    },
+    WriteClass {
+        what: "mass function UPDATE",
+        target: Target::MassFunction,
+        sql: "UPDATE mass_functions SET masses = '{\"0\": 0.7, \"0,1\": 0.3}'::jsonb \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+    WriteClass {
+        what: "agent profile UPDATE",
+        target: Target::Agent,
+        sql: "UPDATE agents SET display_name = 'renamed after the end' \
+               WHERE id = $1 AND $2::uuid IS NOT NULL",
+    },
+];
+
+/// The probe frame the mass-function classes name (privileged setup).
+async fn seed_probe_frame(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ($1, ARRAY['h0', 'h1'], 'public', $2)",
+    )
+    .bind(PROBE_FRAME)
+    .bind(fixture::world_group(pool).await)
+    .execute(pool)
+    .await
+    .expect("probe frame");
+}
+
+/// A fresh target of `target`'s kind owned by `author`, written on the
+/// privileged pool (so the target exists whatever the rule says).
+async fn prepare_target(pool: &PgPool, target: Target, author: Uuid, group: Uuid) -> Uuid {
+    let claim = || async { insert_claim(pool, author, group).await.expect("target claim") };
+    match target {
+        Target::Claim => claim().await,
+        Target::Evidence => fixture::seed_evidence(pool, claim().await, "document").await,
+        // Owned by the writer's group, as the application role writes it (an
+        // edge written on the privileged pool is world-owned, administrative).
+        Target::Edge => {
+            fixture::seed_edge_owned_by(pool, claim().await, claim().await, "public", group).await
+        }
+        Target::MassFunction => sqlx::query_scalar(
+            "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
+             SELECT $1, f.id, $2, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb FROM frames f \
+              WHERE f.name = 'rol01-probe-frame' RETURNING id",
         )
-        .bind(to_retire)
-        .execute(&mut *conn)
+        .bind(claim().await)
+        .bind(author)
+        .fetch_one(pool)
         .await
-        .map(|r| r.rows_affected());
-        let patch = sqlx::query(
-            "UPDATE claims SET truth_value = 0.9, \
-                    labels = array_append(COALESCE(labels, '{}'), 'after-the-end') \
-              WHERE id = $1",
-        )
-        .bind(to_patch)
-        .execute(&mut *conn)
-        .await
-        .map(|r| r.rows_affected());
-        let reopen = sqlx::query("UPDATE claims SET is_current = true WHERE id = $1")
-            .bind(to_retire)
+        .expect("target mass function"),
+        Target::Agent => author,
+    }
+}
+
+/// `class` against `target`, on an `epigraph_app` connection stamped as `who`.
+async fn write_class(
+    pool: &PgPool,
+    who: Uuid,
+    group: Uuid,
+    class: &WriteClass,
+    target: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let sql = class.sql;
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, who, &[group]).await;
+        let r = sqlx::query(sql)
+            .bind(target)
+            .bind(who)
             .execute(&mut *conn)
             .await
             .map(|r| r.rows_affected());
         unstamp(&mut conn).await;
-        (conn, (retire, patch, reopen))
+        (conn, r)
     })
-    .await;
-    assert_eq!(
-        retire.as_ref().ok(),
-        Some(&1),
-        "LIMIT: a same-author retire after the end is still admitted: {retire:?}"
+    .await
+}
+
+/// THE RULING, WHOLE: "a run in progress finishes, but every write it makes
+/// after the assignment ends is refused". Every class of write an attached
+/// agent's session makes (claim UPDATEs of any column, a same-author retire,
+/// a claim DELETE, evidence, edges, mass functions, and its own agent row) is
+/// refused ROL01 once its holder's assignment has ended.
+/// * POSITIVE CONTROL, each class: the same agent's write before the end
+///   lands (one row), so the refusal is the rule, not row security or a
+///   missing grant.
+/// * UNATTACHED CONTROL, each class: an unattached agent of the same human
+///   makes the same write on its own row after the end, and it lands.
+///
+/// Verified to fail: without the shared write check, after the end all
+/// fourteen classes are admitted (the claims trigger checks only an insert, a
+/// re-open and a re-attribution).
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_write_class_is_refused_after_the_end_and_allowed_before_it(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    seed_probe_frame(&pool).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+
+    let mut targets = Vec::new();
+    for class in WRITE_CLASSES {
+        targets.push((
+            prepare_target(&pool, class.target, attached, h_group).await,
+            prepare_target(&pool, class.target, attached, h_group).await,
+            prepare_target(&pool, class.target, plain, h_group).await,
+        ));
+    }
+
+    for (class, (before, _, _)) in WRITE_CLASSES.iter().zip(&targets) {
+        let r = write_class(&pool, attached, h_group, class, *before).await;
+        assert_eq!(
+            r.as_ref().ok(),
+            Some(&1),
+            "POSITIVE CONTROL: the held agent's {} before the end lands: {r:?}",
+            class.what
+        );
+    }
+    end_assignment(&pool, assignment).await;
+
+    for (class, (_, _, own)) in WRITE_CLASSES.iter().zip(&targets) {
+        let r = write_class(&pool, plain, h_group, class, *own).await;
+        assert_eq!(
+            r.as_ref().ok(),
+            Some(&1),
+            "UNATTACHED CONTROL: an unattached agent's {} after the end lands: {r:?}",
+            class.what
+        );
+    }
+    let mut admitted = Vec::new();
+    for (class, (_, after, _)) in WRITE_CLASSES.iter().zip(&targets) {
+        let r = write_class(&pool, attached, h_group, class, *after).await;
+        if code_of(&r).as_deref() != Some(ROL01) {
+            admitted.push(format!("{}: {r:?}", class.what));
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "after the end every write class must be refused ROL01; not refused: {admitted:#?}"
     );
-    assert_eq!(
-        patch.as_ref().ok(),
-        Some(&1),
-        "LIMIT: a truth/labels update after the end is still admitted: {patch:?}"
-    );
-    assert_rol01(&reopen, "a re-open after the end (checked as an insert)");
 }
 
 /// 161's registration adopts a never-registered identity only while it is
