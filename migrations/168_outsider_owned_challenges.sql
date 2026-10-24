@@ -93,11 +93,14 @@
 -- Depends on 114 (the attach and guard functions, `epigraph_writer_group`),
 -- 115 and 122 (the bodies replaced here); independent of everything after 153.
 -- `ADD COLUMN ... NOT NULL DEFAULT false` is a catalog-only change on
--- PostgreSQL 11+ (no table rewrite), under `lock_timeout`. Apply BEFORE a
--- binary built with this change serves: its challenge reads name
--- `writer_owned` only in tests, but its write path expects the attach rule.
--- A binary WITHOUT this change against a database WITH it is unaffected (its
--- insiders inherit as before; its outsiders were already refused by name).
+-- PostgreSQL 11+ (no table rewrite); `CREATE POLICY` and the trigger DDL take
+-- short table locks on `challenges`, all under `lock_timeout`. Apply BEFORE a
+-- binary built with this change serves: that binary admits an outsider in its
+-- preflight, and without the attach rule the INSERT would inherit the claim's
+-- group and be refused (MCP: "refused after the writer check"; HTTP: 403). A
+-- binary WITHOUT this change against a database WITH it keeps working: its
+-- insiders inherit as before, its outsiders are refused by name as before,
+-- and its challenge reads are additionally narrowed by section 6.
 --
 -- UNDO: DROP the two triggers, re-run 114's section 3b and 122's section 8
 -- (`CREATE OR REPLACE` from their text), then DROP COLUMN writer_owned on
