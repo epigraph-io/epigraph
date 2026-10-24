@@ -11,7 +11,9 @@
 //!
 //! Each write calls ONE maintenance-only definer in one transaction,
 //! committed under `--apply` and rolled back otherwise (the audit row with
-//! it), so a dry run prints exactly what the definer decided. The definers
+//! it), so a dry run prints exactly what the definer decided. The transaction
+//! carries this process's identity for the audit rows' `actor` (the team-group
+//! verbs' `begin_audited`). The definers
 //! and the table's triggers hold every rule (no elevating or audit-reading
 //! role, GRB01; no personal, world or seed group, GRB02; a new key only,
 //! GRB03; never `admin`); this module adds only the checks that can be made
@@ -79,7 +81,7 @@ pub async fn define(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<Uuid> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = super::team_group::begin_audited(conn, "define-group-role").await?;
     let binding: Uuid =
         sqlx::query_scalar("SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5, $6)")
             .bind(key)
@@ -109,7 +111,7 @@ pub async fn bind(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<Uuid> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = super::team_group::begin_audited(conn, "bind-group-role").await?;
     let binding: Uuid =
         sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4, $5)")
             .bind(role)
@@ -133,7 +135,7 @@ pub async fn end(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<bool> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = super::team_group::begin_audited(conn, "end-group-role-binding").await?;
     let ended: bool = sqlx::query_scalar("SELECT public.epigraph_end_group_role_binding($1, $2)")
         .bind(binding)
         .bind(reason)

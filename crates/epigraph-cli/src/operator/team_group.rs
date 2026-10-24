@@ -102,7 +102,7 @@ pub fn actor_context(command: &str, session_user: String) -> serde_json::Value {
 
 /// Begin the one transaction a command runs in, with [`ACTOR_SETTING`] set
 /// for it (transaction-local, so it ends with the transaction).
-async fn begin_audited<'c>(
+pub(crate) async fn begin_audited<'c>(
     conn: &'c mut PgConnection,
     command: &str,
 ) -> anyhow::Result<sqlx::Transaction<'c, sqlx::Postgres>> {

@@ -108,8 +108,12 @@
 --   * one live binding per (group, role).
 -- GRB03: `define` refuses a key already in the catalog (use `bind`).
 -- Every bind and end writes one `platform.group_role_bound` /
--- `platform.group_role_unbound` row (123 reserves the `platform.` prefix to
--- a privileged session or a maintenance-owned definer frame).
+-- `platform.group_role_unbound` row, and every define one
+-- `platform.role_defined` row (123 reserves the `platform.` prefix to a
+-- privileged session or a maintenance-owned definer frame). Each names the
+-- acting process as 164's rows do (`actor`, from the transaction-local
+-- `epigraph.operator_actor` the operator CLI sets; NULL when unset), because
+-- `session_user` is the shared maintenance login.
 --
 -- ===================================================================
 -- 4. NO ROSTER ORACLE
@@ -362,6 +366,9 @@ BEGIN
                                'reason', CASE TG_OP WHEN 'INSERT' THEN NEW.reason
                                                     ELSE NEW.revoked_reason END,
                                'recorded_by', session_user::text,
+                               -- 164's acting process (the shared login
+                               -- names no person); NULL when not set.
+                               'actor', public.epigraph_team_group_actor(),
                                'migration', 165));
     RETURN NULL;
 END $$;
@@ -461,6 +468,16 @@ BEGIN
             p_key, 'role', 'custom', ARRAY['role', 'platform-role']);
     INSERT INTO public.platform_roles (key, elevates, reads_audit, role_node_id, description)
     VALUES (p_key, false, false, v_node, p_description);
+    -- The catalog addition is recorded in its own right (the binding's row,
+    -- written by the table's trigger, cannot tell a define from a bind).
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('platform.role_defined', NULL, true,
+            jsonb_build_object('role', p_key, 'role_node_id', v_node,
+                               'description', p_description, 'elevates', false,
+                               'reads_audit', false, 'group_id', p_group,
+                               'reason', p_reason, 'recorded_by', session_user::text,
+                               'actor', public.epigraph_team_group_actor(),
+                               'migration', 165));
     RETURN public.epigraph_bind_group_role(p_key, p_group, p_member_role, p_include_agents,
                                            p_reason);
 END $$;
