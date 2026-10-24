@@ -149,7 +149,12 @@ impl AgentKeyRepository {
         }))
     }
 
-    /// Get the active key for an agent (status = 'active').
+    /// Get the agent's active SIGNING key (`key_type = 'signing'`,
+    /// `status = 'active'`).
+    ///
+    /// Only the signing type: since migration 161 every agent also has an
+    /// active `identity-legacy` key, whose private half is often computable
+    /// from public inputs, and the rotate route rotates whatever this returns.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -167,6 +172,7 @@ impl AgentKeyRepository {
                 valid_from, valid_until, revocation_reason, revoked_by, created_at
             FROM agent_keys
             WHERE agent_id = $1
+              AND key_type = 'signing'
               AND status = 'active'
             ORDER BY created_at DESC
             LIMIT 1

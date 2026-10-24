@@ -691,6 +691,12 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // The pending admin acts (130), FORCEd by the migration that creates
     // them, on the same precedent.
     "pending_admin_acts",
+    // Agent identity lineage (161): prompt blobs, prompt snapshots and the
+    // succession record, FORCEd by the migration that creates them, on the
+    // same precedent.
+    "agent_prompt_blobs",
+    "agent_prompt_snapshots",
+    "agent_succession",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

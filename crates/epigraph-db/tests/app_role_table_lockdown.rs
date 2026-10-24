@@ -1351,12 +1351,16 @@ async fn an_agent_key_never_leaves_revoked(pool: PgPool) {
     let app = app_pool(&pool, 2).await;
     let now = chrono::Utc::now();
     let pk: Vec<u8> = Uuid::new_v4().as_bytes().repeat(2);
+    // An `encryption` key: since 161 a `signing` or `identity-legacy` key is
+    // attested state the application role can neither store nor move
+    // (`agent_identity_lineage.rs::an_application_session_can_neither_bind_nor_move_an_attested_key`).
+    // The transitions pinned here are 118's, for every key type.
     let key = AgentKeyRepository::store(
         &app,
         Uuid::new_v4(),
         epigraph_core::AgentId::from_uuid(agent),
         &pk,
-        "signing",
+        "encryption",
         "active",
         now,
         None,
