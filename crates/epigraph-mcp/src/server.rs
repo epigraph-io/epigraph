@@ -1502,7 +1502,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "The label-dedup index view. READ-ONLY. For up to 100 canonical claim ids, each canonical with every claim marked a duplicate of it (followed down a chain of marks): a marked duplicate leaves the index family yet keeps its own fields, so read a cluster's latest deadline or extra ids here. Only claims you can read are returned; an unreadable canonical is listed in missing. Each duplicate carries its agent_id (the plan itself ignores duplicates of another owner than the canonical's). max_claims caps the duplicates read (default and server cap 5000; truncated when hit)."
+        description = "The label-dedup index view. READ-ONLY. For up to 100 canonical claim ids, each canonical with every claim marked a duplicate of it (followed down a chain of marks): a marked duplicate leaves the index family yet keeps its own fields, so read a cluster's latest deadline or extra ids here. Only claims you can read are returned; an unreadable canonical is listed in missing. Each duplicate carries its agent_id. Like the plan, a duplicate whose author has another owner than the canonical's is left out and listed in foreign_duplicates_ignored (same_owner_only, default true; false returns every duplicate). max_claims caps the duplicates read (default and server cap 5000; truncated when hit)."
     )]
     async fn label_dedup_index_view(
         &self,
