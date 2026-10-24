@@ -26,9 +26,17 @@
 -- required exactly 32 bytes for `kind = 'team'`; section 2 relaxes it to 0 OR
 -- 32, so existing keyed team groups stay valid.
 --
--- The keyed REST member routes refuse a keyless group ("no current key
--- epoch"); that is intended. A keyless group's roster changes only through
--- these verbs.
+-- These verbs are the AUDITED, RULE-HOLDING operator path to a keyless
+-- group's roster. They are not the only writer. The REST add route refuses a
+-- keyless group (it needs a key epoch: "Group has no current key epoch"), but
+-- the REST remove route does not (its revoke needs no epoch, and it keeps its
+-- own last-admin guard). And an application session stamped as the group's
+-- creator (092's arm, while the creator is a live member) or as a live admin
+-- (077's `group_memberships_tenancy`) can write roster rows directly. On those
+-- paths 109's triggers and, once the database is armed, 122's membership
+-- scope still apply, but section 2's GRP rules and section 4's audit row do
+-- not. 122 section 4 is why the application DSN is not the boundary for
+-- that: a holder of it can stamp any principal.
 --
 -- ===================================================================
 -- 2. THE RULES EACH VERB HOLDS ITSELF

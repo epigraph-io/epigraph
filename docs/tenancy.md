@@ -1218,7 +1218,7 @@ epigraph-operator group-member remove --group <id> --agent <agent id> \
 
 Every command is a dry run without `--apply` (the definer runs and its
 transaction, audit row included, is rolled back). The rules live in the
-database functions, so no other caller can skip them:
+database functions these commands call:
 
 * the creator and every `admin` is a registered human operator;
 * a member belongs to a live human: the human itself, or an agent with a LIVE
@@ -1232,8 +1232,16 @@ database functions, so no other caller can skip them:
   a new row;
 * every applied act writes one `group.*` `security_events` row.
 
-The keyed `POST /api/v1/groups/:id/members` route refuses a keyless group (it
-needs a key epoch).
+These commands are the audited path that holds every rule above; they are
+not the only writer. The keyed `POST /api/v1/groups/:id/members` route refuses
+a keyless group (it needs a key epoch), but `DELETE
+/api/v1/groups/:id/members/:agent_id` does not (it keeps its own last-admin
+guard, without the operated-agent rule or a `group.*` audit row). An
+application session stamped as the group's creator or as a live admin can also
+write roster rows directly, under the membership triggers (and, once armed, the
+operator-binding scope) but not under the rules above. The application DSN is
+not the boundary for that, for the reason "Arming, and the valve" gives: a
+holder of it can stamp any principal.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

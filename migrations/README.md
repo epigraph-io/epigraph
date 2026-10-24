@@ -1518,8 +1518,11 @@ restart.
   name). Removal is a revoke; a re-add inserts a new row at the next epoch, so
   a revoked row is never revived. One `group.*` audit row per applied act.
   Callers: `epigraph-operator create-group` and `group-member
-  add|remove|set-role`. The keyed REST member routes refuse these groups (no
-  key epoch); that is intended. Pinned by
+  add|remove|set-role`. They are the audited, rule-holding path, not the only
+  roster writer: the REST add route refuses a keyless group (no key epoch),
+  the REST remove route does not, and an app session stamped as the creator
+  (092) or a live admin (077) can write roster rows directly, under 109's and
+  (armed) 122's triggers but without the GRP rules or the audit row. Pinned by
   `epigraph-db/tests/team_group_verbs.rs` and
   `epigraph-cli/tests/operator_team_group.rs`; registered in
   `tenancy_backfill.rs` (definer register and grant list),
