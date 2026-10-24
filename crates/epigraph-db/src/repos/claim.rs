@@ -6076,13 +6076,16 @@ impl ClaimRepository {
                         )),
                     },
                     // Visible and current, yet the UPDATE matched no row: the
-                    // session may read it but not retire it. Refuse rather
-                    // than insert a successor next to a still-current claim.
-                    Some(true) => DbError::QueryFailed {
-                        source: sqlx::Error::Protocol(format!(
-                            "Claim {} could not be retired by this session",
-                            old_uuid
-                        )),
+                    // session may read it but not retire it (an UPDATE policy
+                    // whose USING hides the row, e.g. an elevated session's
+                    // `claims_elevated_no_update`). Refuse rather than insert
+                    // a successor next to a still-current claim; both
+                    // transports map `WriteRefused` to a denial (HTTP 403,
+                    // MCP INVALID_REQUEST).
+                    Some(true) => DbError::WriteRefused {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                        action: "supersede".to_string(),
                     },
                 });
             }

@@ -222,3 +222,66 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
     .unwrap();
     assert_eq!(successors, 1);
 }
+
+/// A claim the session can READ as current but whose retirement `UPDATE`
+/// matches no row must be refused, with nothing written.
+///
+/// The production producer is an elevated session: `claims_elevated_read`
+/// admits its SELECT while `claims_elevated_no_update`'s USING is false, so the
+/// `UPDATE` silently matches nothing. Before the single-statement retirement,
+/// the function then inserted a successor and a `supersedes` edge next to a
+/// claim that was still current. Here a `BEFORE UPDATE` trigger that skips
+/// this one row stands in for that policy deterministically (named to fire
+/// before every other `BEFORE UPDATE` trigger on `claims`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_act_conn_refuses_a_current_claim_it_cannot_retire(pool: PgPool) {
+    let old = seed_current_claim(&pool).await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_retire() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_retire BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{old}'::uuid) EXECUTE FUNCTION aaa_test_skip_retire();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the retirement stand-in");
+
+    let mut tx = pool.begin().await.unwrap();
+    let r = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(old),
+        "revision that cannot retire its original",
+        TruthValue::clamped(0.6),
+        "unretirable",
+    )
+    .await;
+    // Commit whatever the call left on the transaction: a refusal must have
+    // written nothing for this to observe.
+    tx.commit().await.expect("commit");
+
+    let err = r.expect_err("a claim this session cannot retire must not be superseded");
+    assert!(
+        matches!(&err, epigraph_db::DbError::WriteRefused { id, .. } if *id == old),
+        "a readable, current claim the session cannot retire is WriteRefused; got: {err:?}"
+    );
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(still_current, "the original is untouched");
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(successors, 0, "no successor row was inserted");
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(edges, 0, "no supersedes edge was inserted");
+}
