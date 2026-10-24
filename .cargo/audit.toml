@@ -37,37 +37,6 @@ ignore = [
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
 
-    # ── Deferred — pending rmcp 0.x → 1.x migration ────────────────────────
-    "RUSTSEC-2026-0189", # rmcp 0.15.0: DNS rebinding via streamable-HTTP server
-                         #   transport (CVSS 8.8). epigraph-mcp uses the
-                         #   `transport-streamable-http-server` feature. Fix =
-                         #   upgrade to rmcp >=1.4.0, which is a breaking API
-                         #   change.
-                         #
-                         #   MITIGATION — corrected 2026-09-02. This entry used
-                         #   to claim the endpoint was "not bound directly to a
-                         #   public interface". That is FALSE and the correction
-                         #   matters, because the false version invites someone
-                         #   to conclude the network topology is the safety
-                         #   property and relax the token check:
-                         #       $ ufw status | grep 3443
-                         #       3443/tcp  ALLOW  Anywhere   # EpiGraph MCP HTTP
-                         #       3443/tcp (v6) ALLOW Anywhere (v6)
-                         #       $ ss -lntp | grep 3443
-                         #       LISTEN *:3443  users:(("caddy",...))
-                         #   Caddy binds all interfaces and the port is open to
-                         #   the world. The ACTUAL control is bearer-token
-                         #   secrecy, enforced at Caddy before it proxies: an
-                         #   unauthenticated request gets 401 with
-                         #   `www-authenticate: Bearer resource_metadata=...`.
-                         #   DNS rebinding does not defeat that — the attacker
-                         #   still needs the token — but note a same-origin or
-                         #   CORS-preflight argument would NOT hold here, since
-                         #   defeating same-origin is the whole point of a
-                         #   rebinding attack. Do not re-justify this entry that
-                         #   way.
-                         #   Track in a follow-up backlog item.
-
     # ── FIXED, not suppressed (issue #287) ──────────────────────────────────
     # RUSTSEC-2024-0363 (sqlx 0.7.4 binary-protocol cast),
     # RUSTSEC-2026-0098 / -0099 (rustls-webpki 0.101.7 name-constraint),
@@ -85,4 +54,11 @@ ignore = [
     # patched releases 0.8.6 and 0.9.3 are semver-compatible, so Cargo.lock now
     # resolves them and the suppression is deleted. rand 0.10.x is outside the
     # affected range. Do not re-add it.
+    #
+    # RUSTSEC-2026-0189 (rmcp streamable-HTTP server DNS rebinding, fixed in
+    # rmcp >=1.4.0) was suppressed here pending the rmcp 0.x -> 1.x migration.
+    # That migration has landed: the workspace requires rmcp 2.2 and Cargo.lock
+    # resolves rmcp 2.2.0, so the entry matched nothing and is deleted. The
+    # MCP HTTP endpoint still relies on bearer-token checks at the proxy; that
+    # control does not depend on this entry.
 ]
