@@ -100,6 +100,7 @@
 //! * `group-member add|remove|set-role` — change its roster: an operated agent
 //!   is a member only where its operator writes, the last live admin stays,
 //!   and a removal is a revoke. Each act audited (`group.member_*`).
+//!
 //! And an OAuth cleanup (backlog d3cdd376; see [`dcr_sweep`]):
 //!
 //! * `sweep-dcr-clients` — revoke the dynamically registered (RFC 7591)
