@@ -9,6 +9,14 @@
 //!
 //! POSITIVE CONTROLS, over the same database: an unattached agent boots, and
 //! the attached agent boots once its linked human holds the role.
+//!
+//! The binary runs on the harness's SUPERUSER DSN (`epigraph_app` is NOLOGIN),
+//! so these tests cannot see a missing application-role EXECUTE on
+//! `epigraph_role_agent_may_run` (which would refuse EVERY boot). That grant is
+//! pinned elsewhere: `epigraph-db/tests/agent_identity_lineage.rs`'s
+//! `has_function_privilege` table, and `role_attached_agents.rs`'s
+//! `rol01_is_named_and_the_repository_asks_may_run`, which asks on a pool
+//! downgraded to `epigraph_app`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -288,4 +296,41 @@ async fn an_agent_of_a_previous_holder_does_not_boot(pool: PgPool) {
     assert!(ended);
     grant(&pool, h2).await;
     expect_refused(run(&pool, env).await, NOT_HOLDER, "after the handover");
+}
+
+/// The LEGACY key mode (`EPIGRAPH_MCP_AGENT_KEY`: the signer's own key is the
+/// identity, no host registration) meets the same check: the agent is found
+/// by the signer's public key. CONTROL: it boots once its human holds the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_keyed_attached_agent_does_not_boot_in_a_gap(pool: PgPool) {
+    seed_role(&pool).await;
+    let (h, _) = fixture::seed_human_operator(&pool, "boot-holder-legacy").await;
+    let secret = [0x91_u8; 32];
+    let public = AgentSigner::from_bytes(&secret).expect("key").public_key();
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(public.as_slice())
+        .execute(&pool)
+        .await
+        .expect("a legacy-keyed agent");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, agent, h)
+            .await
+            .expect("link");
+    }
+    attach(&pool, agent).await;
+    let env = vec![("EPIGRAPH_MCP_AGENT_KEY", hex::encode(secret))];
+
+    expect_refused(
+        run(&pool, env.clone()).await,
+        NO_HOLDER,
+        "a legacy-keyed agent in a gap",
+    );
+    grant(&pool, h).await;
+    expect_booted(
+        run(&pool, env).await,
+        "the legacy-keyed agent while its human holds the role",
+    );
 }
