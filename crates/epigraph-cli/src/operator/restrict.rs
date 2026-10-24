@@ -1020,7 +1020,10 @@ pub struct BatchOutcome {
 /// ruling R-CH1): owned by the challenger's group and never moved by the
 /// tenancy cascade, unlike 114's writer-owned evidence, BBAs and traces, which
 /// a narrowing hands to the claim. The prediction must say so, or the batch's
-/// own invariants roll back every restrict of a claim that carries one.
+/// own invariants roll back every restrict of a claim that carries one. Its
+/// READABILITY does follow the claim (168's `challenges_claim_readable`,
+/// ruling R-CH1b), so the readability invariant expects it lost on apply and
+/// regained on reverse.
 fn is_outsider_challenge(table: &str, writer_owned: Option<bool>) -> bool {
     table == "challenges" && writer_owned == Some(true)
 }
@@ -1351,6 +1354,12 @@ async fn run_batch(
             *planned.entry(k.0.clone()).or_default() += 1;
         }
         if before.tenancy.visibility == "public" && want.tenancy.visibility != "public" {
+            expect_lost.insert(k.clone());
+        }
+        // 168 (R-CH1b): an outsider's challenge keeps its public tuple, but a
+        // challenge is readable only with its claim, so a session that loses
+        // the claim loses the challenge too.
+        if is_outsider_challenge(&k.0, a.writer_owned) && before.tenancy.visibility == "public" {
             expect_lost.insert(k.clone());
         }
         let Some(got) = s2.get(k) else {
@@ -2271,6 +2280,14 @@ async fn reverse_batch(
             }
         }
         if a.tenancy.visibility != "public" && want.tenancy.visibility == "public" {
+            expect_gained.insert(k.clone());
+        }
+        // 168 (R-CH1b): an outsider's public challenge becomes readable again
+        // with its claim (the mirror of the apply's expected loss).
+        if is_outsider_challenge(&k.0, a.writer_owned)
+            && want.tenancy.visibility == "public"
+            && recs.get(&a.claim).is_some_and(|r| r.visibility == "public")
+        {
             expect_gained.insert(k.clone());
         }
     }
