@@ -341,6 +341,58 @@ async fn an_unmark_without_a_record_is_refused_and_changes_nothing(pool: PgPool)
     assert!(edge_in_force, "the identity edge is untouched");
 }
 
+/// A duplicate the legacy raw-SQL `fuzzy_dedup_claims` marked gets its
+/// identity edge from the operator backfill (backlog d5781a48), so the un-mark's
+/// act now finds it; but no repair record was ever kept for that mark, so the
+/// un-mark is still refused, as `NoRecord`, and changes nothing. A reversal
+/// of a legacy mark needs an operator decision (what to put back), not this.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backfilled_legacy_mark_is_found_but_not_reversed(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "legacy canonical").await;
+    let dup = new_claim(&pool, author, "legacy duplicate").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let backfilled = ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, true)
+        .await
+        .expect("backfill");
+    assert_eq!(backfilled.inserted, 1, "calibration: {backfilled:?}");
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, None);
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect_err("no repair record for a legacy mark");
+    assert_eq!(err, UnmarkRefusal::NoRecord);
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(canonical), false),
+        "nothing changed"
+    );
+    let edge_in_force: bool = sqlx::query_scalar(
+        "SELECT valid_to IS NULL FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert!(edge_in_force, "the backfilled identity edge stays");
+}
+
 /// The caller's authority was checked against the canonical it read. If the
 /// duplicate has since been re-marked onto ANOTHER canonical, the un-mark must
 /// refuse rather than reverse a mark the caller was never checked against.

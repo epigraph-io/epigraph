@@ -1,0 +1,243 @@
+//! The identity-edge backfill for duplicates the legacy raw-SQL
+//! `fuzzy_dedup_claims` marked (backlog d5781a48).
+//!
+//! Before 2026-10 `scripts/fuzzy_dedup_claims.py` retired a duplicate with its
+//! own `UPDATE claims` (`supersedes = canonical`, `is_current = false`, both
+//! embeddings NULL, the `deduped` label and `properties.deduped_into /
+//! deduped_by / deduped_at`) and wrote no `same_as` identity edge. Every reader
+//! of the dedup identity keys on that edge: the index view
+//! (`marked_duplicates_of`) does not list such a duplicate under its canonical,
+//! and the un-mark refuses it as "marked before identity edges were recorded".
+//!
+//! `ClaimRepository::backfill_legacy_dedup_identity_edges_conn` writes the
+//! missing edge for exactly those rows: dry run unless `apply`, idempotent, and
+//! nothing else is touched (a consolidation source, a dedup-act mark, a
+//! soft-marked duplicate still current, a mark whose canonical moved on).
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use epigraph_db::ClaimRepository;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const DEDUPED_AT: &str = "2026-09-14 08:15:02.123456+00";
+
+/// Retire `dup` onto `canonical` exactly as the legacy script's step 7 did.
+async fn legacy_mark(pool: &PgPool, dup: Uuid, canonical: Uuid, deduped_by: &str, current: bool) {
+    sqlx::query(
+        "UPDATE claims \
+            SET supersedes = CASE WHEN $4 THEN NULL ELSE $1 END, \
+                is_current = $4, \
+                embedding = CASE WHEN $4 THEN embedding END, \
+                embedding_3072 = CASE WHEN $4 THEN embedding_3072 END, \
+                updated_at = NOW(), \
+                labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                properties = COALESCE(properties, '{}'::jsonb) \
+                           || jsonb_build_object('deduped_into', $1::text, \
+                                                 'deduped_by', $3::text, \
+                                                 'deduped_at', $5::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .bind(deduped_by)
+    .bind(current)
+    .bind(DEDUPED_AT)
+    .execute(pool)
+    .await
+    .expect("legacy mark");
+}
+
+/// Every in-force `same_as` edge out of `dup`, with its properties.
+async fn identity_edges(pool: &PgPool, dup: Uuid) -> Vec<(Uuid, Uuid, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT id, target_id, properties FROM edges \
+          WHERE source_id = $1 AND relationship = 'same_as' AND valid_to IS NULL \
+          ORDER BY created_at, id",
+    )
+    .bind(dup)
+    .fetch_all(pool)
+    .await
+    .expect("identity edges")
+}
+
+async fn listed_under(pool: &PgPool, canonical: Uuid) -> Vec<Uuid> {
+    let viewer = fixture::bypass(pool).await.1;
+    ClaimRepository::marked_duplicates_of(pool, &viewer, &[canonical], 50)
+        .await
+        .expect("index view")
+        .rows
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
+
+async fn backfill(pool: &PgPool, apply: bool) -> epigraph_db::repos::claim::LegacyIdentityBackfill {
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, apply)
+        .await
+        .expect("backfill")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_fuzzy_dedup_mark_gets_its_identity_edge_once(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "d5781a48").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "legacy canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "legacy duplicate").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    assert!(
+        listed_under(&pool, canonical).await.is_empty(),
+        "calibration: the index view cannot see a legacy mark"
+    );
+
+    // Dry run: found, nothing written.
+    let dry = backfill(&pool, false).await;
+    assert!(!dry.applied);
+    assert_eq!(dry.inserted, 0);
+    assert_eq!(
+        dry.duplicates
+            .iter()
+            .map(|d| (d.duplicate, d.canonical, d.identity_edge))
+            .collect::<Vec<_>>(),
+        vec![(dup, canonical, None)]
+    );
+    assert!(
+        identity_edges(&pool, dup).await.is_empty(),
+        "a dry run writes nothing"
+    );
+
+    // Apply: one identity edge, attributed to the legacy mark.
+    let applied = backfill(&pool, true).await;
+    assert!(applied.applied);
+    assert_eq!(applied.inserted, 1);
+    let edges = identity_edges(&pool, dup).await;
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    let (id, target, props) = &edges[0];
+    assert_eq!(*target, canonical);
+    assert_eq!(applied.duplicates[0].identity_edge, Some(*id));
+    let dedup = &props["dedup"];
+    assert_eq!(dedup["tool"], "fuzzy_dedup_claims", "{props}");
+    assert_eq!(dedup["run_tag"], "legacy_identity_backfill", "{props}");
+    assert_eq!(
+        dedup["marked_at"], DEDUPED_AT,
+        "the mark's own time, not the backfill's: {props}"
+    );
+    assert!(
+        dedup.get("marked_by").is_none(),
+        "the legacy mark recorded no agent, and none is invented: {props}"
+    );
+    assert!(dedup["backfilled_at"].is_string(), "{props}");
+    assert_eq!(
+        listed_under(&pool, canonical).await,
+        vec![dup],
+        "the index view now lists the legacy duplicate under its canonical"
+    );
+    let factors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factors WHERE $1 = ANY(variable_ids) AND $2 = ANY(variable_ids)",
+    )
+    .bind(dup)
+    .bind(canonical)
+    .fetch_one(&pool)
+    .await
+    .expect("factors");
+    assert_eq!(factors, 0, "the identity edge never becomes a BP factor");
+
+    // Idempotent: a second run finds nothing and writes nothing.
+    let again = backfill(&pool, true).await;
+    assert_eq!(again.inserted, 0);
+    assert!(again.duplicates.is_empty(), "{again:?}");
+    assert_eq!(identity_edges(&pool, dup).await.len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_backfill_leaves_every_other_retirement_alone(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "d5781a48-other").await;
+    let claim = |tag: &'static str| {
+        let pool = pool.clone();
+        async move { fixture::seed_public_claim(&pool, a, tag).await }
+    };
+    let canonical = claim("canonical").await;
+
+    // A consolidation source / plain supersession: retired, no dedup marker.
+    let consolidated = claim("consolidated source").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(consolidated)
+    .execute(&pool)
+    .await
+    .expect("retire a consolidation source");
+    // A soft-marked duplicate the legacy script left CURRENT.
+    let soft = claim("soft-marked, still current").await;
+    legacy_mark(&pool, soft, canonical, "fuzzy_dedup_claims", true).await;
+    // Another tool's marker.
+    let other_tool = claim("another tool's mark").await;
+    legacy_mark(&pool, other_tool, canonical, "some_other_script", false).await;
+    // A legacy mark whose duplicate was later re-pointed elsewhere.
+    let elsewhere = claim("re-pointed elsewhere").await;
+    legacy_mark(&pool, elsewhere, canonical, "fuzzy_dedup_claims", false).await;
+    let third = claim("a third claim").await;
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(third)
+        .bind(elsewhere)
+        .execute(&pool)
+        .await
+        .expect("re-point");
+    // A dedup act's mark: it has its identity edge already.
+    let acted = claim("dedup act duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        epigraph_core::ClaimId::from_uuid(acted),
+        epigraph_core::ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup act");
+    drop(conn);
+    // And one the backfill is for, so the run is not vacuous.
+    let legacy = claim("legacy duplicate").await;
+    legacy_mark(&pool, legacy, canonical, "fuzzy_dedup_claims", false).await;
+
+    let report = backfill(&pool, true).await;
+    assert_eq!(
+        report
+            .duplicates
+            .iter()
+            .map(|d| d.duplicate)
+            .collect::<Vec<_>>(),
+        vec![legacy],
+        "only the legacy fuzzy_dedup_claims mark is selected"
+    );
+    assert_eq!(report.inserted, 1);
+    for untouched in [consolidated, soft, other_tool, elsewhere] {
+        assert!(
+            identity_edges(&pool, untouched).await.is_empty(),
+            "no identity edge for {untouched}"
+        );
+    }
+    assert_eq!(
+        identity_edges(&pool, acted).await.len(),
+        1,
+        "the dedup act's own identity edge is the only one it has"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_backfill_refuses_a_non_privileged_session(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "d5781a48-app").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut conn = app.acquire().await.expect("acquire");
+    for apply in [false, true] {
+        let err = ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, apply)
+            .await
+            .expect_err("an application session would see a fraction of the corpus");
+        assert!(err.to_string().contains("privileged"), "{err}");
+    }
+    assert!(identity_edges(&pool, dup).await.is_empty());
+}
