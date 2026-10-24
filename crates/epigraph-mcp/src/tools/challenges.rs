@@ -190,12 +190,11 @@ pub async fn challenge_claim(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
-    let owned_by_challenger = match admission {
-        ChallengeAdmission::Insider => false,
-        ChallengeAdmission::Outsider { .. } => true,
+    match admission {
+        ChallengeAdmission::Insider | ChallengeAdmission::Outsider { .. } => {}
         ChallengeAdmission::NotWriter => return Err(challenge_not_writer(claim_id)),
         ChallengeAdmission::NoWriterGroup => return Err(challenge_no_writer_group(claim_id)),
-    };
+    }
 
     let challenge_id = ChallengeRepository::create(
         &mut *tx,
@@ -235,7 +234,6 @@ pub async fn challenge_claim(
             "claim_id": claim_id,
             "challenge_type": params.challenge_type,
             "state": "pending",
-            "owned_by_challenger": owned_by_challenger,
         })
         .to_string(),
     )]))
