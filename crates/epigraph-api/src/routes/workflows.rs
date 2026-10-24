@@ -161,6 +161,10 @@ pub struct ListWorkflowsQuery {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportOutcomeRequest {
+    /// `true` only if the workflow's goal or expected outcome was achieved:
+    /// every gate and check passed. A run that ran every step but a gate or
+    /// check failed is `success=false`; record what the steps did in
+    /// `outcome_details` / `step_executions` instead.
     pub success: bool,
     pub outcome_details: String,
     pub quality: Option<f64>,
@@ -193,7 +197,10 @@ pub struct HierarchicalSearchQuery {
     #[serde(default)]
     pub resolve_to_latest: bool,
     /// Minimum `truth_value` to surface. Defaults to 0.3 so rows
-    /// deprecated via `deprecate_workflow` (truth=0.05) drop out.
+    /// deprecated via `deprecate_workflow` (truth=0.05) drop out. Exception:
+    /// with `resolve_to_latest=true` the lineage head of each matched
+    /// `canonical_name` is always returned, flagged `lineage_head_deprecated`
+    /// when its truth is below `min_truth`.
     pub min_truth: Option<f64>,
 }
 
@@ -201,6 +208,8 @@ pub struct HierarchicalSearchQuery {
 #[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
+    /// `true` only if the run's goal or expected outcome was achieved: every
+    /// gate and check passed. Running every step is not success.
     pub success: bool,
     pub step_beliefs: serde_json::Value,
     pub tool_pattern: Vec<String>,
@@ -232,6 +241,18 @@ pub struct HierarchicalWorkflowResult {
     pub truth_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_steps: Option<Vec<ResolvedStepResult>>,
+    /// `resolve_to_latest` only: this row is its lineage's head, the highest
+    /// `generation` of its `canonical_name` (what `improve_workflow_hierarchy`
+    /// builds on). The head of every matched lineage is always returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_lineage_head: Option<bool>,
+    /// `resolve_to_latest` only: the head's generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_generation: Option<i32>,
+    /// `resolve_to_latest` only: the head's `truth_value` is below
+    /// `min_truth` (deprecated). It is returned anyway, so this says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_deprecated: Option<bool>,
 }
 
 /// Per-step resolution result within [`HierarchicalWorkflowResult`].
@@ -251,6 +272,9 @@ pub struct LineageHeadResult {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `false` for a head retired without a `supersedes` edge: it is still the
+    /// lineage's head, but `evolve_step` refuses to supersede it.
+    pub is_current: bool,
 }
 
 // ── Handlers ──
@@ -1107,6 +1131,13 @@ pub async fn report_outcome(
 /// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
 /// ordered newest first. Limit defaults to 10, max 50.
 ///
+/// With `resolve_to_latest=true` the lineage head (highest `generation`) of
+/// every matched `canonical_name` is always returned, even when its goal does
+/// not match `q`, it has no goal embedding, or its truth is below `min_truth`;
+/// each entry carries `is_lineage_head`, `lineage_head_generation` and
+/// `lineage_head_deprecated`. The result can then exceed `limit` by one head
+/// per matched lineage.
+///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -1201,18 +1232,33 @@ pub async fn find_workflow_hierarchical(
         })?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name, so the highest generation per group in `rows` IS the
+    // lineage head (`lineage_heads_in`).
+    let heads = params
+        .resolve_to_latest
+        .then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
     let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()
-        .map(|r| HierarchicalWorkflowResult {
-            workflow_id: r.id,
-            canonical_name: r.canonical_name,
-            generation: r.generation,
-            goal: r.goal,
-            parent_id: r.parent_id,
-            metadata: r.metadata,
-            created_at: r.created_at,
-            truth_value: r.truth_value,
-            resolved_steps: None,
+        .map(|r| {
+            let lineage = heads
+                .as_ref()
+                .and_then(|h| h.get(&r.canonical_name))
+                .copied();
+            HierarchicalWorkflowResult {
+                is_lineage_head: lineage.map(|(id, _, _)| id == r.id),
+                lineage_head_generation: lineage.map(|(_, generation, _)| generation),
+                lineage_head_deprecated: lineage.map(|(_, _, truth)| truth < min_truth),
+                workflow_id: r.id,
+                canonical_name: r.canonical_name,
+                generation: r.generation,
+                goal: r.goal,
+                parent_id: r.parent_id,
+                metadata: r.metadata,
+                created_at: r.created_at,
+                truth_value: r.truth_value,
+                resolved_steps: None,
+            }
         })
         .collect();
 
@@ -1247,6 +1293,7 @@ pub async fn find_workflow_hierarchical(
                                 content: h.content,
                                 truth_value: h.truth_value,
                                 created_at: h.created_at,
+                                is_current: h.is_current,
                             })
                             .collect(),
                         pending_resolution: s.pending_resolution,
@@ -3319,6 +3366,29 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// Backlog 563165f2 (HTTP twin of the MCP `success` definition): the
+    /// OpenAPI schema of the outcome body both outcome routes take must say
+    /// that `success` means the goal was achieved, not that the steps ran.
+    #[test]
+    fn report_outcome_success_is_defined_as_goal_achieved() {
+        let schema =
+            serde_json::to_value(<ReportOutcomeRequest as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let d = schema["properties"]["success"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`success` carries a description: {schema}"));
+        for needle in [
+            "goal or expected outcome was achieved",
+            "every gate and check passed",
+            "ran every step but a gate or",
+        ] {
+            assert!(
+                d.contains(needle),
+                "`success` must say {needle:?}; got: {d}"
+            );
+        }
+    }
 
     /// U032: a step-less new generation (or an empty plan) is the caller's
     /// payload error — 400 with the executor's reason, not a 500 that invites

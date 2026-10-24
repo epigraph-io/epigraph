@@ -493,6 +493,13 @@ pub struct LineageHead {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `COALESCE(claims.is_current, true)`. Headship (no incoming
+    /// `supersedes` edge) and `is_current` are independent: a claim retired
+    /// without a supersedes edge (a deprecated workflow's step reused by a
+    /// later generation, a marked duplicate) is still a head, and
+    /// `evolve_step_conn` refuses to supersede it. Flagged, not filtered: a
+    /// sole lineage member would otherwise vanish from the lineage silently.
+    pub is_current: bool,
 }
 
 /// Result of a successful [`ClaimRepository::evolve_step`] call.
@@ -7015,7 +7022,8 @@ impl ClaimRepository {
         // would return MORE, and wrong. Only `c` carries the predicate.
         let sql = viewer.splice(
             r#"
-            SELECT c.id, c.content, c.truth_value, c.created_at
+            SELECT c.id, c.content, c.truth_value, c.created_at,
+                   COALESCE(c.is_current, true) AS is_current
             FROM claims c
             WHERE c.step_lineage_id = $1
               AND NOT EXISTS (
