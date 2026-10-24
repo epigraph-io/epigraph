@@ -159,6 +159,12 @@
 --   * AID08: the child already has a different active signing key. Nothing
 --     changes; revoking a bound key is a maintenance act (section 7a), after
 --     which the host's new key is bound.
+--   * AID09: the identity already exists, was never registered, and is not
+--     FRESH. A GENERIC scan of every foreign key into `agents` (so a binding
+--     table added later fails closed) refuses any reference except its
+--     genuine personal group and that membership, its legacy key, audit rows
+--     and claims (AID05). Also refused: owning an OAuth client, or sharing the
+--     personal group with another member.
 --
 -- The event family `agent.identity_` is reserved for a privileged session or a
 -- maintenance-owned definer (RESTRICTIVE policy, 148's shape), so an
@@ -785,6 +791,10 @@ DECLARE
     v_unknown    text[];
     v_live       boolean;
     v_link_live  boolean;
+    v_personal   uuid;
+    v_fk         record;
+    v_hit        boolean;
+    v_binding    text;
     v_bound      bytea;
     v_rec_model  text;
     v_rec_hash   text;
@@ -875,6 +885,82 @@ BEGIN
             RAISE EXCEPTION 'AID05: agent % has authored claims and was never registered; it is '
                             'not an EpiClaw identity to adopt', v_child
                 USING ERRCODE = 'AID05';
+        END IF;
+        -- AID09: a never-registered agent is adopted only when it is FRESH,
+        -- decided by a GENERIC scan rather than a list, so a binding table
+        -- added later fails closed without touching this function. Fresh means
+        -- no row in any table references the agent through a foreign key into
+        -- `agents`, except:
+        --   * its GENUINE personal group (`kind 'personal'`, the personal
+        --     did_key, created by the agent itself) and its own membership of
+        --     that group, which is the shape epigraph-mcp creates when it meets
+        --     an identity before the host registers it;
+        --   * its own `identity-legacy` key (the 161 backfill);
+        --   * audit rows (`security_events`), which bind nothing;
+        --   * `claims`, which AID05 already decides.
+        -- It also refuses the two bindings no foreign key into `agents` can
+        -- see: being an OAuth client's owner, and sharing the personal group
+        -- with any other member.
+        IF NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = v_child)
+           AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                            WHERE s.agent_id = v_child) THEN
+            SELECT g.id INTO v_personal
+              FROM public.groups g
+             WHERE g.did_key = 'did:epigraph:personal:' || v_child::text
+               AND g.kind = 'personal'
+               AND g.created_by_agent_id = v_child;
+            FOR v_fk IN
+                SELECT c.conrelid AS rel, a.attname AS col
+                  FROM pg_catalog.pg_constraint c
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                 WHERE c.contype = 'f'
+                   AND c.confrelid = 'public.agents'::regclass
+                   AND array_length(c.conkey, 1) = 1
+                   AND c.conrelid NOT IN ('public.security_events'::regclass,
+                                          'public.claims'::regclass)
+                 ORDER BY c.conrelid::regclass::text, a.attname
+            LOOP
+                -- A table this owner cannot read is not "unbound": fail closed.
+                BEGIN
+                EXECUTE format(
+                    'SELECT EXISTS (SELECT 1 FROM %s WHERE %I = $1%s)',
+                    v_fk.rel::regclass, v_fk.col,
+                    CASE
+                        WHEN v_fk.rel = 'public.groups'::regclass
+                            THEN ' AND id IS DISTINCT FROM $2'
+                        WHEN v_fk.rel = 'public.group_memberships'::regclass
+                            THEN ' AND group_id IS DISTINCT FROM $2'
+                        WHEN v_fk.rel = 'public.agent_keys'::regclass
+                             AND v_fk.col = 'agent_id'
+                            THEN ' AND key_type <> ''identity-legacy'''
+                        ELSE ''
+                    END)
+                  INTO v_hit
+                  USING v_child, v_personal;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    v_hit := true;
+                END;
+                IF v_hit THEN
+                    v_binding := v_fk.rel::regclass::text || '.' || v_fk.col;
+                    EXIT;
+                END IF;
+            END LOOP;
+            IF v_binding IS NULL AND EXISTS (SELECT 1 FROM public.oauth_clients oc
+                                            WHERE oc.owner_id = v_child) THEN
+                v_binding := 'oauth_clients.owner_id';
+            END IF;
+            IF v_binding IS NULL AND v_personal IS NOT NULL
+               AND EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = v_personal AND m.agent_id <> v_child) THEN
+                v_binding := 'another member of its personal group';
+            END IF;
+            IF v_binding IS NOT NULL THEN
+                RAISE EXCEPTION 'AID09: agent % was never registered and is not fresh (bound '
+                                'through %); it is not an EpiClaw identity to adopt',
+                                v_child, v_binding
+                    USING ERRCODE = 'AID09';
+            END IF;
         END IF;
         -- What the identity was registered under: its earliest snapshot.
         SELECT s.model, s.prompt_hash INTO v_rec_model, v_rec_hash
@@ -1239,6 +1325,30 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_link_operator_body(uuid, uuid, jsonb) '
                 'OWNER TO epigraph_maintenance';
+        -- AID09's generic freshness scan reads, as this function's owner,
+        -- the referencing column of every foreign key into `agents`. Grant
+        -- exactly that column (never the row's other columns) where the owner
+        -- cannot already read it. A table added later is refused as "bound"
+        -- by the scan until a later migration grants its column (fail closed).
+        DECLARE
+            v_g record;
+        BEGIN
+            FOR v_g IN
+                SELECT c.conrelid::regclass AS rel, a.attname AS col
+                  FROM pg_catalog.pg_constraint c
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                 WHERE c.contype = 'f'
+                   AND c.confrelid = 'public.agents'::regclass
+                   AND array_length(c.conkey, 1) = 1
+            LOOP
+                IF NOT has_column_privilege('epigraph_maintenance', v_g.rel, v_g.col::text,
+                                            'SELECT') THEN
+                    EXECUTE format('GRANT SELECT (%I) ON %s TO epigraph_maintenance',
+                                   v_g.col, v_g.rel);
+                END IF;
+            END LOOP;
+        END;
         EXECUTE 'ALTER FUNCTION public.epigraph_register_agent_identity('
                 'bytea, uuid, text, text, text, bytea, jsonb) OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_agent_prompt_history(uuid) '
@@ -1298,7 +1408,12 @@ BEGIN
        -- A host-registered identity's key never signs (D1): its signatures
        -- bind through its `signing` key, so it gets no legacy row.
        AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
-                        WHERE s.agent_id = a.id);
+                        WHERE s.agent_id = a.id)
+       -- A key already retired in agent_keys (rotated or revoked) never comes
+       -- back as an ACTIVE legacy key: rotation leaves agents.public_key as it
+       -- was, so this column alone would re-legitimise it for key binding.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_keys r
+                        WHERE r.public_key = a.public_key AND r.status <> 'active');
     GET DIAGNOSTICS n = ROW_COUNT;
     RETURN n;
 END $$;

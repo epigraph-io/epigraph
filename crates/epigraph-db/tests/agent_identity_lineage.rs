@@ -993,6 +993,244 @@ async fn adopting_an_agent_with_claims_and_no_registration_is_refused_aid05(pool
     assert!(again.snapshot_created);
 }
 
+/// AID09: an existing agent that has authored nothing but is ALREADY BOUND to
+/// something is not EpiClaw's to adopt. Adoption would overwrite its
+/// properties, bind a signing key and inherit an operator link onto it. Each
+/// binding is refused on its own, and each refusal changes nothing:
+///
+/// * a registered human operator;
+/// * the agent side of an operator link;
+/// * an OAuth client's principal;
+/// * an agent that already holds an active signing key;
+/// * a member of any group other than its own personal group;
+/// * an agent that ever held a non-legacy key (a rotated signing key).
+///
+/// The rule fails closed: adoption is allowed only for a FRESH agent.
+/// CALIBRATION: `adopting_an_agent_with_claims_and_no_registration_is_refused_aid05`
+/// keeps a claimless, unbound software agent adoptable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn adopting_a_bound_agent_is_refused_aid09(pool: PgPool) {
+    async fn bare(pool: &PgPool, id: &Identity) -> Uuid {
+        let aid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'software_agent')",
+        )
+        .bind(aid)
+        .bind(&id.pubkey)
+        .execute(pool)
+        .await
+        .expect("seed a claimless agent");
+        aid
+    }
+
+    // A registered human operator, presented under its own public key.
+    let human_id = human_operator(&pool).await;
+    let human_key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+        .bind(human_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the human's key");
+    let human = Identity {
+        prompt_hash: blake3::hash(&human_key).to_hex().to_string(),
+        signing: random32(),
+        pubkey: human_key,
+    };
+
+    // The agent side of an operator link.
+    let operated = new_identity();
+    let operated_id = bare(&pool, &operated).await;
+    let op = human_operator(&pool).await;
+    link(&pool, operated_id, op).await;
+
+    // An OAuth client's principal.
+    let client = new_identity();
+    let client_id = bare(&pool, &client).await;
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, agent_id, \
+                                    allowed_scopes, granted_scopes, status) \
+         VALUES ($1, 'aid09 client', 'human', $2, ARRAY['claims:read'], \
+                 ARRAY['claims:read'], 'active')",
+    )
+    .bind(format!("aid09-{}", Uuid::new_v4()))
+    .bind(client_id)
+    .execute(&pool)
+    .await
+    .expect("seed an OAuth client principal");
+
+    // An agent that already holds an active signing key.
+    let keyed = new_identity();
+    let keyed_id = bare(&pool, &keyed).await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+         VALUES ($1, $2, 'signing', 'active')",
+    )
+    .bind(keyed_id)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed an active signing key");
+
+    // A member of a group that is not its own personal group.
+    let member = new_identity();
+    let member_id = bare(&pool, &member).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(fixture::seed_group(&pool).await)
+    .bind(member_id)
+    .execute(&pool)
+    .await
+    .expect("seed a non-personal membership");
+
+    // An agent that once held a signing key, now rotated (any status counts).
+    let retired = new_identity();
+    let retired_id = bare(&pool, &retired).await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+         VALUES ($1, $2, 'signing', 'rotated')",
+    )
+    .bind(retired_id)
+    .bind(random32())
+    .execute(&pool)
+    .await
+    .expect("seed a rotated signing key");
+
+    for (what, id) in [
+        ("a registered human operator", &human),
+        ("an operated agent", &operated),
+        ("an OAuth client principal", &client),
+        ("an agent with an active signing key", &keyed),
+        ("a member of a non-personal group", &member),
+        ("an agent with a rotated signing key", &retired),
+    ] {
+        let before = footprint(&pool).await;
+        let err = try_register(&pool, id, None, "g-aid09", snapshot("g", "l"))
+            .await
+            .expect_err(what);
+        assert_eq!(sqlstate(&err).as_deref(), Some("AID09"), "{what}: {err}");
+        assert_eq!(
+            footprint(&pool).await,
+            before,
+            "{what}: AID09 changes nothing"
+        );
+    }
+
+    // CALIBRATION: an agent whose only binding is its OWN personal group (the
+    // shape epigraph-mcp creates when it meets an identity before the host
+    // has registered it) is fresh, and adoptable.
+    let fresh = new_identity();
+    let fresh_id = bare(&pool, &fresh).await;
+    sqlx::query("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(fresh_id)
+        .execute(&pool)
+        .await
+        .expect("its own personal group");
+    let adopted = register(&pool, &fresh, None, "g-aid09", snapshot("g", "l")).await;
+    assert_eq!(adopted.agent_id, fresh_id);
+    assert!(!adopted.agent_created);
+}
+
+/// AID09 is a GENERIC scan, not a list: an agent referenced by ANY foreign
+/// key into `agents` (other than its genuine personal group, that group's
+/// membership, its legacy key and audit rows) is not fresh. These bindings
+/// appear in no hand-written list. Each is refused AID09 and changes nothing:
+///
+/// * an instance admin, a row that predates migration 123 (a row-security table);
+/// * a perspective's owner (a row-security table);
+/// * an `agent_capabilities` row;
+/// * a member of a group whose `did_key` spells its personal key but which is
+///   NOT a personal group (a forged "personal" group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn aid09_refuses_any_foreign_key_binding_not_only_listed_ones(pool: PgPool) {
+    async fn bare(pool: &PgPool, id: &Identity) -> Uuid {
+        let aid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'software_agent')",
+        )
+        .bind(aid)
+        .bind(&id.pubkey)
+        .execute(pool)
+        .await
+        .expect("seed a claimless agent");
+        aid
+    }
+
+    let admin = new_identity();
+    let admin_id = bare(&pool, &admin).await;
+    // `instance_admins` is frozen since migration 123 (CUS05), so a row can
+    // only be one that predates it: planted with triggers off.
+    {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("replica");
+        sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'aid09 test')")
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await
+            .expect("plant a pre-123 instance admin");
+        tx.commit().await.expect("commit");
+    }
+
+    let owner = new_identity();
+    let owner_id = bare(&pool, &owner).await;
+    sqlx::query("INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2)")
+        .bind(format!("aid09-{}", Uuid::new_v4()))
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("seed a perspective owner");
+
+    let capable = new_identity();
+    let capable_id = bare(&pool, &capable).await;
+    sqlx::query("INSERT INTO agent_capabilities (agent_id) VALUES ($1)")
+        .bind(capable_id)
+        .execute(&pool)
+        .await
+        .expect("seed agent capabilities");
+
+    let forged = new_identity();
+    let forged_id = bare(&pool, &forged).await;
+    let team: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ('forged personal', 'did:epigraph:personal:' || $1::text, \
+                 sha256(gen_random_uuid()::text::bytea), 'team') RETURNING id",
+    )
+    .bind(forged_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a team group spelled like a personal group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(team)
+    .bind(forged_id)
+    .execute(&pool)
+    .await
+    .expect("seed a membership in the forged group");
+
+    for (what, id) in [
+        ("an instance admin", &admin),
+        ("a perspective owner", &owner),
+        ("an agent with capabilities", &capable),
+        ("a member of a forged personal group", &forged),
+    ] {
+        let before = footprint(&pool).await;
+        let err = try_register(&pool, id, None, "g-aid09-generic", snapshot("g", "l"))
+            .await
+            .expect_err(what);
+        assert_eq!(sqlstate(&err).as_deref(), Some("AID09"), "{what}: {err}");
+        assert_eq!(
+            footprint(&pool).await,
+            before,
+            "{what}: AID09 changes nothing"
+        );
+    }
+}
+
 /// AID03: the parent must be an LLM agent (a derived identity, or one whose
 /// properties carry `llm_model`) and must not be a human. Each arm of the
 /// refusal is driven by a parent that ONLY that arm catches (review TC4), and
@@ -1386,6 +1624,33 @@ async fn the_backfill_gives_every_existing_agent_its_legacy_key(pool: PgPool) {
         .expect("RESET ALL");
     drop(conn);
 
+    // An agent whose current public key was already retired in agent_keys
+    // (rotated) and one whose key was revoked: the backfill must not re-mint
+    // either as an ACTIVE legacy key.
+    let mut retired = Vec::new();
+    for status in ["rotated", "revoked"] {
+        let id = Uuid::new_v4();
+        let key = random32();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, agent_type, key_kind) VALUES ($1, $2, 'software_agent', 'ed25519')",
+        )
+        .bind(id)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("seed agent with a retired key");
+        sqlx::query(
+            "INSERT INTO agent_keys (agent_id, public_key, key_type, status) VALUES ($1, $2, 'signing', $3)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("seed the retired key row");
+        retired.push((id, status));
+    }
+
     let mut seeded = Vec::new();
     for kind in ["ed25519", "derived"] {
         let id = Uuid::new_v4();
@@ -1410,16 +1675,33 @@ async fn the_backfill_gives_every_existing_agent_its_legacy_key(pool: PgPool) {
         .expect("RESET ALL");
     drop(conn);
 
+    for (id, status) in &retired {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_keys \
+              WHERE agent_id = $1 AND key_type = 'identity-legacy' AND status = 'active'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy rows of a retired key");
+        assert_eq!(
+            active, 0,
+            "a key already {status} in agent_keys must not come back as an active legacy key"
+        );
+    }
+
+    let retired_ids: Vec<Uuid> = retired.iter().map(|(id, _)| *id).collect();
     let without: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM agents a WHERE NOT EXISTS (\
+        "SELECT count(*) FROM agents a WHERE a.id <> ALL($1) AND NOT EXISTS (\
            SELECT 1 FROM agent_keys k WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')",
     )
+    .bind(&retired_ids)
     .fetch_one(&pool)
     .await
     .expect("agents without a legacy key");
     assert_eq!(
         without, 0,
-        "every pre-existing agent must have its legacy key row"
+        "every other pre-existing agent must have its legacy key row"
     );
 
     for (id, key) in seeded {
