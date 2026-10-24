@@ -619,10 +619,12 @@ pub struct RecallParams {
 
     #[schemars(
         description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
-                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       object grouping the same hits into `confirmed` (belief_score >= 0.75 and \
                        not contested), `open_question` (is_contested — any live \
-                       contradicts/refutes), and `uncertain` (everything else). Contest is \
-                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       contradicts/refutes), and `uncertain` (everything else). The score is \
+                       each hit's `belief_score`, the same value `min_truth` gates on, not its \
+                       authored `truth_value`. Contest is \
+                       checked FIRST, so a high-scoring claim carrying a live refutation is \
                        reported as an open question rather than as confirmed. Ranking is \
                        UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
                        and the union of the three buckets is exactly the flat list — this \
@@ -1698,8 +1700,15 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 ///   independent signals; a corpus can hold a 0.9 claim and a live refutation
 ///   of it at the same time, and that pair is precisely what the caller must
 ///   not be told is settled.
-/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `confirmed` — not contested AND gated score `>= `[`CONFIRMED_SCORE`].
 /// * `uncertain` — everything else.
+///
+/// The score is the GATED score: the value `min_truth` compared against
+/// (`RecallGatedSignals::gated_score`), never the authored `truth_value`.
+/// The two differ whenever evidence has moved a claim's DS cache away from
+/// what its author asserted, and a partition that read the authored value
+/// would call a claim `confirmed` that the gate rates 0.4, or `uncertain` a
+/// claim the gate admitted at 0.9.
 ///
 /// Within each bucket the caller's ranking order is PRESERVED (items are
 /// pushed in the order they were given), so bucketing re-groups the page
@@ -1713,7 +1722,7 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 /// without it, and only the JSON shape differs.
 #[derive(Debug, Clone, Serialize)]
 pub struct EpistemicPartition<T> {
-    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    /// Uncontested, with a gated score at or above [`CONFIRMED_SCORE`].
     pub confirmed: Vec<T>,
     /// Neither confirmed nor contested — believed, but not settled.
     pub uncertain: Vec<T>,
@@ -1721,19 +1730,38 @@ pub struct EpistemicPartition<T> {
     pub open_question: Vec<T>,
 }
 
+/// The two signals [`EpistemicPartition`] buckets a recall hit by.
+///
+/// A trait rather than a caller-supplied closure: the
+/// closure let each call site choose which number to partition on, and both
+/// sites chose the authored `truth_value` while their `min_truth` gate read
+/// `belief_score`. Implementing this on the hit type puts the choice in ONE
+/// place per type, next to the field the gate writes.
+pub(crate) trait RecallGatedSignals {
+    /// The score `min_truth` was compared against for this hit: the DS
+    /// pignistic probability when the claim carries a DS cache, else the
+    /// authored `truth_value` (a hit with no DS state falls back exactly as
+    /// the gate does).
+    fn gated_score(&self) -> f64;
+    /// Whether the dispute post-pass found a live `contradicts`/`refutes`.
+    fn is_contested(&self) -> bool;
+}
+
+impl RecallGatedSignals for RecallResult {
+    fn gated_score(&self) -> f64 {
+        self.belief_score
+    }
+    fn is_contested(&self) -> bool {
+        self.is_contested
+    }
+}
+
 impl<T> EpistemicPartition<T> {
-    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
-    /// `signals`.
-    ///
-    /// `signals` is a closure rather than a trait bound because the two recall
-    /// surfaces carry the same two numbers under different field names
-    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
-    /// live in different modules — and because the score this partitions on
-    /// must stay the SAME score `min_truth` gates on, which is a decision the
-    /// call site owns, not this type.
-    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    /// Bucket `items` by their gated score and contest flag.
+    pub(crate) fn from_ranked<I>(items: I) -> Self
     where
         I: IntoIterator<Item = T>,
+        T: RecallGatedSignals,
     {
         let mut out = Self {
             confirmed: Vec::new(),
@@ -1741,7 +1769,7 @@ impl<T> EpistemicPartition<T> {
             open_question: Vec::new(),
         };
         for item in items {
-            let (score, is_contested) = signals(&item);
+            let (score, is_contested) = (item.gated_score(), item.is_contested());
             if is_contested {
                 out.open_question.push(item);
             } else if score >= CONFIRMED_SCORE {
@@ -1846,13 +1874,12 @@ pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid:
 /// the flag off the response is byte-identical to what it was before this
 /// parameter existed — `Some(vec![])` still serializes as `"results": []`,
 /// which an empty-page caller relies on.
-pub(crate) fn split_epistemic<T>(
+pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     items: Vec<T>,
     partition: bool,
-    signals: impl Fn(&T) -> (f64, bool),
 ) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
     if partition {
-        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+        (None, Some(EpistemicPartition::from_ranked(items)))
     } else {
         (Some(items), None)
     }

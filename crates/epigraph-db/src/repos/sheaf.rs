@@ -31,6 +31,8 @@ pub struct ClaimNeighborBetpRow {
 pub struct EpistemicEdgePairRow {
     pub source_id: Uuid,
     pub target_id: Uuid,
+    /// As stored. Matching is case-insensitive, so this may be `SUPPORTS`;
+    /// `epigraph_engine::restriction_kind_with_profile` lowercases it.
     pub relationship: String,
     pub source_betp: Option<f64>,
     pub target_betp: Option<f64>,
@@ -110,7 +112,16 @@ impl SheafRepository {
         Ok(rows)
     }
 
-    /// Fetch all claim-to-claim epistemic edges with both endpoints' BetP.
+    /// Fetch all in-force claim-to-claim epistemic edges with both endpoints'
+    /// BetP: one row per edge, for MCP `sheaf_cohomology` and `reconcile_sheaf`.
+    ///
+    /// The relationship list is compared CASE-INSENSITIVELY, exactly as in
+    /// [`Self::get_claim_neighbor_betp_pairs`], so the cohomology scan and the
+    /// consistency scan see the same edge set. Writers store both `supports`
+    /// and `SUPPORTS` (likewise `corroborates` / `CORROBORATES`); an exact
+    /// match skipped every upper-case edge. The relationship is returned as
+    /// stored, and two spellings of one relationship between the same pair
+    /// are two rows.
     pub async fn get_epistemic_edge_pairs<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -135,7 +146,7 @@ impl SheafRepository {
             JOIN claims tgt ON tgt.id = e.target_id
             WHERE e.source_type = 'claim'
             AND e.target_type = 'claim'
-            AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
+            AND lower(e.relationship) IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes', 'frame_validates')
             -- A retracted edge must not manufacture a sheaf obstruction: the
             -- assertion has been withdrawn, so the inconsistency it implied is
             -- no longer claimed by anyone.

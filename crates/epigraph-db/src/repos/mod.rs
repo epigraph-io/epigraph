@@ -96,8 +96,8 @@ pub use agent::{
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use agent_identity::{
-    AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptFile,
-    PromptHistoryEntry, PromptSnapshot,
+    AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
+    PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};

@@ -198,7 +198,8 @@ async fn run(
         .await;
 
     println!(
-        "done: {} claims recomputed across {} (claim, frame) writes, {} had no BBAs, {} errors (of {total})",
+        "done: {} claims recomputed across {} (claim, frame) writes, {} had no recomputable input \
+         (no BBA, only ingest templates, or a compound; cache left as it was), {} errors (of {total})",
         claims_with_work.load(Ordering::Relaxed),
         frame_writes.load(Ordering::Relaxed),
         claims_empty.load(Ordering::Relaxed),

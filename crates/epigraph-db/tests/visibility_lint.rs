@@ -1619,6 +1619,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          a Viewer splice has no tenancy column to act on.",
     ),
     (
+        "agent_identity.rs",
+        "prompt_history_index",
+        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
+         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
+         admin, else AID06); it projects only keys and metadata out of the definer, so it reads \
+         strictly less than `prompt_history` and a Viewer splice has no tenancy column to act on.",
+    ),
+    (
+        "agent_identity.rs",
+        "prompt_history_blob",
+        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
+         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
+         admin, else AID06), filtered to the one file a row the definer marks `readable` names: \
+         it returns a subset of what `prompt_history` returns to the same caller, so a Viewer \
+         splice has no tenancy column to act on.",
+    ),
+    (
         "agent.rs",
         "require_bound_author",
         "CHECK through migration 122's `epigraph_require_bound_author` SECURITY DEFINER \
@@ -2880,6 +2897,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          without an error. Pinned by `epigraph-api/tests/frames_evidence_app_role.rs::\
          the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role`. The other \
          callers still pass their pool. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "divergence.rs",
+        "store",
+        "INSERT INTO `ds_bayesian_divergence` ... RETURNING id; a WRITE with no FROM for a \
+         viewer splice. Its control is the table's FORCE'd RLS (079) against the connection's \
+         GUCs, tenancy inherited from the claim (070's inheritor list, 114's writer-owned arm). \
+         Generic so REST `submit_evidence` can write its divergence record on a `write_as` \
+         transaction: on the unstamped raw pool FORCE refused it without an error. Pinned by \
+         `epigraph-api/tests/frames_evidence_armed.rs`. SCOPE: executor only; the \
+         SQL is unchanged.",
     ),
     (
         "mass_function.rs",

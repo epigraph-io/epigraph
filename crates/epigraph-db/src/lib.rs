@@ -84,7 +84,8 @@ pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
-    PromptFile, PromptHistoryEntry, PromptSnapshot,
+    PromptBlobRead, PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot,
+    PromptSnapshotIndex,
 };
 pub use repos::{
     carries_dedup_identity_key, ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken,
