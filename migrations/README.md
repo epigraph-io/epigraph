@@ -1513,25 +1513,42 @@ restart.
   (an operated agent is a member, at any role, only where its operator writes;
   an operator is not removed or demoted to reader under its live agents),
   `GRP04` (a member must belong to a live human operator: unbound and
-  retired-linked agents are refused), `GRP05` (member verbs act only on active
-  keyless team groups) and `GRP06` (one active team group per normalised
-  name). Removal is a revoke; a re-add inserts a new row at the next epoch, so
-  a revoked row is never revived. One `group.*` audit row per applied act.
-  Callers: `epigraph-operator create-group` and `group-member
-  add|remove|set-role`. They are the audited, rule-holding path, not the only
-  roster writer: the REST add route refuses a keyless group (no key epoch),
-  the REST remove route does not, and an app session stamped as the creator
-  (092) or a live admin (077) can write roster rows directly, under 109's and
-  (armed) 122's triggers but without the GRP rules or the audit row. Pinned by
+  retired-linked agents are refused), `GRP05` (member verbs act only on
+  active team groups in the verbs' `did:epigraph:group:` namespace) and
+  `GRP06` (one active verb-made team group per normalised name; the refusal
+  names the holder). `GRP02` counts only admins that are still registered
+  humans, decided under a `FOR NO KEY UPDATE` lock on the `groups` row.
+  Removal is a revoke; a re-add inserts a new row at the next epoch, so a
+  revoked row is never revived. One `group.*` audit row per applied act, with
+  the CLI's process context under `actor` (read from the transaction-local
+  `epigraph.operator_actor`, via the invoker `epigraph_team_group_actor()`).
+  The verbs are the ONLY writer of a verb-made group: the definer trigger
+  `group_memberships_team_roster_verbs_only` (owned by maintenance) and the
+  invoker triggers `groups_team_verbs_only_insert` / `_update` refuse (42501)
+  every non-maintenance write to such a group's roster or row, and any new
+  keyless team group, whatever principal the session is stamped as (so the
+  REST remove route is refused on these groups too). It also re-states 077's
+  `epigraph_live_memberships(uuid)`: a verb-made group's live row counts in a
+  viewer's group set only while the member still belongs to a registered
+  human operator, so a revoked allowance or registration ends access at the
+  next resolve without a write. Callers: `epigraph-operator create-group` and
+  `group-member add|remove|set-role`. Pinned by
   `epigraph-db/tests/team_group_verbs.rs` and
   `epigraph-cli/tests/operator_team_group.rs`; registered in
-  `tenancy_backfill.rs` (definer register and grant list),
+  `tenancy_backfill.rs` (definer register, grant list, the invoker exemption,
+  and `epigraph_live_memberships` moved out of the frozen pre-register list),
   `locked_decisions.rs` (call needles) and `rls_enforcement.rs` (the policy's
-  row-only arm). Undo in the file's header. Slot: 163 is the highest on
-  `main`; no open PR and no remote branch carries 164 or above. **Deploy
-  order:** none against other migrations or the binaries (new functions and a
-  widened CHECK; an older binary has no caller). The CLI subcommands need the
-  migration applied. **Applied to throwaway databases only, NOT to any
+  row-only arm). Undo in the file's header. Slot: 164 is free on `main`
+  (highest 163) and in every open PR; a non-PR remote branch carries 166, so
+  166 is not free to take. **Deploy
+  order:** none against other migrations or the binaries (new functions,
+  triggers that only touch groups no binary creates, a widened CHECK, and a
+  re-stated `epigraph_live_memberships` whose signature and answers for every
+  existing group are unchanged). The CLI subcommands need the migration
+  applied. **Deploy precondition:** confirm the deployed `groups` table
+  carries 060's `groups_public_key_shape` (the re-added, looser CHECK then
+  validates trivially); if it does not, count the rows the new CHECK would
+  refuse before applying. **Applied to throwaway databases only, NOT to any
   deployed database.**
 
 ## `-- no-transaction` migrations

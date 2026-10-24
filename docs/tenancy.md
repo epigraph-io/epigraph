@@ -1232,16 +1232,32 @@ database functions these commands call:
   a new row;
 * every applied act writes one `group.*` `security_events` row.
 
-These commands are the audited path that holds every rule above; they are
-not the only writer. The keyed `POST /api/v1/groups/:id/members` route refuses
-a keyless group (it needs a key epoch), but `DELETE
-/api/v1/groups/:id/members/:agent_id` does not (it keeps its own last-admin
-guard, without the operated-agent rule or a `group.*` audit row). An
-application session stamped as the group's creator or as a live admin can also
-write roster rows directly, under the membership triggers (and, once armed, the
-operator-binding scope) but not under the rules above. The application DSN is
-not the boundary for that, for the reason "Arming, and the valve" gives: a
-holder of it can stamp any principal.
+* a group the commands created (its `did_key` is `did:epigraph:group:<id>`)
+  has ONE writer, these commands: no application session, whatever principal
+  it is stamped as (the group's admin, its creator, demoted or not), can
+  insert or change one of its membership rows or change its group row, and no
+  application session can create a keyless team group or one in that
+  namespace (42501, from the triggers migration 164 adds). The REST routes
+  therefore cannot change such a roster either: add needs a key epoch, and
+  remove is refused like any other application write;
+* a member's access LAPSES with the binding that admitted it: a verb-made
+  group's live row counts in a viewer's group set only while the member still
+  belongs to a registered human operator, so revoking a client allowance or a
+  human's registration (or suspending its human client) ends the member's
+  reads and writes at its next resolve. The row itself stays until
+  `group-member remove` revokes it;
+* the last-admin rule counts only admins that are still registered humans;
+* each audit row also carries `actor`: the CLI's tool, command, version and
+  process identity (real and login uid), since `session_user` is a shared
+  login.
+
+Two limits remain. Row security reads the SESSION's group set, so a session
+stamped before a removal (a cached viewer, a long-lived connection) still
+reads the group until it re-resolves; a removal takes effect at the next
+resolve. And the application DSN is not the boundary for anything an
+application session may do, for the reason "Arming, and the valve" gives: a
+holder of it can stamp any principal. That is why a verb-made group's roster
+is closed to every application session rather than to some principals.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

@@ -23,8 +23,8 @@
 -- empty `wrapped_key_share`. `did_key` is `did:epigraph:group:<id>` (the
 -- community precedent, `did:epigraph:community:<id>`), so it is unique by
 -- construction and claims nothing about a key. `groups_public_key_shape` (060)
--- required exactly 32 bytes for `kind = 'team'`; section 2 relaxes it to 0 OR
--- 32, so existing keyed team groups stay valid.
+-- required exactly 32 bytes for `kind = 'team'`; the first statement below
+-- relaxes it to 0 OR 32, so existing keyed team groups stay valid.
 --
 -- These verbs are the ONLY writer of a verb-made group's roster and group
 -- row. A verb-made group is one whose `did_key` is in the verbs'
@@ -145,7 +145,10 @@
 -- SELECT/INSERT/UPDATE on the three tables written (070) and EXECUTE on the
 -- helpers read (122 and 149 own them by the same role). The `OWNER TO` block
 -- is role-guarded like every such block since 060 and can silently no-op;
--- `tenancy_backfill.rs`'s register and `schema_contract.rs` pin the owner.
+-- `tenancy_backfill.rs`'s register (checked by `verify` and by its
+-- `register_matches_the_maintenance_owned_catalog` test) and
+-- `team_group_verbs.rs::the_verbs_are_maintenance_owned_definers_only_maintenance_executes`
+-- pin the owner. (`schema_contract.rs` has no entry for this file.)
 --
 -- ===================================================================
 -- 6. A MEMBERSHIP LAPSES WITH ITS BINDING
