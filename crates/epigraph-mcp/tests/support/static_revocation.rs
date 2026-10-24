@@ -7,7 +7,7 @@
 //! Tests whose subject is NOT revocation (scope gating, session status codes,
 //! the operated-signer guard) serve on a deliberately dead pool. The
 //! production `DbAccessTokenRevocation` would fail CLOSED there and turn every
-//! valid token into a 401, so they use [`StaticRevocation::none`] and say so.
+//! valid token into a 503, so they use [`StaticRevocation::none`] and say so.
 
 #![allow(dead_code)]
 

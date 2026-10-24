@@ -72,6 +72,121 @@ async fn post_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, Val
     )
 }
 
+/// The headers `routes::oauth_response_headers` puts on every response of the
+/// OAuth and `/.well-known` routers: anti-framing for the consent page,
+/// no-store + `Pragma: no-cache` for tickets and token responses (RFC 6749
+/// section 5.1 names both), no referrer for URLs that carry codes.
+const OAUTH_HEADERS: [(&str, &str); 5] = [
+    ("content-security-policy", "frame-ancestors 'none'"),
+    ("x-frame-options", "DENY"),
+    ("cache-control", "no-store"),
+    ("pragma", "no-cache"),
+    ("referrer-policy", "no-referrer"),
+];
+
+fn assert_oauth_headers(headers: &axum::http::HeaderMap, what: &str) {
+    for (name, expected) in OAUTH_HEADERS {
+        assert_eq!(
+            headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "{what}: header {name}"
+        );
+    }
+}
+
+/// `method uri` with a JSON `body` on `app`: `(status, headers)`.
+async fn status_and_headers(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    body: Body,
+) -> (StatusCode, axum::http::HeaderMap) {
+    use axum::http::header;
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", "192.0.2.7")
+        .body(body)
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    (resp.status(), resp.headers().clone())
+}
+
+/// An OAuth ERROR response carries the headers too: a 400 from the token
+/// endpoint, and a 413 for a body over `max_request_size` (the limit is
+/// enforced by the handler's body extractor, inside the header layer).
+#[tokio::test]
+async fn oauth_error_responses_carry_the_oauth_headers() {
+    let (status, headers) = status_and_headers(
+        app(),
+        Method::POST,
+        "/oauth/token",
+        Body::from(r#"{"grant_type":"authorization_code","code_verifier":"x"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_oauth_headers(&headers, "token endpoint 400");
+
+    let oversized = vec![b' '; config().max_request_size + 1];
+    let (status, headers) =
+        status_and_headers(app(), Method::POST, "/oauth/token", Body::from(oversized)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_oauth_headers(&headers, "token endpoint 413");
+}
+
+/// The rate limiter wraps the merged router, OUTSIDE the OAuth header layer,
+/// so its 429 never passes through that layer. It must still be
+/// uncacheable. The limiter keys an anonymous request on its forwarded IP;
+/// the CONTROL (the first request is 200 and carries the full set) shows the
+/// limiter is live and the route is an OAuth one.
+#[tokio::test]
+async fn a_rate_limited_oauth_response_is_not_cacheable() {
+    if std::env::var("DATABASE_URL").is_err() {
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://test_dummy:test_dummy@localhost/test_dummy",
+        );
+    }
+    let limiter = epigraph_api::AgentRateLimiter::new(epigraph_api::RateLimitConfig {
+        default_rpm: 1,
+        global_rpm: 1000,
+        replenish_interval_secs: 60,
+        enable_global_limit: false,
+    });
+    let state = AppState::new(config())
+        .with_providers(Arc::new(ProviderRegistry::default()))
+        .with_rate_limiter(limiter);
+    let app = create_router(state);
+    let uri = "/.well-known/oauth-authorization-server";
+
+    let (status, headers) = status_and_headers(app.clone(), Method::GET, uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: the first request is admitted"
+    );
+    assert_oauth_headers(&headers, "control: metadata 200");
+
+    let (status, headers) = status_and_headers(app, Method::GET, uri, Body::empty()).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second request inside the window is limited"
+    );
+    for (name, expected) in [("cache-control", "no-store"), ("pragma", "no-cache")] {
+        assert_eq!(
+            headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "429 header {name}"
+        );
+    }
+    assert!(
+        headers.get("retry-after").is_some(),
+        "429 keeps Retry-After"
+    );
+}
+
 // ── DB-backed authorization_code redeem tests ────────────────────────────────
 //
 // These run against a real Postgres test DB (migrations 001-049 applied,
@@ -608,8 +723,11 @@ async fn get_redirect(app: axum::Router, uri: &str) -> (StatusCode, Option<Strin
 }
 
 /// POST application/x-www-form-urlencoded (the consent endpoint uses axum Form,
-/// NOT JSON) and return (status, Location header).
-async fn post_consent(app: axum::Router, body: &str) -> (StatusCode, Option<String>) {
+/// NOT JSON) and return (status, Location header, every header).
+async fn post_consent(
+    app: axum::Router,
+    body: &str,
+) -> (StatusCode, Option<String>, axum::http::HeaderMap) {
     use axum::http::header;
     let req = Request::builder()
         .method(Method::POST)
@@ -624,7 +742,7 @@ async fn post_consent(app: axum::Router, body: &str) -> (StatusCode, Option<Stri
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    (status, loc)
+    (status, loc, resp.headers().clone())
 }
 
 /// Seed an authorize session ALREADY transitioned to consent: create() it keyed by
@@ -740,13 +858,16 @@ async fn consent_allow_mints_redeemable_code() {
     let claude_state = "claude-roundtrip-state-xyz";
     let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, claude_state).await;
 
-    let (status, loc) = post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
+    let (status, loc, headers) =
+        post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
     // axum's Redirect::to emits 303 See Other (the correct POST→GET redirect).
     assert_eq!(
         status,
         StatusCode::SEE_OTHER,
         "Allow must 303-redirect to the client redirect_uri"
     );
+    // The Location carries the code: never cached, never sent as a referrer.
+    assert_oauth_headers(&headers, "consent allow 303");
     let loc = loc.expect("Allow must carry a Location header");
     assert!(
         loc.starts_with(REDIRECT_URI),
@@ -805,13 +926,14 @@ async fn consent_deny_redirects_with_error() {
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, "deny-state").await;
 
-    let (status, loc) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+    let (status, loc, headers) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
 
     assert_eq!(
         status,
         StatusCode::SEE_OTHER,
         "Deny must 303-redirect back to the client"
     );
+    assert_oauth_headers(&headers, "consent deny 303");
     let loc = loc.expect("Deny must carry a Location header");
     assert!(
         loc.starts_with(REDIRECT_URI),
@@ -847,7 +969,7 @@ async fn consent_control_byte_state_does_not_panic() {
     let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, evil_state).await;
 
     // Deny path (does not mint a code, isolating the redirect construction).
-    let (status, loc) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
+    let (status, loc, _) = post_consent(app, &format!("ticket={ticket}&decision=deny")).await;
 
     assert_eq!(
         status,
@@ -881,15 +1003,17 @@ async fn consent_ticket_is_single_use() {
     let ticket =
         seed_consent_session(&pool, &client_id, client_uuid, &scopes, "single-use-state").await;
 
-    let (status1, _loc1) =
+    let (status1, _loc1, _) =
         post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
     assert_eq!(status1, StatusCode::SEE_OTHER, "first Allow must succeed");
 
-    let (status2, _loc2) = post_consent(app, &format!("ticket={ticket}&decision=allow")).await;
+    let (status2, _loc2, headers2) =
+        post_consent(app, &format!("ticket={ticket}&decision=allow")).await;
     assert!(
         status2.is_client_error(),
         "a replayed consent ticket must be rejected (4xx), got {status2}"
     );
+    assert_oauth_headers(&headers2, "replayed consent ticket 4xx");
 }
 
 // ── RFC 7591 dynamic client registration (Task 9) ────────────────────────────
@@ -1051,18 +1175,7 @@ async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
         body.contains("Authorize Claude") && body.contains("name=\"ticket\""),
         "this is the consent page with its ticket: {body}"
     );
-    for (name, expected) in [
-        ("content-security-policy", "frame-ancestors 'none'"),
-        ("x-frame-options", "DENY"),
-        ("cache-control", "no-store"),
-        ("referrer-policy", "no-referrer"),
-    ] {
-        assert_eq!(
-            headers.get(name).and_then(|v| v.to_str().ok()),
-            Some(expected),
-            "consent page header {name}"
-        );
-    }
+    assert_oauth_headers(&headers, "consent page");
 }
 
 // ── Loopback (RFC 8252) redirect URIs: native MCP clients such as OpenAI Codex ──

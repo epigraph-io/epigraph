@@ -2499,25 +2499,69 @@ narrowing `scope`) widened the chain to everything the client is granted.
    client's whole grant, and every rotation re-caps its expiry at now() plus
    the client type's TTL (human 30 days, service 90 days, agent 24 hours) with
    no family-age cap, so a connector that refreshes at least once per TTL keeps
-   the widened scopes indefinitely. Decide, per client, after step 1:
-   * **Revoke** the client's live chains, forcing a fresh consent (humans
-     re-authorize the connector; services run a new `client_credentials`
-     grant): `SELECT public.epigraph_refresh_token_revoke_client('<oauth_clients.id>');`
-     on the maintenance DSN (it returns the number of tokens revoked). The candidates are `human` clients (any connector consented
-     with a narrowed scope) and `client_credentials` clients that request a
-     narrowing `scope`. Read-only census of what each live chain now stores
-     against the grant (maintenance DSN):
+   the widened scopes indefinitely.
+
+   **What a revoke stops, and what it does not.** Revoking a chain (either
+   function below) stops its NEXT refresh, and ends any elevation session on
+   that family at once (migration 125's `refresh_tokens_end_elevations`
+   trigger). Access tokens the chain already issued stay valid until they
+   expire, at most 1 hour for a `human` or `service` client and 15 minutes for
+   an `agent` one, because the bearer check consults only the per-`jti`
+   access-token denylist (migration 141), never the refresh family. To cut a
+   known access token off sooner, revoke it by value at `POST /oauth/revoke`.
+
+   Decide, per chain, after step 1. Every query below is read-only and runs on
+   the maintenance DSN. A family's root is its first token: its row has
+   `family_id` NULL and its `id` is the family id, and every successor a
+   rotation inserts carries `family_id` = that id. A live row with `family_id`
+   NULL has never been rotated, so 118 cannot have widened it.
+   * **Rootless chains: lead with these.** A chain whose root row is no
+     longer there (most chains that were rotated under 118 are in this shape)
+     does not record what its consent granted. The only census is a
+     HEURISTIC against the client's grant as it stands now:
      ```sql
-     SELECT c.id, c.client_id, c.client_type, t.scopes, c.granted_scopes,
+     SELECT t.id AS live_token_id, c.id AS client, c.client_id, c.client_type,
+            t.scopes, c.granted_scopes,
             t.scopes @> c.granted_scopes AS holds_whole_grant
        FROM refresh_tokens t JOIN oauth_clients c ON c.id = t.client_id
       WHERE t.revoked_at IS NULL AND t.expires_at > now()
+        AND t.family_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM refresh_tokens r WHERE r.id = t.family_id)
       ORDER BY c.client_type, c.client_id;
      ```
-     `holds_whole_grant` is true for a chain whose last 118 rotation stored
-     the grant as it stands now, and equally for a consent that genuinely asked
-     for everything; the stored row does not record which, so the decision is
-     the operator's.
+     `holds_whole_grant` errs both ways. It is true for a chain whose last
+     118 rotation stored the grant as it stands now, but equally for a
+     consent that genuinely asked for everything, and for a client whose
+     grant is empty (every array contains `{}`). It is false for a chain that
+     WAS widened under 118 when the client's grant has grown since (a scope
+     added after that rotation). The stored rows cannot tell these apart, so
+     the decision is the operator's.
+   * **Chains that still have their root.** The root's scopes are what the
+     consent granted, so a live successor holding a scope its root does not
+     was widened:
+     ```sql
+     SELECT t.id AS live_token_id, c.id AS client, c.client_id, c.client_type,
+            r.scopes AS consented, t.scopes AS live
+       FROM refresh_tokens t
+       JOIN refresh_tokens r ON r.id = t.family_id
+       JOIN oauth_clients c ON c.id = t.client_id
+      WHERE t.revoked_at IS NULL AND t.expires_at > now()
+        AND NOT (t.scopes <@ r.scopes)
+      ORDER BY c.client_type, c.client_id;
+     ```
+   * **Revoke one chain** (both cases): a family has exactly one live row, so
+     revoking that row ends the chain, and only that one connector must be
+     re-authorized (a human re-authorizes it; a service runs a new
+     `client_credentials` grant):
+     `SELECT public.epigraph_refresh_token_revoke('<live_token_id>', 'revoked');`
+     It returns true when it revoked the row, false when the row was already
+     revoked.
+   * **Revoke a whole client** (the coarse option):
+     `SELECT public.epigraph_refresh_token_revoke_client('<oauth_clients.id>');`
+     returns the number of tokens revoked. Mind the blast radius: a human's
+     connectors all refresh on that human's ONE per-user client, so this logs
+     the human out of EVERY connector, and the same trigger ends every
+     elevation session on those families.
    * **Accept** the widening for chains whose consumer is trusted with the
      whole grant, and record that decision.
 
