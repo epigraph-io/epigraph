@@ -108,9 +108,13 @@
 -- the writer otherwise) and `epigraph_require_attributable` (the author, when
 -- the writer is someone else). No new trigger, and 153's trigger body is not
 -- touched. A restatement of a RETIRED predecessor (the supersede act's
--- inherited author) is not checked on that author: restating an attached
--- agent's retired claim is its human's act, not the agent running. The writer
--- of such a restatement is still checked.
+-- inherited author) is relieved of the check on that author ONLY when the
+-- author identity is itself retired (`epigraph_agent_is_retired`: a retired
+-- operator link and no live one, so it can never run again and naming it is
+-- its human's act). An inherited author that is a live attached agent is
+-- checked like any other: otherwise a sibling of the same human, or the human,
+-- could restate the agent's claim under its name in the gap. The writer of a
+-- restatement is checked either way.
 --
 -- EXEMPT: a privileged session (`epigraph_bypass()`: the maintenance role or a
 -- superuser, i.e. the custodial path), as it is from OPL02. KEYED ON ARMING
@@ -640,6 +644,23 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_role_holder(uuid) FROM PUBLIC;
 
+-- Is `p_agent` a RETIRED identity: linked to a human only through a retired
+-- link (`epigraph_human_of(p, false)` but not `epigraph_human_of(p, true)`)?
+-- Such an identity can never run again (107: a link never moves, and a
+-- retired link never writes), so a write that names it as the inherited
+-- author of a restatement is its human's act, not the agent running. The one
+-- relief from the author arms of ROL01; an unlinked or live-linked agent is
+-- never retired.
+CREATE OR REPLACE FUNCTION public.epigraph_agent_is_retired(p_agent uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT p_agent IS NOT NULL
+       AND public.epigraph_human_of(p_agent, true) IS NULL
+       AND public.epigraph_human_of(p_agent, false) IS NOT NULL
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_agent_is_retired(uuid) FROM PUBLIC;
+
 -- The two 123 checks the claims trigger calls, re-stated (signatures, owner
 -- and grants unchanged: CREATE OR REPLACE keeps both) with the 166 lines. A
 -- later migration that re-bodies either starts from these bodies.
@@ -695,10 +716,12 @@ BEGIN
     IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN;
     END IF;
-    -- 166: ROL01 on the AUTHOR a writer names, except the inherited author of
-    -- a retired predecessor's restatement (its human's act, not the agent
-    -- running; the writer was checked by the writer scope).
-    IF NOT COALESCE(p_inherited, false) THEN
+    -- 166: ROL01 on the AUTHOR a writer names. Relieved only for the
+    -- inherited author of a retired predecessor's restatement when that
+    -- author identity is itself RETIRED (it can never run again, so naming it
+    -- is its human's act); a live attached author is checked like any other.
+    -- The writer was checked by the writer scope.
+    IF NOT (COALESCE(p_inherited, false) AND public.epigraph_agent_is_retired(p_author)) THEN
         PERFORM public.epigraph_require_role_holder(p_author);
     END IF;
     v_writer_human := public.epigraph_human_of(p_writer, true);
@@ -745,9 +768,12 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_require_role_holder(uuid) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_agent_is_retired(uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz), '
                 'public.epigraph_role_agent_may_run(uuid), '
-                'public.epigraph_require_role_holder(uuid) TO epigraph_maintenance';
+                'public.epigraph_require_role_holder(uuid), '
+                'public.epigraph_agent_is_retired(uuid) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         -- The question only. The check is reached through the writer checks,
