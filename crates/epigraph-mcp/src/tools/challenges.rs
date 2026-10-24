@@ -6,34 +6,59 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{ChallengeRepository, ClaimRepository, EventRepository};
+use epigraph_db::repos::challenge::ChallengeAdmission;
+use epigraph_db::{ChallengeRepository, EventRepository};
 
 /// The `data.rule` of [`challenge_not_writer`].
 pub const CHALLENGE_NOT_WRITER_RULE: &str = "challenge_requires_claim_group_writer";
 
-/// The named refusal for a challenge against a claim the challenger can read
-/// but whose owning group it cannot write. The challenge row INHERITS that
-/// group (see [`challenge_claim`]'s doc), so the database would refuse the
-/// INSERT; this says so by name instead of passing on the row-security error.
-/// `INVALID_REQUEST`, like `crate::errors::claim_not_writer`: a denial of
-/// authority, not a server fault and not a bad parameter. Not that helper
-/// itself, because its text offers `claims:admin` as a way in, and a
-/// `claims:admin` token does not change whose group this row is written into.
+/// The named refusal for a challenge against a NON-PUBLIC claim the challenger
+/// can read but whose owning group it cannot write (ruling R-CH1: an outsider's
+/// challenge is the outsider's own row, and on a non-public claim such a row
+/// would be hidden from the claim's own owners, so it is not written). The
+/// database would refuse the INSERT too; this says so by name instead of
+/// passing on the row-security error. `INVALID_REQUEST`, like
+/// `crate::errors::claim_not_writer`: a denial of authority, not a server fault
+/// and not a bad parameter. Not that helper itself, because its text offers
+/// `claims:admin` as a way in, and a `claims:admin` token changes nothing here.
 ///
 /// It does NOT name the claim's owning group: no claim read surface returns
-/// `owner_group_id`, and for another agent's public claim it is usually that
-/// agent's personal group. Same shape as `claim_not_writer`'s `data`.
+/// `owner_group_id`. Same shape as `claim_not_writer`'s `data`.
 fn challenge_not_writer(claim_id: uuid::Uuid) -> McpError {
     McpError {
         code: ErrorCode::INVALID_REQUEST,
         message: std::borrow::Cow::from(format!(
-            "cannot challenge claim {claim_id}: a challenge is owned by the challenged claim's \
-             group, and the challenger holds no live writer or admin membership in it; nothing \
-             was written"
+            "cannot challenge claim {claim_id}: it is not public, and the challenger holds no \
+             live writer or admin membership in its group (a challenger outside the claim's \
+             group may challenge only a public claim); nothing was written"
         )),
         data: Some(serde_json::json!({
             "error": "not_writer",
             "rule": CHALLENGE_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// The `data.rule` of [`challenge_no_writer_group`].
+pub const CHALLENGE_NO_WRITER_GROUP_RULE: &str = "challenge_requires_an_own_write_group";
+
+/// An outsider's challenge on a public claim is owned by the challenger's own
+/// write group (`epigraph_writer_group()`: its operator's personal group, else
+/// its own), and this challenger has none it can write. Nothing could own the
+/// row, so the database would refuse it; this says so by name.
+fn challenge_no_writer_group(claim_id: uuid::Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot challenge claim {claim_id}: a challenge from outside the claim's group is \
+             owned by the challenger's own personal (or operator's) group, and the challenger \
+             can write neither; nothing was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "no_writer_group",
+            "rule": CHALLENGE_NO_WRITER_GROUP_RULE,
             "claim_id": claim_id,
             "retryable": false,
         })),
@@ -111,25 +136,25 @@ const VALID_CHALLENGE_TYPES: &[&str] = &[
 /// the event share the challenge's fate: no `claim.challenged` event for a
 /// challenge that was rolled back.
 ///
-/// # What is still refused, and it is a policy question rather than a bug
+/// # Whose row it is (ruling R-CH1, migration 168)
 ///
-/// The row's `(visibility, owner_group_id)` is inherited from the CHALLENGED
-/// CLAIM by migration 074's BEFORE-row trigger and re-stamped unconditionally by
-/// 070 arm (c) — see `ChallengeRepository::create`'s doc. So a challenger can
-/// write a challenge against a claim in a group it can write, and is refused for
-/// one it cannot. Before this conversion it was refused for BOTH, so this is
-/// strictly a narrowing of the refusal; deciding whether an outsider's objection
-/// should be owned by the objector instead is a tenancy-model change, not this
-/// change.
+/// * An INSIDER (the challenger writes the claim's owning group): the row
+///   inherits the claim's tenancy, as every claim-derived row does.
+/// * An OUTSIDER on a PUBLIC claim: the row is owned by the challenger's own
+///   write group, public, `writer_owned`, and never follows the claim (a later
+///   privatization does not drag it along). Before 168 this was refused.
+/// * An outsider on a NON-public claim it can read: refused by name
+///   ([`challenge_not_writer`]); an outsider with no write group of its own:
+///   refused by name ([`challenge_no_writer_group`]).
+/// * A claim the challenger cannot read: "not found", with exactly the text a
+///   nonexistent claim id gets (ruling R-CH1b), so the refusal is no existence
+///   oracle.
 ///
-/// That refusal is answered BY NAME ([`challenge_not_writer`], before the
-/// INSERT): the claim's owning group is read on the stamped transaction and
-/// compared with the challenger's own writable groups, the set the stamp
-/// carries. It used to surface as an `INTERNAL_ERROR` carrying the raw
-/// `new row violates row-level security policy for table "challenges"`
-/// (backlog deebc487). A claim the caller cannot read stays "not found". A
-/// `42501` from the INSERT itself, past the preflight, is a server-side fault
-/// or a race, not the caller's denial ([`challenge_refused_after_preflight`]).
+/// The decision is `ChallengeRepository::admission_of`, read on the stamped
+/// transaction with the functions the INSERT's triggers use, so the preflight
+/// and the row cannot disagree. A `42501` from the INSERT itself, past the
+/// preflight, is a server-side fault or a race, not the caller's denial
+/// ([`challenge_refused_after_preflight`]).
 pub async fn challenge_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -158,18 +183,17 @@ pub async fn challenge_claim(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, challenger, "challenge_claim").await?;
 
-    // Preflight: the group the challenge row would inherit, read through the
-    // request's viewer (an unreadable claim is not found), against the
-    // challenger's own writable groups, which are the stamp's.
-    let (_author, owner_group) = ClaimRepository::write_target_of(&mut *tx, viewer, claim_id)
+    // Preflight (R-CH1): where the row would land, read through the request's
+    // viewer (an unreadable claim is not found, worded exactly as a missing
+    // one) on the stamped transaction the INSERT uses.
+    let admission = ChallengeRepository::admission_of(&mut *tx, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
-    let challenger_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, agent_id)
-        .await
-        .map_err(internal_error)?;
-    if !challenger_viewer.writable_groups().contains(&owner_group) {
-        return Err(challenge_not_writer(claim_id));
+    match admission {
+        ChallengeAdmission::Insider | ChallengeAdmission::Outsider { .. } => {}
+        ChallengeAdmission::NotWriter => return Err(challenge_not_writer(claim_id)),
+        ChallengeAdmission::NoWriterGroup => return Err(challenge_no_writer_group(claim_id)),
     }
 
     let challenge_id = ChallengeRepository::create(

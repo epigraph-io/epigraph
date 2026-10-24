@@ -682,7 +682,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 247 -> 246 (atom-level belief, the same change): `propagate_beliefs`' factor
 /// load moved onto `AppState::read_as` (`routes/computation.rs` 8 -> 7, keeping
 /// sites).
-const HIGH_WATER: usize = 246;
+///
+/// 246 -> 244 (ruling R-CH1, backlog 2f2eeaea): `submit_challenge` writes its
+/// challenge and its event on one `AppState::write_as` transaction, so
+/// `routes/challenge.rs` 2 -> 0 and its key is deleted, read off
+/// `the_scanner_is_not_vacuous`'s own failure (`left: 244, right: 246`).
+const HIGH_WATER: usize = 244;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -745,7 +750,8 @@ const HIGH_WATER: usize = 246;
 /// (`recorded 10, measured 5`).
 /// 44 -> 43 when `routes/reasoning.rs` reached zero (see [`HIGH_WATER`]).
 /// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
-const HIGH_WATER_FILES: usize = 42;
+/// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
+const HIGH_WATER_FILES: usize = 41;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -768,11 +774,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // module doc for why routing a write through it compiles and then discards
     // the write. Their owner is `ScopedPool::begin_as` plus 16b's write gate.
     ("routes/belief.rs", 3),
-    // 3 before conversion shard 7, which moved `list_challenges` onto
-    // `AppState::read_as`. The two that remain are `submit_challenge`, which
-    // WRITES and holds no `Viewer` at all; its owner is
-    // `D-PR16-claim-authorship-is-not-a-credential`, an open operator decision.
-    ("routes/challenge.rs", 2),
+    // `routes/challenge.rs` was 2 and is GONE: ruling R-CH1 resolved
+    // `D-PR16-claim-authorship-is-not-a-credential`, and `submit_challenge`
+    // (backlog 2f2eeaea) now writes its challenge and its event on one
+    // `AppState::write_as` transaction.
     // 25 before conversion shard 7, which moved `get_claim`, `list_claims`,
     // `list_claim_evidence` and `list_by_labels` onto
     // `AppState::read_as`. FOUR, not six: `get_claim` and `list_claims` each

@@ -75,7 +75,9 @@ const REGISTER: &[(&str, usize)] = &[
     // `belief.rs` (16, then 12 after U024) is gone: `submit_evidence`'s edges,
     // perspective/community scoped beliefs and divergence record moved onto
     // stamped transactions, each under a logged SAVEPOINT (fb9cff66).
-    ("challenge.rs", 1),
+    // `challenge.rs` (1) is gone: `submit_challenge`'s `claim.challenged`
+    // event moved into the challenge's stamped transaction through
+    // `EventRepository::publish_or_log_conn` (backlog 2f2eeaea).
     ("claims.rs", 3),
     ("community.rs", 1),
     ("conflicts.rs", 2),
