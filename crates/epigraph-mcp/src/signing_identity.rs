@@ -131,14 +131,25 @@ pub struct KeyBinding {
     pub key_kind: Option<&'static str>,
 }
 
-/// Whether an attested key row was valid at `at`: inside `[valid_from,
-/// valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a recorded
-/// `valid_until` (rotation records no timestamp of its own, so a rotated key
-/// with an open window binds nothing). A REVOKED or PENDING key binds nothing:
-/// revocation records no timestamp either, so a revoked key is treated as
-/// compromised from the start.
+/// How far before a key's `valid_from` a claim may be dated and still bind.
+///
+/// `claims.created_at` is stamped by the writer's clock (`Claim::new`) and
+/// `valid_from` by the database's (`now()` at registration), so a writer a
+/// little behind the database dates its first claims before the window
+/// opens. This is clock skew, not a security boundary: `created_at` is set by
+/// the writer and is not covered by the signature, so the lower bound never
+/// stopped a determined backdater. Only the LOWER bound is relaxed; a window's
+/// END (rotation, the legacy cut-over) stays exact.
+pub const VALID_FROM_SKEW_SECS: i64 = 60;
+
+/// Whether an attested key row was valid at `at`: inside `[valid_from -
+/// VALID_FROM_SKEW_SECS, valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a
+/// recorded `valid_until` (a rotated key with an open window records no end,
+/// so it binds nothing). A REVOKED or PENDING key binds nothing: a revoked key
+/// is treated as compromised from the start.
 fn valid_at(row: &AttestedKeyRow, at: DateTime<Utc>) -> bool {
-    if at < row.valid_from || row.valid_until.is_some_and(|until| at >= until) {
+    let opens = row.valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
+    if at < opens || row.valid_until.is_some_and(|until| at >= until) {
         return false;
     }
     match row.status.as_str() {
@@ -350,6 +361,25 @@ mod tests {
             b.signature_valid && !b.key_bound,
             "ten minutes early is not skew: {b:?}"
         );
+    }
+
+    /// The skew allowance's exact edge: `valid_from - VALID_FROM_SKEW_SECS`
+    /// binds, one millisecond earlier does not.
+    #[test]
+    fn the_skew_allowance_ends_exactly_at_its_bound() {
+        let author = Uuid::new_v4();
+        let key = AgentSigner::from_bytes(&[6; 32]).expect("key");
+        let digest = [3u8; 32];
+        let sig = key.sign(&digest);
+        let from = Utc::now() - Duration::hours(1);
+        let row = attested(author, &key, "signing", "active", from, None);
+        let edge = from - Duration::seconds(VALID_FROM_SKEW_SECS);
+        let bound = |at| {
+            bind_signature(&digest, Some(&sig), &[0; 32], author, at, std::slice::from_ref(&row))
+                .key_bound
+        };
+        assert!(bound(edge), "the edge itself binds");
+        assert!(!bound(edge - Duration::milliseconds(1)), "past the edge does not");
     }
 
     /// A signature only the signer's `agents.public_key` verifies is valid,
