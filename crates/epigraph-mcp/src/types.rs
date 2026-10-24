@@ -2381,13 +2381,22 @@ pub struct FindWorkflowResult {
 }
 
 /// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
-/// has moved on.
+/// has moved on: listed when the lineage has more than one head, or its single
+/// head is not the frozen claim. A step whose sole head is the frozen claim is
+/// not listed, even when that claim is retired (it never evolved).
 #[derive(Debug, Serialize)]
 pub struct EvolvedStep {
     pub step_index: usize,
     pub frozen_claim_id: String,
+    /// The newest head with `is_current=true`, which is the claim name-mode
+    /// `evolve_step` and `update_with_evidence` act on. When no head of the
+    /// lineage is current, the newest head, with [`Self::is_current`] false.
     pub head_claim_id: String,
     pub head_content: String,
+    /// `false` when every head of the lineage is retired (`is_current=false`
+    /// with no `supersedes` edge): the step cannot be evolved or take
+    /// evidence by name until it is revived or re-ingested.
+    pub is_current: bool,
     /// The lineage has more than one head (concurrent `revises`); the head
     /// shown is the newest, and the caller must reconcile before relying on it.
     pub pending_resolution: bool,

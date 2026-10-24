@@ -546,6 +546,7 @@ fn find_workflow_description_says_steps_are_frozen_and_names_evolved_steps() {
         "frozen",
         "has_evolved_steps",
         "evolved_steps",
+        "is_current",
         "latest_generation",
     ] {
         assert!(

@@ -986,3 +986,172 @@ async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool:
         .await
         .expect("a healthy head evolves");
 }
+
+// ── find_workflow's evolved_steps must name the CURRENT head ────────────
+//
+// `find_workflow` discloses, per hierarchical result, the steps whose lineage
+// head differs from the frozen claim (backlog 563165f2). That head must be
+// chosen the way name-mode `evolve_step` / `update_with_evidence` choose it
+// (the newest head with is_current=true), or the result names a claim those
+// tools then refuse (bridge 00132b1d's mismatch on a second surface). A
+// lineage whose only head is retired is disclosed with `is_current=false`
+// rather than presented as current.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_workflow_evolved_steps_name_the_current_head_and_flag_retirement(pool: PgPool) {
+    use epigraph_mcp::tools::workflows::__test_only::find_workflow_with_pgvec;
+    use epigraph_mcp::types::FindWorkflowParams;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let (_healthy, _retired, branch_current, branch_retired) =
+        seed_retired_step_workflow(&pool).await;
+    let (wf,): (Uuid,) =
+        sqlx::query_as("SELECT id FROM workflows WHERE canonical_name = 'retired-step-wf'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let agent = insert_seed_agent(&pool).await;
+
+    // Step 3: evolved (supersedes), and the evolved claim then retired with no
+    // further supersedes edge, so the lineage's only head is retired.
+    let evolving = seed_versioned_step(&pool, agent, Uuid::new_v4(), "evolving step").await;
+    // Step 4: a concurrent `revises` branch, both heads current.
+    let revised = seed_versioned_step(&pool, agent, Uuid::new_v4(), "revised step").await;
+    for (offset, s) in [(3_i32, evolving), (4, revised)] {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', NOW() + make_interval(secs => $3::int))",
+        )
+        .bind(wf)
+        .bind(s)
+        .bind(offset)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let id_mode = |parent: Uuid, content: &str, edge_type: &str| EvolveStepParams {
+        canonical_name: None,
+        step_index: None,
+        step_lineage_id: String::new(),
+        parent_id: parent.to_string(),
+        content: content.to_string(),
+        edge_type: edge_type.to_string(),
+        rationale: None,
+        level: Some(2),
+    };
+    let evolved_body = parse_body(
+        &evolve_step(
+            &server,
+            &viewer,
+            id_mode(evolving, "evolving step v2", "supersedes"),
+            None,
+        )
+        .await
+        .expect("evolve step 3"),
+    );
+    let evolved_then_retired: Uuid = evolved_body["claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("claim_id expected; got {evolved_body}"));
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(evolved_then_retired)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let revised_body = parse_body(
+        &evolve_step(
+            &server,
+            &viewer,
+            id_mode(revised, "revised step v2", "revises"),
+            None,
+        )
+        .await
+        .expect("revise step 4"),
+    );
+    let revision: Uuid = revised_body["claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("claim_id expected; got {revised_body}"));
+
+    let result = find_workflow_with_pgvec(
+        &server,
+        &viewer,
+        FindWorkflowParams {
+            goal: "retired step probe".to_string(),
+            min_truth: Some(0.0),
+            limit: Some(5),
+        },
+        None,
+    )
+    .await
+    .expect("find_workflow text leg");
+    let body = parse_body(&result);
+    let hit = body
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|r| r["workflow_id"].as_str() == Some(&wf.to_string()))
+        })
+        .unwrap_or_else(|| panic!("the seeded workflow must be returned; got {body}"));
+    assert_eq!(hit["has_evolved_steps"], serde_json::json!(true), "{hit}");
+    let evolved = hit["evolved_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("evolved_steps expected; got {hit}"));
+    let by_index = |i: usize| {
+        evolved
+            .iter()
+            .find(|e| e["step_index"] == serde_json::json!(i))
+            .unwrap_or_else(|| panic!("step {i} must be listed in evolved_steps; got {hit}"))
+    };
+    let indices: Vec<u64> = evolved
+        .iter()
+        .filter_map(|e| e["step_index"].as_u64())
+        .collect();
+    assert_eq!(
+        indices,
+        vec![2, 3, 4],
+        "a never-evolved step is not listed, even when its sole head is retired \
+         (step 1); the healthy step 0 is not listed either: {hit}"
+    );
+
+    // Step 2: the newest head is retired, an older head is current. The
+    // current one is named, as evolve_step name-mode would pick it.
+    let s2 = by_index(2);
+    assert_eq!(
+        s2["head_claim_id"].as_str(),
+        Some(branch_current.to_string().as_str()),
+        "the CURRENT head, not the newer retired {branch_retired}: {s2}"
+    );
+    assert_eq!(s2["is_current"], serde_json::json!(true), "{s2}");
+    assert_eq!(s2["pending_resolution"], serde_json::json!(true), "{s2}");
+
+    // Step 3: the only head is retired; disclosed, flagged, never presented
+    // as current.
+    let s3 = by_index(3);
+    assert_eq!(
+        s3["head_claim_id"].as_str(),
+        Some(evolved_then_retired.to_string().as_str()),
+        "{s3}"
+    );
+    assert_eq!(
+        s3["is_current"],
+        serde_json::json!(false),
+        "a retired-only head must be flagged: {s3}"
+    );
+    assert_eq!(s3["pending_resolution"], serde_json::json!(false), "{s3}");
+
+    // Step 4: concurrent current heads: the newest is named, pending.
+    let s4 = by_index(4);
+    assert_eq!(
+        s4["head_claim_id"].as_str(),
+        Some(revision.to_string().as_str()),
+        "{s4}"
+    );
+    assert_eq!(s4["head_content"].as_str(), Some("revised step v2"));
+    assert_eq!(s4["is_current"], serde_json::json!(true), "{s4}");
+    assert_eq!(
+        s4["pending_resolution"],
+        serde_json::json!(true),
+        "concurrent revises heads must be flagged pending: {s4}"
+    );
+}

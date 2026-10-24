@@ -825,7 +825,17 @@ async fn hierarchical_workflow_result(
                 let evolved: Vec<EvolvedStep> = resolved
                     .into_iter()
                     .filter_map(|s| {
-                        let head = s.heads.first()?;
+                        // The head named is the one name-mode `evolve_step` /
+                        // `update_with_evidence` act on
+                        // (`WorkflowRepository::resolve_step_claim`): the
+                        // newest CURRENT head. Only when no head is current is
+                        // the newest (retired) one shown, flagged
+                        // `is_current=false`, never presented as current.
+                        let head = s
+                            .heads
+                            .iter()
+                            .find(|h| h.is_current)
+                            .or_else(|| s.heads.first())?;
                         if s.heads.len() == 1 && head.id == s.frozen_claim_id {
                             return None;
                         }
@@ -834,6 +844,7 @@ async fn hierarchical_workflow_result(
                             frozen_claim_id: s.frozen_claim_id.to_string(),
                             head_claim_id: head.id.to_string(),
                             head_content: head.content.clone(),
+                            is_current: head.is_current,
                             pending_resolution: s.pending_resolution,
                         })
                     })
