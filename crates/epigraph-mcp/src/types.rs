@@ -774,7 +774,9 @@ pub struct StoreWorkflowParams {
     )]
     pub confidence: Option<f64>,
 
-    #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
+    #[schemars(
+        description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows']). Stored on the workflows row as metadata.tags (trimmed, empties dropped, de-duplicated) on the FIRST store only: a re-store of the same goal is a no-op that keeps the original tags. Not added as claim labels."
+    )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
