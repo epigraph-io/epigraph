@@ -92,6 +92,15 @@
 //!   frame a real claim's BBA, a factor, a child frame, a cached belief or an
 //!   edge still depends on. Audited (`operator.frames_deleted`).
 //!
+//! And keyless team groups (migration 164; see [`team_group`]):
+//!
+//! * `create-group --kind team --name N --admin <person>` — a group with no
+//!   key material whose admin is a registered human operator. Audited
+//!   (`group.team_created`).
+//! * `group-member add|remove|set-role` — change its roster: an operated agent
+//!   is a member only where its operator writes, the last live admin stays,
+//!   and a removal is a revoke. Each act audited (`group.member_*`).
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -141,6 +150,7 @@ pub mod restrict;
 pub mod reverse;
 pub mod system_agent;
 pub mod tables;
+pub mod team_group;
 
 use anyhow::{anyhow, bail, Context};
 use sqlx::PgConnection;
