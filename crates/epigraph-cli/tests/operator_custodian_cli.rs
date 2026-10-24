@@ -70,7 +70,9 @@ async fn assignments(pool: &PgPool, holder: Uuid) -> Vec<(Uuid, bool)> {
 /// `--open-ended` are given, or the role is unknown.
 ///
 /// Verified to fail: `Window::from_flags`' `(None, false)` arm admitting an
-/// open-ended grant -> the grant with no window lands.
+/// open-ended grant -> the grant with no window lands. The unknown-role case
+/// asserts the catalog check's own message, so deleting that check (the
+/// foreign key would still refuse, also exit 1) turns it red.
 #[sqlx::test(migrations = "../../migrations")]
 async fn grant_role_needs_an_explicit_window(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "human").await;
@@ -112,10 +114,29 @@ async fn grant_role_needs_an_explicit_window(pool: PgPool) {
     )
     .await;
     assert_eq!(unknown.code, 1, "an unknown role: {}", unknown.show());
+    // Refused by `grant`'s catalog read, not by a later statement failure (a
+    // foreign key or a broken connection also exits 1): the message names the
+    // role and the catalog's keys.
+    assert!(
+        unknown
+            .stderr
+            .contains("role:superuser is not a platform role")
+            && unknown.stderr.contains("role:platform-custodian")
+            && unknown.stderr.contains("role:auditor"),
+        "the catalog check refused it, naming the catalog: {}",
+        unknown.show()
+    );
     assert!(
         assignments(&pool, h).await.is_empty(),
         "nothing was granted"
     );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type LIKE 'platform.role_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("role audit rows");
+    assert_eq!(audited, 0, "a refused grant writes no audit row");
 }
 
 /// The round trip on the maintenance DSN: a dry-run grant writes nothing (not
