@@ -88,9 +88,13 @@
 --     `admin` that is still a registered human operator is refused (an admin
 --     row of a human whose registration or human client has since lapsed
 --     does not count, so the group cannot be left administered only by a
---     revoked identity), decided under a `FOR UPDATE` lock on the `groups`
---     row that every verb takes first, so two concurrent removals of two
---     admins cannot both pass. (GRP02)
+--     revoked identity), decided under a `FOR NO KEY UPDATE` lock on the
+--     `groups` row that every verb takes first, so two concurrent removals of
+--     two admins cannot both pass. NO KEY: the lock conflicts with itself, so
+--     the verbs are serialised against each other, but not with the KEY SHARE
+--     a foreign-key insert naming the group takes (a claim, a membership), so
+--     a verb in flight, dry runs included, does not stall ordinary writes into
+--     the group. (GRP02)
 --   * ONLY VERB-MADE TEAM GROUPS. The member verbs refuse any group that is
 --     not `kind = 'team'`, in the `did:epigraph:group:` namespace, with an
 --     empty key and status `active`: personal groups (107's link path),
@@ -395,10 +399,11 @@ BEGIN
     END IF;
 
     -- The group row lock first: every roster verb takes it, so roster
-    -- decisions on one group are serialised.
+    -- decisions on one group are serialised (NO KEY: foreign-key writers
+    -- naming the group are not blocked).
     SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
       INTO v_kind, v_did, v_key_len, v_status
-      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+      FROM public.groups g WHERE g.id = p_group FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_add_member: group % does not exist', p_group
             USING ERRCODE = '22023';
@@ -501,7 +506,7 @@ BEGIN
 
     SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
       INTO v_kind, v_did, v_key_len, v_status
-      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+      FROM public.groups g WHERE g.id = p_group FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_remove_member: group % does not exist', p_group
             USING ERRCODE = '22023';
@@ -593,7 +598,7 @@ BEGIN
 
     SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
       INTO v_kind, v_did, v_key_len, v_status
-      FROM public.groups g WHERE g.id = p_group FOR UPDATE;
+      FROM public.groups g WHERE g.id = p_group FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_set_member_role: group % does not exist', p_group
             USING ERRCODE = '22023';
