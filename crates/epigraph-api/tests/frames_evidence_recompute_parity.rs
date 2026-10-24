@@ -467,7 +467,9 @@ async fn deprecated_combination_parameters_are_reported(
         "assume_independent: {warnings:?}"
     );
 
-    // And a plain submission earns no warning at all (the field is omitted).
+    // And a plain submission earns no deprecated-parameter warning. It restates
+    // the BBA stored above (the deprecated fields change nothing stored), so
+    // its one warning is the write outcome's (backlog 6f82db4f).
     let plain = post_evidence(
         &w,
         &w.token_a,
@@ -477,9 +479,14 @@ async fn deprecated_combination_parameters_are_reported(
         }),
     )
     .await;
+    assert_eq!(plain["write_outcome"], "unchanged", "{plain}");
+    let plain_warnings: Vec<&str> = plain["warnings"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     assert!(
-        plain.get("warnings").is_none(),
-        "no deprecated field, no warnings: {plain}"
+        plain_warnings.len() == 1 && plain_warnings[0].contains("identical"),
+        "no deprecated field, no deprecated warning; only the restatement's: {plain}"
     );
 }
 

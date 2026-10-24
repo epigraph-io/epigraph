@@ -586,10 +586,10 @@ pub async fn submit_ds_evidence(
     })
 }
 
-/// Whether `row` already holds exactly what this call is about to store: the
-/// same focal elements with masses equal within 1e-12, and the same values in
-/// every other column the upsert writes (`conflict_k`, `source_strength` and
-/// `evidence_id` are always NULL on this path).
+/// Whether `row` already holds exactly what this call is about to store, by
+/// the probe `POST /api/v1/frames/:id/evidence` shares
+/// (`epigraph_db::bba_write_outcome`), with this path's columns: no
+/// `source_strength`, `conflict_k` or `evidence_id`.
 fn restates_bba(
     row: &epigraph_db::MassFunctionRow,
     masses_json: &serde_json::Value,
@@ -597,25 +597,18 @@ fn restates_bba(
     evidence_type: Option<&str>,
     locality_tag: &str,
 ) -> bool {
-    let same_masses = match (row.masses.as_object(), masses_json.as_object()) {
-        (Some(old), Some(new)) => {
-            old.len() == new.len()
-                && new.iter().all(|(k, v)| {
-                    match (old.get(k).and_then(serde_json::Value::as_f64), v.as_f64()) {
-                        (Some(a), Some(b)) => (a - b).abs() <= 1e-12,
-                        _ => false,
-                    }
-                })
-        }
-        _ => false,
-    };
-    same_masses
-        && row.combination_method.as_deref() == Some(method_name)
-        && row.evidence_type.as_deref() == evidence_type
-        && row.locality_tag == locality_tag
-        && row.conflict_k.is_none()
-        && row.source_strength.is_none()
-        && row.evidence_id.is_none()
+    epigraph_db::bba_write_outcome::restates(
+        row,
+        &epigraph_db::bba_write_outcome::BbaWrite {
+            masses: masses_json,
+            combination_method: method_name,
+            evidence_type,
+            locality_tag,
+            source_strength: None,
+            conflict_k: None,
+            evidence_id: None,
+        },
+    )
 }
 
 /// The calibration the belief recompute itself uses — same loader, same
