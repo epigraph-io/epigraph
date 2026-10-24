@@ -2556,6 +2556,65 @@ mod tests {
         assert!(hits.iter().all(|h| h.id != ids[2]));
     }
 
+    /// Embedding path, the LIMIT drop: the head is embedded and above the
+    /// similarity floor but farther than a sibling, so with `limit = 1` only
+    /// the sibling survives the matched LIMIT. `resolve_to_latest` must still
+    /// return the head, ahead of that sibling; default mode returns the
+    /// sibling alone.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_resolve_to_latest_includes_head_past_the_limit(
+        pool: sqlx::PgPool,
+    ) {
+        let canonical = "limit-head-test";
+        let mut ids = Vec::new();
+        for g in 0..2 {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                &pool,
+                id,
+                canonical,
+                g,
+                "Rotate the signing keys",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        // gen 0 is the exact match; the head (gen 1) is above the 0.5 floor
+        // (similarity 0.8) but farther.
+        WorkflowRepository::set_goal_embedding(&pool, ids[0], &qvec)
+            .await
+            .unwrap();
+        WorkflowRepository::set_goal_embedding(&pool, ids[1], &near)
+            .await
+            .unwrap();
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, true)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[0]],
+            "the head cut by the LIMIT must be added, leading its group"
+        );
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, false)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(order, vec![ids[0]], "default mode keeps the plain LIMIT");
+    }
+
     /// Text path: the head of a matched `canonical_name` is returned even when
     /// its goal does not match and its truth is below `min_truth`.
     #[sqlx::test(migrations = "../../migrations")]

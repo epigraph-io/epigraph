@@ -273,3 +273,72 @@ async fn find_workflow_hierarchical_flags_a_retired_step_head() {
         "the retired head is flagged: {wf}"
     );
 }
+
+/// HTTP twin of the MCP `resolve_to_latest_discloses_a_deprecated_head`. The
+/// route computes `lineage_head_deprecated` itself (head truth below
+/// `min_truth`), so the flag's true branch needs its own HTTP case: a head
+/// deprecated to truth 0.05 under the default `min_truth` (0.3) is returned,
+/// marked the head, and every entry of its lineage says it is deprecated.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_resolve_to_latest_flags_a_deprecated_head() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let canonical = format!("deprecated-head-http-{}", &tag[..12]);
+    let phrase = format!("qqdep{tag}");
+    let live = Uuid::new_v4();
+    let dead = Uuid::new_v4();
+    for (id, generation, truth) in [(live, 0_i32, 1.0_f64), (dead, 1, 0.05)] {
+        sqlx::query(
+            "INSERT INTO workflows (id, canonical_name, goal, generation, metadata, truth_value) \
+             VALUES ($1, $2, $3, $4, '{}'::jsonb, $5)",
+        )
+        .bind(id)
+        .bind(&canonical)
+        .bind(format!("send the {phrase} digest v{generation}"))
+        .bind(generation)
+        .bind(truth)
+        .execute(&pool)
+        .await
+        .expect("seed generation");
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/workflows/hierarchical/search?q={phrase}&resolve_to_latest=true"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let entry = |id: Uuid| {
+        workflows
+            .iter()
+            .find(|w| w["workflow_id"].as_str() == Some(&id.to_string()))
+            .unwrap_or_else(|| panic!("workflow {id} must be returned; got {body}"))
+    };
+    let dead_entry = entry(dead);
+    assert_eq!(dead_entry["is_lineage_head"], serde_json::json!(true));
+    assert_eq!(dead_entry["generation"], serde_json::json!(1));
+    assert_eq!(entry(live)["is_lineage_head"], serde_json::json!(false));
+    assert_eq!(workflows.len(), 2, "{body}");
+    for w in workflows {
+        assert_eq!(w["lineage_head_generation"], serde_json::json!(1), "{w}");
+        assert_eq!(
+            w["lineage_head_deprecated"],
+            serde_json::json!(true),
+            "the head's truth (0.05) is below the default min_truth: {w}"
+        );
+    }
+}
