@@ -873,3 +873,80 @@ async fn rol01_is_named_and_the_repository_asks_may_run(pool: PgPool) {
         .expect("the app role asks");
     assert!(held.may_run && held.holder == Some(h) && held.reason == "held");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review round: snapshots, lineage and ownership
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One claim by `agent` on an `epigraph_app` connection stamped as `agent`,
+/// inside a transaction at `isolation`. After the transaction's snapshot is
+/// taken, `end_between` (an assignment) is ended on ANOTHER connection and
+/// committed. Always rolled back.
+async fn write_in_txn(
+    pool: &PgPool,
+    agent: Uuid,
+    group: Uuid,
+    isolation: &'static str,
+    end_between: Option<Uuid>,
+) -> Result<Uuid, sqlx::Error> {
+    let other = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, agent, &[group]).await;
+        sqlx::query(&format!("BEGIN ISOLATION LEVEL {isolation}"))
+            .execute(&mut *conn)
+            .await
+            .expect("begin");
+        sqlx::query("SELECT 1")
+            .execute(&mut *conn)
+            .await
+            .expect("the transaction's snapshot");
+        if let Some(assignment) = end_between {
+            end_assignment(&other, assignment).await;
+        }
+        let r = insert_claim(&mut *conn, agent, group).await;
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("rollback");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// A transaction that is not READ COMMITTED judges every statement against
+/// its FIRST snapshot, so an assignment ended (revoked) by a handover after
+/// that snapshot would still read as live for as long as the transaction
+/// stays open: the "run in progress" would keep writing after the end. So an
+/// attached agent writes only under READ COMMITTED (as 123's CUS06 refuses a
+/// grant under REPEATABLE READ). POSITIVE CONTROLS: the same agent writes under
+/// READ COMMITTED, and an unattached agent writes under REPEATABLE READ and
+/// SERIALIZABLE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+
+    write_in_txn(&pool, attached, h_group, "READ COMMITTED", None)
+        .await
+        .expect("CONTROL: the holder's agent writes under READ COMMITTED");
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        write_in_txn(&pool, plain, h_group, level, None)
+            .await
+            .unwrap_or_else(|e| panic!("CONTROL: an unattached agent writes under {level}: {e}"));
+        assert_rol01(
+            &write_in_txn(&pool, attached, h_group, level, None).await,
+            &format!("an attached agent under {level}"),
+        );
+    }
+    // The case the rule exists for: the assignment ends after the snapshot.
+    assert_rol01(
+        &write_in_txn(&pool, attached, h_group, "REPEATABLE READ", Some(assignment)).await,
+        "a REPEATABLE READ run whose holder's assignment ended after its snapshot",
+    );
+}
