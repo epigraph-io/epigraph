@@ -215,7 +215,8 @@ pub enum DbError {
     /// human holds the role, or while its linked human is not the holder
     /// (SQLSTATE [`ROLE_HOLDER_REQUIRED`], migration 166). A DENIAL (HTTP 403,
     /// MCP `INVALID_REQUEST`), fixed only by an operator: grant the role to the
-    /// agent's human, re-link the agent to the holder, or detach it.
+    /// agent's human, or detach the agent and attach an identity linked to the
+    /// holder (a link never moves to another human).
     #[error("ROL01 the agent's role has no live holder it belongs to: {message}")]
     RoleHolderRequired { message: String },
 

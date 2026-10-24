@@ -62,8 +62,9 @@ pub fn refusal_text(agent: Uuid, gate: &RoleAgentRunGate) -> String {
         _ => format!(
             "agent {agent} is attached to role {role}, but is not linked to its holder now (the \
              role was handed over, or the agent's own link is not live); a role's agents run \
-             only for the role's holder. Not starting: an operator links the agent to the \
-             holder, or detaches it from the role."
+             only for the role's holder. Not starting: an operator grants the role back to the \
+             agent's human, or detaches the agent from the role and attaches an identity \
+             linked to the holder (a link never moves to another human)."
         ),
     }
 }

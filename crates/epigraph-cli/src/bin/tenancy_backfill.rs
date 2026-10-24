@@ -2554,8 +2554,9 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             false,
         ),
         // 166: attaching and detaching a role's agents is a maintenance act;
-        // the request DSN asks whether an agent may run and reaches the write
-        // check, never the gate's any-time form.
+        // the request DSN asks whether an agent may run, and reaches the write
+        // check only through the maintenance-owned writer checks; never the
+        // gate's any-time form.
         (
             "epigraph_attach_agent_to_role",
             "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
@@ -2580,7 +2581,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_require_role_holder",
             "public.epigraph_require_role_holder(uuid)",
-            true,
+            false,
         ),
     ];
 

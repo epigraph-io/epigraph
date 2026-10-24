@@ -68,7 +68,9 @@
 --   (b) the agent's live-linked human (`epigraph_human_of(agent, true)`) is
 --       that holder.
 -- (b) also refuses an agent still linked to the PREVIOUS holder after a
--- handover, before it is re-linked.
+-- handover. A link is permanent (107 refuses a second operator for an agent),
+-- so such an agent stays refused: the remedies are to grant the role back to
+-- its human, or to detach it and attach an identity linked to the new holder.
 --
 -- `clock_timestamp()`, not `now()`: `now()` is the transaction's start, so a
 -- long-running transaction opened inside the window would keep writing past
@@ -491,8 +493,9 @@ BEGIN
                     END
         USING ERRCODE = 'ROL01',
               HINT = 'Nothing was written. An operator grants the role to the agent''s linked '
-                     'human, re-links the agent to the current holder, or detaches it from '
-                     'the role (epigraph_detach_agent_from_role).';
+                     'human, or detaches the agent from the role '
+                     '(epigraph_detach_agent_from_role) and attaches an identity linked to the '
+                     'current holder; a link never moves to another human.';
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_role_holder(uuid) FROM PUBLIC;
 
@@ -606,14 +609,14 @@ DO $$ BEGIN
                 'public.epigraph_require_role_holder(uuid) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
-        -- The question, and the check the app-callable writer checks call
-        -- (they are definers, but the request path also calls
-        -- `epigraph_require_writer_scope` directly). Never the gate, whose
-        -- `p_at` would make it an any-time oracle.
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid), '
-                'public.epigraph_require_role_holder(uuid) TO epigraph_app';
-        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) '
-                'FROM epigraph_app';
+        -- The question only. The check is reached through the writer checks,
+        -- which are maintenance-owned definers, so their nested call is
+        -- checked against the owner and the app role needs no EXECUTE on it.
+        -- Never the gate, whose `p_at` would make it an any-time oracle.
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz), '
+                'public.epigraph_require_role_holder(uuid) FROM epigraph_app';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_identity_attestor') THEN
         -- The host asks before starting a role's container or schedule.
