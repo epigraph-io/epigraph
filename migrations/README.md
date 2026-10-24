@@ -1501,17 +1501,24 @@ restart.
   each attach and detach audited `platform.role_agent_*`. An attachment
   follows the identity's registered lineage forward (`agent_succession`),
   and 161's registration copies a parent's live attachments to a new child
-  (re-stated with one marked step, 5b). Re-states 123's
-  `epigraph_require_writer_scope` and `epigraph_require_attributable` so
-  that an armed claim INSERT, re-open or re-attribution by, or attributed
-  to, an attached agent is refused `ROL01` unless every live attachment's
-  role is held now (`clock_timestamp()`, READ COMMITTED only) by the
-  agent's live-linked human. Adds `epigraph_role_agent_may_run(uuid)` for
+  over every gap the child's own rows leave (re-stated with one marked step,
+  5b); a SHARED identity (one that runs in another group folder) inherits
+  none, and the audit says why. Once armed, EVERY write an application
+  session stamped as an attached agent makes is refused `ROL01` unless every
+  live attachment's role is held now (`clock_timestamp()`, READ COMMITTED
+  only) by the agent's live-linked human: a statement trigger
+  (`role_agent_write_check`) on all 79 tables the application role writes,
+  a `claims` row trigger for the claim's author (any UPDATE or DELETE), and
+  re-stated 123 `epigraph_require_writer_scope` /
+  `epigraph_require_attributable` for a claim INSERT, re-open or
+  re-attribution. A privileged session is exempt; a retired author identity
+  is the one relief. Adds `epigraph_role_agent_may_run(uuid)` for
   `epigraph_app` (epigraph-mcp's boot check) and
-  `epigraph_identity_attestor` (the host). Coverage is SHORT of the ruling:
-  claim updates other than a re-open or re-attribution, and evidence, edge,
-  belief and membership writes, are not refused (header section 3; pinned
-  in `role_attached_agents.rs`). Behaviour in
+  `epigraph_identity_attestor` (the host). Coverage is complete for the
+  application role (a catalog ratchet in `role_attached_agents.rs` pins the
+  table set); the stated limit is that a holder of the application DSN can
+  stamp itself as another principal (header sections 1 and 3). Needs
+  PostgreSQL 14+ (multiranges). Behaviour in
   `epigraph-db/tests/role_attached_agents.rs` and
   `epigraph-mcp/tests/role_agent_boot_refusal.rs`. Undo:
   `docs/runbooks/166-undo.sql`. Slot: 166 is free on `main` and on every
