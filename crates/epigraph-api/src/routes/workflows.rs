@@ -50,8 +50,9 @@
 //! `SessionGucMode::Transaction` a `ScopedRead` IS a transaction, so on a
 //! pooler deployment that is one open transaction and one pinned pool slot per
 //! in-flight search. This is the class `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-//! owns (`routes/lineage.rs::get_lineage`); that entry stays open and this shard
-//! does not discharge it. `rolling_success_rate` and `find_lineage_root` are
+//! described (`routes/lineage.rs::get_lineage`). That entry is now closed by the
+//! lineage walk's own projection, which does not touch this handler: its
+//! footprint above is unchanged. `rolling_success_rate` and `find_lineage_root` are
 //! both batchable over `r.claim_id`, which would collapse the ~100 to 2, but
 //! that is a separable change with its own acceptance.
 //!

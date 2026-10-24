@@ -333,8 +333,9 @@ impl BehavioralExecutionRepository {
     /// supplied embedding, aggregating across workflow lineages.
     ///
     /// Unlike `behavioral_affinity` which groups by individual `workflow_id`,
-    /// this method walks `variant_of` edges to find each execution's lineage
-    /// root and groups by root. This means a workflow variant inherits goal
+    /// this method walks `variant_of` / `supersedes` edges to find each
+    /// execution's lineage root and groups by root. The walk is computed once
+    /// per workflow and stops at a cycle. This means a workflow variant inherits goal
     /// affinity from its parent/ancestors (but NOT success rate — that's
     /// per-workflow via `rolling_success_rate`).
     ///
@@ -363,26 +364,40 @@ impl BehavioralExecutionRepository {
         // walk-up arm), not only on a base term: an edge the viewer cannot read
         // must not be able to re-admit an ancestor into the lineage. The
         // `live_roots` join over `claims` is marked separately.
+        //
+        // The walk runs once per distinct WORKFLOW (`start_id`), not once per
+        // execution: every execution of one workflow shares its lineage, so
+        // walking it per execution repeated the same climb N times. The final
+        // join fans each walked lineage back out to that workflow's
+        // executions, so the multiset aggregated per root is unchanged,
+        // including one row per PATH for a diamond-shaped lineage (UNION ALL,
+        // no DISTINCT past the base term).
+        //
+        // `path` stops a `variant_of` / `supersedes` cycle from recursing
+        // forever; on an acyclic lineage it removes nothing.
         let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
-                -- Base: every successful execution with an embedding
-                SELECT be.id AS exec_id, be.workflow_id AS root_id
+                -- Base: every workflow with a successful, embedded execution, once
+                SELECT DISTINCT
+                    be.workflow_id         AS start_id,
+                    be.workflow_id         AS root_id,
+                    ARRAY[be.workflow_id]  AS path
                 FROM behavioral_executions be
                 WHERE be.success = TRUE
                   AND be.goal_embedding IS NOT NULL
                 UNION ALL
                 -- Walk up: if current root has a variant_of or supersedes parent, adopt the parent
-                SELECT l.exec_id, e.target_id AS root_id
+                SELECT l.start_id, e.target_id AS root_id, l.path || e.target_id
                 FROM lineage l
                 JOIN edges e ON e.source_id = l.root_id
                     AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
-                WHERE true /* {EDGE_VISIBILITY:e} */
+                WHERE NOT e.target_id = ANY(l.path) /* {EDGE_VISIBILITY:e} */
             ),
-            -- The true root per execution: the ancestor with no outgoing variant_of or supersedes
+            -- The true root per workflow: the ancestor with no outgoing variant_of or supersedes
             roots AS (
-                SELECT l.exec_id, l.root_id
+                SELECT l.start_id, l.root_id
                 FROM lineage l
                 WHERE NOT EXISTS (
                     SELECT 1 FROM edges e
@@ -394,7 +409,7 @@ impl BehavioralExecutionRepository {
             ),
             -- Filter out deprecated lineage roots
             live_roots AS (
-                SELECT r.exec_id, r.root_id
+                SELECT r.start_id, r.root_id
                 FROM roots r
                 JOIN claims c ON c.id = r.root_id
                 WHERE c.truth_value > 0.1
@@ -406,7 +421,10 @@ impl BehavioralExecutionRepository {
                 AVG(1.0 - (be.goal_embedding <=> q.vec))::float8      AS avg_similarity,
                 COUNT(*)::bigint                                       AS execution_count
             FROM live_roots lr
-            JOIN behavioral_executions be ON be.id = lr.exec_id
+            JOIN behavioral_executions be
+              ON be.workflow_id = lr.start_id
+             AND be.success = TRUE
+             AND be.goal_embedding IS NOT NULL
             CROSS JOIN query_vec q
             GROUP BY lr.root_id
             HAVING AVG(1.0 - (be.goal_embedding <=> q.vec)) >= $2
