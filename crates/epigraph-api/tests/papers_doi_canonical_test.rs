@@ -199,3 +199,47 @@ async fn non_doi_keys_stay_verbatim_and_distinct_dois_stay_distinct() {
     assert_eq!(pa["doi"], a.as_str());
     assert_eq!(pb["doi"], b.as_str());
 }
+
+/// A resolver spelling with no scheme (`doi.org/…`, `dx.doi.org/…`,
+/// `www.doi.org/…`) is the same document key as the bare DOI.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheme_less_resolver_spelling_is_the_bare_doi() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    let suffix = format!("e2noscheme.{}", Uuid::new_v4());
+    let bare = format!("10.5555/{suffix}");
+    for spelling in [
+        format!("doi.org/{bare}"),
+        format!("dx.doi.org/{bare}"),
+        format!("www.doi.org/{bare}"),
+    ] {
+        let (status, body) = post_paper(addr, &token, &spelling).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["doi"],
+            bare.as_str(),
+            "{spelling} keys the bare DOI: {body}"
+        );
+    }
+    assert_eq!(
+        rows_ending_in(&pool, &suffix).await.len(),
+        1,
+        "three scheme-less spellings, one paper"
+    );
+    // And a bare lookup finds a row an older writer stored scheme-less.
+    let legacy_suffix = format!("e2noscheme-legacy.{}", Uuid::new_v4());
+    let legacy_bare = format!("10.5555/{legacy_suffix}");
+    let legacy_id: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'legacy') RETURNING id")
+            .bind(format!("dx.doi.org/{legacy_bare}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (status, body) = list_by_doi(addr, &token, &legacy_bare).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["items"][0]["id"], legacy_id.to_string(), "{body}");
+}

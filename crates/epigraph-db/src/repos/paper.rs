@@ -484,13 +484,18 @@ pub struct AssertedClaimRow {
 
 /// Resolver prefixes a caller may put in front of a DOI. Matched
 /// case-insensitively; `doi:` also tolerates whitespace before the DOI.
-pub const DOI_KEY_PREFIXES: [&str; 7] = [
+pub const DOI_KEY_PREFIXES: [&str; 10] = [
     "https://doi.org/",
     "http://doi.org/",
     "https://dx.doi.org/",
     "http://dx.doi.org/",
     "https://www.doi.org/",
     "http://www.doi.org/",
+    // Scheme-less resolver spellings: the key class this normalizer owns is
+    // `^(https?://)?(dx\.|www\.)?doi\.org/`, with the scheme optional.
+    "doi.org/",
+    "dx.doi.org/",
+    "www.doi.org/",
     "doi:",
 ];
 
@@ -578,6 +583,11 @@ mod document_key_tests {
             "doi:10.1021/acsnano.9b05650",
             "doi: 10.1021/acsnano.9b05650",
             "  10.1021/acsnano.9b05650  ",
+            // Scheme-less resolver spellings (the reconcile count's regex
+            // makes the scheme optional, so the normalizer must too).
+            "doi.org/10.1021/acsnano.9b05650",
+            "dx.doi.org/10.1021/acsnano.9b05650",
+            "WWW.DOI.ORG/10.1021/acsnano.9b05650",
         ] {
             assert_eq!(canonical_document_key(raw), BARE, "{raw:?}");
         }
@@ -609,6 +619,11 @@ mod document_key_tests {
             );
         }
         assert_eq!(s.len(), 1 + DOI_KEY_PREFIXES.len(), "{s:?}");
+        // Named, not only through the array: a lookup by the bare DOI must
+        // reach a row an older writer stored scheme-less.
+        for legacy in ["doi.org/", "dx.doi.org/", "www.doi.org/"] {
+            assert!(s.contains(&format!("{legacy}{BARE}")), "{legacy} in {s:?}");
+        }
     }
 
     #[test]
