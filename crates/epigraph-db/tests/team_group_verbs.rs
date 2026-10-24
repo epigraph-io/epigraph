@@ -274,6 +274,9 @@ async fn reset(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
         .expect("reset session authorization");
 }
 
+/// `(prosecdef, owner, proacl, proconfig)` of one function.
+type CatalogRow = (bool, String, Option<String>, Option<Vec<String>>);
+
 /// The four verbs are `SECURITY DEFINER`, owned by `epigraph_maintenance`,
 /// with an explicit ACL naming the maintenance role and neither PUBLIC nor the
 /// application role. Pinned in the catalog because the harness migrates as a
@@ -286,7 +289,7 @@ async fn the_verbs_are_maintenance_owned_definers_only_maintenance_executes(pool
         "public.epigraph_team_group_remove_member(uuid, uuid, text)",
         "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
     ] {
-        let row: Option<(bool, String, Option<String>, Option<Vec<String>>)> = sqlx::query_as(
+        let row: Option<CatalogRow> = sqlx::query_as(
             "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, p.proacl::text, \
                     p.proconfig \
                FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
@@ -365,13 +368,11 @@ async fn the_app_role_cannot_execute_the_verbs_even_with_forged_session_settings
         ),
         (
             "set-role",
-            sqlx::query(
-                "SELECT * FROM public.epigraph_team_group_set_member_role($1, $2, $3, $4)",
-            )
-            .bind(group)
-            .bind(admin)
-            .bind("reader")
-            .bind("forged"),
+            sqlx::query("SELECT * FROM public.epigraph_team_group_set_member_role($1, $2, $3, $4)")
+                .bind(group)
+                .bind(admin)
+                .bind("reader")
+                .bind("forged"),
         ),
         (
             "remove",
@@ -391,13 +392,20 @@ async fn the_app_role_cannot_execute_the_verbs_even_with_forged_session_settings
     }
     reset(conn).await;
 
-    assert_eq!(group_count(&pool).await, groups_before, "no group was created");
+    assert_eq!(
+        group_count(&pool).await,
+        groups_before,
+        "no group was created"
+    );
     assert_eq!(
         group_audit_count(&pool).await,
         audit_before,
         "no audit row was written"
     );
-    assert_eq!(live_role(&pool, group, admin).await.as_deref(), Some("admin"));
+    assert_eq!(
+        live_role(&pool, group, admin).await.as_deref(),
+        Some("admin")
+    );
     assert_eq!(live_role(&pool, group, other).await, None);
 
     // POSITIVE CONTROL: the same add on a maintenance session.
@@ -405,7 +413,10 @@ async fn the_app_role_cannot_execute_the_verbs_even_with_forged_session_settings
         .await
         .expect("the maintenance session adds the member");
     assert!(ok.applied, "{ok:?}");
-    assert_eq!(live_role(&pool, group, other).await.as_deref(), Some("writer"));
+    assert_eq!(
+        live_role(&pool, group, other).await.as_deref(),
+        Some("writer")
+    );
 }
 
 /// The `group.` audit family is reserved: the application role cannot insert
@@ -463,11 +474,12 @@ async fn create_add_set_role_and_remove_work_on_maintenance_and_each_is_audited(
     assert_eq!(key_len, 0, "a keyless team group carries no key material");
     assert_eq!(creator, Some(admin), "the admin Person is the creator");
     assert_eq!(status, "active");
-    let epochs: i64 = sqlx::query_scalar("SELECT count(*) FROM group_key_epochs WHERE group_id = $1")
-        .bind(group)
-        .fetch_one(&pool)
-        .await
-        .expect("epochs");
+    let epochs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_key_epochs WHERE group_id = $1")
+            .bind(group)
+            .fetch_one(&pool)
+            .await
+            .expect("epochs");
     assert_eq!(epochs, 0, "no key epoch is written for a keyless group");
     let (share, epoch): (Vec<u8>, i32) = sqlx::query_as(
         "SELECT wrapped_key_share, epoch FROM group_memberships \
@@ -480,22 +492,36 @@ async fn create_add_set_role_and_remove_work_on_maintenance_and_each_is_audited(
     .expect("the admin row");
     assert!(share.is_empty(), "the admin's share is empty");
     assert_eq!(epoch, 0);
-    assert_eq!(live_role(&pool, group, admin).await.as_deref(), Some("admin"));
+    assert_eq!(
+        live_role(&pool, group, admin).await.as_deref(),
+        Some("admin")
+    );
 
     let added = add(&pool, group, member, "writer").await.expect("add");
     assert!(added.applied && added.membership.is_some(), "{added:?}");
-    assert_eq!(live_role(&pool, group, member).await.as_deref(), Some("writer"));
+    assert_eq!(
+        live_role(&pool, group, member).await.as_deref(),
+        Some("writer")
+    );
 
     // Idempotent: the same add again writes nothing and no audit row.
     let again = add(&pool, group, member, "writer").await.expect("re-add");
     assert!(!again.applied, "{again:?}");
     assert_eq!(again.membership, added.membership);
 
-    let set = set_role(&pool, group, member, "reader").await.expect("set-role");
+    let set = set_role(&pool, group, member, "reader")
+        .await
+        .expect("set-role");
     assert!(set.applied, "{set:?}");
     assert_eq!(set.prior_role.as_deref(), Some("writer"));
-    assert_eq!(set.membership, added.membership, "set-role changes the live row");
-    assert_eq!(live_role(&pool, group, member).await.as_deref(), Some("reader"));
+    assert_eq!(
+        set.membership, added.membership,
+        "set-role changes the live row"
+    );
+    assert_eq!(
+        live_role(&pool, group, member).await.as_deref(),
+        Some("reader")
+    );
 
     let removed = remove(&pool, group, member).await.expect("remove");
     assert!(removed.applied, "{removed:?}");
@@ -545,7 +571,10 @@ async fn create_requires_a_registered_human_admin_and_a_free_name(pool: PgPool) 
         .await
         .expect("suspend the human client");
     let groups_before = group_count(&pool).await;
-    for (who, what) in [(plain, "an unregistered agent"), (suspended, "a suspended human")] {
+    for (who, what) in [
+        (plain, "an unregistered agent"),
+        (suspended, "a suspended human"),
+    ] {
         let r = create(&pool, "Synthetic Refused Team", who).await;
         assert_eq!(
             code_of(&r).as_deref(),
@@ -553,7 +582,11 @@ async fn create_requires_a_registered_human_admin_and_a_free_name(pool: PgPool) 
             "{what} as admin: {r:?}"
         );
     }
-    assert_eq!(group_count(&pool).await, groups_before, "nothing was created");
+    assert_eq!(
+        group_count(&pool).await,
+        groups_before,
+        "nothing was created"
+    );
     assert_eq!(group_audit_count(&pool).await, 0, "no audit row");
 
     // POSITIVE CONTROL: a registered human creates the group.
@@ -589,22 +622,43 @@ async fn the_last_live_admin_can_be_neither_removed_nor_demoted(pool: PgPool) {
     assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "remove: {r:?}");
     for role in ["writer", "reader"] {
         let r = set_role(&pool, group, first, role).await;
-        assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "demote to {role}: {r:?}");
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(LAST_ADMIN),
+            "demote to {role}: {r:?}"
+        );
     }
-    assert_eq!(live_role(&pool, group, first).await.as_deref(), Some("admin"));
-    assert_eq!(audit(&pool, group).await.len(), 1, "only the creation is audited");
+    assert_eq!(
+        live_role(&pool, group, first).await.as_deref(),
+        Some("admin")
+    );
+    assert_eq!(
+        audit(&pool, group).await.len(),
+        1,
+        "only the creation is audited"
+    );
 
     // POSITIVE CONTROL: a second live admin makes the first removable.
-    add(&pool, group, second, "admin").await.expect("second admin");
-    let ok = remove(&pool, group, first).await.expect("remove the first admin");
-    assert!(ok.applied && ok.prior_role.as_deref() == Some("admin"), "{ok:?}");
+    add(&pool, group, second, "admin")
+        .await
+        .expect("second admin");
+    let ok = remove(&pool, group, first)
+        .await
+        .expect("remove the first admin");
+    assert!(
+        ok.applied && ok.prior_role.as_deref() == Some("admin"),
+        "{ok:?}"
+    );
 
     // Now the second is the last.
     let r = remove(&pool, group, second).await;
     assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "{r:?}");
     let r = set_role(&pool, group, second, "writer").await;
     assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "{r:?}");
-    assert_eq!(live_role(&pool, group, second).await.as_deref(), Some("admin"));
+    assert_eq!(
+        live_role(&pool, group, second).await.as_deref(),
+        Some("admin")
+    );
 }
 
 /// The scope rule, checked on two groups: one before the database is armed and
@@ -644,7 +698,9 @@ async fn an_operated_agent_is_a_member_only_where_its_operator_writes(pool: PgPo
             );
         }
         // The operator only READS the group: still refused.
-        add(&pool, group, operator, "reader").await.expect("operator reader");
+        add(&pool, group, operator, "reader")
+            .await
+            .expect("operator reader");
         let r = add(&pool, group, agent, "reader").await;
         assert_eq!(
             code_of(&r).as_deref(),
@@ -654,7 +710,11 @@ async fn an_operated_agent_is_a_member_only_where_its_operator_writes(pool: PgPo
         // Unbound and retired-linked agents are never members.
         for (who, what) in [(unbound, "unbound"), (gone, "retired-linked")] {
             let r = add(&pool, group, who, "reader").await;
-            assert_eq!(code_of(&r).as_deref(), Some(NOT_BOUND), "{phase}: {what}: {r:?}");
+            assert_eq!(
+                code_of(&r).as_deref(),
+                Some(NOT_BOUND),
+                "{phase}: {what}: {r:?}"
+            );
         }
         assert_eq!(live_role(&pool, group, agent).await, None);
 
@@ -671,14 +731,29 @@ async fn an_operated_agent_is_a_member_only_where_its_operator_writes(pool: PgPo
             .expect("the agent may be demoted to reader");
         // Never an admin, by add or by set-role.
         let r = set_role(&pool, group, agent, "admin").await;
-        assert_eq!(code_of(&r).as_deref(), Some(NOT_A_HUMAN_ADMIN), "{phase}: {r:?}");
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(NOT_A_HUMAN_ADMIN),
+            "{phase}: {r:?}"
+        );
 
         // The operator cannot leave its agent stranded.
         let r = remove(&pool, group, operator).await;
-        assert_eq!(code_of(&r).as_deref(), Some(OPERATOR_SCOPE), "{phase}: {r:?}");
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(OPERATOR_SCOPE),
+            "{phase}: {r:?}"
+        );
         let r = set_role(&pool, group, operator, "reader").await;
-        assert_eq!(code_of(&r).as_deref(), Some(OPERATOR_SCOPE), "{phase}: {r:?}");
-        assert_eq!(live_role(&pool, group, operator).await.as_deref(), Some("writer"));
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(OPERATOR_SCOPE),
+            "{phase}: {r:?}"
+        );
+        assert_eq!(
+            live_role(&pool, group, operator).await.as_deref(),
+            Some("writer")
+        );
 
         // POSITIVE CONTROL: with the agent removed, the operator can go.
         remove(&pool, group, agent).await.expect("remove the agent");
@@ -705,16 +780,18 @@ async fn removal_is_a_revoke_and_the_viewer_stops_seeing_the_group(pool: PgPool)
 
     let sees = |pool: PgPool| async move {
         let viewer = Viewer::resolve(&pool, member).await.expect("resolve");
-        let in_set = viewer
-            .group_bind()
-            .is_some_and(|g| g.contains(&group));
+        let in_set = viewer.group_bind().is_some_and(|g| g.contains(&group));
         let groups: Vec<String> = viewer
             .group_bind()
             .unwrap_or_default()
             .iter()
             .map(Uuid::to_string)
             .collect();
-        let writable: Vec<String> = viewer.writable_groups().iter().map(Uuid::to_string).collect();
+        let writable: Vec<String> = viewer
+            .writable_groups()
+            .iter()
+            .map(Uuid::to_string)
+            .collect();
         use sqlx::Executor;
         let mut conn = pool.acquire().await.expect("acquire");
         conn.execute("SET SESSION AUTHORIZATION epigraph_app")
@@ -768,10 +845,16 @@ async fn removal_is_a_revoke_and_the_viewer_stops_seeing_the_group(pool: PgPool)
     // A re-add is a new row; the revoked one stays.
     let readd = add(&pool, group, member, "reader").await.expect("re-add");
     assert!(readd.applied, "{readd:?}");
-    assert_ne!(readd.membership, removed.membership, "a new row, not a revival");
+    assert_ne!(
+        readd.membership, removed.membership,
+        "a new row, not a revival"
+    );
     assert_eq!(
         rows(&pool, group, member).await,
-        [(0, "writer".to_string(), true), (1, "reader".to_string(), false)],
+        [
+            (0, "writer".to_string(), true),
+            (1, "reader".to_string(), false)
+        ],
         "the ledger keeps the revoked row and adds a live one"
     );
     assert_eq!(sees(pool.clone()).await, (true, 1));
@@ -825,15 +908,28 @@ async fn the_creator_arm_ends_with_the_creators_membership(pool: PgPool) {
 
     let (seen, inserted) = roster_seen(pool.clone(), probe_live).await;
     assert_eq!(seen, 1, "POSITIVE CONTROL: the live creator sees its group");
-    assert!(inserted, "POSITIVE CONTROL: the live creator enrols through the arm");
+    assert!(
+        inserted,
+        "POSITIVE CONTROL: the live creator enrols through the arm"
+    );
 
-    add(&pool, group, successor, "admin").await.expect("successor admin");
-    remove(&pool, group, creator).await.expect("remove the creator");
+    add(&pool, group, successor, "admin")
+        .await
+        .expect("successor admin");
+    remove(&pool, group, creator)
+        .await
+        .expect("remove the creator");
 
     let (seen, inserted) = roster_seen(pool.clone(), probe_gone).await;
-    assert_eq!(seen, 0, "a removed creator no longer sees the group through 092's arm");
+    assert_eq!(
+        seen, 0,
+        "a removed creator no longer sees the group through 092's arm"
+    );
     assert!(!inserted, "a removed creator can no longer enrol members");
-    assert_eq!(live_role(&pool, group, successor).await.as_deref(), Some("admin"));
+    assert_eq!(
+        live_role(&pool, group, successor).await.as_deref(),
+        Some("admin")
+    );
 }
 
 /// The verbs act on keyless TEAM groups only: a personal group, the world
@@ -870,12 +966,18 @@ async fn the_member_verbs_refuse_groups_that_are_not_keyless_team_groups(pool: P
     .await
     .expect("keyed group admin row");
 
-    for (g, what) in [(personal, "personal"), (world, "world"), (keyed, "keyed team")] {
+    for (g, what) in [
+        (personal, "personal"),
+        (world, "world"),
+        (keyed, "keyed team"),
+    ] {
         let r = add(&pool, g, member, "reader").await;
         assert_eq!(code_of(&r).as_deref(), Some("GRP05"), "{what}: {r:?}");
         assert_eq!(live_role(&pool, g, member).await, None, "{what}");
     }
     // POSITIVE CONTROL: a verb-created group admits the same member.
-    let group = create(&pool, "Synthetic Kind Team", admin).await.expect("create");
+    let group = create(&pool, "Synthetic Kind Team", admin)
+        .await
+        .expect("create");
     add(&pool, group, member, "reader").await.expect("add");
 }

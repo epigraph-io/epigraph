@@ -202,14 +202,24 @@ async fn create_group_dry_run_writes_nothing_and_apply_creates_exactly_once(pool
     assert_eq!(dry.code, 0, "{}", dry.show());
     assert!(dry.stdout.contains("WOULD BE CREATED"), "{}", dry.show());
     assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
-    assert!(team_groups_named(&pool, name).await.is_empty(), "a dry run created a group");
-    assert!(group_audit(&pool).await.is_empty(), "a dry run wrote an audit row");
+    assert!(
+        team_groups_named(&pool, name).await.is_empty(),
+        "a dry run created a group"
+    );
+    assert!(
+        group_audit(&pool).await.is_empty(),
+        "a dry run wrote an audit row"
+    );
 
     let mut apply_args = args.to_vec();
     apply_args.push("--apply");
     let applied = run_with(&apply_args, Some(&url));
     assert_eq!(applied.code, 0, "{}", applied.show());
-    assert!(applied.stdout.starts_with("CREATED\t"), "{}", applied.show());
+    assert!(
+        applied.stdout.starts_with("CREATED\t"),
+        "{}",
+        applied.show()
+    );
     let group = group_of(&applied);
     assert_eq!(
         team_groups_named(&pool, name).await,
@@ -304,7 +314,11 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
     drop_login(&pool, &role).await;
 
     assert_eq!(dry_add.code, 0, "{}", dry_add.show());
-    assert!(dry_add.stdout.contains("WOULD BE ADDED"), "{}", dry_add.show());
+    assert!(
+        dry_add.stdout.contains("WOULD BE ADDED"),
+        "{}",
+        dry_add.show()
+    );
     assert_eq!(add.code, 0, "{}", add.show());
     assert!(add.stdout.starts_with("ADDED\t"), "{}", add.show());
     assert_eq!(set.code, 0, "{}", set.show());
