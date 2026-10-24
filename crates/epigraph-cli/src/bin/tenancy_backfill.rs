@@ -1927,10 +1927,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // of an attached identity stays unattached). The verbs' writes are
     // refused by the policies (loud). The gate reads `role_agents` and
     // `role_assignments` (both FORCEd) through the same arm: under a
-    // non-member owner it sees no attachment, so every role's agent reads as
-    // UNATTACHED -- ROL01 never fires and epigraph-mcp boots in a gap (quiet,
-    // and in the direction the ruling forbids). The question and the check
-    // only call the gate.
+    // non-member owner it would see no attachment and read every role's
+    // agent as UNATTACHED, so it checks its own frame first and fails CLOSED
+    // (loud: every armed claim write is refused ROL01 and epigraph-mcp
+    // refuses to boot). The question and the check only call the gate.
     ("epigraph_role_agents_guard_insert", 166),
     ("epigraph_role_agents_guard_update", 166),
     ("epigraph_role_agents_audit", 166),

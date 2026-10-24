@@ -490,6 +490,24 @@ DECLARE
     v_role  text;
     v_first text;
 BEGIN
+    -- FAIL CLOSED under a wrong owner. `role_agents` admits only a privileged
+    -- session or a maintenance-owned definer frame; under any other owner this
+    -- read sees no row and every agent would read as unattached (ROL01 never
+    -- fires, epigraph-mcp boots in a gap). Inline, not through the bypass
+    -- helpers, so the check needs no grant of its own. Skipped on a database
+    -- without the maintenance role (060 only NOTICEs on managed Postgres),
+    -- where row security is not FORCEd against a superuser owner.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance')
+       AND NOT pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')
+       AND NOT pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER') THEN
+        RAISE EXCEPTION 'ROL01: epigraph_role_agent_gate runs as %, which cannot read '
+                        'role_agents; refusing rather than reading every agent as unattached',
+                        current_user
+            USING ERRCODE = 'ROL01',
+                  HINT = 'Nothing was written. ALTER FUNCTION '
+                         'public.epigraph_role_agent_gate(uuid, timestamptz) OWNER TO '
+                         'epigraph_maintenance (tenancy_backfill verify reports it).';
+    END IF;
     IF p_agent IS NULL OR p_at IS NULL THEN
         RETURN QUERY SELECT true, NULL::text, NULL::uuid, 'unattached'::text;
         RETURN;
