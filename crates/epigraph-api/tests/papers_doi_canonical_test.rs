@@ -26,7 +26,7 @@ mod common;
 async fn connect() -> (String, PgPool) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(4)
         .connect(&url)
         .await
         .unwrap();
@@ -149,13 +149,25 @@ async fn a_legacy_url_keyed_paper_is_found_by_the_bare_doi_and_not_twinned() {
             .await
             .unwrap();
 
-    let (status, body) = list_by_doi(addr, &token, &bare).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        body["total"], 1,
-        "a bare-DOI lookup must find the URL-keyed row: {body}"
-    );
-    assert_eq!(body["items"][0]["id"], legacy_id.to_string(), "{body}");
+    // Found by the bare DOI and by the other spellings of it, not only by the
+    // exact key it was stored under.
+    for spelling in [
+        bare.clone(),
+        format!("doi:{bare}"),
+        format!("https://dx.doi.org/{bare}"),
+    ] {
+        let (status, body) = list_by_doi(addr, &token, &spelling).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["total"], 1,
+            "GET ?doi={spelling} must find the URL-keyed row: {body}"
+        );
+        assert_eq!(
+            body["items"][0]["id"],
+            legacy_id.to_string(),
+            "{spelling}: {body}"
+        );
+    }
 
     let (status, body) = post_paper(addr, &token, &bare).await;
     assert_eq!(status, 200, "{body}");
@@ -198,6 +210,110 @@ async fn non_doi_keys_stay_verbatim_and_distinct_dois_stay_distinct() {
     assert_ne!(pa["id"], pb["id"], "two DOIs are two papers: {pa} {pb}");
     assert_eq!(pa["doi"], a.as_str());
     assert_eq!(pb["doi"], b.as_str());
+}
+
+/// Where an older writer already left a twin (one URL-keyed row, one bare),
+/// both routes put the canonical row first and the writer returns it.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_an_existing_twin_the_canonical_row_is_the_one_returned() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    let suffix = format!("e2twin.{}", Uuid::new_v4());
+    let bare = format!("10.5555/{suffix}");
+    let url_key = format!("https://doi.org/{bare}");
+    // URL-keyed row FIRST, so heap order alone would hand it back.
+    let url_id: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'url twin') RETURNING id")
+            .bind(&url_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let bare_id: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'bare twin') RETURNING id")
+            .bind(&bare)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let (status, body) = post_paper(addr, &token, &url_key).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["id"],
+        bare_id.to_string(),
+        "POST under the URL spelling must return the canonical row, not the URL twin {url_id}: {body}"
+    );
+    assert_eq!(
+        rows_ending_in(&pool, &suffix).await.len(),
+        2,
+        "no third row"
+    );
+
+    let (status, body) = list_by_doi(addr, &token, &url_key).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 2, "both twins are reported: {body}");
+    assert_eq!(
+        body["items"][0]["id"],
+        bare_id.to_string(),
+        "canonical first: {body}"
+    );
+    assert_eq!(body["items"][1]["id"], url_id.to_string(), "{body}");
+}
+
+/// Two writers racing on one NEW DOI under different spellings now collide on
+/// the canonical key. The loser must get the winner's row, not a unique
+/// violation surfaced as a 500. Deterministic: the canonical row's INSERT is
+/// held open on another connection until the POST is seen waiting on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_post_racing_another_spelling_of_a_new_doi_returns_that_row_not_a_500() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    let suffix = format!("e2race.{}", Uuid::new_v4());
+    let bare = format!("10.5555/{suffix}");
+    let mut held = pool.begin().await.unwrap();
+    let held_id: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'held') RETURNING id")
+            .bind(&bare)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+
+    let url_key = format!("https://doi.org/{bare}");
+    let tok = token.clone();
+    let post = tokio::spawn(async move { post_paper(addr, &tok, &url_key).await });
+
+    for _ in 0..200 {
+        if post.is_finished() {
+            break;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO papers%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    held.commit().await.unwrap();
+
+    let (status, body) = post.await.unwrap();
+    assert_eq!(status, 200, "the racing POST must not fail: {body}");
+    assert_eq!(body["id"], held_id.to_string(), "{body}");
+    assert_eq!(
+        rows_ending_in(&pool, &suffix).await,
+        vec![(held_id, bare.clone())],
+        "one paper, under the canonical key"
+    );
 }
 
 /// A resolver spelling with no scheme (`doi.org/…`, `dx.doi.org/…`,

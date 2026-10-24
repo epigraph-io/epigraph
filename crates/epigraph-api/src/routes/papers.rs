@@ -188,10 +188,16 @@ pub async fn create_paper(
             existing_row
         }
     } else {
-        // New paper — insert
+        // New paper — insert under the canonical key. `ON CONFLICT`: every
+        // spelling now maps to that one key, so a concurrent POST of the same
+        // new document under another spelling collides here; the loser gets
+        // the winner's row instead of a unique violation (a 500).
         sqlx::query(
             r#"INSERT INTO papers (doi, title, journal)
                VALUES ($1, $2, $3)
+               ON CONFLICT (doi) DO UPDATE SET
+                   title   = COALESCE(EXCLUDED.title, papers.title),
+                   journal = COALESCE(EXCLUDED.journal, papers.journal)
                RETURNING id, doi, title, journal, created_at"#,
         )
         .bind(&doi)
