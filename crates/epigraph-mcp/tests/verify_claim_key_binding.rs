@@ -205,6 +205,11 @@ async fn a_revoked_signing_key_verifies_but_is_not_bound(pool: PgPool) {
     let resp = verify(&pool, claim).await;
     assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
     assert_eq!(resp["key_bound"], Value::Bool(false), "{resp}");
+    assert_eq!(
+        resp["key_kind"],
+        Value::from("signing"),
+        "an unbound signature still names the key that verified it: {resp}"
+    );
 }
 
 /// A claim created BEFORE the signing key's `valid_from` is not bound by it.
@@ -292,6 +297,11 @@ async fn a_legacy_identity_key_is_bound_before_the_cut_over_only(pool: PgPool) {
     let resp = verify(&pool, after).await;
     assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
     assert_eq!(resp["key_bound"], Value::Bool(false), "{resp}");
+    assert_eq!(
+        resp["key_kind"],
+        Value::from("identity-legacy"),
+        "after the cut-over the report still says the key is the forgeable legacy one: {resp}"
+    );
 }
 
 /// The HTTP shape: a caller AUTHORS, the server SIGNS with its own active
@@ -403,5 +413,86 @@ async fn a_signature_by_an_unknown_key_is_invalid_and_unbound(pool: PgPool) {
         bound(&resp),
         (Value::Bool(false), Value::Bool(false), Value::Null),
         "{resp}"
+    );
+}
+
+/// A whole second: Postgres stores microseconds, so a sub-microsecond
+/// `Utc::now()` would not round-trip and an "exactly at the edge" claim
+/// would land beside it.
+fn whole_second(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp(t.timestamp(), 0).expect("in range")
+}
+
+/// The window's END is exclusive and exact: a claim dated exactly at
+/// `valid_until` is not bound, one millisecond before it is. Kinds and
+/// statuses beyond active/revoked: an EXPIRED key with a recorded window binds
+/// inside it; a PENDING key binds nothing, though its signature verifies and
+/// is reported as a `signing` key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn window_ends_and_the_other_statuses(pool: PgPool) {
+    let t0 = whole_second(Utc::now() - Duration::days(10));
+    let t1 = t0 + Duration::days(5);
+    let identity = signer(0x81);
+    let agent = seed_agent(&pool, &identity.public_key(), t0).await;
+
+    let closing = signer(0x82);
+    seed_key(&pool, agent, &closing.public_key(), "signing", "active", t0, Some(t1)).await;
+    let at_end = seed_signed_claim(&pool, agent, agent, &closing, "D2: at valid_until", t1).await;
+    let before_end = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &closing,
+        "D2: a millisecond before valid_until",
+        t1 - Duration::milliseconds(1),
+    )
+    .await;
+    let resp = verify(&pool, at_end).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        "valid_until is exclusive: {resp}"
+    );
+    let resp = verify(&pool, before_end).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(true), Value::from("signing")),
+        "{resp}"
+    );
+
+    let expired = signer(0x83);
+    seed_key(&pool, agent, &expired.public_key(), "signing", "expired", t0, Some(t1)).await;
+    let inside = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &expired,
+        "D2: by a key since expired, inside its window",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, inside).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(true), Value::from("signing")),
+        "an expired key binds inside its recorded window: {resp}"
+    );
+
+    let pending = signer(0x84);
+    seed_key(&pool, agent, &pending.public_key(), "signing", "pending", t0, None).await;
+    let by_pending = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &pending,
+        "D2: by a key still pending",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, by_pending).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        "a pending key binds nothing: {resp}"
     );
 }
