@@ -159,10 +159,11 @@
 --   * AID08: the child already has a different active signing key. Nothing
 --     changes; revoking a bound key is a maintenance act (section 7a), after
 --     which the host's new key is bound.
---   * AID09: the identity already exists, was never registered, and is
---     already BOUND (a registered human operator, either side of an operator
---     link, an OAuth client's principal, a system agent, or an active
---     non-legacy key). Claims or not, it is not EpiClaw's to adopt.
+--   * AID09: the identity already exists, was never registered, and is not
+--     FRESH. Fail closed: a registered human operator, either side of an
+--     operator link, an OAuth client (principal or owner), a system agent, a
+--     role assignment, any non-legacy key of any status, or a membership in any
+--     group but its own personal group refuses adoption, claims or not.
 --
 -- The event family `agent.identity_` is reserved for a privileged session or a
 -- maintenance-owned definer (RESTRICTIVE policy, 148's shape), so an
@@ -880,25 +881,36 @@ BEGIN
                             'not an EpiClaw identity to adopt', v_child
                 USING ERRCODE = 'AID05';
         END IF;
-        -- AID09: a never-registered agent that is already BOUND to something is
-        -- not EpiClaw's to adopt either, claims or not. Adoption would overwrite
-        -- its properties, bind a signing key and inherit an operator link onto
-        -- a human, an operated agent, an OAuth principal, a system agent or a
-        -- keyed agent.
+        -- AID09: a never-registered agent is adopted only when it is FRESH.
+        -- The rule fails closed: anything that binds it to a human, a link, a
+        -- credential, a key (any status) or a group other than its own
+        -- personal group (the shape epigraph-mcp creates when it meets an
+        -- identity before the host registers it) refuses adoption. Adoption
+        -- would overwrite its properties, bind a signing key and inherit an
+        -- operator link onto it.
         IF NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = v_child)
            AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
                             WHERE s.agent_id = v_child)
-           AND (EXISTS (SELECT 1 FROM public.human_operators h WHERE h.agent_id = v_child)
-                OR EXISTS (SELECT 1 FROM public.operator_links l
-                            WHERE l.agent_id = v_child OR l.operator_id = v_child)
-                OR EXISTS (SELECT 1 FROM public.oauth_clients oc WHERE oc.agent_id = v_child)
-                OR EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = v_child)
-                OR EXISTS (SELECT 1 FROM public.agent_keys k
-                            WHERE k.agent_id = v_child AND k.status = 'active'
-                              AND k.key_type <> 'identity-legacy')) THEN
-            RAISE EXCEPTION 'AID09: agent % is already bound (a human operator, an operator link, '
-                            'an OAuth client, a system agent or an active key) and was never '
-                            'registered; it is not an EpiClaw identity to adopt', v_child
+           AND NOT (
+                NOT EXISTS (SELECT 1 FROM public.human_operators h WHERE h.agent_id = v_child)
+            AND NOT EXISTS (SELECT 1 FROM public.operator_links l
+                             WHERE l.agent_id = v_child OR l.operator_id = v_child)
+            AND NOT EXISTS (SELECT 1 FROM public.oauth_clients oc
+                             WHERE oc.agent_id = v_child OR oc.owner_id = v_child)
+            AND NOT EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = v_child)
+            AND NOT EXISTS (SELECT 1 FROM public.role_assignments ra
+                             WHERE ra.holder_person_id = v_child OR ra.granted_by = v_child)
+            AND NOT EXISTS (SELECT 1 FROM public.agent_keys k
+                             WHERE k.agent_id = v_child AND k.key_type <> 'identity-legacy')
+            AND NOT EXISTS (SELECT 1 FROM public.group_memberships m
+                              JOIN public.groups g ON g.id = m.group_id
+                             WHERE m.agent_id = v_child
+                               AND g.did_key IS DISTINCT FROM
+                                   'did:epigraph:personal:' || v_child::text)
+           ) THEN
+            RAISE EXCEPTION 'AID09: agent % was never registered and is not fresh (bound to a '
+                            'human, a link, a credential, a key or a group other than its own '
+                            'personal group); it is not an EpiClaw identity to adopt', v_child
                 USING ERRCODE = 'AID09';
         END IF;
         -- What the identity was registered under: its earliest snapshot.
