@@ -1931,6 +1931,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_team_group_add_member", 164),
     ("epigraph_team_group_remove_member", 164),
     ("epigraph_team_group_set_member_role", 164),
+    // 164 (review), the roster guard on `group_memberships`. It reads
+    // `groups` (FORCEd) to decide whether a row belongs to a verb-made group.
+    // Under a non-member owner that read is filtered for an application
+    // caller, so every group reads as "not verb-made" and the guard admits
+    // every application write (QUIET, the direction that reopens the roster
+    // to any stamped admin or creator). The gate itself keys on
+    // `session_user`, which no owner changes.
+    ("epigraph_team_group_roster_verbs_only", 164),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

@@ -26,17 +26,33 @@
 -- required exactly 32 bytes for `kind = 'team'`; section 2 relaxes it to 0 OR
 -- 32, so existing keyed team groups stay valid.
 --
--- These verbs are the AUDITED, RULE-HOLDING operator path to a keyless
--- group's roster. They are not the only writer. The REST add route refuses a
--- keyless group (it needs a key epoch: "Group has no current key epoch"), but
--- the REST remove route does not (its revoke needs no epoch, and it keeps its
--- own last-admin guard). And an application session stamped as the group's
--- creator (092's arm, while the creator is a live member) or as a live admin
--- (077's `group_memberships_tenancy`) can write roster rows directly. On those
--- paths 109's triggers and, once the database is armed, 122's membership
--- scope still apply, but section 2's GRP rules and section 4's audit row do
--- not. 122 section 4 is why the application DSN is not the boundary for
--- that: a holder of it can stamp any principal.
+-- These verbs are the ONLY writer of a verb-made group's roster and group
+-- row. A verb-made group is one whose `did_key` is in the verbs'
+-- `did:epigraph:group:` namespace (108 freezes `did_key` outside maintenance,
+-- so the mark cannot be moved on or off a group). Three triggers below hold
+-- that on every path that is not a maintenance session (`epigraph_bypass()`,
+-- keyed on `session_user`, so neither a forged setting nor a definer frame
+-- an application session reaches can satisfy it):
+--
+--   * `group_memberships_team_roster_verbs_only` refuses an INSERT or UPDATE
+--     of a membership row of a verb-made group. Without it, 077's group-admin
+--     arm and 092's creator arm let an application session stamped as the
+--     group's admin or creator (and 122 section 4 is why the application DSN
+--     is not the boundary: a holder of it can stamp any principal) add a
+--     reader or a human writer (122's scope trigger is quiet for both),
+--     restore a demoted creator to admin, or revoke a row, with none of
+--     section 2's rules and no audit row. The REST routes therefore cannot
+--     change a verb-made roster either: add already needed a key epoch, and
+--     remove is now refused (42501) like every other application write.
+--   * `groups_team_verbs_only_insert` refuses a new group in the namespace,
+--     or a new KEYLESS team group (the CHECK below is relaxed for every
+--     session, and an application principal could otherwise mint a
+--     keyless team group and enrol itself as its admin through 092's empty-
+--     roster arm).
+--   * `groups_team_verbs_only_update` refuses any UPDATE of a verb-made group
+--     row (a demoted creator keeps 092's creator arm on `groups`, and setting
+--     `public_key` or `status` would take the group out of the verbs' hands,
+--     GRP05), and an UPDATE that makes any team group keyless.
 --
 -- ===================================================================
 -- 2. THE RULES EACH VERB HOLDS ITSELF
@@ -72,12 +88,17 @@
 --     `admin` is refused, decided under a `FOR UPDATE` lock on the `groups`
 --     row that every verb takes first, so two concurrent removals of two
 --     admins cannot both pass. (GRP02)
---   * ONLY KEYLESS TEAM GROUPS. The member verbs refuse any group that is not
---     `kind = 'team'` with an empty key and status `active`: personal groups
---     (107's link path), community groups (106), world and seed, and keyed
---     team groups each have their own roster path. (GRP05)
---   * ONE ACTIVE TEAM GROUP PER NAME (case and surrounding space ignored),
---     so a repeated `create-group --apply` cannot mint a second group. (GRP06)
+--   * ONLY VERB-MADE TEAM GROUPS. The member verbs refuse any group that is
+--     not `kind = 'team'`, in the `did:epigraph:group:` namespace, with an
+--     empty key and status `active`: personal groups (107's link path),
+--     community groups (106), world and seed, keyed team groups and any
+--     keyless team group made some other way each have their own roster path
+--     or none. (GRP05)
+--   * ONE ACTIVE VERB-MADE TEAM GROUP PER NAME (case and surrounding space
+--     ignored), so a repeated `create-group --apply` cannot mint a second
+--     group. A keyed team group does not hold a name here (display names are
+--     not unique across kinds), and the refusal names the group that does and
+--     its creator, so a squat is visible. (GRP06)
 --
 -- 109's identity rule holds by construction: no verb changes a row's
 -- `group_id` or `agent_id`.
@@ -126,6 +147,11 @@
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_add_member(uuid, uuid, text, text);
 -- DROP FUNCTION IF EXISTS public.epigraph_create_team_group(text, uuid, text);
 -- DROP POLICY IF EXISTS security_events_group_roster_privileged ON public.security_events;
+-- DROP TRIGGER IF EXISTS groups_team_verbs_only_update ON public.groups;
+-- DROP TRIGGER IF EXISTS groups_team_verbs_only_insert ON public.groups;
+-- DROP TRIGGER IF EXISTS group_memberships_team_roster_verbs_only ON public.group_memberships;
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_row_verbs_only();
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_roster_verbs_only();
 -- and, ONLY when no keyless team group exists, restore 060's
 -- `groups_public_key_shape` text. Groups and memberships the verbs wrote stay
 -- (060 refuses deleting groups; the roster is a ledger), as do their audit
@@ -152,6 +178,76 @@ CREATE POLICY security_events_group_roster_privileged ON public.security_events
         OR (((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()))
             AND created_at = now()));
 
+-- Section 1: a verb-made group has one writer, the verbs.
+--
+-- The roster guard reads `groups`, which is under row security, so it is a
+-- definer (owned by the maintenance role, section 5): an invoker lookup from
+-- an application session that cannot see the group row would read "not
+-- verb-made" and let the write through. Inside this frame `current_user` is
+-- the owner, which is why the gate is `epigraph_bypass()` (session_user) and
+-- never `epigraph_definer_bypass()` (current_user), which would admit every
+-- caller.
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_roster_verbs_only()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_bypass() THEN
+        RETURN NEW;
+    END IF;
+    -- NEW.group_id alone: 109 refuses moving a row to another group outside
+    -- a maintenance session, and a maintenance session has returned above.
+    IF EXISTS (SELECT 1 FROM public.groups g
+                WHERE g.id = NEW.group_id AND g.did_key LIKE 'did:epigraph:group:%') THEN
+        RAISE EXCEPTION 'group_memberships: the roster of team group % is written only by the '
+                        'team-group verbs (epigraph-operator group-member, on the maintenance '
+                        'DSN); nothing was changed', NEW.group_id
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_roster_verbs_only() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS group_memberships_team_roster_verbs_only ON public.group_memberships;
+CREATE TRIGGER group_memberships_team_roster_verbs_only
+    BEFORE INSERT OR UPDATE ON public.group_memberships
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_team_group_roster_verbs_only();
+
+-- The group-row guard reads only the row in hand, so it is an invoker, in
+-- 108's shape (but with the session arm alone, for the reason above).
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_row_verbs_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_bypass() THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'groups: a keyless team group, or any group in the did:epigraph:group: '
+                    'namespace, is created and changed only by the team-group verbs '
+                    '(epigraph-operator create-group, on the maintenance DSN); nothing was '
+                    'changed (did_key %, kind %, % key bytes)',
+                    NEW.did_key, NEW.kind, octet_length(NEW.public_key)
+        USING ERRCODE = '42501';
+END $$;
+
+DROP TRIGGER IF EXISTS groups_team_verbs_only_insert ON public.groups;
+CREATE TRIGGER groups_team_verbs_only_insert
+    BEFORE INSERT ON public.groups
+    FOR EACH ROW
+    WHEN (NEW.did_key LIKE 'did:epigraph:group:%'
+          OR (NEW.kind = 'team' AND octet_length(NEW.public_key) = 0))
+    EXECUTE FUNCTION public.epigraph_team_group_row_verbs_only();
+
+DROP TRIGGER IF EXISTS groups_team_verbs_only_update ON public.groups;
+CREATE TRIGGER groups_team_verbs_only_update
+    BEFORE UPDATE ON public.groups
+    FOR EACH ROW
+    WHEN (OLD.did_key LIKE 'did:epigraph:group:%'
+          OR NEW.did_key LIKE 'did:epigraph:group:%'
+          OR (NEW.kind = 'team' AND octet_length(NEW.public_key) = 0))
+    EXECUTE FUNCTION public.epigraph_team_group_row_verbs_only();
+
 -- -------------------------------------------------------------------
 -- create
 -- -------------------------------------------------------------------
@@ -161,8 +257,10 @@ RETURNS uuid
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
-    v_group uuid := gen_random_uuid();
-    v_name  text := btrim(p_name);
+    v_group        uuid := gen_random_uuid();
+    v_name         text := btrim(p_name);
+    v_held_by      uuid;
+    v_held_creator uuid;
 BEGIN
     IF NOT (public.epigraph_bypass()
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
@@ -188,11 +286,16 @@ BEGIN
     -- Serialise two creations of the same name; the check below then sees the
     -- first one's committed row.
     PERFORM pg_advisory_xact_lock(hashtext('epigraph.team_group_name:' || lower(v_name)));
-    IF EXISTS (SELECT 1 FROM public.groups g
-                WHERE g.kind = 'team' AND g.status = 'active'
-                  AND lower(btrim(g.display_name)) = lower(v_name)) THEN
-        RAISE EXCEPTION 'GRP06: an active team group named % already exists; nothing was '
-                        'created', v_name
+    SELECT g.id, g.created_by_agent_id INTO v_held_by, v_held_creator
+      FROM public.groups g
+     WHERE g.kind = 'team' AND g.status = 'active'
+       AND g.did_key LIKE 'did:epigraph:group:%'
+       AND lower(btrim(g.display_name)) = lower(v_name)
+     ORDER BY g.created_at
+     LIMIT 1;
+    IF v_held_by IS NOT NULL THEN
+        RAISE EXCEPTION 'GRP06: an active team group named % already exists (group %, created '
+                        'by %); nothing was created', v_name, v_held_by, v_held_creator
             USING ERRCODE = 'GRP06';
     END IF;
 
@@ -220,6 +323,7 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_kind      text;
+    v_did       text;
     v_key_len   integer;
     v_status    text;
     v_human     uuid;
@@ -246,17 +350,18 @@ BEGIN
 
     -- The group row lock first: every roster verb takes it, so roster
     -- decisions on one group are serialised.
-    SELECT g.kind::text, octet_length(g.public_key), g.status::text
-      INTO v_kind, v_key_len, v_status
+    SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_did, v_key_len, v_status
       FROM public.groups g WHERE g.id = p_group FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_add_member: group % does not exist', p_group
             USING ERRCODE = '22023';
     END IF;
-    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
-        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
-                        'bytes, status %); its roster has its own path', p_group, v_kind,
-                        v_key_len, v_status
+    IF v_kind <> 'team' OR v_did NOT LIKE 'did:epigraph:group:%' OR v_key_len <> 0
+       OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active team group made by these verbs (kind '
+                        '%, did_key %, % key bytes, status %); its roster has its own path',
+                        p_group, v_kind, v_did, v_key_len, v_status
             USING ERRCODE = 'GRP05';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.id = p_agent) THEN
@@ -330,6 +435,7 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_kind      text;
+    v_did       text;
     v_key_len   integer;
     v_status    text;
     v_live_id   uuid;
@@ -347,17 +453,18 @@ BEGIN
                         'required' USING ERRCODE = '22004';
     END IF;
 
-    SELECT g.kind::text, octet_length(g.public_key), g.status::text
-      INTO v_kind, v_key_len, v_status
+    SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_did, v_key_len, v_status
       FROM public.groups g WHERE g.id = p_group FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_remove_member: group % does not exist', p_group
             USING ERRCODE = '22023';
     END IF;
-    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
-        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
-                        'bytes, status %); its roster has its own path', p_group, v_kind,
-                        v_key_len, v_status
+    IF v_kind <> 'team' OR v_did NOT LIKE 'did:epigraph:group:%' OR v_key_len <> 0
+       OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active team group made by these verbs (kind '
+                        '%, did_key %, % key bytes, status %); its roster has its own path',
+                        p_group, v_kind, v_did, v_key_len, v_status
             USING ERRCODE = 'GRP05';
     END IF;
 
@@ -411,6 +518,7 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_kind      text;
+    v_did       text;
     v_key_len   integer;
     v_status    text;
     v_live_id   uuid;
@@ -436,17 +544,18 @@ BEGIN
                         'admin', p_role USING ERRCODE = '22023';
     END IF;
 
-    SELECT g.kind::text, octet_length(g.public_key), g.status::text
-      INTO v_kind, v_key_len, v_status
+    SELECT g.kind::text, g.did_key, octet_length(g.public_key), g.status::text
+      INTO v_kind, v_did, v_key_len, v_status
       FROM public.groups g WHERE g.id = p_group FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'epigraph_team_group_set_member_role: group % does not exist', p_group
             USING ERRCODE = '22023';
     END IF;
-    IF v_kind <> 'team' OR v_key_len <> 0 OR v_status <> 'active' THEN
-        RAISE EXCEPTION 'GRP05: group % is not an active keyless team group (kind %, % key '
-                        'bytes, status %); its roster has its own path', p_group, v_kind,
-                        v_key_len, v_status
+    IF v_kind <> 'team' OR v_did NOT LIKE 'did:epigraph:group:%' OR v_key_len <> 0
+       OR v_status <> 'active' THEN
+        RAISE EXCEPTION 'GRP05: group % is not an active team group made by these verbs (kind '
+                        '%, did_key %, % key bytes, status %); its roster has its own path',
+                        p_group, v_kind, v_did, v_key_len, v_status
             USING ERRCODE = 'GRP05';
     END IF;
 
@@ -538,6 +647,8 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION '
                 'public.epigraph_team_group_set_member_role(uuid, uuid, text, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_team_group_roster_verbs_only() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
                 'TO epigraph_maintenance';
