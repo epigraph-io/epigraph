@@ -3342,7 +3342,7 @@ impl ClaimRepository {
                       JOIN papers p ON p.id = e.source_id
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
-                        AND p.doi = $4
+                        AND p.doi = ANY($4::text[])
                   )
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -3375,7 +3375,10 @@ impl ClaimRepository {
             .bind(limit)
             .bind(since);
         if let Some(doi) = paper_doi_filter {
-            q = q.bind(doi);
+            // Every stored spelling of the document key (backlog 90756d26),
+            // through the normalizer the paper writers use: a bare filter
+            // finds a URL-keyed legacy paper and vice versa.
+            q = q.bind(crate::repos::paper::document_key_spellings(doi));
         }
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
