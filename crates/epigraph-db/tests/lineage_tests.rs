@@ -1353,6 +1353,74 @@ async fn lineage_truncation_follows_the_viewer(pool: PgPool) {
     assert!(!down_member.claims.contains_key(&below));
 }
 
+/// Truncation follows EDGE visibility too: a PUBLIC claim past `max_depth`
+/// that is reachable only over an edge the viewer cannot read does not make
+/// its result truncated, while a member of the edge's owning group is told the
+/// result was cut.
+///
+/// The claims past the cut are public, so only the edge-level visibility
+/// predicate decides whether the walk may count them; this is the half of
+/// "the probe layer reveals nothing" that
+/// `lineage_truncation_follows_the_viewer` (claim-level) does not reach.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_truncation_follows_edge_visibility(pool: PgPool) {
+    let (edge_owner, edge_group) = fixture::seed_agent_with_group(&pool, "trunc-edge-owner").await;
+    let public = fixture::public_viewer(&pool).await;
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, edge_owner)
+        .await
+        .expect("resolve member");
+
+    // Public chain c0 -> ... -> c{CUT}: complete at depth CUT from either end.
+    let chain = create_claim_chain(&pool, CUT as usize + 1).await;
+    let leaf = *chain.last().unwrap();
+    // One PUBLIC claim beyond each end, each reachable only over a
+    // group-private edge.
+    let above = fixture::seed_public_claim(&pool, edge_owner, "public ancestor").await;
+    fixture::seed_edge_owned_by(&pool, above, chain[0], "group", edge_group).await;
+    let below = fixture::seed_public_claim(&pool, edge_owner, "public descendant").await;
+    fixture::seed_edge_owned_by(&pool, leaf, below, "group", edge_group).await;
+
+    for (walk, public_result, member_result, beyond) in [
+        (
+            "get_lineage",
+            LineageRepository::get_lineage(&pool, &public, leaf, Some(CUT), None)
+                .await
+                .expect("ancestor walk, public"),
+            LineageRepository::get_lineage(&pool, &member, leaf, Some(CUT), None)
+                .await
+                .expect("ancestor walk, member"),
+            above,
+        ),
+        (
+            "get_descendants",
+            LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT))
+                .await
+                .expect("descendant walk, public"),
+            LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT))
+                .await
+                .expect("descendant walk, member"),
+            below,
+        ),
+    ] {
+        // Calibration: both viewers walk the whole public chain.
+        assert_eq!(public_result.claims.len(), CUT as usize + 1, "{walk}");
+        assert_eq!(member_result.claims.len(), CUT as usize + 1, "{walk}");
+        assert!(
+            !public_result.truncated,
+            "{walk}: the only claim past max_depth is reachable only over an edge the \
+             viewer cannot read, so for this viewer the result is complete"
+        );
+        assert!(
+            member_result.truncated,
+            "{walk}: a member of the edge's owning group must be told the result was cut"
+        );
+        assert!(
+            !member_result.claims.contains_key(&beyond),
+            "{walk}: the probe layer must not be returned"
+        );
+    }
+}
+
 // ============================================================================
 // `max_nodes` trims BEFORE the follow-up queries
 // ============================================================================
