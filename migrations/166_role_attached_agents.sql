@@ -124,8 +124,10 @@
 -- live (or not yet started) attachments are copied to the child, each with
 -- `inherited_from`, unless the child already has an overlapping un-detached
 -- row for that role (so a repeat registration copies nothing and never
--- aborts). The copy is a restriction, never a grant, so copying into an
--- identity shared with another group fails safe: it can only refuse.
+-- aborts) or has inherited that parent row before, detached included (a
+-- detach is final: a repeat registration does not re-attach the child). The
+-- copy is a restriction, never a grant, so copying into an identity shared
+-- with another group fails safe: it can only refuse.
 --
 -- ===================================================================
 -- 6. UNDO
@@ -1076,10 +1078,13 @@ BEGIN
     -- of the parent that has not ended (live, or not yet started) is copied
     -- to the child, from now (or its own later start) to its own end, naming
     -- the row it came from, unless the child already has an overlapping
-    -- un-detached attachment to that role. So a LEARNED.md edit or a model
-    -- change does not detach an agent from its role, and a repeat
-    -- registration copies nothing (the NOT EXISTS is the insert guard's own
-    -- overlap test, so the guard never aborts the registration). Each copy
+    -- un-detached attachment to that role, or has ever inherited that row
+    -- (detached included: a detach is final, so a repeat registration naming
+    -- the same parent never undoes an operator's detach). So a LEARNED.md
+    -- edit or a model change does not detach an agent from its role, and a
+    -- repeat registration copies nothing (the first NOT EXISTS is the insert
+    -- guard's own overlap test, so the guard never aborts the registration).
+    -- Each copy
     -- meets the table's guards and writes its own audit row. An attachment
     -- only ever refuses, so a copy never grants the child anything.
     IF v_parent IS NOT NULL THEN
@@ -1096,6 +1101,9 @@ BEGIN
                       AND c.detached_at IS NULL
                       AND (c.valid_to IS NULL OR c.valid_to > GREATEST(now(), pr.valid_from))
                       AND (pr.valid_to IS NULL OR pr.valid_to > c.valid_from))
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
          ORDER BY pr.role, pr.valid_from;
         GET DIAGNOSTICS v_roles_new = ROW_COUNT;
     END IF;
