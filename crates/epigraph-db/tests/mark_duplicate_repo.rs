@@ -389,3 +389,64 @@ async fn mark_duplicate_rejects_missing_canonical(pool: PgPool) {
             .unwrap();
     assert!(matches!(err, DbError::NotFound { .. }), "{err:?}");
 }
+
+/// A dedup onto a claim that is no longer current is refused, whatever retired
+/// it (a mark of its own, a supersession): it would build a chain the caller
+/// never asked for, which the un-mark then refuses while the canonical stays
+/// retired. Nothing is written: the duplicate stays current, with no
+/// `supersedes` and no identity edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let c1 = seed_claim(&pool, agent, "first canonical").await;
+    let c2 = seed_claim(&pool, agent, "newer canonical").await;
+    let s = seed_claim(&pool, agent, "superseded canonical").await;
+    let d = seed_claim(&pool, agent, "duplicate").await;
+    ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(c1), ClaimId::from_uuid(c2))
+        .await
+        .expect("calibration: c1 marked onto the current c2");
+    ClaimRepository::supersede(
+        &pool,
+        ClaimId::from_uuid(s),
+        "superseded canonical, revised",
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede s");
+
+    for retired in [c1, s] {
+        let mut conn = pool.acquire().await.unwrap();
+        let err = ClaimRepository::mark_duplicate_act_attributed_conn(
+            &mut conn,
+            ClaimId::from_uuid(d),
+            ClaimId::from_uuid(retired),
+            &epigraph_db::DuplicateProvenance::new(
+                "test",
+                epigraph_db::DuplicateProvenance::RULE_CALLER_ASSERTED,
+            ),
+        )
+        .await
+        .expect_err("a mark onto a retired canonical is refused");
+        assert!(
+            matches!(err, DbError::QueryFailed { .. })
+                && format!("{err:?}").contains("not current"),
+            "{err:?}"
+        );
+        let (sup, current): (Option<Uuid>, bool) =
+            sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+                .bind(d)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((sup, current), (None, true), "the duplicate is untouched");
+        let identity: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
+        )
+        .bind(d)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(identity, 0, "no identity edge was written");
+    }
+}
