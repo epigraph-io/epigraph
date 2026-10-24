@@ -309,6 +309,22 @@ async fn write_stamped(
     author: Uuid,
     group: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
+    write_stamped_valve(pool, principal, read, write, author, group, false).await
+}
+
+/// [`write_stamped`], optionally with the session's OPL01 valve
+/// (`epigraph.operator_link_enforcement = 'off'`) opened first: an
+/// application session can set it, and it relieves the link binding (OPL01)
+/// only, never the writer scope (OPL02).
+async fn write_stamped_valve(
+    pool: &PgPool,
+    principal: Uuid,
+    read: &[Uuid],
+    write: &[Uuid],
+    author: Uuid,
+    group: Uuid,
+    valve_off: bool,
+) -> Result<Uuid, sqlx::Error> {
     let join = |s: &[Uuid]| {
         s.iter()
             .map(ToString::to_string)
@@ -328,6 +344,11 @@ async fn write_stamped(
         .execute(&mut *conn)
         .await
         .expect("stamp");
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', $1, false)")
+            .bind(if valve_off { "off" } else { "" })
+            .execute(&mut *conn)
+            .await
+            .expect("valve");
         let id = Uuid::new_v4();
         let r = sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
@@ -345,7 +366,8 @@ async fn write_stamped(
         sqlx::query(
             "SELECT set_config('epigraph.principal_id', '', false), \
                     set_config('epigraph.group_ids', '', false), \
-                    set_config('epigraph.writable_group_ids', '', false)",
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.operator_link_enforcement', '', false)",
         )
         .execute(&mut *conn)
         .await
@@ -368,6 +390,15 @@ async fn write_honest(pool: &PgPool, principal: Uuid, group: Uuid) -> Result<Uui
 /// the group in both sets (any holder of the application DSN can set them).
 async fn write_forged(pool: &PgPool, principal: Uuid, group: Uuid) -> Result<Uuid, sqlx::Error> {
     write_stamped(pool, principal, &[group], &[group], principal, group).await
+}
+
+/// [`write_forged`] with the session's OPL01 valve open.
+async fn write_forged_valve_off(
+    pool: &PgPool,
+    principal: Uuid,
+    group: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    write_stamped_valve(pool, principal, &[group], &[group], principal, group, true).await
 }
 
 /// Every membership row of `group`: `(agent, epoch, role, revoked)`.
@@ -983,6 +1014,91 @@ async fn a_deactivated_agent_never_derives_and_a_new_link_does_at_once(pool: PgP
         (true, true),
         "a new link derives at once"
     );
+}
+
+// =====================================================================
+// The writer scope follows the derivation.
+// =====================================================================
+
+/// Revoke `agent`'s ACTING row in its human's personal group (the deactivation
+/// lever; a live link is never retired in place).
+async fn deactivate(pool: &PgPool, personal: Uuid, agent: Uuid) {
+    let mut c = maint(pool).await;
+    let n = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(personal)
+    .bind(agent)
+    .execute(&mut *c)
+    .await
+    .expect("revoke the acting row")
+    .rows_affected();
+    reset(c).await;
+    assert_eq!(n, 1, "PREMISE: one acting row");
+}
+
+/// Armed, the claims-path writer scope (OPL02) asks the question the viewer
+/// asks, keyed on the WRITING principal: an agent whose acting row was revoked
+/// derives nothing, so its write stamped (forged) with the bound group is
+/// refused OPL02, although its link is live and its human holds the role. Its
+/// live-linked sibling, and the human, writing the same way, are admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_a_deactivated_agent_is_refused_a_forged_write(pool: PgPool) {
+    let (h, personal) = human(&pool, "wdeact-h").await;
+    let a = operated(&pool, h, "wdeact-a").await;
+    let sibling = operated(&pool, h, "wdeact-sib").await;
+    let (group, _) = bound_group(&pool, "Synthetic Write Deactivated Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+    deactivate(&pool, personal, a).await;
+    assert_eq!(
+        resolves(&pool, a, group).await,
+        (false, false),
+        "PREMISE: the deactivated agent does not derive"
+    );
+
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "a deactivated agent of a role holder",
+    );
+    write_forged(&pool, sibling, group)
+        .await
+        .expect("POSITIVE CONTROL: its live-linked sibling writes the same way");
+    write_forged(&pool, h, group)
+        .await
+        .expect("POSITIVE CONTROL: the role holder writes the same way");
+}
+
+/// Armed, a RETIRED-linked agent of a role holder is refused OPL02 on a forged
+/// write even with its session's OPL01 valve open (an application session
+/// can open it; it relieves the link binding, never the writer scope). The
+/// human's live-linked agent, on the same valve setting, is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_a_retired_linked_agent_is_refused_a_forged_write_with_the_valve_open(pool: PgPool) {
+    let (h, _) = human(&pool, "wret-h").await;
+    let live = operated(&pool, h, "wret-live").await;
+    let old = retired(&pool, h, "wret-old").await;
+    let (group, _) = bound_group(&pool, "Synthetic Write Retired Team", "writer", true).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+    assert_eq!(
+        resolves(&pool, old, group).await,
+        (false, false),
+        "PREMISE: the retired-linked agent does not derive"
+    );
+
+    assert_refused(
+        &write_forged_valve_off(&pool, old, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "a retired-linked agent of a role holder, valve open",
+    );
+    write_forged_valve_off(&pool, live, group)
+        .await
+        .expect("POSITIVE CONTROL: the live-linked agent writes on the same valve setting");
 }
 
 /// A revoked registration, or a suspended human client, ends the human's and
