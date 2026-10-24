@@ -451,6 +451,26 @@ async fn find_workflow_surfaces_evolved_step_heads(pool: PgPool) {
             .expect("set goal embedding");
     }
 
+    // A newer generation of the evolved workflow's lineage, with a goal that
+    // does not carry the token and no goal embedding, so it is never itself
+    // the hit: the gen-0 hit must say a newer generation exists.
+    let (canonical,): (String,) =
+        sqlx::query_as("SELECT canonical_name FROM workflows WHERE id = $1")
+            .bind(evolved_id)
+            .fetch_one(&pool)
+            .await
+            .expect("canonical_name of the evolved workflow");
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value) \
+         VALUES ($1, $2, 1, 'a reworded later generation', $3, '{}', NOW(), 1.0)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&canonical)
+    .bind(evolved_id)
+    .execute(&pool)
+    .await
+    .expect("seed generation 1");
+
     for (leg, pgvec) in [("text", None), ("embedding", Some(axis_pgvec_1536(7)))] {
         let result = find_workflow_with_pgvec(
             &server,
@@ -510,9 +530,15 @@ async fn find_workflow_surfaces_evolved_step_heads(pool: PgPool) {
         );
         assert_eq!(evolved[0]["pending_resolution"], serde_json::json!(false));
         assert_eq!(
-            hit["latest_generation"],
+            hit["generation"],
             serde_json::json!(0),
-            "{leg} leg: the newest generation of this lineage is disclosed"
+            "{leg} leg: the hit is generation 0: {hit}"
+        );
+        assert_eq!(
+            hit["latest_generation"],
+            serde_json::json!(1),
+            "{leg} leg: a newer generation of this lineage exists and must be \
+             disclosed (latest_generation > generation): {hit}"
         );
 
         let control = find(control_id);
