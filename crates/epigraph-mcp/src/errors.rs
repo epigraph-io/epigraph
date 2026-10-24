@@ -63,15 +63,6 @@ pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
 /// A designed refusal without a code (a `RAISE` that names no code) is
 /// redacted like any other error: that fails closed.
 fn designed_refusal(e: &dyn std::any::Any) -> Option<String> {
-    fn coded(message: &str) -> bool {
-        let b = message.as_bytes();
-        let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
-        (2..=5).contains(&caps)
-            && b.len() > caps + 2
-            && b[caps].is_ascii_digit()
-            && b[caps + 1].is_ascii_digit()
-            && b[caps + 2] == b':'
-    }
     let database = |s: &sqlx::Error| match s {
         sqlx::Error::Database(d) if coded(d.message()) => Some(d.message().to_string()),
         _ => None,
@@ -86,6 +77,18 @@ fn designed_refusal(e: &dyn std::any::Any) -> Option<String> {
         };
     }
     e.downcast_ref::<sqlx::Error>().and_then(database)
+}
+
+/// Whether a database message opens with a schema refusal code: two to five
+/// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
+fn coded(message: &str) -> bool {
+    let b = message.as_bytes();
+    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    (2..=5).contains(&caps)
+        && b.len() > caps + 2
+        && b[caps].is_ascii_digit()
+        && b[caps + 1].is_ascii_digit()
+        && b[caps + 2] == b':'
 }
 
 /// A server fault whose message is DESIGNED, caller-facing text, sent
@@ -444,6 +447,10 @@ mod tests {
         const MARKER: &str = "relation \"secret_table_7f3a\" does not exist at db-host-7f3a";
         let e = internal_error(format!("could not read: {MARKER}"));
         assert_eq!(e.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            e.message, INTERNAL_ERROR_MESSAGE,
+            "the fixed message is sent"
+        );
         assert!(
             !e.message.contains("secret_table_7f3a") && !e.message.contains("db-host-7f3a"),
             "the error text reached the caller: {}",
@@ -549,5 +556,32 @@ mod tests {
             message: "violated".to_string(),
         });
         assert_eq!(other.message, INTERNAL_ERROR_MESSAGE, "{}", other.message);
+    }
+
+    /// The schema-code gate decides which database text reaches the caller,
+    /// so both of its edges are pinned: two to five capitals, exactly two
+    /// digits, a colon, at the start of the message.
+    #[test]
+    fn a_schema_refusal_code_is_recognised_only_in_its_exact_shape() {
+        for accepted in [
+            "FA07: writer-owned attach refused",
+            "CX02: x",
+            "ABCDE12: five capitals",
+        ] {
+            assert!(coded(accepted), "{accepted:?} must be recognised");
+        }
+        for rejected in [
+            "A07: one capital",
+            "ABCDEF07: six capitals",
+            "FA7: one digit",
+            "FA071: three digits",
+            "fa07: lowercase",
+            "x FA07: not at the start",
+            "FA07 no colon",
+            "duplicate key value violates unique constraint \"agents_pkey\"",
+            "",
+        ] {
+            assert!(!coded(rejected), "{rejected:?} must not be recognised");
+        }
     }
 }
