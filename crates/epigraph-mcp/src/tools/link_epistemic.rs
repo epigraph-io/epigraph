@@ -54,7 +54,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::{LinkEpistemicBelief, LinkEpistemicParams, LinkEpistemicResponse};
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository};
+use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository, MassFunctionRepository};
 use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcome};
 
 /// Allowed epistemic relationship strings — the engine's non-neutral relations
@@ -322,6 +322,12 @@ pub async fn do_link_epistemic(
     // `trigger_edge_ds_recomputation` does. Resolved here via a runtime query
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
+    // Overwritten below when the wire is attempted. It stays this when the
+    // source's author cannot be resolved and the wire is skipped. Defensive:
+    // `claims.agent_id` is NOT NULL and both endpoints were viewer-checked
+    // above, so the visibility-spliced author read finds no row only when the
+    // source is removed or hidden concurrently.
+    let mut belief_wired_reason: Option<&'static str> = Some("source_author_unresolved");
     let source_agent_id: Option<uuid::Uuid> = {
         // PR-09: an authorship oracle over a uuid that derives from caller
         // input — it names the `agents.id` behind any claim. Filtered rather
@@ -363,6 +369,30 @@ pub async fn do_link_epistemic(
         // (`update_with_evidence`) carry the same residual, and
         // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs` pins the pair.
         use sqlx::Acquire as _;
+        // Backlog 0a996437: `auto_wire_edge_if_epistemic` answers `None` for
+        // three different reasons (edge out of force, edge already wired, a
+        // refused or failed wiring). Read the first two here, in the engine's
+        // own order and with its `was_created` short-cut, under a savepoint
+        // that is rolled back, so `belief_wired_reason` can name them. A failed
+        // read leaves both unknown, which reports `refused_or_failed`.
+        // `edge_retracted` is defensive: the edge was just looked up or written
+        // in force on this transaction, so it reads false only under a
+        // concurrent retraction. Under READ COMMITTED a concurrent wire of the
+        // same edge between this probe and the engine's read reports
+        // `refused_or_failed` rather than `already_wired` (cosmetic).
+        let (in_force, already_wired) = {
+            let mut probe = tx.begin().await.map_err(internal_error)?;
+            let in_force = EdgeRepository::is_in_force(&mut *probe, edge_id).await.ok();
+            let already_wired = if was_created {
+                Some(false)
+            } else {
+                MassFunctionRepository::exists_for_perspective(&mut *probe, viewer, edge_id)
+                    .await
+                    .ok()
+            };
+            probe.rollback().await.map_err(internal_error)?;
+            (in_force, already_wired)
+        };
         let mut sp = tx.begin().await.map_err(internal_error)?;
         let outcome = auto_wire_edge_if_epistemic(
             &mut sp,
@@ -387,6 +417,15 @@ pub async fn do_link_epistemic(
         } else {
             sp.rollback().await.map_err(internal_error)?;
         }
+        belief_wired_reason = match outcome {
+            Some(EdgeFactorOutcome::Wired) => None,
+            Some(EdgeFactorOutcome::SourceFactorless) => Some("source_has_no_belief"),
+            Some(EdgeFactorOutcome::NonEpistemic) => Some("structural_relationship"),
+            Some(EdgeFactorOutcome::Vacuous) => Some("vacuous_source_mass"),
+            None if in_force == Some(false) => Some("edge_retracted"),
+            None if already_wired == Some(true) => Some("already_wired"),
+            None => Some("refused_or_failed"),
+        };
     }
 
     if was_created {
@@ -472,6 +511,7 @@ pub async fn do_link_epistemic(
         owned_by_caller,
         relationship: params.relationship,
         belief_wired,
+        belief_wired_reason,
         belief_target_claim_id: wire_target.to_string(),
         target_belief,
     })
