@@ -24,8 +24,9 @@ content-hash-keyed dedup that gates migration 107 is a separate tool.
 
 Default mode is dry-run: it reports what it would mark and sends nothing.
 `--execute` needs a bearer token (`--token`, or EPIGRAPH_TOKEN) and refuses to
-start without one. The endpoint requires write authority over both claims, so
-a cross-agent cluster needs a `claims:admin` token. Each duplicate is one
+start without one. The endpoint needs the `claims:write` scope and write
+authority over both claims, so a cross-agent cluster needs a token that also
+carries `claims:admin`. Each duplicate is one
 request; a refused one (HTTP status and body) is reported, the rest of the run
 continues, and the run exits 1.
 
@@ -37,7 +38,9 @@ Usage:
 Skips:
 - A member that is not current, or already carries a `supersedes` pointer, is
   never picked as the canonical; as a duplicate it is skipped and counted as
-  `duplicates_skipped_already_superseded` (the endpoint refuses that case too).
+  `duplicates_skipped_already_superseded` (the endpoint refuses that case too),
+  unless it is already marked onto this cluster's canonical (an earlier run),
+  which is passed over silently.
 - A member labelled `deduped` (a pre-2026-10 mark by this script) is treated
   the same way.
 """
@@ -98,10 +101,12 @@ def load_groups(path: str) -> list[dict]:
 def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None:
     """Pick the canonical claim id for a cluster.
 
-    Prefers the rep id from the input snapshot when it is still live (exists,
-    current, not labelled `deduped`). Otherwise picks by (trace_count,
-    mf_count, edge_count) descending. Returns None when fewer than two members
-    are live (nothing to merge; also the idempotent re-run).
+    Only a live member (exists, current, not labelled `deduped`) can be the
+    canonical. Prefers the rep id from the input snapshot when it is live;
+    otherwise picks by (trace_count, mf_count, edge_count) descending. Returns
+    None only when no member is live: a cluster with one live member is still
+    handed to `merge_cluster`, which reports the members it skips (a member
+    already superseded by another claim is counted, not hidden).
     """
     cur.execute(
         """
@@ -128,8 +133,8 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
         for r in cur.fetchall()
     ]
     live = [r for r in rows if not r["is_deduped"] and r["is_current"]]
-    if len(live) <= 1:
-        return None  # nothing to merge
+    if not live:
+        return None  # no member can be the canonical
     suggested = next((r for r in live if r["id"] == suggested_rep), None)
     if suggested is not None:
         return suggested["id"]
@@ -169,24 +174,31 @@ def merge_cluster(
     """Mark every live non-canonical member a duplicate of `canonical_id`.
 
     Reads only. With `token` (execute mode) each duplicate is one POST to the
-    dedup endpoint; without, it is counted as one the run would mark.
+    dedup endpoint; without, it is counted as one the run would mark. A member
+    already marked onto this canonical (a re-run) is passed over silently; one
+    superseded by another claim, or otherwise not current, is skipped and
+    counted in `duplicates_skipped_already_superseded`.
     """
     stats = ClusterStats(canonical_id=canonical_id)
     duplicates = [m for m in member_ids if m != canonical_id]
 
     for dup_id in duplicates:
         cur.execute(
-            "SELECT 'deduped' = ANY(labels), supersedes FROM claims WHERE id = %s::uuid",
+            "SELECT 'deduped' = ANY(labels), supersedes::text, "
+            "COALESCE(is_current, true) FROM claims WHERE id = %s::uuid",
             (dup_id,),
         )
         row = cur.fetchone()
         if row is None:
             continue  # claim was hard-deleted between the snapshot and now
-        if row[0]:
+        is_deduped, supersedes, is_current = row
+        if is_deduped:
             continue  # already deduped (a pre-2026-10 mark by this script)
-        if row[1] is not None:
-            # Already superseded by some other claim: the endpoint refuses to
-            # overwrite that pointer, so do not ask. Reported, not half-merged.
+        if supersedes is not None and str(supersedes) == canonical_id:
+            continue  # already marked onto this canonical (an earlier run)
+        if supersedes is not None or not is_current:
+            # Superseded by some other claim, or retired: the endpoint refuses
+            # to overwrite that, so do not ask. Reported, not half-merged.
             stats.duplicates_skipped_already_superseded += 1
             continue
         stats.duplicate_count += 1

@@ -51,13 +51,15 @@ edges is a separate operator task.
 
 `--execute` needs a bearer token (`--token` or `EPIGRAPH_TOKEN`) and refuses to
 start without one; `EPIGRAPH_API_BASE` (or `--api-base`) names the API. The
-endpoint requires write authority over both claims, so a cross-agent cluster
-needs a `claims:admin` token. A refused mark is reported with its HTTP status
-and the run exits 1.
+endpoint needs the `claims:write` scope and write authority over both claims,
+so a cross-agent cluster needs a token that also carries `claims:admin`. A
+refused mark is reported with its HTTP status and the run exits 1.
 
 A member that is not current, or already carries a `supersedes` pointer, is
 never the canonical; as a duplicate it is skipped and reported as
-`duplicates_skipped_already_superseded`.
+`duplicates_skipped_already_superseded` (also when it is the cluster's only
+other member), unless it is already marked onto this cluster's canonical by an
+earlier run, which is passed over silently.
 
 This is the **S3 fuzzy** layer. It is *not* the S2 content-hash-keyed
 backfill that gates migration 107 (`UNIQUE (content_hash, agent_id)`).

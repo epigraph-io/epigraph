@@ -106,7 +106,8 @@ class _Cursor:
             ]
         elif "supersedes" in sql and sql.lstrip().upper().startswith("SELECT"):
             c = self.claims.get(params[0])
-            self._one = None if c is None else (False, c["supersedes"])
+            # (is_deduped, supersedes, is_current)
+            self._one = None if c is None else (False, c["supersedes"], c["is_current"])
 
     def fetchone(self):
         return self._one
@@ -269,6 +270,40 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
         canonical = posts[0]["body"]["canonical_id"]
         self.assertIn(canonical, (DUP_A, DUP_B))
         self.assertNotIn(CANON, posts[0]["path"])
+        self.assertEqual(rc, 0, out)
+
+    def _single_group(self, members):
+        with open(self.input, "w") as fh:
+            json.dump({"groups": [{"rep": members[0], "members": members}]}, fh)
+
+    def test_a_lone_live_member_still_reports_its_already_superseded_duplicate(self):
+        # One live member (the canonical) and one member superseded by another
+        # claim: nothing to mark, but the skipped member is counted, not
+        # folded into "already deduped". The same in a dry run and executed.
+        self._single_group([CANON, DUP_SUPERSEDED])
+        for argv in ([], ["--execute"]):
+            with self.subTest(argv=argv):
+                _Recorder.requests = []
+                rc, out = self._run(
+                    argv, {"EPIGRAPH_TOKEN": "tok-123", "EPIGRAPH_API_BASE": self.base}
+                )
+                self.assertEqual(self._posts(), [], out)
+                self.assertRegex(out, r"duplicates_skipped_already_superseded:\s+1\b")
+                self.assertEqual(rc, 0, out)
+
+    def test_a_rerun_passes_over_its_own_earlier_marks(self):
+        # DUP_A was marked onto CANON by an earlier run (the endpoint set
+        # supersedes = CANON). A re-run neither re-posts it nor reports it as
+        # superseded elsewhere; DUP_B is still marked, DUP_SUPERSEDED counted.
+        self.claims[DUP_A] = {"is_current": False, "supersedes": CANON}
+        rc, out = self._run(
+            ["--execute"], {"EPIGRAPH_TOKEN": "tok-123", "EPIGRAPH_API_BASE": self.base}
+        )
+        self.assertEqual(
+            [p["path"] for p in self._posts()], [f"/api/v1/claims/{DUP_B}/dedup"], out
+        )
+        self.assertRegex(out, r"duplicates_marked:\s+1\b")
+        self.assertRegex(out, r"duplicates_skipped_already_superseded:\s+1\b")
         self.assertEqual(rc, 0, out)
 
 

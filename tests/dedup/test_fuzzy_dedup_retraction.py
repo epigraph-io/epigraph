@@ -10,7 +10,8 @@ marks through `POST /api/v1/claims/{dup}/dedup` and reads the database only.
 These tests assert the RECALL CONSEQUENCE and the identity edge, and drive the
 real script end to end against a disposable database. The executed-mark test
 also needs an API serving that database (DEDUP_TEST_API_BASE) and a bearer
-token for it (DEDUP_TEST_TOKEN) and skips without them; the rest are
+token for it with `claims:write` (plus `claims:admin` for a cross-agent
+cluster) in DEDUP_TEST_TOKEN, and skips without them; the rest are
 database-only. The request shape and the read-only contract are pinned without
 a database in scripts/tests/test_fuzzy_dedup_claims.py.
 
