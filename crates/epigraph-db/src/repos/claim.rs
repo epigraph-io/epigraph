@@ -11807,7 +11807,12 @@ async fn reverse_marked_duplicate(
     // UPDATE, which `edges_auto_factor` (INSERT only) never sees. A factor
     // keyed to an edge just moved back off the canonical names the canonical
     // (one an earlier un-mark in a chain minted there) and is stale; it goes
-    // first, then both endpoints' edges are re-minted.
+    // first, and the `(type, pair)` slots it held on the canonical are kept.
+    // Then the duplicate's edges are re-minted, and on the canonical only
+    // those freed slots: the un-mark leaves every other canonical factor as
+    // it found it. Two statements, not one data-modifying CTE: in one
+    // statement the INSERT's ON CONFLICT would still see the rows being
+    // deleted and leave the freed slot empty.
     let moved_back: Vec<String> = out
         .retargeted_back
         .iter()
@@ -11815,20 +11820,25 @@ async fn reverse_marked_duplicate(
         .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
         .map(|id| id.to_string())
         .collect();
-    if !moved_back.is_empty() {
-        sqlx::query(
+    let freed_slots: Vec<String> = if moved_back.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM factors f
               WHERE f.variable_ids @> ARRAY[$1]::uuid[]
-                AND f.properties->>'source_edge_id' = ANY($2)"#,
+                AND f.properties->>'source_edge_id' = ANY($2)
+             RETURNING f.factor_type || ':' || array_to_string(f.variable_ids, ',')"#,
         )
         .bind(canon_uuid)
         .bind(&moved_back)
-        .execute(&mut *conn)
-        .await?;
-    }
+        .fetch_all(&mut *conn)
+        .await?
+    };
     sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
-        .bind([dup_uuid, canon_uuid].as_slice())
+        .bind(dup_uuid)
+        .bind(canon_uuid)
+        .bind(&freed_slots)
         .execute(&mut *conn)
         .await?;
 
@@ -12002,20 +12012,29 @@ async fn reverse_marked_duplicate(
     Ok(out)
 }
 
-/// The INSERT minting the BP factors `edges_auto_factor` would mint for every in-force
-/// claim-claim edge touching the claims in `$1` whose endpoints are both current, as if
-/// each edge were inserted now: the body of migration 038's
-/// `auto_create_factor_from_edge`, over a set. For a path that puts edges
-/// back by UPDATE (which that INSERT trigger never sees) onto a claim made
-/// current again. A dedup identity edge is skipped (the act writes it after
-/// retiring the duplicate, so it never had one). One factor per
-/// `(factor_type, pair)`, from the earliest edge, and an existing one is kept
+/// The INSERT minting the BP factors `edges_auto_factor` would mint, as if
+/// each edge were inserted now, for every in-force claim-claim edge whose
+/// endpoints are both current and that either touches the claim `$1` or
+/// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
+/// (as `type:lo,hi`). For the un-mark, which puts edges back by UPDATE (which
+/// that INSERT trigger never sees) onto a claim made current again: `$1` is
+/// the duplicate, `$2` its canonical and `$3` the slots the stale-factor
+/// DELETE freed there.
+///
+/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// set, and must stay that: a migration that changes the trigger's mapping,
+/// potentials, description or properties changes this too (the
+/// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
+/// Like the trigger it mints `decomposes_to` factors, on the duplicate's
+/// edges. A dedup identity edge is skipped (the act writes it after retiring
+/// the duplicate, so it never had one). One factor per `(factor_type, pair)`,
+/// from the earliest edge, and an existing one is kept
 /// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
 const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
          INSERT INTO factors (factor_type, variable_ids, potential, description, properties)
          SELECT DISTINCT ON (x.ft, x.var_ids) x.ft, x.var_ids, x.pot, x.descr, x.props
            FROM (
-             SELECT e.id, e.created_at, m.ft,
+             SELECT e.id, e.created_at, m.ft, (e.source_id = $1 OR e.target_id = $1) AS on_dup,
                     CASE WHEN e.source_id < e.target_id
                          THEN ARRAY[e.source_id, e.target_id]
                          ELSE ARRAY[e.target_id, e.source_id] END AS var_ids,
@@ -12050,12 +12069,15 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                                 END AS score) ms
                ) m
               WHERE e.source_type = 'claim' AND e.target_type = 'claim'
-                AND e.valid_to IS NULL
-                AND (e.source_id = ANY($1) OR e.target_id = ANY($1))
+                -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
+                AND (e.valid_to IS NULL OR e.valid_to > now())
+                AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
                 AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
                 AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
                 AND m.ft IS NOT NULL
            ) x
+          WHERE x.on_dup
+             OR (x.ft || ':' || array_to_string(x.var_ids, ',')) = ANY($3)
           ORDER BY x.ft, x.var_ids, x.created_at, x.id
          ON CONFLICT DO NOTHING"#;
 

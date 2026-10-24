@@ -1248,3 +1248,35 @@ async fn a_freed_slot_on_the_canonical_goes_to_its_parallel_edge(pool: PgPool) {
         "the freed slot on the canonical is re-minted for its parallel edge"
     );
 }
+
+/// The un-mark rebuilds the duplicate's factors and the slots it frees on the
+/// canonical, and nothing else: a canonical edge whose factor something else
+/// removed (here a `decomposes_to` factor, as a sweep of those would) stays
+/// without one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_leaves_the_canonicals_other_factors_as_it_found_them(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let atom = fixture::seed_public_claim(&pool, a, "atom").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let e_dec = edge(&pool, canonical, atom, "decomposes_to").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_dec)
+        .execute(&pool)
+        .await
+        .expect("remove the decomposition's factor");
+    let e_sup = edge(&pool, supporter, dup, "supports").await;
+
+    let repair = mark(&pool, dup, canonical).await;
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_sup).await,
+        vec![sorted_pair(supporter, dup)],
+        "calibration: the un-mark re-minted the duplicate's factor"
+    );
+    assert!(
+        factors_of_edge(&pool, e_dec).await.is_empty(),
+        "the un-mark mints nothing for a canonical edge it did not move"
+    );
+}
