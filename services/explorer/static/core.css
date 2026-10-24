@@ -1,0 +1,346 @@
+/* EpiGraph Explorer — core area: landing, search, claim page.
+ *
+ * Builds on app.css custom properties; no inline styles (CSP style-src
+ * 'self'). Layouts collapse to one column below ~48rem and hold at 400px.
+ */
+
+/* ---- search panel (landing + search page) -------------------------------- */
+
+.search-panel {
+  margin: 0 0 var(--space-5);
+  max-width: 44rem;
+}
+
+.search-panel__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.search-panel__row input[type="search"] {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.search-panel__row select {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.search-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  border: 0;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+}
+
+.search-modes legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+}
+
+.search-modes__option {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+}
+
+.search-panel__hint {
+  margin: var(--space-2) 0 0;
+}
+
+/* ---- landing ------------------------------------------------------------- */
+
+.landing-hero {
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.landing-hero .lead {
+  max-width: var(--measure);
+  color: var(--text-muted);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.stats__item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+}
+
+.stats__item dt {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.stats__item dd {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+}
+
+.landing-overviews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 0 var(--space-6);
+}
+
+.landing-overviews > .section {
+  margin-block: var(--space-4);
+}
+
+.overview-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.overview-list a {
+  overflow-wrap: anywhere;
+}
+
+/* ---- search results ------------------------------------------------------ */
+
+.results {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+}
+
+.result {
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.result:last-child {
+  border-bottom: 0;
+}
+
+.result__text {
+  margin: 0 0 var(--space-1);
+  max-width: var(--measure);
+  overflow-wrap: break-word;
+}
+
+.result__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  align-items: baseline;
+  margin: 0;
+}
+
+.result__score {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.result__superseded {
+  color: var(--refute);
+}
+
+.result__labels {
+  margin: var(--space-2) 0 0;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+/* ---- claim page ---------------------------------------------------------- */
+
+.claim__header {
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.claim__kicker {
+  font-size: 0.875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  margin: 0 0 var(--space-3);
+}
+
+.claim__content {
+  margin: 0 0 var(--space-4);
+  padding: 0 0 0 var(--space-4);
+  border-left: 3px solid var(--accent);
+  white-space: pre-line;
+}
+
+.claim__nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  font-size: 0.95rem;
+}
+
+.claim-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+.claim-layout__aside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.claim-panel .section__title {
+  margin-top: 0;
+}
+
+.claim-panel .meta dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.claim-meter {
+  width: 6rem;
+  max-width: 100%;
+  height: 0.6rem;
+}
+
+@media (max-width: 48rem) {
+  .claim-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .claim-layout__aside {
+    margin-top: 0;
+  }
+}
+
+/* Connections, grouped by relationship family. */
+.outlinks__family {
+  margin: var(--space-4) 0 var(--space-5);
+  padding-left: var(--space-4);
+  border-left: 3px solid var(--border);
+}
+
+.outlinks__family--support {
+  border-left-color: var(--support);
+}
+
+.outlinks__family--refute {
+  border-left-color: var(--refute);
+}
+
+.outlinks__family-title {
+  margin-top: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+
+.outlinks__family--support .outlinks__family-title {
+  color: var(--support);
+}
+
+.outlinks__family--refute .outlinks__family-title {
+  color: var(--refute);
+}
+
+.outlinks__heading {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.outlinks__list > li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--space-2) 0;
+}
+
+.outlinks__list a,
+.outlinks__plain {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+/* Evidence, challenges, provenance. */
+.evidence-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: baseline;
+  margin: 0 0 var(--space-1);
+}
+
+.evidence-item__text {
+  margin: 0 0 var(--space-1);
+  max-width: var(--measure);
+  overflow-wrap: break-word;
+  white-space: pre-line;
+}
+
+.challenge__state {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.challenge--accepted .challenge__state {
+  color: var(--refute);
+}
+
+.challenge--rejected .challenge__state {
+  color: var(--text-muted);
+}
+
+.provenance-path {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-2);
+}
+
+.provenance-path__step {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+
+.provenance-path__sep {
+  align-self: center;
+  color: var(--text-muted);
+}
+
+/* Anonymous claim page. */
+.signin-prompt h1 {
+  margin-top: 0;
+}

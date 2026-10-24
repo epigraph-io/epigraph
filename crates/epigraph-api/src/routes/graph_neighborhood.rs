@@ -1,13 +1,16 @@
 //! /api/v1/graph/neighborhoods/:id/expand — compound + atomic modes.
 //!
-//! Compound mode (this file): nodes are compound claims (those with
+//! Compound mode (the default): nodes are compound claims (those with
 //! decomposes_to children inside the neighborhood) plus standalone claims
 //! (no decomposes_to in either direction). Edges are induced from atom-level
 //! relationships (mass-weighted by `forward_strength`) plus direct
 //! compound-compound edges that exist outside the decomposition hierarchy.
 //!
-//! Atomic mode is implemented in Task 8 — for now `atomic_response` returns
-//! an empty placeholder.
+//! Atomic mode (`?mode=atomic`) returns the neighborhood's member claims
+//! themselves, the epistemic edges between them (`decomposes_to` excluded,
+//! positive `forward_strength` only), and the compound groups those atoms
+//! belong to. Neither mode applies `budget` yet, so both report
+//! `truncated: false`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -138,10 +141,10 @@ pub async fn expand(
     use axum::http::StatusCode;
     // Conversion shard 5. ONE viewer-stamped connection for the whole response.
     //
-    // The existence probe immediately below reads `graph_neighborhoods` and
-    // `graph_cluster_runs`; measured at migration head 92 NEITHER carries row
+    // The run lookup and the existence probe immediately below read the
+    // clustering-run tables; measured at migration head 92 NEITHER carries row
     // level security (`pg_class.relrowsecurity` is false on both, and no policy
-    // exists on either), so stamping this statement narrows nothing and this
+    // exists on either), so stamping these statements narrows nothing and the
     // probe is NOT made viewer-filtered by the change. What the stamp is for is
     // the node projections in `atomic_response` / `compound_response`, which
     // read `claims`, `edges` and `claim_neighborhood_membership`.
@@ -157,14 +160,33 @@ pub async fn expand(
             "Failed to acquire a scoped connection".to_string(),
         )
     })?;
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM graph_neighborhoods WHERE id = $1 \
-         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
-    )
-    .bind(neighborhood_id)
-    .fetch_optional(&mut *read)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The latest-run lookup was a SUBQUERY inside the existence probe below.
+    // It is split out so it goes through `ClusterRunRepository::latest`, the
+    // one spelling `GET /claims/:id/placement` also reads: this route must
+    // accept the `neighborhood_id`s that route hands out, and two copies of
+    // "newest completed_at" are free to drift the day either changes. The
+    // lookup runs on the same viewer-stamped connection as the probe.
+    //
+    // Splitting it also makes "no run has ever completed" its own arm. The
+    // subquery form returned NULL there, the probe matched nothing, and the
+    // handler answered "neighborhood not found in latest run" — the same 404
+    // this arm returns, so the behaviour is unchanged.
+    let latest_run = epigraph_db::ClusterRunRepository::latest(&mut *read)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(run_id) = latest_run.map(|r| r.run_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "neighborhood not found in latest run".into(),
+        ));
+    };
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM graph_neighborhoods WHERE id = $1 AND run_id = $2")
+            .bind(neighborhood_id)
+            .bind(run_id)
+            .fetch_optional(&mut *read)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if exists.is_none() {
         return Err((
             StatusCode::NOT_FOUND,

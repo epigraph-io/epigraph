@@ -1,0 +1,395 @@
+/* EpiGraph Explorer — graph area: the SVG canvas (static/graph.js) and the
+ * theme / community / neighbourhood views.
+ *
+ * Reuses the custom properties from app.css so light and dark stay in step.
+ * Node fills are computed in graph.js (a continuous ramp cannot be a class)
+ * and set as SVG presentation attributes, which CSP style-src 'self' allows;
+ * everything else is here.
+ */
+
+/* Rules below give some of these elements a display value, which would
+ * beat the UA's [hidden] rule; keep the attribute authoritative for
+ * everything graph.js toggles. */
+.graph[hidden],
+.graph [hidden],
+.graph-share[hidden] {
+  display: none !important;
+}
+
+.graph-title {
+  margin-bottom: var(--space-2);
+}
+
+.graph-lead {
+  margin-bottom: var(--space-4);
+}
+
+.graph-crumbs {
+  margin-bottom: var(--space-2);
+}
+
+/* ---- canvas --------------------------------------------------------------- */
+
+.graph {
+  margin: var(--space-5) 0;
+}
+
+.graph__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-2);
+}
+
+.graph__status {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.graph__status--error {
+  color: var(--refute);
+}
+
+.graph__fit {
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.875rem;
+}
+
+.graph__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(15rem, 19rem);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.graph__stage {
+  position: relative;
+  height: clamp(22rem, 62vh, 40rem);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.graph__svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.graph__svg--panning {
+  cursor: grabbing;
+}
+
+.graph__bg {
+  fill: transparent;
+}
+
+.graph__panel {
+  padding: var(--space-4);
+  min-width: 0;
+}
+
+.graph__panel-title {
+  font-size: 1.05rem;
+  margin: 0 0 var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.graph__panel-type {
+  margin-bottom: var(--space-3);
+}
+
+.graph__panel-content {
+  font-size: 0.95rem;
+  line-height: 1.55;
+  max-height: 14rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.graph__panel-meta {
+  margin-bottom: var(--space-3);
+}
+
+.graph__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 var(--space-2);
+}
+
+.graph__actions .button,
+.graph__actions .button-quiet,
+.graph__actions button {
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.875rem;
+}
+
+.graph__actions button[disabled] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.graph__panel-status {
+  margin: 0;
+  min-height: 1.4em;
+}
+
+.graph__cap {
+  margin-top: var(--space-3);
+  max-width: none;
+  padding: var(--space-3) var(--space-4);
+}
+
+.graph__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin-top: var(--space-3);
+}
+
+.graph__key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.graph__swatch {
+  display: inline-block;
+  width: 1.6rem;
+  height: 0;
+  border-top: 2px solid var(--support);
+}
+
+.graph__swatch--refute {
+  border-top: 2px dashed var(--refute);
+}
+
+.graph__swatch--structural {
+  border-top: 1px solid var(--text-muted);
+}
+
+.graph__ramp {
+  display: inline-block;
+  width: 3rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  /* Mirrors RAMP_* in graph.js; tests/graph.rs keeps the two in step. */
+  background: linear-gradient(90deg, hsl(212, 35%, 72%), hsl(212, 70%, 38%));
+}
+
+.graph__help {
+  margin-top: var(--space-3);
+  color: var(--text-muted);
+}
+
+.graph__help summary {
+  cursor: pointer;
+}
+
+.graph__help ul {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+}
+
+@media (prefers-color-scheme: dark) {
+  .graph__ramp {
+    background: linear-gradient(90deg, hsl(212, 35%, 36%), hsl(212, 70%, 76%));
+  }
+}
+
+@media (max-width: 48rem) {
+  .graph__body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .graph__stage {
+    height: clamp(18rem, 55vh, 28rem);
+  }
+}
+
+/* ---- SVG marks ------------------------------------------------------------ */
+
+.gedge {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.gedge--support {
+  stroke: var(--support);
+}
+
+.gedge--refute {
+  stroke: var(--refute);
+  stroke-dasharray: 6 4;
+}
+
+.gedge--structural {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  opacity: 0.55;
+}
+
+.gedge--active {
+  stroke-width: 2.5;
+  opacity: 1;
+}
+
+.garrow--support {
+  fill: var(--support);
+}
+
+.garrow--refute {
+  fill: var(--refute);
+}
+
+.garrow--structural {
+  fill: var(--text-muted);
+}
+
+.gnode {
+  cursor: pointer;
+  outline: none;
+}
+
+/* Every node keeps an outline that clears 3:1 against the stage, whatever the
+ * belief ramp does to its fill; --surface here would be the stage's own colour,
+ * which erases a pale node instead of separating it. */
+.gnode circle {
+  stroke: var(--text-muted);
+  stroke-width: 1.5;
+}
+
+.gnode--entity circle {
+  stroke: var(--text-muted);
+  stroke-dasharray: 3 2;
+}
+
+.gnode--center circle {
+  stroke: var(--text);
+  stroke-width: 2.5;
+}
+
+.gnode--selected circle {
+  stroke: var(--accent);
+  stroke-width: 3.5;
+  stroke-dasharray: none;
+}
+
+.gnode:focus-visible circle {
+  stroke: var(--focus);
+  stroke-width: 4;
+  stroke-dasharray: none;
+}
+
+.glabel {
+  display: none;
+  fill: var(--text);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.gnode--center .glabel,
+.gnode--selected .glabel,
+.gnode:hover .glabel,
+.gnode:focus .glabel,
+.graph__svg--zoomed .glabel {
+  display: inline;
+}
+
+/* ---- non-permalink notice, mode toggle, lists ----------------------------- */
+
+.graph-permalink {
+  margin-bottom: var(--space-5);
+}
+
+.graph-permalink p:last-child,
+.graph-expired p:last-child {
+  margin-bottom: 0;
+}
+
+.graph-permalink__share a {
+  overflow-wrap: anywhere;
+}
+
+.graph-share {
+  margin-left: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.875rem;
+}
+
+.graph-expired h2 {
+  margin-top: 0;
+  font-size: 1.2rem;
+}
+
+.graph-modes {
+  display: inline-flex;
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: var(--space-2);
+}
+
+.graph-mode {
+  padding: var(--space-2) var(--space-4);
+  text-decoration: none;
+  color: var(--text);
+  background: var(--surface);
+}
+
+.graph-mode + .graph-mode {
+  border-left: 1px solid var(--border);
+}
+
+.graph-mode[aria-current="page"] {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+}
+
+.graph-list .graph-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.graph-list .graph-row a {
+  overflow-wrap: anywhere;
+}
+
+.graph-row__rel {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.graph-row--support .graph-row__rel {
+  color: var(--support);
+}
+
+.graph-row--refute .graph-row__rel {
+  color: var(--refute);
+}
+
+.graph-edges td {
+  overflow-wrap: anywhere;
+}

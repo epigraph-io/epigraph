@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block title %}Sign in · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("auth.css") }}">
+<meta name="robots" content="noindex">
+<script src="{{ ctx.static_url("embed.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<section class="auth-page card" aria-labelledby="signin-title">
+  <h1 id="signin-title">Sign in to {{ ctx.product_name() }}</h1>
+  <p class="lead">Sign-in opens in a separate window: EpiGraph's sign-in page cannot run inside an embedded page.</p>
+  <div class="auth-page__actions">
+    <button type="button" id="epx-embed-signin" hidden
+            data-login="{{ popup_login_url }}"
+            data-redeem="{{ redeem_url }}"
+            data-return-to="{{ return_to }}">Sign in</button>
+  </div>
+  <p id="epx-embed-status" class="auth-page__status notice" role="status" aria-live="polite" hidden></p>
+  <noscript><p class="notice notice--warn">Signing in from an embedded page needs JavaScript.</p></noscript>
+  <p class="small muted">You can also <a href="{{ open_url }}" target="_blank" rel="noopener">open {{ ctx.product_name() }} in a new tab</a> and sign in there.</p>
+</section>
+{% endblock %}
