@@ -567,3 +567,75 @@ async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(po
         "a claim signed after the rotation is not bound: {resp}"
     );
 }
+
+/// Every read this slice adds runs on the APPLICATION role in production, not
+/// on the superuser pool the other tests use: verify_claim's `agent_keys`
+/// join and the boot check's `agents` / `agent_keys` lookups. Migration 077
+/// grants `epigraph_app` SELECT on every table (`ON ALL TABLES` and the
+/// default privileges), and 118 revokes only UPDATE / DELETE on
+/// `agent_keys`; this drives both reads on a pool DOWNGRADED to
+/// `epigraph_app`, with no extra grant, so a lost SELECT fails here instead
+/// of every container's boot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_new_reads_work_on_the_application_role(pool: PgPool) {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(&pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(!bypassrls, "epigraph_app holds BYPASSRLS: this arm is vacuous");
+
+    let t0 = Utc::now() - Duration::days(10);
+    let identity = signer(0xA1);
+    let signing = signer(0xA2);
+    let agent = seed_agent(&pool, &identity.public_key(), t0).await;
+    seed_key(&pool, agent, &signing.public_key(), "signing", "active", t0, None).await;
+    let claim = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &signing,
+        "D2: verified on the application role",
+        t0 + Duration::days(1),
+    )
+    .await;
+    // Resolve on the superuser pool (see `fixture::downgraded_pool`), read on
+    // the downgraded one.
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&app)
+        .await
+        .expect("current_user");
+    assert_eq!(role, "epigraph_app", "calibration: the pool is downgraded");
+
+    assert_eq!(
+        epigraph_mcp::signing_identity::check_signing_key(
+            &app,
+            &identity.public_key(),
+            &signing.public_key()
+        )
+        .await,
+        Ok(agent),
+        "the boot check reads agents and agent_keys as epigraph_app"
+    );
+
+    let server = build_test_server(app.clone());
+    let out = verify_claim(
+        &server,
+        &viewer,
+        VerifyClaimParams {
+            claim_id: claim.to_string(),
+        },
+    )
+    .await
+    .expect("verify_claim on the application role");
+    let resp: Value = common::first_text(&out);
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(true), Value::from("signing")),
+        "{resp}"
+    );
+}
