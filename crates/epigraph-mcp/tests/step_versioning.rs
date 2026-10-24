@@ -1168,3 +1168,29 @@ async fn find_workflow_evolved_steps_name_the_current_head_and_flag_retirement(p
         "concurrent revises heads must be flagged pending: {s4}"
     );
 }
+
+/// With resolve_to_latest=true a lineage head below min_truth is returned
+/// (flagged), so the min_truth contract an agent reads must state that
+/// exception instead of promising deprecated rows are always hidden.
+#[test]
+fn min_truth_description_states_the_lineage_head_exception() {
+    let tools = EpiGraphMcpFull::all_tools_json();
+    let d = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "find_workflow_hierarchical")
+        .and_then(|t| t["inputSchema"]["properties"]["min_truth"]["description"].as_str())
+        .expect("find_workflow_hierarchical.min_truth carries a description")
+        .to_string();
+    for needle in [
+        "with resolve_to_latest=true the lineage head",
+        "always returned",
+        "lineage_head_deprecated",
+    ] {
+        assert!(
+            d.contains(needle),
+            "min_truth must say {needle:?}; got: {d}"
+        );
+    }
+}

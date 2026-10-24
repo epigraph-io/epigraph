@@ -189,7 +189,10 @@ pub struct HierarchicalSearchQuery {
     #[serde(default)]
     pub resolve_to_latest: bool,
     /// Minimum `truth_value` to surface. Defaults to 0.3 so rows
-    /// deprecated via `deprecate_workflow` (truth=0.05) drop out.
+    /// deprecated via `deprecate_workflow` (truth=0.05) drop out. Exception:
+    /// with `resolve_to_latest=true` the lineage head of each matched
+    /// `canonical_name` is always returned, flagged `lineage_head_deprecated`
+    /// when its truth is below `min_truth`.
     pub min_truth: Option<f64>,
 }
 

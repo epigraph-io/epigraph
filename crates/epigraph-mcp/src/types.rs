@@ -942,7 +942,7 @@ pub struct FindWorkflowHierarchicalParams {
     pub resolve_to_latest: Option<bool>,
 
     #[schemars(
-        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows."
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when its truth is below min_truth."
     )]
     pub min_truth: Option<f64>,
 }
