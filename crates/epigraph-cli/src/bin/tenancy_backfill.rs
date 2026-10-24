@@ -1962,13 +1962,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_bind_group_role", 165),
     ("epigraph_define_group_role", 165),
     ("epigraph_end_group_role_binding", 165),
-    // The derivation, the effective writer test and the roster read the
+    // The derivation and the roster read the
     // FORCEd `group_role_bindings`, `role_assignments` and `group_memberships`
     // through `epigraph_definer_bypass()`: under a non-member owner every
     // read is filtered to nothing, so nobody derives anything (fail-closed,
     // QUIET: role members silently lose the group).
     ("epigraph_role_derived_memberships", 165),
-    ("epigraph_writes_group_at", 165),
     ("epigraph_group_role_roster", 165),
 ];
 
@@ -2617,10 +2616,10 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             false,
         ),
         // 165: binding a role to a group is a maintenance act, and the
-        // derivation, the effective writer test and the roster answer for any
-        // principal (a roster oracle); the request DSN calls none of them.
-        // It reaches the derivation only through `epigraph_live_memberships`
-        // and the claims trigger's writer scope, both maintenance-owned.
+        // derivation and the roster answer for any principal (a roster
+        // oracle); the request DSN calls none of them. It reaches the
+        // derivation only through `epigraph_live_memberships` and the claims
+        // trigger's writer scope, both maintenance-owned.
         (
             "epigraph_define_group_role",
             "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
@@ -2639,11 +2638,6 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_role_derived_memberships",
             "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_writes_group_at",
-            "public.epigraph_writes_group_at(uuid, uuid, timestamp with time zone, boolean)",
             false,
         ),
         (

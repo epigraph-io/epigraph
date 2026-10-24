@@ -1575,10 +1575,10 @@ restart.
   `epigraph_operator_actor`) or live 149 allowance names such a human.
   Re-states `epigraph_live_memberships(uuid)` as 164's body UNION the derived
   rows at `now()` (signature, result, owner and app grant unchanged), and
-  123's `epigraph_require_writer_scope` (OPL02, armed only) to ask
-  `epigraph_writes_group_at(uuid, uuid, timestamptz, boolean)`: 122's direct
-  test or a live writer binding whose role the human holds then (on behalf of
-  an agent, only a binding that includes agents). 122's
+  123's `epigraph_require_writer_scope` (OPL02, armed only) to admit, after
+  122's direct test, the WRITING PRINCIPAL's own derived `writer` membership
+  (the viewer's rule, so a retired-linked or deactivated agent of a role
+  holder is refused even with a forged stamp or its OPL01 valve open). 122's
   `epigraph_operator_writes_group` (the membership door, the team-group
   verbs) is NOT changed: it stays direct-only so no explicit row can outlive
   a window. `epigraph_group_role_roster(uuid, timestamptz)` (maintenance only)

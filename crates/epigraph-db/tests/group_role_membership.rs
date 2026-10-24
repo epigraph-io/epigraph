@@ -443,10 +443,10 @@ async fn bound_group(pool: &PgPool, name: &str, member_role: &str, agents: bool)
 /// `(prosecdef, owner, proacl, proconfig)` of one function.
 type CatalogRow = (bool, String, Option<String>, Option<Vec<String>>);
 
-/// The six new functions are `SECURITY DEFINER`, owned by
+/// The five new functions are `SECURITY DEFINER`, owned by
 /// `epigraph_maintenance`, pin their search path, and are NOT executable by
-/// PUBLIC or the application role: the derived-membership helper, the
-/// effective writer test and the roster answer for ANY principal (an unbound
+/// PUBLIC or the application role: the derived-membership helper and the
+/// roster answer for ANY principal (an unbound
 /// roster read is an oracle, 123's rule), and the three binding verbs are
 /// maintenance acts. `epigraph_live_memberships(uuid)` keeps exactly the
 /// signature, result and application grant every viewer (and every pinned
@@ -457,7 +457,6 @@ type CatalogRow = (bool, String, Option<String>, Option<Vec<String>>);
 async fn the_new_helpers_are_maintenance_definers_the_app_role_cannot_call(pool: PgPool) {
     for signature in [
         "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
-        "public.epigraph_writes_group_at(uuid, uuid, timestamp with time zone, boolean)",
         "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
         "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
         "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
@@ -544,11 +543,6 @@ async fn the_app_role_has_no_roster_oracle(pool: PgPool) {
           WHERE group_id = $2",
         "SELECT count(*) FROM public.epigraph_group_role_roster($2, now()) WHERE true \
             AND $1::uuid IS NOT NULL",
-        // The boolean is CONSUMED: a `count(*)` over a subquery whose column
-        // is unused lets the planner drop the call, and an uncalled function
-        // meets no EXECUTE check.
-        "SELECT CASE WHEN public.epigraph_writes_group_at($1, $2, now(), false) \
-                THEN 1::bigint ELSE 0::bigint END",
     ];
     for sql in calls {
         let r: Result<i64, _> = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {

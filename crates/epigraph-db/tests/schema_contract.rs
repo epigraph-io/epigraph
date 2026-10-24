@@ -3099,10 +3099,10 @@ async fn migration_131_admin_act_reader_is_owned_and_granted(pool: PgPool) {
 /// re-bodies is a SECURITY DEFINER owned by `epigraph_maintenance` with an
 /// explicit ACL that excludes PUBLIC; the application role executes only the
 /// two re-bodied reads it already called (the viewer's group-set read and the
-/// claims-path writer scope), never the derivation, the effective writer
-/// test, the roster or the binding verbs; the binding table is SELECT-only for
-/// the app (and row security shows it nothing) and SELECT/INSERT plus the end
-/// columns for maintenance; the one-live-binding index is partial; and the
+/// claims-path writer scope), never the derivation, the roster or the
+/// binding verbs; the binding table is SELECT-only for the app (and row
+/// security shows it nothing) and SELECT/INSERT plus the end columns for
+/// maintenance; the one-live-binding index is partial; and the
 /// four guard/audit triggers exist. Pinned here because the harness migrates
 /// as a superuser, so a silently no-opped `OWNER TO` or a PUBLIC grant would
 /// pass every behavioural test.
@@ -3124,12 +3124,6 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
         (
             "epigraph_role_derived_memberships",
             "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
-            "s",
-            false,
-        ),
-        (
-            "epigraph_writes_group_at",
-            "public.epigraph_writes_group_at(uuid, uuid, timestamp with time zone, boolean)",
             "s",
             false,
         ),

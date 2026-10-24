@@ -1285,7 +1285,11 @@ operator link, or a service client allowed for that human
 (`allow-author-binding-client`). A retired link, an agent whose acting row was
 revoked, and anyone whose human was revoked or whose human client was
 suspended never derive. A binding never confers `admin`, and a role that
-elevates or reads the audit trail cannot be bound.
+elevates or reads the audit trail cannot be bound. Once the operator binding
+is armed, the database's claim-write check (OPL02) asks the same question,
+keyed on the WRITING principal itself: an agent that does not derive the group
+is refused a claim write into it even with a forged stamp, and even with its
+session's link valve open.
 
 Nothing is written to the group's roster for these members. Membership is
 computed each time a viewer is resolved, so it LAPSES at the assignment's

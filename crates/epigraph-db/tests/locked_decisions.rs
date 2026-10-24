@@ -1585,7 +1585,6 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         // `epigraph_live_memberships` and the claims trigger.
         "epigraph_role_derived_memberships",
         "epigraph_group_role_roster",
-        "epigraph_writes_group_at",
         "FROM group_role_bindings",
     ];
     const READ_ROOTS: usize = 2;
