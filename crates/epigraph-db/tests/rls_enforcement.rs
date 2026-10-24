@@ -315,6 +315,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    (
+        "role_agents",
+        "DELETE",
+        "A role attachment (166) is ended by its detach stamp, never deleted: the row is the \
+         record that the agent belonged to the role, from when to when. Under FORCE the \
+         absent DELETE policy default-denies every non-superuser role, 166 grants DELETE to \
+         nobody, and its guards refuse DELETE and TRUNCATE for every role, a superuser \
+         included, short of disabling triggers.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -386,6 +395,7 @@ const PROTECTED: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "role_agents",
 ];
 
 // ===========================================================================

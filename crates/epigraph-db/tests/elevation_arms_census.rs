@@ -110,6 +110,11 @@ const EXCLUDED: &[(&str, &str)] = &[
         "agent lineage (161): written only by the attestor's registration definer, read \
          only through the prompt-history definer, which has its own admin arm",
     ),
+    (
+        "role_agents",
+        "role attachments (166): maintenance-written, read only through the role-agent \
+         definers; an attachment confers no read and widens nothing",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (

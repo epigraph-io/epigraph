@@ -719,6 +719,19 @@ impl From<DbError> for ApiError {
                         .to_string(),
                 }
             }
+            // Migration 166 (ROL01): a role's agent wrote while no human holds
+            // the role, or while its linked human is not the holder. The agent
+            // and role stay in the log.
+            DbError::RoleHolderRequired { message } => {
+                tracing::warn!(detail = %message, "role-attached agent without its live holder");
+                ApiError::Forbidden {
+                    reason: "ROL01: the writing or named agent is attached to a role that no \
+                             human holds now, or whose holder is not the agent's linked human; a \
+                             role's agents write only while a human holds the role, and only for \
+                             that holder. Nothing was written."
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -898,6 +911,29 @@ mod tests {
             ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
             other => panic!("OPL02 must be Forbidden: {other:?}"),
         }
+    }
+
+    /// Migration 166's ROL01 is a DENIAL (403) carrying its code; the
+    /// database's text (agent and role) stays in the log. Mutation caught: the
+    /// arm removed (it falls to the fault arm).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_role_agent_without_its_holder_is_forbidden_with_the_code() {
+        let api = ApiError::from(DbError::RoleHolderRequired {
+            message: "ROL01: agent 00000000-0000-0000-0000-00000000abcd is attached to role r"
+                .to_string(),
+        });
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.starts_with("ROL01"), "the code: {reason}");
+                assert!(
+                    !reason.contains("00000000-0000-0000-0000-00000000abcd"),
+                    "the database text must stay server-side: {reason}"
+                );
+            }
+            other => panic!("ROL01 must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     /// An elevated request asking to write is a 403 denial naming the remedy,

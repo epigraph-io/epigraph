@@ -2254,6 +2254,7 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "role_agents",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2347,6 +2348,12 @@ const AGENT_IDENTITY_TABLES: &[&str] = &[
     "agent_succession",
 ];
 
+/// The role attachments, which migration 166 creates and FORCEs. An ELEVENTH
+/// TERM for the same reason as the ten above: FORCEd by the migration that
+/// creates it, none of the earlier kinds, and carrying no `visibility` /
+/// `owner_group_id` columns, so it does not join `tier_a`.
+const ROLE_AGENT_TABLES: &[&str] = &["role_agents"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2402,6 +2409,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(ELEVATED_ACCESS_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ADMIN_ACT_TABLES.iter().map(|s| (*s).to_string()))
         .chain(AGENT_IDENTITY_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ROLE_AGENT_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()
