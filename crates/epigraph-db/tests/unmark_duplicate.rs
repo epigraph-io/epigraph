@@ -1311,3 +1311,34 @@ async fn a_malformed_matcher_score_does_not_block_the_unmark(pool: PgPool) {
     unmark(&pool, dup, &repair.revert).await;
     assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
 }
+
+/// A patched matcher score that is decimal-shaped but whose exponent
+/// overflows `numeric` (e.g. "1e999999") must not abort the un-mark either:
+/// the cast would raise "value overflows numeric format", so the shape guard
+/// has to reject it and the re-mint falls back to the constant strength.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_overflowing_matcher_score_exponent_does_not_block_the_unmark(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let source = fixture::seed_public_claim(&pool, a, "matched source").await;
+    let e = edge_with_props(
+        &pool,
+        source,
+        dup,
+        "CORROBORATES",
+        serde_json::json!({"source": "cross_source_matcher", "score": 0.9}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE edges SET properties = jsonb_set(properties, '{score}', '\"1e999999\"') WHERE id = $1",
+    )
+    .bind(e)
+    .execute(&pool)
+    .await
+    .expect("patch the score");
+
+    let repair = mark(&pool, dup, canonical).await;
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
+}

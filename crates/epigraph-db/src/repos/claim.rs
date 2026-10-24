@@ -12056,8 +12056,10 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                -- to [0, 1]. The trigger casts it at INSERT; properties can be
                -- patched since, so a score that is not a decimal number falls
                -- back to the constant (as a missing one does) instead of
-               -- failing the whole un-mark. Clamped as numeric, then cast, so
-               -- an out-of-range exponent cannot overflow the double either.
+               -- failing the whole un-mark. The exponent is bounded to three
+               -- digits so the numeric cast itself cannot overflow (numeric_in
+               -- raises on e.g. "1e999999"); clamped as numeric, then cast, so
+               -- a large in-range exponent cannot overflow the double either.
                CROSS JOIN LATERAL (
                  SELECT ft.factor_type AS ft,
                         COALESCE(ms.score, ft.forward_strength) AS fwd,
@@ -12067,7 +12069,7 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                                       AND e.properties->>'source' = 'cross_source_matcher'
                                       AND e.properties ? 'score'
                                       AND e.properties->>'score'
-                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?\s*$'
+                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,3})?\s*$'
                                      THEN GREATEST(0.0, LEAST(1.0,
                                               (e.properties->>'score')::numeric))::double precision
                                 END AS score) ms
