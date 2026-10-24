@@ -1358,9 +1358,7 @@ async fn restate_as(
 /// skipped whenever `p_inherited` is true (the sibling's and the human's
 /// restatements land).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_restatement_names_an_attached_author_only_while_held_unless_it_is_retired(
-    pool: PgPool,
-) {
+async fn a_restatement_names_an_attached_author_only_while_held_unless_it_is_retired(pool: PgPool) {
     seed_role(&pool, ROLE).await;
     let (h, h_group) = human(&pool, "holder").await;
     let attached = agent_of(&pool, h, "curator").await;
@@ -1584,9 +1582,8 @@ async fn a_succession_copy_keeps_the_parents_window(pool: PgPool) {
 /// maintenance definer.
 async fn attach_window(pool: &PgPool, role: &str, agent: Uuid, from: &str, to: &str) -> Uuid {
     let role = role.to_string();
-    let sql = format!(
-        "SELECT public.epigraph_attach_agent_to_role($1, $2, {from}, {to}, 'test window')"
-    );
+    let sql =
+        format!("SELECT public.epigraph_attach_agent_to_role($1, $2, {from}, {to}, 'test window')");
     fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let id: Uuid = sqlx::query_scalar(&sql)
             .bind(&role)
@@ -1654,7 +1651,10 @@ async fn a_succession_copy_fills_every_gap_in_the_childs_own_window(pool: PgPool
     )
     .await;
 
-    assert_eq!(register(&pool, &child_key, Some(parent), "g-166-gaps").await, child);
+    assert_eq!(
+        register(&pool, &child_key, Some(parent), "g-166-gaps").await,
+        child
+    );
     assert_eq!(
         uncovered_by(&pool, parent_row, child).await,
         ("{}".to_string(), 2),
@@ -1745,7 +1745,10 @@ async fn a_shared_identity_inherits_no_attachment_and_the_audit_says_why(pool: P
 
     let shared_key = random32();
     let shared = register(&pool, &shared_key, None, "g-166-elsewhere").await;
-    assert_eq!(register(&pool, &shared_key, Some(parent), "g-166-own").await, shared);
+    assert_eq!(
+        register(&pool, &shared_key, Some(parent), "g-166-own").await,
+        shared
+    );
     assert!(
         live_attachments(&pool, shared).await.is_empty(),
         "a shared identity inherits no attachment"
@@ -1818,7 +1821,10 @@ async fn attaching_an_identity_skips_a_shared_successor_and_the_audit_says_why(p
     }
     let shared_key = random32();
     let shared = register(&pool, &shared_key, Some(parent), "g-166-ln-own").await;
-    assert_eq!(register(&pool, &shared_key, None, "g-166-ln-elsewhere").await, shared);
+    assert_eq!(
+        register(&pool, &shared_key, None, "g-166-ln-elsewhere").await,
+        shared
+    );
     let own = register(&pool, &random32(), Some(parent), "g-166-ln-own").await;
 
     let row = attach(&pool, ROLE, parent).await;
@@ -2012,7 +2018,8 @@ const WRITE_CLASSES: &[WriteClass] = &[
     WriteClass {
         what: "claim properties UPDATE",
         target: Target::Claim,
-        sql: "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"probe\": 1}' \
+        sql:
+            "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"probe\": 1}' \
                WHERE id = $1 AND $2::uuid IS NOT NULL",
     },
     WriteClass {
@@ -2029,7 +2036,8 @@ const WRITE_CLASSES: &[WriteClass] = &[
     WriteClass {
         what: "evidence INSERT",
         target: Target::Claim,
-        sql: "INSERT INTO evidence (claim_id, evidence_type, content_hash) \
+        sql:
+            "INSERT INTO evidence (claim_id, evidence_type, content_hash) \
               SELECT $1, 'observation', \
                      decode(md5($2::text || clock_timestamp()::text) || md5(random()::text), 'hex')",
     },
@@ -2093,7 +2101,11 @@ async fn seed_probe_frame(pool: &PgPool) {
 /// A fresh target of `target`'s kind owned by `author`, written on the
 /// privileged pool (so the target exists whatever the rule says).
 async fn prepare_target(pool: &PgPool, target: Target, author: Uuid, group: Uuid) -> Uuid {
-    let claim = || async { insert_claim(pool, author, group).await.expect("target claim") };
+    let claim = || async {
+        insert_claim(pool, author, group)
+            .await
+            .expect("target claim")
+    };
     match target {
         Target::Claim => claim().await,
         Target::Evidence => fixture::seed_evidence(pool, claim().await, "document").await,
@@ -2287,7 +2299,9 @@ async fn an_attached_agents_claim_is_not_rewritten_by_anyone_after_the_end(pool:
     let plain_claim = insert_claim(&pool, plain, h_group).await.expect("claim");
 
     assert_eq!(
-        update_truth_as(&pool, Some(h), h_group, claims[0]).await.ok(),
+        update_truth_as(&pool, Some(h), h_group, claims[0])
+            .await
+            .ok(),
         Some(1),
         "POSITIVE CONTROL: the human updates its attached agent's claim before the end"
     );
@@ -2302,8 +2316,16 @@ async fn an_attached_agents_claim_is_not_rewritten_by_anyone_after_the_end(pool:
         "a no-principal session rewriting the attached agent's claim after the end",
     );
     for (who, claim, what) in [
-        (Some(h), plain_claim, "the human, its unattached agent's claim"),
-        (None, plain_claim, "a no-principal session, the unattached agent's claim"),
+        (
+            Some(h),
+            plain_claim,
+            "the human, its unattached agent's claim",
+        ),
+        (
+            None,
+            plain_claim,
+            "a no-principal session, the unattached agent's claim",
+        ),
         (Some(h), gone_claim, "the human, a retired identity's claim"),
     ] {
         assert_eq!(
@@ -2348,12 +2370,16 @@ async fn the_write_check_is_keyed_on_arming_and_spares_a_privileged_session(pool
     }
 
     assert_eq!(
-        update_truth_as(&pool, Some(attached), h_group, claims[0]).await.ok(),
+        update_truth_as(&pool, Some(attached), h_group, claims[0])
+            .await
+            .ok(),
         Some(1),
         "CONTROL: an unarmed database refuses no update in a gap"
     );
     assert_eq!(
-        write_class(&pool, attached, h_group, evidence_insert, claims[0]).await.ok(),
+        write_class(&pool, attached, h_group, evidence_insert, claims[0])
+            .await
+            .ok(),
         Some(1),
         "CONTROL: an unarmed database refuses no evidence in a gap"
     );
