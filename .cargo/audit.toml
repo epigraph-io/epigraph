@@ -33,12 +33,6 @@ ignore = [
                          #   cloudflare_access.rs), and epigraph's own tokens
                          #   are signed HS256 (epigraph-auth JwtConfig). An RSA
                          #   private key outside tests re-opens this entry.
-    "RUSTSEC-2026-0097", # rand: unsound with a custom logger. Cargo.lock
-                         #   resolves both 0.8.5 and 0.9.2, and both are flagged.
-                         #   NOTE: the "no patched release yet" justification
-                         #   this entry used to carry is dated and was not
-                         #   re-verified when this file was last touched — check
-                         #   the advisory's patched range before renewing it.
     "RUSTSEC-2024-0384", # instant: unmaintained. Transitive via `ascent`
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
@@ -85,4 +79,10 @@ ignore = [
     # affected ranges — so the suppressions are deleted rather than carried.
     # Do not re-add them: a reappearance means a dependency regressed onto the
     # old TLS/DB stack and `cargo audit` should say so.
+    #
+    # RUSTSEC-2026-0097 (rand unsound with a custom logger; GHSA-cq8v-f236-94qc)
+    # was suppressed here while Cargo.lock resolved rand 0.8.5 and 0.9.2. The
+    # patched releases 0.8.6 and 0.9.3 are semver-compatible, so Cargo.lock now
+    # resolves them and the suppression is deleted. rand 0.10.x is outside the
+    # affected range. Do not re-add it.
 ]
