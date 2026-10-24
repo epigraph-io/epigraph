@@ -427,3 +427,44 @@ fn the_separate_signing_key_mode_is_refused_on_an_http_listener() {
         );
     }
 }
+
+/// The signing PRIVATE key is read from the environment only: on the command
+/// line it would sit in `ps` output and `/proc/<pid>/cmdline`, readable by
+/// every process in the container. `--agent-signing-key` is therefore not an
+/// argument at all (a usage error, exit 2, before anything else runs), and the
+/// error never echoes the value. The positive control is every boot above,
+/// which passes the key through `EPIGRAPH_AGENT_SIGNING_KEY`.
+#[test]
+fn the_signing_key_is_not_accepted_on_the_command_line() {
+    let identity = AgentSigner::from_bytes(&[0xF1; 32])
+        .expect("id")
+        .public_key();
+    let signing_secret_hex = hex::encode([0xF2u8; 32]);
+    let out = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"))
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_MCP_AGENT_KEY")
+        .env_remove("EPIGRAPH_AGENT_MODEL")
+        .env_remove("EPIGRAPH_OPERATOR_ID")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env("EPIGRAPH_AGENT_IDENTITY_PUBKEY", hex::encode(identity))
+        .args([
+            "--database-url",
+            "postgres://invalid:invalid@127.0.0.1:1/nope",
+            "--agent-signing-key",
+            &signing_secret_hex,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mcp bin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--agent-signing-key must be a usage error, not a key source"
+    );
+    assert!(stderr.contains("--agent-signing-key"), "{stderr}");
+    assert!(
+        !stderr.contains(&signing_secret_hex[..16]),
+        "the usage error must never echo the private key"
+    );
+}
