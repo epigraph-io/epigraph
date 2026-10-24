@@ -990,3 +990,53 @@ async fn a_repeat_registration_does_not_reattach_a_detached_child(pool: PgPool) 
         "CONTROL: a new child of the attached parent is copied"
     );
 }
+
+/// An identity changes whenever its prompt files or model do, so the identity
+/// an operator attaches may already have registered successors (the one that
+/// runs now). Attaching it attaches every registered successor down its
+/// lineage too, each naming the row it came from; otherwise the running
+/// identity would write in a gap unrefused. CONTROL: an agent outside the
+/// lineage is untouched, and the newest identity writes once its human holds
+/// the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn attaching_an_identity_attaches_its_registered_successors(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-lineage").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let child = register(&pool, &random32(), Some(parent), "g-166-lineage").await;
+    let newest = register(&pool, &random32(), Some(child), "g-166-lineage").await;
+    let outside = agent_of(&pool, h, "outside").await;
+
+    let row = attach(&pool, ROLE, parent).await;
+    assert_eq!(
+        live_attachments(&pool, child).await,
+        vec![(ROLE.to_string(), Some(row))],
+        "the registered successor is attached with the ancestor"
+    );
+    let newest_rows = live_attachments(&pool, newest).await;
+    assert_eq!(
+        newest_rows.len(),
+        1,
+        "the newest identity in the lineage is attached: {newest_rows:?}"
+    );
+    assert!(live_attachments(&pool, outside).await.is_empty());
+
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, newest, newest, h_group).await,
+        "the newest identity of an attached lineage, in a gap",
+    );
+    write_as(&pool, outside, outside, h_group)
+        .await
+        .expect("CONTROL: an agent outside the lineage writes in the gap");
+    grant(&pool, ROLE, h, None).await;
+    write_as(&pool, newest, newest, h_group)
+        .await
+        .expect("the newest identity writes while its human holds the role");
+}
