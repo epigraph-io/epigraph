@@ -676,16 +676,35 @@ pub fn combine_by_item(
             })
             .collect(),
     );
-    let mut for_fold: Vec<MassFunction> = items
+    let for_fold: Vec<MassFunction> = items
         .into_iter()
         .filter_map(|it| it.atoms.into_iter().next().map(|(_, m)| m))
         .collect();
-    if for_fold.len() == 1 {
-        let only = for_fold.pop().expect("len == 1");
+    dempster_across_items(for_fold, conflict_threshold)
+}
+
+/// Combine one atom's items (one BBA per item of an [`item_partition`]) by
+/// Dempster, and report the conflict the fold saw: a lone item's own
+/// empty-set mass, else [`combination::fold_conflict`] over the steps. The
+/// shared tail of [`combine_by_item`] and the atom evidence fold
+/// (`crate::atom_items::atom_fold`).
+///
+/// At total conflict between dogmatic items `combine_multiple` does not fail:
+/// it falls back to Yager's closed rule (the conflict mass goes to Θ).
+///
+/// # Errors
+/// Propagates `DsError` from the Dempster fold, including
+/// `combine_multiple`'s error when `items` is empty.
+pub fn dempster_across_items(
+    mut items: Vec<MassFunction>,
+    conflict_threshold: f64,
+) -> Result<(MassFunction, f64), DsError> {
+    if items.len() == 1 {
+        let only = items.pop().expect("len == 1");
         let k = only.mass_of_conflict();
         Ok((only, k))
     } else {
-        let (combined, reports) = combination::combine_multiple(&for_fold, conflict_threshold)?;
+        let (combined, reports) = combination::combine_multiple(&items, conflict_threshold)?;
         let k = combination::fold_conflict(&combined, &reports);
         Ok((combined, k))
     }
