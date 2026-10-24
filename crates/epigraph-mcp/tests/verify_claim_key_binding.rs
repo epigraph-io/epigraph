@@ -17,6 +17,9 @@
 //! 7a), and the claim rows need a chosen `created_at`, `signature` and
 //! `signer_id`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
 use chrono::{DateTime, Duration, Utc};
@@ -494,5 +497,73 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
         bound(&resp),
         (Value::Bool(true), Value::Bool(false), Value::from("signing")),
         "a pending key binds nothing: {resp}"
+    );
+}
+
+/// ROTATION, the documented maintenance flow (161: rotating a signing key is a
+/// maintenance act, through `epigraph_agent_key_set_status`), must not unbind
+/// the claims the key legitimately signed while it was active. It ends the
+/// key's window at the rotation, so a claim dated AFTER the rotation is not
+/// bound by it. Driven through the real definer on a maintenance session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(pool: PgPool) {
+    let t0 = whole_second(Utc::now() - Duration::days(10));
+    let identity = signer(0x91);
+    let signing = signer(0x92);
+    let agent = seed_agent(&pool, &identity.public_key(), t0).await;
+    seed_key(&pool, agent, &signing.public_key(), "signing", "active", t0, None).await;
+    let before = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &signing,
+        "D2: signed while the key was active",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, before).await;
+    assert_eq!(resp["key_bound"], Value::Bool(true), "calibration: {resp}");
+
+    let key_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM agent_keys WHERE agent_id = $1 AND public_key = $2",
+    )
+    .bind(agent)
+    .bind(signing.public_key().as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("key id");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "SELECT * FROM epigraph_agent_key_set_status($1, 'rotated', 'test rotation', NULL)",
+        )
+        .bind(key_id)
+        .fetch_all(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("maintenance rotates the key");
+
+    let resp = verify(&pool, before).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(true), Value::from("signing")),
+        "a claim signed before the rotation stays bound: {resp}"
+    );
+
+    let after = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &signing,
+        "D2: signed with the key after its rotation",
+        Utc::now() + Duration::minutes(5),
+    )
+    .await;
+    let resp = verify(&pool, after).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(true), Value::Bool(false), Value::from("signing")),
+        "a claim signed after the rotation is not bound: {resp}"
     );
 }
