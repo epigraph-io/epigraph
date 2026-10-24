@@ -139,6 +139,28 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: PgPool) {
     let old = seed_current_claim(&pool).await;
+    // Both vector columns populated, so "the retirement clears both" below can
+    // fail: a current claim may carry embeddings, a retired one may not.
+    sqlx::query(
+        "UPDATE claims SET embedding = array_fill(0.01::real, ARRAY[1536])::vector, \
+                           embedding_3072 = array_fill(0.01::real, ARRAY[3072])::vector \
+         WHERE id = $1",
+    )
+    .bind(old)
+    .execute(&pool)
+    .await
+    .expect("seed both embeddings");
+    let both_vectors: bool = sqlx::query_scalar(
+        "SELECT embedding IS NOT NULL AND embedding_3072 IS NOT NULL FROM claims WHERE id = $1",
+    )
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        both_vectors,
+        "calibration: the claim starts with both vectors"
+    );
     let mut tx = pool.begin().await.unwrap();
     ClaimRepository::supersede_act_conn(
         &mut tx,
@@ -189,7 +211,8 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert!(!is_current && !has_vec);
+    assert!(!is_current, "the old claim is retired");
+    assert!(!has_vec, "the retirement cleared both vector columns");
     let successors: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
     )
