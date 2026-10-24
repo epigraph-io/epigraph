@@ -27,9 +27,12 @@ pub const INTERNAL_ERROR_MESSAGE: &str = "internal error; the detail is in the s
 /// hosts or another tenant's rows, so it never reaches the caller. The MCP
 /// twin of the HTTP layer's `ApiError::InternalError` redaction (PR #667).
 ///
-/// One exception, decided on the error's TYPE, never on its rendered text: a
-/// refusal the codebase itself authored ([`designed_refusal`]) is sent as it
-/// was written, because it is the caller's remedy.
+/// One exception: a refusal the codebase itself authored
+/// ([`designed_refusal`]) is sent as it was written, because it is the
+/// caller's remedy. It is recognised from the error's type, never from the
+/// rendered `Display` of `e`, so it only applies where `e` reaches this call
+/// unwrapped (`.map_err(internal_error)`): a coded refusal formatted into a
+/// `String` first (`internal_error(format!("ctx: {e}"))`) is redacted.
 ///
 /// Text the CALLER must read (an operator remedy, "Nothing was written") is
 /// [`internal_error_text`], or [`internal_error_logged`] when there is also an
@@ -48,17 +51,23 @@ pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
 
 /// The caller-facing text of a refusal the codebase authored, or `None`.
 ///
-/// Two shapes qualify, both recognised by type:
+/// Two shapes qualify:
 ///
-/// * a database error whose own message opens with a schema refusal code
-///   (`FA07: ...`, `CX02: ...`: two to five capitals, two digits, a colon), the
-///   convention the migrations' `RAISE EXCEPTION` refusals follow. Only that
-///   message is returned, not the driver's wrapping of it.
+/// * a `sqlx::Error::Database` (bare or inside `DbError::QueryFailed`) whose
+///   own message opens with a schema refusal code ([`coded`]: `FA07: ...`,
+///   `CX02: ...`), the convention the migrations' `RAISE EXCEPTION` refusals
+///   follow. This arm reads the database's MESSAGE (not the driver's
+///   wrapping of it), and only that message is returned.
 /// * `DbError::QueryFailed { source: sqlx::Error::Protocol(msg) }`, the shape
 ///   the repo layer builds for its own refusals (`mark_duplicate: canonical
 ///   ... is not current`); every such site in `epigraph-db` writes literal
-///   text and ids, no error. A bare `sqlx::Error::Protocol` does NOT qualify:
-///   `epigraph-engine` stringifies other errors into that variant.
+///   text and ids, no error. A bare `sqlx::Error::Protocol` does not qualify,
+///   because `epigraph-engine` stringifies other errors into that variant.
+///   RESIDUAL: `From<sqlx::Error> for DbError` wraps ANY `Protocol` error into
+///   this same shape once it is `?`-converted, including sqlx's own protocol
+///   errors and an engine stringification that went through `DbError`, and
+///   that text is then sent as written. A dedicated `DbError` variant for
+///   repo-authored refusals would close it.
 ///
 /// A designed refusal without a code (a `RAISE` that names no code) is
 /// redacted like any other error: that fails closed.
@@ -531,8 +540,10 @@ mod tests {
     }
 
     /// A refusal the repo layer authored (`QueryFailed { Protocol }`) is the
-    /// caller's remedy and is sent as written; the same variant built outside
-    /// `DbError` (engine code stringifies other errors into it) is not.
+    /// caller's remedy and is sent as written; a bare `sqlx::Error::Protocol`
+    /// handed over unconverted (engine code stringifies other errors into it)
+    /// is not. Once `?` converts such an error into `DbError` it takes the
+    /// first shape: see [`designed_refusal`]'s RESIDUAL.
     #[test]
     fn a_repo_authored_refusal_passes_and_a_bare_protocol_error_does_not() {
         let designed = internal_error(epigraph_db::DbError::QueryFailed {
