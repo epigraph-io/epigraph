@@ -131,7 +131,8 @@ async fn grant_role_needs_an_explicit_window(pool: PgPool) {
         "nothing was granted"
     );
     let audited: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM security_events WHERE event_type LIKE 'platform.role_%'",
+        "SELECT count(*) FROM security_events \
+          WHERE event_type IN ('platform.role_granted', 'platform.role_ended')",
     )
     .fetch_one(&pool)
     .await
