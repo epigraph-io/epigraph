@@ -1664,6 +1664,42 @@ async fn a_succession_copy_fills_every_gap_in_the_childs_own_window(pool: PgPool
     );
 }
 
+/// Attaching an identity attaches its registered successors over the WHOLE
+/// attached window, under the same rule as the succession copy: a successor
+/// that already holds its own short attachment to the role inside that window
+/// is attached for every part of the window its row leaves uncovered.
+///
+/// Verified to fail: the lineage copy skipping a successor whenever it has
+/// ANY overlapping row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn attaching_an_identity_fills_every_gap_in_a_successors_own_window(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-lineage-gaps").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let child = register(&pool, &random32(), Some(parent), "g-166-lineage-gaps").await;
+    attach_window(
+        &pool,
+        ROLE,
+        child,
+        "now() + interval '1 hour'",
+        "now() + interval '2 hours'",
+    )
+    .await;
+
+    let parent_row = attach(&pool, ROLE, parent).await;
+    assert_eq!(
+        uncovered_by(&pool, parent_row, child).await,
+        ("{}".to_string(), 2),
+        "the successor's own hour leaves two gaps in the attached window; both are attached"
+    );
+}
+
 /// The identity attestor runs the registration (whose succession copy writes
 /// `role_agents` in a maintenance-owned definer frame) but cannot write the
 /// table itself, nor call the attach / detach verbs.
