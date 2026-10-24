@@ -41,6 +41,31 @@ pub enum PromotionFailure {
 
 const PROMOTION_THRESHOLD: f64 = 0.60;
 
+/// The frame a hypothesis is assessed on until it is promoted.
+pub const HYPOTHESIS_ASSESSMENT_FRAME: &str = "hypothesis_assessment";
+
+/// The frame a promotion MOVES the hypothesis's latest assessment onto (the
+/// source row is retired in the same transaction, backlog 846b808e).
+pub const RESEARCH_VALIDITY_FRAME: &str = "research_validity";
+
+/// The `properties.hypothesis_status` a promotion writes.
+pub const PROMOTED_STATUS: &str = "promoted";
+
+/// The frame a hypothesis's status reads its belief from, given its
+/// `properties.hypothesis_status`: [`RESEARCH_VALIDITY_FRAME`] once it is
+/// promoted, since the promotion moved its evidence there, and
+/// [`HYPOTHESIS_ASSESSMENT_FRAME`] otherwise. Reading the old frame after a
+/// promotion reports zero belief, or another agent's later BBA (backlog
+/// 090221d9).
+#[must_use]
+pub fn status_belief_frame(hypothesis_status: Option<&str>) -> &'static str {
+    if hypothesis_status == Some(PROMOTED_STATUS) {
+        RESEARCH_VALIDITY_FRAME
+    } else {
+        HYPOTHESIS_ASSESSMENT_FRAME
+    }
+}
+
 /// Evaluate whether a hypothesis meets promotion criteria.
 pub fn evaluate_promotion(input: &PromotionInput) -> PromotionResult {
     let mut failures = Vec::new();
@@ -73,6 +98,18 @@ pub fn evaluate_promotion(input: &PromotionInput) -> PromotionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_reads_research_validity_only_once_promoted() {
+        assert_eq!(status_belief_frame(Some("promoted")), "research_validity");
+        for other in [None, Some("open"), Some("testing"), Some("Promoted")] {
+            assert_eq!(
+                status_belief_frame(other),
+                "hypothesis_assessment",
+                "{other:?}"
+            );
+        }
+    }
 
     #[test]
     fn all_criteria_met_supported() {

@@ -324,3 +324,146 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         "a refused promotion leaves the source in place"
     );
 }
+
+async fn status_of(addr: SocketAddr, agent: Uuid, claim: Uuid) -> serde_json::Value {
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/hypothesis/{claim}/status"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("status request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(status.is_success(), "status: {status} {body}");
+    body
+}
+
+fn mass(masses: &serde_json::Value, key: &str) -> f64 {
+    masses
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+/// After a promotion the hypothesis's evidence lives on `research_validity`
+/// (the promotion MOVED it), so `GET /hypothesis/:id/status` must read that
+/// frame for a promoted hypothesis (backlog 090221d9). Reading
+/// `hypothesis_assessment` reported zero belief, or, as here, whatever BBA
+/// another agent filed there after the promotion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promoted_hypothesis_status_reads_research_validity(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "090221d9-promoter").await;
+    let (later, _) = viewer_fixture::seed_agent_with_group(&pool, "090221d9-later").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "090221d9 promoted hypothesis").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert!(status.is_success(), "promote: {status} {body}");
+
+    // A later agent's assessment on the old frame, nothing like the promoted one.
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        r.claim,
+        r.hyp_frame,
+        Some(later),
+        None,
+        &serde_json::json!({"1": 0.9, "0,1": 0.1}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a later hypothesis_assessment BBA");
+
+    let s = status_of(r.addr, agent, r.claim).await;
+    assert_eq!(s["status"], "promoted", "CALIBRATION: {s}");
+    assert!(
+        mass(&source.masses, "0") >= 0.6,
+        "CALIBRATION: the promoted evidence cleared the gate: {:?}",
+        source.masses
+    );
+    assert_eq!(
+        (
+            s["belief"]["supported"].as_f64(),
+            s["belief"]["unsupported"].as_f64()
+        ),
+        (
+            Some(mass(&source.masses, "0")),
+            Some(mass(&source.masses, "1"))
+        ),
+        "a promoted hypothesis's status reads the evidence it was promoted on: {s}"
+    );
+}
+
+/// A promoted hypothesis is not promoted again. Its status now reads the
+/// promoted evidence, so the gate passes; a second promotion would move
+/// whatever `hypothesis_assessment` BBA was filed since onto
+/// `research_validity` beside (or over) the promoted one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promoted_hypothesis_is_not_promoted_again(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "090221d9-twice").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "090221d9 promoted twice").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert!(status.is_success(), "promote: {status} {body}");
+    let promoted: Vec<(Uuid, serde_json::Value)> = rows(&pool, r.claim, r.rv_frame)
+        .await
+        .into_iter()
+        .map(|row| (row.id, row.masses))
+        .collect();
+    assert_eq!(promoted.len(), 1, "CALIBRATION: one promoted row");
+
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        r.claim,
+        r.hyp_frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.95, "0,1": 0.05}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a new hypothesis_assessment BBA after the promotion");
+
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "a second promotion is refused: {status} {body}"
+    );
+    assert!(body.contains("already promoted"), "{body}");
+    let after: Vec<(Uuid, serde_json::Value)> = rows(&pool, r.claim, r.rv_frame)
+        .await
+        .into_iter()
+        .map(|row| (row.id, row.masses))
+        .collect();
+    assert_eq!(
+        after, promoted,
+        "the refused promotion leaves research_validity as the first one left it"
+    );
+}

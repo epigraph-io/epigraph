@@ -160,3 +160,70 @@ async fn cli_promote_leaves_the_evidence_on_one_binary_frame(pool: PgPool) {
     assert_eq!(folded[0].masses, masses, "with the source's masses");
     assert_ne!(folded[0].id, source, "the source row itself is retired");
 }
+
+/// `hypothesis status` on a promoted hypothesis reads the frame its evidence
+/// was moved to, `research_validity` (backlog 090221d9): reading
+/// `hypothesis_assessment` printed zero belief, or, as here, the masses of a
+/// BBA another agent filed there after the promotion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_status_of_a_promoted_hypothesis_reads_research_validity(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "090221d9-cli").await;
+    let (later, _) = fixture::seed_agent_with_group(&pool, "090221d9-cli-later").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "090221d9 cli promoted hypothesis").await;
+    let hyp_frame = binary_frame(&pool, "hypothesis_assessment").await;
+    binary_frame(&pool, "research_validity").await;
+    seed_completed_analysis(&pool, agent, claim).await;
+    let store = |who: Uuid, masses: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            epigraph_db::MassFunctionRepository::store_with_perspective(
+                &pool,
+                claim,
+                hyp_frame,
+                Some(who),
+                None,
+                &masses,
+                None,
+                Some("error_derived"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+            .expect("seed a hypothesis_assessment BBA")
+        }
+    };
+    store(agent, serde_json::json!({"0": 0.8, "0,1": 0.2})).await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let run = |args: [&str; 2]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("DATABASE_URL", &url)
+            .env("MAINTENANCE_DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("spawn hypothesis");
+        assert!(
+            out.status.success(),
+            "hypothesis {args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let id = claim.to_string();
+    run(["promote", &id]);
+    store(later, serde_json::json!({"1": 0.9, "0,1": 0.1})).await;
+
+    let printed = run(["status", &id]);
+    assert!(
+        printed.contains("Status: promoted"),
+        "CALIBRATION: {printed}"
+    );
+    assert!(
+        printed.contains("Supported:   0.8000") && printed.contains("Unsupported: 0.0000"),
+        "a promoted hypothesis's status prints the evidence it was promoted on:\n{printed}"
+    );
+}
