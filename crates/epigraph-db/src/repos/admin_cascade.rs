@@ -41,6 +41,17 @@ use uuid::Uuid;
 /// `security_events.event_type` of an administrative cascade that ran.
 pub const EVENT_APPLIED: &str = "cascade.admin_applied";
 
+/// `security_events.event_type` of the row that keeps the ids an
+/// [`EVENT_APPLIED`] row's `touched` counts (the edges the repair moved,
+/// most of them other writers'). The applied row names the triggering
+/// principal, and `security_events_read` lets a principal read the rows
+/// naming it, so that row carries counts only; this one has `agent_id` NULL,
+/// readable by privileged and admin sessions only, and names its applied row
+/// in `details.applied_event_id`. Written in the applied row's transaction,
+/// on the maintenance connection only (117 refuses a `cascade.*` row
+/// elsewhere).
+pub const EVENT_APPLIED_IDS: &str = "cascade.admin_applied_ids";
+
 /// `security_events.event_type` of a cascade that did not run.
 pub const EVENT_DEFERRED: &str = "cascade.deferred";
 
@@ -54,6 +65,14 @@ pub const EVENT_FAILED: &str = "cascade.admin_failed";
 /// committed (the belief cascade is best-effort and runs per claim), and
 /// names that row in `details.applied_event_id`.
 pub const EVENT_BELIEF: &str = "cascade.belief_rederived";
+
+/// `security_events.event_type` of the row that keeps what an
+/// [`EVENT_BELIEF`] row counts: the claim ids the re-derivation targeted,
+/// recomputed and left unbacked, and its error texts, which can name claims
+/// the triggering principal cannot read. Agent-less for the same reason as
+/// [`EVENT_APPLIED_IDS`]; names the belief row in `details.belief_event_id`
+/// and the applied row in `details.applied_event_id`.
+pub const EVENT_BELIEF_IDS: &str = "cascade.belief_rederived_ids";
 
 /// `security_events.event_type` of a pending cascade an operator retired
 /// instead of replaying (its act was undone, say, so its repair can never

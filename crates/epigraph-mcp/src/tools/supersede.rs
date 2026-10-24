@@ -26,6 +26,9 @@ pub async fn supersede_claim(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let old = parse_uuid(&params.claim_id)?;
+    // The replacement's size cap, before the act's transaction opens: a refusal
+    // leaves the old claim current.
+    crate::tools::claims::check_claim_content_length(&params.content)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
     // The gate read, the authority decision and the stamped transaction the
