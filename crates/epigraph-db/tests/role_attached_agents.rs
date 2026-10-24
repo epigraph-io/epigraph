@@ -1,0 +1,825 @@
+//! Migration 166: an agent attached to a role writes only while a human holds
+//! that role, and only while the agent's own linked human is that holder.
+//!
+//! # What is under test
+//!
+//! * `role_agents` records which agents belong to which role. It is
+//!   append-only and maintenance-written (`epigraph_attach_agent_to_role` /
+//!   `epigraph_detach_agent_from_role`, each audited); the application role
+//!   reads no row and writes none.
+//! * A claim written or authored by an agent with a LIVE attachment is refused
+//!   `ROL01` unless, at the statement's clock, the role has a live human
+//!   holder AND the agent's live-linked human is that holder. The check sits in
+//!   the operator-binding path (the claims trigger's writer-scope and
+//!   attribution checks), so no write path skips it.
+//! * "A run in progress finishes, but its writes after the end are refused":
+//!   a write inside an OPEN transaction after the assignment's `valid_to`
+//!   passes is refused, because the check reads `clock_timestamp()`, not the
+//!   transaction's start.
+//! * `epigraph_role_agent_may_run(agent)` answers the host and epigraph-mcp
+//!   without exposing the roster. Both the application role and the identity
+//!   attestor can EXECUTE it.
+//! * A succession registered by the attestor copies the parent's live
+//!   attachments to the child, once.
+//! * POSITIVE CONTROL throughout: an agent with no attachment writes exactly as
+//!   before, during the same gap that refuses an attached agent.
+//!
+//! # Why the writes run as `epigraph_app`
+//!
+//! `#[sqlx::test]` connects as a superuser, and a superuser session is a
+//! PRIVILEGED session (`epigraph_bypass()`), which ROL01 exempts on purpose
+//! (the custodial maintenance path). So every refusal here is measured on a
+//! connection whose `session_user` is the application role, stamped with the
+//! principal and groups `ScopedPool` would stamp. Fixture rows are seeded on
+//! the superuser connection.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use epigraph_db::AgentRepository;
+use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const ROL01: &str = "ROL01";
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+const ATTESTOR: &str = "epigraph_identity_attestor";
+const ROLE: &str = "role:test-curator";
+const OTHER_ROLE: &str = "role:test-steward";
+
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(|c| c.to_string())
+}
+
+fn code_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> Option<String> {
+    r.as_ref().err().and_then(sqlstate)
+}
+
+fn assert_rol01<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, what: &str) {
+    assert_eq!(
+        code_of(r).as_deref(),
+        Some(ROL01),
+        "{what}: expected ROL01, got {r:?}"
+    );
+}
+
+/// A synthetic catalog role, with the role node 123 requires for every role.
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+/// Arm the operator binding as the maintenance role would (the production
+/// state every refusal below is measured in, unless a test says otherwise).
+async fn arm(pool: &PgPool) {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT armed_now FROM public.epigraph_arm_operator_binding()")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the maintenance role arms");
+        (conn, ())
+    })
+    .await;
+}
+
+/// A registered human with its personal group.
+async fn human(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+    fixture::seed_human_operator(pool, label).await
+}
+
+/// An agent live-linked to `operator`.
+async fn agent_of(pool: &PgPool, operator: Uuid, label: &str) -> Uuid {
+    let (agent, _) = fixture::seed_agent_with_group(pool, label).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("live link");
+    assert!(out.link_live, "the fixture link must be live");
+    agent
+}
+
+/// Grant `role` to `holder`, live from a few seconds ago (a host whose clock
+/// steps backward must still see it live), until `valid_to_secs` from now.
+async fn grant(pool: &PgPool, role: &str, holder: Uuid, valid_to_secs: Option<f64>) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', \
+                CASE WHEN $3::float8 IS NULL THEN NULL \
+                     ELSE now() + make_interval(secs => $3::float8) END, \
+                NULL, 'test grant')",
+    )
+    .bind(role)
+    .bind(holder)
+    .bind(valid_to_secs)
+    .fetch_one(pool)
+    .await
+    .expect("grant role")
+}
+
+async fn end_assignment(pool: &PgPool, assignment: Uuid) {
+    let ended: bool = sqlx::query_scalar(
+        "SELECT public.epigraph_end_role_assignment($1, 'test handover', NULL::uuid)",
+    )
+    .bind(assignment)
+    .fetch_one(pool)
+    .await
+    .expect("end assignment");
+    assert!(ended);
+}
+
+/// Attach `agent` to `role` through the maintenance definer, live from a few
+/// seconds ago.
+async fn attach(pool: &PgPool, role: &str, agent: Uuid) -> Uuid {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, id)
+    })
+    .await
+}
+
+async fn detach(pool: &PgPool, role: &str, agent: Uuid) -> i32 {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role($1, $2, 'test detach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role detaches");
+        (conn, n)
+    })
+    .await
+}
+
+/// A `('public', group)` claim by `author`, on whatever connection `exec` is.
+async fn insert_claim<'e, E>(exec: E, author: Uuid, group: Uuid) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let id = Uuid::new_v4();
+    let hash = id.as_bytes().repeat(2);
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("role agent probe {id}"))
+    .bind(hash)
+    .bind(author)
+    .bind(group)
+    .execute(exec)
+    .await?;
+    Ok(id)
+}
+
+async fn stamp(conn: &mut sqlx::PgConnection, principal: Uuid, groups: &[Uuid]) {
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::query(
+        "SELECT set_config('epigraph.principal_id', $1, false), \
+                set_config('epigraph.group_ids', $2, false), \
+                set_config('epigraph.writable_group_ids', $2, false)",
+    )
+    .bind(principal.to_string())
+    .bind(&set)
+    .execute(&mut *conn)
+    .await
+    .expect("stamp");
+}
+
+async fn unstamp(conn: &mut sqlx::PgConnection) {
+    sqlx::query(
+        "SELECT set_config('epigraph.principal_id', '', false), \
+                set_config('epigraph.group_ids', '', false), \
+                set_config('epigraph.writable_group_ids', '', false)",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("unstamp");
+}
+
+/// One claim by `author` into `group`, on an `epigraph_app` connection stamped
+/// as `writer` with `group` readable and writable.
+async fn write_as(
+    pool: &PgPool,
+    writer: Uuid,
+    author: Uuid,
+    group: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, writer, &[group]).await;
+        let r = insert_claim(&mut *conn, author, group).await;
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct MayRun {
+    may_run: bool,
+    role: Option<String>,
+    holder: Option<Uuid>,
+    reason: String,
+}
+
+async fn may_run_as(pool: &PgPool, role: &str, agent: Uuid) -> Result<MayRun, sqlx::Error> {
+    fixture::as_role(pool, role, |mut conn| async move {
+        let r = sqlx::query_as::<_, MayRun>(
+            "SELECT may_run, role, holder, reason FROM public.epigraph_role_agent_may_run($1)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The write refusal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The ruling's core: with no human holding the role, an attached agent's
+/// claim is refused ROL01; once its linked human holds the role, the same
+/// write lands. POSITIVE CONTROL in the same gap: an unattached agent of the
+/// same human writes. A human naming its attached agent as the AUTHOR is
+/// refused alike (the attribution arm), and writes as itself.
+///
+/// Verified to fail: the role check removed from `epigraph_require_writer_scope`
+/// lets the gap write land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agent_writes_only_while_its_human_holds_the_role(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let unattached = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    arm(&pool).await;
+
+    // The gap: nobody holds the role.
+    let gap = write_as(&pool, attached, attached, h_group).await;
+    assert_rol01(&gap, "an attached agent in a gap");
+    let text = gap.expect_err("refused").to_string();
+    assert!(
+        text.contains(ROLE),
+        "the refusal must name the role: {text}"
+    );
+    let named = write_as(&pool, h, attached, h_group).await;
+    assert_rol01(&named, "a human naming its attached agent as author in a gap");
+    write_as(&pool, unattached, unattached, h_group)
+        .await
+        .expect("POSITIVE CONTROL: an unattached agent of the same human writes in the gap");
+    write_as(&pool, h, h, h_group)
+        .await
+        .expect("POSITIVE CONTROL: the human writes as itself in the gap");
+
+    // The linked human takes the role: the same writes land.
+    grant(&pool, ROLE, h, None).await;
+    write_as(&pool, attached, attached, h_group)
+        .await
+        .expect("the attached agent writes while its human holds the role");
+    write_as(&pool, h, attached, h_group)
+        .await
+        .expect("the holder names its attached agent as author");
+}
+
+/// "A run in progress finishes, but every write it makes after the end is
+/// refused." The assignment's `valid_to` passes while a transaction is OPEN:
+/// its first write lands, its write after `valid_to` is refused, and so is a
+/// fresh transaction's.
+///
+/// Verified to fail: `clock_timestamp()` replaced by `now()` in the write
+/// check (the open transaction's second write lands, because `now()` is the
+/// transaction's start).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_after_the_assignment_ends_is_refused_mid_run(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    grant(&pool, ROLE, h, Some(3.0)).await;
+    arm(&pool).await;
+
+    let (first, after) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, attached, &[h_group]).await;
+        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+        let first = insert_claim(&mut *conn, attached, h_group).await;
+        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+        let after = insert_claim(&mut *conn, attached, h_group).await;
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("rollback");
+        unstamp(&mut conn).await;
+        (conn, (first, after))
+    })
+    .await;
+    assert!(
+        first.is_ok(),
+        "the write inside the window lands: {first:?}"
+    );
+    assert_rol01(&after, "a write in the same open transaction after valid_to");
+    let fresh = write_as(&pool, attached, attached, h_group).await;
+    assert_rol01(&fresh, "a fresh transaction after valid_to");
+}
+
+/// After a handover (H1's assignment ended, H2 granted), an agent still linked
+/// to H1 is refused: the role HAS a holder, but not the agent's human. CONTROL:
+/// an agent linked to H2 and attached to the same role writes.
+///
+/// Verified to fail: the "linked human is the holder" test weakened to "the
+/// role has some live holder" lets the H1 agent write after the handover.
+#[sqlx::test(migrations = "../../migrations")]
+async fn after_a_handover_an_agent_of_the_previous_holder_is_refused(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h1, h1_group) = human(&pool, "holder-1").await;
+    let (h2, h2_group) = human(&pool, "holder-2").await;
+    let old = agent_of(&pool, h1, "curator-old").await;
+    let new = agent_of(&pool, h2, "curator-new").await;
+    attach(&pool, ROLE, old).await;
+    attach(&pool, ROLE, new).await;
+    let a1 = grant(&pool, ROLE, h1, None).await;
+    arm(&pool).await;
+
+    write_as(&pool, old, old, h1_group)
+        .await
+        .expect("before the handover H1's agent writes");
+    assert_rol01(
+        &write_as(&pool, new, new, h2_group).await,
+        "H2's agent before H2 holds the role",
+    );
+
+    end_assignment(&pool, a1).await;
+    grant(&pool, ROLE, h2, None).await;
+
+    assert_rol01(
+        &write_as(&pool, old, old, h1_group).await,
+        "an agent linked to the previous holder after the handover",
+    );
+    write_as(&pool, new, new, h2_group)
+        .await
+        .expect("CONTROL: an agent linked to the new holder writes");
+}
+
+/// POSITIVE CONTROL for the whole rule: agents with no live attachment are
+/// unaffected, including an agent whose attachment was DETACHED, an agent
+/// whose attachment has not started, and an agent of a human holding no role
+/// at all; an attachment to another role does not leak.
+#[sqlx::test(migrations = "../../migrations")]
+async fn agents_without_a_live_attachment_are_unaffected(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    seed_role(&pool, OTHER_ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let detached = agent_of(&pool, h, "detached").await;
+    let future = agent_of(&pool, h, "future").await;
+    let other = agent_of(&pool, h, "other-role").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, detached).await;
+    assert_eq!(detach(&pool, ROLE, detached).await, 1, "one row detached");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() + interval '1 hour', \
+                                                         NULL, 'starts later')",
+        )
+        .bind(ROLE)
+        .bind(future)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a future attachment");
+        (conn, ())
+    })
+    .await;
+    attach(&pool, OTHER_ROLE, other).await;
+    grant(&pool, OTHER_ROLE, h, None).await;
+    arm(&pool).await;
+
+    for (agent, what) in [
+        (detached, "a detached agent"),
+        (future, "an agent whose attachment has not started"),
+        (other, "an agent of another role its human holds"),
+        (plain, "an agent never attached"),
+    ] {
+        write_as(&pool, agent, agent, h_group)
+            .await
+            .unwrap_or_else(|e| panic!("{what} must write: {e}"));
+    }
+}
+
+/// ROL01 is keyed on the operator binding's ARMING, like OPL02 (the claims
+/// trigger checks nothing on an unarmed database), and the valve does not
+/// relieve it: the valve relieves OPL01 only. A PRIVILEGED session (the
+/// maintenance role, the custodial path) is exempt, as it is from OPL02.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rol01_is_keyed_on_arming_survives_the_valve_and_spares_a_privileged_session(
+    pool: PgPool,
+) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+
+    write_as(&pool, attached, attached, h_group)
+        .await
+        .expect("an unarmed database enforces nothing in the binding path");
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, attached, attached, h_group).await,
+        "armed",
+    );
+    let valve = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, attached, &[h_group]).await;
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', 'off', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve");
+        let r = insert_claim(&mut *conn, attached, h_group).await;
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve reset");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await;
+    assert_rol01(&valve, "with the valve off");
+
+    let privileged = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = insert_claim(&mut *conn, attached, h_group).await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        privileged.is_ok(),
+        "a privileged session is exempt: {privileged:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The record: who writes it, and what it audits
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The application role cannot write `role_agents` (INSERT, UPDATE, DELETE are
+/// permission denials), cannot call the attach / detach definers, and reads no
+/// row of it even when rows exist. CALIBRATION: the maintenance role attaches,
+/// and each attach and detach writes one `platform.` audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_write_role_agents_directly(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let other = agent_of(&pool, h, "other").await;
+    let row = attach(&pool, ROLE, attached).await;
+
+    let (insert, update, delete, attach_fn, detach_fn, visible) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, h, &[]).await;
+            let insert = sqlx::query(
+                "INSERT INTO role_agents (role, agent_id, reason) VALUES ($1, $2, 'forged')",
+            )
+            .bind(ROLE)
+            .bind(other)
+            .execute(&mut *conn)
+            .await;
+            let update = sqlx::query(
+                "UPDATE role_agents SET detached_at = now(), detached_by = session_user, \
+                        detach_reason = 'forged' WHERE id = $1",
+            )
+            .bind(row)
+            .execute(&mut *conn)
+            .await;
+            let delete = sqlx::query("DELETE FROM role_agents WHERE id = $1")
+                .bind(row)
+                .execute(&mut *conn)
+                .await;
+            let attach_fn = sqlx::query(
+                "SELECT public.epigraph_attach_agent_to_role($1, $2, NULL, NULL, 'forged')",
+            )
+            .bind(ROLE)
+            .bind(other)
+            .execute(&mut *conn)
+            .await;
+            let detach_fn =
+                sqlx::query("SELECT public.epigraph_detach_agent_from_role($1, $2, 'forged')")
+                    .bind(ROLE)
+                    .bind(attached)
+                    .execute(&mut *conn)
+                    .await;
+            let visible: Result<i64, _> = sqlx::query_scalar("SELECT count(*) FROM role_agents")
+                .fetch_one(&mut *conn)
+                .await;
+            unstamp(&mut conn).await;
+            (conn, (insert, update, delete, attach_fn, detach_fn, visible))
+        })
+        .await;
+    for (what, code) in [
+        ("INSERT", code_of(&insert)),
+        ("UPDATE", code_of(&update)),
+        ("DELETE", code_of(&delete)),
+        ("attach definer", code_of(&attach_fn)),
+        ("detach definer", code_of(&detach_fn)),
+    ] {
+        assert_eq!(
+            code.as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "the app role's {what} on role_agents must be a permission denial"
+        );
+    }
+    assert_eq!(
+        visible.expect("the app role may SELECT the table"),
+        0,
+        "the app role reads no attachment row"
+    );
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM role_agents WHERE id = $1 AND detached_at IS NULL",
+    )
+    .bind(row)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(live, 1, "the refused writes changed nothing");
+
+    assert_eq!(detach(&pool, ROLE, attached).await, 1);
+    let audit: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM security_events \
+          WHERE event_type LIKE 'platform.role_agent_%' AND agent_id = $1 ORDER BY created_at",
+    )
+    .bind(attached)
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        audit,
+        vec![
+            "platform.role_agent_attached".to_string(),
+            "platform.role_agent_detached".to_string()
+        ]
+    );
+}
+
+/// `role_agents` is append-only on every role, the maintenance role and the
+/// superuser included: the one change a row takes is its detach (stamped
+/// `now()` by the detaching login, with a reason), a detached row is final,
+/// and no row is deleted. A human, or a role node, is never attached:
+/// agents only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn role_agents_is_append_only_and_attaches_agents_only(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let row = attach(&pool, ROLE, attached).await;
+
+    let rewrite = sqlx::query("UPDATE role_agents SET valid_to = now() + interval '1 day' WHERE id = $1")
+        .bind(row)
+        .execute(&pool)
+        .await;
+    assert!(rewrite.is_err(), "a window is never rewritten: {rewrite:?}");
+    let delete = sqlx::query("DELETE FROM role_agents WHERE id = $1")
+        .bind(row)
+        .execute(&pool)
+        .await;
+    assert!(delete.is_err(), "a row is never deleted: {delete:?}");
+    let backdated = sqlx::query(
+        "INSERT INTO role_agents (role, agent_id, valid_from, reason) \
+         VALUES ($1, $2, now() - interval '1 day', 'backdated')",
+    )
+    .bind(ROLE)
+    .bind(agent_of(&pool, h, "backdated").await)
+    .execute(&pool)
+    .await;
+    assert!(backdated.is_err(), "an attachment is never back-dated");
+    let overlap = sqlx::query(
+        "INSERT INTO role_agents (role, agent_id, reason) VALUES ($1, $2, 'twice')",
+    )
+    .bind(ROLE)
+    .bind(attached)
+    .execute(&pool)
+    .await;
+    assert!(overlap.is_err(), "one live attachment per (role, agent)");
+    let human_row = sqlx::query(
+        "INSERT INTO role_agents (role, agent_id, reason) VALUES ($1, $2, 'a human')",
+    )
+    .bind(ROLE)
+    .bind(h)
+    .execute(&pool)
+    .await;
+    assert!(human_row.is_err(), "a human is never attached as an agent");
+
+    assert_eq!(detach(&pool, ROLE, attached).await, 1);
+    let reopen = sqlx::query(
+        "UPDATE role_agents SET detached_at = NULL, detached_by = NULL, detach_reason = NULL \
+          WHERE id = $1",
+    )
+    .bind(row)
+    .execute(&pool)
+    .await;
+    assert!(reopen.is_err(), "a detached row is final: {reopen:?}");
+    assert_eq!(
+        detach(&pool, ROLE, attached).await,
+        0,
+        "a second detach ends nothing"
+    );
+    // CALIBRATION: after the detach the agent can be attached again.
+    attach(&pool, ROLE, attached).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The question the host and epigraph-mcp ask
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `epigraph_role_agent_may_run` answers the application role and the
+/// identity attestor (the host), and its answers track the write rule:
+/// unattached -> may run; a gap -> no holder; the holder's agent -> may run,
+/// naming its own human; an agent of a previous holder -> not the holder, and
+/// the current holder is NOT disclosed to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn may_run_answers_the_app_role_and_the_attestor(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h1, _) = human(&pool, "holder-1").await;
+    let (h2, _) = human(&pool, "holder-2").await;
+    let plain = agent_of(&pool, h1, "plain").await;
+    let a1 = agent_of(&pool, h1, "curator-1").await;
+    attach(&pool, ROLE, a1).await;
+
+    for caller in ["epigraph_app", ATTESTOR] {
+        assert_eq!(
+            may_run_as(&pool, caller, plain).await.expect(caller),
+            MayRun {
+                may_run: true,
+                role: None,
+                holder: None,
+                reason: "unattached".into()
+            },
+            "{caller}: an unattached agent"
+        );
+        assert_eq!(
+            may_run_as(&pool, caller, a1).await.expect(caller),
+            MayRun {
+                may_run: false,
+                role: Some(ROLE.into()),
+                holder: None,
+                reason: "no_holder".into()
+            },
+            "{caller}: a gap"
+        );
+    }
+    let g1 = grant(&pool, ROLE, h1, None).await;
+    for caller in ["epigraph_app", ATTESTOR] {
+        assert_eq!(
+            may_run_as(&pool, caller, a1).await.expect(caller),
+            MayRun {
+                may_run: true,
+                role: Some(ROLE.into()),
+                holder: Some(h1),
+                reason: "held".into()
+            },
+            "{caller}: the holder's agent"
+        );
+    }
+    end_assignment(&pool, g1).await;
+    grant(&pool, ROLE, h2, None).await;
+    for caller in ["epigraph_app", ATTESTOR] {
+        assert_eq!(
+            may_run_as(&pool, caller, a1).await.expect(caller),
+            MayRun {
+                may_run: false,
+                role: Some(ROLE.into()),
+                holder: None,
+                reason: "not_holder".into()
+            },
+            "{caller}: an agent of the previous holder"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Succession
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn random32() -> Vec<u8> {
+    [
+        Uuid::new_v4().as_bytes().as_slice(),
+        Uuid::new_v4().as_bytes().as_slice(),
+    ]
+    .concat()
+}
+
+/// Register an identity on the attestor role; returns the agent id.
+async fn register(pool: &PgPool, pubkey: &[u8], parent: Option<Uuid>, group: &str) -> Uuid {
+    let pubkey = pubkey.to_vec();
+    let hash = blake3::hash(&pubkey).to_hex().to_string();
+    let group = group.to_string();
+    fixture::as_role(pool, ATTESTOR, |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                 $1, $2, 'test-model-166', $3, $4, NULL, $5)",
+        )
+        .bind(&pubkey)
+        .bind(parent)
+        .bind(&hash)
+        .bind(&group)
+        .bind(json!({"in_prompt": {}}))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the attestor registers the identity");
+        (conn, id)
+    })
+    .await
+}
+
+async fn live_attachments(pool: &PgPool, agent: Uuid) -> Vec<(String, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT role, inherited_from FROM role_agents \
+          WHERE agent_id = $1 AND detached_at IS NULL ORDER BY role",
+    )
+    .bind(agent)
+    .fetch_all(pool)
+    .await
+    .expect("attachments")
+}
+
+/// A succession the attestor registers copies the parent's live attachments
+/// to the child (so a LEARNED.md edit does not detach an agent from its
+/// role), records which row it came from, and does it once: the same
+/// registration again copies nothing and still succeeds. A DETACHED parent
+/// attachment is not copied. The child is then held to the rule: refused in
+/// the gap.
+///
+/// Verified to fail: the copy block removed from the registration.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_succession_copies_the_parents_live_attachments_once(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    seed_role(&pool, OTHER_ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let parent_key = random32();
+    let parent = register(&pool, &parent_key, None, "g-166").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, parent, h)
+            .await
+            .expect("link the parent");
+    }
+    let kept = attach(&pool, ROLE, parent).await;
+    attach(&pool, OTHER_ROLE, parent).await;
+    assert_eq!(detach(&pool, OTHER_ROLE, parent).await, 1);
+
+    let child_key = random32();
+    let child = register(&pool, &child_key, Some(parent), "g-166").await;
+    assert_eq!(
+        live_attachments(&pool, child).await,
+        vec![(ROLE.to_string(), Some(kept))],
+        "the child carries the parent's live attachment, and only that one"
+    );
+    let again = register(&pool, &child_key, Some(parent), "g-166").await;
+    assert_eq!(again, child);
+    assert_eq!(
+        live_attachments(&pool, child).await.len(),
+        1,
+        "a repeat registration copies nothing"
+    );
+
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, child, child, h_group).await,
+        "the successor in a gap",
+    );
+    grant(&pool, ROLE, h, None).await;
+    write_as(&pool, child, child, h_group)
+        .await
+        .expect("the successor writes while its human holds the role");
+}
