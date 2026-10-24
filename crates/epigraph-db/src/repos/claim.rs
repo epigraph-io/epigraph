@@ -4892,15 +4892,21 @@ impl ClaimRepository {
     }
 
     /// Each of `ids` the viewer reads, with whether it is current, LOCKED
-    /// `FOR SHARE` (in id order) until the caller's transaction ends.
+    /// `FOR NO KEY UPDATE` (in id order) until the caller's transaction ends.
     ///
     /// The locking twin of [`Self::are_all_current`], for a check that a later
     /// write in the same transaction relies on (a dedup mark onto a canonical
-    /// that must stay current). `FOR SHARE`, not `FOR KEY SHARE`: supersede,
-    /// deprecate, consolidate and mark retire a claim with a plain `UPDATE`
-    /// (`FOR NO KEY UPDATE`), and only `FOR SHARE` conflicts with that, so a
-    /// retirement that has not committed when this runs is waited for and its
-    /// result read; one that starts afterwards waits for the caller's commit.
+    /// that must stay current). Supersede, deprecate, consolidate and mark
+    /// retire a claim with a plain `UPDATE` (itself a `FOR NO KEY UPDATE`
+    /// lock), which this conflicts with: a retirement that has not committed
+    /// when this runs is waited for and its result read; one that starts
+    /// afterwards waits for the caller's commit. `FOR KEY SHARE` would not
+    /// conflict with it at all. `FOR SHARE` would, but two callers would then
+    /// both hold the row and deadlock when each goes on to `UPDATE` it (a
+    /// label-dedup unit relabels its canonical after marking onto it), where
+    /// `FOR NO KEY UPDATE` makes the second wait for the first and then read
+    /// its result. It does not conflict with `FOR KEY SHARE`, so a foreign-key
+    /// check against the row is not blocked.
     ///
     /// `is_current` is returned, not filtered on: under READ COMMITTED a row
     /// retired while this waited is re-read and comes back `false`, rather
@@ -4922,7 +4928,7 @@ impl ClaimRepository {
             "SELECT id, COALESCE(is_current, true) FROM claims \
              WHERE id = ANY($1) \
              /* {VISIBILITY:claims} */ \
-             ORDER BY id FOR SHARE OF claims",
+             ORDER BY id FOR NO KEY UPDATE OF claims",
             2,
         );
         let mut q = sqlx::query_as::<_, (uuid::Uuid, bool)>(&sql).bind(ids);
