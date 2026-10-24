@@ -202,3 +202,67 @@ async fn ingest_workflow_merges_source_tags_into_caller_metadata(pool: PgPool) {
         "the caller's own metadata keys are kept: {meta}"
     );
 }
+
+/// Runs MCP `store_workflow` from wire-shaped JSON (so the `tags` deserializer
+/// runs as it does for a real client) and returns the response body.
+async fn store_from_wire(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    goal: &str,
+    tags: Value,
+) -> Value {
+    let params: StoreWorkflowParams = serde_json::from_value(json!({
+        "goal": goal,
+        "steps": [format!("restore probe step for {goal}")],
+        "tags": tags,
+    }))
+    .expect("wire-shaped store_workflow params");
+    let r = epigraph_mcp::tools::workflows::store_workflow(server, viewer, params, None)
+        .await
+        .expect("store_workflow");
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    let text = r
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("a text body");
+    serde_json::from_str(&text).expect("a JSON body")
+}
+
+/// Re-storing the same goal is the existing idempotent no-op: the second call
+/// reports `already_ingested` and the row keeps the tags of the FIRST store.
+/// Tags on a re-store are not merged; this pins that documented behaviour so a
+/// later change cannot start partially overwriting them unnoticed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn store_workflow_restore_keeps_first_store_tags(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = fixture::public_viewer(&pool).await;
+    let goal = format!("restore tags probe goal {}", Uuid::new_v4());
+
+    let first = store_from_wire(&server, &viewer, &goal, json!(["alpha"])).await;
+    assert_eq!(
+        first.get("already_ingested"),
+        Some(&json!(false)),
+        "{first}"
+    );
+
+    let second = store_from_wire(&server, &viewer, &goal, json!(["beta"])).await;
+    assert_eq!(
+        second.get("already_ingested"),
+        Some(&json!(true)),
+        "a re-store of the same goal is the idempotent no-op: {second}"
+    );
+    assert_eq!(
+        second.get("workflow_id"),
+        first.get("workflow_id"),
+        "same row: {first} vs {second}"
+    );
+
+    let meta = metadata_for_goal(&pool, &goal).await;
+    assert_eq!(
+        meta.get("tags"),
+        Some(&json!(["alpha"])),
+        "a re-store keeps the first store's tags: {meta}"
+    );
+}
