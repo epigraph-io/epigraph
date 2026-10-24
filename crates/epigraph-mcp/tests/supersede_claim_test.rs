@@ -157,3 +157,44 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
         "replacement claim {new_id} must be is_current = true"
     );
 }
+
+/// The MCP `supersede_claim` path: the replacement inherits the predecessor's
+/// labels except the novelty gate's per-submission `near-duplicate` flag.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_does_not_carry_the_near_duplicate_flag(pool: PgPool) {
+    let old = seed_claim(&pool, "v1", 0.5).await;
+    sqlx::query("UPDATE claims SET labels = ARRAY['backlog','near-duplicate'] WHERE id = $1")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let result = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &admin_viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: old.to_string(),
+            content: "v2".into(),
+            truth_value: 0.7,
+            reason: "newer evidence".into(),
+        },
+        Some(&auth),
+    )
+    .await
+    .unwrap();
+    let new_id = parse_uuid_field(&first_text(&result), "new_claim_id");
+    let (labels,): (Vec<String>,) =
+        sqlx::query_as("SELECT COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = $1")
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(labels, vec!["backlog".to_string()], "{labels:?}");
+}

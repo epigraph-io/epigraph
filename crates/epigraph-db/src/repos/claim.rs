@@ -798,6 +798,13 @@ impl DuplicateProvenance {
     }
 }
 
+/// Labels a supersession does NOT carry from the retired claim onto its
+/// replacement ([`ClaimRepository::supersede_act_conn`] carries every other
+/// one). `near-duplicate` is the novelty gate's flag on one submission (its
+/// content was near another claim's); on the replacement, whose content is
+/// new, it would read as pointing at its own predecessor.
+pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -940,6 +947,15 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// Neither direction moves a dedup identity edge
+/// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
+/// [`DUPLICATE_IDENTITY_PROPERTY`]), as [`repair_marked_duplicate`] does not:
+/// it names the claim its duplicate's `supersedes` names, and the un-mark and
+/// the index view read it by that pointer. A duplicate of a canonical that is
+/// later superseded (or consolidated) therefore keeps its edge to the retired
+/// canonical, and stays marked: the un-mark refuses it while that canonical is
+/// retired, and the canonical, retired by another act, has no mark to undo.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -995,6 +1011,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1013,6 +1030,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -6216,10 +6234,13 @@ impl ClaimRepository {
         .fetch_optional(&mut *conn)
         .await?;
 
-        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
+        let (agent_id, is_current, mut old_labels) = old_row.ok_or(DbError::NotFound {
             entity: "Claim".to_string(),
             id: old_uuid,
         })?;
+        // Per-submission review flags describe the OLD content, not the
+        // replacement's, so they do not carry (see `NON_CARRIED_LABELS`).
+        old_labels.retain(|l| !NON_CARRIED_LABELS.contains(&l.as_str()));
 
         if !is_current {
             return Err(DbError::QueryFailed {
@@ -10787,6 +10808,10 @@ async fn migrate_consolidated_edges(
     // a redundant copy. The test is on the source endpoint's own row (a
     // missing row counting as non-public), so the deferred replay gives the
     // same result.
+    //
+    // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
+    // candidate either: it names the claim its duplicate supersedes, so it is
+    // neither moved nor retracted (see `migrate_superseded_edges`).
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -10799,6 +10824,7 @@ async fn migrate_consolidated_edges(
           AND e.valid_to IS NULL
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
+          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11116,18 +11142,35 @@ async fn mark_duplicate_act(
             source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
         });
     }
-    let canon_exists: bool = sqlx::query_scalar(
+    // The canonical must exist and be CURRENT: a mark onto a retired claim
+    // builds a dedup chain the caller never saw, which the un-mark then
+    // refuses while that canonical stays retired. A plain read, not FOR SHARE
+    // (that would take the UPDATE policy on the caller's stamped session); a
+    // concurrent retirement after it makes an ordinary chain, which the
+    // un-mark already orders.
+    let canon_current: Option<bool> = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+        SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
     )
     .bind(canon_uuid)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    if !canon_exists {
-        return Err(DbError::NotFound {
-            entity: "Claim".into(),
-            id: canon_uuid,
-        });
+    match canon_current {
+        None => {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: canon_uuid,
+            })
+        }
+        Some(false) => {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
+                     dedup chain onto a retired claim"
+                )),
+            })
+        }
+        Some(true) => {}
     }
     let row: Option<(Option<Uuid>,)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -11872,6 +11915,46 @@ async fn reverse_marked_duplicate(
     let done = out.unretracted_edges.clone();
     note_drift(&record.retracted_edges, &done, &mut drifted);
 
+    // The BP factor graph. Retiring the duplicate deleted every factor naming
+    // it (`claims_deactivate_factors`), and the edges came back above by
+    // UPDATE, which `edges_auto_factor` (INSERT only) never sees. A factor
+    // keyed to an edge just moved back off the canonical names the canonical
+    // (one an earlier un-mark in a chain minted there) and is stale; it goes
+    // first, and the `(type, pair)` slots it held on the canonical are kept.
+    // Then the duplicate's edges are re-minted, and on the canonical only
+    // those freed slots: the un-mark leaves every other canonical factor as
+    // it found it. Two statements, not one data-modifying CTE: in one
+    // statement the INSERT's ON CONFLICT would still see the rows being
+    // deleted and leave the freed slot empty.
+    let moved_back: Vec<String> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .map(|id| id.to_string())
+        .collect();
+    let freed_slots: Vec<String> = if moved_back.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM factors f
+              WHERE f.variable_ids @> ARRAY[$1]::uuid[]
+                AND f.properties->>'source_edge_id' = ANY($2)
+             RETURNING f.factor_type || ':' || array_to_string(f.variable_ids, ',')"#,
+        )
+        .bind(canon_uuid)
+        .bind(&moved_back)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+        .bind(dup_uuid)
+        .bind(canon_uuid)
+        .bind(&freed_slots)
+        .execute(&mut *conn)
+        .await?;
+
     // BBAs moved onto the canonical go back with their old tenancy while the
     // duplicate is still public (its audience then is what it was); on a
     // duplicate that has since gone non-public a row becomes the claim's own,
@@ -12041,6 +12124,81 @@ async fn reverse_marked_duplicate(
     out.drifted = drifted;
     Ok(out)
 }
+
+/// The INSERT minting the BP factors `edges_auto_factor` would mint, as if
+/// each edge were inserted now, for every in-force claim-claim edge whose
+/// endpoints are both current and that either touches the claim `$1` or
+/// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
+/// (as `type:lo,hi`). For the un-mark, which puts edges back by UPDATE (which
+/// that INSERT trigger never sees) onto a claim made current again: `$1` is
+/// the duplicate, `$2` its canonical and `$3` the slots the stale-factor
+/// DELETE freed there.
+///
+/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// set, and must stay that: a migration that changes the trigger's mapping,
+/// potentials, description or properties changes this too (the
+/// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
+/// Like the trigger it mints `decomposes_to` factors, on the duplicate's
+/// edges. A dedup identity edge is skipped (the act writes it after retiring
+/// the duplicate, so it never had one). One factor per `(factor_type, pair)`,
+/// from the earliest edge, and an existing one is kept
+/// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
+const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         INSERT INTO factors (factor_type, variable_ids, potential, description, properties)
+         SELECT DISTINCT ON (x.ft, x.var_ids) x.ft, x.var_ids, x.pot, x.descr, x.props
+           FROM (
+             SELECT e.id, e.created_at, m.ft, (e.source_id = $1 OR e.target_id = $1) AS on_dup,
+                    CASE WHEN e.source_id < e.target_id
+                         THEN ARRAY[e.source_id, e.target_id]
+                         ELSE ARRAY[e.target_id, e.source_id] END AS var_ids,
+                    CASE WHEN m.ft = 'mutual_exclusion' THEN '{}'::jsonb
+                         WHEN m.ft = 'directional_support' THEN jsonb_build_object(
+                              'forward_strength', m.fwd, 'reverse_strength', m.rev,
+                              'source_var', e.source_id::text)
+                         ELSE jsonb_build_object('strength', m.fwd) END AS pot,
+                    format('Auto-generated from %s edge %s', e.relationship, e.id) AS descr,
+                    jsonb_build_object('source_edge_id', e.id, 'relationship', e.relationship,
+                                       'edge_source_id', e.source_id,
+                                       'edge_target_id', e.target_id) AS props
+               FROM edges e
+               JOIN claims s ON s.id = e.source_id
+               JOIN claims t ON t.id = e.target_id
+               CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+               -- 038's override: a cross-source matcher's evidential_support
+               -- edge carries its own strength in properties.score, clamped
+               -- to [0, 1]. The trigger casts it at INSERT; properties can be
+               -- patched since, so a score that is not a decimal number falls
+               -- back to the constant (as a missing one does) instead of
+               -- failing the whole un-mark. The exponent is bounded to three
+               -- digits so the numeric cast itself cannot overflow (numeric_in
+               -- raises on e.g. "1e999999"); clamped as numeric, then cast, so
+               -- a large in-range exponent cannot overflow the double either.
+               CROSS JOIN LATERAL (
+                 SELECT ft.factor_type AS ft,
+                        COALESCE(ms.score, ft.forward_strength) AS fwd,
+                        COALESCE(ms.score, ft.reverse_strength) AS rev
+                   FROM (SELECT CASE WHEN ft.factor_type = 'evidential_support'
+                                      AND e.properties ? 'source'
+                                      AND e.properties->>'source' = 'cross_source_matcher'
+                                      AND e.properties ? 'score'
+                                      AND e.properties->>'score'
+                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,3})?\s*$'
+                                     THEN GREATEST(0.0, LEAST(1.0,
+                                              (e.properties->>'score')::numeric))::double precision
+                                END AS score) ms
+               ) m
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+                -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
+                AND (e.valid_to IS NULL OR e.valid_to > now())
+                AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
+                AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
+                AND m.ft IS NOT NULL
+           ) x
+          WHERE x.on_dup
+             OR (x.ft || ':' || array_to_string(x.var_ids, ',')) = ANY($3)
+          ORDER BY x.ft, x.var_ids, x.created_at, x.id
+         ON CONFLICT DO NOTHING"#;
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
 /// keyed to any edge (those follow their edge, or stay with it), not an

@@ -366,6 +366,21 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
             .await
             .expect("edge");
     assert_eq!((target, in_force), (dup, true));
+    // The reversal re-mints the BP factors the duplicate's retirement deleted,
+    // here on the non-superuser `epigraph_maintenance` login: the edge put
+    // back on the duplicate has its factor again, on the duplicate.
+    let factors: Vec<Vec<Uuid>> = sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_other)
+    .fetch_all(&pool)
+    .await
+    .expect("factors");
+    assert_eq!(
+        factors,
+        vec![vec![other.min(dup), other.max(dup)]],
+        "the restored edge's factor, re-minted as epigraph_maintenance"
+    );
     let diamond_in_force: bool =
         sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
             .bind(e_diamond)
@@ -375,6 +390,20 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
     assert!(
         diamond_in_force,
         "the collision-retracted edge is back in force"
+    );
+    // The mark retracted that copy instead of moving it; back in force, it is
+    // re-minted on the duplicate too, on the same login.
+    let diamond_factors: Vec<Vec<Uuid>> = sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_diamond)
+    .fetch_all(&pool)
+    .await
+    .expect("factors");
+    assert_eq!(
+        diamond_factors,
+        vec![vec![third.min(dup), third.max(dup)]],
+        "the un-retracted copy's factor, re-minted as epigraph_maintenance"
     );
 }
 

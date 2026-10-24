@@ -179,3 +179,60 @@ async fn supersede_nonexistent_claim_returns_404() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+/// POST /api/v1/claims/:id/supersede carries the old claim's labels onto the
+/// replacement except the novelty gate's per-submission `near-duplicate`
+/// flag, which on the replacement would point at its own predecessor. The
+/// route runs the shared `ClaimRepository::supersede_act_conn`; this is the
+/// HTTP twin of its DB and MCP arms.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersede_route_does_not_carry_the_near_duplicate_flag() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let claim_id =
+        common::seed_claim_writable_by_client(&pool, "supersede label carry", client_id).await;
+    sqlx::query("UPDATE claims SET labels = ARRAY['backlog', 'near-duplicate'] WHERE id = $1")
+        .bind(claim_id)
+        .execute(&pool)
+        .await
+        .expect("label the claim");
+
+    let body = serde_json::json!({
+        "content": "supersede label carry, revised",
+        "truth_value": 0.7,
+        "reason": "label carry test",
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims/{claim_id}/supersede"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status == 200 || status == 201,
+        "calibration: the supersession commits; got {status} — body={text}"
+    );
+
+    let labels: Vec<String> =
+        sqlx::query_scalar("SELECT labels FROM claims WHERE supersedes = $1 AND is_current")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the replacement");
+    assert_eq!(
+        labels,
+        vec!["backlog".to_string()],
+        "every label carries except near-duplicate"
+    );
+}
