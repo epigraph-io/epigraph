@@ -382,3 +382,202 @@ async fn hierarchical_outcome_reports_surface_as_behavioral_affinity(pool: PgPoo
         "one report, counted once however many steps it wrote: {hit}"
     );
 }
+
+/// Backlog 563165f2: `find_workflow` returns a hierarchical workflow's FROZEN
+/// steps (the claims its `executes` edges named at ingest), and before this fix
+/// it gave no signal that a step had since been evolved. A caller following
+/// the frozen text then ran a step whose current version differs (the report:
+/// an evolved step added a package install the frozen text lacks).
+///
+/// The fix is additive: `steps` stays frozen (pinned plans rely on that), and
+/// the result discloses `has_evolved_steps` plus the evolved step's head. Both
+/// hierarchical legs are driven: the text fallback (`pgvec = None`) and the
+/// embedding leg, since each builds its result separately.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_workflow_surfaces_evolved_step_heads(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    // `evolve_step` on a ScopedPool server also runs the supersede cascade,
+    // which needs a maintenance session this fixture does not configure; the
+    // plain server runs the act alone, as `step_versioning.rs` does.
+    let plain = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let token = format!("qqev{}", Uuid::new_v4().simple());
+
+    let frozen_steps = ["fetch the inputs", "install the client", "run the report"];
+    let evolved_id = store(
+        &server,
+        &viewer,
+        &format!("evolved step probe {token}"),
+        &frozen_steps,
+    )
+    .await;
+    let control_id = store(
+        &server,
+        &viewer,
+        &format!("unevolved control {token}"),
+        &["alpha step", "beta step"],
+    )
+    .await;
+
+    let resolved =
+        epigraph_db::WorkflowRepository::resolve_steps_to_heads(&pool, &viewer, evolved_id)
+            .await
+            .expect("resolve steps");
+    assert_eq!(resolved.len(), 3, "precondition: three plan steps");
+    let frozen1 = resolved[1].frozen_claim_id;
+    let evolved_text = "install the client and postgresql-client";
+    epigraph_mcp::tools::evolve_step::evolve_step(
+        &plain,
+        &viewer,
+        epigraph_mcp::tools::evolve_step::EvolveStepParams {
+            parent_id: frozen1.to_string(),
+            canonical_name: None,
+            step_index: None,
+            step_lineage_id: String::new(),
+            content: evolved_text.to_string(),
+            edge_type: "supersedes".to_string(),
+            rationale: None,
+            level: Some(2),
+        },
+        None,
+    )
+    .await
+    .expect("evolve_step supersedes step 1");
+
+    let unit: Vec<f32> = (0..1536).map(|i| if i == 7 { 1.0 } else { 0.0 }).collect();
+    for id in [evolved_id, control_id] {
+        epigraph_db::WorkflowRepository::set_goal_embedding(&pool, id, &unit)
+            .await
+            .expect("set goal embedding");
+    }
+
+    // A newer generation of the evolved workflow's lineage, with a goal that
+    // does not carry the token and no goal embedding, so it is never itself
+    // the hit: the gen-0 hit must say a newer generation exists.
+    let (canonical,): (String,) =
+        sqlx::query_as("SELECT canonical_name FROM workflows WHERE id = $1")
+            .bind(evolved_id)
+            .fetch_one(&pool)
+            .await
+            .expect("canonical_name of the evolved workflow");
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value) \
+         VALUES ($1, $2, 1, 'a reworded later generation', $3, '{}', NOW(), 1.0)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&canonical)
+    .bind(evolved_id)
+    .execute(&pool)
+    .await
+    .expect("seed generation 1");
+
+    for (leg, pgvec) in [("text", None), ("embedding", Some(axis_pgvec_1536(7)))] {
+        let result = find_workflow_with_pgvec(
+            &server,
+            &viewer,
+            FindWorkflowParams {
+                goal: token.clone(),
+                limit: Some(5),
+                min_truth: Some(0.0),
+            },
+            pgvec,
+        )
+        .await
+        .expect("find_workflow_with_pgvec");
+        let body = first_text(&result);
+        let arr = body.as_array().expect("result is an array");
+        let find = |id: Uuid| {
+            arr.iter()
+                .find(|r| r["workflow_id"].as_str() == Some(&id.to_string()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{leg} leg: workflow {id} must be returned: {}",
+                        serde_json::to_string(arr).unwrap()
+                    )
+                })
+        };
+
+        let hit = find(evolved_id);
+        let steps: Vec<&str> = hit["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .map(|s| s.as_str().expect("step string"))
+            .collect();
+        assert_eq!(
+            steps, frozen_steps,
+            "{leg} leg: `steps` must stay the FROZEN plan text; the default is unchanged"
+        );
+        assert_eq!(
+            hit["has_evolved_steps"],
+            serde_json::json!(true),
+            "{leg} leg: an evolved step must be disclosed: {hit}"
+        );
+        let evolved = hit["evolved_steps"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{leg} leg: evolved_steps array expected: {hit}"));
+        assert_eq!(evolved.len(), 1, "{leg} leg: exactly step 1 evolved: {hit}");
+        assert_eq!(evolved[0]["step_index"], serde_json::json!(1));
+        assert_eq!(
+            evolved[0]["frozen_claim_id"].as_str(),
+            Some(frozen1.to_string().as_str())
+        );
+        assert_eq!(evolved[0]["head_content"].as_str(), Some(evolved_text));
+        assert_ne!(
+            evolved[0]["head_claim_id"].as_str(),
+            Some(frozen1.to_string().as_str()),
+            "{leg} leg: the head is the evolved claim, not the frozen one"
+        );
+        assert_eq!(evolved[0]["pending_resolution"], serde_json::json!(false));
+        assert_eq!(
+            hit["generation"],
+            serde_json::json!(0),
+            "{leg} leg: the hit is generation 0: {hit}"
+        );
+        assert_eq!(
+            hit["latest_generation"],
+            serde_json::json!(1),
+            "{leg} leg: a newer generation of this lineage exists and must be \
+             disclosed (latest_generation > generation): {hit}"
+        );
+
+        let control = find(control_id);
+        assert_eq!(
+            control["has_evolved_steps"],
+            serde_json::json!(false),
+            "{leg} leg: an unevolved hierarchical workflow reports false, so the \
+             signal is not a constant: {control}"
+        );
+        assert!(
+            control.get("evolved_steps").is_none(),
+            "{leg} leg: no evolved_steps entry when nothing evolved: {control}"
+        );
+    }
+}
+
+/// The tool description is the contract an agent reads: it must say the steps
+/// are frozen and where the evolved heads are.
+#[test]
+fn find_workflow_description_says_steps_are_frozen_and_names_evolved_steps() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let description = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "find_workflow")
+        .and_then(|t| t["description"].as_str())
+        .expect("find_workflow is registered with a description")
+        .to_string();
+    for needle in [
+        "frozen",
+        "has_evolved_steps",
+        "evolved_steps",
+        "is_current",
+        "latest_generation",
+    ] {
+        assert!(
+            description.contains(needle),
+            "find_workflow's description must mention {needle:?}; got: {description}"
+        );
+    }
+}
