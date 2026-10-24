@@ -81,6 +81,37 @@ pub struct RevokeKeyRequest {
 // HANDLERS
 // =============================================================================
 
+/// The caller rule for every agent-key mutation: the caller must be the
+/// target agent (`auth.agent_id == agent_id`) or hold `claims:admin`.
+///
+/// `claims:admin` is read through [`AuthContext::has_scope`], so the admin
+/// override holds only while the admin-scope switch (migration 128) is
+/// unarmed. Once it is armed, `claims:admin` counts only on an elevated token,
+/// and an elevated token carries no `agents:write`, so no HTTP request can use
+/// the override; an armed deployment rotates or revokes another agent's key
+/// as a maintenance action instead.
+///
+/// Key rotation and revocation both call this before the hex decode, the
+/// key lookup and the signature checks, so a non-owner cannot use those
+/// outcomes to probe a mutation target. (The JSON body is deserialized by the
+/// extractor before the handler runs; that refusal depends only on the
+/// caller's own input. Key rows themselves are not secret:
+/// `GET /api/v1/agents/:id/keys` lists them to any `agents:read` holder.)
+///
+/// [`AuthContext::has_scope`]: crate::middleware::bearer::AuthContext::has_scope
+#[cfg(feature = "db")]
+fn require_self_or_admin(
+    auth: &crate::middleware::bearer::AuthContext,
+    agent_id: Uuid,
+) -> Result<(), ApiError> {
+    if !auth.has_scope("claims:admin") && auth.agent_id != Some(agent_id) {
+        return Err(ApiError::Forbidden {
+            reason: "can only mutate your own agent record".into(),
+        });
+    }
+    Ok(())
+}
+
 /// List all keys for an agent
 ///
 /// GET /api/v1/agents/:id/keys
@@ -121,17 +152,55 @@ pub async fn list_agent_keys(
     })
 }
 
+/// Since migration 161 a `signing` (or `identity-legacy`) key is attested
+/// state: the host's identity registration binds it and a maintenance session
+/// retires it. On an application session its status change or a new signing
+/// row is refused with SQLSTATE 42501 (AK02). Answer that as a 403 naming the
+/// right path, not as an opaque 500. Nothing was written: the refusal comes
+/// from the first statement of each act.
+#[cfg(feature = "db")]
+fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        ApiError::Forbidden {
+            reason: "this is an attested signing key: it is rotated through the host's \
+                     identity registration, and revoked by a maintenance session"
+                .to_string(),
+        }
+    } else {
+        e.into()
+    }
+}
+
 /// Rotate the agent's active signing key
 ///
 /// POST /api/v1/agents/:id/keys/rotate
 ///
-/// Rotates the currently active key for the agent by:
+/// Rotates the agent's active `signing` key (keys of other types are never
+/// touched) by:
 /// 1. Verifying the old key signature over the canonical rotation message
 /// 2. Verifying the new key signature over the same message
-/// 3. Marking the old key as `rotated`
-/// 4. Storing and activating the new key
+/// 3. Marking the old key as `rotated`, which closes its validity window
+///    (`valid_until`, migration 162)
+/// 4. Storing and activating the new key, valid from no earlier than the
+///    old key's window closed
 ///
-/// Requires `agents:write` scope.
+/// Requires `agents:write` scope. Caller must be the target agent
+/// (auth.agent_id == :id) or have `claims:admin` (unarmed admin-scope switch
+/// only; see `require_self_or_admin`), checked before the hex decode, the key
+/// lookup and the signature checks. The old-key signature alone is not an
+/// ownership proof: a derived LLM-agent key is computable from public inputs.
+///
+/// # Errors
+///
+/// - 400 Bad Request: a field is not valid hex or has the wrong length
+/// - 401 Unauthorized: Missing or invalid Bearer token, or the old-key or
+///   new-key signature does not verify (`SignatureError`)
+/// - 403 Forbidden: Missing scope or caller is not the target agent
+/// - 404 Not Found: The agent has no active signing key
+/// - 422 Unprocessable Entity: the body does not deserialize (missing field
+///   or wrong JSON type); refused by the extractor, the same for every caller
+/// - 500 Internal Server Error: the old key left `active` under the request
+///   (a concurrent rotation; the status definer refuses with `AK01`)
 #[cfg(feature = "db")]
 pub async fn rotate_agent_key(
     State(state): State<AppState>,
@@ -142,6 +211,7 @@ pub async fn rotate_agent_key(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+        require_self_or_admin(auth, id)?;
     }
 
     // Decode the new public key from hex
@@ -200,7 +270,7 @@ pub async fn rotate_agent_key(
     let agent_id = AgentId::from_uuid(id);
 
     // Look up the current active key
-    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id)
+    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id, "signing")
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "ActiveAgentKey".to_string(),
@@ -242,11 +312,18 @@ pub async fn rotate_agent_key(
         });
     }
 
-    // Mark old key as rotated
-    AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None).await?;
+    // Mark old key as rotated. Since migration 162 this also closes its
+    // validity window (`valid_until`) on the database clock.
+    let retired =
+        AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None)
+            .await
+            .map_err(attested_key_refusal)?;
 
-    // Store the new active key
+    // Store the new active key. Its window opens no earlier than the old one
+    // closed, so the two never overlap even if this host's clock is behind
+    // the database's.
     let now = Utc::now();
+    let valid_from = retired.valid_until.map_or(now, |closed| closed.max(now));
     let new_key_id = Uuid::new_v4();
     let new_key_row = AgentKeyRepository::store(
         &state.db_pool,
@@ -255,11 +332,12 @@ pub async fn rotate_agent_key(
         &new_key_array,
         "signing",
         "active",
-        now,
+        valid_from,
         None,
         now,
     )
-    .await?;
+    .await
+    .map_err(attested_key_refusal)?;
 
     Ok(Json(new_key_row.into()))
 }
@@ -282,16 +360,22 @@ pub async fn rotate_agent_key(
 ///
 /// POST /api/v1/agents/:id/keys/:key_id/revoke
 ///
-/// Marks the given key as `revoked` with the provided reason.
+/// Marks the given key as `revoked` with the provided reason and closes its
+/// validity window (`valid_until`, never moved later; migration 162).
 /// A revoked key cannot be used for signing or verification.
+/// `revoked_by` records the agent when the agent itself revoked, and nothing
+/// on an admin override.
 /// Requires `agents:write` scope. Caller must be the target agent
-/// (auth.agent_id == :id) or have `claims:admin`.
+/// (auth.agent_id == :id) or have `claims:admin` (unarmed admin-scope switch
+/// only; see `require_self_or_admin`).
 ///
 /// # Errors
 ///
+/// - 400 Bad Request: the key is already revoked
 /// - 401 Unauthorized: Missing or invalid Bearer token
 /// - 403 Forbidden: Missing scope or caller is not the target agent
 /// - 404 Not Found: Agent or key does not exist
+/// - 422 Unprocessable Entity: the body does not deserialize
 #[cfg(feature = "db")]
 pub async fn revoke_agent_key(
     State(state): State<AppState>,
@@ -302,12 +386,7 @@ pub async fn revoke_agent_key(
     // Enforce scope when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
         crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        // Caller must be the target agent OR have claims:admin
-        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
-            return Err(ApiError::Forbidden {
-                reason: "can only mutate your own agent record".into(),
-            });
-        }
+        require_self_or_admin(auth, id)?;
     }
 
     // Look up the key to verify it belongs to this agent
@@ -331,14 +410,22 @@ pub async fn revoke_agent_key(
         });
     }
 
+    // `revoked_by` names the agent only when the agent itself revoked. An
+    // admin override records no one: `revoked_by` references `agents(id)` and
+    // an admin principal need not have an agents row, so recording it could
+    // fail the emergency revoke path; recording the target would be false.
+    let caller_is_agent = auth_ctx
+        .as_ref()
+        .is_some_and(|axum::Extension(auth)| auth.agent_id == Some(id));
     let updated = AgentKeyRepository::update_status(
         &state.db_pool,
         key_id,
         "revoked",
         Some(request.reason.as_str()),
-        Some(id), // revoked_by = the agent themselves (or admin acting on their behalf)
+        caller_is_agent.then_some(id),
     )
-    .await?;
+    .await
+    .map_err(attested_key_refusal)?;
 
     Ok(Json(updated.into()))
 }

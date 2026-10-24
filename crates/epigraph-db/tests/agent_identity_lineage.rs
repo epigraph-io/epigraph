@@ -2116,6 +2116,7 @@ async fn the_active_key_lookup_never_returns_a_legacy_identity_key(pool: PgPool)
     let got = epigraph_db::AgentKeyRepository::get_active_key(
         &pool,
         epigraph_core::AgentId::from_uuid(legacy_only),
+        "signing",
     )
     .await
     .expect("lookup");
@@ -2139,6 +2140,7 @@ async fn the_active_key_lookup_never_returns_a_legacy_identity_key(pool: PgPool)
     let got = epigraph_db::AgentKeyRepository::get_active_key(
         &pool,
         epigraph_core::AgentId::from_uuid(r.agent_id),
+        "signing",
     )
     .await
     .expect("lookup")

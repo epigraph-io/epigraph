@@ -149,12 +149,16 @@ impl AgentKeyRepository {
         }))
     }
 
-    /// Get the agent's active SIGNING key (`key_type = 'signing'`,
-    /// `status = 'active'`).
+    /// Get the agent's active key of one `key_type` (status = 'active').
     ///
-    /// Only the signing type: since migration 161 every agent also has an
+    /// `idx_agent_keys_active` admits one active key per (agent, key_type),
+    /// so an agent can hold several active keys of different types at once.
+    /// Callers name the type they act on; rotation retires the active
+    /// `'signing'` key and must never pick up a key of another type.
+    ///
+    /// Rotation passes `'signing'`: since migration 161 every agent also has an
     /// active `identity-legacy` key, whose private half is often computable
-    /// from public inputs, and the rotate route rotates whatever this returns.
+    /// from public inputs, so it must never be the key a rotation acts on.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -162,38 +166,24 @@ impl AgentKeyRepository {
     pub async fn get_active_key(
         pool: &PgPool,
         agent_id: AgentId,
+        key_type: &str,
     ) -> Result<Option<AgentKeyRow>, DbError> {
         let agent_uuid: Uuid = agent_id.as_uuid();
 
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                id, agent_id, public_key, key_type, status,
-                valid_from, valid_until, revocation_reason, revoked_by, created_at
-            FROM agent_keys
-            WHERE agent_id = $1
-              AND key_type = 'signing'
-              AND status = 'active'
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-            agent_uuid
+        let row = sqlx::query_as::<_, AgentKeyRow>(
+            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
+                    revocation_reason, revoked_by, created_at \
+               FROM agent_keys \
+              WHERE agent_id = $1 AND key_type = $2 AND status = 'active' \
+              ORDER BY created_at DESC \
+              LIMIT 1",
         )
+        .bind(agent_uuid)
+        .bind(key_type)
         .fetch_optional(pool)
         .await?;
 
-        Ok(row.map(|r| AgentKeyRow {
-            id: r.id,
-            agent_id: r.agent_id,
-            public_key: r.public_key,
-            key_type: r.key_type,
-            status: r.status,
-            valid_from: r.valid_from,
-            valid_until: r.valid_until,
-            revocation_reason: r.revocation_reason,
-            revoked_by: r.revoked_by,
-            created_at: r.created_at,
-        }))
+        Ok(row)
     }
 
     /// List all keys for an agent (all statuses).
