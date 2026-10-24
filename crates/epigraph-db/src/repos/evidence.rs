@@ -9,6 +9,16 @@ use uuid::Uuid;
 /// Repository for Evidence operations
 pub struct EvidenceRepository;
 
+/// What names an evidence row's source, for the canonical item key
+/// ([`EvidenceRepository::source_identity_by_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceSourceIdentity {
+    /// `properties->>'doi'`.
+    pub doi: Option<String>,
+    /// `source_url`.
+    pub source_url: Option<String>,
+}
+
 /// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
 ///
 /// `evidence_type` and `created_at` are projected even though today's only
@@ -734,6 +744,43 @@ impl EvidenceRepository {
             }
         }
         Ok(out)
+    }
+
+    /// The source identity of each of `ids` that `viewer` can see
+    /// ([`EvidenceSourceIdentity`]), keyed by evidence id. An id the
+    /// viewer cannot see, or that names no evidence row, is absent.
+    ///
+    /// Backs the canonical item key of the atom fold
+    /// (`epigraph_engine::source_dependence::item_key`, SPEC §3.3), which
+    /// reads a DOI first and a URL second.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn source_identity_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, EvidenceSourceIdentity>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT e.id, e.properties->>'doi', e.source_url \
+             FROM evidence e \
+             WHERE e.id = ANY($1) \
+               /* {VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(id, doi, source_url)| (id, EvidenceSourceIdentity { doi, source_url }))
+            .collect())
     }
 
     /// `source_url` of each of `ids` that has one and that `viewer` can see,

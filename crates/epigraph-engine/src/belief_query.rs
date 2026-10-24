@@ -312,14 +312,81 @@ pub async fn get_perspective_belief(
 /// captures them so the batch path resolves them once (see
 /// [`get_perspective_belief_batch`]) and the pure combine
 /// ([`combine_framed_bbas`]) touches the DB zero more times.
-struct FramedBeliefContext {
-    calibration: CalibrationConfig,
-    per_frame_intra: Option<f64>,
-    per_frame_weights: Option<std::collections::HashMap<String, f64>>,
-    perspective: Option<PerspectiveReliability>,
+///
+/// It is also the lens context of the atom fold
+/// ([`crate::atom_items::atom_axiom_rows`], SPEC §3.3 "Lens context"): there
+/// the calibration and the perspective apply, while each row's per-frame
+/// overrides come from that row's own frame, because the atom fold reads
+/// several frames at once. A context built by [`Self::new`] carries no
+/// per-frame overrides.
+pub struct FramedBeliefContext {
+    pub(crate) calibration: CalibrationConfig,
+    pub(crate) per_frame_intra: Option<f64>,
+    pub(crate) per_frame_weights: Option<std::collections::HashMap<String, f64>>,
+    pub(crate) perspective: Option<PerspectiveReliability>,
 }
 
 impl FramedBeliefContext {
+    /// A lens context with no per-frame overrides: `calibration`, and the
+    /// querying perspective's reliability overrides when there is a lens
+    /// (`None` is the global, no-lens read).
+    #[must_use]
+    pub fn new(
+        calibration: CalibrationConfig,
+        perspective: Option<PerspectiveReliability>,
+    ) -> Self {
+        Self {
+            calibration,
+            per_frame_intra: None,
+            per_frame_weights: None,
+            perspective,
+        }
+    }
+
+    /// The global (no-lens) context over the workspace calibration, falling
+    /// back to the built-in calibration when `calibration.toml` cannot be
+    /// loaded, exactly as the cache recompute does.
+    #[must_use]
+    pub fn global() -> Self {
+        Self::new(
+            CalibrationConfig::from_workspace_root()
+                .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback()),
+            None,
+        )
+    }
+
+    /// The lens context of `perspective_id` with no per-frame overrides: the
+    /// workspace calibration (as [`Self::global`]) and the perspective's
+    /// reliability maps, resolved exactly as [`get_perspective_belief`]
+    /// resolves them (an unknown or empty perspective is no opinion). `None`
+    /// is the global context.
+    ///
+    /// This is the context a compound read under a lens passes to
+    /// [`crate::compound_belief::derive_compound_belief_batch`], so a compound
+    /// under lens P is derived from its leaves under lens P (SPEC §3.3).
+    ///
+    /// # Errors
+    /// `Db` if the perspective read fails.
+    pub async fn for_perspective(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Self, BeliefQueryError> {
+        let mut ctx = Self::global();
+        if let Some(pid) = perspective_id {
+            ctx.perspective = Some(
+                PerspectiveRepository::get_by_id(pool, viewer, pid)
+                    .await?
+                    .map(|p| PerspectiveReliability {
+                        source_reliability: p.source_reliability().unwrap_or_default(),
+                        locality_reliability: p.locality_reliability().unwrap_or_default(),
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(ctx)
+    }
+
     /// Resolve the frame-scoped reliability inputs from the DB exactly once.
     ///
     /// Per-frame loads are best-effort: a DB error there falls back to global
@@ -581,3 +648,65 @@ async fn perspective_belief_for_claim(
 // its source in `edge_factor::tests` (effective_source_strength_with_perspective).
 // The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
 // is covered by the `perspective_frame_function` sqlx integration test.
+
+/// The `shadow` view of one claim under `mode` (SPEC §7.1): `None` in
+/// [`CompoundBeliefMode::Legacy`](crate::belief_view::CompoundBeliefMode),
+/// which issues no query at all. In `Shadow`, the claim's
+/// [`BeliefView`](crate::belief_view::BeliefView) under the global lens: a
+/// compound's derived value (R-DEP over the viewer's visible leaves, with its
+/// `not_all` valuation), or an atom's or standalone's AEF value. A procedural
+/// or rule claim, or a claim the viewer cannot see, has none.
+///
+/// The shadow never changes or fails the served read: a computation error is
+/// logged and the view omitted. It is always the `binary_truth` value under
+/// the global lens, whatever frame or lens the served read used.
+///
+/// **Known gap, carried from the atom reader** (`atom_axiom`'s module doc):
+/// on an application session row security can hide a compound's whole
+/// decomposition from a viewer; the role read then finds no compound, so that
+/// compound's own rows fold as an atom's and its frozen cache can be read as a
+/// `Legacy` leaf. The derivation is exact on a connection that bypasses row
+/// security. Per-request reads close this before any mode serves derived
+/// values (the read-dispatch PR fails closed or reads roles with definer
+/// rights); the shadow, off by default, is diagnostic only until then.
+pub async fn shadow_belief(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    mode: crate::belief_view::CompoundBeliefMode,
+) -> Option<crate::belief_view::BeliefView> {
+    if mode != crate::belief_view::CompoundBeliefMode::Shadow {
+        return None;
+    }
+    match shadow_view(pool, viewer, claim_id).await {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(claim = %claim_id, %error, "shadow belief omitted");
+            None
+        }
+    }
+}
+
+/// [`shadow_belief`]'s computation: the compound derivation first, then the
+/// atom view.
+async fn shadow_view(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<crate::belief_view::BeliefView>, String> {
+    let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
+    let ctx = FramedBeliefContext::global();
+    let ids = [claim_id];
+    if let Some(view) =
+        crate::compound_belief::derive_compound_belief_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id)
+    {
+        return Ok(Some(view));
+    }
+    Ok(
+        crate::compound_belief::atom_belief_view_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id),
+    )
+}

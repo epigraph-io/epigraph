@@ -2547,6 +2547,14 @@ pub struct BeliefResponse {
     /// top-level belief/plausibility/etc remain the global (unlensed) values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<LensedBelief>,
+    /// The claim's belief under the atom-level model, beside the served value
+    /// (`EPIGRAPH_COMPOUND_BELIEF=shadow` only; omitted, not null, otherwise,
+    /// so a get_belief in the default mode is byte-identical to today). A
+    /// compound carries `basis: "derived"`: computed from its visible atoms,
+    /// not evidence about the claim. The top-level fields stay the served
+    /// values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<epigraph_engine::belief_view::BeliefView>,
 }
 
 #[derive(Debug, Serialize)]
