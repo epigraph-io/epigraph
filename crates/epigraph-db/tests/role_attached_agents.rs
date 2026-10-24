@@ -1613,3 +1613,120 @@ async fn with_no_principal_and_the_valve_off_the_author_is_still_checked(pool: P
         .await
         .expect("CONTROL: an unattached author on the same session writes");
 }
+
+/// THE CURRENT LIMIT, PINNED, NOT ENDORSED. The ruling refuses every write a
+/// run makes after its holder's assignment ends. ROL01 sits in the claims
+/// operator-binding path, so it refuses a claim INSERT, a re-open and a
+/// re-attribution; it does NOT (yet) refuse an attached agent's same-author
+/// retire of its own claim or an UPDATE of a claim's truth value or labels
+/// (the claims trigger never runs the binding checks for those), nor its
+/// evidence, edge, belief or membership writes. Extending the refusal is
+/// open follow-up work; that change is expected to turn the "still admitted"
+/// assertions below into refusals, and this test with them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn after_the_end_claim_inserts_are_refused_and_claim_updates_are_not_yet(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let to_retire = write_as(&pool, attached, attached, h_group)
+        .await
+        .expect("written while held");
+    let to_patch = write_as(&pool, attached, attached, h_group)
+        .await
+        .expect("written while held");
+    end_assignment(&pool, assignment).await;
+
+    assert_rol01(
+        &write_as(&pool, attached, attached, h_group).await,
+        "a new claim after the end",
+    );
+    let (retire, patch, reopen) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, attached, &[h_group]).await;
+        let retire = sqlx::query(
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+              WHERE id = $1",
+        )
+        .bind(to_retire)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        let patch = sqlx::query(
+            "UPDATE claims SET truth_value = 0.9, \
+                    labels = array_append(COALESCE(labels, '{}'), 'after-the-end') \
+              WHERE id = $1",
+        )
+        .bind(to_patch)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        let reopen = sqlx::query("UPDATE claims SET is_current = true WHERE id = $1")
+            .bind(to_retire)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+        unstamp(&mut conn).await;
+        (conn, (retire, patch, reopen))
+    })
+    .await;
+    assert_eq!(
+        retire.as_ref().ok(),
+        Some(&1),
+        "LIMIT: a same-author retire after the end is still admitted: {retire:?}"
+    );
+    assert_eq!(
+        patch.as_ref().ok(),
+        Some(&1),
+        "LIMIT: a truth/labels update after the end is still admitted: {patch:?}"
+    );
+    assert_rol01(&reopen, "a re-open after the end (checked as an insert)");
+}
+
+/// 161's registration adopts a never-registered identity only while it is
+/// FRESH, and an attachment is a reference into `agents`, so attaching an
+/// identity BEFORE the host first registers it makes that registration abort
+/// `AID09`, naming `role_agents` (fail closed: the identity stays refused).
+/// The handover order is register first, then attach. CONTROL: the same
+/// shape without the attachment is adopted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attachment_before_the_first_registration_aborts_it(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (early, _) = fixture::seed_agent_with_group(&pool, "attached-early").await;
+    let (fresh, _) = fixture::seed_agent_with_group(&pool, "fresh").await;
+    attach(&pool, ROLE, early).await;
+
+    let try_register = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .expect("key");
+            let hash = blake3::hash(&key).to_hex().to_string();
+            fixture::as_role(&pool, ATTESTOR, |mut conn| async move {
+                let r: Result<Uuid, _> = sqlx::query_scalar(
+                    "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                         $1, NULL, 'test-model-166', $2, 'g-166-early', NULL, $3)",
+                )
+                .bind(&key)
+                .bind(&hash)
+                .bind(json!({"in_prompt": {}}))
+                .fetch_one(&mut *conn)
+                .await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    let refused = try_register(early).await;
+    assert_eq!(code_of(&refused).as_deref(), Some("AID09"), "{refused:?}");
+    let text = refused.expect_err("refused").to_string();
+    assert!(text.contains("role_agents"), "names the binding: {text}");
+    assert_eq!(
+        try_register(fresh).await.expect("CONTROL: a fresh identity is adopted"),
+        fresh
+    );
+}
