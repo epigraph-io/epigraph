@@ -1403,4 +1403,52 @@ async fn belief_wired_false_names_its_reason(pool: PgPool) {
     let vac = link_raw(&server, &viewer, refuted, t4, "contradicts").await;
     assert_eq!(vac["belief_wired"], false, "{vac}");
     assert_eq!(vac["belief_wired_reason"], "vacuous_source_mass", "{vac}");
+
+    // 5. A wiring that FAILS inside the engine is `refused_or_failed`, not
+    // `already_wired`: the edge is new, so the pre-read knows it was not
+    // wired, and the engine's own write of the edge's mass function is made
+    // to raise. The engine rolls back to its savepoint, so the edge itself
+    // still commits.
+    sqlx::query(
+        "CREATE FUNCTION test_0a996437_refuse_bba() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test: BBA write refused'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_0a996437_refuse_bba BEFORE INSERT ON mass_functions \
+         FOR EACH ROW EXECUTE FUNCTION test_0a996437_refuse_bba()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create refusing trigger");
+    let t5 = seed_claim(&pool, "0a996437 target 5", 0.5).await;
+    let failed = link_raw(&server, &viewer, believed, t5, "supports").await;
+    assert_eq!(failed["was_created"], true, "{failed}");
+    assert_eq!(failed["belief_wired"], false, "{failed}");
+    assert_eq!(
+        failed["belief_wired_reason"], "refused_or_failed",
+        "{failed}"
+    );
+    let edge_id: Uuid = failed["edge_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("edge_id: {failed}"));
+    let edge_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = $1")
+        .bind(edge_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count edge");
+    assert_eq!(
+        edge_rows, 1,
+        "a failed wiring leaves the edge committed: {failed}"
+    );
+    let bba_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
+            .bind(edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count edge BBA");
+    assert_eq!(bba_rows, 0, "the failed wiring stored no BBA: {failed}");
 }
