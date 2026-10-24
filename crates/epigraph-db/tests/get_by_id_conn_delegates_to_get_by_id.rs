@@ -146,6 +146,29 @@ async fn get_by_id_conn_returns_exactly_what_get_by_id_returns(pool: PgPool) {
         .await
         .unwrap();
 
+    // A NON-NULL trace_id, so the trace column's decode is pinned to a stored
+    // value rather than compared NULL to NULL. `claims.trace_id` references
+    // `reasoning_traces`, whose row in turn names a claim: an anchor claim
+    // carries the trace.
+    let anchor_text = format!("getbyidconn trace anchor {}", Uuid::new_v4());
+    let anchor: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+    )
+    .bind(&anchor_text)
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .expect("seed trace anchor claim");
+    let trace: Uuid = sqlx::query_scalar(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, explanation) \
+         VALUES ($1, 'deductive', 'get_by_id_conn trace fixture') RETURNING id",
+    )
+    .bind(anchor)
+    .fetch_one(&pool)
+    .await
+    .expect("seed reasoning trace");
+
     // A SIGNED public claim whose stored digest is deliberately NOT
     // blake3(content): `claim_from_row` recomputes blake3, so only a reader
     // that post-fixes the stored columns returns this sha256.
@@ -153,12 +176,13 @@ async fn get_by_id_conn_returns_exactly_what_get_by_id_returns(pool: PgPool) {
     let signed_sig: Vec<u8> = (0u8..64).collect();
     let signed: Uuid = sqlx::query_scalar(
         "INSERT INTO claims (content, content_hash, truth_value, agent_id, \
-                             signature, signer_id) \
-         VALUES ($1, sha256($1::bytea), 0.625, $2, $3, $2) RETURNING id",
+                             signature, signer_id, trace_id) \
+         VALUES ($1, sha256($1::bytea), 0.625, $2, $3, $2, $4) RETURNING id",
     )
     .bind(&signed_text)
     .bind(owner)
     .bind(&signed_sig)
+    .bind(trace)
     .fetch_one(&pool)
     .await
     .expect("seed signed claim");
@@ -232,6 +256,22 @@ async fn get_by_id_conn_returns_exactly_what_get_by_id_returns(pool: PgPool) {
         signed_conn.2,
         0.625f64.to_bits(),
         "truth value is the row's"
+    );
+    assert_eq!(
+        signed_conn.6,
+        Some(trace),
+        "get_by_id_conn must return the stored trace_id"
+    );
+    let (created_at, updated_at): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT created_at, updated_at FROM claims WHERE id = $1")
+            .bind(signed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (signed_conn.8, signed_conn.9),
+        (created_at, updated_at),
+        "get_by_id_conn must return the stored timestamps"
     );
 
     let (_, retired_conn) = both(&pool, &stranger, retired).await;
