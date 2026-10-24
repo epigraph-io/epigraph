@@ -565,7 +565,14 @@ async fn create_requires_a_registered_human_admin_and_a_free_name(pool: PgPool) 
     // The same name again (case and padding aside) is refused.
     let dup = create(&pool, "  synthetic refused TEAM ", ok).await;
     assert_eq!(code_of(&dup).as_deref(), Some(DUPLICATE_NAME), "{dup:?}");
-    assert_eq!(group_count(&pool).await, groups_before + 1);
+    let named: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM groups \
+          WHERE kind = 'team' AND lower(btrim(display_name)) = 'synthetic refused team'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("named team groups");
+    assert_eq!(named, 1, "the duplicate created nothing");
 }
 
 /// The last live admin can be neither removed nor demoted. With a second live
