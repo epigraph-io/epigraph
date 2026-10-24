@@ -91,6 +91,28 @@ fn warnings(out: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The claim's cached belief columns, as the recompute wrote them.
+async fn cached_belief(pool: &PgPool, claim: Uuid) -> (Option<f64>, Option<f64>, Option<f64>) {
+    sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read cached belief")
+}
+
+fn assert_same_belief(a: &serde_json::Value, b: &serde_json::Value) {
+    for k in ["belief", "plausibility", "pignistic_prob"] {
+        let (x, y) = (
+            a[k].as_f64().unwrap_or(f64::NAN),
+            b[k].as_f64().unwrap_or(f64::NAN),
+        );
+        assert!(
+            (x - y).abs() <= 1e-12,
+            "{k} moved on an `unchanged` write: {x} -> {y} ({a} vs {b})"
+        );
+    }
+}
+
 async fn stored_masses(pool: &PgPool, id: &str) -> serde_json::Value {
     sqlx::query_scalar("SELECT masses FROM mass_functions WHERE id = $1::uuid")
         .bind(id)
@@ -118,6 +140,11 @@ async fn each_write_reports_whether_it_inserted_deduplicated_or_replaced(pool: P
         "a first submission carries no warning: {first}"
     );
     let id = first["mass_function_id"].as_str().expect("id").to_string();
+    let cache_after_first = cached_belief(&pool, claim).await;
+    assert!(
+        cache_after_first.0.is_some(),
+        "CALIBRATION: the first submission wrote the claim's cached belief"
+    );
 
     // (a) Byte-identical resubmission: folded once, and SAID so.
     let again = submit(&server, &viewer, claim, frame, masses.clone(), None).await;
@@ -130,6 +157,14 @@ async fn each_write_reports_whether_it_inserted_deduplicated_or_replaced(pool: P
     assert!(
         w[0].contains("identical") && w[0].contains("not combined again"),
         "the dedup warning must say the resubmission was not combined again: {w:?}"
+    );
+    // ... and what it says holds: the belief did not move on its account,
+    // neither in the response nor in the claim's cache.
+    assert_same_belief(&first, &again);
+    assert_eq!(
+        cached_belief(&pool, claim).await,
+        cache_after_first,
+        "an `unchanged` write must leave the claim's cached belief as it was"
     );
 
     // (b) Different masses on the same (claim, frame, agent, perspective) key:
@@ -154,6 +189,41 @@ async fn each_write_reports_whether_it_inserted_deduplicated_or_replaced(pool: P
             "stored {k}: {got} vs {want} ({stored})"
         );
     }
+
+    // (b2) The SAME masses on the same key with a different evidence_type is
+    // not a restatement: the upsert overwrites evidence_type, which changes
+    // the calibrated weight the combine applies, so it is `replaced`.
+    let typed = serde_json::json!({
+        "claim_id": claim.to_string(),
+        "frame_id": frame.to_string(),
+        "hypothesis_index": 0,
+        "masses": changed.clone(),
+        "evidence_type": "empirical",
+    });
+    let retyped = first_text(
+        &tools::ds::submit_ds_evidence(
+            &server,
+            &viewer,
+            serde_json::from_value(typed).expect("params"),
+            None,
+        )
+        .await
+        .expect("submit_ds_evidence (typed)"),
+    );
+    assert_eq!(retyped["mass_function_id"], id.as_str(), "{retyped}");
+    assert_eq!(retyped["write_outcome"], "replaced", "{retyped}");
+    assert_eq!(retyped["deduplicated"], false, "{retyped}");
+    let stored_type: Option<String> =
+        sqlx::query_scalar("SELECT evidence_type FROM mass_functions WHERE id = $1::uuid")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stored evidence_type");
+    assert_eq!(
+        stored_type.as_deref(),
+        Some("empirical"),
+        "the retyped BBA replaced the untyped one in place"
+    );
 
     // (c) A distinct perspective adds an independent BBA.
     let created = first_text(
