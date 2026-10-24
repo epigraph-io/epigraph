@@ -5754,7 +5754,9 @@ impl ClaimRepository {
     /// One static `UPDATE … FROM unnest($1::uuid[], $2::float8[])` statement,
     /// so the SQL text and the bind count (two) do not depend on the batch
     /// size. Only updates claims that exist - non-existent IDs are silently
-    /// skipped. An id listed twice is updated once, with one of its values.
+    /// skipped. An id listed more than once is updated once, with the value
+    /// of its FIRST occurrence (the contract the previous `CASE id WHEN …`
+    /// form had: its first matching arm won).
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -5795,9 +5797,15 @@ impl ClaimRepository {
         // (one prepared statement per size) and a batch above 32767 items
         // exceeded the protocol's 65535-bind limit. `unnest` binds two arrays
         // whatever the size.
+        //
+        // Deduplicated here, first occurrence kept: `UPDATE … FROM` joining a
+        // target row to several source rows applies an unspecified one of
+        // them, so the old first-wins contract has to be made explicit.
+        let mut seen = std::collections::HashSet::with_capacity(updates.len());
         let (ids, values): (Vec<Uuid>, Vec<f64>) = updates
             .iter()
             .map(|(claim_id, truth_value)| (Uuid::from(*claim_id), truth_value.value()))
+            .filter(|(id, _)| seen.insert(*id))
             .unzip();
 
         let result = sqlx::query(
