@@ -1098,6 +1098,87 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
             .contains(&dup),
         "the index view lists the duplicate under the claim it supersedes"
     );
+    // The un-mark reads the same pointer: it finds the identity edge and
+    // refuses for the documented terminal state (the canonical is retired),
+    // writing nothing.
+    let bypass = fixture::bypass(&pool).await.1;
+    let refusal =
+        ClaimRepository::unmark_duplicate_act_conn(&mut conn, &bypass, ClaimId::from_uuid(dup))
+            .await
+            .expect_err("the un-mark refuses while the canonical is retired");
+    assert!(
+        format!("{refusal:?}")
+            .contains(&format!("supersedes {canonical}, which is itself retired")),
+        "the refusal names the retired canonical: {refusal:?}"
+    );
+    assert_eq!(
+        edge_target(&pool, identity).await,
+        (dup, canonical, true),
+        "the refused un-mark leaves the identity edge in force"
+    );
+}
+
+/// The outgoing direction of the same migration: a claim that was itself a
+/// marked duplicate and was un-marked keeps its retracted identity edge (the
+/// record that the mark happened) as its source. Superseding that claim later
+/// moves its other outgoing edges onto the replacement, never that record.
+/// The outgoing UPDATE has no `valid_to` filter, so without the exclusion it
+/// would re-source the retracted row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superseding_an_unmarked_duplicate_leaves_its_retracted_identity_edge(pool: PgPool) {
+    let a = seed_agent(&pool).await;
+    let target = seed_claim(&pool, a, "the claim it was once marked onto").await;
+    let claim = seed_claim(&pool, a, "a duplicate, un-marked since").await;
+    let supported = seed_claim(&pool, a, "supported").await;
+    let support = seed_supports_edge(&pool, claim, supported).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
+        &mut conn,
+        ClaimId::from_uuid(claim),
+        ClaimId::from_uuid(target),
+        &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
+    )
+    .await
+    .expect("mark");
+    let identity = r.revert.identity_edge.expect("the act's identity edge");
+    let bypass = fixture::bypass(&pool).await.1;
+    ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        &bypass,
+        ClaimId::from_uuid(claim),
+        &r.revert,
+    )
+    .await
+    .expect("un-mark");
+    assert_eq!(
+        edge_target(&pool, identity).await,
+        (claim, target, false),
+        "calibration: the un-mark retracted the identity edge and left it in place"
+    );
+
+    let (replacement, _) = ClaimRepository::supersede_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(claim),
+        "a duplicate, revised",
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    ClaimRepository::migrate_superseded_edges_conn(&mut conn, claim, replacement)
+        .await
+        .expect("edge migration");
+
+    assert_eq!(
+        edge_target(&pool, support).await,
+        (replacement, supported, true),
+        "calibration: an ordinary outgoing edge moved to the replacement"
+    );
+    assert_eq!(
+        edge_target(&pool, identity).await,
+        (claim, target, false),
+        "the retracted identity edge keeps its source and stays retracted"
+    );
 }
 
 /// The same for a consolidation of the canonical: the identity edge is
