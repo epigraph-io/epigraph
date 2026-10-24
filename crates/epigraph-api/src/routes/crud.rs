@@ -186,8 +186,8 @@ pub async fn list_evidence(
             handler = "list_evidence",
             "could not acquire a viewer-stamped connection"
         );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
+        ApiError::InternalErrorStatic {
+            message: "Failed to acquire a scoped connection",
         }
     })?;
 
@@ -1187,8 +1187,8 @@ pub async fn get_boundary_claims(
             handler = "get_boundary_claims",
             "could not acquire a viewer-stamped connection"
         );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
+        ApiError::InternalErrorStatic {
+            message: "Failed to acquire a scoped connection",
         }
     })?;
 
@@ -1747,8 +1747,8 @@ pub async fn get_split_candidates(
             handler = "get_split_candidates",
             "could not acquire a viewer-stamped connection"
         );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
+        ApiError::InternalErrorStatic {
+            message: "Failed to acquire a scoped connection",
         }
     })?;
 
@@ -1819,8 +1819,8 @@ pub async fn get_distant_claims(
             handler = "get_distant_claims",
             "could not acquire a viewer-stamped connection"
         );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
+        ApiError::InternalErrorStatic {
+            message: "Failed to acquire a scoped connection",
         }
     })?;
 
@@ -1925,8 +1925,8 @@ pub async fn get_theme_embeddings(
             handler = "get_theme_embeddings",
             "could not acquire a viewer-stamped connection"
         );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
+        ApiError::InternalErrorStatic {
+            message: "Failed to acquire a scoped connection",
         }
     })?;
 

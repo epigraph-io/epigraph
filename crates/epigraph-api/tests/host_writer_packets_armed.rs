@@ -89,6 +89,7 @@ use epigraph_db::{AgentRepository, ScopedPool, SessionGucMode};
 use http_body_util::BodyExt;
 use sqlx::PgPool;
 use tower::ServiceExt;
+use tracing_test::traced_test;
 use uuid::Uuid;
 use viewer_fixture::{
     as_role, database_url_for, downgraded_pool, seed_agent_with_group, seed_human_operator,
@@ -834,6 +835,7 @@ async fn legacy_privacy_policies(
 // so the legacy policies it installs reach no other test.
 #[allow(clippy::too_many_lines)]
 #[sqlx::test(migrations = "../../migrations")]
+#[traced_test]
 async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_through_the_legacy_privacy_policies_without_a_membership(
     pool: PgPool,
 ) {
@@ -888,11 +890,17 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_through_the_leg
     );
     let p1 = egress_packet(l, &format!("p1-{}.example.test", Uuid::new_v4().simple()));
     let (status, body) = post_packet(&state, &s_token, &p1).await;
+    // The 500 body is redacted (F-route-error-text-remainder): row security's
+    // refusal is read from the server log, and must not be in the body.
     assert!(
         !status.is_success()
-            && body
+            && !body
                 .to_string()
                 .contains("new row violates row-level security policy for table"),
+        "CALIBRATION: the refusal is not passed to the caller: {status} {body}"
+    );
+    assert!(
+        logs_contain("new row violates row-level security policy for table"),
         "CALIBRATION: without the legacy policies and without a membership the HG claim is \
          refused by row security: {status} {body}"
     );

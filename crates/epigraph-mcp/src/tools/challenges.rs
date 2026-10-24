@@ -6,7 +6,77 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{ChallengeRepository, EventRepository};
+use epigraph_db::{ChallengeRepository, ClaimRepository, EventRepository};
+
+/// The `data.rule` of [`challenge_not_writer`].
+pub const CHALLENGE_NOT_WRITER_RULE: &str = "challenge_requires_claim_group_writer";
+
+/// The named refusal for a challenge against a claim the challenger can read
+/// but whose owning group it cannot write. The challenge row INHERITS that
+/// group (see [`challenge_claim`]'s doc), so the database would refuse the
+/// INSERT; this says so by name instead of passing on the row-security error.
+/// `INVALID_REQUEST`, like `crate::errors::claim_not_writer`: a denial of
+/// authority, not a server fault and not a bad parameter. Not that helper
+/// itself, because its text offers `claims:admin` as a way in, and a
+/// `claims:admin` token does not change whose group this row is written into.
+///
+/// It does NOT name the claim's owning group: no claim read surface returns
+/// `owner_group_id`, and for another agent's public claim it is usually that
+/// agent's personal group. Same shape as `claim_not_writer`'s `data`.
+fn challenge_not_writer(claim_id: uuid::Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot challenge claim {claim_id}: a challenge is owned by the challenged claim's \
+             group, and the challenger holds no live writer or admin membership in it; nothing \
+             was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": CHALLENGE_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// A `42501` from the challenge INSERT AFTER [`challenge_claim`]'s preflight
+/// admitted the challenger. That is not the caller's denial (the preflight
+/// already answers that by name): it is a membership revoked in between, or a
+/// server-side GRANT / policy fault. So it is logged, and answered as an
+/// `INTERNAL_ERROR` with a fixed message: neither the raw row-security text
+/// nor a `not_writer` refusal that would blame the caller.
+fn challenge_refused_after_preflight(claim_id: uuid::Uuid, e: &sqlx::Error) -> McpError {
+    tracing::error!(
+        target: "tenancy.scoped_write",
+        tool = "challenge_claim",
+        claim_id = %claim_id,
+        error = %e,
+        "challenge INSERT refused (insufficient_privilege) after the writer preflight admitted \
+         the challenger. Nothing was written."
+    );
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: std::borrow::Cow::from(format!(
+            "challenge_claim: the database refused the challenge on claim {claim_id} after the \
+             writer check admitted it (a membership change in between, or a server-side policy \
+             fault; the detail is in the server log); nothing was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "write_refused_after_preflight",
+            "claim_id": claim_id,
+        })),
+    }
+}
+
+/// `true` for PostgreSQL's `insufficient_privilege` (SQLSTATE `42501`), which
+/// a row-security `WITH CHECK` raises.
+fn is_insufficient_privilege(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("42501")
+}
 
 const VALID_CHALLENGE_TYPES: &[&str] = &[
     "insufficient_evidence",
@@ -51,6 +121,15 @@ const VALID_CHALLENGE_TYPES: &[&str] = &[
 /// strictly a narrowing of the refusal; deciding whether an outsider's objection
 /// should be owned by the objector instead is a tenancy-model change, not this
 /// change.
+///
+/// That refusal is answered BY NAME ([`challenge_not_writer`], before the
+/// INSERT): the claim's owning group is read on the stamped transaction and
+/// compared with the challenger's own writable groups, the set the stamp
+/// carries. It used to surface as an `INTERNAL_ERROR` carrying the raw
+/// `new row violates row-level security policy for table "challenges"`
+/// (backlog deebc487). A claim the caller cannot read stays "not found". A
+/// `42501` from the INSERT itself, past the preflight, is a server-side fault
+/// or a race, not the caller's denial ([`challenge_refused_after_preflight`]).
 pub async fn challenge_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -79,6 +158,20 @@ pub async fn challenge_claim(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, challenger, "challenge_claim").await?;
 
+    // Preflight: the group the challenge row would inherit, read through the
+    // request's viewer (an unreadable claim is not found), against the
+    // challenger's own writable groups, which are the stamp's.
+    let (_author, owner_group) = ClaimRepository::write_target_of(&mut *tx, viewer, claim_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+    let challenger_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, agent_id)
+        .await
+        .map_err(internal_error)?;
+    if !challenger_viewer.writable_groups().contains(&owner_group) {
+        return Err(challenge_not_writer(claim_id));
+    }
+
     let challenge_id = ChallengeRepository::create(
         &mut *tx,
         claim_id,
@@ -87,7 +180,13 @@ pub async fn challenge_claim(
         &params.explanation,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| {
+        if is_insufficient_privilege(&e) {
+            challenge_refused_after_preflight(claim_id, &e)
+        } else {
+            internal_error(e)
+        }
+    })?;
 
     // Durable event, in the same transaction and SAVEPOINT-wrapped: it rides the
     // challenge's fate, and a refused event cannot abort the challenge.

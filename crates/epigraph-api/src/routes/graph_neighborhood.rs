@@ -164,7 +164,7 @@ pub async fn expand(
     .bind(neighborhood_id)
     .fetch_optional(&mut *read)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal)?;
     if exists.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -199,7 +199,7 @@ async fn compound_response(
         neighborhood_id,
     )
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(|r| CompoundNode {
         id: r.id,
@@ -241,7 +241,7 @@ async fn compound_response(
     .bind(neighborhood_id)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(
         |(source, target, relationship, strength, atom_edge_count)| InducedEdge {
@@ -282,7 +282,7 @@ async fn compound_response(
     )
     .bind(neighborhood_id)
     .fetch_all(&mut *conn).await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
     .collect();
@@ -341,7 +341,7 @@ async fn compound_response(
     .bind(neighborhood_id)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(|(source, target, kind, atom_count)| StructuralEdge {
         source,
@@ -403,7 +403,7 @@ async fn atomic_response(
         neighborhood_id,
     )
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(|r| AtomicNode {
         id: r.id,
@@ -426,7 +426,7 @@ async fn atomic_response(
         "#,
     )
     .bind(neighborhood_id).fetch_all(&mut *conn).await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(internal)?
     .into_iter()
     .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
     .collect();
@@ -438,7 +438,7 @@ async fn atomic_response(
             neighborhood_id,
         )
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(internal)?
         .into_iter()
         .map(|r| CompoundGroup {
             compound_id: r.compound_id,
@@ -664,6 +664,32 @@ pub async fn claim_compound_neighborhood(
     }))
 }
 
+/// A 500 for a failed statement. The driver's error is LOGGED, never sent:
+/// the body is [`crate::errors::INTERNAL_ERROR_BODY`], as for every
+/// `ApiError::InternalError` (F-route-error-text-remainder).
 fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(target: "api.internal_error", route = "graph_neighborhood", detail = %e, "internal error");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        crate::errors::INTERNAL_ERROR_BODY.to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every failed statement in this file answers through `internal`, which
+    /// may not hand the driver's error text to the caller
+    /// (F-route-error-text-remainder).
+    #[test]
+    fn internal_answers_never_carry_the_driver_error() {
+        let (status, body) = internal(sqlx::Error::Protocol(
+            "relation \"neighborhoods\" does not exist".to_string(),
+        ));
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("neighborhoods"), "{body}");
+        assert!(!body.contains("does not exist"), "{body}");
+        assert_eq!(body, crate::errors::INTERNAL_ERROR_BODY);
+    }
 }
