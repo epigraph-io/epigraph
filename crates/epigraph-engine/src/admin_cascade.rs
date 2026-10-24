@@ -532,25 +532,36 @@ pub async fn retirement_for_caller(
     out
 }
 
+/// The `details.reason_code` of every [`EVENT_FAILED`] row.
+pub const FAILED_REASON_CODE: &str = "repair_failed";
+
 /// Record a repair that failed (and rolled back), on the maintenance
-/// connection, and build the caller's status: the reason it gets is generic,
-/// the audit row carries the error.
+/// connection, and build the caller's status: the reason it gets is generic.
+///
+/// The audit row carries a static reason ([`FAILED_REASON_CODE`] and the step
+/// that failed), never the error: the row names the triggering agent, who can
+/// read it, and the error is a driver error that can spell SQL, a constraint
+/// or another writer's row (backlog 9d6f21c5). The error goes to the server
+/// log. `step` is `&'static str` so only a literal can reach the row.
 async fn failed(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
-    step: &str,
+    step: &'static str,
     e: impl std::fmt::Display,
 ) -> CascadeStatus {
-    let reason = format!("{step} failed on the maintenance connection: {e}");
+    let reason = format!("{step} failed on the maintenance connection");
     tracing::warn!(
         target: "tenancy.admin_cascade",
         cause = trigger.cause.as_str(),
         subject = %trigger.subject_id,
+        error = %e,
         "{reason}"
     );
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("failed");
-    details["reason"] = serde_json::Value::String(reason);
+    details["reason_code"] = serde_json::json!(FAILED_REASON_CODE);
+    details["reason"] =
+        serde_json::Value::String(format!("{reason}; the detail is in the server log"));
     let (audit_event_id, audit_error) =
         match audit::record(&mut *admin, EVENT_FAILED, trigger.agent_id, false, &details).await {
             Ok(id) => (Some(id), None),
