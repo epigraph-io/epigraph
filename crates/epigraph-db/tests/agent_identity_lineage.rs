@@ -390,7 +390,8 @@ async fn the_app_role_cannot_register_even_with_a_forged_principal(pool: PgPool)
 /// history read. The registration's ACL is EXACTLY the attestor's EXECUTE, and
 /// it is a maintenance-owned definer pinned to a search_path. No other role can
 /// act as it, and the only privilege granted to it BY NAME, on any function or
-/// relation in `public`, is that EXECUTE (a catalog sweep, not a hand list).
+/// relation in `public`, is that EXECUTE plus, since migration 166, EXECUTE on
+/// `epigraph_role_agent_may_run` (a catalog sweep, not a hand list).
 ///
 /// NOLOGIN is pinned in the migration TEXT, not on the role: the role is
 /// cluster-wide and operations give it LOGIN on any cluster where the host
@@ -442,9 +443,13 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
         granted,
         vec![
             "epigraph_register_agent_identity(bytea,uuid,text,text,text,bytea,jsonb) EXECUTE"
-                .to_string()
+                .to_string(),
+            // Migration 166: the host asks whether a role-attached identity may
+            // run before it starts one. A read that answers one agent at a
+            // time, never the roster.
+            "epigraph_role_agent_may_run(uuid) EXECUTE".to_string(),
         ],
-        "the attestor holds exactly one named privilege"
+        "the attestor holds exactly the registration and the role-agent question"
     );
 
     let member_of: Vec<String> = sqlx::query_scalar(
@@ -490,6 +495,12 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
             false,
         ),
         ("public.epigraph_agent_prompt_history(uuid)", false, true),
+        ("public.epigraph_role_agent_may_run(uuid)", true, true),
+        (
+            "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
+            false,
+            false,
+        ),
     ] {
         for (role, want) in [(ATTESTOR, attestor_may), ("epigraph_app", app_may)] {
             let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")

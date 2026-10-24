@@ -401,3 +401,223 @@ DO $$ BEGIN
                 'public.epigraph_detach_agent_from_role(text, uuid, text) FROM epigraph_app';
     END IF;
 END $$;
+
+-- ===================================================================
+-- THE RULE (section 3) AND THE QUESTION (section 4)
+-- ===================================================================
+
+-- The predicate, at `p_at`, for any agent. Internal: EXECUTE-able by the
+-- maintenance role only; the application role and the attestor ask through
+-- `epigraph_role_agent_may_run`, which pins the clock. Every LIVE attachment
+-- must be held by the agent's own live-linked human; the first one that is
+-- not (by role key) is the answer. `holder` is returned only when it is the
+-- agent's own human (section 4's disclosure).
+CREATE OR REPLACE FUNCTION public.epigraph_role_agent_gate(p_agent uuid, p_at timestamptz)
+RETURNS TABLE (may_run boolean, role text, holder uuid, reason text)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_human uuid;
+    v_role  text;
+    v_first text;
+BEGIN
+    IF p_agent IS NULL OR p_at IS NULL THEN
+        RETURN QUERY SELECT true, NULL::text, NULL::uuid, 'unattached'::text;
+        RETURN;
+    END IF;
+    v_human := public.epigraph_human_of(p_agent, true);
+    FOR v_role IN
+        SELECT DISTINCT ra.role FROM public.role_agents ra
+         WHERE ra.agent_id = p_agent AND ra.detached_at IS NULL
+           AND ra.valid_from <= p_at AND (ra.valid_to IS NULL OR p_at < ra.valid_to)
+         ORDER BY ra.role
+    LOOP
+        IF public.epigraph_live_role_assignment(v_human, v_role, p_at) IS NULL THEN
+            RETURN QUERY
+            SELECT false, v_role, NULL::uuid,
+                   CASE WHEN EXISTS (
+                            SELECT 1 FROM public.role_assignments x
+                             WHERE x.role = v_role AND x.revoked_at IS NULL
+                               AND public.epigraph_live_role_assignment(
+                                       x.holder_person_id, v_role, p_at) IS NOT NULL)
+                        THEN 'not_holder' ELSE 'no_holder' END;
+            RETURN;
+        END IF;
+        v_first := COALESCE(v_first, v_role);
+    END LOOP;
+    IF v_first IS NULL THEN
+        RETURN QUERY SELECT true, NULL::text, NULL::uuid, 'unattached'::text;
+    ELSE
+        RETURN QUERY SELECT true, v_first, v_human, 'held'::text;
+    END IF;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) FROM PUBLIC;
+
+-- Section 4: the host's and epigraph-mcp's question, now.
+CREATE OR REPLACE FUNCTION public.epigraph_role_agent_may_run(p_agent uuid)
+RETURNS TABLE (may_run boolean, role text, holder uuid, reason text)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT g.may_run, g.role, g.holder, g.reason
+      FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid) FROM PUBLIC;
+
+-- Section 3: returns quietly, or raises ROL01 naming the role. The statement's
+-- clock, never the transaction's start: a run that opened its transaction
+-- inside the window writes nothing after `valid_to`. A privileged session is
+-- exempt (the custodial path), as it is from OPL02.
+CREATE OR REPLACE FUNCTION public.epigraph_require_role_holder(p_agent uuid)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_gate record;
+BEGIN
+    IF p_agent IS NULL OR public.epigraph_bypass() THEN
+        RETURN;
+    END IF;
+    SELECT g.* INTO v_gate FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g;
+    IF v_gate.may_run THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION 'ROL01: agent % is attached to role %, and %; a role''s agents write only '
+                    'while a human holds the role, and only for that holder', p_agent,
+                    v_gate.role,
+                    CASE v_gate.reason
+                        WHEN 'no_holder' THEN 'no human holds that role now'
+                        ELSE 'the human it is linked to does not hold that role now'
+                    END
+        USING ERRCODE = 'ROL01',
+              HINT = 'Nothing was written. An operator grants the role to the agent''s linked '
+                     'human, re-links the agent to the current holder, or detaches it from '
+                     'the role (epigraph_detach_agent_from_role).';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_role_holder(uuid) FROM PUBLIC;
+
+-- The two 123 checks the claims trigger calls, re-stated (signatures, owner
+-- and grants unchanged: CREATE OR REPLACE keeps both) with the 166 lines. A
+-- later migration that re-bodies either starts from these bodies.
+-- 123's claims-path writer scope (122's, with 123's HINT); delta: the 166 line.
+CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    -- 166: ROL01, the agent the claims trigger checks here (the author, or
+    -- the stamped writer when that is someone else).
+    PERFORM public.epigraph_require_role_holder(p_agent);
+    v_human := public.epigraph_human_of(p_agent, false);
+    IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_operator_scope_exempt() THEN
+        RETURN;
+    END IF;
+    IF v_human = p_agent THEN
+        RAISE EXCEPTION 'OPL02: human operator % holds no writer/admin membership in group %; '
+                        'a human writes only where it writes', p_agent, p_group
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Write into a group you write (your personal group is the default). '
+                         'A custodial revision is made on the maintenance DSN with '
+                         'epigraph-operator custodial-supersede.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % is linked to operator %, which holds no writer/admin '
+                    'membership in group %; a linked agent writes only where its own operator '
+                    'writes', p_agent, v_human, p_group
+        USING ERRCODE = 'OPL02',
+              HINT = 'Write into a group the operator writes (its personal group is the '
+                     'default), or have the operator join the group first. No application '
+                     'session crosses humans, a custodian''s included.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
+
+-- 123's attribution check (122's, with 123's HINTs); delta: the 166 block.
+CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(
+    p_author uuid, p_writer uuid, p_inherited boolean)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_author_human uuid;
+    v_writer_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    -- 166: ROL01 on the AUTHOR a writer names, except the inherited author of
+    -- a retired predecessor's restatement (its human's act, not the agent
+    -- running; the writer was checked by the writer scope).
+    IF NOT COALESCE(p_inherited, false) THEN
+        PERFORM public.epigraph_require_role_holder(p_author);
+    END IF;
+    v_writer_human := public.epigraph_human_of(p_writer, true);
+    v_author_human := public.epigraph_human_of(p_author, NOT COALESCE(p_inherited, false));
+    IF v_author_human IS NULL THEN
+        -- No human for this row's kind. A RETIRED identity still belongs to
+        -- its human: a writer outside that human is refused below (OPL02,
+        -- whatever the valve), before the binding check the valve relieves.
+        v_author_human := public.epigraph_human_of(p_author, false);
+        IF v_author_human IS NULL OR v_author_human = v_writer_human
+           OR public.epigraph_operator_scope_exempt() THEN
+            PERFORM public.epigraph_require_bound_author(p_author);
+            RETURN;
+        END IF;
+    ELSIF v_writer_human = v_author_human THEN
+        RETURN;
+    ELSIF public.epigraph_operator_scope_exempt() THEN
+        RETURN;
+    END IF;
+    IF v_writer_human IS NULL THEN
+        RAISE EXCEPTION 'OPL02: the writing principal % belongs to no human operator, and a claim '
+                        'it writes may not be attributed to %, which belongs to human operator %; '
+                        'an unbound writer names no bound author', p_writer, p_author,
+                        v_author_human
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Author the claim as the writing agent itself. The valve relieves the '
+                         'binding (OPL01) only; no application session crosses humans.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % writes a claim attributed to %, which belongs to human '
+                    'operator %, not to the writer''s operator %; a claim may name only an '
+                    'author of the writer''s own human', p_writer, p_author, v_author_human,
+                    v_writer_human
+        USING ERRCODE = 'OPL02',
+              HINT = 'Author the claim as the writing agent itself. A custodial revision is '
+                     'made on the maintenance DSN with epigraph-operator custodial-supersede.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_agent_may_run(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_role_holder(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz), '
+                'public.epigraph_role_agent_may_run(uuid), '
+                'public.epigraph_require_role_holder(uuid) TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        -- The question, and the check the app-callable writer checks call
+        -- (they are definers, but the request path also calls
+        -- `epigraph_require_writer_scope` directly). Never the gate, whose
+        -- `p_at` would make it an any-time oracle.
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid), '
+                'public.epigraph_require_role_holder(uuid) TO epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_gate(uuid, timestamptz) '
+                'FROM epigraph_app';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_identity_attestor') THEN
+        -- The host asks before starting a role's container or schedule.
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid) '
+                'TO epigraph_identity_attestor';
+    END IF;
+END $$;
