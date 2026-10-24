@@ -239,3 +239,66 @@ async fn the_boot_check_admits_only_the_agents_active_signing_key(pool: PgPool) 
     .expect("revoke");
     assert!(check_signing_key(&pool, &identity, &signing).await.is_err());
 }
+
+/// The boot check reads `key_type` and `status` in the spelling migration
+/// 161's guard compares (`lower(btrim(..))`, which trims SPACES only), so a
+/// row the guard does not treat as attested never admits. `'signing\t'` is
+/// not a signing key to the guard, so the application role can insert it for
+/// any agent; were it admitted, the container would sign with a key that
+/// `verify_claim` (same SQL spelling) never binds. Positive control: the same
+/// agent's registered key, and a `' Signing '` spelling the guard does
+/// attest, both admit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boot_check_normalises_as_the_guard_does(pool: PgPool) {
+    use epigraph_mcp::signing_identity::check_signing_key;
+
+    let identity = signer(0xA1).public_key();
+    let signing = signer(0xA2).public_key();
+    let agent = register(&pool, identity, signing, "g-s2-norm").await;
+    assert_eq!(
+        check_signing_key(&pool, &identity, &signing).await,
+        Ok(agent),
+        "positive control: the registered key admits"
+    );
+
+    let insert = |key: [u8; 32], key_type: &'static str, status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(agent)
+            .bind(key.as_slice())
+            .bind(key_type)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("key row");
+        }
+    };
+
+    let spaced = signer(0xA3).public_key();
+    insert(spaced, " Signing ", "active").await;
+    assert_eq!(
+        check_signing_key(&pool, &identity, &spaced).await,
+        Ok(agent),
+        "a space-padded, upper-case spelling is a signing key to the guard too"
+    );
+
+    for (byte, key_type, status) in [
+        (0xA4, "signing\t", "active"),
+        (0xA5, "signing\n", "active"),
+        (0xA6, "signing", "active\t"),
+    ] {
+        let key = signer(byte).public_key();
+        insert(key, key_type, status).await;
+        let refusal = check_signing_key(&pool, &identity, &key)
+            .await
+            .expect_err("a spelling the guard does not attest never admits");
+        assert!(
+            refusal.contains("is not an active signing key of"),
+            "{key_type:?}/{status:?}: {refusal}"
+        );
+    }
+}
