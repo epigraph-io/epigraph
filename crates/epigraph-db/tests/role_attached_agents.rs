@@ -2320,6 +2320,66 @@ async fn an_attached_agents_claim_is_not_rewritten_by_anyone_after_the_end(pool:
     );
 }
 
+/// The write check is keyed on ARMING, like OPL02 and the claims path's
+/// ROL01, and spares a PRIVILEGED session (the maintenance role: the custodial
+/// path), whatever principal it stamps. In a gap, an attached agent:
+/// * CONTROL, unarmed: updates its claim and writes evidence;
+/// * armed: is refused ROL01 on both;
+/// * CONTROL, a maintenance session stamped as the same agent: updates it.
+///
+/// Verified to fail: without the write check the armed UPDATE lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_write_check_is_keyed_on_arming_and_spares_a_privileged_session(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    let evidence_insert = WRITE_CLASSES
+        .iter()
+        .find(|c| c.what == "evidence INSERT")
+        .expect("the evidence class");
+    let mut claims = Vec::new();
+    for _ in 0..4 {
+        claims.push(insert_claim(&pool, attached, h_group).await.expect("claim"));
+    }
+
+    assert_eq!(
+        update_truth_as(&pool, Some(attached), h_group, claims[0]).await.ok(),
+        Some(1),
+        "CONTROL: an unarmed database refuses no update in a gap"
+    );
+    assert_eq!(
+        write_class(&pool, attached, h_group, evidence_insert, claims[0]).await.ok(),
+        Some(1),
+        "CONTROL: an unarmed database refuses no evidence in a gap"
+    );
+    arm(&pool).await;
+    assert_rol01(
+        &update_truth_as(&pool, Some(attached), h_group, claims[1]).await,
+        "armed: the attached agent's update in a gap",
+    );
+    assert_rol01(
+        &write_class(&pool, attached, h_group, evidence_insert, claims[2]).await,
+        "armed: the attached agent's evidence in a gap",
+    );
+    let privileged = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        stamp(&mut conn, attached, &[h_group]).await;
+        let r = sqlx::query(TRUTH_UPDATE)
+            .bind(claims[3])
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        privileged.ok(),
+        Some(1),
+        "CONTROL: a maintenance session stamped as the agent updates in a gap"
+    );
+}
+
 /// 161's registration adopts a never-registered identity only while it is
 /// FRESH, and an attachment is a reference into `agents`, so attaching an
 /// identity BEFORE the host first registers it makes that registration abort
