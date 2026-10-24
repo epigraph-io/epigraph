@@ -12,6 +12,7 @@ pub mod agent;
 pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
+pub mod atom_axiom;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
