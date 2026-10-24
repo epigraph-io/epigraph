@@ -1131,6 +1131,106 @@ async fn adopting_a_bound_agent_is_refused_aid09(pool: PgPool) {
     assert!(!adopted.agent_created);
 }
 
+/// AID09 is a GENERIC scan, not a list: an agent referenced by ANY foreign
+/// key into `agents` (other than its genuine personal group, that group's
+/// membership, its legacy key and audit rows) is not fresh. These bindings
+/// appear in no hand-written list. Each is refused AID09 and changes nothing:
+///
+/// * an instance admin, a row that predates migration 123 (a row-security table);
+/// * a perspective's owner (a row-security table);
+/// * an `agent_capabilities` row;
+/// * a member of a group whose `did_key` spells its personal key but which is
+///   NOT a personal group (a forged "personal" group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn aid09_refuses_any_foreign_key_binding_not_only_listed_ones(pool: PgPool) {
+    async fn bare(pool: &PgPool, id: &Identity) -> Uuid {
+        let aid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'software_agent')",
+        )
+        .bind(aid)
+        .bind(&id.pubkey)
+        .execute(pool)
+        .await
+        .expect("seed a claimless agent");
+        aid
+    }
+
+    let admin = new_identity();
+    let admin_id = bare(&pool, &admin).await;
+    // `instance_admins` is frozen since migration 123 (CUS05), so a row can
+    // only be one that predates it: planted with triggers off.
+    {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("replica");
+        sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'aid09 test')")
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await
+            .expect("plant a pre-123 instance admin");
+        tx.commit().await.expect("commit");
+    }
+
+    let owner = new_identity();
+    let owner_id = bare(&pool, &owner).await;
+    sqlx::query("INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2)")
+        .bind(format!("aid09-{}", Uuid::new_v4()))
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("seed a perspective owner");
+
+    let capable = new_identity();
+    let capable_id = bare(&pool, &capable).await;
+    sqlx::query("INSERT INTO agent_capabilities (agent_id) VALUES ($1)")
+        .bind(capable_id)
+        .execute(&pool)
+        .await
+        .expect("seed agent capabilities");
+
+    let forged = new_identity();
+    let forged_id = bare(&pool, &forged).await;
+    let team: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ('forged personal', 'did:epigraph:personal:' || $1::text, \
+                 sha256(gen_random_uuid()::text::bytea), 'team') RETURNING id",
+    )
+    .bind(forged_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a team group spelled like a personal group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(team)
+    .bind(forged_id)
+    .execute(&pool)
+    .await
+    .expect("seed a membership in the forged group");
+
+    for (what, id) in [
+        ("an instance admin", &admin),
+        ("a perspective owner", &owner),
+        ("an agent with capabilities", &capable),
+        ("a member of a forged personal group", &forged),
+    ] {
+        let before = footprint(&pool).await;
+        let err = try_register(&pool, id, None, "g-aid09-generic", snapshot("g", "l"))
+            .await
+            .expect_err(what);
+        assert_eq!(sqlstate(&err).as_deref(), Some("AID09"), "{what}: {err}");
+        assert_eq!(
+            footprint(&pool).await,
+            before,
+            "{what}: AID09 changes nothing"
+        );
+    }
+}
+
 /// AID03: the parent must be an LLM agent (a derived identity, or one whose
 /// properties carry `llm_model`) and must not be a human. Each arm of the
 /// refusal is driven by a parent that ONLY that arm catches (review TC4), and
