@@ -335,9 +335,13 @@ async fn a_write_after_the_assignment_ends_is_refused_mid_run(pool: PgPool) {
     let (h, h_group) = human(&pool, "holder").await;
     let attached = agent_of(&pool, h, "curator").await;
     attach(&pool, ROLE, attached).await;
-    grant(&pool, ROLE, h, Some(3.0)).await;
+    // A window long enough for the setup and the first write on a slow
+    // runner; the sleep below is measured on the DATABASE's clock (a test
+    // host's clock may step backward), with margin.
+    let assignment = grant(&pool, ROLE, h, Some(8.0)).await;
     arm(&pool).await;
 
+    let other = pool.clone();
     let (first, after) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, attached, &[h_group]).await;
         sqlx::query("BEGIN")
@@ -345,7 +349,8 @@ async fn a_write_after_the_assignment_ends_is_refused_mid_run(pool: PgPool) {
             .await
             .expect("begin");
         let first = insert_claim(&mut *conn, attached, h_group).await;
-        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+        let left = seconds_left(&other, "role_assignments", assignment).await;
+        tokio::time::sleep(std::time::Duration::from_secs_f64(left + 1.5)).await;
         let after = insert_claim(&mut *conn, attached, h_group).await;
         sqlx::query("ROLLBACK")
             .execute(&mut *conn)
@@ -584,7 +589,7 @@ async fn the_app_role_cannot_write_role_agents_directly(pool: PgPool) {
     assert_eq!(detach(&pool, ROLE, attached).await, 1);
     let audit: Vec<String> = sqlx::query_scalar(
         "SELECT event_type FROM security_events \
-          WHERE event_type LIKE 'platform.role_agent_%' AND agent_id = $1 ORDER BY created_at",
+          WHERE event_type LIKE 'platform.role_agent_%' AND agent_id = $1 ORDER BY event_type",
     )
     .bind(attached)
     .fetch_all(&pool)
@@ -946,7 +951,14 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     }
     // The case the rule exists for: the assignment ends after the snapshot.
     assert_rol01(
-        &write_in_txn(&pool, attached, h_group, "REPEATABLE READ", Some(assignment)).await,
+        &write_in_txn(
+            &pool,
+            attached,
+            h_group,
+            "REPEATABLE READ",
+            Some(assignment),
+        )
+        .await,
         "a REPEATABLE READ run whose holder's assignment ended after its snapshot",
     );
 }
@@ -1281,7 +1293,10 @@ async fn an_assignment_ended_elsewhere_refuses_the_open_runs_next_write(pool: Pg
     let other = pool.clone();
     let (first, after) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, attached, &[h_group]).await;
-        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .expect("begin");
         let first = insert_claim(&mut *conn, attached, h_group).await;
         end_assignment(&other, assignment).await;
         let after = insert_claim(&mut *conn, attached, h_group).await;
@@ -1461,8 +1476,16 @@ async fn a_succession_copy_keeps_the_parents_window(pool: PgPool) {
     }
     fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         for (role, from, to) in [
-            (ROLE, "now() - interval '5 seconds'", "now() + interval '1 hour'"),
-            (OTHER_ROLE, "now() + interval '1 hour'", "now() + interval '2 hours'"),
+            (
+                ROLE,
+                "now() - interval '5 seconds'",
+                "now() + interval '1 hour'",
+            ),
+            (
+                OTHER_ROLE,
+                "now() + interval '1 hour'",
+                "now() + interval '2 hours'",
+            ),
         ] {
             sqlx::query(&format!(
                 "SELECT public.epigraph_attach_agent_to_role($1, $2, {from}, {to}, 'window')"
@@ -1726,7 +1749,9 @@ async fn an_attachment_before_the_first_registration_aborts_it(pool: PgPool) {
     let text = refused.expect_err("refused").to_string();
     assert!(text.contains("role_agents"), "names the binding: {text}");
     assert_eq!(
-        try_register(fresh).await.expect("CONTROL: a fresh identity is adopted"),
+        try_register(fresh)
+            .await
+            .expect("CONTROL: a fresh identity is adopted"),
         fresh
     );
 }
