@@ -2380,6 +2380,100 @@ async fn the_write_check_is_keyed_on_arming_and_spares_a_privileged_session(pool
     );
 }
 
+/// The tables the application role can write that carry NO role-holder write
+/// check, each with the concrete harm the check would do there. Exact: a
+/// table that gains the check, or loses the application role's write, must
+/// leave this list.
+const WRITE_CHECK_EXEMPT: &[(&str, &str)] = &[(
+    "security_events",
+    "the audit record: the API records a refused or denied request in its own \
+     transaction stamped as the refused principal, so checking it would drop the \
+     record of the very refusal (and of authentication events) for a role agent in a \
+     gap; an audit row confers nothing",
+)];
+
+/// THE COVERAGE RATCHET. Every public table the application role can INSERT,
+/// UPDATE or DELETE (at table or column level) carries the shared role-holder
+/// write check as a BEFORE ... FOR EACH STATEMENT trigger on INSERT, UPDATE
+/// and DELETE, or is on [`WRITE_CHECK_EXEMPT`] with its reason; and `claims`
+/// carries the AUTHOR arm as a BEFORE UPDATE OR DELETE row trigger. So a
+/// table a later migration hands the application role is refused here until
+/// it is covered or its exemption is argued.
+///
+/// Verified to fail: without the triggers every app-writable table but the
+/// exempt one is reported uncovered.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_table_the_app_role_writes_carries_the_role_holder_write_check(pool: PgPool) {
+    let writable: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') \
+            AND (has_table_privilege('epigraph_app', c.oid, 'INSERT') \
+                 OR has_table_privilege('epigraph_app', c.oid, 'UPDATE') \
+                 OR has_table_privilege('epigraph_app', c.oid, 'DELETE') \
+                 OR EXISTS (SELECT 1 FROM pg_attribute a \
+                             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                               AND (has_column_privilege('epigraph_app', c.oid, a.attnum, \
+                                                         'INSERT') \
+                                    OR has_column_privilege('epigraph_app', c.oid, a.attnum, \
+                                                            'UPDATE'))))",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("app-writable tables")
+    .into_iter()
+    .collect();
+    // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16.
+    let checked: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT DISTINCT t.tgrelid::regclass::text FROM pg_trigger t \
+          WHERE NOT t.tgisinternal AND t.tgenabled <> 'D' \
+            AND t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure \
+            AND (t.tgtype & 1) = 0 AND (t.tgtype & 2) = 2 AND (t.tgtype & 28) = 28",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|t: String| t.trim_start_matches("public.").to_string())
+    .collect();
+    let exempt: std::collections::BTreeSet<String> = WRITE_CHECK_EXEMPT
+        .iter()
+        .map(|(t, _)| (*t).to_string())
+        .collect();
+
+    let uncovered: Vec<&String> = writable
+        .iter()
+        .filter(|t| !checked.contains(*t) && !exempt.contains(*t))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "app-writable tables with no role-holder write check and no exemption: {uncovered:?}"
+    );
+    let stale: Vec<&String> = exempt
+        .iter()
+        .filter(|t| !writable.contains(*t) || checked.contains(*t))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "exemptions that no longer apply (not app-writable, or checked after all): {stale:?}"
+    );
+    let author_arm: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger t \
+                         WHERE t.tgrelid = 'public.claims'::regclass AND NOT t.tgisinternal \
+                           AND t.tgenabled <> 'D' \
+                           AND t.tgfoid = to_regprocedure( \
+                                   'public.epigraph_role_agent_write_check()') \
+                           AND (t.tgtype & 1) = 1 AND (t.tgtype & 2) = 2 \
+                           AND (t.tgtype & 24) = 24)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("author arm");
+    assert!(
+        author_arm,
+        "claims carries the author arm as a BEFORE UPDATE OR DELETE row trigger"
+    );
+}
+
 /// 161's registration adopts a never-registered identity only while it is
 /// FRESH, and an attachment is a reference into `agents`, so attaching an
 /// identity BEFORE the host first registers it makes that registration abort
