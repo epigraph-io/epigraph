@@ -22,6 +22,10 @@
 //! because it is the property that decides which challenges a converted
 //! `challenge_claim` can still not write — and a test that only stamped "the
 //! author's group" over a self-owned claim would hide it.
+//!
+//! The one exception since migration 168 (ruling R-CH1): a challenge on a
+//! PUBLIC claim by a challenger that cannot write the claim's group is owned by
+//! the challenger's own group (`challenges` joined 114's writer-owned rows).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -174,17 +178,21 @@ async fn a_challenge_insert_lands_when_the_session_carries_the_claims_group(pool
     assert_eq!(challenge_count(&pool, claim).await, 1);
 }
 
-/// **The residual, pinned so it cannot be mistaken for a regression later.** A
-/// challenger stamped with its OWN group, objecting to a claim owned by a
-/// different group, is still refused — because the row inherits the CLAIM's
-/// tenancy and the `WITH CHECK` asks about that group.
+/// **The residual this file used to pin, now ruled (R-CH1, migration 168).** A
+/// challenger stamped with its OWN group, objecting to a PUBLIC claim owned by a
+/// different group, is an outsider, and its challenge is owned by the
+/// outsider: the row lands in the challenger's group, stays public, and is
+/// flagged `writer_owned`, instead of inheriting the claim's group and being
+/// refused by 077's `WITH CHECK`.
 ///
-/// This is the one thing the conversion does not fix, and it is a tenancy-model
-/// question (should an objection be owned by the objector?) rather than a
-/// stamping bug. Asserting it here means a future change to the derived-tenancy
-/// triggers has to come and edit this arm deliberately.
+/// This arm used to assert the refusal, with the note that a change to the
+/// derived-tenancy triggers had to come and edit it deliberately. 168 is that
+/// change. `challenge_ownership.rs` carries the full set of arms (insider,
+/// propagation, guard, non-public claims).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_challenge_against_a_foreign_groups_claim_is_still_refused(pool: PgPool) {
+async fn a_challenge_against_a_foreign_groups_public_claim_is_owned_by_the_challenger(
+    pool: PgPool,
+) {
     let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "chal-owner").await;
     let (challenger, challenger_group) =
         fixture::seed_agent_with_group(&pool, "chal-challenger").await;
@@ -213,13 +221,22 @@ async fn a_challenge_against_a_foreign_groups_claim_is_still_refused(pool: PgPoo
     })
     .await;
 
-    assert!(
-        out.is_err(),
-        "a challenge inherits the CHALLENGED claim's owner_group_id, so a challenger with write \
-         authority only in its own group cannot write it. If this now succeeds, the \
-         derived-tenancy triggers changed and `challenge_claim`'s doc must be revisited: {out:?}"
+    let id = out.expect(
+        "an outsider's challenge on a public claim is owned by the outsider (R-CH1), so a \
+         challenger with write authority only in its own group writes it",
     );
-    assert_eq!(challenge_count(&pool, claim).await, 0);
+    let (group, visibility, writer_owned): (Uuid, String, bool) = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, writer_owned FROM challenges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the challenge");
+    assert_eq!(group, challenger_group, "owned by the challenger's group");
+    assert_ne!(group, owner_group);
+    assert_eq!(visibility, "public");
+    assert!(writer_owned, "flagged as the challenger's own row");
+    assert_eq!(challenge_count(&pool, claim).await, 1);
 }
 
 // ===========================================================================
