@@ -72,3 +72,18 @@ fn goal_text_descriptions_say_a_hierarchical_goal_is_embedded() {
     );
     assert!(!w.contains("stores no goal embedding"), "stale: {w}");
 }
+
+/// A caller that reads none of a workflow's plan is refused like an unknown
+/// id; the description says so, since a caller cannot otherwise tell why a
+/// workflow it found by name answers "not found".
+#[test]
+fn report_hierarchical_outcome_describes_the_unreadable_plan_refusal() {
+    let d = description(&tool("report_hierarchical_outcome"));
+    assert!(
+        d.contains(
+            "a caller that can read none of its plan (none of its executes edges) gets the same \
+             not-found error as an unknown id, and nothing is written"
+        ),
+        "got: {d}"
+    );
+}

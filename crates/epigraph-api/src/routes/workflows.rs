@@ -1271,7 +1271,9 @@ pub async fn find_workflow_hierarchical(
 /// (best-effort) onto every step row so the report feeds behavioral affinity.
 /// NOT idempotent: a retried report counts twice.
 ///
-/// Returns 404 if the id does not correspond to a `workflows` row. Use
+/// Returns 404 if the id does not correspond to a `workflows` row, or if the
+/// caller can read none of the workflow's `executes` edges (the two are not
+/// told apart, and nothing is written). Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
 ///
 /// # Authority
@@ -1286,10 +1288,14 @@ pub async fn find_workflow_hierarchical(
 /// The whole report runs on one transaction stamped with the caller's viewer
 /// ([`AppState::write_as`]). `workflows` and `behavioral_executions` have no
 /// row security, so that changes nothing about the two writes; it changes the
-/// step LOOKUP, which reads `claims` and `edges`. On the plain transaction this
-/// used to run on, row security admitted only public rows, so a group's own
-/// member got every row of a group-private workflow written with a NULL
-/// `step_claim_id`, silently. Now a member resolves its group's steps, and any
+/// reads of `claims` and `edges`. On the plain transaction this used to run
+/// on, row security admitted only public rows, so a group's own member got
+/// every row of a group-private workflow written with a NULL `step_claim_id`,
+/// silently. A caller that reads NONE of the plan's `executes` edges
+/// (`WorkflowRepository::viewer_reads_any_executes_edge`) is refused with the
+/// missing-id 404 before anything is written: `workflows` has no row security,
+/// so without that check any `claims:write` holder could move the counters of
+/// a workflow it cannot read. A reader of the plan resolves its steps, and any
 /// `step_index` that matches no step the caller can read is listed in
 /// `unresolved_step_indices` with a `warning` (out of range and not visible are
 /// deliberately not told apart). Shared with MCP:
@@ -1306,7 +1312,7 @@ pub async fn find_workflow_hierarchical(
         (status = 400, description = "quality outside [0, 1]"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write"),
-        (status = 404),
+        (status = 404, description = "no such workflow, or the caller reads none of its plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1385,15 +1391,28 @@ pub async fn report_hierarchical_outcome(
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflows lookup failed: {e}"),
             })?;
+    let not_found = || ApiError::NotFound {
+        entity: "hierarchical workflow".into(),
+        id: workflow_id.to_string(),
+    };
     let mut metadata = match row {
         Some((m,)) => m,
-        None => {
-            return Err(ApiError::NotFound {
-                entity: "hierarchical workflow".into(),
-                id: workflow_id.to_string(),
-            });
-        }
+        None => return Err(not_found()),
     };
+    // A caller that reads none of the plan's `executes` edges cannot read this
+    // workflow (`workflows` has no row security; its plan does): 404 exactly
+    // like a missing id, before any write. Shared with MCP.
+    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
+        &mut tx,
+        &viewer,
+        workflow_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow visibility check failed: {e}"),
+    })? {
+        return Err(not_found());
+    }
 
     // 2. Compute deltas
     let success = request.success;
@@ -2035,7 +2054,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2544,8 +2563,8 @@ pub struct DeleteStepRequest {
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
 /// detail logged and kept out of the body. A content-less generation
-/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
-/// else stays a 500.
+/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
+/// the caller's payload errors: 400. Everything else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2561,6 +2580,14 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         // U032: a content-less generation is the caller's payload error: 400,
         // not a 500 that invites the retry loop that minted the stubs.
         e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // Blank claim content in the payload (thesis, phase, step or
+        // operation), refused by the executor's pre-flight: 400 naming the
+        // field.
+        e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
             ApiError::BadRequest {
                 message: format!("workflow ingest: {e}"),
             }
@@ -3275,6 +3302,26 @@ mod tests {
         }
     }
 
+    /// The executor's pre-flight refusal of blank claim content in the
+    /// caller's payload is a 400 carrying the field path, not a 500 that
+    /// invites a retry of a payload that can never succeed.
+    #[test]
+    fn blank_claim_content_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::InvalidContent {
+                path: "phases[0].steps[0].operations[0]".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.starts_with("workflow ingest: ")
+                    && message.contains("blank claim content at phases[0].steps[0].operations[0]"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
     /// Build a minimal AppState backed by the given pool.
@@ -3563,6 +3610,53 @@ mod tests {
         assert!(body["canonical_name"].as_str().is_some());
     }
 
+    /// Through the route: a payload whose only step has a blank `compound` is
+    /// answered 400 naming the field, and no `workflows` row is written.
+    /// Positive control: the same payload with its content intact is a 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_refuses_blank_step_content_as_400(pool: PgPool) {
+        let post = |app: axum::Router, payload: serde_json::Value| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/workflows/ingest")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let count = |pool: PgPool, name: &'static str| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let app = test_router(pool.clone()).await;
+
+        let mut blank = ingest_payload("http-blank-step-content");
+        blank["phases"][0]["steps"][0]["compound"] = serde_json::json!("   ");
+        let (status, text) = post(app.clone(), blank).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("blank claim content at phases[0].steps[0]"),
+            "the 400 names the field: {text}"
+        );
+        assert_eq!(count(pool.clone(), "http-blank-step-content").await, 0);
+
+        let (status, text) = post(app, ingest_payload("http-intact-step-content")).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(count(pool, "http-intact-step-content").await, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
         let app = test_router(pool).await;
@@ -3610,6 +3704,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(&pool, workflow_id).await;
 
         // Build a minimal axum app with just the outcome route, on a state
         // that can stamp the report's transaction (the route refuses to run
@@ -3654,6 +3749,37 @@ mod tests {
         assert_eq!(metadata["success_count"], 1);
     }
 
+    /// Give a bare test root the one thing the outcome route requires of a
+    /// workflow besides its row: a plan claim the reporter can read. One public
+    /// level-0 (thesis) claim at `plan_index` 0, so no `step_index` resolves
+    /// and the row counts these tests assert are unchanged.
+    async fn attach_public_thesis(pool: &PgPool, workflow_id: uuid::Uuid) {
+        // Inserted with its level rather than updated afterwards: the
+        // route-layer write ratchet (`tests/viewer_route_table_lint.rs`) counts
+        // an `UPDATE` of `claims` anywhere in this file.
+        let content = format!("outcome test thesis {workflow_id}");
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        let thesis = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, properties) \
+             VALUES ($1, $2, $3, 0.5, jsonb_build_object('level', 0)) RETURNING id",
+        )
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(ensure_system_agent(pool).await)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', 0))",
+        )
+        .bind(workflow_id)
+        .bind(thesis)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// The caller every outcome-route test reports as: an agent token holding
     /// `claims:write`, the scope the route requires. Its principal belongs to
     /// no group; the superuser test pool filters nothing, so these tests pin
@@ -3690,6 +3816,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
         let state = scoped_test_state(pool).await;
         let app = axum::Router::new()
             .route(
@@ -3910,6 +4037,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
         let state = scoped_test_state(pool)
             .await
             .with_embedding_service(std::sync::Arc::new(MockProvider::new(
