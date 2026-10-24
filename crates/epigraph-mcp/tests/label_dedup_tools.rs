@@ -1931,6 +1931,27 @@ async fn a_strangers_duplicate_is_left_out_of_the_index_view(pool: PgPool) {
     );
     assert_eq!(all["foreign_duplicates_ignored"], json!([]), "{all}");
 
+    // The owner rule runs AFTER the `max_claims` cap, so `truncated` keeps its
+    // meaning (more marked duplicates exist than were read) whichever owner
+    // the cut-off row has. With a cap of one, the row read is the first in id
+    // order: if it is the stranger's, nothing is listed and it is reported
+    // ignored; if it is the member's, it is listed. Either way the second
+    // duplicate was not read, so the view is truncated. Filtering before the
+    // cap would leave one row, within the cap, and report it whole.
+    let capped = view(json!({"claim_ids": [member.to_string()], "max_claims": 1})).await;
+    assert_eq!(capped["truncated"], true, "{capped}");
+    let first = std::cmp::min(own, theirs);
+    if first == theirs {
+        assert!(ids(&capped).is_empty(), "{capped}");
+        assert_eq!(
+            capped["foreign_duplicates_ignored"],
+            json!([{"canonical": member.to_string(), "id": theirs.to_string()}]),
+            "{capped}"
+        );
+    } else {
+        assert_eq!(ids(&capped), vec![own.to_string()], "{capped}");
+        assert_eq!(capped["foreign_duplicates_ignored"], json!([]), "{capped}");
+    }
 }
 
 /// The duplicates read is capped like the family read: a family whose one
