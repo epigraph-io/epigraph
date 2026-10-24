@@ -491,7 +491,7 @@ async fn prepare_submission(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
-                    internal_error(format!(
+                    crate::errors::internal_error_text(format!(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
@@ -1525,7 +1525,24 @@ pub async fn update_with_evidence(
             tool = "update_with_evidence",
             "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
         );
-        internal_error(e)
+        // `e` is `"<step>: <cause>"`. The step is one of ds_auto's own
+        // literals and names what failed; the cause can be driver text and
+        // stays in the log above (backlog 49863d2c).
+        let step = e.split_once(':').map(|(step, _)| step).filter(|s| {
+            !s.is_empty()
+                && s.len() <= 40
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c == ' ')
+        });
+        crate::errors::internal_error_text(match step {
+            Some(step) => format!(
+                "{step}: the claim's Dempster-Shafer belief could not be wired. Rolled back; \
+                 nothing from this submission was stored"
+            ),
+            None => "the claim's Dempster-Shafer belief could not be wired. Rolled back; \
+                     nothing from this submission was stored"
+                .to_string(),
+        })
     })?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
@@ -2078,7 +2095,7 @@ pub async fn resolve_backlog_item(
         // rather than trusted, because following it would retire the item
         // against a claim this call did not write.
         PreparedSubmission::Existing(_) => {
-            return Err(internal_error(
+            return Err(crate::errors::internal_error_text(
                 "resolve_backlog_item: the novelty gate returned an existing claim for a \
                  resolution at threshold 0.0; refusing to retire the item against a claim this \
                  call did not write. Nothing was written.",
@@ -2177,10 +2194,13 @@ pub async fn resolve_backlog_item(
         )
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "resolve_backlog_item: could not record basis {basis_uuid}: {e}. Nothing was \
-                 written: the resolution claim was rolled back with it."
-            ))
+            crate::errors::internal_error_logged(
+                format!(
+                    "resolve_backlog_item: could not record basis {basis_uuid}. Nothing was \
+                     written: the resolution claim was rolled back with it."
+                ),
+                e,
+            )
         })?;
         basis_edge_ids.push(row.id.to_string());
     }
@@ -2220,11 +2240,14 @@ pub async fn resolve_backlog_item(
             )
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing \
-                     was written: the resolution claim and its basis edges were rolled back \
-                     with it."
-                ))
+                crate::errors::internal_error_logged(
+                    format!(
+                        "resolve_backlog_item: could not label {original_id} resolved. Nothing \
+                         was written: the resolution claim and its basis edges were rolled back \
+                         with it."
+                    ),
+                    e,
+                )
             })?
         };
 

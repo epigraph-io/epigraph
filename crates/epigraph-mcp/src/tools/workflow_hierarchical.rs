@@ -355,7 +355,7 @@ pub async fn do_report_hierarchical_outcome_as(
             tool = "report_hierarchical_outcome",
             "report refused: this process was not built from a ScopedPool"
         );
-        internal_error(
+        crate::errors::internal_error_text(
             "report_hierarchical_outcome: this process was not built from a ScopedPool, so the \
              step lookup cannot be stamped with the caller's viewer. Nothing was written.",
         )
@@ -799,9 +799,18 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_is_all_or_nothing_when_a_step_row_fails(pool: sqlx::PgPool) {
         let workflow_id = ingest_fixture(&pool, "test-outcome-atomic").await;
+        // A sequence is not transactional, so the trigger's `nextval` survives
+        // the rollback its own RAISE causes: it is what ties the failure to the
+        // injected refusal now that the driver text no longer reaches the
+        // caller (backlog 49863d2c).
+        sqlx::query("CREATE SEQUENCE u033_refusals")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE FUNCTION u033_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN \
+               PERFORM nextval('u033_refusals'); RAISE EXCEPTION 'u033 injected'; END IF; \
              RETURN NEW; END $$",
         )
         .execute(&pool)
@@ -830,9 +839,18 @@ mod tests {
         // Tie the failure to the injected refusal of step B, so an unrelated
         // early error (begin, lookup) cannot satisfy this test.
         assert_eq!(err.code, ErrorCode::INTERNAL_ERROR, "{err:?}");
+        let (refusals, fired): (i64, bool) =
+            sqlx::query_as("SELECT last_value, is_called FROM u033_refusals")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(
-            err.message.contains("u033 injected"),
-            "the error must carry the step-row refusal: {err:?}"
+            fired && refusals == 1,
+            "the failure must be the injected refusal of step B: {err:?}"
+        );
+        assert!(
+            !err.message.contains("u033 injected"),
+            "the database's error text must not reach the caller: {err:?}"
         );
 
         let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;

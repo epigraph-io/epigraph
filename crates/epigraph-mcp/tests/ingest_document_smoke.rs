@@ -802,7 +802,10 @@ async fn refuse_every_trace_insert(pool: &PgPool) {
         "CREATE OR REPLACE FUNCTION refuse_trace_for_test() RETURNS trigger
          LANGUAGE plpgsql AS $$
          BEGIN
-             RAISE EXCEPTION 'refused reasoning_traces insert (test trigger)'
+             -- The table name comes from TG_TABLE_NAME, so the refusal's text
+             -- appears only in the raised error and never in this statement,
+             -- which the test's captured log also records.
+             RAISE EXCEPTION 'refused % insert (test trigger)', TG_TABLE_NAME
                  USING ERRCODE = '42501';
          END $$",
     )
@@ -852,9 +855,12 @@ async fn assert_failed_walk_reported(
         ),
         Err(e) => e,
     };
+    // The walk's own cause is recorded in the server log (each caller of this
+    // helper asserts that); the caller gets the fixed message plus the walk's
+    // remedy, without the database's text (backlog 49863d2c).
     assert!(
-        err.message.contains("refused reasoning_traces insert"),
-        "the walk's own cause must reach the caller, got: {}",
+        !err.message.contains("refused reasoning_traces insert"),
+        "the database's error text must not reach the caller, got: {}",
         err.message
     );
     assert!(
@@ -874,6 +880,7 @@ async fn assert_failed_walk_reported(
     );
 }
 
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -892,9 +899,14 @@ async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPo
     )
     .await;
     assert_failed_walk_reported(&pool, outcome).await;
+    assert!(
+        logs_contain("refused reasoning_traces insert"),
+        "the walk's own cause must be the recorded one"
+    );
 }
 
 /// The file-path entry point is the second detached handler; same contract.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -918,6 +930,10 @@ async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: P
     .await;
     let _ = std::fs::remove_file(&path);
     assert_failed_walk_reported(&pool, outcome).await;
+    assert!(
+        logs_contain("refused reasoning_traces insert"),
+        "the walk's own cause must be the recorded one"
+    );
 }
 
 /// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the

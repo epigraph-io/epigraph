@@ -105,7 +105,7 @@ pub async fn memorize(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
-                    internal_error(format!(
+                    crate::errors::internal_error_text(format!(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
