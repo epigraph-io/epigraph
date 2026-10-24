@@ -199,10 +199,11 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL`
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 
-Outside the repo layer, `scripts/fuzzy_dedup_claims.py` matches
-`mark_duplicate_act`'s `claims` UPDATE column for column, but writes no
-`same_as` identity edge, so a duplicate it marks has no dedup record and
-cannot be un-marked (`unmark_duplicate` refuses it). On the re-embed side,
+`scripts/fuzzy_dedup_claims.py` marks through `POST /api/v1/claims/:id/dedup`
+(the act above, with its identity edge and cascade) and only reads the
+database. Duplicates it marked before 2026-10 with its own `claims` UPDATE have
+no `same_as` identity edge, so they cannot be un-marked (`unmark_duplicate`
+refuses them). On the re-embed side,
 `crates/epigraph-cli/src/reembed.rs::fetch_batch` selects only current claims
 (`ReembedTarget::eligible_predicate`), so `epigraph-cli reembed` never writes a
 3072 vector back onto a retired claim.

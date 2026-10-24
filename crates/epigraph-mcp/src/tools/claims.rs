@@ -200,6 +200,25 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The largest claim content, in bytes, the claim-writing tools accept. The
+/// same cap as the HTTP twins (`epigraph-api` `routes/submit.rs` and
+/// `routes/batch.rs`, `MAX_CLAIM_CONTENT_LENGTH`), so the two transports agree
+/// on what a claim may be. Document ingest (`ingest_document*`) has its own,
+/// larger cap and does not go through this check.
+pub const MAX_CLAIM_CONTENT_LENGTH: usize = 65_536;
+
+/// Refuse claim `content` longer than [`MAX_CLAIM_CONTENT_LENGTH`] bytes as the
+/// caller's error. Run it before anything is resolved, embedded or written.
+pub(crate) fn check_claim_content_length(content: &str) -> Result<(), McpError> {
+    if content.len() > MAX_CLAIM_CONTENT_LENGTH {
+        return Err(invalid_params(format!(
+            "content is {} bytes; the maximum is {MAX_CLAIM_CONTENT_LENGTH} bytes",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -363,6 +382,11 @@ async fn prepare_submission(
     mut params: SubmitClaimParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<PreparedSubmission, McpError> {
+    // The size cap FIRST: before the author is resolved, before the novelty
+    // gate embeds the content and before any write. `submit_claim`,
+    // `batch_submit_claims` (per entry) and `resolve_backlog_item` all pass
+    // through here.
+    check_claim_content_length(&params.content)?;
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
@@ -1244,7 +1268,9 @@ pub async fn update_with_evidence(
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
-            .map_err(internal_error)?
+            // `InvalidData` (every head of the step's lineage is retired) is
+            // the caller's to fix, not an internal error.
+            .map_err(crate::errors::db_caller_error)?
             .ok_or_else(|| {
                 invalid_params(format!(
                     "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"

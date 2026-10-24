@@ -8,8 +8,11 @@
 //!   no perspective until U027 (it now keys each input by its own evidence
 //!   perspective and stores no cached row, so the arms below pin that it
 //!   still folds exactly once);
-//! * `POST /api/v1/frames/:id/evidence` does when the body omits both
-//!   `agent_id` and `perspective_id`.
+//! * `POST /api/v1/frames/:id/evidence` did when the body omitted both
+//!   `agent_id` and `perspective_id`. Since the 2026-10-22 ruling ("Evidence
+//!   shouldn't be able to have no agent_id") an omitted `agent_id` is the
+//!   caller's own, so `/evidence` no longer writes that slot; the arm below
+//!   pins that such an input is the caller's and still folds exactly once.
 //!
 //! Both handlers used to cache their fold result in that same slot, which
 //! overwrote the input. Since U024 `/evidence` caches nothing (it delegates to
@@ -336,25 +339,28 @@ async fn an_agent_input_then_an_assess_input_are_each_folded_once(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_lone_anonymous_evidence_input_is_folded_once(
+async fn an_evidence_input_with_no_agent_id_is_the_callers_and_folded_once(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
     let w = world(pool_opts, conn_opts, "lone-anonymous").await;
+    // No `agent_id` in the body; the token's agent is the owner.
     w.submit(None).await;
-    // Non-vacuity: the input really landed in the agent-less,
-    // perspective-less slot.
-    let slot: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
-         AND source_agent_id IS NULL AND perspective_id IS NULL",
+    let rows: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT source_agent_id, perspective_id FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2",
     )
     .bind(w.claim)
     .bind(w.frame)
-    .fetch_one(&w.pool)
+    .fetch_all(&w.pool)
     .await
-    .expect("count slot rows");
-    assert_eq!(slot, 1, "the anonymous input occupies the shared slot");
+    .expect("read the pair's rows");
+    assert_eq!(
+        rows,
+        vec![(Some(w.owner), None)],
+        "the input is the caller's own, and nothing occupies the agent-less slot"
+    );
     // 0.6 + 0.4/2: the input at its stored reliability 1.0.
-    w.assert_folds_to(0.8, "lone anonymous /evidence").await;
+    w.assert_folds_to(0.8, "/evidence with no agent_id").await;
     assert!((expected_betp(&[(&agent_masses(), 1.0)]) - 0.8).abs() < 1e-12);
 }

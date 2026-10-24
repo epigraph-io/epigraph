@@ -617,15 +617,15 @@ async fn read_family(
         let dups = ClaimRepository::marked_duplicates_of(&mut *read, viewer, &ids, cap_i64)
             .await
             .map_err(db_caller_error)?;
-        let dups_truncated = dups.len() > cap;
+        // Over the cap, or a chain deeper than the walk follows: either way
+        // some duplicate (and its dates) is missing from the read.
+        let dups_truncated = dups.rows.len() > cap || dups.chain_truncated;
         let mut by_canonical: BTreeMap<Uuid, Vec<DedupClaim>> = BTreeMap::new();
-        for d in dups.into_iter().take(cap) {
+        for d in dups.rows.into_iter().take(cap) {
             // Only the canonical's own owner's duplicates feed the plan: a
             // stranger who marked a claim onto a public member must not move
             // its dates (a far deadline would hold off its close-out).
-            if owners.owner_of(&mut read, d.agent_id).await?
-                != owners.owner_of(&mut read, d.canonical_agent_id).await?
-            {
+            if is_foreign_duplicate(&mut owners, &mut read, &d).await? {
                 foreign.push(json!({"canonical": d.canonical, "id": d.id}));
                 continue;
             }
@@ -849,6 +849,19 @@ impl OwnerCache {
     }
 }
 
+/// Whether `d`'s author has another owner than its canonical's author. The
+/// ONE owner rule behind the plan's `coverage.foreign_duplicates_ignored` and
+/// the index view's, so the two cannot drift apart: a stranger who marked a
+/// claim onto a public member must not move its dates.
+async fn is_foreign_duplicate(
+    owners: &mut OwnerCache,
+    conn: &mut sqlx::PgConnection,
+    d: &epigraph_db::MarkedDuplicateRow,
+) -> Result<bool, McpError> {
+    Ok(owners.owner_of(&mut *conn, d.agent_id).await?
+        != owners.owner_of(&mut *conn, d.canonical_agent_id).await?)
+}
+
 /// Why the write identity does not own claim `id`, or `None` when it does:
 /// its author, an agent of the author's operator, or (HTTP) a `claims:admin`
 /// caller. The ONE check behind `unit_check`, apply's `CROSS_OWNER_MEMBER` /
@@ -881,6 +894,16 @@ async fn member_not_owned(
     )
 }
 
+/// How [`canonical_refusal`] reads whether the canonical is still current.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CanonicalCheck {
+    /// The plan's prediction: a plain read, no row lock.
+    Predict,
+    /// Apply's check before marking onto the canonical: a locking read held
+    /// to the unit's commit.
+    HoldForMark,
+}
+
 /// Why the write identity may not mark a duplicate onto `canonical`, or
 /// `None`: `mark_duplicate`'s own rule for the canonical (its owning group
 /// must be one the caller writes, since the cascade moves other writers'
@@ -889,10 +912,18 @@ async fn member_not_owned(
 /// showed). Without it a label-dedup apply could make a mark that
 /// `mark_duplicate` refuses, and that `unmark_duplicate` (the revert) then
 /// refuses too.
+///
+/// `check` says how currency is read. [`CanonicalCheck::Predict`] (the
+/// plan's `write_check`) reads it plainly: a prediction takes no row lock, so
+/// a read-scoped plan never blocks a concurrent write to a canonical nor
+/// waits behind one. [`CanonicalCheck::HoldForMark`] (apply, on the unit's
+/// transaction) reads it under a row lock held to the unit's commit, so the
+/// canonical cannot be retired between this check and the mark.
 async fn canonical_refusal(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     canonical: Uuid,
+    check: CanonicalCheck,
 ) -> Result<Option<String>, McpError> {
     let Some((_, group)) = ClaimRepository::write_target_of(&mut *conn, viewer, canonical)
         .await
@@ -908,13 +939,29 @@ async fn canonical_refusal(
              mark_duplicate (and its un-mark) would refuse the mark"
         )));
     }
-    if !ClaimRepository::are_all_current(&mut *conn, viewer, &[canonical])
+    if check == CanonicalCheck::Predict {
+        return Ok(
+            (!ClaimRepository::are_all_current(&mut *conn, viewer, &[canonical])
+                .await
+                .map_err(db_caller_error)?)
+            .then(|| format!("canonical {canonical} is no longer current")),
+        );
+    }
+    // Locked on the unit's transaction, so the canonical cannot be retired
+    // (marked, superseded, deprecated) between this check and the mark: a
+    // retirement in flight is waited for and read, a later one waits for this
+    // unit's commit.
+    match ClaimRepository::current_state_locked(&mut *conn, viewer, &[canonical])
         .await
         .map_err(db_caller_error)?
+        .first()
     {
-        return Ok(Some(format!("canonical {canonical} is no longer current")));
+        Some((_, true)) => Ok(None),
+        Some((_, false)) => Ok(Some(format!("canonical {canonical} is no longer current"))),
+        None => Ok(Some(format!(
+            "canonical {canonical} could not be locked by this identity's write session"
+        ))),
     }
-    Ok(None)
 }
 
 // ── write_check: a prediction, never a write ────────────────────────────────
@@ -1025,21 +1072,25 @@ async fn write_check(
         for m in &unit.marks {
             let why = match act.as_mut() {
                 None => act_refusal.clone(),
-                Some(tx) => match canonical_refusal(tx, viewer, m.canonical).await? {
-                    Some(why) => Some(why),
-                    None => (!ClaimRepository::session_may_mark_conn(
-                        tx,
-                        ClaimId::from_uuid(m.dup),
-                        ClaimId::from_uuid(m.canonical),
-                    )
-                    .await
-                    .map_err(db_caller_error)?)
-                    .then(|| {
-                        "this identity's own write predicates refuse the dedup act (it must \
+                Some(tx) => {
+                    match canonical_refusal(tx, viewer, m.canonical, CanonicalCheck::Predict)
+                        .await?
+                    {
+                        Some(why) => Some(why),
+                        None => (!ClaimRepository::session_may_mark_conn(
+                            tx,
+                            ClaimId::from_uuid(m.dup),
+                            ClaimId::from_uuid(m.canonical),
+                        )
+                        .await
+                        .map_err(db_caller_error)?)
+                        .then(|| {
+                            "this identity's own write predicates refuse the dedup act (it must \
                          write the duplicate)"
-                            .to_string()
-                    }),
-                },
+                                .to_string()
+                        }),
+                    }
+                }
             };
             applies &= why.is_none();
             mark_checks.push(json!({
@@ -1413,7 +1464,9 @@ async fn apply_unit(
     canonicals.sort();
     canonicals.dedup();
     for canonical in canonicals {
-        if let Some(why) = canonical_refusal(&mut tx, viewer, canonical).await? {
+        if let Some(why) =
+            canonical_refusal(&mut tx, viewer, canonical, CanonicalCheck::HoldForMark).await?
+        {
             return Err(refusal(
                 codes::MARK_REFUSED,
                 format!("{}: {why}. Nothing of the unit was written", unit.unit),
@@ -1881,7 +1934,9 @@ pub const INDEX_VIEW_MAX_IDS: usize = 100;
 /// one connection stamped from the caller's viewer: a canonical or a duplicate
 /// the caller cannot read is not returned (a canonical is listed in
 /// `missing`), so a caller that must see every duplicate needs a viewer that
-/// reads them all. Read-only.
+/// reads them all. Like the plan, it leaves out (and lists in
+/// `foreign_duplicates_ignored`) a duplicate of another owner than its
+/// canonical's, unless `same_owner_only` is `false`. Read-only.
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` (no id, more than [`INDEX_VIEW_MAX_IDS`], a malformed
@@ -1932,14 +1987,25 @@ pub async fn label_dedup_index_view(
     )
     .await
     .map_err(db_caller_error)?;
+    let truncated = dups.rows.len() > max.effective || dups.chain_truncated;
+    // The plan's owner rule, after the cap (so `truncated` keeps its meaning).
+    let same_owner_only = params.same_owner_only.unwrap_or(true);
+    let mut owners = OwnerCache::default();
+    let mut kept = Vec::with_capacity(dups.rows.len().min(max.effective));
+    let mut foreign = Vec::new();
+    for d in dups.rows.iter().take(max.effective) {
+        if same_owner_only && is_foreign_duplicate(&mut owners, &mut read, d).await? {
+            foreign.push(json!({"canonical": d.canonical, "id": d.id}));
+        } else {
+            kept.push(d);
+        }
+    }
     read.commit().await.map_err(db_caller_error)?;
-    let truncated = dups.len() > max.effective;
     let views: Vec<Value> = found
         .into_iter()
         .map(|(id, content, labels)| {
-            let duplicates: Vec<Value> = dups
+            let duplicates: Vec<Value> = kept
                 .iter()
-                .take(max.effective)
                 .filter(|d| d.canonical == id)
                 .map(|d| {
                     json!({"id": d.id, "content": d.content, "labels": d.labels,
@@ -1956,6 +2022,7 @@ pub async fn label_dedup_index_view(
         "views": views,
         "missing": missing,
         "truncated": truncated,
+        "foreign_duplicates_ignored": foreign,
         "max_claims": max.json(),
     }))
 }

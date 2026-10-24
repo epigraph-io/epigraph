@@ -1,17 +1,19 @@
-"""Integration test: fuzzy_dedup_claims.py must RETRACT duplicates, not just label them.
+"""Integration test: fuzzy_dedup_claims.py must RETRACT duplicates, through the act.
 
-Backlog c40ab067. The script used to append the `deduped` label plus
-`deduped_into`/`deduped_by`/`deduped_at` properties and stop there, leaving the
-duplicate `is_current = true` with its embedding intact. `recall()` filters
-`WHERE c.embedding IS NOT NULL AND c.is_current` on both its dense and lexical
-legs (ClaimRepository::search_hybrid_scoped_since), so those duplicates kept
-coming back next to their canonical partner and a single-origin figure read as
-two-to-four-way corroboration.
+Backlog c40ab067: the script once only labelled duplicates, leaving them
+`is_current = true` with their embedding, so `recall()` (which filters `WHERE
+c.embedding IS NOT NULL AND c.is_current`) kept returning them next to their
+canonical. Backlog 32c01f7d: it then retracted them with its own SQL, which
+wrote no `same_as` identity edge, so the mark could not be un-marked. It now
+marks through `POST /api/v1/claims/{dup}/dedup` and reads the database only.
 
-These tests assert the RECALL CONSEQUENCE — "would the recall predicate still
-return this row" — not merely that a column changed, and they drive the real
-script end to end against a disposable database rather than reimplementing its
-SQL.
+These tests assert the RECALL CONSEQUENCE and the identity edge, and drive the
+real script end to end against a disposable database. The executed-mark test
+also needs an API serving that database (DEDUP_TEST_API_BASE) and a bearer
+token for it with `claims:write` (plus `claims:admin` for a cross-agent
+cluster) in DEDUP_TEST_TOKEN, and skips without them; the rest are
+database-only. The request shape and the read-only contract are pinned without
+a database in scripts/tests/test_fuzzy_dedup_claims.py.
 
 Uses a `_test`-suffixed DSN and skips the whole module when it is unavailable,
 same shape as tests/theme/conftest.py. It writes and deletes its own rows only.
@@ -129,7 +131,11 @@ def seeded(db):
     db.commit()
 
 
-def run_script(tmp_path, groups, execute: bool):
+API_BASE = os.environ.get("DEDUP_TEST_API_BASE")
+API_TOKEN = os.environ.get("DEDUP_TEST_TOKEN")
+
+
+def run_script(tmp_path, groups, execute: bool, token: str | None = None, expect_rc: int = 0):
     snapshot = tmp_path / "semantic-dedup.json"
     snapshot.write_text(json.dumps({"groups": groups}))
     argv = [
@@ -142,10 +148,18 @@ def run_script(tmp_path, groups, execute: bool):
     ]
     if execute:
         argv.append("--execute")
+    env = {k: v for k, v in os.environ.items() if k not in ("EPIGRAPH_TOKEN", "EPIGRAPH_API_BASE")}
+    if token is not None:
+        env["EPIGRAPH_TOKEN"] = token
+    if API_BASE:
+        env["EPIGRAPH_API_BASE"] = API_BASE
     proc = subprocess.run(
-        argv, capture_output=True, text=True, cwd=str(REPO_ROOT / "scripts")
+        argv, capture_output=True, text=True, cwd=str(REPO_ROOT / "scripts"), env=env
     )
-    assert proc.returncode == 0, f"script failed:\nSTDOUT\n{proc.stdout}\nSTDERR\n{proc.stderr}"
+    assert proc.returncode == expect_rc, (
+        f"script exited {proc.returncode}, wanted {expect_rc}:\n"
+        f"STDOUT\n{proc.stdout}\nSTDERR\n{proc.stderr}"
+    )
     return proc.stdout
 
 
@@ -155,50 +169,72 @@ def recallable(db, claim_id: str) -> bool:
         return cur.fetchone()[0]
 
 
+@pytest.mark.skipif(
+    not (API_BASE and API_TOKEN),
+    reason="needs DEDUP_TEST_API_BASE (an API serving the test DB) and DEDUP_TEST_TOKEN",
+)
 def test_executed_dedup_removes_the_duplicate_from_recall(db, seeded, tmp_path):
-    """THE REGRESSION GUARD for c40ab067.
+    """THE REGRESSION GUARD for c40ab067 and 32c01f7d.
 
     After an --execute run the duplicate must no longer satisfy recall's
     `embedding IS NOT NULL AND is_current` predicate, while the canonical still
-    does. Asserting the predicate rather than a single column is the point: the
-    filed defect is "both rows keep coming back from recall", and a label-only
-    soft-mark satisfies every column assertion that is not this one.
+    does, AND it must carry the in-force `same_as` identity edge (with
+    `properties.dedup`) that un-mark and the index view key on.
     """
     canonical, dup, _already, _prior = seeded
 
     assert recallable(db, canonical), "canonical must be recallable before the run"
     assert recallable(db, dup), "duplicate must be recallable before the run"
 
-    run_script(tmp_path, [{"rep": canonical, "members": [canonical, dup]}], execute=True)
+    run_script(
+        tmp_path, [{"rep": canonical, "members": [canonical, dup]}], execute=True,
+        token=API_TOKEN,
+    )
 
     assert recallable(db, canonical), "the canonical must survive the merge intact"
     assert not recallable(db, dup), (
         "the duplicate still satisfies recall's predicate — this is exactly the "
-        "c40ab067 defect: a label-only soft-mark leaves it corroborating its own canonical"
+        "c40ab067 defect: a soft-mark leaves it corroborating its own canonical"
     )
 
     with db.cursor() as cur:
         cur.execute(
-            "SELECT supersedes::text, is_current, embedding IS NULL, embedding_3072 IS NULL, "
-            "'deduped' = ANY(labels), properties->>'deduped_into' "
+            "SELECT supersedes::text, is_current, embedding IS NULL, embedding_3072 IS NULL "
             "FROM claims WHERE id = %s::uuid",
             (dup,),
         )
-        (supersedes, is_current, emb_null, emb_3072_null, labelled,
-         deduped_into) = cur.fetchone()
+        supersedes, is_current, emb_null, emb_3072_null = cur.fetchone()
+        cur.execute(
+            "SELECT count(*) FROM edges WHERE source_id = %s::uuid AND target_id = %s::uuid "
+            "AND relationship = 'same_as' AND valid_to IS NULL AND properties ? 'dedup'",
+            (dup, canonical),
+        )
+        identity_edges = cur.fetchone()[0]
 
-    # Lineage, not just visibility: `supersedes` is what makes the retraction
-    # reversible and is what mark_duplicate_with_repair writes.
     assert supersedes == canonical
     assert is_current is False
     assert emb_null is True
     # Recall at centroid_dim=3072 reads `embedding_3072` with no is_current
     # filter, so the retraction must null it too (as mark_duplicate_act does).
     assert emb_3072_null is True
-    # The pre-existing soft-mark contract is preserved, not replaced — the GUI's
-    # collapse view and every label-aware reader still work.
-    assert labelled is True
-    assert deduped_into == canonical
+    # The dedup record: what makes the mark reversible (32c01f7d).
+    assert identity_edges == 1
+
+
+def test_execute_without_a_token_refuses_and_writes_nothing(db, seeded, tmp_path):
+    """--execute with no bearer token refuses to start; the duplicate stays
+    recallable and unmarked."""
+    canonical, dup, _already, _prior = seeded
+
+    run_script(
+        tmp_path, [{"rep": canonical, "members": [canonical, dup]}], execute=True,
+        expect_rc=2,
+    )
+
+    assert recallable(db, dup)
+    with db.cursor() as cur:
+        cur.execute("SELECT supersedes FROM claims WHERE id = %s::uuid", (dup,))
+        assert cur.fetchone()[0] is None
 
 
 def test_dry_run_leaves_the_duplicate_recallable(db, seeded, tmp_path):
@@ -220,12 +256,13 @@ def test_an_already_superseded_duplicate_keeps_its_lineage(db, seeded, tmp_path)
     Re-pointing it at this cluster's canonical would silently destroy the
     earlier lineage. `ClaimRepository::mark_duplicate_with_repair` errors on
     this case ("already superseded; refusing to overwrite"); the script skips
-    and counts it.
+    and counts it, and never asks the endpoint (which refuses it too).
+    Decided on the read-only path, so a dry run shows it.
     """
     canonical, _dup, already, prior = seeded
 
     stdout = run_script(
-        tmp_path, [{"rep": canonical, "members": [canonical, already]}], execute=True
+        tmp_path, [{"rep": canonical, "members": [canonical, already]}], execute=False
     )
 
     with db.cursor() as cur:

@@ -234,8 +234,9 @@ use axum::{
 ///   Allow button bound to a single-use ticket. Rendered inside another
 ///   origin's frame, a signed-in user can be walked onto it (clickjacking).
 ///   The legacy header covers browsers without CSP level 2.
-/// * `Cache-Control: no-store`: that ticket, and every token response (RFC 6749
-///   section 5.1 requires it there), must not be stored by any cache.
+/// * `Cache-Control: no-store` and `Pragma: no-cache`: that ticket, and every
+///   token response, must not be stored by any cache. RFC 6749 section 5.1
+///   requires both on a token response (`Pragma` for HTTP/1.0 caches).
 /// * `Referrer-Policy: no-referrer`: these URLs carry codes and state.
 ///
 /// Inserted, not appended, so a handler cannot weaken them.
@@ -248,6 +249,7 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
@@ -746,7 +748,7 @@ pub fn create_router_with_extensions(
     // already registered above (`/api/v1/claims/:id` is the clearest case).
     // ------------------------------------------------------------------
     let protected = protected
-        .route("/claims", get(claims::list_claims))
+        .route("/claims", get(claims::list_claims_route))
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
@@ -779,7 +781,7 @@ pub fn create_router_with_extensions(
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
         .route("/api/v1/search/semantic", post(search::semantic_search))
-        .route("/api/v1/claims", get(claims_query::list_claims_query))
+        .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",
             get(claims::find_claims_needing_embeddings),

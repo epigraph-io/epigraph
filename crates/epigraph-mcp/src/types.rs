@@ -774,7 +774,9 @@ pub struct StoreWorkflowParams {
     )]
     pub confidence: Option<f64>,
 
-    #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
+    #[schemars(
+        description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows']). Stored on the workflows row as metadata.tags (trimmed, empties dropped, de-duplicated) on the FIRST store only: a re-store of the same goal is a no-op that keeps the original tags. Not added as claim labels."
+    )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
@@ -842,7 +844,9 @@ pub struct ReportWorkflowOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(description = "Step-by-step execution log: planned vs actual")]
@@ -935,12 +939,12 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and order results by (canonical_name ASC, generation DESC) so the newest variant per lineage is first. Defaults to false (frozen step references, newest-created-at first)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth), and the head leads its lineage group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
 
     #[schemars(
-        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows."
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when its truth is below min_truth."
     )]
     pub min_truth: Option<f64>,
 }
@@ -972,7 +976,9 @@ pub struct ReportHierarchicalOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed.")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(
@@ -1897,6 +1903,12 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
@@ -1911,6 +1923,12 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
@@ -2228,6 +2246,14 @@ pub struct LinkEpistemicResponse {
     pub owned_by_caller: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// Why `belief_wired` is false (backlog 0a996437); omitted when it is
+    /// true. One of `source_has_no_belief`, `structural_relationship`,
+    /// `vacuous_source_mass`, `already_wired` or `refused_or_failed` (the
+    /// wiring was refused, e.g. a target this caller cannot write, or failed);
+    /// `edge_retracted` and `source_author_unresolved` are defensive values
+    /// seen only under a concurrent retraction or removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_wired_reason: Option<&'static str>,
     /// The claim `target_belief` describes, and the one the belief wire
     /// recomputed.
     ///
@@ -2392,6 +2418,50 @@ pub struct FindWorkflowResult {
     /// when never evaluated. Advisory — callers may prefer promoted variants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotable: Option<bool>,
+    /// Hierarchical results only (absent for flat workflow claims). `steps` is
+    /// the FROZEN plan text: the claims the workflow's `executes` edges named
+    /// at ingest. `Some(true)` when at least one of those steps has since been
+    /// evolved (`evolve_step`), so its lineage head differs from the frozen
+    /// claim; the heads are in [`Self::evolved_steps`]. Absent when the
+    /// lineage lookup failed (best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_evolved_steps: Option<bool>,
+    /// The steps whose lineage head is not the frozen claim, indexed the way
+    /// `evolve_step` / `report_hierarchical_outcome` index steps. Absent when
+    /// nothing evolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evolved_steps: Option<Vec<EvolvedStep>>,
+    /// Hierarchical results only: the highest `generation` that exists for
+    /// this workflow's `canonical_name`. Greater than `generation` when a newer
+    /// generation of the same lineage exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_generation: Option<i64>,
+}
+
+/// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
+/// has moved on: listed when the lineage has more than one head, or its single
+/// head is not the frozen claim. A step whose sole head is the frozen claim is
+/// not listed, even when that claim is retired (it never evolved).
+#[derive(Debug, Serialize)]
+pub struct EvolvedStep {
+    /// The index `evolve_step` / `report_hierarchical_outcome` take. It counts
+    /// the `executes` edges the caller can see, so it is not guaranteed to be
+    /// the position of the same step in [`FindWorkflowResult::steps`]; match on
+    /// `frozen_claim_id` when that matters.
+    pub step_index: usize,
+    pub frozen_claim_id: String,
+    /// The newest head with `is_current=true`, which is the claim name-mode
+    /// `evolve_step` and `update_with_evidence` act on. When no head of the
+    /// lineage is current, the newest head, with [`Self::is_current`] false.
+    pub head_claim_id: String,
+    pub head_content: String,
+    /// `false` when every head of the lineage is retired (`is_current=false`
+    /// with no `supersedes` edge): the step cannot be evolved or take
+    /// evidence by name until it is revived or re-ingested.
+    pub is_current: bool,
+    /// The lineage has more than one head (concurrent `revises`); the head
+    /// shown is the newest, and the caller must reconcile before relying on it.
+    pub pending_resolution: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2516,6 +2586,15 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// What this call did to the caller's BBA for this (claim, frame,
+    /// perspective_id): `inserted` (none existed), `unchanged` (an identical
+    /// BBA was already stored, so nothing new was combined) or `replaced` (an
+    /// earlier, different BBA was overwritten in place, same id). Backlog
+    /// bcbe34b2.
+    pub write_outcome: String,
+    /// True iff `write_outcome` is `unchanged`: an identical resubmission is
+    /// stored once, not combined again.
+    pub deduplicated: bool,
     /// Human-readable notes about inputs that were ACCEPTED but do not do what
     /// their name suggests (e.g. a non-default `combination_method` or any
     /// `gamma`, neither of which changes the returned belief). Omitted when
@@ -2547,6 +2626,14 @@ pub struct BeliefResponse {
     /// top-level belief/plausibility/etc remain the global (unlensed) values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<LensedBelief>,
+    /// The claim's belief under the atom-level model, beside the served value
+    /// (`EPIGRAPH_COMPOUND_BELIEF=shadow` only; omitted, not null, otherwise,
+    /// so a get_belief in the default mode is byte-identical to today). A
+    /// compound carries `basis: "derived"`: computed from its visible atoms,
+    /// not evidence about the claim. The top-level fields stay the served
+    /// values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<epigraph_engine::belief_view::BeliefView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3547,4 +3634,8 @@ pub struct LabelDedupIndexViewParams {
         description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
     )]
     pub max_claims: Option<i64>,
+    #[schemars(
+        description = "Leave out a duplicate whose author has another owner than the canonical's, as the plan does (default true); each one left out is listed in foreign_duplicates_ignored. false returns every duplicate"
+    )]
+    pub same_owner_only: Option<bool>,
 }

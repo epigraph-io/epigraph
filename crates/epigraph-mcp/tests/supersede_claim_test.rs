@@ -157,3 +157,116 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
         "replacement claim {new_id} must be is_current = true"
     );
 }
+
+/// The MCP `supersede_claim` path: the replacement inherits the predecessor's
+/// labels except the novelty gate's per-submission `near-duplicate` flag.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_does_not_carry_the_near_duplicate_flag(pool: PgPool) {
+    let old = seed_claim(&pool, "v1", 0.5).await;
+    sqlx::query("UPDATE claims SET labels = ARRAY['backlog','near-duplicate'] WHERE id = $1")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let result = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &admin_viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: old.to_string(),
+            content: "v2".into(),
+            truth_value: 0.7,
+            reason: "newer evidence".into(),
+        },
+        Some(&auth),
+    )
+    .await
+    .unwrap();
+    let new_id = parse_uuid_field(&first_text(&result), "new_claim_id");
+    let (labels,): (Vec<String>,) =
+        sqlx::query_as("SELECT COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = $1")
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(labels, vec!["backlog".to_string()], "{labels:?}");
+}
+
+/// MCP twin of the HTTP 403: a supersession whose retirement the database
+/// refuses (the claim is readable and current, but its UPDATE matches no row)
+/// is a caller-side denial (`INVALID_REQUEST`), not an internal error, and
+/// writes nothing: no successor, no `supersedes` edge, the original still
+/// current.
+///
+/// The production producer is a session whose UPDATE policy hides the row
+/// while its SELECT policy shows it (an elevated session:
+/// `claims_elevated_no_update` / `claims_elevated_read`). A `BEFORE UPDATE`
+/// trigger that skips only this claim's row stands in for it deterministically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_the_database_refuses_to_retire_is_a_denial(pool: PgPool) {
+    let old = seed_claim(&pool, "unretirable v1", 0.5).await;
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
+
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_retire() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_retire BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{old}'::uuid) EXECUTE FUNCTION aaa_test_skip_retire();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the retirement stand-in");
+
+    let result = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &admin_viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: old.to_string(),
+            content: "unretirable v2".into(),
+            truth_value: 0.7,
+            reason: "unretirable".into(),
+        },
+        Some(&auth),
+    )
+    .await;
+
+    let err = result.expect_err("a claim the session cannot retire must not be superseded");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "a refused retirement is a denial, not a server fault; got {err:?}"
+    );
+    let (still_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(still_current, "the original is untouched");
+    let (successors,): (i64,) = sqlx::query_as("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(successors, 0, "no successor row was inserted");
+    let (edges,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(edges, 0, "no supersedes edge was inserted");
+}

@@ -9,14 +9,16 @@
 //! caller-declared type must not raise a BBA's weight above what the writer
 //! could already assign, so the type waits for a server-side derivation.
 //!
-//! `POST /api/v1/hypothesis/:id/promote` copies the latest
+//! `POST /api/v1/hypothesis/:id/promote` moves the latest
 //! `hypothesis_assessment` BBA onto `research_validity`. The raw INSERT it
 //! used kept only the masses and the method, so the copy lost its type,
 //! reliability, locality and evidence link and was weighted 0.5;
-//! `MassFunctionRepository::copy_to_frame` keeps all four.
+//! `MassFunctionRepository::copy_to_frame` keeps all four. The source row is
+//! then retired (backlog 846b808e, `promoted_hypothesis_bba_folded_once.rs`).
 #![cfg(feature = "db")]
 
 mod common;
+mod viewer_fixture;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -72,18 +74,6 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     id
 }
 
-async fn seed_claim(pool: &PgPool, owner: Uuid, content: &str) -> Uuid {
-    sqlx::query_scalar(
-        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
-         VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
-    )
-    .bind(format!("{content} {}", Uuid::new_v4()))
-    .bind(owner)
-    .fetch_one(pool)
-    .await
-    .expect("seed claim")
-}
-
 /// (source_agent_id, combination_method, evidence_type) of every BBA on the pair.
 async fn bbas(
     pool: &PgPool,
@@ -118,8 +108,16 @@ async fn analyze(
     data_source: &str,
     scope_limitations: serde_json::Value,
 ) -> Analyzed {
-    let agent = seed_agent(pool).await;
-    let hypothesis = seed_claim(pool, agent, "bc06ec6f error_derived hypothesis").await;
+    // The promoter writes the claim's group: promotion retires the source BBA
+    // under the caller's write predicate (backlog 846b808e).
+    let (agent, group) = viewer_fixture::seed_agent_with_group(pool, "bc06ec6f").await;
+    let hypothesis = viewer_fixture::seed_group_claim(
+        pool,
+        agent,
+        group,
+        &format!("bc06ec6f error_derived hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ('hypothesis_assessment', \
          ARRAY['true','false']::text[]) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
@@ -243,8 +241,9 @@ async fn rows(pool: &PgPool, claim: Uuid, frame: Uuid) -> Vec<epigraph_db::MassF
     .expect("read BBA rows")
 }
 
-/// Promotion copies the latest `hypothesis_assessment` BBA with its
-/// provenance, so the copy keeps the source's effective weight. The source row
+/// Promotion moves the latest `hypothesis_assessment` BBA with its
+/// provenance, so the moved row keeps the source's effective weight, and the
+/// source row is gone afterwards. The source row
 /// is seeded typed, with a reliability, an intra locality and an evidence
 /// link: an untyped error_derived source would let a copy that drops all four
 /// columns pass.
@@ -311,6 +310,13 @@ async fn promote_copies_the_source_bba_with_its_provenance(
         .await
         .expect("make the typed source the latest row");
 
+    // Snapshot the source BEFORE promoting: the promotion retires it.
+    let source = rows(&pool, a.hypothesis, a.frame)
+        .await
+        .into_iter()
+        .find(|r| r.id == source_id)
+        .expect("source row");
+
     let (addr, _shutdown) = spawn_app(&conn_opts).await;
     let token = common::mint_token_with_agent(&["claims:read", "claims:write"], a.agent);
     let resp = reqwest::Client::new()
@@ -326,11 +332,13 @@ async fn promote_copies_the_source_bba_with_its_provenance(
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert!(status.is_success(), "promote: {status} {body}");
 
-    let source = rows(&pool, a.hypothesis, a.frame)
-        .await
-        .into_iter()
-        .find(|r| r.id == source_id)
-        .expect("source row");
+    assert!(
+        rows(&pool, a.hypothesis, a.frame)
+            .await
+            .iter()
+            .all(|r| r.id != source_id),
+        "the promoted source row is retired from hypothesis_assessment"
+    );
     let copies = rows(&pool, a.hypothesis, rv_frame).await;
     assert_eq!(copies.len(), 1, "one promoted BBA: {copies:?}");
     let copy = &copies[0];

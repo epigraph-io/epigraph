@@ -64,11 +64,11 @@
 //! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
 //!   `workflows` has no row security. A rewritten submitter is then honoured by
 //!   the workflow authority gate.
-//! * Outcome report (as changed by #632): `POST
+//! * Outcome report (as changed by #632, then by the visibility gate): `POST
 //!   /api/v1/workflows/hierarchical/:id/outcome` needs `claims:write`; on a
-//!   group-private plan a member's report resolves the steps, a non-member's
-//!   records every step with a NULL `step_claim_id` and lists it in
-//!   `unresolved_step_indices`.
+//!   group-private plan a member's report resolves the steps, and a
+//!   non-member, which reads none of the plan's `executes` edges, is answered
+//!   404 (MCP: the unknown-id error) with nothing written.
 //! * `executes` edge mutation: any principal that writes G (an `admin` or a
 //!   plain `writer` row) can rewrite `plan_index` and retract an `executes`
 //!   edge of a G-private workflow, over REST and over the stdio MCP tools; a
@@ -1370,18 +1370,18 @@ async fn use_count(pool: &PgPool, wf: Uuid) -> i64 {
     .expect("use_count")
 }
 
-/// CHARACTERIZATION (as changed by #632, the stamped outcome report). A
-/// hierarchical outcome report on a G-private plan runs on ONE transaction
-/// stamped with the caller's viewer, and the REST route needs `claims:write`:
+/// CHARACTERIZATION (as changed by #632, the stamped outcome report, and by
+/// the visibility gate). A hierarchical outcome report on a G-private plan
+/// runs on ONE transaction stamped with the caller's viewer, and the REST
+/// route needs `claims:write`:
 ///
 /// * a non-member holding only `claims:read` is refused (403) and nothing
 ///   moves;
-/// * a non-member holding `claims:write` records the run, every step with a
-///   NULL `step_claim_id`, and the response lists every index in
-///   `unresolved_step_indices` with a `warning`;
+/// * a non-member holding `claims:write` reads none of the plan's `executes`
+///   edges, so it is answered 404, as for an unknown id, and nothing moves;
 /// * a member's report resolves the group's steps (the plan's level-2 claims);
-/// * the MCP twin, as the stdio server's own agent (not a member of G),
-///   records NULL steps and reports them unresolved.
+/// * the MCP twin, as the stdio server's own agent (not a member of G), is
+///   refused with the unknown-id error and writes nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(pool: PgPool) {
     let w = private_workflow(&pool, small_extraction("acme-outcome-plan", 2)).await;
@@ -1426,19 +1426,17 @@ async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(poo
     assert_eq!(use_count(&pool, w.workflow_id).await, start);
     assert!(rest_rows(pool.clone(), w.workflow_id).await.is_empty());
 
-    // A non-member holding claims:write: recorded, every step unresolved.
+    // A non-member holding claims:write: it reads none of the plan, so the
+    // workflow is "not found" to it, and nothing moves.
     let (status, resp) = w
         .api
         .post(&uri, &token(w.stranger, WRITE_SCOPES), &body("non-member"))
         .await;
-    assert_eq!(status, StatusCode::OK, "{resp}");
-    assert_eq!(use_count(&pool, w.workflow_id).await, start + 1);
-    assert_eq!(resp["unresolved_step_indices"], json!([0, 1]), "{resp}");
-    assert!(resp["warning"].is_string(), "{resp}");
-    assert_eq!(
-        rest_rows(pool.clone(), w.workflow_id).await,
-        vec![None, None],
-        "the non-member's rows are unattributed"
+    assert_eq!(status, StatusCode::NOT_FOUND, "{resp}");
+    assert_eq!(use_count(&pool, w.workflow_id).await, start);
+    assert!(
+        rest_rows(pool.clone(), w.workflow_id).await.is_empty(),
+        "the non-member writes no row"
     );
 
     // A member: the group's steps resolve.
@@ -1447,7 +1445,7 @@ async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(poo
         .post(&uri, &token(w.reader, WRITE_SCOPES), &body("member"))
         .await;
     assert_eq!(status, StatusCode::OK, "{resp}");
-    assert_eq!(use_count(&pool, w.workflow_id).await, start + 2);
+    assert_eq!(use_count(&pool, w.workflow_id).await, start + 1);
     assert!(
         resp["unresolved_step_indices"]
             .as_array()
@@ -1478,14 +1476,18 @@ async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(poo
             goal_text: Some("workflow-plan goal".to_string()),
         },
     )
-    .await
-    .expect("the MCP report succeeds");
-    assert_ne!(r.is_error, Some(true), "{r:?}");
-    assert_eq!(use_count(&pool, w.workflow_id).await, start + 3);
-    assert_eq!(
-        step_rows(&pool, w.workflow_id, "mcp-report").await,
-        vec![None, None],
-        "a non-member's MCP report leaves the steps unresolved"
+    .await;
+    let err = r.expect_err("a non-member's MCP report is refused");
+    assert!(
+        err.message.contains("no hierarchical workflow with id"),
+        "refused as for an unknown id: {err:?}"
+    );
+    assert_eq!(use_count(&pool, w.workflow_id).await, start + 1);
+    assert!(
+        step_rows(&pool, w.workflow_id, "mcp-report")
+            .await
+            .is_empty(),
+        "a non-member's MCP report writes no row"
     );
 }
 

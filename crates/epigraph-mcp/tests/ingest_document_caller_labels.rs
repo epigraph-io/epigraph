@@ -210,6 +210,7 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
         &server,
         &viewer,
         IngestDocumentInlineParams {
+            wait: None,
             extraction: extraction_with(
                 "U035 Control",
                 ok_doi,
@@ -240,6 +241,7 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
         &server,
         &viewer,
         IngestDocumentInlineParams {
+            wait: None,
             extraction: extraction_with(
                 "U035 Refused",
                 bad_doi,
@@ -290,6 +292,7 @@ impl CwdFixture {
 
     fn params(&self) -> IngestDocumentParams {
         IngestDocumentParams {
+            wait: None,
             file_path: self.0.display().to_string(),
         }
     }

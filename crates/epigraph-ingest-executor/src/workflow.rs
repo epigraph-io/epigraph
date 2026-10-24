@@ -111,6 +111,122 @@ mod label_derivation_tests {
     }
 }
 
+/// The `workflows.metadata` an ingest writes: the caller's `source.metadata`
+/// with `source.tags` recorded under `"tags"`.
+///
+/// `WorkflowSource.tags` is the only place `store_workflow`, `ingest_workflow`
+/// and their REST twins put a caller's tags, and nothing else in the ingest
+/// reads it, so without this the tags were lost (backlog 055f7114). They are
+/// trimmed, empties dropped, and de-duplicated in first-seen order.
+///
+/// Merge policy, so no caller value is lost:
+/// - no usable tags: the metadata is returned unchanged (a tagless workflow
+///   reads exactly as before);
+/// - `Null` metadata (the caller sent none) becomes `{"tags": [...]}`;
+/// - an object keeps every key; a caller `"tags"` ARRAY is extended with the
+///   tags it lacks (its own entries first), and a caller `"tags"` that is not
+///   an array is left as the caller wrote it;
+/// - any other JSON value (a string, number or array) is left unchanged, since
+///   it has no key to put the tags under.
+///
+/// The wfd1 plan digest does not read metadata, so this changes no digest.
+fn workflow_row_metadata(metadata: &serde_json::Value, tags: &[String]) -> serde_json::Value {
+    let mut wanted: Vec<String> = Vec::new();
+    for t in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if !wanted.iter().any(|w| w == t) {
+            wanted.push(t.to_string());
+        }
+    }
+    if wanted.is_empty() {
+        return metadata.clone();
+    }
+    let mut obj = match metadata {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(o) => o.clone(),
+        _ => return metadata.clone(),
+    };
+    match obj.get_mut("tags") {
+        None => {
+            obj.insert("tags".to_string(), serde_json::json!(wanted));
+        }
+        Some(serde_json::Value::Array(existing)) => {
+            for t in wanted {
+                if !existing.iter().any(|e| e.as_str() == Some(t.as_str())) {
+                    existing.push(serde_json::Value::String(t));
+                }
+            }
+        }
+        Some(_) => {}
+    }
+    serde_json::Value::Object(obj)
+}
+
+#[cfg(test)]
+mod row_metadata_tests {
+    use super::workflow_row_metadata;
+    use serde_json::json;
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn tags_are_trimmed_deduplicated_and_empties_dropped() {
+        let got = workflow_row_metadata(
+            &json!({ "prerequisites": ["cargo"] }),
+            &tags(&[" rust ", "", "deployment", "rust", "   "]),
+        );
+        assert_eq!(
+            got,
+            json!({ "prerequisites": ["cargo"], "tags": ["rust", "deployment"] })
+        );
+    }
+
+    #[test]
+    fn null_metadata_becomes_an_object_holding_the_tags() {
+        assert_eq!(
+            workflow_row_metadata(&serde_json::Value::Null, &tags(&["rust"])),
+            json!({ "tags": ["rust"] })
+        );
+    }
+
+    #[test]
+    fn no_usable_tags_leaves_the_metadata_untouched() {
+        assert_eq!(
+            workflow_row_metadata(&serde_json::Value::Null, &tags(&["", "  "])),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            workflow_row_metadata(&json!({ "prerequisites": [] }), &[]),
+            json!({ "prerequisites": [] })
+        );
+    }
+
+    #[test]
+    fn a_caller_tags_array_is_extended_not_replaced() {
+        let got = workflow_row_metadata(
+            &json!({ "owner_team": "infra", "tags": ["legacy", 7] }),
+            &tags(&["rust", "legacy"]),
+        );
+        assert_eq!(
+            got,
+            json!({ "owner_team": "infra", "tags": ["legacy", 7, "rust"] })
+        );
+    }
+
+    #[test]
+    fn values_with_no_place_for_tags_are_left_as_the_caller_wrote_them() {
+        assert_eq!(
+            workflow_row_metadata(&json!({ "tags": "csv,list" }), &tags(&["rust"])),
+            json!({ "tags": "csv,list" })
+        );
+        assert_eq!(
+            workflow_row_metadata(&json!("opaque"), &tags(&["rust"])),
+            json!("opaque")
+        );
+    }
+}
+
 /// A newly inserted plan edge as returned by the executor. Callers iterate
 /// these post-hoc to fire `auto_wire_edge_if_epistemic` (the executor itself
 /// is pure-DB and doesn't depend on epigraph-engine — mirrors the embedding
@@ -521,7 +637,7 @@ async fn execute_plan(
         generation,
         goal,
         parent_id,
-        extraction.source.metadata.clone(),
+        workflow_row_metadata(&extraction.source.metadata, &extraction.source.tags),
     )
     .await
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;

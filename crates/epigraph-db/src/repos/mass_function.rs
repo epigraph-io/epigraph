@@ -267,89 +267,46 @@ pub fn ingest_template_predicate(mf: &str, f: &str) -> String {
     )
 }
 
-/// How far up a `decomposes_to` tree [`frozen_compound_predicate`] looks for
-/// a workflow root (the leaf-closure depth cap of the atom-level belief SPEC).
-const COMPOUND_ROOT_SEARCH_DEPTH: i32 = 6;
-
 /// The placeholder [`MassFunctionRepository::cache_owner_frame_for_claim`]
-/// carries where [`frozen_compound_predicate`] is installed.
+/// carries where [`with_frozen_compound_excluded`] installs the compound test.
 const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 
-/// A boolean SQL expression over the claim bound as `$1`: TRUE when that claim
-/// is a **non-procedural compound**, whose cached belief no recompute that
+/// Replace [`NOT_FROZEN_COMPOUND_MARKER`] in `sql` with a clause that is FALSE
+/// when the claim bound as `$1` is a **compound**
+/// ([`super::claim_role::IS_COMPOUND_SQL`], the one spelling of the role):
+/// an in-force `decomposes_to` out-edge to a current claim, outside a
+/// procedural tree and not a rule. Its cached belief is a query over its
+/// leaves, not a fold of the BBAs that sit on it, so no recompute that
 /// resolves its owner through
-/// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite.
+/// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite it.
 /// Writers that fold a named frame directly (for example the post-removal
 /// recompute of `backfill_factors`' edge re-wire, or the per-write
 /// `recompute_claim_belief_on_frame` callers) do not pass through this check;
 /// they are moved onto the single atom-cache writer separately.
 ///
-/// * **Compound:** it has an in-force ([`super::edge::EDGE_IN_FORCE`])
-///   `decomposes_to` out-edge to a current claim. Its belief is a query over
-///   its leaves, not a fold of the BBAs that happen to sit on it, so refolding
-///   those BBAs into its cache is never right.
-/// * **Procedural** (exempt, keeps today's behaviour): the claim, or an
-///   ancestor up to [`COMPOUND_ROOT_SEARCH_DEPTH`] in-force `decomposes_to`
-///   hops above it, is a ROOT (no in-force `decomposes_to` in-edge) stamped
-///   `properties.source_type = 'workflow'`. A cycle or a tree deeper than the
-///   cap finds no root, so the claim stays frozen: the safe direction.
+/// A procedural node (every root above it is a workflow thesis authored by the
+/// registered `workflow-ingest` system agent) is no compound and keeps today's
+/// behaviour;
+/// a cycle or a tree deeper than [`super::claim_role::ROLE_MAX_DEPTH`] finds
+/// no procedural root, so its compounds stay frozen: the safe direction.
 ///
-/// Role is structure, not content, so these edge and claim reads carry no
-/// viewer splice: a viewer that cannot see a decomposition must not be able
-/// to refold the compound's cache for everyone. That holds as written only on
-/// a connection that bypasses row security, which is how the bulk
-/// recomputers run (the maintenance pool and the maintenance session).
-/// `edges` and `claims` are FORCE ROW LEVEL SECURITY, so on an app connection
-/// (the per-write `routes::assess` refresh) the server still filters these
-/// reads, and a caller who can see none of a compound's in-force
-/// decomposition edges finds no compound here. Making the role read
-/// independent of row security is left to the claim-role module that
-/// replaces this predicate.
-///
-/// Inline until the claim-role module gives the compound and procedural
-/// predicates their one shared spelling, which then replaces this one.
-fn frozen_compound_predicate() -> String {
-    use super::edge::EDGE_IN_FORCE;
-    format!(
-        "(EXISTS (
-             SELECT 1 FROM edges e
-             JOIN claims child ON child.id = e.target_id
-             WHERE e.source_id = $1
-               AND e.relationship = 'decomposes_to'
-               AND e.target_type = 'claim'
-               AND {EDGE_IN_FORCE}
-               AND COALESCE(child.is_current, true))
-          AND NOT EXISTS (
-             WITH RECURSIVE up(id, depth) AS (
-                 SELECT $1::uuid, 0
-                 UNION
-                 SELECT e.source_id, up.depth + 1
-                 FROM up
-                 JOIN edges e ON e.target_id = up.id
-                 WHERE e.relationship = 'decomposes_to'
-                   AND e.source_type = 'claim'
-                   AND {EDGE_IN_FORCE}
-                   AND up.depth < {COMPOUND_ROOT_SEARCH_DEPTH})
-             SELECT 1
-             FROM up
-             JOIN claims root ON root.id = up.id
-             WHERE root.properties->>'source_type' = 'workflow'
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                   WHERE e.target_id = up.id
-                     AND e.relationship = 'decomposes_to'
-                     AND {EDGE_IN_FORCE})))"
-    )
-}
-
-/// Replace [`NOT_FROZEN_COMPOUND_MARKER`] in `sql` with
-/// `AND NOT <`[`frozen_compound_predicate`]`>`.
+/// The role read carries no viewer splice (role is structure: a viewer that
+/// cannot see a decomposition must not be able to refold the compound's
+/// cache for everyone). That holds as written on a connection that bypasses
+/// row security, which is how the bulk recomputers run; on an application
+/// connection (the per-write `routes::assess` refresh) the server's row
+/// security still filters the role read, as the
+/// [`claim_role`](super::claim_role) module doc states.
 fn with_frozen_compound_excluded(sql: &str) -> String {
     assert!(
         sql.contains(NOT_FROZEN_COMPOUND_MARKER),
         "owner query has no {NOT_FROZEN_COMPOUND_MARKER} marker:\n{sql}"
     );
-    let predicate = format!("AND NOT {}", frozen_compound_predicate());
+    let predicate = format!(
+        "AND NOT EXISTS (SELECT 1 FROM claims owner_role \
+                          WHERE owner_role.id = $1 AND {})",
+        super::claim_role::is_compound_sql("owner_role")
+    );
     sql.replace(NOT_FROZEN_COMPOUND_MARKER, &predicate)
 }
 
@@ -1347,12 +1304,14 @@ impl MassFunctionRepository {
     /// that has real input elsewhere. (The fold of the owner frame itself is unchanged: a template
     /// that shares the owner frame with a real input is still folded there.)
     ///
-    /// **A non-procedural compound has no owner** ([`frozen_compound_predicate`]):
+    /// **A compound has no owner** ([`super::claim_role::IS_COMPOUND_SQL`]):
     /// its belief is a query over its leaves, so no recompute that resolves its
     /// owner here (the three bulk recomputers and the `routes::assess`
     /// refresh) refolds the BBAs that sit on it into its cache. Writers that
-    /// fold a named frame directly are not covered. A workflow-rooted
-    /// (procedural) tree keeps the rules below.
+    /// fold a named frame directly are not covered. A procedural node (one
+    /// whose every root is a workflow thesis authored by the registered
+    /// `workflow-ingest` system agent, [`super::claim_role::IS_PROCEDURAL_SQL`])
+    /// keeps the rules below.
     ///
     /// Among the frames holding the claim's remaining inputs:
     ///

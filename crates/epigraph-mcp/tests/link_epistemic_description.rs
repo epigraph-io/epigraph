@@ -90,3 +90,26 @@ fn link_epistemic_description_lists_vacuous_restriction_as_a_no_wire_reason() {
     let needle = "the source's restricted mass is vacuous (e.g. a contradictor with ~no belief)";
     assert!(d.contains(needle), "description lacks {needle:?}: {d}");
 }
+
+/// `belief_wired=false` names its cause in the response (backlog 0a996437),
+/// and the contract an agent reads says so, with every value the tool emits.
+#[test]
+fn link_epistemic_description_names_the_belief_wired_reason_values() {
+    let d = link_epistemic_description();
+    for needle in [
+        "belief_wired_reason names which, and is omitted when belief_wired is true",
+        "source_has_no_belief",
+        "vacuous_source_mass",
+        "already_wired",
+        "structural_relationship",
+        "refused_or_failed (a refused or failed wiring)",
+        // Not producible by a single call (both dedup probes return only
+        // in-force rows, and every claims row has an author), so the contract
+        // names them as defensive rather than as ordinary outcomes.
+        "Two further values are defensive and appear only when the edge or its source \
+         changes underneath the call (a concurrent retraction or removal): edge_retracted \
+         and source_author_unresolved.",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}

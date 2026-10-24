@@ -348,6 +348,47 @@ pub async fn submit_ds_evidence(
     // (effective_source_strength), and the legacy path already baked the
     // raw `reliability` float into the pre-discounted masses above rather
     // than caching it here — unchanged from pre-change behavior.
+    //
+    // Backlog bcbe34b2: the upsert below returns only the row id, so an
+    // identical resubmission and a silent overwrite both looked like a first
+    // submission. Read this agent's row for the key first, on the same
+    // transaction, and report what the write does to it. (The caller's row
+    // has an agent, so the cached-combination exclusion never hides it.)
+    let prior = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|row| row.source_agent_id == Some(agent_id) && row.perspective_id == perspective_id);
+    let write_outcome = match &prior {
+        None => "inserted",
+        Some(row)
+            if restates_bba(
+                row,
+                &masses_json,
+                &method_name,
+                stored_evidence_type.as_deref(),
+                stored_locality_tag,
+            ) =>
+        {
+            "unchanged"
+        }
+        Some(_) => "replaced",
+    };
+    match write_outcome {
+        "unchanged" => warnings.push(
+            "this BBA is identical to the one this agent already stored for this claim, frame \
+             and perspective_id; it is stored once and was not combined again, so the belief \
+             did not move on its account."
+                .to_string(),
+        ),
+        "replaced" => warnings.push(
+            "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
+             perspective_id (same mass_function_id); it was not added beside it. To add \
+             independent evidence, submit it under a distinct perspective_id."
+                .to_string(),
+        ),
+        _ => {}
+    }
     let mf_id = MassFunctionRepository::store_with_perspective(
         &mut *tx,
         claim_id,
@@ -538,9 +579,43 @@ pub async fn submit_ds_evidence(
         mass_on_missing,
         bba_count: bba_count as i64,
         method_used: method_name,
+        write_outcome: write_outcome.to_string(),
+        deduplicated: write_outcome == "unchanged",
         warnings,
         unknown_keys,
     })
+}
+
+/// Whether `row` already holds exactly what this call is about to store: the
+/// same focal elements with masses equal within 1e-12, and the same values in
+/// every other column the upsert writes (`conflict_k`, `source_strength` and
+/// `evidence_id` are always NULL on this path).
+fn restates_bba(
+    row: &epigraph_db::MassFunctionRow,
+    masses_json: &serde_json::Value,
+    method_name: &str,
+    evidence_type: Option<&str>,
+    locality_tag: &str,
+) -> bool {
+    let same_masses = match (row.masses.as_object(), masses_json.as_object()) {
+        (Some(old), Some(new)) => {
+            old.len() == new.len()
+                && new.iter().all(|(k, v)| {
+                    match (old.get(k).and_then(serde_json::Value::as_f64), v.as_f64()) {
+                        (Some(a), Some(b)) => (a - b).abs() <= 1e-12,
+                        _ => false,
+                    }
+                })
+        }
+        _ => false,
+    };
+    same_masses
+        && row.combination_method.as_deref() == Some(method_name)
+        && row.evidence_type.as_deref() == evidence_type
+        && row.locality_tag == locality_tag
+        && row.conflict_k.is_none()
+        && row.source_strength.is_none()
+        && row.evidence_id.is_none()
 }
 
 /// The calibration the belief recompute itself uses — same loader, same
@@ -617,6 +692,24 @@ pub async fn get_belief(
     viewer: &epigraph_db::visibility::Viewer,
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
+    get_belief_in_mode(
+        server,
+        viewer,
+        params,
+        epigraph_engine::belief_view::CompoundBeliefMode::current(),
+    )
+    .await
+}
+
+/// [`get_belief`] under an explicit `EPIGRAPH_COMPOUND_BELIEF` mode: in
+/// `shadow` the response also carries the claim's atom-level `shadow` view;
+/// in `legacy` it is exactly today's response.
+pub async fn get_belief_in_mode(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: GetBeliefParams,
+    mode: epigraph_engine::belief_view::CompoundBeliefMode,
+) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
 
@@ -688,6 +781,9 @@ pub async fn get_belief(
         None => None,
     };
 
+    let shadow =
+        epigraph_engine::belief_query::shadow_belief(&server.pool, viewer, claim_id, mode).await;
+
     let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
         claim_id: claim_id.to_string(),
@@ -699,6 +795,7 @@ pub async fn get_belief(
         mass_on_missing: interval.mass_on_missing,
         source: interval.source,
         lensed_belief,
+        shadow,
     })
 }
 
