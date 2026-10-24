@@ -1199,6 +1199,42 @@ scopes; arming is an operator step (`docs/deploy.md`).
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
 
+## Keyless team groups (migration 164)
+
+A team group is a visibility boundary, not an encryption one: it carries no
+key, no key epoch and no wrapped shares. The operator creates one, and changes
+its roster, on the maintenance DSN only:
+
+```bash
+epigraph-operator create-group --kind team --name "<name>" --admin <person agent id> \
+    --reason "<why>" [--apply]
+epigraph-operator group-member add --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member set-role --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member remove --group <id> --agent <agent id> \
+    --reason "<why>" [--apply]
+```
+
+Every command is a dry run without `--apply` (the definer runs and its
+transaction, audit row included, is rolled back). The rules live in the
+database functions, so no other caller can skip them:
+
+* the creator and every `admin` is a registered human operator;
+* a member belongs to a live human: the human itself, or an agent with a LIVE
+  operator link (or a client allowance) to one; unbound and retired-linked
+  agents are refused;
+* an operated agent is a member, at any role, only of a group its operator
+  writes, and an operator cannot be removed or demoted to `reader` while one
+  of its agents is a live member (remove the agents first);
+* the last live admin cannot be removed or demoted;
+* a removal sets `revoked_at` and keeps the row; adding the agent back writes
+  a new row;
+* every applied act writes one `group.*` `security_events` row.
+
+The keyed `POST /api/v1/groups/:id/members` route refuses a keyless group (it
+needs a key epoch).
+
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
 `ownership` was the pre-tenancy ACL table: one row per node, naming an agent and

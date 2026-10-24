@@ -1493,6 +1493,44 @@ restart.
   been applied. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **164**: public `keyless_team_group_verbs`. Relaxes `groups_public_key_shape`
+  (060) so a `kind = 'team'` group may carry 0 OR 32 key bytes (keyed groups
+  stay valid), reserves the `group.` `security_events` family to a privileged
+  session or definer frame (RESTRICTIVE insert policy
+  `security_events_group_roster_privileged`, the 123/148 shape), and adds four
+  SECURITY DEFINERs owned by `epigraph_maintenance`, EXECUTE revoked from
+  PUBLIC and `epigraph_app` and granted to the maintenance role only:
+  `epigraph_create_team_group(text, uuid, text)`,
+  `epigraph_team_group_add_member(uuid, uuid, text, text)`,
+  `epigraph_team_group_remove_member(uuid, uuid, text)` and
+  `epigraph_team_group_set_member_role(uuid, uuid, text, text)`. A created
+  group is keyless (empty `public_key`, no `group_key_epochs` row, empty
+  shares, `did_key = did:epigraph:group:<id>`) and its creator and first admin
+  is a registered human operator. Because a maintenance session switches off
+  109's and 122's membership triggers, each verb restates the rules in its
+  body, armed or not: SQLSTATE `GRP01` (an admin must be a Person), `GRP02`
+  (the last live admin stays, decided under the `groups` row lock), `GRP03`
+  (an operated agent is a member, at any role, only where its operator writes;
+  an operator is not removed or demoted to reader under its live agents),
+  `GRP04` (a member must belong to a live human operator: unbound and
+  retired-linked agents are refused), `GRP05` (member verbs act only on active
+  keyless team groups) and `GRP06` (one active team group per normalised
+  name). Removal is a revoke; a re-add inserts a new row at the next epoch, so
+  a revoked row is never revived. One `group.*` audit row per applied act.
+  Callers: `epigraph-operator create-group` and `group-member
+  add|remove|set-role`. The keyed REST member routes refuse these groups (no
+  key epoch); that is intended. Pinned by
+  `epigraph-db/tests/team_group_verbs.rs` and
+  `epigraph-cli/tests/operator_team_group.rs`; registered in
+  `tenancy_backfill.rs` (definer register and grant list),
+  `locked_decisions.rs` (call needles) and `rls_enforcement.rs` (the policy's
+  row-only arm). Undo in the file's header. Slot: 163 is the highest on
+  `main`; no open PR and no remote branch carries 164 or above. **Deploy
+  order:** none against other migrations or the binaries (new functions and a
+  widened CHECK; an older binary has no caller). The CLI subcommands need the
+  migration applied. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
