@@ -98,6 +98,30 @@ async fn group_audit(pool: &PgPool) -> Vec<String> {
     .expect("audit rows")
 }
 
+/// `(role, revoked)` of every membership row of `(group, agent)`, by epoch.
+async fn member_rows(pool: &PgPool, group: Uuid, agent: Uuid) -> Vec<(String, bool)> {
+    sqlx::query_as(
+        "SELECT role::text, revoked_at IS NOT NULL FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 ORDER BY epoch",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_all(pool)
+    .await
+    .expect("member rows")
+}
+
+/// The `details->'actor'` of every `group.*` audit row, oldest first.
+async fn audit_actors(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(details->'actor', 'null'::jsonb) FROM security_events \
+          WHERE event_type LIKE 'group.%' ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("audit actors")
+}
+
 /// The `group=<uuid>` field of the first stdout line that has one.
 fn group_of(run: &Run) -> Uuid {
     run.stdout
@@ -243,21 +267,27 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
     let admin_s = admin.to_string();
     let member_s = member.to_string();
 
-    let created = run_with(
-        &[
+    let create_args = |apply: bool| {
+        let mut v = vec![
             "create-group",
             "--kind",
             "team",
             "--name",
             "Synthetic Member Team",
             "--admin",
-            &admin_s,
+            admin_s.as_str(),
             "--reason",
             "cli test",
-            "--apply",
-        ],
-        Some(&dsn),
-    );
+        ];
+        if apply {
+            v.push("--apply");
+        }
+        v
+    };
+    // A dry run as the NOSUPERUSER maintenance login, too.
+    let dry_create = run_with(&create_args(false), Some(&dsn));
+    let dry_create_left = team_groups_named(&pool, "Synthetic Member Team").await;
+    let created = run_with(&create_args(true), Some(&dsn));
     let group = if created.code == 0 {
         group_of(&created)
     } else {
@@ -293,7 +323,12 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
 
     let dry_add = run(member_args("add", Some("writer"), false));
     let add = run(member_args("add", Some("writer"), true));
+    let dry_set = run(member_args("set-role", Some("reader"), false));
+    let after_dry_set = member_rows(&pool, group, member).await;
     let set = run(member_args("set-role", Some("reader"), true));
+    let dry_remove = run(member_args("remove", None, false));
+    let after_dry_remove = member_rows(&pool, group, member).await;
+    let audit_after_dry_remove = group_audit(&pool).await;
     let remove = run(member_args("remove", None, true));
     // The last admin cannot be removed.
     let last = run_with(
@@ -313,6 +348,43 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
     // Drop the cluster-global role BEFORE asserting, so a failure cannot leak it.
     drop_login(&pool, &role).await;
 
+    assert_eq!(dry_create.code, 0, "{}", dry_create.show());
+    assert!(
+        dry_create.stdout.contains("DRY RUN"),
+        "{}",
+        dry_create.show()
+    );
+    assert!(
+        dry_create_left.is_empty(),
+        "a dry create as the maintenance login created a group"
+    );
+    assert_eq!(dry_set.code, 0, "{}", dry_set.show());
+    assert!(dry_set.stdout.contains("DRY RUN"), "{}", dry_set.show());
+    assert_eq!(
+        after_dry_set,
+        [("writer".to_string(), false)],
+        "a dry set-role changed nothing"
+    );
+    assert_eq!(dry_remove.code, 0, "{}", dry_remove.show());
+    assert!(
+        dry_remove.stdout.contains("DRY RUN"),
+        "{}",
+        dry_remove.show()
+    );
+    assert_eq!(
+        after_dry_remove,
+        [("reader".to_string(), false)],
+        "a dry remove revoked nothing"
+    );
+    assert_eq!(
+        audit_after_dry_remove,
+        [
+            "group.team_created",
+            "group.member_added",
+            "group.member_role_set"
+        ],
+        "neither dry run wrote an audit row"
+    );
     assert_eq!(dry_add.code, 0, "{}", dry_add.show());
     assert!(
         dry_add.stdout.contains("WOULD BE ADDED"),
@@ -329,15 +401,7 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
     assert_eq!(last.code, 1, "{}", last.show());
     assert!(last.stderr.contains("last live admin"), "{}", last.show());
 
-    let rows: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT role::text, revoked_at IS NOT NULL FROM group_memberships \
-          WHERE group_id = $1 AND agent_id = $2 ORDER BY epoch",
-    )
-    .bind(group)
-    .bind(member)
-    .fetch_all(&pool)
-    .await
-    .expect("member rows");
+    let rows = member_rows(&pool, group, member).await;
     assert_eq!(
         rows,
         [("reader".to_string(), true)],
@@ -363,4 +427,18 @@ async fn member_verbs_carry_a_whole_cycle_as_a_non_superuser_maintenance_login(p
         ],
         "one audit row per applied act; none for the dry run or the refusal"
     );
+    // Each audit row names the PROCESS that acted, not only the shared
+    // maintenance login: the tool, its version and the process's real uid
+    // (from the kernel, which no environment variable changes).
+    let own_uid = epigraph_cli::operator::client_scope::Operator::process_uid();
+    for actor in audit_actors(&pool).await {
+        assert_eq!(actor["tool"], "epigraph-operator", "{actor}");
+        assert_eq!(actor["cli_version"], env!("CARGO_PKG_VERSION"), "{actor}");
+        assert_eq!(
+            actor["process_uid"].as_u64(),
+            own_uid.map(u64::from),
+            "{actor}"
+        );
+        assert!(actor["command"].is_string(), "{actor}");
+    }
 }

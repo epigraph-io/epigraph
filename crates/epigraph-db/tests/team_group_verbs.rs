@@ -28,7 +28,12 @@
 //! * a removal keeps the row (`revoked_at` set), `Viewer::resolve` stops
 //!   returning the group, the member's stamped application session stops
 //!   reading the group's claims, and a re-add writes a NEW row;
-//! * migration 092's group-creation arm ends with the creator's membership.
+//! * a verb-made group's roster and group row have ONE writer, the verbs: an
+//!   application session stamped as the group's own admin or creator
+//!   (demoted or not) writes neither, and cannot mint a group the verbs would
+//!   manage; migration 092's creator arm reads the group only while the
+//!   creator is a live member;
+//! * the member verbs refuse every group they do not manage (GRP05).
 //!
 //! Every verb runs on a session whose `session_user` IS `epigraph_maintenance`
 //! (`SET SESSION AUTHORIZATION`), not on the harness superuser, so the grants
@@ -267,6 +272,89 @@ async fn forged_app_conn(
     conn
 }
 
+/// An application-role connection stamped with `principal` ONLY: no group
+/// set, no writable set, the valve untouched. Only a policy arm keyed on the
+/// principal itself (077's own-row and group-admin arms, 092's creator arm)
+/// can admit what it does, which is exactly the case a lookup filtered by row
+/// security would get wrong.
+async fn stamped_app_conn(
+    pool: &PgPool,
+    principal: Uuid,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade to the application role");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+        .bind(principal.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the principal");
+    conn
+}
+
+/// Run one statement binding `(a, b)` on `conn`; the rows it changed.
+async fn exec2(
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+    a: Uuid,
+    b: Uuid,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(sql)
+        .bind(a)
+        .bind(b)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+}
+
+/// Run one statement binding `a` on `conn`; the rows it changed.
+async fn exec1(conn: &mut sqlx::PgConnection, sql: &str, a: Uuid) -> Result<u64, sqlx::Error> {
+    sqlx::query(sql)
+        .bind(a)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+}
+
+/// The message of a refusal, for asserting WHICH control refused.
+fn message_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> String {
+    r.as_ref()
+        .err()
+        .and_then(|e| e.as_database_error().map(|d| d.message().to_string()))
+        .unwrap_or_default()
+}
+
+/// A KEYED team group made through the APPLICATION path, in the REST create
+/// route's shape: `creator`'s stamped session inserts the group (092's creator
+/// arm) and its own admin row (the empty-roster bootstrap). Not verb-managed:
+/// the positive control for every statement the verb-managed groups refuse.
+async fn app_keyed_group(pool: &PgPool, creator: Uuid, name: &str) -> Uuid {
+    let mut conn = stamped_app_conn(pool, creator).await;
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'did:key:probe-' || gen_random_uuid()::text, \
+                 decode(repeat('ab', 32), 'hex'), 'team', $2) RETURNING id",
+    )
+    .bind(name)
+    .bind(creator)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the application path creates a keyed team group");
+    exec2(
+        &mut conn,
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+        group,
+        creator,
+    )
+    .await
+    .expect("the creator enrols itself as admin of an empty roster");
+    reset(conn).await;
+    group
+}
+
 async fn reset(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
     use sqlx::Executor;
     conn.execute("RESET SESSION AUTHORIZATION")
@@ -388,6 +476,10 @@ async fn the_app_role_cannot_execute_the_verbs_even_with_forged_session_settings
             code_of(&r).as_deref(),
             Some(INSUFFICIENT_PRIVILEGE),
             "{what} on a forged application session must be refused 42501: {r:?}"
+        );
+        assert!(
+            message_of(&r).contains("permission denied for function"),
+            "{what}: refused by the ACL, before the body runs: {r:?}"
         );
     }
     reset(conn).await;
@@ -723,13 +815,22 @@ async fn an_operated_agent_is_a_member_only_where_its_operator_writes(pool: PgPo
         set_role(&pool, group, operator, "writer")
             .await
             .expect("operator writer");
+        // Never an admin by add, even where its operator writes (the one
+        // state in which every other add rule would admit it).
+        let r = add(&pool, group, agent, "admin").await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(NOT_A_HUMAN_ADMIN),
+            "{phase}: an operated agent added as admin: {r:?}"
+        );
+        assert_eq!(live_role(&pool, group, agent).await, None, "{phase}");
         add(&pool, group, agent, "writer")
             .await
             .expect("the agent is admitted where its operator writes");
         set_role(&pool, group, agent, "reader")
             .await
             .expect("the agent may be demoted to reader");
-        // Never an admin, by add or by set-role.
+        // Nor by set-role.
         let r = set_role(&pool, group, agent, "admin").await;
         assert_eq!(
             code_of(&r).as_deref(),
@@ -835,7 +936,24 @@ async fn removal_is_a_revoke_and_the_viewer_stops_seeing_the_group(pool: PgPool)
     assert_eq!(
         sees(pool.clone()).await,
         (false, 0),
-        "a removed member neither resolves the group nor reads its claim"
+        "a removed member's re-resolved viewer neither carries the group nor, stamped from \
+         it, reads the group's claim"
+    );
+    // RECORDED LIMITATION, pinned so a change shows: row security reads the
+    // SESSION's group set, so a session stamped BEFORE the removal (a cached
+    // viewer, a long-lived connection) still reads the group's claim until it
+    // re-resolves. The revoke takes effect at the next resolve, not at the
+    // database.
+    let mut stale = forged_app_conn(&pool, member, group).await;
+    let stale_reads: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&mut *stale)
+        .await
+        .expect("stale read");
+    reset(stale).await;
+    assert_eq!(
+        stale_reads, 1,
+        "a session stamped with the pre-removal group set still reads (limitation)"
     );
 
     // Removing again is a no-op, not a second revoke.
@@ -860,57 +978,63 @@ async fn removal_is_a_revoke_and_the_viewer_stops_seeing_the_group(pool: PgPool)
     assert_eq!(sees(pool.clone()).await, (true, 1));
 }
 
-/// Migration 092's group-creation arm on a verb-created group: the creator's
-/// stamped application session reads the roster while it is a live member, and
-/// loses it once removed (another admin remains), so the arm keyed on
-/// `created_by_agent_id` does not outlive the membership.
+/// The words of 164's roster guard, so a refusal is attributed to IT and not
+/// to row security or another trigger that happens to share the SQLSTATE.
+const ROSTER_GUARD: &str = "only by the team-group verbs";
+
+/// Migration 092's group-creation arm on a verb-created group. Its READ half
+/// is bounded by the roster: the creator's stamped application session reads
+/// the group row while it is a live member and loses it once removed (another
+/// admin remains), so the arm keyed on `created_by_agent_id` does not outlive
+/// the membership. Its WRITE half never reaches a verb-managed roster: the
+/// creator's stamped insert is refused by 164's roster guard (named by its
+/// message, not just its SQLSTATE) both while it is a live member and after.
+/// The positive control is the identical insert by the same creator into a
+/// keyed group it made through the application path, which lands.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_creator_arm_ends_with_the_creators_membership(pool: PgPool) {
+async fn the_creator_arm_reads_only_while_a_member_and_never_writes_a_managed_roster(pool: PgPool) {
     let creator = human(&pool, "arm-creator").await;
     let successor = human(&pool, "arm-successor").await;
     let group = create(&pool, "Synthetic Arm Team", creator)
         .await
         .expect("create");
+    let keyed = app_keyed_group(&pool, creator, "arm keyed control").await;
+    let enrol =
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+                 VALUES ($1, $2, ''::bytea, 7, 'reader')";
 
-    // The creator's stamped session with NO group set: only the 092 arm (or
-    // its own-row arm) can admit it.
     let probe_live = human(&pool, "arm-probe-live").await;
     let probe_gone = human(&pool, "arm-probe-gone").await;
-    let roster_seen = |pool: PgPool, probe: Uuid| async move {
-        use sqlx::Executor;
-        let mut conn = pool.acquire().await.expect("acquire");
-        conn.execute("SET SESSION AUTHORIZATION epigraph_app")
-            .await
-            .expect("downgrade");
-        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
-            .bind(creator.to_string())
-            .execute(&mut *conn)
-            .await
-            .expect("stamp");
-        let group_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM groups WHERE id = $1")
-            .bind(group)
-            .fetch_one(&mut *conn)
+    let attempt = |pool: PgPool, probe: Uuid| async move {
+        let mut conn = stamped_app_conn(&pool, creator).await;
+        let seen = exec1(&mut conn, "SELECT 1 FROM groups WHERE id = $1", group)
             .await
             .expect("groups read");
-        let insert = sqlx::query(
-            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-             VALUES ($1, $2, ''::bytea, 7, 'reader')",
-        )
-        .bind(group)
-        .bind(probe)
-        .execute(&mut *conn)
-        .await;
-        conn.execute("RESET SESSION AUTHORIZATION")
-            .await
-            .expect("reset");
-        (group_rows, insert.is_ok())
+        let inserted = exec2(&mut conn, enrol, group, probe).await;
+        reset(conn).await;
+        (seen, inserted)
     };
 
-    let (seen, inserted) = roster_seen(pool.clone(), probe_live).await;
+    let (seen, inserted) = attempt(pool.clone(), probe_live).await;
     assert_eq!(seen, 1, "POSITIVE CONTROL: the live creator sees its group");
+    assert_eq!(
+        code_of(&inserted).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "the live creator's stamped insert into a verb-managed roster: {inserted:?}"
+    );
     assert!(
-        inserted,
-        "POSITIVE CONTROL: the live creator enrols through the arm"
+        message_of(&inserted).contains(ROSTER_GUARD),
+        "refused by the roster guard: {inserted:?}"
+    );
+
+    // POSITIVE CONTROL: the identical insert into the creator's keyed group.
+    let mut conn = stamped_app_conn(&pool, creator).await;
+    let control = exec2(&mut conn, enrol, keyed, probe_live).await;
+    reset(conn).await;
+    assert_eq!(
+        control.expect("the insert shape lands on a keyed group"),
+        1,
+        "the creator enrols through 092's arm where the verbs do not manage the roster"
     );
 
     add(&pool, group, successor, "admin")
@@ -920,25 +1044,274 @@ async fn the_creator_arm_ends_with_the_creators_membership(pool: PgPool) {
         .await
         .expect("remove the creator");
 
-    let (seen, inserted) = roster_seen(pool.clone(), probe_gone).await;
+    let (seen, inserted) = attempt(pool.clone(), probe_gone).await;
     assert_eq!(
         seen, 0,
         "a removed creator no longer sees the group through 092's arm"
     );
-    assert!(!inserted, "a removed creator can no longer enrol members");
+    assert_eq!(
+        code_of(&inserted).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{inserted:?}"
+    );
+    assert!(message_of(&inserted).contains(ROSTER_GUARD), "{inserted:?}");
+    assert_eq!(live_role(&pool, group, probe_live).await, None);
+    assert_eq!(live_role(&pool, group, probe_gone).await, None);
     assert_eq!(
         live_role(&pool, group, successor).await.as_deref(),
         Some("admin")
     );
 }
 
-/// The verbs act on keyless TEAM groups only: a personal group, the world
-/// group, and a keyed team group are refused (their rosters have their own
-/// paths), and nothing is written.
+/// A verb-managed roster has ONE writer, the verbs. An application session
+/// stamped as the group's own live admin and creator (the strongest stamp a
+/// holder of the application DSN can forge) cannot add an operated agent as a
+/// reader (122 is quiet for reader rows), cannot add that agent's operator as
+/// a writer (122 is quiet for a human), cannot demote itself and cannot revoke
+/// a row (the REST remove route's statement). Nothing changes and no audit row
+/// appears. The positive control is the same principal enrolling the same
+/// agent, and revoking it, in a keyed group it made through the application
+/// path.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_member_verbs_refuse_groups_that_are_not_keyless_team_groups(pool: PgPool) {
+async fn the_application_path_cannot_write_a_verb_managed_roster(pool: PgPool) {
+    let admin = human(&pool, "roster-admin").await;
+    let operator = human(&pool, "roster-operator").await;
+    let agent = operated(&pool, operator, "roster-agent").await;
+    let group = create(&pool, "Synthetic Roster Team", admin)
+        .await
+        .expect("create");
+    let keyed = app_keyed_group(&pool, admin, "roster keyed control").await;
+    let audit_before = audit(&pool, group).await.len();
+
+    let insert_reader = "INSERT INTO group_memberships \
+                           (group_id, agent_id, wrapped_key_share, epoch, role) \
+                         VALUES ($1, $2, ''::bytea, 9, 'reader')";
+    let insert_writer = "INSERT INTO group_memberships \
+                           (group_id, agent_id, wrapped_key_share, epoch, role) \
+                         VALUES ($1, $2, ''::bytea, 9, 'writer')";
+    let demote = "UPDATE group_memberships SET role = 'reader' \
+                   WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL";
+    let revoke = "UPDATE group_memberships SET revoked_at = now() \
+                   WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL";
+
+    let mut conn = stamped_app_conn(&pool, admin).await;
+    let attempts = [
+        (
+            "an operated agent as reader",
+            exec2(&mut conn, insert_reader, group, agent).await,
+        ),
+        (
+            "its operator as writer",
+            exec2(&mut conn, insert_writer, group, operator).await,
+        ),
+        (
+            "the admin demoting itself",
+            exec2(&mut conn, demote, group, admin).await,
+        ),
+        (
+            "the admin revoking its own row",
+            exec2(&mut conn, revoke, group, admin).await,
+        ),
+    ];
+    // POSITIVE CONTROL: the same principal, the same statements, a keyed group.
+    let control_add = exec2(&mut conn, insert_reader, keyed, agent).await;
+    let control_revoke = exec2(&mut conn, revoke, keyed, agent).await;
+    reset(conn).await;
+
+    for (what, r) in &attempts {
+        assert_eq!(
+            code_of(r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{what}: {r:?}"
+        );
+        assert!(message_of(r).contains(ROSTER_GUARD), "{what}: {r:?}");
+    }
+    assert_eq!(live_role(&pool, group, agent).await, None);
+    assert_eq!(live_role(&pool, group, operator).await, None);
+    assert_eq!(
+        live_role(&pool, group, admin).await.as_deref(),
+        Some("admin")
+    );
+    assert_eq!(
+        audit(&pool, group).await.len(),
+        audit_before,
+        "no audit row"
+    );
+
+    assert_eq!(control_add.expect("keyed: enrol"), 1, "keyed: enrol");
+    assert_eq!(control_revoke.expect("keyed: revoke"), 1, "keyed: revoke");
+}
+
+/// A creator DEMOTED by set-role stays demoted: its stamped application
+/// session can neither promote its own row back to admin (092's creator arm
+/// would admit that on any other group) nor rewrite the group row (`public_key`,
+/// `status`, `display_name`), any of which would take the group out of the
+/// verbs' hands (GRP05) or rename it under the audit trail. The verbs still
+/// manage the group afterwards. The positive control is the same four
+/// statements by a creator demoted the same way in a keyed group made through
+/// the application path, each of which changes one row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_demoted_creator_cannot_restore_itself_or_change_the_group_row(pool: PgPool) {
+    let creator = human(&pool, "demote-creator").await;
+    let second = human(&pool, "demote-second").await;
+    let late = human(&pool, "demote-late").await;
+    let name = "Synthetic Demotion Team";
+    let group = create(&pool, name, creator).await.expect("create");
+    add(&pool, group, second, "admin")
+        .await
+        .expect("second admin");
+    let demoted = set_role(&pool, group, creator, "reader")
+        .await
+        .expect("demote the creator");
+    assert!(demoted.applied, "{demoted:?}");
+
+    let promote = "UPDATE group_memberships SET role = 'admin' \
+                    WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL";
+    let rekey = "UPDATE groups SET public_key = decode(repeat('cd', 32), 'hex') WHERE id = $1";
+    let suspend = "UPDATE groups SET status = 'suspended' WHERE id = $1";
+    let rename = "UPDATE groups SET display_name = 'renamed on the app path' WHERE id = $1";
+
+    let mut conn = stamped_app_conn(&pool, creator).await;
+    let attempts = [
+        (
+            "self-promotion",
+            exec2(&mut conn, promote, group, creator).await,
+        ),
+        ("re-key", exec1(&mut conn, rekey, group).await),
+        ("suspend", exec1(&mut conn, suspend, group).await),
+        ("rename", exec1(&mut conn, rename, group).await),
+    ];
+    reset(conn).await;
+    for (what, r) in &attempts {
+        assert_eq!(
+            code_of(r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{what}: {r:?}"
+        );
+    }
+    assert_eq!(
+        live_role(&pool, group, creator).await.as_deref(),
+        Some("reader")
+    );
+    let row: (i32, String, String) = sqlx::query_as(
+        "SELECT octet_length(public_key), status::text, display_name FROM groups WHERE id = $1",
+    )
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("the group row");
+    assert_eq!(row, (0, "active".to_string(), name.to_string()));
+    add(&pool, group, late, "reader")
+        .await
+        .expect("the verbs still manage the group");
+
+    // POSITIVE CONTROL: a keyed group, the same creator, demoted the same way
+    // (a second admin first, then its own row to reader), the same statements.
+    let keyed = app_keyed_group(&pool, creator, "demotion keyed control").await;
+    let mut conn = stamped_app_conn(&pool, creator).await;
+    let insert_admin = "INSERT INTO group_memberships \
+                          (group_id, agent_id, wrapped_key_share, epoch, role) \
+                        VALUES ($1, $2, ''::bytea, 0, 'admin')";
+    let demote = "UPDATE group_memberships SET role = 'reader' \
+                   WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL";
+    let setup = [
+        exec2(&mut conn, insert_admin, keyed, second).await,
+        exec2(&mut conn, demote, keyed, creator).await,
+    ];
+    let controls = [
+        (
+            "self-promotion",
+            exec2(&mut conn, promote, keyed, creator).await,
+        ),
+        ("re-key", exec1(&mut conn, rekey, keyed).await),
+        ("suspend", exec1(&mut conn, suspend, keyed).await),
+        ("rename", exec1(&mut conn, rename, keyed).await),
+    ];
+    reset(conn).await;
+    for r in setup {
+        assert_eq!(r.expect("keyed control setup"), 1);
+    }
+    for (what, r) in controls {
+        assert_eq!(
+            r.unwrap_or_else(|e| panic!("keyed {what}: {e}")),
+            1,
+            "keyed {what}"
+        );
+    }
+}
+
+/// The application path cannot mint a group the verbs would manage: neither a
+/// keyless team group (the relaxed CHECK admits one) nor any group in the
+/// verbs' `did:epigraph:group:` namespace, while a keyed team group is still
+/// app-creatable (the REST create route). And a team NAME is held only by a
+/// verb-made group: a keyed group of the same name does not refuse `create`,
+/// while a second verb-made one is refused with GRP06 naming the first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_application_path_cannot_mint_a_group_the_verbs_would_manage(pool: PgPool) {
+    let (minter, _) = fixture::seed_agent_with_group(&pool, "mint-agent").await;
+    let admin = human(&pool, "mint-admin").await;
+    let name = "Synthetic Squat Team";
+    let insert = |did: &'static str, key: &'static str| {
+        format!(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('{name}', {did} || gen_random_uuid()::text, {key}, 'team', $1)"
+        )
+    };
+    let keyless_sql = insert("'did:key:probe-'", "''::bytea");
+    let namespaced_sql = insert("'did:epigraph:group:'", "decode(repeat('ab', 32), 'hex')");
+    let keyed_sql = insert("'did:key:probe-'", "decode(repeat('ab', 32), 'hex')");
+
+    let mut conn = stamped_app_conn(&pool, minter).await;
+    let keyless = exec1(&mut conn, &keyless_sql, minter).await;
+    let namespaced = exec1(&mut conn, &namespaced_sql, minter).await;
+    let keyed = exec1(&mut conn, &keyed_sql, minter).await;
+    reset(conn).await;
+
+    for (what, r) in [("keyless", &keyless), ("namespaced", &namespaced)] {
+        assert_eq!(
+            code_of(r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "an app-minted {what} team group: {r:?}"
+        );
+    }
+    assert_eq!(
+        keyed.expect("POSITIVE CONTROL: a keyed team group is app-creatable"),
+        1
+    );
+    let minted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM groups WHERE created_by_agent_id = $1 AND kind = 'team'",
+    )
+    .bind(minter)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(minted, 1, "only the keyed control was created");
+
+    let first = create(&pool, name, admin)
+        .await
+        .expect("a keyed group of the same name does not hold the name");
+    let dup = create(&pool, "  synthetic squat TEAM", admin).await;
+    assert_eq!(code_of(&dup).as_deref(), Some(DUPLICATE_NAME), "{dup:?}");
+    assert!(
+        message_of(&dup).contains(&first.to_string()),
+        "GRP06 names the group that holds the name: {dup:?}"
+    );
+}
+
+/// The member verbs act only on ACTIVE, verb-made team groups. Every other
+/// group is refused with GRP05 by add, remove AND set-role, each with a live
+/// member row present so remove and set-role reach the guard, and nothing is
+/// written: a personal group (107's link path), the world and seed groups, a
+/// community group, a keyed team group, a keyless team group outside the
+/// verbs' `did:epigraph:group:` namespace, and a verb-made group that is
+/// suspended or deprovisioned. The positive control is the same three verbs on
+/// an active verb-made group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_member_verbs_refuse_every_group_they_do_not_manage(pool: PgPool) {
+    const NOT_MANAGED: &str = "GRP05";
     let admin = human(&pool, "kind-admin").await;
     let member = human(&pool, "kind-member").await;
+    let newcomer = human(&pool, "kind-newcomer").await;
     let personal: Uuid = sqlx::query_scalar(
         "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
     )
@@ -946,38 +1319,653 @@ async fn the_member_verbs_refuse_groups_that_are_not_keyless_team_groups(pool: P
     .fetch_one(&pool)
     .await
     .expect("personal group");
-    let world = fixture::world_group(&pool).await;
-    let keyed: Uuid = sqlx::query_scalar(
-        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
-         VALUES ('keyed probe', 'did:key:probe-' || gen_random_uuid()::text, \
-                 decode(repeat('ab', 32), 'hex'), 'team', $1) RETURNING id",
+    let raw_group = |did: &'static str, key: &'static str, kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(&format!(
+                "INSERT INTO groups (display_name, did_key, public_key, kind, \
+                                     created_by_agent_id) \
+                 VALUES ('{kind} probe', {did} || gen_random_uuid()::text, {key}, '{kind}', $1) \
+                 RETURNING id"
+            ))
+            .bind(admin)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{kind} probe group: {e}"))
+        }
+    };
+    let community = raw_group("'did:epigraph:community:'", "''::bytea", "community").await;
+    let keyed = raw_group(
+        "'did:key:probe-'",
+        "decode(repeat('ab', 32), 'hex')",
+        "team",
     )
-    .bind(admin)
-    .fetch_one(&pool)
-    .await
-    .expect("keyed team group");
-    sqlx::query(
-        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'admin')",
-    )
-    .bind(keyed)
-    .bind(admin)
-    .execute(&pool)
-    .await
-    .expect("keyed group admin row");
-
-    for (g, what) in [
-        (personal, "personal"),
-        (world, "world"),
-        (keyed, "keyed team"),
-    ] {
-        let r = add(&pool, g, member, "reader").await;
-        assert_eq!(code_of(&r).as_deref(), Some("GRP05"), "{what}: {r:?}");
-        assert_eq!(live_role(&pool, g, member).await, None, "{what}");
+    .await;
+    let keyless_outside = raw_group("'did:key:probe-'", "''::bytea", "team").await;
+    let mut parked = Vec::new();
+    for status in ["suspended", "deprovisioned"] {
+        let g = create(&pool, &format!("Synthetic Parked Team {status}"), admin)
+            .await
+            .expect("create");
+        sqlx::query("UPDATE groups SET status = $2 WHERE id = $1")
+            .bind(g)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("park the group");
+        parked.push((g, status));
     }
-    // POSITIVE CONTROL: a verb-created group admits the same member.
+
+    let mut refused = vec![
+        (personal, "personal"),
+        (fixture::world_group(&pool).await, "world"),
+        (fixture::seed_group(&pool).await, "seed"),
+        (community, "community"),
+        (keyed, "keyed team"),
+        (keyless_outside, "keyless team outside the verbs' namespace"),
+    ];
+    refused.extend(parked);
+    for (g, what) in &refused {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'reader')",
+        )
+        .bind(g)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: seed a live member row: {e}"));
+    }
+
+    let audit_before = group_audit_count(&pool).await;
+    for (g, what) in refused {
+        let r = add(&pool, g, newcomer, "reader").await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(NOT_MANAGED),
+            "{what}: add: {r:?}"
+        );
+        let r = remove(&pool, g, member).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(NOT_MANAGED),
+            "{what}: remove: {r:?}"
+        );
+        let r = set_role(&pool, g, member, "writer").await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(NOT_MANAGED),
+            "{what}: set-role: {r:?}"
+        );
+        assert_eq!(live_role(&pool, g, newcomer).await, None, "{what}");
+        assert_eq!(
+            live_role(&pool, g, member).await.as_deref(),
+            Some("reader"),
+            "{what}"
+        );
+    }
+    assert_eq!(group_audit_count(&pool).await, audit_before, "no audit row");
+
+    // POSITIVE CONTROL: an active verb-made group takes all three.
     let group = create(&pool, "Synthetic Kind Team", admin)
         .await
         .expect("create");
-    add(&pool, group, member, "reader").await.expect("add");
+    assert!(
+        add(&pool, group, member, "reader")
+            .await
+            .expect("add")
+            .applied
+    );
+    assert!(
+        set_role(&pool, group, member, "writer")
+            .await
+            .expect("set-role")
+            .applied
+    );
+    assert!(remove(&pool, group, member).await.expect("remove").applied);
+}
+
+/// `(readable, writable)`: whether `agent`'s `Viewer::resolve` carries `group`
+/// in its read set and in its write set.
+async fn resolves(pool: &PgPool, agent: Uuid, group: Uuid) -> (bool, bool) {
+    let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
+    (
+        viewer.group_bind().is_some_and(|g| g.contains(&group)),
+        viewer.writable_groups().contains(&group),
+    )
+}
+
+/// A fresh agent bound to `operator` by a migration-149 client ALLOWANCE (an
+/// active service client for the agent, allowed by the maintenance role), with
+/// no operator link. Returns `(agent, client)`.
+async fn allowance_bound(pool: &PgPool, operator: Uuid, label: &str) -> (Uuid, Uuid) {
+    let (agent, _) = fixture::seed_agent_with_group(pool, label).await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'team group allowance fixture', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("team-group-allowance-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    let mut c = maint(pool).await;
+    sqlx::query("SELECT allowed_now FROM public.epigraph_allow_author_binding_client($1, $2, $3)")
+        .bind(client)
+        .bind(operator)
+        .bind("team group verb test")
+        .fetch_one(&mut *c)
+        .await
+        .expect("allow the client for the operator");
+    reset(c).await;
+    (agent, client)
+}
+
+/// A membership in a verb-made group lasts only as long as the binding that
+/// admitted it. An agent bound to its operator by a 149 client allowance is
+/// refused (GRP03) until the operator writes the group, then admitted, and
+/// its viewer carries the group. Once the allowance is revoked the agent
+/// belongs to no live human: its viewer no longer carries the group (the row
+/// is still live; nothing else ended it), a promotion is refused with GRP04,
+/// and the operator can still clean the row up with `remove`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_membership_lapses_with_the_allowance_that_admitted_it(pool: PgPool) {
+    let owner = human(&pool, "lapse-owner").await;
+    let operator = human(&pool, "lapse-operator").await;
+    let (agent, client) = allowance_bound(&pool, operator, "lapse-service").await;
+    let group = create(&pool, "Synthetic Allowance Team", owner)
+        .await
+        .expect("create");
+
+    let r = add(&pool, group, agent, "reader").await;
+    assert_eq!(
+        code_of(&r).as_deref(),
+        Some(OPERATOR_SCOPE),
+        "an allowance-bound agent whose operator does not write the group: {r:?}"
+    );
+    add(&pool, group, operator, "writer")
+        .await
+        .expect("operator writer");
+    add(&pool, group, agent, "reader")
+        .await
+        .expect("POSITIVE CONTROL: admitted where its operator writes");
+    assert_eq!(resolves(&pool, agent, group).await, (true, false));
+
+    let mut c = maint(&pool).await;
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, $2)",
+    )
+    .bind(client)
+    .bind("team group verb test")
+    .fetch_one(&mut *c)
+    .await
+    .expect("revoke the allowance");
+    reset(c).await;
+    assert!(revoked, "PREMISE: the allowance was live");
+
+    assert_eq!(
+        resolves(&pool, agent, group).await,
+        (false, false),
+        "a member whose binding lapsed no longer reads the group"
+    );
+    assert_eq!(
+        live_role(&pool, group, agent).await.as_deref(),
+        Some("reader"),
+        "the row itself is untouched (the lapse is read, not written)"
+    );
+    let r = set_role(&pool, group, agent, "writer").await;
+    assert_eq!(code_of(&r).as_deref(), Some(NOT_BOUND), "promotion: {r:?}");
+    assert_eq!(
+        resolves(&pool, operator, group).await,
+        (true, true),
+        "the operator, still registered, is unaffected"
+    );
+    let gone = remove(&pool, group, agent)
+        .await
+        .expect("remove the lapsed row");
+    assert!(gone.applied, "{gone:?}");
+}
+
+/// When a human's REGISTRATION is revoked, the human and every agent it
+/// operates stop carrying a verb-made group in their viewers, while the
+/// human's personal group (107's path, not the verbs') still resolves. A
+/// further agent of that human is refused (GRP04), the human cannot be made
+/// an admin (GRP04), and the group's other admin is unaffected.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_membership_lapses_when_the_human_is_revoked(pool: PgPool) {
+    let owner = human(&pool, "revoked-owner").await;
+    let (operator, personal) = fixture::seed_human_operator(&pool, "revoked-operator").await;
+    let agent = operated(&pool, operator, "revoked-agent").await;
+    let later = operated(&pool, operator, "revoked-later").await;
+    let group = create(&pool, "Synthetic Revoked Team", owner)
+        .await
+        .expect("create");
+    add(&pool, group, operator, "writer")
+        .await
+        .expect("operator");
+    add(&pool, group, agent, "writer").await.expect("agent");
+    assert_eq!(resolves(&pool, operator, group).await, (true, true));
+    assert_eq!(resolves(&pool, agent, group).await, (true, true));
+
+    let mut c = maint(&pool).await;
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, $2)")
+            .bind(operator)
+            .bind("team group verb test")
+            .fetch_one(&mut *c)
+            .await
+            .expect("revoke the registration");
+    reset(c).await;
+    assert!(revoked, "PREMISE: the registration was live");
+
+    assert_eq!(
+        resolves(&pool, operator, group).await,
+        (false, false),
+        "a revoked human no longer reads or writes the group"
+    );
+    assert_eq!(
+        resolves(&pool, agent, group).await,
+        (false, false),
+        "nor does its agent"
+    );
+    assert!(
+        resolves(&pool, operator, personal).await.0,
+        "POSITIVE CONTROL: the lapse is scoped to verb-made groups"
+    );
+    assert_eq!(
+        resolves(&pool, owner, group).await,
+        (true, true),
+        "the registered admin is unaffected"
+    );
+    let r = add(&pool, group, later, "reader").await;
+    assert_eq!(code_of(&r).as_deref(), Some(NOT_BOUND), "{r:?}");
+    let r = set_role(&pool, group, operator, "admin").await;
+    assert_eq!(code_of(&r).as_deref(), Some(NOT_BOUND), "{r:?}");
+}
+
+/// A PROMOTION meets the operator-scope rule again: an operated agent added as
+/// a reader while its operator wrote the group cannot be promoted once the
+/// operator only reads it (a state the verbs never produce, set here out of
+/// band), and can once the operator writes again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promotion_meets_the_operator_scope_again(pool: PgPool) {
+    let owner = human(&pool, "promote-owner").await;
+    let operator = human(&pool, "promote-operator").await;
+    let agent = operated(&pool, operator, "promote-agent").await;
+    let group = create(&pool, "Synthetic Promotion Team", owner)
+        .await
+        .expect("create");
+    add(&pool, group, operator, "writer")
+        .await
+        .expect("operator");
+    add(&pool, group, agent, "reader").await.expect("agent");
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(operator)
+    .execute(&pool)
+    .await
+    .expect("narrow the operator out of band");
+
+    let r = set_role(&pool, group, agent, "writer").await;
+    assert_eq!(code_of(&r).as_deref(), Some(OPERATOR_SCOPE), "{r:?}");
+    assert_eq!(
+        live_role(&pool, group, agent).await.as_deref(),
+        Some("reader")
+    );
+
+    set_role(&pool, group, operator, "writer")
+        .await
+        .expect("the operator writes again");
+    set_role(&pool, group, agent, "writer")
+        .await
+        .expect("POSITIVE CONTROL: promoted where its operator writes");
+}
+
+/// "Another admin" means another LIVE REGISTERED HUMAN admin. With a second
+/// admin whose human client is suspended (so it is no longer a registered
+/// human operator, and its viewer no longer carries the group), the first
+/// admin is still the last one that counts: neither removable nor demotable.
+/// Once the second admin's client is active again, the first is removable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_live_human_admin_counts_as_another_admin(pool: PgPool) {
+    let first = human(&pool, "counted-first").await;
+    let second = human(&pool, "counted-second").await;
+    let group = create(&pool, "Synthetic Counted Team", first)
+        .await
+        .expect("create");
+    add(&pool, group, second, "admin")
+        .await
+        .expect("second admin");
+    let set_client = |status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE oauth_clients SET status = $2 \
+                  WHERE agent_id = $1 AND client_type = 'human'",
+            )
+            .bind(second)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("second admin's client -> {status}: {e}"));
+        }
+    };
+    set_client("suspended").await;
+
+    let r = remove(&pool, group, first).await;
+    assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "remove: {r:?}");
+    let r = set_role(&pool, group, first, "writer").await;
+    assert_eq!(code_of(&r).as_deref(), Some(LAST_ADMIN), "demote: {r:?}");
+    assert_eq!(
+        live_role(&pool, group, first).await.as_deref(),
+        Some("admin")
+    );
+
+    // POSITIVE CONTROL: the second admin is a registered human again.
+    set_client("active").await;
+    let ok = remove(&pool, group, first)
+        .await
+        .expect("removable beside a live human admin");
+    assert!(ok.applied, "{ok:?}");
+}
+
+/// Wait (bounded) until another backend running `fragment` is waiting on a
+/// lock, or `task` has already finished. True when a waiter was seen.
+async fn waits_on_a_lock(
+    pool: &PgPool,
+    fragment: &str,
+    task: &tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+) -> bool {
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                AND wait_event_type = 'Lock' AND query LIKE '%' || $1 || '%'",
+        )
+        .bind(fragment)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            return true;
+        }
+        if task.is_finished() {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Two concurrent removals of a group's two admins cannot both pass the
+/// last-admin rule. The first removal holds its transaction open; the second
+/// waits on the group row the first locked, and once the first commits, the
+/// second sees one admin left and is refused with GRP02. The group keeps an
+/// admin. (The test asserts the OUTCOME, not a timeout: the second removal
+/// also meets the link lock later on, so a lock wait alone would not show that
+/// the row lock is what serialises the decision.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_removals_of_two_admins_cannot_both_pass(pool: PgPool) {
+    let first = human(&pool, "race-first").await;
+    let second = human(&pool, "race-second").await;
+    let group = create(&pool, "Synthetic Race Team", first)
+        .await
+        .expect("create");
+    add(&pool, group, second, "admin")
+        .await
+        .expect("second admin");
+
+    let mut c1 = maint(&pool).await;
+    sqlx::query("BEGIN").execute(&mut *c1).await.expect("begin");
+    sqlx::query("SELECT * FROM public.epigraph_team_group_remove_member($1, $2, $3)")
+        .bind(group)
+        .bind(first)
+        .bind("race one")
+        .execute(&mut *c1)
+        .await
+        .expect("the first removal passes, uncommitted");
+
+    let racer = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut c2 = maint(&pool).await;
+            let r = sqlx::query(
+                "SELECT * FROM public.epigraph_team_group_remove_member($1, $2, 'race two')",
+            )
+            .bind(group)
+            .bind(second)
+            .execute(&mut *c2)
+            .await
+            .map(|_| ());
+            reset(c2).await;
+            r
+        })
+    };
+    let waited = waits_on_a_lock(&pool, "race two", &racer).await;
+    sqlx::query("COMMIT")
+        .execute(&mut *c1)
+        .await
+        .expect("commit");
+    reset(c1).await;
+    let second_outcome = racer.await.expect("join");
+
+    assert!(
+        waited,
+        "the second removal waited for the first: {second_outcome:?}"
+    );
+    assert_eq!(
+        code_of(&second_outcome).as_deref(),
+        Some(LAST_ADMIN),
+        "the second removal, decided after the first committed: {second_outcome:?}"
+    );
+    assert_eq!(live_role(&pool, group, first).await, None);
+    assert_eq!(
+        live_role(&pool, group, second).await.as_deref(),
+        Some("admin"),
+        "the group keeps an admin"
+    );
+}
+
+/// Two concurrent creations of the same name cannot both pass GRP06: the
+/// second waits on the first's name lock and, once the first commits, is
+/// refused. Exactly one group holds the name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_creations_of_one_name_cannot_both_pass(pool: PgPool) {
+    let admin = human(&pool, "race-creator").await;
+    let name = "Synthetic Racing Name";
+
+    let mut c1 = maint(&pool).await;
+    sqlx::query("BEGIN").execute(&mut *c1).await.expect("begin");
+    sqlx::query("SELECT public.epigraph_create_team_group($1, $2, 'race one')")
+        .bind(name)
+        .bind(admin)
+        .execute(&mut *c1)
+        .await
+        .expect("the first creation passes, uncommitted");
+
+    let racer = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut c2 = maint(&pool).await;
+            let r = sqlx::query("SELECT public.epigraph_create_team_group($1, $2, 'race two')")
+                .bind(name)
+                .bind(admin)
+                .execute(&mut *c2)
+                .await
+                .map(|_| ());
+            reset(c2).await;
+            r
+        })
+    };
+    let waited = waits_on_a_lock(&pool, "race two", &racer).await;
+    sqlx::query("COMMIT")
+        .execute(&mut *c1)
+        .await
+        .expect("commit");
+    reset(c1).await;
+    let second_outcome = racer.await.expect("join");
+
+    assert!(
+        waited,
+        "the second creation waited for the first: {second_outcome:?}"
+    );
+    assert_eq!(
+        code_of(&second_outcome).as_deref(),
+        Some(DUPLICATE_NAME),
+        "{second_outcome:?}"
+    );
+    let named: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM groups WHERE kind = 'team' AND display_name = $1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(named, 1, "one group holds the name");
+}
+
+/// A verb in flight does not block ordinary writes that merely NAME the group:
+/// while an uncommitted `add` holds the group row, a claim owned by the group
+/// is inserted (its foreign key takes a KEY SHARE lock on the same row). The
+/// verbs lock the row `FOR NO KEY UPDATE`, which still serialises them against
+/// each other (the two tests above) but not against foreign-key readers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_verb_in_flight_does_not_block_a_write_that_names_the_group(pool: PgPool) {
+    let admin = human(&pool, "inflight-admin").await;
+    let member = human(&pool, "inflight-member").await;
+    let group = create(&pool, "Synthetic In-flight Team", admin)
+        .await
+        .expect("create");
+
+    let mut c1 = maint(&pool).await;
+    sqlx::query("BEGIN").execute(&mut *c1).await.expect("begin");
+    sqlx::query("SELECT * FROM public.epigraph_team_group_add_member($1, $2, 'reader', 'held')")
+        .bind(group)
+        .bind(member)
+        .execute(&mut *c1)
+        .await
+        .expect("an add holds the group row, uncommitted");
+
+    let mut c2 = pool.acquire().await.expect("acquire");
+    sqlx::query("SET lock_timeout = '2s'")
+        .execute(&mut *c2)
+        .await
+        .expect("lock timeout");
+    let write = sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES (gen_random_uuid(), 'in-flight probe', \
+                 decode(md5('in-flight probe') || md5('in-flight probe'), 'hex'), 0.8, $1, \
+                 true, 'group', $2)",
+    )
+    .bind(admin)
+    .bind(group)
+    .execute(&mut *c2)
+    .await;
+    sqlx::query("RESET lock_timeout")
+        .execute(&mut *c2)
+        .await
+        .expect("reset lock timeout");
+    sqlx::query("COMMIT")
+        .execute(&mut *c1)
+        .await
+        .expect("commit");
+    reset(c1).await;
+
+    assert!(
+        write.is_ok(),
+        "a claim naming the group is not blocked by a verb in flight: {write:?}"
+    );
+    assert_eq!(
+        live_role(&pool, group, member).await.as_deref(),
+        Some("reader"),
+        "and the verb committed"
+    );
+}
+
+/// The in-body gate, on its own: with EXECUTE granted to the application role
+/// (a later migration that grants too widely, simulated inside a transaction
+/// that is rolled back), every verb still refuses a forged application session
+/// with 42501, and the refusal is the body's own ("only a maintenance
+/// session"), not the ACL's. The ACL refusal is pinned separately, by its own
+/// message, in the forged-session test above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_body_refuses_a_non_maintenance_session_even_with_execute(pool: PgPool) {
+    let admin = human(&pool, "body-admin").await;
+    let other = human(&pool, "body-other").await;
+    let group = create(&pool, "Synthetic Body Team", admin)
+        .await
+        .expect("create");
+    let audit_before = group_audit_count(&pool).await;
+    let calls: [(&str, &str, &str); 4] = [
+        (
+            "create",
+            "public.epigraph_create_team_group(text, uuid, text)",
+            "SELECT public.epigraph_create_team_group('body probe ' || $1::text, $2, 'forged ' || $3::text)",
+        ),
+        (
+            "add",
+            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+            "SELECT * FROM public.epigraph_team_group_add_member($1, $2, 'writer', 'forged ' || $3::text)",
+        ),
+        (
+            "set-role",
+            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
+            "SELECT * FROM public.epigraph_team_group_set_member_role($1, $3, 'reader', 'forged ' || $2::text)",
+        ),
+        (
+            "remove",
+            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+            "SELECT * FROM public.epigraph_team_group_remove_member($1, $3, 'forged ' || $2::text)",
+        ),
+    ];
+    for (what, signature, call) in calls {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION {signature} TO epigraph_app"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("grant too widely, inside the transaction");
+        sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+            .execute(&mut *tx)
+            .await
+            .expect("downgrade to the application role");
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, true), \
+                    set_config('epigraph.group_ids', $2, true), \
+                    set_config('epigraph.writable_group_ids', $2, true)",
+        )
+        .bind(admin.to_string())
+        .bind(group.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("forge the session settings");
+        let r = sqlx::query(call)
+            .bind(group)
+            .bind(other)
+            .bind(admin)
+            .execute(&mut *tx)
+            .await;
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{what}: {r:?}"
+        );
+        assert!(
+            message_of(&r).contains("only a maintenance session"),
+            "{what}: refused by the body's own gate, not the ACL: {r:?}"
+        );
+    }
+    assert_eq!(group_audit_count(&pool).await, audit_before, "no audit row");
+    assert_eq!(live_role(&pool, group, other).await, None);
+    assert_eq!(
+        live_role(&pool, group, admin).await.as_deref(),
+        Some("admin")
+    );
 }
