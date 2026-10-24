@@ -128,7 +128,8 @@
 -- Every applied act writes one `security_events` row, attributed to the
 -- member (or the admin, for a creation): `group.team_created`,
 -- `group.member_added`, `group.member_removed`, `group.member_role_set`, with
--- the group, member, roles, epoch, reason and `session_user` in `details`. A
+-- the group, member, roles, epoch, reason, `session_user` and the CLI's
+-- process context (`actor`: tool, command, version, uids) in `details`. A
 -- no-op (re-adding a member at its current role, removing a non-member,
 -- setting the role it already has) writes nothing. The `group.` event family
 -- is reserved (a RESTRICTIVE insert policy in the 123 / 148 shape), so the
@@ -169,6 +170,7 @@
 -- DROP TRIGGER IF EXISTS groups_team_verbs_only_insert ON public.groups;
 -- DROP TRIGGER IF EXISTS group_memberships_team_roster_verbs_only ON public.group_memberships;
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_row_verbs_only();
+-- DROP FUNCTION IF EXISTS public.epigraph_team_group_actor();
 -- DROP FUNCTION IF EXISTS public.epigraph_team_group_roster_verbs_only();
 -- and re-state 077's `epigraph_live_memberships` body (without the verb-made
 -- group conjunct; owner and grants unchanged).
@@ -298,6 +300,34 @@ SET search_path = public, pg_temp AS $$
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_live_memberships(uuid) FROM PUBLIC;
 
+-- Section 4: WHO acted. `session_user` is the shared maintenance login, which
+-- names no person. The operator CLI states its process (tool, command,
+-- version, real and login uid and their names, the environment's advisory
+-- user) in a transaction-local setting before calling a verb, and every audit
+-- row carries it under `actor`. It is the caller's statement, not proof, but
+-- only a maintenance session reaches the verbs. Absent (a direct SQL call) it
+-- is JSON null; a value that is not a JSON object is refused rather than
+-- recorded as something it is not. Invoker: it reads only the caller's own
+-- setting.
+CREATE OR REPLACE FUNCTION public.epigraph_team_group_actor()
+RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_raw   text := NULLIF(current_setting('epigraph.operator_actor', true), '');
+    v_actor jsonb;
+BEGIN
+    IF v_raw IS NULL THEN
+        RETURN NULL;
+    END IF;
+    v_actor := v_raw::jsonb;
+    IF jsonb_typeof(v_actor) <> 'object' THEN
+        RAISE EXCEPTION 'epigraph.operator_actor must be a JSON object' USING ERRCODE = '22023';
+    END IF;
+    RETURN v_actor;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_actor() FROM PUBLIC;
+
 -- -------------------------------------------------------------------
 -- create
 -- -------------------------------------------------------------------
@@ -358,7 +388,8 @@ BEGIN
     VALUES ('group.team_created', p_admin, true,
             jsonb_build_object('group_id', v_group, 'display_name', v_name, 'kind', 'team',
                                'admin', p_admin, 'reason', p_reason,
-                               'session_user', session_user::text));
+                               'session_user', session_user::text,
+                               'actor', public.epigraph_team_group_actor()));
     RETURN v_group;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) FROM PUBLIC;
@@ -470,7 +501,8 @@ BEGIN
             jsonb_build_object('group_id', p_group, 'member', p_agent, 'role', p_role,
                                'epoch', v_epoch, 'membership_id', v_id,
                                'operator', CASE WHEN v_human <> p_agent THEN v_human END,
-                               'reason', p_reason, 'session_user', session_user::text));
+                               'reason', p_reason, 'session_user', session_user::text,
+                               'actor', public.epigraph_team_group_actor()));
     RETURN QUERY SELECT v_id, true;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_add_member(uuid, uuid, text, text)
@@ -554,7 +586,8 @@ BEGIN
     VALUES ('group.member_removed', p_agent, true,
             jsonb_build_object('group_id', p_group, 'member', p_agent,
                                'prior_role', v_live_role, 'membership_id', v_live_id,
-                               'reason', p_reason, 'session_user', session_user::text));
+                               'reason', p_reason, 'session_user', session_user::text,
+                               'actor', public.epigraph_team_group_actor()));
     RETURN QUERY SELECT v_live_id, true, v_live_role;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_remove_member(uuid, uuid, text)
@@ -683,7 +716,8 @@ BEGIN
             jsonb_build_object('group_id', p_group, 'member', p_agent,
                                'prior_role', v_live_role, 'role', p_role,
                                'membership_id', v_live_id, 'reason', p_reason,
-                               'session_user', session_user::text));
+                               'session_user', session_user::text,
+                               'actor', public.epigraph_team_group_actor()));
     RETURN QUERY SELECT v_live_id, true, v_live_role;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_set_member_role(uuid, uuid, text, text)
@@ -705,6 +739,10 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_live_memberships(uuid) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_team_group_actor() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_team_group_actor() '
+                'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_create_team_group(text, uuid, text) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '

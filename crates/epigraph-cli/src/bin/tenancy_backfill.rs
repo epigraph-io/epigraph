@@ -3099,6 +3099,10 @@ mod definer_register_tests {
         // registration. It runs as whichever maintenance-owned definer calls it
         // (or as a maintenance session); EXECUTE is the maintenance role's alone.
         "epigraph_link_operator_body",
+        // 164: the team-group verbs' audit `actor`, read from the caller's
+        // own transaction-local setting; EXECUTE is the maintenance role's
+        // alone.
+        "epigraph_team_group_actor",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

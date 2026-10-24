@@ -74,6 +74,50 @@ pub struct MemberAct {
     pub prior_role: Option<String>,
 }
 
+/// The transaction-local setting the definers read into each audit row's
+/// `actor` (migration 164, `epigraph_team_group_actor`).
+pub const ACTOR_SETTING: &str = "epigraph.operator_actor";
+
+/// What this process says about itself in the audit row: the tool, the
+/// command, its version, and [`super::client_scope::Operator`]'s identity of
+/// the process (the environment's advisory user, the real and login uids from
+/// the kernel, and their passwd names). `session_user` is recorded by the
+/// definer itself.
+#[must_use]
+pub fn actor_context(command: &str, session_user: String) -> serde_json::Value {
+    let op = super::client_scope::Operator::of_this_process(session_user);
+    serde_json::json!({
+        "tool": "epigraph-operator",
+        "command": command,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "os_user": op.os_user,
+        "os_user_source": "environment (SUDO_USER, USER, LOGNAME): advisory, settable by the \
+                           caller",
+        "process_uid": op.process_uid,
+        "process_user": op.process_user,
+        "login_uid": op.login_uid,
+        "login_user": op.login_user,
+    })
+}
+
+/// Begin the one transaction a command runs in, with [`ACTOR_SETTING`] set
+/// for it (transaction-local, so it ends with the transaction).
+async fn begin_audited<'c>(
+    conn: &'c mut PgConnection,
+    command: &str,
+) -> anyhow::Result<sqlx::Transaction<'c, sqlx::Postgres>> {
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    let session_user: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config($1, $2, true)")
+        .bind(ACTOR_SETTING)
+        .bind(actor_context(command, session_user).to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 async fn finish(tx: sqlx::Transaction<'_, sqlx::Postgres>, apply: bool) -> anyhow::Result<()> {
     if apply {
         tx.commit().await?;
@@ -98,7 +142,7 @@ pub async fn create(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<Uuid> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = begin_audited(&mut *conn, "create-group").await?;
     let group: Uuid = sqlx::query_scalar("SELECT public.epigraph_create_team_group($1, $2, $3)")
         .bind(name)
         .bind(admin)
@@ -124,7 +168,7 @@ pub async fn add(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<MemberAct> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = begin_audited(&mut *conn, "group-member add").await?;
     let (membership, applied): (Option<Uuid>, bool) = sqlx::query_as(
         "SELECT out_membership_id, out_applied \
            FROM public.epigraph_team_group_add_member($1, $2, $3, $4)",
@@ -155,7 +199,7 @@ pub async fn remove(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<MemberAct> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = begin_audited(&mut *conn, "group-member remove").await?;
     let (membership, applied, prior_role): (Option<Uuid>, bool, Option<String>) = sqlx::query_as(
         "SELECT out_membership_id, out_applied, out_prior_role \
            FROM public.epigraph_team_group_remove_member($1, $2, $3)",
@@ -187,7 +231,7 @@ pub async fn set_role(
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<MemberAct> {
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut tx = begin_audited(&mut *conn, "group-member set-role").await?;
     let (membership, applied, prior_role): (Option<Uuid>, bool, Option<String>) = sqlx::query_as(
         "SELECT out_membership_id, out_applied, out_prior_role \
            FROM public.epigraph_team_group_set_member_role($1, $2, $3, $4)",
@@ -228,6 +272,19 @@ mod tests {
             let e = validate_role(bad).expect_err(bad).to_string();
             assert!(e.contains("reader, writer, admin"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn the_actor_context_names_the_tool_command_version_and_process() {
+        let a = actor_context("group-member add", "maint_login".to_string());
+        assert!(a.is_object(), "{a}");
+        assert_eq!(a["tool"], "epigraph-operator");
+        assert_eq!(a["command"], "group-member add");
+        assert_eq!(a["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            a["process_uid"].as_u64(),
+            super::super::client_scope::Operator::process_uid().map(u64::from)
+        );
     }
 
     #[test]

@@ -642,6 +642,10 @@ async fn create_add_set_role_and_remove_work_on_maintenance_and_each_is_audited(
         assert_eq!(d["member"], member.to_string(), "{kind}: {d}");
         assert_eq!(d["reason"], "team group verb test", "{kind}: {d}");
         assert!(d["session_user"].is_string(), "{kind}: {d}");
+        assert!(
+            d["actor"].is_null(),
+            "{kind}: a direct SQL call states no process context: {d}"
+        );
     }
     assert_eq!(events[1].2["role"], "writer");
     assert_eq!(events[2].2["prior_role"], "writer");
