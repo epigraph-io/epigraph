@@ -391,6 +391,20 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
         diamond_in_force,
         "the collision-retracted edge is back in force"
     );
+    // The mark retracted that copy instead of moving it; back in force, it is
+    // re-minted on the duplicate too, on the same login.
+    let diamond_factors: Vec<Vec<Uuid>> = sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_diamond)
+    .fetch_all(&pool)
+    .await
+    .expect("factors");
+    assert_eq!(
+        diamond_factors,
+        vec![vec![third.min(dup), third.max(dup)]],
+        "the un-retracted copy's factor, re-minted as epigraph_maintenance"
+    );
 }
 
 /// `properties.dedup` marks a dedup act's identity edge, which the un-mark and
