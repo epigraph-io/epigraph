@@ -41,6 +41,8 @@ Skips:
   `duplicates_skipped_already_superseded` (the endpoint refuses that case too),
   unless it is already marked onto this cluster's canonical (an earlier run),
   which is passed over silently.
+- A request that gets no HTTP answer (refused, reset, timed out) counts as a
+  refusal for that duplicate; the cluster's other marks still count.
 - A member labelled `deduped` (a pre-2026-10 mark by this script) is treated
   the same way.
 """
@@ -145,7 +147,12 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
 def post_dedup(
     api_base: str, token: str, dup_id: str, canonical_id: str, timeout: float = 60.0
 ) -> tuple[int, str]:
-    """POST /api/v1/claims/{dup}/dedup. Returns (HTTP status, response body)."""
+    """POST /api/v1/claims/{dup}/dedup. Returns (HTTP status, response body).
+
+    A request that gets no HTTP answer (connection refused or reset, timeout)
+    returns status 0 and the error text, so the caller counts it as a refusal
+    for that duplicate and keeps the marks already made in the cluster.
+    """
     req = urllib.request.Request(
         f"{api_base.rstrip('/')}/api/v1/claims/{dup_id}/dedup",
         data=json.dumps(
@@ -162,6 +169,10 @@ def post_dedup(
             return resp.status, resp.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        # URLError covers refused/unresolvable; OSError covers a reset or a
+        # timeout mid-response (http.client raises those unwrapped).
+        return 0, f"no HTTP response: {e}"
 
 
 def merge_cluster(
@@ -209,7 +220,8 @@ def merge_cluster(
             stats.duplicates_marked += 1
         else:
             stats.duplicates_refused += 1
-            stats.refusals.append(f"{dup_id} -> {canonical_id}: HTTP {status} {body[:300]}")
+            what = f"HTTP {status}" if status else "no response"
+            stats.refusals.append(f"{dup_id} -> {canonical_id}: {what} {body[:300]}")
     return stats
 
 

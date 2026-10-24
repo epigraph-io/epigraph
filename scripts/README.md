@@ -53,7 +53,8 @@ edges is a separate operator task.
 start without one; `EPIGRAPH_API_BASE` (or `--api-base`) names the API. The
 endpoint needs the `claims:write` scope and write authority over both claims,
 so a cross-agent cluster needs a token that also carries `claims:admin`. A
-refused mark is reported with its HTTP status and the run exits 1.
+refused mark, or a request that got no HTTP answer, is reported with its
+status and the run exits 1; the cluster's other marks still count.
 
 A member that is not current, or already carries a `supersedes` pointer, is
 never the canonical; as a duplicate it is skipped and reported as

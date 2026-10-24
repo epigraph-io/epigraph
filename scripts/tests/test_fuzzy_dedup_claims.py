@@ -42,7 +42,8 @@ WRITE_SQL = re.compile(r"^\s*(UPDATE|DELETE|INSERT|ALTER|TRUNCATE)\b", re.I | re
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
     """Records each request; answers POST /api/v1/claims/<id>/dedup with the
-    status configured for that id (default 200)."""
+    status configured for that id (default 200), or hangs up without an answer
+    when it is configured as "drop"."""
 
     requests: list = []
     statuses: dict = {}
@@ -61,6 +62,10 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         )
         m = re.fullmatch(r"/api/v1/claims/([0-9a-f-]{36})/dedup", self.path)
         status = type(self).statuses.get(m.group(1), 200) if m else 404
+        if status == "drop":
+            # Hang up without an HTTP answer (a reset / dead upstream).
+            self.close_connection = True
+            return
         if status == 200:
             payload = {"duplicate_id": m.group(1), "canonical_id": CANON, "mode": "dedup"}
         else:
@@ -305,6 +310,36 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
         self.assertRegex(out, r"duplicates_marked:\s+1\b")
         self.assertRegex(out, r"duplicates_skipped_already_superseded:\s+1\b")
         self.assertEqual(rc, 0, out)
+
+    def test_a_dropped_connection_is_a_refusal_and_keeps_the_clusters_other_marks(self):
+        # DUP_A is marked (200), then the upstream hangs up on DUP_B. DUP_A's
+        # mark is real and must stay counted; DUP_B is a refusal, not a failed
+        # cluster that discards the count.
+        _Recorder.statuses = {DUP_B: "drop"}
+        rc, out = self._run(
+            ["--execute"], {"EPIGRAPH_TOKEN": "tok-123", "EPIGRAPH_API_BASE": self.base}
+        )
+        self.assertEqual(len(self._posts()), 2, out)
+        self.assertRegex(out, r"duplicates_marked:\s+1\b")
+        self.assertRegex(out, r"duplicates_refused:\s+1\b")
+        self.assertRegex(out, r"clusters_failed:\s+0\b")
+        self.assertIn(DUP_B, out, "the unanswered duplicate is named")
+        self.assertEqual(rc, 1, out)
+
+    def test_an_unreachable_api_refuses_each_duplicate_and_fails_the_run(self):
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            closed = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        rc, out = self._run(
+            ["--execute"], {"EPIGRAPH_TOKEN": "tok-123", "EPIGRAPH_API_BASE": closed}
+        )
+        self.assertEqual(_Recorder.requests, [])
+        self.assertRegex(out, r"duplicates_marked:\s+0\b")
+        self.assertRegex(out, r"duplicates_refused:\s+2\b")
+        self.assertRegex(out, r"clusters_failed:\s+0\b")
+        self.assertEqual(rc, 1, out)
 
 
 if __name__ == "__main__":
