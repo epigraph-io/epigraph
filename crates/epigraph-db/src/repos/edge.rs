@@ -1377,9 +1377,12 @@ impl EdgeRepository {
     /// `limit = None` is `LIMIT NULL`, i.e. no cap.
     ///
     /// Filtered by the co-owner-aware edge predicate
-    /// (`Viewer::edge_predicate_fragment`), so a derived result can name only
-    /// endpoints of edges the viewer could already list through
-    /// `GET /api/v1/edges`.
+    /// (`Viewer::edge_predicate_fragment`) AND by the claim predicate on both
+    /// endpoints, so a derived result can name only claims the viewer can
+    /// read. The edge predicate alone is not enough: it trusts the edge's own
+    /// stamp, and an edge stamped wider than one of its endpoints (a legacy
+    /// row, a stamp forced past migration 070's trigger) would otherwise carry
+    /// a hidden claim's id into the analysis (backlog 2e44a404).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -1398,20 +1401,24 @@ impl EdgeRepository {
             Some(_) => viewer.splice(
                 "SELECT e.source_id, e.target_id, e.relationship, e.properties \
                    FROM edges e \
+                   JOIN claims cs ON cs.id = e.source_id \
+                   JOIN claims ct ON ct.id = e.target_id \
                   WHERE e.source_type = 'claim' \
                     AND e.target_type = 'claim' \
                     AND e.source_id = ANY($1) \
                     AND e.target_id = ANY($1) \
-                    /* {EDGE_VISIBILITY:e} */ \
+                    /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:cs} */ /* {VISIBILITY:ct} */ \
                   LIMIT $2",
                 3,
             ),
             None => viewer.splice(
                 "SELECT e.source_id, e.target_id, e.relationship, e.properties \
                    FROM edges e \
+                   JOIN claims cs ON cs.id = e.source_id \
+                   JOIN claims ct ON ct.id = e.target_id \
                   WHERE e.source_type = 'claim' \
                     AND e.target_type = 'claim' \
-                    /* {EDGE_VISIBILITY:e} */ \
+                    /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:cs} */ /* {VISIBILITY:ct} */ \
                   LIMIT $1",
                 2,
             ),

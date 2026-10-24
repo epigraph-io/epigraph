@@ -413,9 +413,10 @@ pub async fn analyze(
 /// claim-to-claim edge, capped at 10 000 rows to prevent OOM on large graphs.
 ///
 /// `conn` is the caller's viewer-stamped connection (`AppState::read_as`) and
-/// the statement carries the edge-visibility predicate, so the row-level
-/// policies and the in-query predicate agree about which edges the caller may
-/// see.
+/// the statement carries the edge-visibility predicate and the claim predicate
+/// on both endpoints, so the row-level policies and the in-query predicate
+/// agree about which edges the caller may see, and no edge brings in an
+/// endpoint claim the caller cannot read.
 ///
 /// The edge `strength` field is stored inside the `properties` JSONB column
 /// (key `"strength"`).  If absent or non-numeric the edge defaults to 0.5.
