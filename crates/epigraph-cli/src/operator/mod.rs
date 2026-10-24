@@ -138,6 +138,7 @@ pub mod confirmations;
 pub mod custodian;
 pub mod delete_frames;
 pub mod elevation;
+pub mod group_role;
 pub mod hide;
 pub mod human;
 pub mod legacy;
