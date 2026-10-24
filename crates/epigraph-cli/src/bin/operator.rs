@@ -75,6 +75,12 @@
 //!     epigraph-operator delete-frames --ids-file frames.txt [--companion-claims-file claims.txt] \
 //!         --reason TEXT [--apply --confirm-delete N]
 //!     epigraph-operator create-group --kind team --name NAME --admin <uuid> --reason TEXT [--apply]
+//!     epigraph-operator define-group-role --key role:K --description TEXT --group <uuid> \
+//!         --member-role reader|writer [--include-agents] --reason TEXT [--apply]
+//!     epigraph-operator bind-group-role --role role:K --group <uuid> --member-role reader|writer \
+//!         [--include-agents] --reason TEXT [--apply]
+//!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
+//!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
 //!         --reason TEXT [--apply]
 //!     epigraph-operator group-member set-role --group <uuid> --agent <uuid> \
@@ -84,8 +90,8 @@
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    delete_frames, elevation, hide, human, legacy, link, passkey, reown, reown_linked, restrict,
-    reverse, system_agent, team_group,
+    delete_frames, elevation, group_role, hide, human, legacy, link, passkey, reown, reown_linked,
+    restrict, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -108,7 +114,8 @@ enum Command {
     /// explicit window. Agents never hold a role (CUS01); once a custodian
     /// exists every grant names a live custodian as --granted-by (CUS03).
     GrantRole {
-        /// `role:platform-custodian` or `role:auditor`.
+        /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
+        /// `define-group-role` added (migration 165).
         #[arg(long)]
         role: String,
         /// The human's own agent id (a registered human operator).
@@ -312,6 +319,83 @@ enum Command {
         /// Commit. Without it, the group, its admin row and its audit row roll back.
         #[arg(long)]
         apply: bool,
+    },
+    /// Define a NON-ELEVATING catalog role and bind it to a group (migration
+    /// 165): every registered human holding a live assignment of the role
+    /// (`grant-role`) is then a member of the group, and with
+    /// --include-agents every agent registered to such a human. Computed, never
+    /// written: it lapses at the assignment's end. Audited.
+    DefineGroupRole {
+        /// The new role key, `role:<lowercase-key>`; refused if the catalog
+        /// already holds it (bind it with bind-group-role instead).
+        #[arg(long)]
+        key: String,
+        /// The catalog row's description.
+        #[arg(long)]
+        description: String,
+        /// The group whose membership follows the role (not personal, world or seed).
+        #[arg(long)]
+        group: Uuid,
+        /// `reader` or `writer` (a role never confers admin).
+        #[arg(long)]
+        member_role: String,
+        /// Also make every agent registered to a holder (an acting live link
+        /// or a live client allowance) a member.
+        #[arg(long)]
+        include_agents: bool,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the role, its binding and the audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Bind an EXISTING non-elevating catalog role to a group (migration 165).
+    /// A role that elevates or reads the audit trail is refused (GRB01).
+    BindGroupRole {
+        /// The catalog role key.
+        #[arg(long)]
+        role: String,
+        /// The group whose membership follows the role.
+        #[arg(long)]
+        group: Uuid,
+        /// `reader` or `writer`.
+        #[arg(long)]
+        member_role: String,
+        /// Also make every agent registered to a holder a member.
+        #[arg(long)]
+        include_agents: bool,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the binding and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End a role binding now (migration 165): its members lapse at their
+    /// next resolution. Final; a new binding is a new row. Audited.
+    EndGroupRoleBinding {
+        /// The binding id (as define-group-role / bind-group-role printed it).
+        #[arg(long)]
+        binding: Uuid,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the end and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Who holds a group through its role bindings at an instant (migration
+    /// 165): each role holder and each agent registered to one. Read-only.
+    GroupRoster {
+        /// The group.
+        #[arg(long)]
+        group: Uuid,
+        /// The instant (RFC 3339; default now). The binding and the role
+        /// window are read at this instant; links, allowances and
+        /// registrations as they are now.
+        #[arg(long)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Change a keyless team group's roster (migration 164): add, remove (a
     /// revoke; the row is kept) or set a member's role. Each act audited.
@@ -900,6 +984,31 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             team_group::validate_text("--reason", &target.reason)?;
         }
+        Command::DefineGroupRole {
+            key,
+            description,
+            member_role,
+            reason,
+            ..
+        } => {
+            group_role::validate_key("--key", key)?;
+            group_role::validate_member_role(member_role)?;
+            team_group::validate_text("--description", description)?;
+            team_group::validate_text("--reason", reason)?;
+        }
+        Command::BindGroupRole {
+            role,
+            member_role,
+            reason,
+            ..
+        } => {
+            group_role::validate_key("--role", role)?;
+            group_role::validate_member_role(member_role)?;
+            team_group::validate_text("--reason", reason)?;
+        }
+        Command::EndGroupRoleBinding { reason, .. } => {
+            team_group::validate_text("--reason", reason)?;
+        }
         _ => {}
     }
     let db = operator::connect().await?;
@@ -1244,6 +1353,105 @@ async fn main_inner() -> anyhow::Result<i32> {
                      (the id above is not kept)."
                 );
             }
+            Ok(0)
+        }
+        Command::DefineGroupRole {
+            key,
+            description,
+            group,
+            member_role,
+            include_agents,
+            reason,
+            apply,
+        } => {
+            let binding = group_role::define(
+                &mut conn,
+                &key,
+                &description,
+                group,
+                &member_role,
+                include_agents,
+                &reason,
+                apply,
+            )
+            .await?;
+            println!(
+                "{}DEFINED\trole={key}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            println!(
+                "{}BOUND\tbinding={binding}\trole={key}\tgroup={group}\tmember_role={member_role}\t\
+                 include_agents={include_agents}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            if !apply {
+                println!(
+                    "DRY RUN: the role, its graph node, the binding and its audit row were rolled \
+                     back (the id above is not kept)."
+                );
+            }
+            Ok(0)
+        }
+        Command::BindGroupRole {
+            role,
+            group,
+            member_role,
+            include_agents,
+            reason,
+            apply,
+        } => {
+            let binding = group_role::bind(
+                &mut conn,
+                &role,
+                group,
+                &member_role,
+                include_agents,
+                &reason,
+                apply,
+            )
+            .await?;
+            println!(
+                "{}BOUND\tbinding={binding}\trole={role}\tgroup={group}\tmember_role={member_role}\t\
+                 include_agents={include_agents}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            if !apply {
+                println!("DRY RUN: the binding and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::EndGroupRoleBinding {
+            binding,
+            reason,
+            apply,
+        } => {
+            let ended = group_role::end(&mut conn, binding, &reason, apply).await?;
+            if ended {
+                println!(
+                    "{}ENDED\tbinding={binding}",
+                    if apply { "" } else { "WOULD BE " }
+                );
+                if !apply {
+                    println!("DRY RUN: the end and its audit row were rolled back.");
+                }
+            } else {
+                println!("ALREADY-ENDED\tbinding={binding}\t(or no such binding; nothing changed)");
+            }
+            Ok(0)
+        }
+        Command::GroupRoster { group, at } => {
+            let rows = group_role::roster(&mut conn, group, at).await?;
+            for row in &rows {
+                println!(
+                    "MEMBER\tagent={}\trole={}\tholder={}",
+                    row.agent, row.role, row.holder
+                );
+            }
+            println!(
+                "members={}\tgroup={group}\tat={}",
+                rows.len(),
+                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339())
+            );
             Ok(0)
         }
         Command::GroupMember { action } => {

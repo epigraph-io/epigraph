@@ -1,6 +1,7 @@
 //! `grant-role` / `end-role-assignment` / `list-role-assignments`: the
-//! platform roles of migration 123 (`role:platform-custodian`,
-//! `role:auditor`), held by registered humans through timestamped
+//! platform roles of migration 123's catalog (`role:platform-custodian`,
+//! `role:auditor`, and any non-elevating role migration 165's
+//! `define-group-role` adds), held by registered humans through timestamped
 //! assignments.
 //!
 //! Every write goes through 123's maintenance-only definers
@@ -51,8 +52,30 @@ use serde_json::json;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-/// The catalog roles a grant may name (migration 123's seed).
-pub const ROLES: &[&str] = &["role:platform-custodian", "role:auditor"];
+/// The shape of a catalog key (123's `platform_roles_key_shape`). Which keys
+/// EXIST is the catalog's answer, read by [`catalog_roles`] on the connection:
+/// 123 seeds two, and migration 165's `define-group-role` adds more at runtime.
+#[must_use]
+pub fn is_role_key(role: &str) -> bool {
+    let Some(rest) = role.strip_prefix("role:") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Every key in the role catalog, sorted.
+///
+/// # Errors
+/// The read failed.
+pub async fn catalog_roles(conn: &mut PgConnection) -> anyhow::Result<Vec<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT key FROM public.platform_roles ORDER BY key")
+            .fetch_all(&mut *conn)
+            .await?,
+    )
+}
 
 /// The validated window of a grant: `valid_to` `None` is open-ended, and
 /// only an explicit `--open-ended` produces it.
@@ -63,19 +86,21 @@ pub struct Window {
 }
 
 impl Window {
-    /// Exactly one of `valid_to` / `open_ended`, and a role from [`ROLES`].
+    /// Exactly one of `valid_to` / `open_ended`, and a role key of the
+    /// catalog's shape (whether the catalog holds it is [`grant`]'s check, on
+    /// the connection).
     ///
     /// # Errors
     /// Neither or both window flags; a `valid_to` not after `valid_from` (or
-    /// not in the future); an unknown role.
+    /// not in the future); a role that is not a `role:<key>`.
     pub fn from_flags(
         role: &str,
         valid_from: Option<DateTime<Utc>>,
         valid_to: Option<DateTime<Utc>>,
         open_ended: bool,
     ) -> anyhow::Result<Self> {
-        if !ROLES.contains(&role) {
-            anyhow::bail!("--role {role} is not a platform role; one of {ROLES:?}");
+        if !is_role_key(role) {
+            anyhow::bail!("--role {role} is not a platform role key (role:<lowercase-key>)");
         }
         match (valid_to, open_ended) {
             (None, false) => anyhow::bail!(
@@ -137,8 +162,9 @@ pub fn end_act_args(assignment: Uuid, reason: &str) -> serde_json::Value {
 /// which is then required). Returns the assignment as written.
 ///
 /// # Errors
-/// The table's guards refused it (CUS01 a holder that is not a registered
-/// human, CUS02 a back-dated start, CUS03 the grantor rule, ELV10 a grantor
+/// The role is not in the catalog; the table's guards refused it (CUS01 a
+/// holder that is not a registered human, CUS02 a back-dated start, CUS03 the
+/// grantor rule, ELV10 a grantor
 /// holding a passkey with no act, ELV08 / ELV09 an act that does not
 /// authorize this grant), or a statement failed.
 #[allow(clippy::too_many_arguments)]
@@ -153,6 +179,10 @@ pub async fn grant(
     apply: bool,
 ) -> anyhow::Result<RoleAssignmentRow> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let catalog = catalog_roles(&mut tx).await?;
+    if !catalog.iter().any(|k| k == role) {
+        anyhow::bail!("--role {role} is not a platform role; the catalog holds {catalog:?}");
+    }
     let id = match act {
         None => {
             RoleAssignmentRepository::grant(
