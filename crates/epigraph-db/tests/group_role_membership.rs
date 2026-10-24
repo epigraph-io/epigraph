@@ -1718,10 +1718,26 @@ async fn a_human_only_binding_does_not_reach_the_agents(pool: PgPool) {
 /// the human and its agent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_reader_binding_reads_and_never_writes(pool: PgPool) {
-    let (h, _) = human(&pool, "reader-h").await;
+    let (h, personal) = human(&pool, "reader-h").await;
     let a = operated(&pool, h, "reader-a").await;
     let (group, _) = bound_group(&pool, "Synthetic Reader Team", "reader", true).await;
     grant(&pool, ROLE, h, 0, None).await;
+
+    // UNARMED, on a database with no orphan permissive policy: the honest
+    // stamp is the write gate, and it does not carry the group as writable,
+    // so row security's WITH CHECK refuses the write (42501). The same
+    // session shape writes the human's personal group.
+    for (who, what) in [(h, "human"), (a, "agent")] {
+        assert_eq!(
+            code_of(&write_honest(&pool, who, group).await).as_deref(),
+            Some("42501"),
+            "unarmed, the {what}'s honest write into a reader-bound group"
+        );
+    }
+    write_honest(&pool, h, personal)
+        .await
+        .expect("POSITIVE CONTROL: unarmed, the human writes its personal group");
+
     arm(&pool).await;
     assert_eq!(
         resolves(&pool, h, group).await,
@@ -1745,6 +1761,61 @@ async fn a_reader_binding_reads_and_never_writes(pool: PgPool) {
         AGENT_SCOPE,
         "agent",
     );
+}
+
+/// Armed versus unarmed, as a deployment meets them. UNARMED on a clean
+/// database, the session stamp is the only database write gate: an honest
+/// non-member is refused by row security (42501) while a FORGED stamp is
+/// admitted, and the derived member's honest write lands. With the orphan
+/// permissive `claims_privacy` policy a long-lived deployment may carry
+/// (`FOR ALL USING (true)`, created by no migration), even the honest
+/// non-member write is admitted: that is why the window is enforced by
+/// arming, not by the stamp. ARMED, the non-member is refused OPL02 whether
+/// its stamp is honest or forged, with the policy still installed, and the
+/// derived member still writes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arming_is_the_write_gate_with_or_without_an_orphan_permissive_policy(pool: PgPool) {
+    let (m, _) = human(&pool, "gate-m").await;
+    let (o, _) = human(&pool, "gate-o").await;
+    let (group, _) = bound_group(&pool, "Synthetic Gate Team", "writer", true).await;
+    grant(&pool, ROLE, m, 0, None).await;
+
+    write_honest(&pool, m, group)
+        .await
+        .expect("POSITIVE CONTROL: unarmed, the derived member writes through its stamp");
+    assert_eq!(
+        code_of(&write_honest(&pool, o, group).await).as_deref(),
+        Some("42501"),
+        "unarmed, clean: the honest non-member is refused by row security"
+    );
+    write_forged(&pool, o, group)
+        .await
+        .expect("unarmed, clean: a forged stamp is admitted (the stamp is the only gate)");
+
+    sqlx::query("CREATE POLICY claims_privacy ON claims FOR ALL USING (true)")
+        .execute(&pool)
+        .await
+        .expect("the orphan permissive policy (a deployment shape)");
+    write_honest(&pool, o, group)
+        .await
+        .expect("unarmed, orphan policy: even the honest non-member write is admitted");
+
+    arm(&pool).await;
+    assert_refused(
+        &write_honest(&pool, o, group).await,
+        OPL02,
+        HUMAN_SCOPE,
+        "armed, orphan policy, honest stamp",
+    );
+    assert_refused(
+        &write_forged(&pool, o, group).await,
+        OPL02,
+        HUMAN_SCOPE,
+        "armed, orphan policy, forged stamp",
+    );
+    write_honest(&pool, m, group)
+        .await
+        .expect("POSITIVE CONTROL: armed, the derived member still writes");
 }
 
 // =====================================================================
