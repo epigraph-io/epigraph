@@ -209,6 +209,49 @@ mod tests {
             logs_contain("llm-gateway-6e2a"),
             "the withheld detail must reach the server log"
         );
+
+        // The client-init stage: its error names the server's configured
+        // provider, which is the server's to read.
+        let init = llm_unavailable("client init", "unknown provider 'llm-provider-6e2a'");
+        let ApiError::ServiceUnavailable { service } = &init else {
+            panic!("an LLM failure is a 503: {init:?}");
+        };
+        assert!(
+            service.contains("LLM client init failed") && !service.contains("llm-provider-6e2a"),
+            "{service}"
+        );
+        assert!(logs_contain("llm-provider-6e2a"));
+    }
+
+    /// CI never compiles the `genai` handler, so its wiring is pinned on the
+    /// source: both LLM failure sites go through `llm_unavailable`, and the
+    /// only `service: format!(` outside these tests is the helper's own fixed
+    /// reason, so no provider error is interpolated into a 503 (backlog
+    /// 49863d2c).
+    #[test]
+    fn the_genai_handler_routes_every_provider_error_through_llm_unavailable() {
+        let src = include_str!("analyze.rs");
+        let code = &src[..src
+            .find("#[cfg(test)]\nmod tests")
+            .expect("the test module marker")];
+        for site in [
+            "create_llm_client(&provider).map_err(|e| llm_unavailable(\"client init\", e))",
+            ".map_err(|e: LlmError| llm_unavailable(\"request\", e))",
+        ] {
+            assert!(code.contains(site), "the handler no longer has: {site}");
+        }
+        let interpolated: Vec<_> = code.match_indices("service: format!(").collect();
+        assert_eq!(
+            interpolated.len(),
+            1,
+            "a 503 body is built with format! outside llm_unavailable: {interpolated:?}"
+        );
+        assert!(
+            code[interpolated[0].0..].starts_with(
+                "service: format!(\"LLM {stage} failed; the detail is in the server log\")"
+            ),
+            "the one format! must be llm_unavailable's fixed reason"
+        );
     }
 
     #[test]
