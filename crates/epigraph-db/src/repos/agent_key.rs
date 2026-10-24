@@ -134,7 +134,12 @@ impl AgentKeyRepository {
     }
 
     /// Every `agent_keys` row carrying `public_key`, of any type and status,
-    /// oldest first.
+    /// oldest first, with `key_type` and `status` trimmed and lower-cased in
+    /// SQL (`lower(btrim(..))`): the spelling migration 161's guard and
+    /// [`Self::attested_keys_for_claim`] compare, so a caller matches on exact
+    /// literals and agrees with both. (Rust's `trim()` would also strip tabs
+    /// and newlines, which `btrim` keeps, and so admit a row the guard does
+    /// not treat as attested.)
     ///
     /// `epigraph-mcp`'s separate-signing-key boot check reads this, once at
     /// start-up on its own pool, to say precisely why a signing key does not
@@ -150,8 +155,9 @@ impl AgentKeyRepository {
         public_key: &[u8; 32],
     ) -> Result<Vec<AgentKeyRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentKeyRow>(
-            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
-                    revocation_reason, revoked_by, created_at \
+            "SELECT id, agent_id, public_key, \
+                    lower(btrim(key_type)) AS key_type, lower(btrim(status)) AS status, \
+                    valid_from, valid_until, revocation_reason, revoked_by, created_at \
                FROM agent_keys WHERE public_key = $1 ORDER BY created_at, id",
         )
         .bind(public_key.as_slice())

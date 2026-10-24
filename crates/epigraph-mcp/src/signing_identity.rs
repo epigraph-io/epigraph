@@ -75,15 +75,20 @@ pub async fn check_signing_key(
 /// The pure half of [`check_signing_key`]: admit iff some row of `rows` (all
 /// of them carry the signing public key) is an active `signing` key of
 /// `agent`; otherwise say what the rows show instead.
+///
+/// `rows` come from `AgentKeyRepository::rows_with_public_key`, which spells
+/// `key_type` and `status` as migration 161's guard does (`lower(btrim(..))`),
+/// so they are compared here as exact literals: normalising again in Rust
+/// would be a second, different spelling.
 fn signing_key_verdict(
     agent: Uuid,
     signing_public_key: &[u8; 32],
     rows: &[AgentKeyRow],
 ) -> Result<(), String> {
-    let norm = |s: &str| s.trim().to_ascii_lowercase();
-    if rows.iter().any(|r| {
-        r.agent_id == agent && norm(&r.key_type) == KEY_KIND_SIGNING && norm(&r.status) == "active"
-    }) {
+    if rows
+        .iter()
+        .any(|r| r.agent_id == agent && r.key_type == KEY_KIND_SIGNING && r.status == "active")
+    {
         return Ok(());
     }
     let signing_hex = hex::encode(signing_public_key);
@@ -250,8 +255,10 @@ mod tests {
         let other = Uuid::new_v4();
         let pk = [7u8; 32];
         assert!(signing_key_verdict(agent, &pk, &[key_row(agent, "signing", "active")]).is_ok());
-        assert!(signing_key_verdict(agent, &pk, &[key_row(agent, " Signing ", "ACTIVE")]).is_ok());
         for rows in [
+            // Normalising is the read's job (SQL `lower(btrim(..))`), so a
+            // spelling the read would not produce is not admitted here.
+            vec![key_row(agent, "signing\t", "active")],
             vec![],
             vec![key_row(other, "signing", "active")],
             vec![key_row(agent, "identity-legacy", "active")],
