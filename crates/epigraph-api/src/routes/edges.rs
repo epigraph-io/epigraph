@@ -61,11 +61,13 @@
 //! own answers `403 not_owner` naming the rule ([`ApiError::EdgeNotOwned`]).
 //! An invisible edge still answers 404.
 //!
-//! NOT converted (5 sites, `no_unscoped_pool.rs`): the post-commit side
+//! NOT converted (4 sites, `no_unscoped_pool.rs`): the post-commit side
 //! effects of those handlers, which run on the raw pool after the commit as
-//! they did before: `create_edge`'s DS recomputation, provenance row and factor
-//! INSERT, and the provenance rows of `delete_edge`, `patch_edge` and
-//! `relate_claims`. Stamping them is follow-up work.
+//! they did before: `create_edge`'s DS recomputation and provenance row, and
+//! the provenance rows of `delete_edge`, `patch_edge` and `relate_claims`.
+//! Stamping them is follow-up work. (`create_edge`'s own BP factor INSERT, the
+//! fifth, is gone: it fed only BP, and atom-level belief removed it, SPEC
+//! §4.1 W10. The `edges_auto_factor` trigger still keys a factor to each edge.)
 //!
 //! The five converted handlers take `ViewerExtractor`, which refuses a request
 //! with no `AuthContext`; their `edges:write` scope check and their provenance
@@ -757,7 +759,7 @@ pub async fn create_edge(
     //
     // For the if_not_exists path, the repo returns `was_created=false` on
     // a dedup hit. We then SKIP all post-create side effects (provenance,
-    // DS recomputation, factor INSERT, edge.added event) and return the
+    // DS recomputation, edge.added event) and return the
     // STORED row with a 200 OK so retried drainer batches don't double-fire
     // events or write redundant provenance entries. Mirrors the claims
     // pattern in `routes/claims.rs::create_claim`.
@@ -858,7 +860,7 @@ pub async fn create_edge(
     })?;
 
     // UNSCOPED, deliberately and counted (`no_unscoped_pool.rs`): the DS
-    // recomputation, the provenance row and the factor INSERT below run after
+    // recomputation and the provenance row below run after
     // the commit on the raw pool, as they did before the write moved onto the
     // stamped transaction. Stamping them is follow-up work.
     let pool = &state.db_pool;
@@ -924,7 +926,7 @@ pub async fn create_edge(
 
     // ── Remaining side effects: only run when we actually created a new edge ──
     // A dedup hit (was_created=false) is by design semantically idempotent for
-    // these; re-running provenance / factor-creation / events would defeat the
+    // these; re-running provenance / events would defeat the
     // whole purpose of if_not_exists for drainer retries. DS recomputation
     // (above) is the one exception — see its comment for why.
     if was_created {
@@ -948,46 +950,6 @@ pub async fn create_edge(
             .await
             {
                 tracing::warn!(edge_id = %edge_id, error = %e, "Failed to record edge provenance");
-            }
-        }
-
-        // P2a: Auto-create factor for epistemic edges
-        // Belt-and-suspenders: DB trigger (migration 044/049) also fires on INSERT,
-        // but this Rust path ensures factor creation even if the trigger is absent
-        // (e.g. dev environments that haven't run all migrations).
-        if matches!(
-            request.relationship.to_uppercase().as_str(),
-            "SUPPORTS" | "CONTRADICTS"
-        ) {
-            let factor_type = if request.relationship.to_uppercase() == "SUPPORTS" {
-                "evidential_support"
-            } else {
-                "mutual_exclusion"
-            };
-
-            let potential = if factor_type == "evidential_support" {
-                serde_json::json!({"source_weight": 0.7, "target_weight": 0.3})
-            } else {
-                serde_json::json!({"strength": 0.8})
-            };
-
-            let variable_ids = vec![request.source_id, request.target_id];
-            if let Err(e) = sqlx::query(
-                "INSERT INTO factors (factor_type, variable_ids, potential, description) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(factor_type)
-            .bind(&variable_ids)
-            .bind(&potential)
-            .bind(format!("Auto-created from {} edge", request.relationship))
-            .execute(&state.db_pool)
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to auto-create factor for edge — BP will not include this relationship"
-                );
             }
         }
 

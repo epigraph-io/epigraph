@@ -122,7 +122,10 @@ DECLARE t text;
           'elevated_access',
           -- ---- the pending admin acts (130) ------------------------------
           -- FORCEd by 130 at creation, same precedent and reason.
-          'pending_admin_acts'];
+          'pending_admin_acts',
+          -- ---- agent identity lineage (161) -----------------------------
+          -- FORCEd by 161 at creation, same precedent and reason.
+          'agent_prompt_blobs','agent_prompt_snapshots','agent_succession'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

@@ -201,6 +201,31 @@ pub async fn build_app_for_tests_with_admin_cascade(
     Ok(crate::routes::create_router(state))
 }
 
+/// [`build_app_for_tests`] with BP apply switched ON
+/// ([`state::BpApply::On`]), as a server started with `EPIGRAPH_BP_APPLY=on`
+/// is. For the tests of `POST /api/v1/bp/propagate`'s write path, which is
+/// refused (409) on every other fixture.
+#[cfg(feature = "db")]
+pub async fn build_app_for_tests_with_bp_apply(
+    database_url: &str,
+) -> Result<axum::Router, sqlx::Error> {
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        database_url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+    let state =
+        crate::state::AppState::with_scoped_pool(scoped, crate::state::ApiConfig::default())
+            .with_webhook_egress(test_webhook_egress())
+            .with_bp_apply(crate::state::BpApply::On);
+    Ok(crate::routes::create_router(state))
+}
+
 #[cfg(test)]
 mod migrate_on_boot_gate_tests {
     use super::should_migrate_on_boot;

@@ -1900,6 +1900,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // skip never fires, while the allowance read still works (loud refusals
     // only).
     ("epigraph_operator_links_refuse_allowlisted_agent", 149),
+    // 161, agent identity lineage. The registration writes three FORCEd tables
+    // whose policies admit only `epigraph_definer_bypass()`, plus `agents`,
+    // `agent_keys`, the link tables and `security_events` (whose
+    // `agent.identity_` family is reserved to the same arm): under a
+    // non-member owner every registration is refused (loud). The history read
+    // reads the same FORCEd tables through the same arm: under a non-member
+    // owner it returns the lineage with no snapshot at all, i.e. "this agent
+    // ran nothing" (quiet, the stake that makes the owner a control here).
+    ("epigraph_register_agent_identity", 161),
+    ("epigraph_agent_prompt_history", 161),
+    // 161 (review CR6), the re-runnable identity-legacy key backfill. It skips
+    // a host-registered identity by reading `agent_prompt_snapshots`, a FORCEd
+    // table whose policy admits only `epigraph_definer_bypass()`: under a
+    // non-member owner that read sees no snapshot, so a cut-over re-run gives
+    // every keyed identity a legacy row it must never have (quiet, and in the
+    // direction of binding a key that never signs).
+    ("epigraph_backfill_legacy_agent_keys", 161),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2492,6 +2509,31 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_admin_acts_of_principal(integer)",
             true,
         ),
+        // 161: the shared link body is a link function (maintenance only);
+        // the identity registration belongs to the attestor role alone; the
+        // prompt-history read is principal-gated and called on the request DSN.
+        (
+            "epigraph_link_operator_body",
+            "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_register_agent_identity",
+            "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_agent_prompt_history",
+            "public.epigraph_agent_prompt_history(uuid)",
+            true,
+        ),
+        // 161 (review CR6): the cut-over's legacy-key backfill is a
+        // maintenance act; the request DSN never runs it.
+        (
+            "epigraph_backfill_legacy_agent_keys",
+            "public.epigraph_backfill_legacy_agent_keys()",
+            false,
+        ),
     ];
 
     let app_exists: bool =
@@ -2995,6 +3037,10 @@ mod definer_register_tests {
         "epigraph_writer_owner_guard",
         // 115: the owner-immutability guard.
         "epigraph_owner_immutable_guard",
+        // 161: `epigraph_link_operator`'s body, shared with the identity
+        // registration. It runs as whichever maintenance-owned definer calls it
+        // (or as a maintenance session); EXECUTE is the maintenance role's alone.
+        "epigraph_link_operator_body",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

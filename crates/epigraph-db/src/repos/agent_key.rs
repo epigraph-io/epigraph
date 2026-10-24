@@ -156,6 +156,10 @@ impl AgentKeyRepository {
     /// Callers name the type they act on; rotation retires the active
     /// `'signing'` key and must never pick up a key of another type.
     ///
+    /// Rotation passes `'signing'`: since migration 161 every agent also has an
+    /// active `identity-legacy` key, whose private half is often computable
+    /// from public inputs, so it must never be the key a rotation acts on.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]

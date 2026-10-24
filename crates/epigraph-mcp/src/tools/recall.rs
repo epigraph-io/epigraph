@@ -248,9 +248,11 @@ pub struct RecallWithContextParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// When `true`, REPLACE the flat `results` array with an
     /// `epistemic_partition` object grouping the same hits into `confirmed`
-    /// (`truth_value >= 0.75` and not contested), `open_question`
+    /// (`belief_score >= 0.75` and not contested), `open_question`
     /// (`is_contested` — any live `contradicts`/`refutes`), and `uncertain`
-    /// (everything else). Contest is checked FIRST, so a high-truth paragraph
+    /// (everything else). The score is each hit's `belief_score`, the same
+    /// value `min_truth` gates on, not its authored `truth_value`. Contest is
+    /// checked FIRST, so a high-scoring paragraph
     /// carrying a live refutation is reported as an open question rather than
     /// as confirmed.
     ///
@@ -628,6 +630,16 @@ pub struct RecallHit {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl crate::types::RecallGatedSignals for RecallHit {
+    /// `belief_score`: the value `min_truth` compared against for this hit.
+    fn gated_score(&self) -> f64 {
+        self.belief_score
+    }
+    fn is_contested(&self) -> bool {
+        self.is_contested
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PaperMeta {
     pub paper_id: Uuid,
@@ -645,7 +657,16 @@ pub struct SectionMeta {
 pub struct AtomChild {
     pub atom_id: Uuid,
     pub content: String,
+    /// The atom's independently authored `claims.truth_value`, reported
+    /// unchanged.
     pub truth_value: f64,
+    /// The atom's effective belief, on the same scale as the hit's own
+    /// `belief_score`: its DS pignistic probability when it carries a DS
+    /// cache, else `truth_value`. Equality with `truth_value` means "no DS
+    /// state". This is what lets a reader of a compound hit see which atom
+    /// carries the doubt: the authored values say what was asserted, this says
+    /// what the evidence now supports.
+    pub belief_score: f64,
     pub bridge_to_paragraphs: Vec<Uuid>,
 }
 
@@ -1112,11 +1133,8 @@ async fn recall_with_context_post_embed(
         // asked for the bucketed shape must get three empty buckets, not a
         // silently different shape on the zero-hit path. Getting `results: []`
         // back from a partitioned request would look like the flag was ignored.
-        let (results, epistemic_partition) = crate::types::split_epistemic(
-            Vec::new(),
-            params.epistemic_partition,
-            |_: &RecallHit| (0.0, false),
-        );
+        let (results, epistemic_partition) =
+            crate::types::split_epistemic(Vec::<RecallHit>::new(), params.epistemic_partition);
         return success_json(&RecallWithContextResponse {
             results,
             epistemic_partition,
@@ -1260,10 +1278,27 @@ async fn recall_with_context_post_embed(
     // an error yields an empty map and every hit falls back to the
     // `core.truth_value` the context fetch already carries, i.e. to exactly the
     // pre-fix behaviour.
-    let belief_by_paragraph = match epigraph_db::ClaimRepository::effective_belief_batch(
+    //
+    // The same round-trip also resolves the context atoms' effective belief,
+    // so each atom is reported on the scale the hit itself is gated on. The
+    // atom ids come from `fetch_batched_context`, which already applied the
+    // viewer's visibility; `effective_belief_batch` applies it again, and an
+    // atom it does not return keeps its `truth_value` fall-back.
+    let belief_ids: Vec<Uuid> = paragraph_ids
+        .iter()
+        .copied()
+        .chain(
+            ctx.atoms_by_paragraph
+                .values()
+                .flat_map(|atoms| atoms.iter().map(|a| a.atom_id)),
+        )
+        .collect::<std::collections::HashSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
         &server.pool,
         viewer,
-        &paragraph_ids,
+        &belief_ids,
     )
     .await
     {
@@ -1291,7 +1326,7 @@ async fn recall_with_context_post_embed(
         };
         // Absent key == invisible to this viewer / deleted between the kNN and
         // this read; fall back to the truth_value already in hand.
-        let belief_score = belief_by_paragraph
+        let belief_score = belief_by_claim
             .get(&paragraph_id)
             .copied()
             .unwrap_or(core.truth_value);
@@ -1309,11 +1344,16 @@ async fn recall_with_context_post_embed(
         // supports / refutes / corroborates edges gets them populated.
         let paper = ctx.paper_meta.get(&paragraph_id).cloned();
 
-        let atoms = ctx
+        let mut atoms = ctx
             .atoms_by_paragraph
             .get(&paragraph_id)
             .cloned()
             .unwrap_or_default();
+        for atom in &mut atoms {
+            if let Some(&score) = belief_by_claim.get(&atom.atom_id) {
+                atom.belief_score = score;
+            }
+        }
         let atoms_total = ctx
             .atoms_total_by_paragraph
             .get(&paragraph_id)
@@ -1621,13 +1661,13 @@ async fn recall_with_context_post_embed(
     // and after the audit spawn, which derives `returned_claim_ids` from
     // `results` and must name exactly the hits that were served.
     //
-    // The score is the SAME `truth_value` `min_truth` gates on, read back off
-    // the built hit rather than recomputed, so the bucket threshold and the
-    // gate cannot drift apart.
+    // The score is `belief_score`, the value `min_truth` gated on above, read
+    // back off the built hit through `RecallGatedSignals` rather than chosen
+    // here: this site used to pass `truth_value`, which the gate stopped
+    // reading when it moved to the DS cache, and the two disagree on every
+    // claim whose evidence has moved it.
     let (results, epistemic_partition) =
-        crate::types::split_epistemic(results, params.epistemic_partition, |h: &RecallHit| {
-            (h.truth_value, h.is_contested)
-        });
+        crate::types::split_epistemic(results, params.epistemic_partition);
 
     success_json(&RecallWithContextResponse {
         results,
@@ -1842,6 +1882,9 @@ pub async fn fetch_batched_context(
                     atom_id: r.atom_id,
                     content: r.content,
                     truth_value: r.truth_value,
+                    // The fall-back value; `recall_with_context_post_embed`
+                    // overwrites it from the page's one effective-belief batch.
+                    belief_score: r.truth_value,
                     bridge_to_paragraphs: vec![],
                 });
         }

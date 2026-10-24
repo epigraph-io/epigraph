@@ -223,6 +223,149 @@ pub fn cached_combination_predicate(qualifier: &str) -> String {
     )
 }
 
+/// The frame every ingest template row sits on (see
+/// [`ingest_template_predicate`]).
+pub const INGEST_TEMPLATE_FRAME_NAME: &str = "research_validity";
+
+/// The `source_strength` every ingest template row carries.
+pub const INGEST_TEMPLATE_SOURCE_STRENGTH: f64 = 0.3;
+
+/// The least mass an ingest template row puts on the whole frame
+/// (`masses->>'0,1'`). The signature is `>=` this.
+pub const INGEST_TEMPLATE_MIN_THETA: f64 = 0.80;
+
+/// How far `source_strength` may sit from [`INGEST_TEMPLATE_SOURCE_STRENGTH`]
+/// and still be the template: the column is a float written from a literal.
+const INGEST_TEMPLATE_SOURCE_STRENGTH_TOLERANCE: f64 = 1e-6;
+
+/// The placeholder a combine-input query carries where
+/// [`with_ingest_template_excluded`] installs its predicate.
+const NOT_INGEST_TEMPLATE_MARKER: &str = "/* {NOT_INGEST_TEMPLATE} */";
+
+/// A boolean SQL expression, TRUE exactly for an **ingest template** row:
+/// the near-vacuous BBA document ingest attached to a claim as a placeholder
+/// assessment, not evidence about it. It is on the frame named
+/// [`INGEST_TEMPLATE_FRAME_NAME`], has no `combination_method`, has a
+/// `source_strength` within 1e-6 of [`INGEST_TEMPLATE_SOURCE_STRENGTH`], and
+/// puts at least [`INGEST_TEMPLATE_MIN_THETA`] of its mass on the whole frame.
+/// Every coordinate is required: a row that differs in any one of them is
+/// somebody's assessment and stays an input.
+///
+/// `mf` qualifies the `mass_functions` columns and `f` the joined `frames`
+/// row (`"mf."`, `"f."`). Never NULL.
+///
+/// This is the ONE spelling. Public so later readers that drop the template
+/// from a fold use this predicate rather than a copy that could drift.
+#[must_use]
+pub fn ingest_template_predicate(mf: &str, f: &str) -> String {
+    format!(
+        "COALESCE({f}name = '{INGEST_TEMPLATE_FRAME_NAME}' \
+         AND {mf}combination_method IS NULL \
+         AND abs(COALESCE({mf}source_strength, 0) - {INGEST_TEMPLATE_SOURCE_STRENGTH}) \
+             < {INGEST_TEMPLATE_SOURCE_STRENGTH_TOLERANCE} \
+         AND COALESCE(({mf}masses->>'0,1')::float8, 0) >= {INGEST_TEMPLATE_MIN_THETA}, false)"
+    )
+}
+
+/// How far up a `decomposes_to` tree [`frozen_compound_predicate`] looks for
+/// a workflow root (the leaf-closure depth cap of the atom-level belief SPEC).
+const COMPOUND_ROOT_SEARCH_DEPTH: i32 = 6;
+
+/// The placeholder [`MassFunctionRepository::cache_owner_frame_for_claim`]
+/// carries where [`frozen_compound_predicate`] is installed.
+const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
+
+/// A boolean SQL expression over the claim bound as `$1`: TRUE when that claim
+/// is a **non-procedural compound**, whose cached belief no recompute that
+/// resolves its owner through
+/// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite.
+/// Writers that fold a named frame directly (for example the post-removal
+/// recompute of `backfill_factors`' edge re-wire, or the per-write
+/// `recompute_claim_belief_on_frame` callers) do not pass through this check;
+/// they are moved onto the single atom-cache writer separately.
+///
+/// * **Compound:** it has an in-force ([`super::edge::EDGE_IN_FORCE`])
+///   `decomposes_to` out-edge to a current claim. Its belief is a query over
+///   its leaves, not a fold of the BBAs that happen to sit on it, so refolding
+///   those BBAs into its cache is never right.
+/// * **Procedural** (exempt, keeps today's behaviour): the claim, or an
+///   ancestor up to [`COMPOUND_ROOT_SEARCH_DEPTH`] in-force `decomposes_to`
+///   hops above it, is a ROOT (no in-force `decomposes_to` in-edge) stamped
+///   `properties.source_type = 'workflow'`. A cycle or a tree deeper than the
+///   cap finds no root, so the claim stays frozen: the safe direction.
+///
+/// Role is structure, not content, so these edge and claim reads carry no
+/// viewer splice: a viewer that cannot see a decomposition must not be able
+/// to refold the compound's cache for everyone. That holds as written only on
+/// a connection that bypasses row security, which is how the bulk
+/// recomputers run (the maintenance pool and the maintenance session).
+/// `edges` and `claims` are FORCE ROW LEVEL SECURITY, so on an app connection
+/// (the per-write `routes::assess` refresh) the server still filters these
+/// reads, and a caller who can see none of a compound's in-force
+/// decomposition edges finds no compound here. Making the role read
+/// independent of row security is left to the claim-role module that
+/// replaces this predicate.
+///
+/// Inline until the claim-role module gives the compound and procedural
+/// predicates their one shared spelling, which then replaces this one.
+fn frozen_compound_predicate() -> String {
+    use super::edge::EDGE_IN_FORCE;
+    format!(
+        "(EXISTS (
+             SELECT 1 FROM edges e
+             JOIN claims child ON child.id = e.target_id
+             WHERE e.source_id = $1
+               AND e.relationship = 'decomposes_to'
+               AND e.target_type = 'claim'
+               AND {EDGE_IN_FORCE}
+               AND COALESCE(child.is_current, true))
+          AND NOT EXISTS (
+             WITH RECURSIVE up(id, depth) AS (
+                 SELECT $1::uuid, 0
+                 UNION
+                 SELECT e.source_id, up.depth + 1
+                 FROM up
+                 JOIN edges e ON e.target_id = up.id
+                 WHERE e.relationship = 'decomposes_to'
+                   AND e.source_type = 'claim'
+                   AND {EDGE_IN_FORCE}
+                   AND up.depth < {COMPOUND_ROOT_SEARCH_DEPTH})
+             SELECT 1
+             FROM up
+             JOIN claims root ON root.id = up.id
+             WHERE root.properties->>'source_type' = 'workflow'
+               AND NOT EXISTS (
+                   SELECT 1 FROM edges e
+                   WHERE e.target_id = up.id
+                     AND e.relationship = 'decomposes_to'
+                     AND {EDGE_IN_FORCE})))"
+    )
+}
+
+/// Replace [`NOT_FROZEN_COMPOUND_MARKER`] in `sql` with
+/// `AND NOT <`[`frozen_compound_predicate`]`>`.
+fn with_frozen_compound_excluded(sql: &str) -> String {
+    assert!(
+        sql.contains(NOT_FROZEN_COMPOUND_MARKER),
+        "owner query has no {NOT_FROZEN_COMPOUND_MARKER} marker:\n{sql}"
+    );
+    let predicate = format!("AND NOT {}", frozen_compound_predicate());
+    sql.replace(NOT_FROZEN_COMPOUND_MARKER, &predicate)
+}
+
+/// Replace [`NOT_INGEST_TEMPLATE_MARKER`] in `sql` with `AND NOT <predicate>`
+/// ([`ingest_template_predicate`]), so the query reads no ingest template
+/// row. The query must join `frames` (qualified by `f`) to the
+/// `mass_functions` row (qualified by `mf`).
+fn with_ingest_template_excluded(sql: &str, mf: &str, f: &str) -> String {
+    assert!(
+        sql.contains(NOT_INGEST_TEMPLATE_MARKER),
+        "combine-input query has no {NOT_INGEST_TEMPLATE_MARKER} marker:\n{sql}"
+    );
+    let predicate = format!("AND NOT {}", ingest_template_predicate(mf, f));
+    sql.replace(NOT_INGEST_TEMPLATE_MARKER, &predicate)
+}
+
 /// Whether a writer must NOT store its cached combination row for this pair,
 /// because the row would overwrite an input.
 ///
@@ -1191,16 +1334,32 @@ impl MassFunctionRepository {
 
     /// The frame that owns a claim's cached `claims.{belief, plausibility,
     /// mass_on_empty, pignistic_prob, mass_on_missing, belief_frame_id}`
-    /// scalars, or `None` when the claim has no combine input the viewer can see.
+    /// scalars, or `None` (leave the cache alone) when the claim has no
+    /// combine input the viewer can see.
     ///
     /// Only combine inputs count: cached combination rows are excluded exactly
     /// as [`Self::get_for_claim_frame`] excludes them, so the owner is always a
-    /// frame the recompute can fold. Among the frames holding the claim's inputs:
+    /// frame the recompute can fold. **Ingest template rows
+    /// ([`ingest_template_predicate`]) do not count either.** A claim whose
+    /// only inputs are templates has no owner, so no recompute that resolves
+    /// its owner here replaces its cache with the template's near-vacuous
+    /// fold; and a frame that holds nothing but a template cannot own a claim
+    /// that has real input elsewhere. (The fold of the owner frame itself is unchanged: a template
+    /// that shares the owner frame with a real input is still folded there.)
+    ///
+    /// **A non-procedural compound has no owner** ([`frozen_compound_predicate`]):
+    /// its belief is a query over its leaves, so no recompute that resolves its
+    /// owner here (the three bulk recomputers and the `routes::assess`
+    /// refresh) refolds the BBAs that sit on it into its cache. Writers that
+    /// fold a named frame directly are not covered. A workflow-rooted
+    /// (procedural) tree keeps the rules below.
+    ///
+    /// Among the frames holding the claim's remaining inputs:
     ///
     /// 1. the frame named `binary_truth`, when the claim has an input on it;
     /// 2. else the frame named `claim_validity`, when the claim has an input on it;
     /// 3. else the claim's recorded owner (`claims.belief_frame_id`), while that
-    ///    frame still holds an input;
+    ///    frame still holds a non-template input;
     /// 4. else the first-writer frame: the frame holding the claim's earliest
     ///    input (`mass_functions.created_at`), ties broken by frame id.
     ///
@@ -1226,13 +1385,16 @@ impl MassFunctionRepository {
         claim_id: Uuid,
     ) -> Result<Option<Uuid>, DbError> {
         let sql = viewer.splice(
-            &with_cached_combination_excluded(
-                r#"
+            &with_frozen_compound_excluded(&with_ingest_template_excluded(
+                &with_cached_combination_excluded(
+                    r#"
             SELECT mf.frame_id
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             WHERE mf.claim_id = $1
               /* {NOT_CACHED_COMBINATION} */
+              /* {NOT_INGEST_TEMPLATE} */
+              /* {NOT_FROZEN_COMPOUND} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY CASE
                        WHEN f.name = 'binary_truth' THEN 0
@@ -1249,8 +1411,11 @@ impl MassFunctionRepository {
                      mf.frame_id
             LIMIT 1
             "#,
+                    "mf.",
+                ),
                 "mf.",
-            ),
+                "f.",
+            )),
             2,
         );
         let mut vq = sqlx::query_scalar(&sql).bind(claim_id);

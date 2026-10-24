@@ -9,6 +9,7 @@ pub mod admin_act_ceremony;
 pub mod admin_cascade;
 pub mod admin_scope_enforcement;
 pub mod agent;
+pub mod agent_identity;
 pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
@@ -94,6 +95,10 @@ pub use agent::{
 };
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
+pub use agent_identity::{
+    AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
+    PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
+};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};

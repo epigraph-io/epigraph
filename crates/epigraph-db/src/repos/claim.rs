@@ -1996,11 +1996,22 @@ impl ClaimRepository {
     /// Claims absent from the returned map are absent because the **viewer
     /// cannot see them** (or they were deleted mid-page). Callers must fall back
     /// to the `truth_value` they already hydrated rather than treating absence
-    /// as pass-or-drop — see the four `min_truth` call sites.
+    /// as pass-or-drop — see the four `min_truth` call sites
+    /// (`epigraph-mcp` `tools::memory::recall_post_embed`,
+    /// `tools::recall::recall_with_context_post_embed`, `tools::graph::traverse`,
+    /// and `epigraph-engine` `recall::effective_beliefs`).
+    ///
+    /// One caller is not a gate: `recall_with_context_post_embed` adds its
+    /// hits' context-atom ids to the same batch and reports each atom's value
+    /// as that atom's `belief_score`. It relies on the same fall-back contract,
+    /// so an atom absent from the map keeps its `truth_value`.
+    ///
+    /// `claim_ids` is kept out of the tracing span (only its length is
+    /// recorded): that context-atom page can carry thousands of ids.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
+    #[instrument(skip(executor, viewer, claim_ids), fields(claim_count = claim_ids.len()))]
     pub async fn effective_belief_batch<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
