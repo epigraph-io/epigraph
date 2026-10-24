@@ -43,6 +43,10 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str]) -> Outcome
     let mut args = vec!["--database-url", db_url];
     args.extend_from_slice(extra_args);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"));
+    // The separate-signing-key pair may be exported on the runner (by a host
+    // in that mode); cleared FIRST, so only what this test sets reaches the child.
+    cmd.env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY");
     for (k, v) in env {
         cmd.env(k, v);
     }
