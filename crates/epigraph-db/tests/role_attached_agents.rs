@@ -1315,52 +1315,105 @@ async fn an_assignment_ended_elsewhere_refuses_the_open_runs_next_write(pool: Pg
     );
 }
 
-/// A RETIRED predecessor's restatement inherits its author, and restating an
-/// attached agent's retired claim is its human's act: the human's restatement
-/// in a gap lands. The WRITER of a restatement is still checked: the attached
-/// agent restating its own retired claim in the gap is refused. CONTROL: the
-/// human naming the agent on a FRESH claim in the gap is refused.
+/// One restatement of `retired` (author `author`) by an `epigraph_app` session
+/// stamped as `writer`.
+async fn restate_as(
+    pool: &PgPool,
+    writer: Uuid,
+    author: Uuid,
+    group: Uuid,
+    retired: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, writer, &[group]).await;
+        let r = insert_successor(&mut *conn, author, group, retired).await;
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// A restatement of a RETIRED claim inherits its author, and the attribution
+/// check is relieved of ROL01 on that inherited author ONLY when the author
+/// identity is itself retired (a retired operator link and no live one: it
+/// can never run again, so naming it is its human's act) or the session is
+/// privileged. Otherwise the inherited author is an attached agent that may
+/// run again, and naming it after its role lapsed is a write presented as
+/// that agent's in the gap: refused, whoever writes it. So, after the lapse:
+/// * the attached agent restating its own retired claim is refused (the
+///   writer arm);
+/// * an UNATTACHED sibling of the same human restating it, author = the
+///   attached agent, is refused (the inherited author arm);
+/// * the human restating it is refused alike;
+/// * CONTROL: the sibling restating a retired claim whose author is a
+///   genuinely RETIRED identity attached to the same role lands;
+/// * CONTROL: a privileged session restating the attached agent's claim lands;
+/// * CONTROL: the human naming the agent on a FRESH claim is refused.
 ///
-/// Verified to fail: the author check in `epigraph_require_attributable` run
-/// whatever `p_inherited` says.
+/// Verified to fail: the author check in `epigraph_require_attributable`
+/// skipped whenever `p_inherited` is true (the sibling's and the human's
+/// restatements land).
 #[sqlx::test(migrations = "../../migrations")]
-async fn restating_a_role_agents_retired_claim_is_its_humans_act(pool: PgPool) {
+async fn a_restatement_names_an_attached_author_only_while_held_unless_it_is_retired(
+    pool: PgPool,
+) {
     seed_role(&pool, ROLE).await;
     let (h, h_group) = human(&pool, "holder").await;
     let attached = agent_of(&pool, h, "curator").await;
+    let sibling = agent_of(&pool, h, "sibling").await;
+    let (gone, _) = fixture::seed_agent_with_group(&pool, "retired-curator").await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_retired_agent(&mut conn, gone, h).await;
+        (conn, r)
+    })
+    .await
+    .expect("a retired link");
     attach(&pool, ROLE, attached).await;
+    attach(&pool, ROLE, gone).await;
+    // The retired identity's claim, written before arming (once armed, its
+    // retired link binds it to no human, so even the privileged pool's fresh
+    // claim is refused OPL01).
+    let gone_claim = insert_claim(&pool, gone, h_group)
+        .await
+        .expect("the retired identity's claim (unarmed setup)");
     let assignment = grant(&pool, ROLE, h, None).await;
     arm(&pool).await;
 
-    let retired = write_as(&pool, attached, attached, h_group)
-        .await
-        .expect("written while held");
-    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
-        .bind(retired)
-        .execute(&pool)
-        .await
-        .expect("retire the predecessor (privileged setup)");
+    let mut retired = Vec::new();
+    for _ in 0..4 {
+        retired.push(
+            write_as(&pool, attached, attached, h_group)
+                .await
+                .expect("written while held"),
+        );
+    }
+    for id in retired.iter().chain(std::iter::once(&gone_claim)) {
+        sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("retire the predecessor (privileged setup)");
+    }
     end_assignment(&pool, assignment).await;
 
-    let by_agent = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, attached, &[h_group]).await;
-        let r = insert_successor(&mut *conn, attached, h_group, retired).await;
-        unstamp(&mut conn).await;
-        (conn, r)
-    })
-    .await;
-    assert_rol01(&by_agent, "the attached agent restating its retired claim");
-    let by_human = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, h, &[h_group]).await;
-        let r = insert_successor(&mut *conn, attached, h_group, retired).await;
-        unstamp(&mut conn).await;
-        (conn, r)
-    })
-    .await;
-    assert!(
-        by_human.is_ok(),
-        "the human restates the agent's retired claim in the gap: {by_human:?}"
+    assert_rol01(
+        &restate_as(&pool, attached, attached, h_group, retired[0]).await,
+        "the attached agent restating its retired claim after the lapse",
     );
+    assert_rol01(
+        &restate_as(&pool, sibling, attached, h_group, retired[1]).await,
+        "an unattached sibling restating the attached agent's claim after the lapse",
+    );
+    assert_rol01(
+        &restate_as(&pool, h, attached, h_group, retired[2]).await,
+        "the human restating the attached agent's claim after the lapse",
+    );
+    restate_as(&pool, sibling, gone, h_group, gone_claim)
+        .await
+        .expect("CONTROL: a retired identity's claim is restated in the gap");
+    insert_successor(&pool, attached, h_group, retired[3])
+        .await
+        .expect("CONTROL: a privileged session restates the attached agent's claim");
     assert_rol01(
         &write_as(&pool, h, attached, h_group).await,
         "CONTROL: the human naming the agent on a fresh claim in the gap",
