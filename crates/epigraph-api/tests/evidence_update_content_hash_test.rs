@@ -169,3 +169,69 @@ async fn put_onto_a_sibling_body_on_the_same_claim_is_refused_and_writes_nothing
         "the duplicate is the caller's error, not a server fault; body={body}"
     );
 }
+
+/// The route's main job: backfilling `raw_content` on evidence created without
+/// a body. `POST /api/v1/evidence` stores a caller-supplied `content_hash`
+/// unchecked when `raw_content` is absent (external evidence). Once the body
+/// is backfilled, the stored digest describes that body: the caller-supplied
+/// external digest is replaced, deliberately, so the row is checkable.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfilling_raw_content_replaces_a_caller_supplied_external_digest() {
+    let w = setup().await;
+    let claim = seed_claim(&w.pool, w.principal, w.group).await;
+    let external = digest(&format!("external artefact {}", Uuid::new_v4()));
+    let ev = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence \
+             (id, content_hash, evidence_type, raw_content, claim_id, owner_group_id, visibility) \
+         VALUES ($1, $2, 'document', NULL, $3, $4, 'group')",
+    )
+    .bind(ev)
+    .bind(&external)
+    .bind(claim)
+    .bind(w.group)
+    .execute(&w.pool)
+    .await
+    .expect("seed body-less evidence");
+
+    let body_text = format!("backfilled body {}", Uuid::new_v4());
+    let (status, body) = put_raw_content(&w, ev, &body_text).await;
+    assert_eq!(status, 200, "the backfill must succeed; body={body}");
+
+    let (raw, hash) = stored(&w.pool, ev).await;
+    assert_eq!(raw.as_deref(), Some(body_text.as_str()));
+    assert_ne!(
+        hash, external,
+        "the external digest no longer describes the row once it has a body"
+    );
+    assert_eq!(
+        hash,
+        digest(&body_text),
+        "content_hash = BLAKE3(backfilled body)"
+    );
+}
+
+/// A sealed claim's evidence holds the seal sentinel in `raw_content`; its real
+/// body lives in the seal manifest and unseal writes it back. A PUT onto that
+/// row would store plaintext into a sealed row and, now that the digest moves
+/// with the body, leave the digest of the PUT body behind after unseal restores
+/// the original. Refused as not-found (the same answer as "not writable"), and
+/// nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_onto_a_sealed_evidence_row_is_refused_and_writes_nothing() {
+    let w = setup().await;
+    let claim = seed_claim(&w.pool, w.principal, w.group).await;
+    let sentinel = "[sealed]";
+    let ev = seed_consistent_evidence(&w.pool, claim, w.group, sentinel).await;
+
+    let (status, body) = put_raw_content(&w, ev, "plaintext written over a seal").await;
+
+    let (raw, hash) = stored(&w.pool, ev).await;
+    assert_eq!(
+        raw.as_deref(),
+        Some(sentinel),
+        "a sealed row's body must not be rewritten (status {status}, body {body})"
+    );
+    assert_eq!(hash, digest(sentinel), "nor its digest");
+    assert_eq!(status, 404, "refused as not-found; body={body}");
+}

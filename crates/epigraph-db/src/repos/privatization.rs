@@ -831,10 +831,13 @@ const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-
 /// The sentinel `evidence.raw_content` carries once its claim is sealed.
 ///
 /// Not id-suffixed, and it does not need to be: `evidence` has no generated
-/// tsvector, no uniqueness constraint over its content and no content hash, so
-/// the three reasons the claim sentinel carries an id do not apply. One fixed
-/// token is the smaller side channel.
-const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+/// tsvector and its `content_hash` is left as the ORIGINAL body's digest (it is
+/// not recomputed from the sentinel), so the reasons the claim sentinel carries
+/// an id do not apply. One fixed token is the smaller side channel.
+///
+/// `pub(crate)` for `EvidenceRepository::update_raw_content`, which refuses to
+/// rewrite a row holding it.
+pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
 
 /// The key under which a seal manifest carries an evidence row's
 /// `evidence.source_url` inside that row's `properties`.
