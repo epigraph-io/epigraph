@@ -24,7 +24,8 @@
 //!   attestor can EXECUTE it.
 //! * A succession registered by the attestor copies the parent's live
 //!   attachments to the child, once, over every gap the child's own rows
-//!   leave; a SHARED identity is copied nothing, and the audit says why.
+//!   leave; a SHARED successor (one that runs in more than one group) is
+//!   copied too, and the audit flags it so the host alerts every group.
 //! * POSITIVE CONTROL throughout: an agent with no attachment writes exactly as
 //!   before, during the same gap that refuses an attached agent.
 //!
@@ -1704,121 +1705,148 @@ async fn attaching_an_identity_fills_every_gap_in_a_successors_own_window(pool: 
     );
 }
 
-/// The latest registration audit row of `agent`: (`role_attachments_copied`,
-/// `role_attachments_skipped`).
-async fn registration_audit(pool: &PgPool, agent: Uuid) -> (Option<i64>, Option<String>) {
+/// The registration audit row of `agent` that names `parent`:
+/// (`role_attachments_copied`, `role_attachments_shared`). Selected by the
+/// parent it names, never by `created_at` (a host whose clock steps backward
+/// can stamp the later of two registrations earlier).
+async fn registration_audit(
+    pool: &PgPool,
+    agent: Uuid,
+    parent: Uuid,
+) -> (Option<i64>, Option<String>) {
     sqlx::query_as(
         "SELECT (details ->> 'role_attachments_copied')::bigint, \
-                details ->> 'role_attachments_skipped' \
+                details ->> 'role_attachments_shared' \
            FROM security_events \
           WHERE event_type = 'agent.identity_registered' AND agent_id = $1 \
-          ORDER BY created_at DESC, id DESC LIMIT 1",
+            AND details ->> 'parent_agent_id' = $2::text",
     )
     .bind(agent)
+    .bind(parent)
     .fetch_one(pool)
     .await
-    .expect("a registration audit row")
+    .expect("one registration audit row naming the parent")
 }
 
-/// A SHARED identity (it already runs in another group folder) inherits no
-/// role attachment from a succession, as it inherits no operator link (161
-/// step 5): an attachment ties every group's runs of the identity to the
-/// role, so one role's gap would stop the other groups too. The registration
-/// skips the copy and its audit row says why (`role_attachments_skipped =
-/// shared_identity`); attaching it remains a manual act, which still works.
-/// CONTROL: an unshared successor of the same parent, in the parent's folder,
-/// is copied and records no skip.
-///
-/// Verified to fail: the copy run whatever other folders the child runs in.
+/// Link `agent` to `operator` on the privileged pool (a test fixture step).
+async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link");
+}
+
+/// A SHARED successor (an identity that already runs in another group
+/// folder) inherits its parent's role attachment like any other successor:
+/// an attachment only ever refuses, so skipping it would leave a linked,
+/// write-capable identity outside the role's restriction (the succession
+/// escape the copy exists to close). The cost, accepted, is that the shared
+/// identity is dormant in EVERY group it runs in while the role has no
+/// holder; the registration's audit row FLAGS it
+/// (`role_attachments_shared = shared_identity`) so the host alerts every
+/// affected group.
+/// * The shared successor is attached, refused ROL01 in the gap, and writes
+///   once its human holds the role.
+/// * A repeat registration copies nothing and writes no second flag.
+/// * CONTROL: an unshared successor of the same parent is copied and carries
+///   no flag.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_shared_identity_inherits_no_attachment_and_the_audit_says_why(pool: PgPool) {
+async fn a_shared_successor_inherits_the_attachment_and_the_audit_flags_it(pool: PgPool) {
     seed_role(&pool, ROLE).await;
-    let (h, _) = human(&pool, "holder").await;
+    let (h, h_group) = human(&pool, "holder").await;
     let parent = register(&pool, &random32(), None, "g-166-own").await;
-    {
-        let mut conn = pool.acquire().await.expect("acquire");
-        AgentRepository::link_operator(&mut conn, parent, h)
-            .await
-            .expect("link the parent");
-    }
-    attach(&pool, ROLE, parent).await;
+    link(&pool, parent, h).await;
+    let parent_row = attach(&pool, ROLE, parent).await;
 
     let shared_key = random32();
     let shared = register(&pool, &shared_key, None, "g-166-elsewhere").await;
+    link(&pool, shared, h).await;
     assert_eq!(
         register(&pool, &shared_key, Some(parent), "g-166-own").await,
         shared
     );
-    assert!(
-        live_attachments(&pool, shared).await.is_empty(),
-        "a shared identity inherits no attachment"
-    );
-    assert_eq!(
-        registration_audit(&pool, shared).await,
-        (Some(0), Some("shared_identity".to_string())),
-        "the registration records why it copied nothing"
-    );
-    let skips_before: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
-            AND details ->> 'role_attachments_skipped' = 'shared_identity'",
-    )
-    .bind(shared)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    register(&pool, &shared_key, Some(parent), "g-166-own").await;
-    let skips_after: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
-            AND details ->> 'role_attachments_skipped' = 'shared_identity'",
-    )
-    .bind(shared)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    assert_eq!(
-        (skips_before, skips_after),
-        (1, 1),
-        "a repeat registration withholds nothing new and audits no second skip"
-    );
-    attach(&pool, ROLE, shared).await;
     assert_eq!(
         live_attachments(&pool, shared).await,
-        vec![(ROLE.to_string(), None)],
-        "CONTROL: a manual attach of the shared identity still works"
+        vec![(ROLE.to_string(), Some(parent_row))],
+        "a shared successor inherits the parent's attachment"
     );
+    assert_eq!(
+        registration_audit(&pool, shared, parent).await,
+        (Some(1), Some("shared_identity".to_string())),
+        "the registration flags the shared identity it attached"
+    );
+    let flags = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM security_events WHERE agent_id = $1 \
+                AND details ->> 'role_attachments_shared' = 'shared_identity'",
+        )
+        .bind(shared)
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    let before = flags(pool.clone()).await;
+    register(&pool, &shared_key, Some(parent), "g-166-own").await;
+    assert_eq!(
+        (before, flags(pool.clone()).await, live_attachments(&pool, shared).await.len()),
+        (1, 1, 1),
+        "a repeat registration copies nothing and flags nothing new"
+    );
+
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, shared, shared, h_group).await,
+        "the shared successor in a gap",
+    );
+    grant(&pool, ROLE, h, None).await;
+    write_as(&pool, shared, shared, h_group)
+        .await
+        .expect("the shared successor writes while its human holds the role");
 
     let own = register(&pool, &random32(), Some(parent), "g-166-own").await;
     assert_eq!(
-        live_attachments(&pool, own).await.len(),
-        1,
+        live_attachments(&pool, own).await,
+        vec![(ROLE.to_string(), Some(parent_row))],
         "CONTROL: an unshared successor is copied"
     );
     assert_eq!(
-        registration_audit(&pool, own).await,
+        registration_audit(&pool, own, parent).await,
         (Some(1), None),
-        "CONTROL: an unshared successor records no skip"
+        "CONTROL: an unshared successor carries no flag"
     );
 }
 
+/// The `platform.role_agent_copied_shared` events naming `agent`:
+/// (role, reason, attachment the copy came from).
+async fn shared_copy_events(pool: &PgPool, agent: Uuid) -> Vec<(String, String, Uuid)> {
+    sqlx::query_as(
+        "SELECT details ->> 'role', details ->> 'reason', \
+                (details ->> 'attachment_id')::uuid \
+           FROM security_events \
+          WHERE event_type = 'platform.role_agent_copied_shared' AND agent_id = $1 \
+          ORDER BY created_at, id",
+    )
+    .bind(agent)
+    .fetch_all(pool)
+    .await
+    .expect("shared-copy events")
+}
+
 /// The lineage follow obeys the same rule: attaching an identity attaches
-/// its registered successors, except a SHARED one (it runs in more than one
-/// group folder), which is skipped with one `platform.role_agent_copy_skipped`
-/// audit row naming the role, the attachment and `shared_identity`. CONTROL:
-/// an unshared successor of the same identity is attached.
-///
-/// Verified to fail: the lineage copy run whatever other folders the
-/// successor runs in.
+/// EVERY registered successor down its lineage, a shared one included, and
+/// flags each shared one with exactly ONE `platform.role_agent_copied_shared`
+/// event naming the role, the attachment and `shared_identity`, however deep
+/// it sits (the copies' own firings write no second event).
+/// * A shared direct successor, and a shared GRANDCHILD under an unshared
+///   successor, are attached, each flagged once; the shared one is refused
+///   ROL01 in the gap and writes once its human holds the role.
+/// * CONTROL: the unshared successor is attached and carries no flag.
 #[sqlx::test(migrations = "../../migrations")]
-async fn attaching_an_identity_skips_a_shared_successor_and_the_audit_says_why(pool: PgPool) {
+async fn attaching_an_identity_attaches_a_shared_successor_and_flags_it_once(pool: PgPool) {
     seed_role(&pool, ROLE).await;
-    let (h, _) = human(&pool, "holder").await;
+    let (h, h_group) = human(&pool, "holder").await;
     let parent = register(&pool, &random32(), None, "g-166-ln-own").await;
-    {
-        let mut conn = pool.acquire().await.expect("acquire");
-        AgentRepository::link_operator(&mut conn, parent, h)
-            .await
-            .expect("link the parent");
-    }
+    link(&pool, parent, h).await;
     let shared_key = random32();
     let shared = register(&pool, &shared_key, Some(parent), "g-166-ln-own").await;
     assert_eq!(
@@ -1826,32 +1854,50 @@ async fn attaching_an_identity_skips_a_shared_successor_and_the_audit_says_why(p
         shared
     );
     let own = register(&pool, &random32(), Some(parent), "g-166-ln-own").await;
+    let grand_key = random32();
+    let grand = register(&pool, &grand_key, Some(own), "g-166-ln-own").await;
+    assert_eq!(
+        register(&pool, &grand_key, None, "g-166-ln-elsewhere-2").await,
+        grand
+    );
 
     let row = attach(&pool, ROLE, parent).await;
+    for (who, what) in [
+        (shared, "the shared successor"),
+        (own, "the unshared successor"),
+        (grand, "the shared grandchild"),
+    ] {
+        assert_eq!(
+            live_attachments(&pool, who).await,
+            vec![(ROLE.to_string(), Some(row))],
+            "{what} is attached with its ancestor"
+        );
+    }
+    let flagged = vec![(ROLE.to_string(), "shared_identity".to_string(), row)];
+    assert_eq!(
+        shared_copy_events(&pool, shared).await,
+        flagged,
+        "one event flags the shared successor"
+    );
+    assert_eq!(
+        shared_copy_events(&pool, grand).await,
+        flagged,
+        "one event flags the shared grandchild, not one per ancestor row"
+    );
     assert!(
-        live_attachments(&pool, shared).await.is_empty(),
-        "a shared successor is not attached with its ancestor"
+        shared_copy_events(&pool, own).await.is_empty(),
+        "CONTROL: the unshared successor carries no flag"
     );
-    let skipped: Vec<(String, String, Uuid)> = sqlx::query_as(
-        "SELECT details ->> 'role', details ->> 'reason', \
-                (details ->> 'attachment_id')::uuid \
-           FROM security_events \
-          WHERE event_type = 'platform.role_agent_copy_skipped' AND agent_id = $1",
-    )
-    .bind(shared)
-    .fetch_all(&pool)
-    .await
-    .expect("skip rows");
-    assert_eq!(
-        skipped,
-        vec![(ROLE.to_string(), "shared_identity".to_string(), row)],
-        "one audit row says why the shared successor was skipped"
+
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, shared, shared, h_group).await,
+        "the shared successor in a gap",
     );
-    assert_eq!(
-        live_attachments(&pool, own).await,
-        vec![(ROLE.to_string(), Some(row))],
-        "CONTROL: an unshared successor is attached"
-    );
+    grant(&pool, ROLE, h, None).await;
+    write_as(&pool, shared, shared, h_group)
+        .await
+        .expect("the shared successor writes while its human holds the role");
 }
 
 /// The identity attestor runs the registration (whose succession copy writes
