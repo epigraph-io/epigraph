@@ -968,17 +968,19 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_role_agent_write_check() FROM PUBLIC;
 
 -- Every public table the application role can INSERT, UPDATE or DELETE (at
--- table or column level) on a database migrated to this file, measured from
--- the catalog. `role_attached_agents.rs`
+-- table or column level): the list measured on a clean migrate to this file,
+-- UNION the set measured from THIS database's catalog when it runs, so a
+-- table a deployed database hands the application role beyond a clean
+-- migrate (an out-of-band or default-privilege grant) is covered too, never
+-- silently skipped. `role_attached_agents.rs`
 -- (`every_table_the_app_role_writes_carries_the_role_holder_write_check`)
--- re-measures it, so a table a later migration hands the application role
--- fails that test until it carries this trigger. Guarded per table, so a
--- database without one of them still migrates.
+-- re-measures the set on a clean migrate, and `tenancy_backfill verify`
+-- re-measures it on a deployed one (a later grant fails it). Guarded per
+-- table, so a database without one of the listed tables still migrates.
 DO $$
 DECLARE
-    v_table text;
-BEGIN
-    FOREACH v_table IN ARRAY ARRAY[
+    v_table  text;
+    v_tables text[] := ARRAY[
         'activities', 'agent_keys', 'agent_spans', 'agent_state_history', 'agents', 'analyses',
         'analysis_methods', 'behavioral_executions', 'bp_messages', 'challenges',
         'claim_cluster_membership', 'claim_clusters', 'claim_encryption', 'claim_frames',
@@ -998,7 +1000,27 @@ BEGIN
         'provenance_log', 'reasoning_traces', 'recall_events', 'refresh_tokens', 'rls_canary',
         'security_events', 'tasks', 'trace_parents', 'triples', 'webhook_subscriptions',
         'workflow_executions', 'workflows'
-    ] LOOP
+    ];
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        SELECT array_agg(t ORDER BY t) INTO v_tables
+          FROM (SELECT unnest(v_tables) AS t
+                UNION
+                SELECT c.relname::text
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+                   AND (has_table_privilege('epigraph_app', c.oid, 'INSERT')
+                        OR has_table_privilege('epigraph_app', c.oid, 'UPDATE')
+                        OR has_table_privilege('epigraph_app', c.oid, 'DELETE')
+                        OR EXISTS (SELECT 1 FROM pg_attribute a
+                                    WHERE a.attrelid = c.oid AND a.attnum > 0
+                                      AND NOT a.attisdropped
+                                      AND (has_column_privilege('epigraph_app', c.oid,
+                                                                a.attnum, 'INSERT')
+                                           OR has_column_privilege('epigraph_app', c.oid,
+                                                                   a.attnum, 'UPDATE'))))) u;
+    END IF;
+    FOREACH v_table IN ARRAY v_tables LOOP
         IF to_regclass('public.' || v_table) IS NOT NULL THEN
             EXECUTE format('DROP TRIGGER IF EXISTS role_agent_write_check ON public.%I',
                            v_table);
