@@ -3573,6 +3573,7 @@ async fn resolve_seeds(
             // than absorbed. See this function's doc.
             limit: i64::from(node_cap).saturating_add(1),
             offset: 0,
+            after: None,
         },
     )
     .await?;

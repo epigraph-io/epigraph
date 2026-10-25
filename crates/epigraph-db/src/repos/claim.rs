@@ -171,8 +171,14 @@ pub struct LabelQuery<'a> {
     pub min_truth: f64,
     /// Max rows returned.
     pub limit: i64,
-    /// Rows to skip, for paging `created_at DESC`.
+    /// Rows to skip, for paging `(created_at DESC, id DESC)`. Kept for
+    /// compatibility; prefer [`Self::after`], which does not drift.
     pub offset: i64,
+    /// Keyset position: return only rows strictly after this one in
+    /// `(created_at DESC, id DESC)` order. `None` starts at the newest row.
+    /// Unlike `offset`, a page boundary does not move when rows are inserted
+    /// or retired between pages.
+    pub after: Option<LabelCursor>,
 }
 
 impl Default for LabelQuery<'_> {
@@ -184,7 +190,71 @@ impl Default for LabelQuery<'_> {
             min_truth: 0.0,
             limit: 100,
             offset: 0,
+            after: None,
         }
+    }
+}
+
+/// A keyset position in [`ClaimRepository::list_by_labels`]'s
+/// `(created_at DESC, id DESC)` order: the last row of the previous page.
+///
+/// Callers see it only as the opaque token from [`Self::encode`], which the
+/// REST `GET /api/v1/claims/by-labels` and MCP `query_claims_by_label`
+/// surfaces hand out as the next-page cursor and accept back as `after`.
+/// A token names a row the caller was already served, and a forged one
+/// only moves the starting point of a read that stays viewer-filtered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelCursor {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: Uuid,
+}
+
+/// Version prefix of [`LabelCursor`]'s token, so a later format can be told
+/// apart (and an old one refused) rather than half-parsed.
+const LABEL_CURSOR_PREFIX: &str = "k1.";
+
+impl LabelCursor {
+    /// The cursor of `claim`, the last row of a page.
+    #[must_use]
+    pub fn of(claim: &Claim) -> Self {
+        Self {
+            created_at: claim.created_at,
+            id: claim.id.as_uuid(),
+        }
+    }
+
+    /// The next-page cursor for a page `rows` read with `limit`: the last
+    /// row's position when the page is full (more rows may follow), `None`
+    /// when it is short (the set is exhausted). `limit` is clamped exactly as
+    /// [`ClaimRepository::list_by_labels`] clamps it.
+    #[must_use]
+    pub fn next_page(rows: &[(Claim, Vec<String>)], limit: i64) -> Option<Self> {
+        let limit = usize::try_from(limit.clamp(1, 1000)).unwrap_or(usize::MAX);
+        if rows.len() < limit {
+            return None;
+        }
+        rows.last().map(|(c, _)| Self::of(c))
+    }
+
+    /// The opaque token: `k1.<created_at micros>.<id hex>`. URL-safe.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{LABEL_CURSOR_PREFIX}{}.{}",
+            self.created_at.timestamp_micros(),
+            self.id.simple()
+        )
+    }
+
+    /// Parse a token from [`Self::encode`]. `None` for anything else.
+    #[must_use]
+    pub fn decode(token: &str) -> Option<Self> {
+        let rest = token.strip_prefix(LABEL_CURSOR_PREFIX)?;
+        let (micros, id) = rest.split_once('.')?;
+        let micros: i64 = micros.parse().ok()?;
+        let created_at = chrono::DateTime::from_timestamp_micros(micros)?;
+        let id = Uuid::try_parse(id).ok()?;
+        Some(Self { created_at, id })
     }
 }
 
@@ -5190,7 +5260,16 @@ impl ClaimRepository {
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
-    /// Results are ordered by `created_at DESC` and filtered by optional truth threshold.
+    /// Results are ordered by `(created_at DESC, id DESC)`, a total order, and
+    /// filtered by optional truth threshold.
+    ///
+    /// # Paging
+    /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
+    ///   taken from the previous page with [`LabelCursor::next_page`]. A
+    ///   boundary does not drift when rows are inserted or retired between
+    ///   pages, and the database never reads and discards skipped rows.
+    /// - `offset` (compatibility): skip N rows. It still applies when `after`
+    ///   is set, but the API surfaces refuse that combination.
     ///
     /// # Filters
     /// - `exclude_labels`: drop any claim whose label set intersects this
@@ -5221,6 +5300,7 @@ impl ClaimRepository {
             min_truth,
             limit,
             offset,
+            after,
         } = query;
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -5247,12 +5327,13 @@ impl ClaimRepository {
               AND c.truth_value >= $2
               AND ($3::text[] = '{}'::text[] OR NOT (c.labels && $3))
               AND ($4 = false OR COALESCE(c.is_current, true) = true)
+              AND ($7::timestamptz IS NULL OR (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
               /* {VISIBILITY:c} */
-            ORDER BY c.created_at DESC
+            ORDER BY c.created_at DESC, c.id DESC
             LIMIT $5
             OFFSET $6
             "#,
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(labels)
@@ -5260,7 +5341,9 @@ impl ClaimRepository {
             .bind(exclude_labels)
             .bind(current_only)
             .bind(limit)
-            .bind(offset);
+            .bind(offset)
+            .bind(after.map(|a| a.created_at))
+            .bind(after.map(|a| a.id));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

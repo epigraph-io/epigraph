@@ -2624,6 +2624,7 @@ pub async fn list_by_labels(
             min_truth,
             limit,
             offset,
+            after: None,
         },
     )
     .await

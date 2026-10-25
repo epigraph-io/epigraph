@@ -341,6 +341,7 @@ pub async fn query_claims_by_label(
             min_truth,
             limit,
             offset,
+            after: None,
         },
     )
     .await
