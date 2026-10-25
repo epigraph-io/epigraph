@@ -1407,6 +1407,9 @@ async fn restate_as(
 ///   genuinely RETIRED identity attached to the same role lands;
 /// * CONTROL: a privileged session restating the attached agent's claim lands;
 /// * CONTROL: the human naming the agent on a FRESH claim is refused.
+/// * CONTROL WHILE HELD: the sibling's and the human's restatements of the
+///   attached agent's retired claims land (the refusals above are the gap,
+///   not a rule against inherited authors).
 ///
 /// Verified to fail: the author check in `epigraph_require_attributable`
 /// skipped whenever `p_inherited` is true (the sibling's and the human's
@@ -1436,7 +1439,7 @@ async fn a_restatement_names_an_attached_author_only_while_held_unless_it_is_ret
     arm(&pool).await;
 
     let mut retired = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..6 {
         retired.push(
             write_as(&pool, attached, attached, h_group)
                 .await
@@ -1450,6 +1453,12 @@ async fn a_restatement_names_an_attached_author_only_while_held_unless_it_is_ret
             .await
             .expect("retire the predecessor (privileged setup)");
     }
+    restate_as(&pool, sibling, attached, h_group, retired[4])
+        .await
+        .expect("CONTROL while held: the sibling restates the attached agent's claim");
+    restate_as(&pool, h, attached, h_group, retired[5])
+        .await
+        .expect("CONTROL while held: the human restates the attached agent's claim");
     end_assignment(&pool, assignment).await;
 
     assert_rol01(
