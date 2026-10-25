@@ -1700,6 +1700,170 @@ async fn a_seal_keeps_an_outsiders_challenge_and_deletes_an_insiders(pool: PgPoo
     );
 }
 
+/// Rulings R-3 x R-5: after a seal, the challenge the seal KEPT (an
+/// outsider's public, writer-owned row on a now sealed claim) is still
+/// resolvable by the claim's owner, and by nobody else, and it is no existence
+/// oracle for the sealed claim through the resolution definer either.
+///
+/// A stranger and the outsider itself (neither can read the sealed claim)
+/// get exactly the `(sqlstate, text)` a random id gets, and nothing is
+/// written or audited; a writer of the claim's group then sets the status,
+/// which lands with an audit row naming it, and every non-resolution column
+/// of the kept row is unchanged. A definer that judged readability by the
+/// CHALLENGE row (public) instead of its claim would answer the stranger with
+/// the owner refusal (42501) instead of "not found".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_claims_kept_challenge_is_resolved_only_by_the_claims_owner(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-res-outsider").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-res-stranger").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a public finding, sealed, then its challenge resolved', $2, 0.5, $3, \
+                 true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(world.author)
+    .bind(world.group)
+    .execute(&pool)
+    .await
+    .expect("seed a public claim in the seal target's group");
+    let p = pool.clone();
+    let theirs: Uuid = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, outsider).await;
+        let id = epigraph_db::ChallengeRepository::create(
+            &mut *conn,
+            claim,
+            Some(outsider),
+            "factual_error",
+            "the outsider's objection, kept by the seal",
+        )
+        .await;
+        (conn, id)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("restrict the claim before sealing it");
+    let payload = seal_payload(&pool, claim).await;
+    let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+    assert_eq!(sealed, vec![claim], "CALIBRATION: the claim was sealed");
+
+    let row = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT to_jsonb(ch) FROM challenges ch WHERE ch.id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read a challenge")
+        }
+    };
+    let audit = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT agent_id FROM security_events \
+                  WHERE event_type = 'challenges.claim_owner_resolution' \
+                    AND details->>'challenge_id' = $1::text",
+            )
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .expect("read the resolution audit")
+        }
+    };
+    let before = row(theirs).await;
+    assert_eq!(
+        (before["writer_owned"].clone(), before["visibility"].clone()),
+        (serde_json::json!(true), serde_json::json!("public")),
+        "CALIBRATION: the seal kept the outsider's public, writer-owned row"
+    );
+
+    let sqlstate = |e: &sqlx::Error| {
+        e.as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned())
+    };
+    let missing = Uuid::new_v4();
+    let p = pool.clone();
+    let answers = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let mut out = Vec::new();
+        for (who, agent) in [("stranger", stranger), ("outsider", outsider)] {
+            stamp_as(&mut conn, &p, agent).await;
+            let hidden = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn, theirs, "accepted", None,
+            )
+            .await;
+            let random = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn, missing, "accepted", None,
+            )
+            .await;
+            out.push((who, hidden, random));
+        }
+        (conn, out)
+    })
+    .await;
+    for (who, hidden, random) in &answers {
+        let hidden = hidden.as_ref().expect_err("a non-reader resolves nothing");
+        let random = random.as_ref().expect_err("a random id resolves nothing");
+        assert_eq!(
+            (sqlstate(hidden), hidden.to_string()),
+            (sqlstate(random), random.to_string()),
+            "{who}: the sealed claim's kept challenge answers exactly as a random id"
+        );
+    }
+    assert_eq!(row(theirs).await, before, "the refusals wrote nothing");
+    assert!(
+        audit(theirs).await.is_empty(),
+        "the refusals audited nothing"
+    );
+
+    let p = pool.clone();
+    let author = world.author;
+    let landed = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, author).await;
+        let r = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+            &mut *conn,
+            theirs,
+            "accepted",
+            Some(&serde_json::json!({ "reason": "sealed, still answered" })),
+        )
+        .await;
+        (conn, r)
+    })
+    .await;
+    landed.expect("a writer of the sealed claim's group sets the kept challenge's status");
+    let after = row(theirs).await;
+    assert_eq!(after["state"], "accepted");
+    assert_eq!(after["resolved_by"], author.to_string());
+    assert_eq!(
+        audit(theirs).await,
+        vec![Some(author)],
+        "one audit row naming the resolver"
+    );
+    let strip = |mut v: serde_json::Value| {
+        for col in ["state", "resolved_by", "resolved_at", "resolution_details"] {
+            v.as_object_mut().expect("a row object").remove(col);
+        }
+        v
+    };
+    assert_eq!(
+        strip(after),
+        strip(before),
+        "every non-resolution column of the kept row is unchanged"
+    );
+}
+
 #[test]
 fn the_fixture_seeds_exactly_the_tables_the_seal_deletes() {
     assert_eq!(
