@@ -2992,3 +2992,173 @@ async fn the_166_undo_restores_the_catalog_below_166(pool: PgPool) {
         .await
         .expect("after the undo the formerly attached agent's armed write lands");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Completion round: pins on the author arm
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sql` (`$1` the target, `$2` a second agent id) on an `epigraph_app`
+/// connection stamped as `who`, or, with `who = None`, carrying NO principal
+/// with the valve off (so OPL01 is relieved and only ROL01 can refuse).
+async fn run_as(
+    pool: &PgPool,
+    who: Option<Uuid>,
+    group: Uuid,
+    sql: &'static str,
+    target: Uuid,
+    other: Uuid,
+) -> Result<u64, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        match who {
+            Some(w) => stamp(&mut conn, w, &[group]).await,
+            None => {
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', '', false), \
+                            set_config('epigraph.group_ids', $1, false), \
+                            set_config('epigraph.writable_group_ids', $1, false), \
+                            set_config('epigraph.operator_link_enforcement', 'off', false)",
+                )
+                .bind(group.to_string())
+                .execute(&mut *conn)
+                .await
+                .expect("no principal, valve off");
+            }
+        }
+        let r = sqlx::query(sql)
+            .bind(target)
+            .bind(other)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve reset");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The author-arm classes: what another principal may not do to an attached
+/// agent's claim in its gap. `$1` is the claim, `$2` unused but bound.
+const AUTHOR_CLASSES: &[(&str, &str)] = &[
+    (
+        "content UPDATE",
+        "UPDATE claims SET content = content || ' (edited)' WHERE id = $1 AND $2::uuid IS NOT NULL",
+    ),
+    (
+        "labels UPDATE",
+        "UPDATE claims SET labels = array_append(COALESCE(labels, '{}'), 'relabelled') \
+          WHERE id = $1 AND $2::uuid IS NOT NULL",
+    ),
+    (
+        "properties UPDATE",
+        "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"probe\": 1}' \
+          WHERE id = $1 AND $2::uuid IS NOT NULL",
+    ),
+    (
+        "retire (is_current = false)",
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1 AND $2::uuid IS NOT NULL",
+    ),
+    (
+        "DELETE",
+        "DELETE FROM claims WHERE id = $1 AND $2::uuid IS NOT NULL",
+    ),
+];
+
+/// THE AUTHOR ARM, EVERY CLASS, FOR EVERY OTHER PRINCIPAL. After an attached
+/// agent's holder's assignment ends, neither its human nor a session with no
+/// principal (valve off) changes what the agent's claim says, relabels it,
+/// edits its properties, retires it or deletes it. Each refusal is ROL01.
+/// (Re-attributing a claim is not in the table: 153 refuses every
+/// application re-attribution OPL02, attached or not.)
+/// * CONTROL, each class and each principal: the same statement on an
+///   UNATTACHED agent's claim lands (one row), so the refusal is the rule,
+///   not row security or a missing grant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_other_principal_rewrites_an_attached_agents_claim_after_the_end(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    end_assignment(&pool, assignment).await;
+
+    let mut admitted = Vec::new();
+    for (who, label) in [(Some(h), "the human"), (None, "a no-principal session")] {
+        for (what, sql) in AUTHOR_CLASSES {
+            let own = insert_claim(&pool, plain, h_group).await.expect("claim");
+            let r = run_as(&pool, who, h_group, sql, own, plain).await;
+            assert_eq!(
+                r.as_ref().ok(),
+                Some(&1),
+                "CONTROL: {label}'s {what} of an unattached agent's claim lands: {r:?}"
+            );
+            let target = insert_claim(&pool, attached, h_group).await.expect("claim");
+            let r = run_as(&pool, who, h_group, sql, target, plain).await;
+            if code_of(&r).as_deref() != Some(ROL01) {
+                admitted.push(format!("{label}: {what}: {r:?}"));
+            }
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "after the end every author-arm class must be refused ROL01; not refused: {admitted:#?}"
+    );
+}
+
+/// The real supersede path (`ClaimRepository::supersede_act_conn`) retires the
+/// predecessor and inserts its successor in one transaction. A human's
+/// supersede of its attached agent's CURRENT claim, after the end, is refused
+/// ROL01 as a whole: retiring the predecessor changes what the agent's claim
+/// says. CONTROL: the same human supersedes its unattached agent's claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_humans_supersede_of_an_attached_agents_claim_is_refused_after_the_end(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let theirs = insert_claim(&pool, attached, h_group).await.expect("claim");
+    let own = insert_claim(&pool, plain, h_group).await.expect("claim");
+    end_assignment(&pool, assignment).await;
+
+    let supersede = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                stamp(&mut conn, h, &[h_group]).await;
+                sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+                let r = epigraph_db::ClaimRepository::supersede_act_conn(
+                    &mut conn,
+                    epigraph_core::ClaimId::from(claim),
+                    "a restatement after the end",
+                    epigraph_core::TruthValue::new(0.6).expect("truth"),
+                    "completion-round pin",
+                )
+                .await;
+                sqlx::query("ROLLBACK")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("rollback");
+                unstamp(&mut conn).await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    supersede(own)
+        .await
+        .expect("CONTROL: the human supersedes its unattached agent's claim");
+    let refused = supersede(theirs).await;
+    assert!(
+        matches!(refused, Err(epigraph_db::DbError::RoleHolderRequired { .. })),
+        "the human's supersede of the attached agent's claim after the end: {refused:?}"
+    );
+}
