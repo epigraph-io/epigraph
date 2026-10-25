@@ -23,6 +23,7 @@ pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
 pub mod belief_modes;
+pub mod belief_profile;
 pub mod belief_query;
 pub mod belief_view;
 pub mod bp;

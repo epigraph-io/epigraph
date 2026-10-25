@@ -22,10 +22,10 @@ use epigraph_db::repos::claim_role::leaf_closure_batch;
 use epigraph_db::{EvidenceRepository, FrameRepository};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
+use crate::belief_profile::{overrides_in, BeliefProfile, FrameTier};
 use crate::belief_query::FramedBeliefContext;
 use crate::edge_factor::{
-    effective_source_strength_with_perspective, resolve_hypothesis_index, PerspectiveReliability,
-    CLAIM_VALIDITY_FRAME_ID,
+    effective_source_strength_profiled, resolve_hypothesis_index, CLAIM_VALIDITY_FRAME_ID,
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 use crate::source_dependence::{
@@ -259,7 +259,9 @@ impl EvidencedInterval {
         Self {
             belief: 0.0,
             plausibility: 1.0,
+            // belief-profile: allow-literal (the vacuous interval's BetP on a binary frame)
             pignistic_prob: 0.5,
+            // belief-profile: allow-literal (the vacuous interval's BetP on a binary frame)
             pignistic_false: 0.5,
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
@@ -369,15 +371,16 @@ pub async fn atom_axiom_rows(
 /// Each kept row is coarsened to `binary_truth` (a claim at hypothesis
 /// index 1 of a 2-hypothesis frame has its literals swapped;
 /// `claim_validity` maps supported → T, refuted → F, uncertain → Θ),
-/// discounted by α = `effective_source_strength_with_perspective` on the
-/// row's own frame under the lens of `ctx`, and keyed by
+/// discounted by α = `effective_source_strength_profiled` under
+/// [`FramedBeliefContext::profile_for_frame`] of the row's own frame (the
+/// lens of `ctx`, with that frame's tier), and keyed by
 /// [`crate::source_dependence::item_key`] over the cited evidence the viewer
 /// can see. No `asserting_paper` is passed: the ingest rekey (SPEC §4.3)
 /// resolves those rows' papers, so until then an `auto_wire` row is its own
 /// item.
 ///
-/// A claim with no row left is absent from the map. The frame-scoped fields
-/// of `ctx` are not read: each row's own frame overrides apply.
+/// A claim with no row left is absent from the map. The frame tier of `ctx`
+/// is not read: each row's own frame tier applies.
 ///
 /// A stored row that cannot be parsed or coarsened is skipped and logged
 /// (with its row id): it is no input, so it neither fails the batch nor
@@ -498,7 +501,8 @@ pub(crate) fn read_rows(inputs: Vec<AtomInputRow>) -> Result<Vec<ReadRow>, Strin
 }
 
 /// Discount each read row by α under the lens of `ctx` (each row's own
-/// frame's overrides) and key it by its canonical source, as `viewer` sees
+/// frame's tier, [`FramedBeliefContext::profile_for_frame`]) and key it by
+/// its canonical source, as `viewer` sees
 /// the evidence it cites. A positive compound-source edge row is read
 /// one-sided first. Rows come back in input order.
 ///
@@ -513,8 +517,11 @@ pub(crate) async fn key_and_discount(
     if kept.is_empty() {
         return Ok(Vec::new());
     }
-    // Per-frame reliability overrides, once per frame.
-    let mut overrides: HashMap<Uuid, FrameOverrides> = HashMap::new();
+    // The profile each frame's rows fold under: the lens of `ctx` with that
+    // frame's tier (its two dedicated keys and its `belief_profile` object),
+    // resolved once per frame. The reads are best-effort like the framed
+    // read's: a failed one is no override at that tier.
+    let mut profiles: HashMap<Uuid, BeliefProfile> = HashMap::new();
     for frame_id in kept
         .iter()
         .map(|(r, _, _)| r.row.frame_id)
@@ -528,7 +535,16 @@ pub(crate) async fn key_and_discount(
             .await
             .ok()
             .flatten();
-        overrides.insert(frame_id, (intra, weights));
+        let frame_row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
+            .await
+            .ok()
+            .flatten();
+        let profile = ctx.profile_for_frame(FrameTier {
+            overrides: frame_row.as_ref().and_then(|f| overrides_in(&f.properties)),
+            intra_evidence_locality_factor: intra,
+            evidence_type_weights: weights.as_ref(),
+        });
+        profiles.insert(frame_id, profile);
     }
 
     // The cited evidence each row's key reads, as the viewer sees it.
@@ -542,7 +558,6 @@ pub(crate) async fn key_and_discount(
         .await
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
-    let no_lens = PerspectiveReliability::default();
     let mut out: Vec<AxiomRow> = Vec::with_capacity(kept.len());
     for (r, class, mut coarse) in kept {
         if let AxiomClass::EdgeFactor {
@@ -556,14 +571,10 @@ pub(crate) async fn key_and_discount(
                 coarse = without_disbelief(&coarse);
             }
         }
-        let (intra, weights) = overrides.get(&r.row.frame_id).cloned().unwrap_or_default();
-        let alpha = effective_source_strength_with_perspective(
-            &r.row,
-            intra,
-            weights.as_ref(),
-            &ctx.calibration,
-            ctx.perspective.as_ref().unwrap_or(&no_lens),
-        );
+        let profile = profiles
+            .get(&r.row.frame_id)
+            .ok_or_else(|| format!("no profile resolved for frame {}", r.row.frame_id))?;
+        let alpha = effective_source_strength_profiled(&r.row, profile);
         let bba = combination::discount(&coarse, alpha).map_err(|e| format!("discount: {e}"))?;
         let cited = cited_evidence(&r);
         let evidence = cited.and_then(|id| {
@@ -595,15 +606,13 @@ pub(crate) async fn key_and_discount(
     Ok(out)
 }
 
-/// A frame's `(intra_evidence_locality_factor, evidence_type_weights)`.
-type FrameOverrides = (Option<f64>, Option<HashMap<String, f64>>);
-
 /// `combination_method` of the author's `truth_value` seed
 /// (`epigraph_mcp::tools::ds_auto::TRUTH_VALUE_SEED_METHOD`).
 const SEED_METHOD: &str = "truth_value_seed";
 /// `combination_method` of the CDST auto-assessment.
 const AUTO_CDST_METHOD: &str = "auto_cdst";
 /// `combination_method`s of propagated BBAs.
+// belief-profile: allow-literal (array length of a fixed method list)
 const PROPAGATED_METHODS: [&str; 2] = ["propagated_from_parent", "propagated_from_neighbor"];
 /// `combination_method` of a hypothesis' experiment-derived BBA, and of its
 /// promoted `research_validity` copy.
@@ -725,6 +734,7 @@ fn coarsen_to_binary(
             *out.entry(to).or_insert(0.0) += m;
         }
     } else {
+        // belief-profile: allow-literal (the binary frame's hypothesis count)
         let swap = resolve_hypothesis_index(r.hypothesis_index, 2) == 1;
         for (fe, &m) in stored.focal_elements() {
             let subset = if swap {
@@ -770,9 +780,26 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
 /// goes to Θ (Bel 0, Pl 1). A derivation that must agree with this fold on
 /// one leaf (D11) has to use the same K = 1 convention.
 ///
+/// This is the fold under the served profile ([`BeliefProfile::served`]);
+/// a fold under a lens takes that lens's profile through
+/// [`atom_fold_under`].
+///
 /// # Errors
 /// Rows of more than one atom, or a Dempster step that errors.
 pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
+    atom_fold_under(rows, BeliefProfile::served())
+}
+
+/// [`atom_fold`] under `profile`: the Dempster fold across items takes the
+/// profile's `combination.conflict_threshold` (carried, and not consumed by
+/// `combine_multiple` today, like every fold's).
+///
+/// # Errors
+/// Rows of more than one atom, or a Dempster step that errors.
+pub fn atom_fold_under(
+    rows: &[AxiomRow],
+    profile: &BeliefProfile,
+) -> Result<EvidencedInterval, String> {
     let Some(first) = rows.first() else {
         return Ok(EvidencedInterval::unproven());
     };
@@ -795,7 +822,8 @@ pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
     let for_fold: Vec<MassFunction> = items.iter().filter_map(|it| it.on(atom).cloned()).collect();
     let n = for_fold.len();
     let (combined, conflict) =
-        dempster_across_items(for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
+        dempster_across_items(for_fold, profile.combination.conflict_threshold)
+            .map_err(|e| format!("atom_fold: {e}"))?;
     let t = FocalElement::positive(BTreeSet::from([0]));
     Ok(EvidencedInterval {
         belief: measures::belief(&combined, &t),

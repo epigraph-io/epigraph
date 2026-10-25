@@ -612,23 +612,24 @@ fn restates_bba(
     )
 }
 
-/// The calibration the belief recompute itself uses — same loader, same
-/// fallback as `edge_factor::compute_combined_belief` — so a vocabulary
-/// verdict here agrees with what the combine will actually do.
-fn recompute_calibration() -> epigraph_engine::calibration::CalibrationConfig {
-    epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(|_| {
-        epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
-    })
+/// The belief profile the recompute folds under before any frame tier: the
+/// served (default) profile, whose weight and alias tables come from
+/// `calibration.toml` and its `[belief_profiles]` table. A vocabulary verdict
+/// read from it agrees with the weights `edge_factor::compute_combined_belief`
+/// resolves (a frame's own `evidence_type_weights` key is checked separately,
+/// in [`evidence_type_resolves`]).
+fn recompute_profile() -> &'static epigraph_engine::belief_profile::BeliefProfile {
+    epigraph_engine::belief_profile::BeliefProfile::served()
 }
 
-/// Every evidence-type key the calibration resolves (canonical keys and
+/// Every evidence-type key the served profile resolves (canonical keys and
 /// aliases), sorted — what a caller told its key is unknown needs to see.
 pub(crate) fn known_evidence_type_keys() -> Vec<String> {
-    let c = recompute_calibration();
-    let mut keys: Vec<String> = c
+    let r = &recompute_profile().reliability;
+    let mut keys: Vec<String> = r
         .evidence_type_weights
         .keys()
-        .chain(c.evidence_type_aliases.keys())
+        .chain(r.evidence_type_aliases.keys())
         .cloned()
         .collect();
     keys.sort();
@@ -638,7 +639,7 @@ pub(crate) fn known_evidence_type_keys() -> Vec<String> {
 
 /// Would the recompute resolve `evidence_type` to a real weight for a BBA on
 /// `frame_id` rather than the 0.5 unknown-type fallback? True when it is in the
-/// engine's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key`])
+/// served profile's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key_in`])
 /// or the frame's own strict-key `evidence_type_weights` override names it
 /// (Tier 1 of `effective_source_strength`).
 ///
@@ -647,7 +648,7 @@ pub(crate) fn known_evidence_type_keys() -> Vec<String> {
 /// yes/no about the caller's own key. A failed read counts as "no override",
 /// matching the recompute's own `.ok().flatten()`.
 async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, et: &str) -> bool {
-    if epigraph_engine::edge_factor::is_known_evidence_type_key(et, &recompute_calibration()) {
+    if epigraph_engine::edge_factor::is_known_evidence_type_key_in(et, recompute_profile()) {
         return true;
     }
     FrameRepository::get_per_frame_evidence_type_weights(&server.pool, frame_id)
