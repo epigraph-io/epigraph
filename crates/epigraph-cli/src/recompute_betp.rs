@@ -735,17 +735,24 @@ async fn resync_scoped_rows(
     compound_source_edges: CompoundSourceEdges,
     log: &WaveLog,
 ) -> Result<(usize, usize), String> {
-    let rows: Vec<ScopedRow> = sqlx::query_as(
+    // The caller resyncs only a claim it has just re-read as this wave's
+    // atom role; the read also refuses a compound's rows itself, so no path
+    // rewrites a compound's scoped rows from an atom fold.
+    let sql = format!(
         "SELECT d.id, d.frame_id, d.scope_type, d.scope_id, d.belief, d.plausibility, \
                 d.mass_on_empty, d.mass_on_missing, d.conflict_k, d.strategy_used, \
                 d.pignistic_prob, array_length(f.hypotheses, 1) \
            FROM ds_combined_beliefs d JOIN frames f ON f.id = d.frame_id \
-          WHERE d.claim_id = $1 ORDER BY d.id FOR UPDATE OF d",
-    )
-    .bind(claim_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("scoped rows: {e}"))?;
+          WHERE d.claim_id = $1 \
+            AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.id = d.claim_id AND {}) \
+          ORDER BY d.id FOR UPDATE OF d",
+        epigraph_db::repos::claim_role::is_compound_sql("c")
+    );
+    let rows: Vec<ScopedRow> = sqlx::query_as(&sql)
+        .bind(claim_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("scoped rows: {e}"))?;
     if rows.is_empty() {
         return Ok((0, 0));
     }
