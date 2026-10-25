@@ -15,9 +15,13 @@ record, plus the belief re-derivation.
 The database is READ ONLY here (a read-only session): it picks canonicals and
 skips members already retired. Until 2026-10 the script marked duplicates with
 its own SQL (a raw `UPDATE claims` and hand-written, lossy re-pointing), which
-wrote no identity edge, so those marks cannot be un-marked and the index view
-does not see them. Backfilling identity edges for marks made that way is a
-separate operator task, not this script's.
+wrote no identity edge. Those marks are un-markable once an operator's
+`backfill_dedup_identity_edges --apply` (epigraph-cli) has written the edge:
+`unmark_duplicate` then makes the claim current again and restores nothing
+(that SQL kept no repair record; the answer says `legacy_mark`). A legacy mark
+the backfill cannot reconstruct is refused with the reason. Until backfilled,
+the index view does not see them. The backfill is an operator task, not this
+script's.
 
 This is the *S3 fuzzy* layer (cross-agent semantic equivalence). The S2
 content-hash-keyed dedup that gates migration 107 is a separate tool.
@@ -44,7 +48,8 @@ Skips:
 - A request that gets no HTTP answer (refused, reset, timed out) counts as a
   refusal for that duplicate; the cluster's other marks still count.
 - A member labelled `deduped` (a pre-2026-10 mark by this script) is treated
-  the same way.
+  the same way while it is retired. Once un-marked it is current again (the
+  label stays on it) and is an ordinary member.
 """
 
 from __future__ import annotations
