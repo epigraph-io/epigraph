@@ -397,11 +397,209 @@ pub async fn atom_axiom_rows_under(
     ctx: &FramedBeliefContext,
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
+    let kept = select_atom_rows(&mut *conn, viewer, ids, mode, compound_source_edges).await?;
+    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
+    for row in key_and_discount(conn, viewer, kept, ctx).await? {
+        out.entry(row.atom_id).or_default().push(row);
+    }
+    Ok(out)
+}
+
+/// One row of an atom's AEF input as the drift decomposition reads it
+/// (SPEC §10.4): the [`AxiomRow`] the fold reads, plus what the
+/// decomposition needs to fold it the ways the fold does not (the legacy
+/// source grouping, the two-sided read of a compound-source edge row, the
+/// fold without attribution). Only [`atom_drift_rows`] builds one.
+#[derive(Debug, Clone)]
+pub struct DriftRow {
+    axiom: AxiomRow,
+    two_sided_bba: MassFunction,
+    legacy_key: Option<crate::source_dependence::SourceKey>,
+    frame_id: Uuid,
+    perspective_id: Option<Uuid>,
+    attributed: bool,
+}
+
+impl DriftRow {
+    /// The row as the fold reads it.
+    #[must_use]
+    pub const fn axiom(&self) -> &AxiomRow {
+        &self.axiom
+    }
+
+    /// The stored row's own frame (before coarsening).
+    #[must_use]
+    pub const fn frame_id(&self) -> Uuid {
+        self.frame_id
+    }
+
+    /// The stored row's `perspective_id`.
+    #[must_use]
+    pub const fn perspective_id(&self) -> Option<Uuid> {
+        self.perspective_id
+    }
+
+    /// An `attributed_v1` row (SPEC §5.3).
+    #[must_use]
+    pub const fn is_attributed(&self) -> bool {
+        self.attributed
+    }
+
+    /// An edge-factor row whose edge's source is a compound.
+    #[must_use]
+    pub const fn is_compound_source(&self) -> bool {
+        is_compound_source(self.axiom.class)
+    }
+}
+
+/// The [`AxiomMode::Display`] rows of each atom under no lens, exactly as
+/// the single atom-cache writer reads them under `compound_source_edges`, as
+/// [`DriftRow`]s. Writes nothing.
+///
+/// # Errors
+/// A database read.
+pub async fn atom_drift_rows(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    compound_source_edges: CompoundSourceEdges,
+) -> Result<HashMap<Uuid, Vec<DriftRow>>, String> {
+    let ctx = FramedBeliefContext::global();
+    let kept = select_atom_rows(
+        &mut *conn,
+        viewer,
+        ids,
+        AxiomMode::Display,
+        compound_source_edges,
+    )
+    .await?;
+    let stored: Vec<epigraph_db::MassFunctionRow> =
+        kept.iter().map(|(r, _, _)| r.row.clone()).collect();
+    // In input order, one per kept row: aligned with `stored`.
+    let rows = key_and_discount_two_sided(&mut *conn, viewer, kept, &ctx).await?;
+    let keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &stored)
+        .await
+        .map_err(|e| format!("evidence source_url read: {e}"))?;
+    debug_assert_eq!(rows.len(), stored.len());
+    debug_assert_eq!(keys.len(), stored.len());
+    let mut out: HashMap<Uuid, Vec<DriftRow>> = HashMap::new();
+    for (((axiom, two_sided_bba), stored), legacy_key) in rows.into_iter().zip(stored).zip(keys) {
+        out.entry(axiom.atom_id).or_default().push(DriftRow {
+            frame_id: stored.frame_id,
+            perspective_id: stored.perspective_id,
+            attributed: stored.combination_method.as_deref()
+                == Some(crate::source_dependence::ATTRIBUTED_METHOD),
+            axiom,
+            two_sided_bba,
+            legacy_key,
+        });
+    }
+    Ok(out)
+}
+
+/// BetP(TRUE) of `rows` folded the LEGACY way, by the agent-bound
+/// [`crate::source_dependence::SourceKey`] grouping of
+/// [`crate::source_dependence::combine_with_source_dependence`], over the
+/// rows the AEF reads (SPEC §10.4 stages (3), (3a), (3b)). `attributed_v1`
+/// rows are left out (they enter at stage (4)); `two_sided` reads a positive
+/// compound-source edge row with its m(F) (stage (3)) instead of one-sided
+/// (stage (3a)); `with_compound_source` false drops those rows (stage (3b)).
+/// No row left is the vacuous .5, as [`atom_fold`] of nothing.
+///
+/// # Errors
+/// A Dempster step that errors.
+pub fn drift_legacy_grouping_betp(
+    rows: &[DriftRow],
+    two_sided: bool,
+    with_compound_source: bool,
+) -> Result<f64, String> {
+    let items: Vec<(Option<crate::source_dependence::SourceKey>, MassFunction)> = rows
+        .iter()
+        .filter(|r| !r.attributed)
+        .filter(|r| with_compound_source || !r.is_compound_source())
+        .map(|r| {
+            let bba = if two_sided {
+                r.two_sided_bba.clone()
+            } else {
+                r.axiom.bba.clone()
+            };
+            (r.legacy_key.clone(), bba)
+        })
+        .collect();
+    if items.is_empty() {
+        return Ok(EvidencedInterval::unproven().pignistic_prob());
+    }
+    let (combined, _) = crate::source_dependence::combine_with_source_dependence(items, 0.9)
+        .map_err(|e| format!("combine_with_source_dependence: {e}"))?;
+    Ok(measures::pignistic_probability(&combined, 0))
+}
+
+/// [`atom_fold`] of `rows`, with or without their `attributed_v1` rows
+/// (SPEC §10.4 stages (3c) and (4)). With them, this is the value the single
+/// atom-cache writer stores for rows read under the same setting.
+///
+/// # Errors
+/// As [`atom_fold`].
+pub fn drift_atom_fold(
+    rows: &[DriftRow],
+    with_attributed: bool,
+) -> Result<EvidencedInterval, String> {
+    let axioms: Vec<AxiomRow> = rows
+        .iter()
+        .filter(|r| with_attributed || !r.attributed)
+        .map(|r| r.axiom.clone())
+        .collect();
+    atom_fold(&axioms)
+}
+
+/// [`atom_fold`] of the rows stored on `frame_id` whose `perspective_id` is
+/// in `perspectives` (every row on the frame when `None`): the fold of one
+/// scope's evidence on one frame, for resyncing an atom's per-frame,
+/// per-scope `ds_combined_beliefs` row (SPEC §7.2), which holds the fold of
+/// exactly that frame's rows in that scope. `None` when no row matches.
+///
+/// # Errors
+/// As [`atom_fold`].
+pub fn drift_scope_fold(
+    rows: &[DriftRow],
+    frame_id: Uuid,
+    perspectives: Option<&BTreeSet<Uuid>>,
+) -> Result<Option<EvidencedInterval>, String> {
+    let axioms: Vec<AxiomRow> = rows
+        .iter()
+        .filter(|r| r.frame_id == frame_id)
+        .filter(|r| {
+            perspectives.is_none_or(|set| r.perspective_id.is_some_and(|p| set.contains(&p)))
+        })
+        .map(|r| r.axiom.clone())
+        .collect();
+    if axioms.is_empty() {
+        return Ok(None);
+    }
+    atom_fold(&axioms).map(Some)
+}
+
+/// Steps 1 to 4 of [`atom_axiom_rows_under`] (see there): the stored rows
+/// some fold of `ids` reads under `mode` and `compound_source_edges`, each
+/// classified and coarsened by [`read_rows`], in row order, not yet
+/// discounted or keyed. [`atom_axiom_rows_under`] and [`atom_drift_rows`]
+/// both select through this, so the drift decomposition reads exactly the
+/// rows the single atom-cache writer folds.
+///
+/// # Errors
+/// A database read.
+async fn select_atom_rows(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    mode: AxiomMode,
+    compound_source_edges: CompoundSourceEdges,
+) -> Result<Vec<ReadRow>, String> {
     let inputs = atom_input_rows(&mut *conn, viewer, ids, CLAIM_VALIDITY_FRAME_ID)
         .await
         .map_err(|e| format!("atom_input_rows: {e}"))?;
     if inputs.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(Vec::new());
     }
 
     // Step 1, the class of each row, and its coarsening. A row that cannot be
@@ -457,15 +655,7 @@ pub async fn atom_axiom_rows_under(
     if mode == AxiomMode::Pure {
         kept.retain(|(_, class, _)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
     }
-    if kept.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
-    for row in key_and_discount(conn, viewer, kept, ctx).await? {
-        out.entry(row.atom_id).or_default().push(row);
-    }
-    Ok(out)
+    Ok(kept)
 }
 
 /// A stored row read for a fold: the row, its class, and its BBA coarsened to
@@ -514,6 +704,26 @@ pub(crate) async fn key_and_discount(
     kept: Vec<ReadRow>,
     ctx: &FramedBeliefContext,
 ) -> Result<Vec<AxiomRow>, String> {
+    Ok(key_and_discount_two_sided(conn, viewer, kept, ctx)
+        .await?
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect())
+}
+
+/// [`key_and_discount`], each row paired with its BBA discounted by the same
+/// α WITHOUT the one-sided read of a positive compound-source edge row (the
+/// row's own `bba` on every other row), which the drift decomposition folds
+/// at SPEC §10.4 stage (3). Rows come back in input order, one per input.
+///
+/// # Errors
+/// As [`key_and_discount`].
+async fn key_and_discount_two_sided(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    kept: Vec<ReadRow>,
+    ctx: &FramedBeliefContext,
+) -> Result<Vec<(AxiomRow, MassFunction)>, String> {
     if kept.is_empty() {
         return Ok(Vec::new());
     }
@@ -558,24 +768,32 @@ pub(crate) async fn key_and_discount(
         .await
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
-    let mut out: Vec<AxiomRow> = Vec::with_capacity(kept.len());
-    for (r, class, mut coarse) in kept {
-        if let AxiomClass::EdgeFactor {
-            compound_source: true,
-        } = class
-        {
-            if r.edge_relationship
-                .as_deref()
-                .is_some_and(is_positive_relationship)
-            {
-                coarse = without_disbelief(&coarse);
+    let mut out: Vec<(AxiomRow, MassFunction)> = Vec::with_capacity(kept.len());
+    for (r, class, two_sided) in kept {
+        let one_sided = matches!(
+            class,
+            AxiomClass::EdgeFactor {
+                compound_source: true
             }
-        }
+        ) && r
+            .edge_relationship
+            .as_deref()
+            .is_some_and(is_positive_relationship);
+        let coarse = if one_sided {
+            without_disbelief(&two_sided)
+        } else {
+            two_sided.clone()
+        };
         let profile = profiles
             .get(&r.row.frame_id)
             .ok_or_else(|| format!("no profile resolved for frame {}", r.row.frame_id))?;
         let alpha = effective_source_strength_profiled(&r.row, profile);
         let bba = combination::discount(&coarse, alpha).map_err(|e| format!("discount: {e}"))?;
+        let two_sided_bba = if one_sided {
+            combination::discount(&two_sided, alpha).map_err(|e| format!("discount: {e}"))?
+        } else {
+            bba.clone()
+        };
         let cited = cited_evidence(&r);
         let evidence = cited.and_then(|id| {
             identities.get(&id).map(|i| ItemEvidence {
@@ -594,14 +812,17 @@ pub(crate) async fn key_and_discount(
             (None, Some(id)) if r.row.evidence_id.is_none() => ItemKey::Evidence(id),
             (None, _) => item_key(&r.row, None, None),
         };
-        out.push(AxiomRow {
-            row_id: r.row.id,
-            atom_id: r.row.claim_id,
-            key,
-            class,
-            coarse,
-            bba,
-        });
+        out.push((
+            AxiomRow {
+                row_id: r.row.id,
+                atom_id: r.row.claim_id,
+                key,
+                class,
+                coarse,
+                bba,
+            },
+            two_sided_bba,
+        ));
     }
     Ok(out)
 }
@@ -890,6 +1111,161 @@ mod tests {
     #[test]
     fn the_process_settings_carry_ruling_o24() {
         assert!(crate::edge_factor::AtomCacheSettings::current().vacate_on_evidence_removal);
+    }
+
+    fn bba(masses: &serde_json::Value) -> MassFunction {
+        MassFunction::from_json_masses(binary_frame().expect("frame"), masses).expect("bba")
+    }
+
+    /// One drift row of atom `atom`, on `frame`, with no legacy source key
+    /// (each row its own legacy source) and its own item key.
+    fn drift_row(
+        atom: Uuid,
+        frame: Uuid,
+        class: AxiomClass,
+        two_sided: &serde_json::Value,
+        one_sided: &serde_json::Value,
+        perspective_id: Option<Uuid>,
+        attributed: bool,
+    ) -> DriftRow {
+        let row_id = Uuid::new_v4();
+        DriftRow {
+            axiom: AxiomRow {
+                row_id,
+                atom_id: atom,
+                key: crate::source_dependence::ItemKey::Row(row_id),
+                class,
+                coarse: bba(one_sided),
+                bba: bba(one_sided),
+            },
+            two_sided_bba: bba(two_sided),
+            legacy_key: None,
+            frame_id: frame,
+            perspective_id,
+            attributed,
+        }
+    }
+
+    /// SPEC §10.4 stages (3), (3a), (3b): a positive compound-source edge row
+    /// with disbelief mass lowers BetP(TRUE) when read two-sided (3) against
+    /// one-sided (3a); excluding compound-source rows (3b) is the value
+    /// without that row at all, whichever side is asked for; and an
+    /// `attributed_v1` row never enters these stages (it is stage (4)).
+    #[test]
+    fn the_legacy_grouping_stages_read_compound_source_rows_as_their_flags_say() {
+        let atom = Uuid::new_v4();
+        let frame = Uuid::new_v4();
+        let evidence = serde_json::json!({ "0": 0.6, "0,1": 0.4 });
+        let ev = drift_row(
+            atom,
+            frame,
+            AxiomClass::Evidence,
+            &evidence,
+            &evidence,
+            None,
+            false,
+        );
+        let cs = drift_row(
+            atom,
+            frame,
+            AxiomClass::EdgeFactor {
+                compound_source: true,
+            },
+            &serde_json::json!({ "0": 0.5, "1": 0.2, "0,1": 0.3 }),
+            &serde_json::json!({ "0": 0.5, "0,1": 0.5 }),
+            None,
+            false,
+        );
+        let attributed = drift_row(
+            atom,
+            frame,
+            AxiomClass::Evidence,
+            &serde_json::json!({ "1": 0.9, "0,1": 0.1 }),
+            &serde_json::json!({ "1": 0.9, "0,1": 0.1 }),
+            None,
+            true,
+        );
+        let v = |rows: &[DriftRow], two_sided, with_cs| {
+            drift_legacy_grouping_betp(rows, two_sided, with_cs).expect("fold")
+        };
+        let both = [ev.clone(), cs.clone()];
+        assert!(
+            v(&both, true, true) < v(&both, false, true) - 1e-6,
+            "two-sided keeps m(F), so it lowers BetP(TRUE): {} vs {}",
+            v(&both, true, true),
+            v(&both, false, true)
+        );
+        let alone = v(std::slice::from_ref(&ev), false, true);
+        for two_sided in [true, false] {
+            assert_eq!(v(&both, two_sided, false), alone, "excluded = absent");
+        }
+        let with_attr = [ev, cs, attributed];
+        for (two_sided, with_cs) in [(true, true), (false, true), (false, false)] {
+            assert_eq!(
+                v(&with_attr, two_sided, with_cs),
+                v(&both, two_sided, with_cs),
+                "an attributed_v1 row is not in stages (3) to (3b)"
+            );
+        }
+        assert_eq!(v(&[], true, true), 0.5, "no row is the vacuous .5");
+    }
+
+    /// The scoped resync's selection (SPEC §7.2 per-frame rows): the fold of
+    /// one frame's rows in one scope. Rows on another frame, and (for a
+    /// perspective) rows of another or no perspective, do not move it; no
+    /// matching row is `None`, never a vacuous fold.
+    #[test]
+    fn a_scope_fold_reads_one_frame_and_one_scope() {
+        let atom = Uuid::new_v4();
+        let (f1, f2) = (Uuid::new_v4(), Uuid::new_v4());
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let m = |t: f64| serde_json::json!({ "0": t, "0,1": 1.0 - t });
+        let row = |frame, t, persp| {
+            drift_row(
+                atom,
+                frame,
+                AxiomClass::Evidence,
+                &m(t),
+                &m(t),
+                persp,
+                false,
+            )
+        };
+        let on_f1 = [row(f1, 0.7, None), row(f1, 0.4, Some(p))];
+        let mut all = on_f1.to_vec();
+        all.extend([
+            row(f2, 0.9, None),
+            row(f2, 0.2, Some(p)),
+            row(f1, 0.3, Some(q)),
+        ]);
+        let global = |rows: &[DriftRow]| drift_scope_fold(rows, f1, None).expect("fold");
+        let mut f1_all = on_f1.to_vec();
+        f1_all.push(row(f1, 0.3, Some(q)));
+        assert_eq!(
+            global(&all).map(|i| i.pignistic_prob()),
+            global(&f1_all).map(|i| i.pignistic_prob()),
+            "rows on another frame do not move a frame's global fold"
+        );
+        let only_p = |rows: &[DriftRow]| {
+            drift_scope_fold(rows, f1, Some(&BTreeSet::from([p]))).expect("fold")
+        };
+        assert_eq!(
+            only_p(&all).map(|i| i.pignistic_prob()),
+            only_p(&[row(f1, 0.4, Some(p))]).map(|i| i.pignistic_prob()),
+            "a perspective's fold on a frame reads only its own rows there"
+        );
+        assert!(
+            drift_scope_fold(&all, Uuid::new_v4(), None)
+                .expect("fold")
+                .is_none(),
+            "no row on the frame is None"
+        );
+        assert!(
+            drift_scope_fold(&all, f2, Some(&BTreeSet::from([q])))
+                .expect("fold")
+                .is_none(),
+            "no row of the scope on the frame is None"
+        );
     }
 
     #[test]

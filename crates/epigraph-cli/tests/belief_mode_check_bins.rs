@@ -13,7 +13,8 @@
 //! fixture `/health` served from a plain thread (the bin is a separate
 //! process, so the fixture must keep serving while the test blocks on it).
 //! The writing-run tests seed a claim whose cached BetP is a stale sentinel
-//! that a real `recompute_betp` run rewrites; "writes nothing" is checked on
+//! that a real `recompute_betp` wave (cohort v2: `--role`, `--snapshot`,
+//! `--wave`, the disk gate) rewrites; "writes nothing" is checked on
 //! that sentinel and on every BBA and combined-belief row, and the control
 //! (`matching_modes_*`) proves the same run DOES write when the modes agree,
 //! so a refusal is the mode check's doing and not a broken fixture.
@@ -243,19 +244,71 @@ fn assert_refused_for_atom_fold(r: &Run, what: &str) {
 }
 
 // ── recompute_betp ──────────────────────────────────────────────────────────
+//
+// Since cohort v2 (SPEC §10.7) a writing `recompute_betp` run is a WAVE: it
+// needs `--role`, `--snapshot`, `--wave` and the disk gate, and its fold must
+// cover the role. [`WaveArgs`] supplies all of them, so each test below varies
+// only the mode it is about.
+
+/// The flags of a writing standalone wave, with a scratch wave file.
+struct WaveArgs {
+    dir: std::path::PathBuf,
+    args: Vec<String>,
+}
+
+impl WaveArgs {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("belief-mode-check-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let d = dir.to_str().expect("utf-8").to_string();
+        let args = vec![
+            "--role".into(),
+            "standalone".into(),
+            "--snapshot".into(),
+            format!("{d}/wave.jsonl"),
+            "--wave".into(),
+            "mode-check".into(),
+            "--disk-path".into(),
+            d,
+            "--min-free-gb".into(),
+            "0".into(),
+            "--disk-check-cmd".into(),
+            "true".into(),
+        ];
+        Self { dir, args }
+    }
+
+    /// The wave flags plus `extra`.
+    fn with<'a>(&'a self, extra: &[&'a str]) -> Vec<&'a str> {
+        self.args
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .collect()
+    }
+
+    /// An empty snapshot S0, for a dry run (every claim then starts from its
+    /// served value).
+    fn empty_s0(&self) -> String {
+        let p = self.dir.join("s0.jsonl");
+        std::fs::write(&p, "").expect("write S0");
+        p.to_str().expect("utf-8").to_string()
+    }
+}
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_writing_run_refuses_when_its_atom_fold_differs_from_the_server(pool: PgPool) {
     let hub = seed_stale_hub(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    // The server is the one ahead: this process runs `legacy`, so the build's
-    // own fold refusal cannot fire and only the skew check can refuse.
+    // The server is the one ahead: this process runs `legacy`, so only the
+    // skew check can refuse (it runs before the role-coverage check).
     let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &[],
+        &wave.with(&[]),
         &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
@@ -268,19 +321,25 @@ async fn a_writing_run_refuses_when_its_atom_fold_differs_from_the_server(pool: 
     );
 }
 
-/// Control for the refusal above: the same bin, the same fixture server, the
-/// same seeded claim, with modes that agree. It must run and rewrite the
-/// sentinel; otherwise the refusal test could pass on a broken fixture.
+/// Control for the refusal above: the same bin, the same seeded claim, with
+/// modes that agree (both `aef_standalone`, the fold a standalone wave runs
+/// under). It must run and rewrite the sentinel; otherwise the refusal test
+/// could pass on a broken fixture.
 #[sqlx::test(migrations = "../../migrations")]
 async fn matching_modes_let_the_same_writing_run_proceed_and_write(pool: PgPool) {
     let hub = seed_stale_hub(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(legacy_modes()));
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &[],
-        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+        &wave.with(&[]),
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
     );
 
     assert_eq!(
@@ -303,8 +362,7 @@ async fn matching_modes_let_the_same_writing_run_proceed_and_write(pool: PgPool)
 /// and the bin is asked for the fold the server will flip to. The bin's own
 /// environment is ALSO skewed (`aef`), the worst case; a dry run is exempt
 /// all the same, never contacts the API (so it runs on a host with no API),
-/// and writes nothing. This build has no AEF fold, so the preview must not
-/// print a per-claim row: those would be legacy numbers under an AEF label.
+/// writes nothing, and reports the claim's decomposition under the target.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_nothing(
     pool: PgPool,
@@ -313,10 +371,20 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
     let (api, hits) = fixture_health_counted(health_with(legacy_modes()));
+    let wave = WaveArgs::new();
+    let s0 = wave.empty_s0();
 
     let r = run(
         RECOMPUTE_BETP,
-        &["--dry-run", "--target-fold", "aef"],
+        &[
+            "--dry-run",
+            "--role",
+            "standalone",
+            "--target-fold",
+            "aef",
+            "--s0",
+            &s0,
+        ],
         &[
             ("DATABASE_URL", &db),
             ("EPIGRAPH_API_URL", &api),
@@ -336,15 +404,16 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
         0,
         "a dry run must not contact the API"
     );
+    let line = r
+        .stdout
+        .lines()
+        .find(|l| l.contains(&hub.to_string()))
+        .unwrap_or_else(|| panic!("the hub's decomposition line\nstdout: {}", r.stdout));
+    let v: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+    assert_eq!(v["target_fold"], "aef", "{line}");
     assert!(
-        r.stdout.contains("cannot compute the aef fold"),
-        "an AEF preview must say this build cannot compute it\nstdout: {}",
-        r.stdout
-    );
-    assert!(
-        !r.stdout.contains(&hub.to_string()),
-        "an AEF preview must print no per-claim row (they would be legacy numbers)\nstdout: {}",
-        r.stdout
+        v["components"].get("4").is_some(),
+        "an AEF target reaches (4): {line}"
     );
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
     assert_eq!(
@@ -354,12 +423,12 @@ async fn a_dry_run_with_a_target_fold_proceeds_under_a_legacy_server_and_writes_
     );
 }
 
-/// Control for the AEF preview above: the same seed under `--target-fold
-/// legacy` DOES print the hub's per-claim row, so the AEF test's "no row"
-/// check is not passing on an empty cohort. Also exempt, and also silent
-/// towards the API, with a skewed environment.
+/// The cohort-v1 report is kept as a dry run (SPEC §10.7): `--dry-run` alone
+/// previews the legacy owner fold of #197's cohort, prints the seeded hub's
+/// row, never contacts the API and writes nothing, under a skewed
+/// environment.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_the_api(
+async fn the_cohort_v1_dry_run_report_previews_the_seeded_claim_without_contacting_the_api(
     pool: PgPool,
 ) {
     let hub = seed_stale_hub(&pool).await;
@@ -369,7 +438,7 @@ async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_th
 
     let r = run(
         RECOMPUTE_BETP,
-        &["--dry-run", "--target-fold", "legacy"],
+        &["--dry-run"],
         &[
             ("DATABASE_URL", &db),
             ("EPIGRAPH_API_URL", &api),
@@ -391,7 +460,7 @@ async fn a_legacy_target_dry_run_previews_the_seeded_claim_without_contacting_th
     );
     assert!(
         r.stdout.contains(&hub.to_string()),
-        "a legacy preview prints the hub's row\nstdout: {}",
+        "the cohort-v1 report prints the hub's row\nstdout: {}",
         r.stdout
     );
     assert_eq!(
@@ -410,11 +479,16 @@ async fn a_writing_run_refuses_when_the_server_modes_cannot_be_read(pool: PgPool
     // Port 1 is privileged and unbound: nothing a parallel test binds can
     // land on it, unlike a just-released ephemeral port.
     let dead = "http://127.0.0.1:1";
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &[],
-        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", dead)],
+        &wave.with(&[]),
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", dead),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
     );
 
     assert_eq!(
@@ -441,11 +515,16 @@ async fn a_writing_run_refuses_a_server_that_does_not_report_belief_modes(pool: 
         "version": "0.0.0-fixture",
         "timestamp": "2026-01-01T00:00:00Z",
     }));
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &[],
-        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+        &wave.with(&[]),
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
     );
 
     assert_eq!(
@@ -470,10 +549,11 @@ async fn a_target_fold_without_dry_run_is_refused_and_writes_nothing(pool: PgPoo
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
     let api = fixture_health(health_with(legacy_modes()));
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &["--target-fold", "legacy"],
+        &wave.with(&["--target-fold", "legacy"]),
         &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
     );
 
@@ -494,21 +574,21 @@ async fn a_target_fold_without_dry_run_is_refused_and_writes_nothing(pool: PgPoo
 
 /// The override: a skewed writing run with `--allow-mode-skew` proceeds and
 /// writes, and says so on stderr. The skew is on a mode the run does not act
-/// on (`compound_write_guard`): an `atom_fold` skew would also meet the
-/// build's own fold refusal, which the override does not lift (see
-/// `a_writing_run_under_a_fold_this_build_cannot_write_refuses_even_when_the_server_agrees`).
+/// on (`compound_write_guard`); the fold agrees and covers the wave's role.
 #[sqlx::test(migrations = "../../migrations")]
 async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) {
     let hub = seed_stale_hub(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(legacy_modes()));
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let wave = WaveArgs::new();
 
     let r = run(
         RECOMPUTE_BETP,
-        &["--allow-mode-skew"],
+        &wave.with(&["--allow-mode-skew"]),
         &[
             ("DATABASE_URL", &db),
             ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
             ("EPIGRAPH_COMPOUND_WRITE_GUARD", "refuse"),
         ],
     );
@@ -523,43 +603,46 @@ async fn allow_mode_skew_lets_a_skewed_writing_run_proceed_loudly(pool: PgPool) 
     assert!((after - 0.5).abs() > 0.05, "the run wrote; got {after}");
 }
 
-/// This build's cache writers implement only the legacy fold. A writing run
-/// whose `EPIGRAPH_ATOM_FOLD` names another fold must refuse even when the
-/// server agrees: agreement compares flag values, not what the build can do,
-/// so a binary older than the server's fold would otherwise write
-/// legacy-fold caches under an AEF label. Not lifted by `--allow-mode-skew`,
-/// which overrides a skew, not this.
+/// A writing wave is the reviewed AEF apply of its role (SPEC §10.3): under a
+/// fold that does not fold that role with the AEF it would write the legacy
+/// owner fold over the cohort, which is the frozen cohort-v1 apply. So it
+/// refuses even when the server agrees, and `--allow-mode-skew` (which
+/// overrides a skew, not this) does not lift it. A standalone wave under
+/// `legacy`, and a leaf wave under `aef_standalone`, are both refused.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_writing_run_under_a_fold_this_build_cannot_write_refuses_even_when_the_server_agrees(
+async fn a_writing_wave_under_a_fold_that_does_not_cover_its_role_refuses_even_when_the_server_agrees(
     pool: PgPool,
 ) {
     let hub = seed_stale_hub(&pool).await;
     let before = belief_state(&pool).await;
     let db = fixture::database_url_for(&pool).await;
-    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let wave = WaveArgs::new();
 
-    for args in [&[][..], &["--allow-mode-skew"][..]] {
-        let r = run(
-            RECOMPUTE_BETP,
-            args,
-            &[
-                ("DATABASE_URL", &db),
-                ("EPIGRAPH_API_URL", &api),
-                ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
-            ],
-        );
-        assert_eq!(
-            r.code, REFUSED,
-            "recompute_betp {args:?}: a writing run under a fold this build cannot write \
-             must exit 3\nstdout: {}\nstderr: {}",
-            r.stdout, r.stderr
-        );
-        assert!(
-            r.stderr.contains("writes only the legacy fold") && r.stderr.contains("aef_standalone"),
-            "recompute_betp {args:?}: the refusal must name the fold and what this build \
-             writes\nstderr: {}",
-            r.stderr
-        );
+    for (fold, role) in [("legacy", "standalone"), ("aef_standalone", "leaf")] {
+        let api = fixture_health(health_with(modes_with_atom_fold(fold)));
+        for extra in [&[][..], &["--allow-mode-skew"][..]] {
+            let mut args = wave.with(extra);
+            args[1] = role;
+            let r = run(
+                RECOMPUTE_BETP,
+                &args,
+                &[
+                    ("DATABASE_URL", &db),
+                    ("EPIGRAPH_API_URL", &api),
+                    ("EPIGRAPH_ATOM_FOLD", fold),
+                ],
+            );
+            assert_eq!(
+                r.code, REFUSED,
+                "a {role} wave under {fold} {extra:?} must exit 3\nstdout: {}\nstderr: {}",
+                r.stdout, r.stderr
+            );
+            assert!(
+                r.stderr.contains("cohort-v1 apply") && r.stderr.contains(fold),
+                "the refusal must name the fold and why\nstderr: {}",
+                r.stderr
+            );
+        }
     }
     assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
     assert_eq!(

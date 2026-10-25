@@ -169,6 +169,12 @@ name = "belief_cache_bins"
 path = "tests/belief_cache_bins.rs"
 required-features = ["db"]
 
+# Cohort-v2 waves of `recompute_betp` as real processes (`db`-gated bins).
+[[test]]
+name = "recompute_betp_wave"
+path = "tests/recompute_betp_wave.rs"
+required-features = ["db"]
+
 # Spawns the wave bins (`db`-gated) against a fixture `/health`.
 [[test]]
 name = "belief_mode_check_bins"

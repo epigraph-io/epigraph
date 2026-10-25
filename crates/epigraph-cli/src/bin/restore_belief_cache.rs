@@ -28,6 +28,12 @@
 //! the downstream list, prints the counts so far, and exits non-zero, and the
 //! outcomes file lists exactly the committed claims (plus `not_in_wave`).
 //!
+//! A cohort-v2 wave also rewrites its atoms' own `ds_combined_beliefs` rows
+//! and records them in `<wave file>.scoped.jsonl`. When that sidecar exists
+//! (and the claim restore succeeded), its rows are put back the same way,
+//! compare-and-swap, under the same `--claims` filter
+//! (`epigraph_cli::belief_cache::restore_scoped`), and their counts printed.
+//!
 //! Only counts are printed; ids stay in the files. `--dry-run` runs the same
 //! statements and rolls every batch back.
 
@@ -40,8 +46,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use epigraph_cli::belief_cache::{
-    downstream_edges, plan_restore, read_claim_ids, read_wave, restore_wave_with, RestoreOptions,
-    RestoreReport, DEFAULT_RESTORE_BATCH,
+    downstream_edges, plan_restore, read_claim_ids, read_scoped_wave, read_wave, restore_scoped,
+    restore_wave_with, scoped_sidecar_path, RestoreOptions, RestoreReport, DEFAULT_RESTORE_BATCH,
 };
 
 #[derive(Parser, Debug)]
@@ -179,6 +185,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     downstream_w.flush()?;
 
+    // The wave's per-scope rows (SPEC §7.2), recorded in the sidecar a
+    // cohort-v2 wave writes next to its wave file. Restored the same way,
+    // after the claim caches, under the same `--claims` filter.
+    let sidecar = scoped_sidecar_path(&cli.from);
+    let scoped = if restore.is_ok() && sidecar.exists() {
+        let records: Vec<_> = read_scoped_wave(BufReader::new(
+            File::open(&sidecar).map_err(|e| anyhow::anyhow!("{}: {e}", sidecar.display()))?,
+        ))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", sidecar.display()))?
+        .into_iter()
+        .filter(|r| only.as_ref().is_none_or(|ids| ids.contains(&r.claim_id)))
+        .collect();
+        Some(
+            restore_scoped(
+                maint.pool(),
+                &records,
+                &RestoreOptions {
+                    batch_size: cli.batch_size,
+                    dry_run: cli.dry_run,
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let buckets = report.buckets();
     if cli.dry_run {
         println!("DRY RUN: every batch rolled back");
@@ -186,6 +219,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     println!("wave records: {}", records.len());
     for (outcome, ids) in buckets {
         println!("{outcome}: {}", ids.len());
+    }
+    if let Some(sc) = &scoped {
+        println!("scoped_restored: {}", sc.restored.len());
+        println!("scoped_already_restored: {}", sc.already_restored.len());
+        println!(
+            "scoped_superseded_since_wave: {}",
+            sc.superseded_since_wave.len()
+        );
+        println!("scoped_missing: {}", sc.missing.len());
     }
     println!("downstream_edges: {}", downstream.len());
     println!("outcomes: {}", outcomes_path.display());

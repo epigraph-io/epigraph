@@ -839,3 +839,201 @@ pub async fn write_snapshot<W: Write>(
         snapshot_at,
     })
 }
+
+// ── per-scope rows a wave rewrites (SPEC §7.2) ─────────────────────────────
+//
+// A cohort-v2 wave resyncs a wave atom's own `ds_combined_beliefs` rows from
+// the atom fold. Nothing in the claim-cache restore above covers those rows,
+// so the wave records each row's `before` and `written` in a SIDECAR next to
+// its wave file ([`scoped_sidecar_path`]) and [`restore_scoped`] puts them
+// back the same way: only where the row still holds exactly `written`.
+
+/// The value columns of one `ds_combined_beliefs` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedColumns {
+    #[serde(with = "exact_f64")]
+    pub belief: Option<f64>,
+    #[serde(with = "exact_f64")]
+    pub plausibility: Option<f64>,
+    #[serde(with = "exact_f64")]
+    pub mass_on_empty: Option<f64>,
+    #[serde(with = "exact_f64")]
+    pub mass_on_missing: Option<f64>,
+    #[serde(with = "exact_f64")]
+    pub conflict_k: Option<f64>,
+    pub strategy_used: Option<String>,
+    #[serde(with = "exact_f64")]
+    pub pignistic_prob: Option<f64>,
+}
+
+/// One line of a wave's scoped sidecar: what the wave found in one
+/// `ds_combined_beliefs` row and what it wrote there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedWaveRecord {
+    /// `ds_combined_beliefs.id`.
+    pub row_id: Uuid,
+    pub claim_id: Uuid,
+    pub frame_id: Uuid,
+    pub scope_type: String,
+    pub scope_id: Option<Uuid>,
+    pub before: ScopedColumns,
+    pub written: ScopedColumns,
+    pub wave: String,
+    /// The run's `wave_at`, as [`WaveRecord::at`].
+    pub at: DateTime<Utc>,
+}
+
+/// Where a wave file's scoped sidecar lives: `<wave file>.scoped.jsonl`.
+#[must_use]
+pub fn scoped_sidecar_path(wave_file: &std::path::Path) -> std::path::PathBuf {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".scoped.jsonl");
+    std::path::PathBuf::from(p)
+}
+
+/// Append one scoped record as a JSON line.
+///
+/// # Errors
+/// Serialization or I/O failure.
+pub fn write_scoped_record<W: Write>(out: &mut W, rec: &ScopedWaveRecord) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *out, rec)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Parse a scoped sidecar.
+///
+/// # Errors
+/// I/O failure or a malformed line.
+pub fn read_scoped_wave<R: BufRead>(input: R) -> anyhow::Result<Vec<ScopedWaveRecord>> {
+    let mut out = Vec::new();
+    for (i, line) in input.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(&line).map_err(|e| anyhow::anyhow!("line {}: {e}", i + 1))?);
+    }
+    Ok(out)
+}
+
+/// Per-row outcome of [`restore_scoped`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopedRestoreReport {
+    /// Put back to the wave's `before`.
+    pub restored: Vec<Uuid>,
+    /// Already holds `before`.
+    pub already_restored: Vec<Uuid>,
+    /// Holds neither: a later write landed; left alone.
+    pub superseded_since_wave: Vec<Uuid>,
+    /// The row no longer exists.
+    pub missing: Vec<Uuid>,
+}
+
+/// One row's restore: the `before` of the trailing CHAINED run of its
+/// records, compared against the last `written` (as [`plan_restore`] does
+/// for a claim recorded more than once).
+fn scoped_restore_entries(
+    records: &[ScopedWaveRecord],
+) -> Vec<(Uuid, ScopedColumns, ScopedColumns)> {
+    let mut by_row: HashMap<Uuid, Vec<&ScopedWaveRecord>> = HashMap::new();
+    let mut order: Vec<Uuid> = Vec::new();
+    for r in records {
+        let e = by_row.entry(r.row_id).or_default();
+        if e.is_empty() {
+            order.push(r.row_id);
+        }
+        e.push(r);
+    }
+    order
+        .into_iter()
+        .filter_map(|id| {
+            let mut recs = by_row.remove(&id)?;
+            recs.sort_by_key(|r| r.at);
+            let last = recs.last()?;
+            let mut first = recs.len() - 1;
+            while first > 0 && recs[first - 1].written == recs[first].before {
+                first -= 1;
+            }
+            Some((id, recs[first].before.clone(), last.written.clone()))
+        })
+        .collect()
+}
+
+/// Compare-and-swap restore of a wave's scoped rows: each row goes back to
+/// its `before` only where it still holds exactly `written`. One transaction
+/// per `opts.batch_size` rows; `opts.dry_run` rolls every batch back.
+///
+/// # Errors
+/// Any database error; batches already committed stay committed.
+pub async fn restore_scoped(
+    pool: &PgPool,
+    records: &[ScopedWaveRecord],
+    opts: &RestoreOptions,
+) -> anyhow::Result<ScopedRestoreReport> {
+    const SAME: &str = "belief IS NOT DISTINCT FROM $2 AND plausibility IS NOT DISTINCT FROM $3 \
+         AND mass_on_empty IS NOT DISTINCT FROM $4 AND mass_on_missing IS NOT DISTINCT FROM $5 \
+         AND conflict_k IS NOT DISTINCT FROM $6 AND strategy_used IS NOT DISTINCT FROM $7 \
+         AND pignistic_prob IS NOT DISTINCT FROM $8";
+    let restore_sql = format!(
+        "UPDATE ds_combined_beliefs SET belief = $9, plausibility = $10, mass_on_empty = $11, \
+                mass_on_missing = $12, conflict_k = $13, strategy_used = $14, \
+                pignistic_prob = $15 \
+          WHERE id = $1 AND {SAME} RETURNING id"
+    );
+    let probe_sql = format!("SELECT ({SAME}) FROM ds_combined_beliefs WHERE id = $1");
+    fn bind<'q>(
+        sql: &'q str,
+        id: Uuid,
+        c: &ScopedColumns,
+    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        sqlx::query(sql)
+            .bind(id)
+            .bind(c.belief)
+            .bind(c.plausibility)
+            .bind(c.mass_on_empty)
+            .bind(c.mass_on_missing)
+            .bind(c.conflict_k)
+            .bind(c.strategy_used.clone())
+            .bind(c.pignistic_prob)
+    }
+    let entries = scoped_restore_entries(records);
+    let mut report = ScopedRestoreReport::default();
+    for chunk in entries.chunks(opts.batch_size.max(1)) {
+        let mut tx = pool.begin().await?;
+        for (id, before, written) in chunk {
+            let hit = bind(&restore_sql, *id, written)
+                .bind(before.belief)
+                .bind(before.plausibility)
+                .bind(before.mass_on_empty)
+                .bind(before.mass_on_missing)
+                .bind(before.conflict_k)
+                .bind(before.strategy_used.clone())
+                .bind(before.pignistic_prob)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if hit.is_some() {
+                report.restored.push(*id);
+                continue;
+            }
+            let holds_before: Option<Option<bool>> = {
+                use sqlx::Row as _;
+                bind(&probe_sql, *id, before)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.get::<Option<bool>, _>(0))
+            };
+            match holds_before {
+                None => report.missing.push(*id),
+                Some(Some(true)) => report.already_restored.push(*id),
+                Some(_) => report.superseded_since_wave.push(*id),
+            }
+        }
+        if opts.dry_run {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+        }
+    }
+    Ok(report)
+}
