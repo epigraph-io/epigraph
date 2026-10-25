@@ -174,3 +174,63 @@ async fn a_redirect_onto_a_mismatched_research_validity_frame_is_a_caller_error(
         .expect("claim_frames");
     assert_eq!(bound, 0, "no frame binding either");
 }
+
+/// A redirected write's frame-scoped checks are made against the frame the BBA
+/// is FILED on: `research_validity` here carries an `evidence_type_weights`
+/// override for a custom evidence type that `hypothesis_assessment` does not.
+/// The BBA is combined at that override's weight, so the response must not
+/// warn that the type falls to the 0.5 unknown-type reliability.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_redirected_write_checks_its_evidence_type_against_the_frame_it_is_filed_on(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let hyp_frame = ensure_frame(&pool, "hypothesis_assessment").await;
+    let rv_frame = ensure_frame(&pool, "research_validity").await;
+    sqlx::query(
+        "UPDATE frames SET properties = COALESCE(properties, '{}'::jsonb) \
+              || '{\"evidence_type_weights\": {\"r8_bench_assay\": 0.8}}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(rv_frame)
+    .execute(&pool)
+    .await
+    .expect("research_validity's override");
+    let promoted = hypothesis(&pool, "promoted").await;
+
+    let out = first_text(
+        &tools::ds::submit_ds_evidence(
+            &server,
+            &viewer,
+            serde_json::from_value(serde_json::json!({
+                "claim_id": promoted.to_string(),
+                "frame_id": hyp_frame.to_string(),
+                "hypothesis_index": 0,
+                "masses": {"1": 0.7, "0,1": 0.3},
+                "evidence_type": "r8_bench_assay",
+            }))
+            .unwrap(),
+            None,
+        )
+        .await
+        .expect("accepted"),
+    );
+    assert_eq!(
+        frames_with_bbas(&pool, promoted).await,
+        vec![rv_frame],
+        "CALIBRATION: redirected: {out}"
+    );
+    assert!(
+        out.get("unknown_keys")
+            .is_none_or(|k| k == &serde_json::json!([])),
+        "the filed-on frame's override resolves the type: {out}"
+    );
+    let vocab_warning = out["warnings"].as_array().is_some_and(|w| {
+        w.iter().any(|s| {
+            s.as_str()
+                .is_some_and(|s| s.contains("not in the calibration vocabulary"))
+        })
+    });
+    assert!(!vocab_warning, "no unknown-type warning: {out}");
+}

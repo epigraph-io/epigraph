@@ -125,38 +125,13 @@ pub async fn submit_ds_evidence(
     let mut warnings = deprecated_parameter_warnings(method, params.gamma);
 
     // Get frame from DB
-    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
+    let mut frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
-
-    // Backlog 45cbaef4 (G6): an index that names none of the frame's
-    // hypotheses is stored as given (the column is an unconstrained integer, and
-    // refusing would change a call that used to succeed), but every belief
-    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
-    // Say so rather than let the caller believe it addressed that hypothesis.
-    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
-        Some(params.hypothesis_index),
-        frame.hypothesis_count(),
-    );
-    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
-        warnings.push(format!(
-            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
-             was stored as given, but every belief read, including the belief returned here, \
-             is about hypothesis 0 ({:?}).",
-            params.hypothesis_index,
-            frame.hypothesis_count(),
-            frame.hypothesis_count().saturating_sub(1),
-            frame_row
-                .hypotheses
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default(),
-        ));
-    }
 
     // Parse the mass function. Reliability handling forks on whether the
     // caller opted into calibrated per-source-class discounting:
@@ -193,24 +168,6 @@ pub async fn submit_ds_evidence(
     let stored_evidence_type =
         epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
 
-    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
-    // recompute resolves is ACCEPTED and silently combined at the 0.5
-    // unknown-type weight (`effective_source_strength`'s last tier: this path
-    // stores no `source_strength`). Report it, never refuse it — the vocabulary
-    // is operator-extensible and a new key may be deliberate.
-    let unknown_keys = match calibrated_evidence_type {
-        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
-            warnings.push(format!(
-                "evidence_type={et:?} is not in the calibration vocabulary \
-                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
-                 has no entry in this frame's evidence_type_weights override, so this BBA is \
-                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
-                known_evidence_type_keys().join(", ")
-            ));
-            vec![et.to_string()]
-        }
-        _ => Vec::new(),
-    };
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
     } else {
@@ -337,9 +294,59 @@ pub async fn submit_ds_evidence(
                 named_frame,
                 target.id,
             ));
-            target.id
+            let id = target.id;
+            frame_row = target;
+            id
         }
         None => frame_id,
+    };
+
+    // The frame-scoped checks below are about the frame the BBA is FILED on
+    // (the redirect's target, when there is one), not the one named: its
+    // hypotheses and its `evidence_type_weights` override are what the
+    // recompute reads.
+    // Backlog 45cbaef4 (G6): an index that names none of the frame's
+    // hypotheses is stored as given (the column is an unconstrained integer, and
+    // refusing would change a call that used to succeed), but every belief
+    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
+    // Say so rather than let the caller believe it addressed that hypothesis.
+    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
+        Some(params.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
+        warnings.push(format!(
+            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
+             was stored as given, but every belief read, including the belief returned here, \
+             is about hypothesis 0 ({:?}).",
+            params.hypothesis_index,
+            frame.hypothesis_count(),
+            frame.hypothesis_count().saturating_sub(1),
+            frame_row
+                .hypotheses
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
+    }
+
+    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
+    // recompute resolves is ACCEPTED and silently combined at the 0.5
+    // unknown-type weight (`effective_source_strength`'s last tier: this path
+    // stores no `source_strength`). Report it, never refuse it — the vocabulary
+    // is operator-extensible and a new key may be deliberate.
+    let unknown_keys = match calibrated_evidence_type {
+        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
+            warnings.push(format!(
+                "evidence_type={et:?} is not in the calibration vocabulary \
+                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
+                 has no entry in this frame's evidence_type_weights override, so this BBA is \
+                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
+                known_evidence_type_keys().join(", ")
+            ));
+            vec![et.to_string()]
+        }
+        _ => Vec::new(),
     };
 
     // Migration 114: on a public claim this caller does not own, the BBA is the
