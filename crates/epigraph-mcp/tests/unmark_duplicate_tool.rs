@@ -784,3 +784,89 @@ async fn an_unbackfilled_legacy_mark_is_refused_with_its_reason(pool: PgPool) {
         .expect("count");
     assert_eq!(events_after, events_before, "no audit row either");
 }
+
+/// The success path of R-11 through the tool, for a `claims:write` caller with
+/// no admin scope who writes every claim of the chain (it merged the canonical
+/// itself): the un-mark follows the consolidation to the merged claim, answers
+/// both ids, makes the duplicate current, and takes its edge back from the
+/// merged claim, where the merge's edge migration had carried it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmarking_onto_its_own_merged_canonical_restores_the_duplicate(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (a, a_auth, a_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let canonical = owned_public_claim(&pool, a, "r11 own canonical").await;
+    let dup = owned_public_claim(&pool, a, "r11 own duplicate").await;
+    let partner = owned_public_claim(&pool, a, "r11 own merge partner").await;
+    let supporter = seed_claim(&pool, "r11 supporter", 0.5).await;
+    let e = edge(&pool, supporter, dup).await;
+    mark_duplicate(
+        &server,
+        &a_viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller marks its own duplicate");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+        &mut conn,
+        &[canonical, partner],
+        &format!("r11 merged by the caller {}", Uuid::new_v4()),
+        0.5,
+        epigraph_db::repos::claim::ConsolidateMode::Merge,
+        "merge",
+        a,
+    )
+    .await
+    .expect("the caller merges its canonical")
+    .merged_id;
+    epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+        &mut conn,
+        merged,
+        &[canonical, partner],
+    )
+    .await
+    .expect("edge migration");
+    drop(conn);
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(target, merged, "calibration: the edge followed the merge");
+
+    let r = unmark_duplicate(
+        &server,
+        &a_viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller writes every claim of the chain");
+    let b = body(&r);
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(b["current_canonical_id"], serde_json::json!(merged), "{b}");
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(b["cascade"]["touched"]["drifted"], 0, "{b}");
+    assert_eq!(state(&pool, dup).await, (None, true, 0));
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(
+        target, dup,
+        "the edge is back on the duplicate, from the merged claim"
+    );
+}
