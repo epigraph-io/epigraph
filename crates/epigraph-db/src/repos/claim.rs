@@ -8230,8 +8230,12 @@ impl ClaimRepository {
     /// [`DUPLICATE_IDENTITY_PROPERTY`] with the legacy tool, the
     /// [`LEGACY_IDENTITY_BACKFILL_RUN_TAG`], the mark's own `deduped_at` as
     /// `marked_at` and a `backfilled_at`; no `marked_by`, which the legacy mark
-    /// never recorded. Like the act's edge it is written after the retirement,
-    /// so `edges_auto_factor` mints no factor for it.
+    /// never recorded. The legacy `deduped_at` is Postgres timestamp text
+    /// (`now()::text`); `marked_at` is re-encoded as the act writes it
+    /// (`to_jsonb` of the `timestamptz`), and left out when the text is not
+    /// timestamp-shaped, so a stray non-timestamp value does not abort the
+    /// run's single transaction. Like the act's edge it is written after the
+    /// retirement, so `edges_auto_factor` mints no factor for it.
     ///
     /// It does NOT make the mark reversible: the legacy script kept no repair
     /// record, so the administrative un-mark still refuses it
@@ -8308,7 +8312,10 @@ impl ClaimRepository {
                     jsonb_build_object($3::text,
                         $4::jsonb
                         || jsonb_strip_nulls(jsonb_build_object(
-                               'marked_at', c.properties->'deduped_at',
+                               'marked_at', CASE WHEN c.properties->>'deduped_at'
+                                   ~ '^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?\s*(Z|[+-]\d{2}(:?\d{2})?)?\s*$'
+                                   THEN to_jsonb((c.properties->>'deduped_at')::timestamptz)
+                                   END,
                                'backfilled_at', now())))
                FROM claims c WHERE c.id = ANY($1)
              RETURNING source_id, id"#,

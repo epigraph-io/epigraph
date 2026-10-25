@@ -119,10 +119,21 @@ async fn a_legacy_fuzzy_dedup_mark_gets_its_identity_edge_once(pool: PgPool) {
     let dedup = &props["dedup"];
     assert_eq!(dedup["tool"], "fuzzy_dedup_claims", "{props}");
     assert_eq!(dedup["run_tag"], "legacy_identity_backfill", "{props}");
-    assert_eq!(
-        dedup["marked_at"], DEDUPED_AT,
-        "the mark's own time, not the backfill's: {props}"
+    // The mark's own instant, not the backfill's, re-encoded as the dedup
+    // act writes `marked_at` (`to_jsonb(now())`: ISO 8601), not the legacy
+    // `now()::text` spelling it was stored in.
+    let marked_at = dedup["marked_at"].as_str().expect("marked_at text");
+    assert!(
+        marked_at.contains('T') && marked_at != DEDUPED_AT,
+        "marked_at is in the act's encoding, not the legacy text: {props}"
     );
+    let same_instant: bool = sqlx::query_scalar("SELECT $1::timestamptz = $2::timestamptz")
+        .bind(marked_at)
+        .bind(DEDUPED_AT)
+        .fetch_one(&pool)
+        .await
+        .expect("compare instants");
+    assert!(same_instant, "the mark's own instant: {props}");
     assert!(
         dedup.get("marked_by").is_none(),
         "the legacy mark recorded no agent, and none is invented: {props}"
@@ -240,6 +251,40 @@ async fn the_backfill_refuses_a_non_privileged_session(pool: PgPool) {
         assert!(err.to_string().contains("privileged"), "{err}");
     }
     assert!(identity_edges(&pool, dup).await.is_empty());
+}
+
+/// A legacy `deduped_at` that is not a timestamp does not abort the run (one
+/// transaction for the whole corpus): the edge is written without a
+/// `marked_at`, and the stray text is not copied into the act's field.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stray_legacy_deduped_at_is_left_out_not_fatal(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "d5781a48-stray").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let good = fixture::seed_public_claim(&pool, a, "well-formed duplicate").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    legacy_mark(&pool, good, canonical, "fuzzy_dedup_claims", false).await;
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"deduped_at\": \"yesterday-ish\"}' \
+          WHERE id = $1",
+    )
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("stray deduped_at");
+
+    let report = backfill(&pool, true).await;
+    assert_eq!(report.inserted, 2, "{report:?}");
+    let stray = identity_edges(&pool, dup).await;
+    assert_eq!(stray.len(), 1, "{stray:?}");
+    let dedup = &stray[0].2["dedup"];
+    assert!(dedup.get("marked_at").is_none(), "{dedup}");
+    assert_eq!(dedup["tool"], "fuzzy_dedup_claims", "{dedup}");
+    let well_formed = identity_edges(&pool, good).await;
+    assert!(
+        well_formed[0].2["dedup"]["marked_at"].is_string(),
+        "calibration: a well-formed deduped_at is carried in the same run: {well_formed:?}"
+    );
 }
 
 /// The function runs on the `epigraph_maintenance` login itself (not only a
