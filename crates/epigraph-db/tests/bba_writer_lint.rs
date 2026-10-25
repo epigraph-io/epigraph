@@ -37,6 +37,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "reverse_marked_duplicate", 4, "SPEC §4.1 W14: undoing a dedup moves BBAs back; PR-L1c"),
     ("crates/epigraph-db/src/repos/edge.rs", "remove_withdrawn_edge_bbas_conn", 1, "SPEC §4.2: edge withdrawal deletes the edge's factor BBAs (a lifecycle act on the target atom)"),
     ("crates/epigraph-db/src/repos/edge.rs", "withdraw_edge_bbas_conn", 1, "SPEC §4.2: edge withdrawal deletes the edge's factor BBAs (a lifecycle act on the target atom)"),
+    ("crates/epigraph-db/src/repos/experiment.rs", "retire_promoted_hypothesis_bba", 1, "SPEC §4.1 W13: a promotion's DELETE of the hypothesis_assessment row it just copied, in the same transaction as copy_to_frame; it adds nothing to any claim, and PR-W4's refusal at the copy refuses the whole promotion"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "backfill_evidence_type_where_untyped", 1, "maintenance backfill of the evidence_type tag only; masses untouched"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "copy_to_frame", 1, "the repo-layer BBA writer API itself, delegating to store_with_perspective"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "delete_edge_bbas", 1, "the repo-layer delete of an edge's factor BBAs, behind the SPEC §4.1 W8 callers"),
