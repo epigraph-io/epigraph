@@ -158,7 +158,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-cli/src/bin/analyze_graph.rs", "main", Tag::Todo { pr: "unassigned", why: "operator analysis report buckets claims by truth_value; no plan row converts it" }),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", Tag::Todo { pr: "PR-W4", why: "dekg migrate reads claim Pl to bootstrap raw BBAs; SPEC §4.1 W13" }),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", Tag::Todo { pr: "PR-W4", why: "CLI hypothesis prior from neighbours' cached Bel/Pl; SPEC §4.1 W13" }),
-    ("crates/epigraph-cli/src/bin/recompute_betp.rs", "run_dry", Tag::Todo { pr: "PR-C2", why: "dry-run diff of cached BetP; cohort v2 selects evidenced atoms only (SPEC §10.3)" }),
     // --- epigraph-db --------------------------------------------------------
     ("crates/epigraph-db/src/repos/alternative_set.rs", "scan_candidates", Tag::Todo { pr: "PR-R5", why: "suggest_alternative_sets scores pairs by LEAST(COALESCE(pignistic_prob, 0)); SPEC §7.2 excludes compounds, no NULL as 0" }),
     ("crates/epigraph-db/src/repos/analysis.rs", "get_claims_for_analysis", Tag::Todo { pr: "unassigned", why: "analysis selection ordered on truth_value; no plan row converts it" }),

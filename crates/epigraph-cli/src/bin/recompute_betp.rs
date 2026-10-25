@@ -542,14 +542,19 @@ async fn run_cohort_v1_report(
         "claim_id", "cached_before", "recomputed_after", "delta"
     );
     let (mut previewed, mut unchanged, mut skipped) = (0usize, 0usize, 0usize);
+    // A compound's cache is never read: the owner lookup below skips every
+    // compound (PR-0), so its frozen own-fold value is never reported.
+    let cached_before_sql = format!(
+        "SELECT c.pignistic_prob FROM claims c WHERE c.id = $1 AND NOT {}",
+        epigraph_db::repos::claim_role::is_compound_sql("c")
+    );
     for &claim_id in &cohort {
-        let cached_before: Option<f64> =
-            sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
-                .bind(claim_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?
-                .flatten();
+        let cached_before: Option<f64> = sqlx::query_scalar(&cached_before_sql)
+            .bind(claim_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .flatten();
         // No owner: a recompute writes nothing for this claim (no BBA, only
         // ingest templates, or a compound).
         let Some((_, owned)) = predict_cached_after(pool, viewer, claim_id).await? else {
