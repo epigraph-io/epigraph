@@ -122,6 +122,22 @@ async fn a_malformed_cursor_and_a_cursor_with_offset_are_invalid_params(pool: Pg
     .expect_err("a malformed cursor must be refused");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
 
+    // Well-formed and inside chrono's range, but before Postgres timestamptz's
+    // earliest value (4714-11-24 BC): refused as a bad cursor, not surfaced as
+    // an internal error when the bind fails.
+    let err = query_claims_by_label(
+        &server,
+        &viewer,
+        params(
+            "mcp-refuse",
+            2,
+            Some("k1.-230000000000000000.0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+        ),
+    )
+    .await
+    .expect_err("a cursor outside timestamptz's range must be refused");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+
     let first = parse(
         &query_claims_by_label(
             &server,

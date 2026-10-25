@@ -195,8 +195,62 @@ fn label_cursor_token_survives_encode_and_refuses_anything_else() {
         "k1.notanumber.0f1e2d3c4b5a69788796a5b4c3d2e1f0",
         "k1.1790000000123456.not-a-uuid",
         "k1.99999999999999999999.0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        // Inside chrono's range but before Postgres timestamptz's earliest
+        // value (4714-11-24 BC): would decode, then fail at bind time.
+        "k1.-230000000000000000.0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "k1.-210866803200000001.0f1e2d3c4b5a69788796a5b4c3d2e1f0",
     ] {
         assert_eq!(LabelCursor::decode(bad), None, "must refuse {bad:?}");
+    }
+}
+
+/// Postgres timestamptz's earliest value, 4714-11-24 00:00 BC UTC, in Unix
+/// microseconds. Written out here, not imported, so the test checks the
+/// decoder's bound against the database rather than against itself.
+const PG_MIN_MICROS: i64 = -210_866_803_200_000_000;
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_decodable_cursor_binds_and_the_bound_is_postgres_own(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let id = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    // The database itself: the bound is accepted, one microsecond earlier is not.
+    let at_min = DateTime::from_timestamp_micros(PG_MIN_MICROS).unwrap();
+    let below = DateTime::from_timestamp_micros(PG_MIN_MICROS - 1).unwrap();
+    sqlx::query("SELECT $1::timestamptz")
+        .bind(at_min)
+        .execute(&pool)
+        .await
+        .expect("Postgres accepts its earliest timestamptz");
+    assert!(
+        sqlx::query("SELECT $1::timestamptz")
+            .bind(below)
+            .execute(&pool)
+            .await
+            .is_err(),
+        "one microsecond before the bound must be out of Postgres's range"
+    );
+
+    // The decoder: exactly the same edge.
+    assert!(LabelCursor::decode(&format!("k1.{}.{id}", PG_MIN_MICROS - 1)).is_none());
+    // Both ends of what decode accepts reach list_by_labels without a bind
+    // error: Postgres's earliest value and chrono's latest (which Postgres's
+    // upper bound, 294276 AD, already covers).
+    let max_micros = DateTime::<Utc>::MAX_UTC.timestamp_micros();
+    for micros in [PG_MIN_MICROS, max_micros] {
+        let token = format!("k1.{micros}.{id}");
+        let after = LabelCursor::decode(&token).unwrap_or_else(|| panic!("{token} decodes"));
+        ClaimRepository::list_by_labels(
+            &pool,
+            &viewer,
+            epigraph_db::LabelQuery {
+                labels: &["keyset-bound".to_string()],
+                after: Some(after),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a decodable cursor {token} must bind: {e}"));
     }
 }
 

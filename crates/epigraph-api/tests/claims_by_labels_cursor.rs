@@ -112,6 +112,11 @@ async fn by_labels_refuses_a_malformed_cursor_and_a_cursor_with_offset() {
         "after=garbage".to_string(),
         "after=k1.1.not-a-uuid".to_string(),
         "after=k9.0.00000000000000000000000000000000".to_string(),
+        // Well-formed and inside chrono's range, but before Postgres
+        // timestamptz's earliest value (4714-11-24 BC, Unix micros
+        // -210866803200000000): a bad cursor, not a failed bind (500).
+        "after=k1.-230000000000000000.0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),
+        "after=k1.-210866803200000001.0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),
         // `after` with a non-zero `offset` is ambiguous.
         format!("after={well_formed}&offset=2"),
     ];

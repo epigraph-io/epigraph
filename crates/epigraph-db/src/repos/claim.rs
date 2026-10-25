@@ -213,6 +213,14 @@ pub struct LabelCursor {
 /// apart (and an old one refused) rather than half-parsed.
 const LABEL_CURSOR_PREFIX: &str = "k1.";
 
+/// Postgres `timestamptz`'s earliest value (4714-11-24 00:00 BC UTC) in Unix
+/// microseconds. chrono reaches further back, so without this check a forged
+/// token could decode and then fail at bind time ("timestamp out of range"),
+/// which the surfaces would report as an internal error instead of a refused
+/// cursor. chrono's latest value is inside Postgres's upper bound (294276 AD),
+/// so only the lower edge needs checking.
+const PG_TIMESTAMPTZ_MIN_MICROS: i64 = -210_866_803_200_000_000;
+
 impl LabelCursor {
     /// The cursor of `claim`, the last row of a page.
     #[must_use]
@@ -246,12 +254,17 @@ impl LabelCursor {
         )
     }
 
-    /// Parse a token from [`Self::encode`]. `None` for anything else.
+    /// Parse a token from [`Self::encode`]. `None` for anything else,
+    /// including a position Postgres `timestamptz` cannot represent, so every
+    /// decoded cursor binds.
     #[must_use]
     pub fn decode(token: &str) -> Option<Self> {
         let rest = token.strip_prefix(LABEL_CURSOR_PREFIX)?;
         let (micros, id) = rest.split_once('.')?;
         let micros: i64 = micros.parse().ok()?;
+        if micros < PG_TIMESTAMPTZ_MIN_MICROS {
+            return None;
+        }
         let created_at = chrono::DateTime::from_timestamp_micros(micros)?;
         let id = Uuid::try_parse(id).ok()?;
         Some(Self { created_at, id })
