@@ -97,6 +97,13 @@ struct Fixture {
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
+    seed_fixture_with_head_truth(pool, 0.05).await
+}
+
+/// [`seed_fixture`] with alpha's head at `head_truth` (every other row as
+/// documented there). Whether that head counts as deprecated is decided by
+/// the caller's `min_truth`, not by the value itself.
+async fn seed_fixture_with_head_truth(pool: &PgPool, head_truth: f64) -> Fixture {
     let alpha = "alpha-deprecated-head-order";
     let beta = "beta-deprecated-head-order";
     Fixture {
@@ -118,7 +125,15 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
             Some(at_similarity(1.0)),
         )
         .await,
-        a_dead: seed(pool, alpha, 2, "qqdeporder send the digest v2", 0.05, None).await,
+        a_dead: seed(
+            pool,
+            alpha,
+            2,
+            "qqdeporder send the digest v2",
+            head_truth,
+            None,
+        )
+        .await,
         b0: seed(
             pool,
             beta,
@@ -141,6 +156,15 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
 }
 
 async fn search(server: &EpiGraphMcpFull, pool: &PgPool) -> serde_json::Value {
+    // Default min_truth (0.3): the 0.05 head is below it.
+    search_at(server, pool, None).await
+}
+
+async fn search_at(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    min_truth: Option<f64>,
+) -> serde_json::Value {
     let viewer = fixture::public_viewer(pool).await;
     let result = find_workflow_hierarchical(
         server,
@@ -149,8 +173,7 @@ async fn search(server: &EpiGraphMcpFull, pool: &PgPool) -> serde_json::Value {
             query: "qqdeporder".to_string(),
             limit: Some(10),
             resolve_to_latest: Some(true),
-            // Default min_truth (0.3): the 0.05 head is below it.
-            min_truth: None,
+            min_truth,
         },
     )
     .await
@@ -229,6 +252,140 @@ async fn embedding_path_sorts_a_deprecated_head_after_its_groups_live_rows(pool:
         "the embedding path must answer, not the ILIKE fallback: {body}"
     );
     assert_deprecated_head_trails(&body, &f);
+}
+
+// ── "Deprecated" is measured against the CALLER's min_truth ─────────────
+//
+// The flag is `head_truth < min_truth` and the position must follow the same
+// bound value, not a constant. Each case below is chosen so that a hardcoded
+// threshold fails it: a 0.05 head at min_truth 0.0 is LIVE (catches any
+// constant above 0.05); a 0.4 head is LIVE at the default 0.3 (catches
+// `<= 0.05`) and DEPRECATED at 0.5 (catches `< 0.3`). On the embedding path
+// the 0.5 case ties the head with alpha gen 0 at the group's worst distance,
+// so it is decided by the `deprecated` tiebreak alone, and a live head sits
+// at the group's best distance: the two copies of the predicate in that
+// statement (the tiebreak column and the distance CASE) each have to follow
+// `min_truth` for the order to come out right.
+
+/// alpha's head LEADS its group (live under this `min_truth`).
+fn head_leads(f: &Fixture) -> Vec<Uuid> {
+    vec![f.a_dead, f.a1, f.a0, f.b_head, f.b0]
+}
+
+/// alpha's head TRAILS the live rows of its group (deprecated under this
+/// `min_truth`).
+fn head_trails(f: &Fixture) -> Vec<Uuid> {
+    vec![f.a1, f.a0, f.a_dead, f.b_head, f.b0]
+}
+
+fn assert_order_and_flag(
+    body: &serde_json::Value,
+    expected: &[Uuid],
+    f: &Fixture,
+    alpha_deprecated: bool,
+    case: &str,
+) {
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let order: Vec<Uuid> = workflows
+        .iter()
+        .filter_map(|w| w["workflow_id"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    assert_eq!(order, expected, "{case}: order; got {body}");
+    for w in workflows {
+        let alpha = w["canonical_name"].as_str() == Some("alpha-deprecated-head-order");
+        assert_eq!(
+            w["lineage_head_deprecated"],
+            serde_json::json!(alpha && alpha_deprecated),
+            "{case}: the flag and the position must agree; {w}"
+        );
+    }
+    let head = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&f.a_dead.to_string()))
+        .expect("alpha's head is returned");
+    assert_eq!(head["is_lineage_head"], serde_json::json!(true), "{head}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ilike_path_a_head_above_min_truth_zero_leads_its_group(pool: PgPool) {
+    let f = seed_fixture(&pool).await;
+    let server = ilike_server(pool.clone());
+    let body = search_at(&server, &pool, Some(0.0)).await;
+    assert_eq!(body["search_path"], serde_json::json!("ilike"), "{body}");
+    assert_order_and_flag(
+        &body,
+        &head_leads(&f),
+        &f,
+        false,
+        "0.05 head, min_truth 0.0",
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ilike_path_deprecation_follows_a_raised_min_truth(pool: PgPool) {
+    let f = seed_fixture_with_head_truth(&pool, 0.4).await;
+    let server = ilike_server(pool.clone());
+
+    let body = search_at(&server, &pool, None).await;
+    assert_eq!(body["search_path"], serde_json::json!("ilike"), "{body}");
+    assert_order_and_flag(
+        &body,
+        &head_leads(&f),
+        &f,
+        false,
+        "0.4 head, default min_truth 0.3",
+    );
+
+    let body = search_at(&server, &pool, Some(0.5)).await;
+    assert_eq!(body["search_path"], serde_json::json!("ilike"), "{body}");
+    assert_order_and_flag(&body, &head_trails(&f), &f, true, "0.4 head, min_truth 0.5");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn embedding_path_a_head_above_min_truth_zero_leads_its_group(pool: PgPool) {
+    let f = seed_fixture(&pool).await;
+    let server = embedding_server(pool.clone());
+    let body = search_at(&server, &pool, Some(0.0)).await;
+    assert_eq!(
+        body["search_path"],
+        serde_json::json!("embedding"),
+        "{body}"
+    );
+    assert_order_and_flag(
+        &body,
+        &head_leads(&f),
+        &f,
+        false,
+        "0.05 head, min_truth 0.0",
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn embedding_path_deprecation_follows_a_raised_min_truth(pool: PgPool) {
+    let f = seed_fixture_with_head_truth(&pool, 0.4).await;
+    let server = embedding_server(pool.clone());
+
+    let body = search_at(&server, &pool, None).await;
+    assert_eq!(
+        body["search_path"],
+        serde_json::json!("embedding"),
+        "{body}"
+    );
+    assert_order_and_flag(
+        &body,
+        &head_leads(&f),
+        &f,
+        false,
+        "0.4 head, default min_truth 0.3",
+    );
+
+    let body = search_at(&server, &pool, Some(0.5)).await;
+    assert_eq!(
+        body["search_path"],
+        serde_json::json!("embedding"),
+        "{body}"
+    );
+    assert_order_and_flag(&body, &head_trails(&f), &f, true, "0.4 head, min_truth 0.5");
 }
 
 /// The ordering an agent reads in the tool schema must state it.

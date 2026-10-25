@@ -2732,4 +2732,147 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 2, "default mode unchanged");
     }
+
+    /// Seeds `canonical` gens 0..=1 (live, truth 1.0 and 0.6, goal
+    /// "consider all available tools") and a head at gen 2 with
+    /// `head_truth` and a goal the text query misses. Gen 0 sits at cosine
+    /// similarity 0.8 to the axis-0 query vector, gen 1 at 1.0, and the head
+    /// has no embedding, so on both search paths the head is ADDED. Returns
+    /// `(ids by generation, query vector)`.
+    async fn seed_threshold_lineage(
+        pool: &sqlx::PgPool,
+        canonical: &str,
+        head_truth: f64,
+    ) -> (Vec<uuid::Uuid>, Vec<f32>) {
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        let mut ids = Vec::new();
+        for (g, goal, truth, emb) in [
+            (0, "consider all available tools", 1.0, Some(&near)),
+            (1, "consider all available tools", 0.6, Some(&qvec)),
+            (2, "rewrite the plan", head_truth, None),
+        ] {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                pool,
+                id,
+                canonical,
+                g,
+                goal,
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            WorkflowRepository::set_truth_value(pool, id, truth)
+                .await
+                .unwrap();
+            if let Some(v) = emb {
+                WorkflowRepository::set_goal_embedding(pool, id, v)
+                    .await
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        (ids, qvec)
+    }
+
+    /// Text path: "deprecated" is `truth_value < min_truth` for the CALLER's
+    /// `min_truth`, not a constant. A 0.4 head leads at 0.3 and trails at
+    /// 0.5; a 0.05 head leads at 0.0. Each case fails a hardcoded threshold
+    /// (`< 0.3` fails 0.5, `<= 0.05` fails 0.5, any constant above 0.05
+    /// fails 0.0).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, _) = seed_threshold_lineage(&pool, "text-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let p = &pool;
+        let at = move |min_truth: f64| {
+            WorkflowRepository::search_hierarchical_by_text(
+                p,
+                "available tools",
+                10,
+                min_truth,
+                true,
+            )
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
+        );
+    }
+
+    /// Embedding path, the same thresholds. A deprecated head takes its
+    /// group's WORST distance, which here is gen 0's: the tie is decided by
+    /// the `deprecated` tiebreak alone (`injected DESC` would put the head
+    /// first). A live head takes the BEST distance, gen 1's. The statement
+    /// spells the predicate twice (tiebreak column, distance CASE); with
+    /// either copy on a constant `< 0.3`, the 0.5 case comes out by
+    /// generation `[1, 2, 0]` instead of `[1, 0, 2]`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, qvec) = seed_threshold_lineage(&pool, "embed-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let (p, q) = (&pool, &qvec[..]);
+        let at = move |min_truth: f64| {
+            WorkflowRepository::find_hierarchical_by_embedding(p, q, 0.5, min_truth, 10, true)
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
+        );
+    }
 }

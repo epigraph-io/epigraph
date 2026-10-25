@@ -553,3 +553,72 @@ async fn find_workflow_hierarchical_embedding_sorts_a_deprecated_head_after_live
         },
     );
 }
+
+/// HTTP twin of the min_truth cases in `workflow_deprecated_head_order.rs`.
+/// The route computes `lineage_head_deprecated` itself (`truth < min_truth`),
+/// after either search path, so it must use the same caller-supplied bound
+/// the repo statement sorted by: a 0.4 head leads at the default 0.3 and
+/// trails at `min_truth=0.5`, and the flag agrees with the position each time.
+/// A hardcoded `< 0.3` or `<= 0.05` in the sort or the flag fails one of the
+/// two requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_deprecation_follows_the_callers_min_truth() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let alpha = format!("{}-a-dep-threshold", &tag[..12]);
+    let phrase = format!("qqthr{tag}");
+    let a0 = seed_order_row(&pool, &alpha, 0, &format!("{phrase} digest"), 1.0, None).await;
+    let a1 = seed_order_row(&pool, &alpha, 1, &format!("{phrase} digest v1"), 0.6, None).await;
+    let head = seed_order_row(&pool, &alpha, 2, "rewritten plan", 0.4, None).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let fetch = |min_truth: &'static str| {
+        let (token, phrase) = (token.clone(), phrase.clone());
+        async move {
+            let body: serde_json::Value = reqwest::Client::new()
+                .get(format!(
+                    "http://{addr}/api/v1/workflows/hierarchical/search?q={phrase}&resolve_to_latest=true{min_truth}"
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body
+        }
+    };
+    let check = |body: &serde_json::Value, expected: Vec<Uuid>, deprecated: bool, case: &str| {
+        let workflows = body["workflows"].as_array().expect("workflows array");
+        let order: Vec<Uuid> = workflows
+            .iter()
+            .filter_map(|w| w["workflow_id"].as_str().and_then(|s| s.parse().ok()))
+            .collect();
+        assert_eq!(order, expected, "{case}: order; got {body}");
+        for w in workflows {
+            assert_eq!(
+                w["lineage_head_deprecated"],
+                serde_json::json!(deprecated),
+                "{case}: the flag and the position must agree; {w}"
+            );
+        }
+    };
+
+    let body = fetch("").await;
+    check(
+        &body,
+        vec![head, a1, a0],
+        false,
+        "0.4 head, default min_truth 0.3",
+    );
+    let body = fetch("&min_truth=0.5").await;
+    check(&body, vec![a1, a0, head], true, "0.4 head, min_truth 0.5");
+}
