@@ -271,3 +271,83 @@ async fn an_application_edge_cannot_carry_the_dedup_key() {
             .unwrap();
     assert_eq!(n, 0, "nothing written");
 }
+
+/// A duplicate whose canonical was superseded after the mark is un-marked
+/// against the canonical's current replacement (operator ruling R-11): the
+/// route follows the supersession instead of refusing (409) while the
+/// canonical is retired, the dup's edge comes back from the replacement, and
+/// the answer names both.
+#[tokio::test(flavor = "multi_thread")]
+async fn undedup_follows_a_superseded_canonical_to_its_replacement() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
+    let tag = Uuid::new_v4();
+    let canonical = common::seed_claim(&pool, &format!("r11 canonical {tag}")).await;
+    let dup =
+        common::seed_claim_with_agent(&pool, &format!("r11 duplicate {tag}"), client_id).await;
+    let supporter = common::seed_claim(&pool, &format!("r11 supporter {tag}")).await;
+    let e = edge(&pool, supporter, dup).await;
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/dedup"),
+        &token,
+        serde_json::json!({"canonical_id": canonical, "reason": "r11 fixture"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+        &mut conn,
+        epigraph_core::ClaimId::from_uuid(canonical),
+        &format!("r11 canonical, revised {tag}"),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, canonical, replacement)
+        .await
+        .expect("edge migration");
+    drop(conn);
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(
+        target, replacement,
+        "calibration: the edge followed the canonical"
+    );
+
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/undedup"),
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "the undedup follows the supersession: {b}");
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(
+        b["current_canonical_id"],
+        serde_json::json!(replacement),
+        "{b}"
+    );
+    assert_eq!(b["cascade"]["touched"]["edges_retargeted_back"], 1, "{b}");
+    assert_eq!(dup_state(&pool, dup).await, (None, true));
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(target, dup, "the edge is back on the duplicate");
+}

@@ -583,3 +583,101 @@ async fn a_backfilled_legacy_mark_unmarks_through_the_tool(pool: PgPool) {
     assert_eq!(b["cascade"]["touched"]["legacy_mark"], true, "{b}");
     assert_eq!(state(&pool, dup).await, (None, true, 0));
 }
+
+/// A public claim authored by `agent` and owned by its personal group.
+async fn owned_public_claim(pool: &PgPool, agent: Uuid, tag: &str) -> Uuid {
+    let group = common::personal_group_of(pool, agent).await;
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             labels, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("{tag} {id}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed owned claim");
+    id
+}
+
+/// Un-marking follows a canonical's consolidation to the merged claim
+/// (operator ruling R-11), and the reversal moves the duplicate's rows off THAT
+/// claim, so the caller needs the same authority over it as over the
+/// canonical. A merge by another agent leaves the caller writing the
+/// duplicate and the canonical, not the merged claim: the un-mark is refused,
+/// naming the merged claim, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmarking_onto_a_merged_canonical_needs_authority_over_the_merged_claim(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (a, a_auth, a_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let (b, _, _) = common::seed_caller(&pool, &["claims:write"]).await;
+    let canonical = owned_public_claim(&pool, a, "r11 canonical").await;
+    let dup = owned_public_claim(&pool, a, "r11 duplicate").await;
+    let partner = owned_public_claim(&pool, b, "r11 merge partner").await;
+    mark_duplicate(
+        &server,
+        &a_viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller marks its own duplicate onto its own canonical");
+    assert_eq!(state(&pool, dup).await, (Some(canonical), false, 1));
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+        &mut conn,
+        &[canonical, partner],
+        &format!("r11 merged by another agent {}", Uuid::new_v4()),
+        0.5,
+        epigraph_db::repos::claim::ConsolidateMode::Merge,
+        "merge",
+        b,
+    )
+    .await
+    .expect("another agent merges the canonical")
+    .merged_id;
+    epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+        &mut conn,
+        merged,
+        &[canonical, partner],
+    )
+    .await
+    .expect("edge migration");
+    drop(conn);
+
+    let err = unmark_duplicate(
+        &server,
+        &a_viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect_err("the caller does not write the merged claim");
+    assert!(
+        err.message.contains(&merged.to_string()) && !err.message.contains("itself retired"),
+        "the refusal names the merged claim the reversal would act on: {}",
+        err.message
+    );
+    assert_eq!(
+        state(&pool, dup).await,
+        (Some(canonical), false, 1),
+        "nothing was written"
+    );
+}

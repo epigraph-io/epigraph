@@ -849,3 +849,167 @@ async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: 
         .expect("assess");
     assert_eq!(on, dup, "the assess row is back in its slot");
 }
+
+/// How a canonical is retired after the mark, for
+/// [`an_unmark_follows_the_canonicals_replacement`].
+#[derive(Clone, Copy, Debug)]
+enum Retire {
+    Supersede,
+    Consolidate,
+}
+
+/// Un-marking a duplicate whose canonical was later SUPERSEDED or CONSOLIDATED
+/// follows the chain to the current canonical and restores the duplicate
+/// against it (operator ruling R-11; before it, the un-mark refused while the
+/// canonical was retired). The rows the mark moved have since gone two ways:
+/// the supersession / merge carried the dup's `supports` edge on to the
+/// replacement, and left its claim-level BBA on the retired canonical. Both
+/// come back and nothing is reported drifted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool) {
+    let f = frame(&pool).await;
+    for how in [Retire::Supersede, Retire::Consolidate] {
+        let (_scoped, viewer) = fixture::bypass(&pool).await;
+        let (author, other) = (new_agent(&pool).await, new_agent(&pool).await);
+        let canonical = new_claim(&pool, author, "canonical").await;
+        let dup = new_claim(&pool, author, "duplicate").await;
+        let supporter = new_claim(&pool, other, "supporter").await;
+        FrameRepository::assign_claim(&pool, dup, f, Some(0))
+            .await
+            .expect("bind");
+        let e: Uuid = sqlx::query_scalar(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+        )
+        .bind(supporter)
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+        let own = store(
+            &pool,
+            dup,
+            f,
+            Some(author),
+            None,
+            serde_json::json!({"1": 0.4, "0,1": 0.6}),
+        )
+        .await;
+
+        let mut conn = pool.acquire().await.expect("acquire");
+        ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("act");
+        let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+        let (status, _) = apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+        assert!(
+            status.audit_event_id.is_some(),
+            "{how:?}: applied dedup row"
+        );
+
+        let replacement = match how {
+            Retire::Supersede => {
+                let (replacement, _) = ClaimRepository::supersede_act_conn(
+                    &mut conn,
+                    ClaimId::from_uuid(canonical),
+                    &format!("canonical, revised {}", Uuid::new_v4()),
+                    epigraph_core::TruthValue::clamped(0.5),
+                    "revision",
+                )
+                .await
+                .expect("supersede act");
+                ClaimRepository::migrate_superseded_edges_conn(&mut conn, canonical, replacement)
+                    .await
+                    .expect("edge migration");
+                replacement
+            }
+            Retire::Consolidate => {
+                let partner = new_claim(&pool, author, "consolidation partner").await;
+                let merged = ClaimRepository::consolidate_act_conn(
+                    &mut conn,
+                    &[canonical, partner],
+                    &format!("canonical and partner, merged {}", Uuid::new_v4()),
+                    0.5,
+                    epigraph_db::repos::claim::ConsolidateMode::Merge,
+                    "merge",
+                    author,
+                )
+                .await
+                .expect("consolidate act")
+                .merged_id;
+                ClaimRepository::migrate_consolidated_edges_conn(
+                    &mut conn,
+                    merged,
+                    &[canonical, partner],
+                )
+                .await
+                .expect("edge migration");
+                merged
+            }
+        };
+        let edge_target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+            .bind(e)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+        assert_eq!(
+            edge_target, replacement,
+            "{how:?}: calibration: the dup's edge followed the canonical to its replacement"
+        );
+        let bba_on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+            .bind(own)
+            .fetch_one(&pool)
+            .await
+            .expect("bba");
+        assert_eq!(
+            bba_on, canonical,
+            "{how:?}: calibration: the dup's BBA stayed on the retired canonical"
+        );
+
+        let ut = trigger(CascadeCause::Undedup, author, dup, None);
+        let (outcome, report) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+            .await
+            .unwrap_or_else(|e| panic!("{how:?}: the un-mark follows the chain: {e}"));
+        assert!(report.errors.is_empty(), "{how:?}: {:?}", report.errors);
+        assert_eq!(current(&pool, dup).await, (None, true), "{how:?}");
+        let edge_target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+            .bind(e)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+        assert_eq!(
+            edge_target, dup,
+            "{how:?}: the edge is back on the duplicate"
+        );
+        let bba_on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+            .bind(own)
+            .fetch_one(&pool)
+            .await
+            .expect("bba");
+        assert_eq!(bba_on, dup, "{how:?}: the BBA is back on the duplicate");
+        let out = serde_json::to_value(&outcome).expect("outcome");
+        assert_eq!(
+            out["canonical_id"],
+            serde_json::json!(canonical),
+            "{how:?}: {out}"
+        );
+        assert_eq!(
+            out["current_canonical_id"],
+            serde_json::json!(replacement),
+            "{how:?}: restored against the current canonical: {out}"
+        );
+        assert_eq!(out["cascade"]["touched"]["drifted"], 0, "{how:?}: {out}");
+        assert_eq!(
+            out["cascade"]["touched"]["edges_retargeted_back"], 1,
+            "{how:?}: {out}"
+        );
+        assert_eq!(
+            out["cascade"]["touched"]["bbas_returned"], 1,
+            "{how:?}: {out}"
+        );
+    }
+}

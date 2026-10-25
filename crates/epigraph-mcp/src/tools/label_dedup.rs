@@ -1874,19 +1874,17 @@ fn expectation(m: &AppliedMark) -> crate::tools::supersede::UnmarkExpectation {
 }
 
 /// Every un-mark of a revert, proved admissible before anything is written:
-/// its own gate (read-only), and its canonical current or un-marked earlier by
-/// this same revert (the un-mark act refuses a duplicate whose canonical is
-/// still retired). `UNMARK_REFUSED` names every one that is not.
+/// its own gate (read-only), and a current canonical to restore it against
+/// (its canonical, or the claim that replaced it since: the gate's chain), or
+/// its canonical un-marked earlier by this same revert (the un-mark act
+/// refuses a duplicate whose canonical is itself still a marked duplicate).
+/// `UNMARK_REFUSED` names every one that is not.
 async fn preflight_unmarks(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     unmarks: &[AppliedMark],
 ) -> Result<(), McpError> {
-    let scoped = server
-        .scoped
-        .as_ref()
-        .ok_or_else(|| internal_error("revert_label_dedup needs a ScopedPool"))?;
     let mut refused = Vec::new();
     let mut undone_first = std::collections::BTreeSet::new();
     for m in unmarks {
@@ -1895,17 +1893,9 @@ async fn preflight_unmarks(
         {
             Err(e) => refused.push(format!("{}: {}", m.dup, e.message)),
             Ok(_) if undone_first.contains(&m.canonical) => {}
-            Ok(_) => {
-                let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
-                let current = ClaimRepository::are_all_current(&mut *read, viewer, &[m.canonical])
-                    .await
-                    .map_err(db_caller_error)?;
-                read.commit().await.map_err(db_caller_error)?;
-                if !current {
-                    refused.push(format!(
-                        "{}: its canonical {} is itself a marked duplicate; un-mark {} first",
-                        m.dup, m.canonical, m.canonical
-                    ));
+            Ok(gate) => {
+                if let Err(why) = gate.chain {
+                    refused.push(format!("{}: claim {} {why}", m.dup, m.dup));
                 }
             }
         }

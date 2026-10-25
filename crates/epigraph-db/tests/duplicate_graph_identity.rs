@@ -1099,24 +1099,37 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
             .contains(&dup),
         "the index view lists the duplicate under the claim it supersedes"
     );
-    // The un-mark reads the same pointer: it finds the identity edge and
-    // refuses for the documented terminal state (the canonical is retired),
-    // writing nothing.
+    // The un-mark reads the same pointer: it finds the identity edge, and
+    // follows the canonical's supersession to its replacement (operator ruling
+    // R-11) instead of refusing while the canonical is retired.
     let bypass = fixture::bypass(&pool).await.1;
-    let refusal =
-        ClaimRepository::unmark_duplicate_act_conn(&mut conn, &bypass, ClaimId::from_uuid(dup))
-            .await
-            .expect_err("the un-mark refuses while the canonical is retired");
+    let (unmarked, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        &bypass,
+        ClaimId::from_uuid(dup),
+        &r.revert,
+    )
+    .await
+    .expect("the un-mark follows the canonical's replacement");
+    assert_eq!(unmarked.canonical, canonical, "the claim the mark named");
     assert!(
-        format!("{refusal:?}")
-            .contains(&format!("supersedes {canonical}, which is itself retired")),
-        "the refusal names the retired canonical: {refusal:?}"
+        reversal.stale_claims.contains(&replacement),
+        "the reversal ran against the current canonical: {:?}",
+        reversal.stale_claims
     );
+    assert!(reversal.drifted.is_empty(), "{:?}", reversal.drifted);
+    let (identity_source, identity_target, identity_in_force) = edge_target(&pool, identity).await;
     assert_eq!(
-        edge_target(&pool, identity).await,
-        (dup, canonical, true),
-        "the refused un-mark leaves the identity edge in force"
+        (identity_source, identity_target, identity_in_force),
+        (dup, canonical, false),
+        "the un-mark retracts the identity edge it found"
     );
+    let dup_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("dup");
+    assert!(dup_current, "the duplicate is current again");
 }
 
 /// The outgoing direction of the same migration: a claim that was itself a
