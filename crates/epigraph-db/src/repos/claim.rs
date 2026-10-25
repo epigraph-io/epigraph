@@ -8487,7 +8487,7 @@ impl ClaimRepository {
         // current replacement (operator ruling R-11); one that was itself
         // marked a duplicate is refused (un-mark it first).
         let chain = match (
-            canonical_chain(&mut tx, viewer, canonical).await?,
+            canonical_chain(&mut tx, viewer, canonical, ChainLock::ForShare).await?,
             authorized_chain,
         ) {
             (Ok(chain), None) => chain,
@@ -8581,7 +8581,7 @@ impl ClaimRepository {
         if q.fetch_optional(&mut *conn).await?.is_none() {
             return Ok(Err(no_identity_edge_refusal(conn, viewer, dup).await?));
         }
-        canonical_chain(conn, viewer, canonical).await
+        canonical_chain(conn, viewer, canonical, ChainLock::None).await
     }
 
     /// Whether THIS session may un-mark `dup` from `canonical`: a privileged
@@ -11390,6 +11390,15 @@ impl ClaimRepository {
     }
 }
 
+/// Whether [`canonical_chain`] locks the claims it walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainLock {
+    /// A plain read (the request paths, on the caller's read transaction).
+    None,
+    /// `FOR SHARE OF c` on each claim of the chain (the un-mark's act).
+    ForShare,
+}
+
 /// The most replacements [`canonical_chain`] follows from one canonical: far
 /// above any real supersession depth, as the version-chain walk's cap.
 const CANONICAL_CHAIN_MAX: usize = 100;
@@ -11408,10 +11417,16 @@ const CANONICAL_CHAIN_MAX: usize = 100;
 /// duplicate (it carries a dedup identity edge; un-mark it first), one retired
 /// with no replacement (a deprecation), one with two, a cycle, and a chain
 /// longer than [`CANONICAL_CHAIN_MAX`].
+///
+/// [`ChainLock::ForShare`] (the un-mark's act, on the maintenance connection)
+/// holds every claim of the chain `FOR SHARE` until the act's transaction
+/// ends, so none can be retired while the reversal re-mints factors on the
+/// head; the request paths read it without locks.
 async fn canonical_chain(
     conn: &mut sqlx::PgConnection,
     viewer: &crate::visibility::Viewer,
     canonical: Uuid,
+    lock: ChainLock,
 ) -> Result<Result<Vec<Uuid>, String>, DbError> {
     let mut chain = vec![canonical];
     loop {
@@ -11421,11 +11436,14 @@ async fn canonical_chain(
         } else {
             format!("whose replacement {at}")
         };
-        let sql = viewer.splice(
+        let mut sql = viewer.splice(
             "SELECT COALESCE(c.is_current, true) FROM claims c \
               WHERE c.id = $1 /* {VISIBILITY:c} */",
             2,
         );
+        if lock == ChainLock::ForShare {
+            sql.push_str(" FOR SHARE OF c");
+        }
         let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(at);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

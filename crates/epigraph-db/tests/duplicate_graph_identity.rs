@@ -1244,3 +1244,84 @@ async fn consolidating_a_canonical_leaves_its_duplicates_identity_edge(pool: PgP
         "the index view must not list the duplicate under the merged claim"
     );
 }
+
+/// Supersede `old` through the act, as the supersede routes do (edges carried
+/// on); returns the replacement.
+async fn supersede_canonical(pool: &PgPool, old: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (replacement, _) = ClaimRepository::supersede_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(old),
+        &format!("revised {old} {}", Uuid::new_v4()),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, replacement)
+        .await
+        .expect("edge migration");
+    replacement
+}
+
+/// The un-mark's act holds the claims of the canonical's chain against a
+/// concurrent retirement until it commits (operator ruling R-11): the reversal
+/// re-mints BP factors on the chain's head, so a supersession of the head that
+/// committed between the chain read and the reversal would leave factors on a
+/// retired claim after its `claims_deactivate_factors` trigger ran. While the
+/// act's transaction is open, retiring the head waits (here: times out).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_act_holds_the_chain_against_a_concurrent_retirement(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-lock").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 lock canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 lock duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    let head = supersede_canonical(&pool, canonical).await;
+    let retire_head = "UPDATE claims SET is_current = false, embedding = NULL, \
+                       embedding_3072 = NULL WHERE id = $1";
+
+    // CALIBRATION: with no un-mark in flight the head can be retired at once.
+    let mut other = pool.acquire().await.expect("acquire");
+    sqlx::query("SET lock_timeout = '500ms'")
+        .execute(&mut *other)
+        .await
+        .expect("lock_timeout");
+    let mut probe = sqlx::Acquire::begin(&mut *other).await.expect("begin");
+    sqlx::query(retire_head)
+        .bind(head)
+        .execute(&mut *probe)
+        .await
+        .expect("calibration: nothing holds the head");
+    probe.rollback().await.expect("rollback");
+
+    let bypass = fixture::bypass(&pool).await.1;
+    let mut act = pool.begin().await.expect("begin the act's transaction");
+    let unmarked =
+        ClaimRepository::unmark_duplicate_act_conn(&mut act, &bypass, ClaimId::from_uuid(dup))
+            .await
+            .expect("the act follows the chain");
+    assert_eq!(unmarked.chain, vec![canonical, head], "calibration");
+
+    let err = sqlx::query(retire_head)
+        .bind(head)
+        .execute(&mut *other)
+        .await
+        .expect_err("the head is held until the un-mark commits");
+    let code = err
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.to_string()));
+    assert_eq!(
+        code.as_deref(),
+        Some("55P03"),
+        "a lock wait, not another refusal: {err}"
+    );
+    act.rollback().await.expect("rollback the act");
+}

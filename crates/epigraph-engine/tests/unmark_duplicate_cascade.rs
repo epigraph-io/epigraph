@@ -1101,7 +1101,9 @@ async fn an_authorized_unmark_refuses_a_chain_that_changed_without_naming_it(poo
           WHERE id = $1",
     )
     .bind(replacement)
-    .execute(&pool)
+    // On the un-mark's own connection: the refused act's rollback is flushed
+    // by this statement, releasing the chain rows it held.
+    .execute(&mut *conn)
     .await
     .expect("deprecate the replacement");
     let err = apply_unmark_authorized(
