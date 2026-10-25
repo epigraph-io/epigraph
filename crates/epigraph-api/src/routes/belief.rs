@@ -333,8 +333,9 @@ pub struct EvidenceSubmissionResponse {
     /// What this write did to the caller's BBA for its key (claim, frame,
     /// agent, perspective_id), decided before the store by the probe MCP
     /// `submit_ds_evidence` shares (`epigraph_db::bba_write_outcome`):
-    /// `inserted`, `unchanged` (an identical resubmission: the row is left as
-    /// it was) or `replaced` (a different BBA overwrote it, same
+    /// `inserted`, `unchanged` (an identical resubmission: the stored values
+    /// stay the same, though the upsert still refreshes the row's
+    /// `created_at`) or `replaced` (a different BBA overwrote it, same
     /// `mass_function_id`). Backlog 6f82db4f.
     pub write_outcome: String,
     /// True exactly when `write_outcome` is `unchanged`.
@@ -1618,9 +1619,9 @@ pub async fn submit_evidence(
     match write_outcome {
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged => warnings.push(
             "this BBA is identical to the one this agent already stored for this claim, frame \
-             and perspective_id; the row was left as it was, so the claim's Dempster-Shafer \
-             belief did not move on its account (bayesian_posterior still applies this \
-             submission's Beta update)."
+             and perspective_id; its stored values are unchanged (the row's created_at is \
+             refreshed), so the claim's Dempster-Shafer belief did not move on its account \
+             (bayesian_posterior still applies this submission's Beta update)."
                 .to_string(),
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(

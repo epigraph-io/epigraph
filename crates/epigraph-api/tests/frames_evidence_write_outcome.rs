@@ -157,6 +157,14 @@ async fn stored(pool: &PgPool, id: &Value) -> (Value, Option<String>) {
         .expect("read the stored BBA")
 }
 
+async fn created_at(pool: &PgPool, id: &Value) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar("SELECT created_at FROM mass_functions WHERE id = $1::uuid")
+        .bind(id.as_str().expect("mass_function_id"))
+        .fetch_one(pool)
+        .await
+        .expect("read the stored BBA's created_at")
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
     pool_opts: PgPoolOptions,
@@ -187,8 +195,10 @@ async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
         "a first submission carries no warning (the field is omitted): {first}"
     );
     let first_row = stored(&w.pool, &first["mass_function_id"]).await;
+    let first_created = created_at(&w.pool, &first["mass_function_id"]).await;
 
-    // The identical request: one row, untouched, and the caller is told.
+    // The identical request: one row, its stored values unchanged, and the
+    // caller is told.
     let again = post(&w, &token_a, body.clone()).await;
     assert_eq!(again["write_outcome"], "unchanged", "{again}");
     assert_eq!(again["deduplicated"], true, "{again}");
@@ -198,6 +208,18 @@ async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
         "an unchanged write says so: {again}"
     );
     assert_eq!(stored(&w.pool, &again["mass_function_id"]).await, first_row);
+    // What the warning promises about the row: the upsert still rewrites it,
+    // so its created_at (which latest-row readers order by) moves forward.
+    assert!(
+        created_at(&w.pool, &again["mass_function_id"]).await > first_created,
+        "an unchanged write still refreshes the row's created_at, as its warning says"
+    );
+    assert!(
+        warnings(&again)
+            .iter()
+            .any(|x| x.contains("created_at is refreshed")),
+        "the warning says the row's created_at moved: {again}"
+    );
 
     // The same raw masses at another reliability store other masses: a
     // replacement under the same id, never "unchanged".
