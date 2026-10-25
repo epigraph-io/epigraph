@@ -870,3 +870,23 @@ async fn unmarking_onto_its_own_merged_canonical_restores_the_duplicate(pool: Pg
         "the edge is back on the duplicate, from the merged claim"
     );
 }
+
+/// The tool's description says which marks it un-marks and what the answer
+/// carries (operator rulings R-7 and R-11), so an agent knows to look for
+/// them.
+#[test]
+fn unmark_duplicate_description_names_legacy_marks_and_the_current_canonical() {
+    let d = epigraph_mcp::server::EpiGraphMcpFull::static_tools()
+        .iter()
+        .find(|t| t.name == "unmark_duplicate")
+        .and_then(|t| t.description.as_deref().map(str::to_string))
+        .expect("unmark_duplicate is in the manifest and has a description");
+    for needle in [
+        "legacy fuzzy_dedup_claims mark whose edge backfill_dedup_identity_edges reconstructed",
+        "cascade.touched.legacy_mark",
+        "followed to its current replacement (current_canonical_id)",
+        "every claim of that chain",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}
