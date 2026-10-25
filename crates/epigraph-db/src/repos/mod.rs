@@ -13,15 +13,18 @@ pub mod agent_identity;
 pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
+pub mod atom_axiom;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
 pub mod claim_encryption;
+pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
+pub mod compound_valuation;
 pub mod conflict_density;
 pub mod context;
 pub mod corpus_stats;
@@ -110,11 +113,11 @@ pub use claim::{
     ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
     DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
     EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
-    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow, MovedBba,
-    NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SupersedeEdgeMigration,
-    SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
-    EXPANSION_RELATIONSHIPS,
+    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
+    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
+    SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

@@ -46,3 +46,52 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
         .unwrap();
     assert!(canon_current);
 }
+
+/// `mark_duplicate` onto a canonical that is no longer current is refused and
+/// writes nothing: the duplicate stays current with no `supersedes`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_refuses_a_retired_canonical(pool: PgPool) {
+    let canonical = seed_claim(&pool, "retired canonical", 0.5).await;
+    let newer = seed_claim(&pool, "newer canonical", 0.5).await;
+    let dup = seed_claim(&pool, "duplicate", 0.5).await;
+    epigraph_db::ClaimRepository::mark_duplicate(
+        &pool,
+        epigraph_core::ClaimId::from_uuid(canonical),
+        epigraph_core::ClaimId::from_uuid(newer),
+    )
+    .await
+    .expect("calibration: retire the canonical by a mark of its own");
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let err = epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &admin_viewer,
+        epigraph_mcp::types::MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect_err("a mark onto a retired canonical is refused");
+    assert!(err.message.contains("not current"), "{err:?}");
+
+    let (sup, is_current): (Option<uuid::Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (sup, is_current),
+        (None, true),
+        "the duplicate is untouched"
+    );
+}

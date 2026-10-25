@@ -376,6 +376,33 @@ impl ErrorResponse {
     }
 }
 
+/// The response for a refused packet.
+///
+/// A 5xx body is REDACTED, as `ApiError`'s are (F-route-error-text-remainder):
+/// this handler builds its own `ErrorResponse`s, many with the driver's error
+/// interpolated into `message` or `details`, so the message and details are
+/// LOGGED (target `api.internal_error`) and the body keeps only the error key
+/// and a fixed literal. A 4xx body is the caller's to read and is sent as built.
+fn error_response(status: StatusCode, error: ErrorResponse) -> Response {
+    if !status.is_server_error() {
+        return (status, Json(error)).into_response();
+    }
+    tracing::error!(
+        target: "api.internal_error",
+        route = "submit/packet",
+        kind = %error.error,
+        detail = %error.message,
+        details = ?error.details,
+        "packet submission failed"
+    );
+    let message = if error.error == "DatabaseError" {
+        crate::errors::DATABASE_ERROR_BODY
+    } else {
+        crate::errors::INTERNAL_ERROR_BODY
+    };
+    (status, Json(ErrorResponse::new(error.error, message))).into_response()
+}
+
 // =============================================================================
 // VALIDATION
 // =============================================================================
@@ -1652,7 +1679,7 @@ pub async fn submit_packet(
 
     // 2. Validate the packet
     if let Err((status, error)) = validate_packet(&packet, &state).await {
-        return (status, Json(error)).into_response();
+        return error_response(status, error);
     }
 
     // 3. Calculate truth value from evidence (NOT from reputation - BAD ACTOR TEST)
@@ -1727,7 +1754,7 @@ pub async fn submit_packet(
                     response_evidence_ids,
                 )
             }
-            Err((status, error)) => return (status, Json(error)).into_response(),
+            Err((status, error)) => return error_response(status, error),
         }
     };
     // Without the db feature there is no persistence step; the response simply

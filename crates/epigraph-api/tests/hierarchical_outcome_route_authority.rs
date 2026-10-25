@@ -17,6 +17,10 @@
 //!    a group's own member reporting on a workflow whose steps are
 //!    group-private got every row written with a NULL `step_claim_id`, a 200,
 //!    and no log line. MEASURED on a throwaway database at the base commit.
+//! 3. **No visibility gate on the counters.** `workflows` has no row security,
+//!    so a `claims:write` holder that reads none of the plan still moved its
+//!    counters and appended rows. Such a caller is now answered with the
+//!    missing-id 404 and nothing is written.
 //!
 //! Both pools of the `AppState` are the application role (`epigraph_app`,
 //! FORCE row security, no BYPASSRLS); the fixture is seeded on the superuser
@@ -293,8 +297,9 @@ async fn the_route_requires_claims_write(pool: PgPool) {
 }
 
 /// A member of the owning group resolves each `step_index` to its planned
-/// step; a non-member records the run with NULL `step_claim_id`s and is told
-/// which indices did not resolve, without learning any step id.
+/// step, and an index it cannot resolve is recorded with a NULL
+/// `step_claim_id` and disclosed. (A non-member, which reads none of the plan,
+/// is refused outright: `non_member_cannot_move_a_group_private_workflows_counters`.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn step_ids_resolve_through_the_callers_viewer(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -320,33 +325,82 @@ async fn step_ids_resolve_through_the_callers_viewer(pool: PgPool) {
     assert!(unresolved(&json).is_empty(), "{json}");
     assert!(json.get("warning").is_none(), "{json}");
 
+    // An index past the plan: recorded unattributed, and disclosed.
     let (status, text) = post(
         &state,
         w.workflow_id,
-        Some(token(w.stranger, &["claims:write"])),
-        body(&[0, 1]),
+        Some(token(w.member, &["claims:write"])),
+        body(&[7]),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
     let json: serde_json::Value = serde_json::from_str(&text).expect("json");
-    assert_eq!(unresolved(&json), vec![0, 1], "{json}");
+    assert_eq!(unresolved(&json), vec![7], "{json}");
     assert!(
         json["warning"]
             .as_str()
             .is_some_and(|w| w.contains("step_claim_id")),
         "{json}"
     );
+    assert_eq!(written(&pool, w.workflow_id).await, (Some(2), 3));
+}
+
+/// A caller holding `claims:write` that can read none of a workflow's
+/// `executes` edges is answered exactly as for an id that does not exist
+/// (404), and nothing is written: neither the `workflows.metadata` counters
+/// nor any `behavioral_executions` row. `workflows` itself has no row
+/// security, so the plan's visibility is the only thing that can say whether
+/// the caller may report on it. Positive control: a member of the owning
+/// group records the same report.
+#[sqlx::test(migrations = "../../migrations")]
+async fn non_member_cannot_move_a_group_private_workflows_counters(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let w = seed_private_workflow(&pool, "outcome-route-non-member").await;
+
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.stranger, &["claims:read", "claims:write"])),
+        body(&[0, 1]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(
+        written(&pool, w.workflow_id).await,
+        (None, 0),
+        "a caller that reads none of the plan moves no counter and writes no row"
+    );
     for step in &w.steps {
         assert!(
             !text.contains(&step.to_string()),
-            "the response must not name a step the caller cannot read: {text}"
+            "the refusal must not name a step: {text}"
         );
     }
-    let nulls = step_rows(&pool, w.workflow_id)
-        .await
-        .into_iter()
-        .filter(|(_, id)| id.is_none())
-        .count();
-    assert_eq!(nulls, 2, "the non-member's two rows are unattributed");
-    assert_eq!(written(&pool, w.workflow_id).await, (Some(2), 4));
+
+    // Indistinguishable from an id that does not exist.
+    let unknown = Uuid::new_v4();
+    let (unknown_status, unknown_text) = post(
+        &state,
+        unknown,
+        Some(token(w.stranger, &["claims:read", "claims:write"])),
+        body(&[0, 1]),
+    )
+    .await;
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown_text}");
+    assert_eq!(
+        text.replace(&w.workflow_id.to_string(), "<id>"),
+        unknown_text.replace(&unknown.to_string(), "<id>"),
+        "an unreadable workflow and a missing one get the same answer"
+    );
+
+    // Positive control: the owning group's member records the run.
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.member, &["claims:write"])),
+        body(&[0, 1]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
 }

@@ -682,6 +682,15 @@ async fn token_responses_are_not_cacheable(pool: PgPool) {
         Some("no-store"),
         "a token response must not be cached"
     );
+    // RFC 6749 section 5.1 names both: Cache-Control for HTTP/1.1 caches and
+    // `Pragma: no-cache` for HTTP/1.0 ones.
+    assert_eq!(
+        resp.headers()
+            .get(header::PRAGMA)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache"),
+        "a token response carries Pragma: no-cache (RFC 6749 section 5.1)"
+    );
 }
 
 /// POST `/oauth/revoke` for an access token.
