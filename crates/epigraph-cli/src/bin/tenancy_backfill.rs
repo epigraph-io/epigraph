@@ -1925,6 +1925,58 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every keyed identity a legacy row it must never have (quiet, and in the
     // direction of binding a key that never signs).
     ("epigraph_backfill_legacy_agent_keys", 161),
+    // 164, the keyless team-group verbs. Each body refuses any session that is
+    // not a maintenance member (or a superuser), and the FORCEd reads it makes
+    // (`groups`, `group_memberships`) are admitted by the CALLER's
+    // `epigraph_bypass()` arm, which keys on `session_user`, so a wrong owner
+    // does not filter them. The owner decides the table privileges the writes
+    // run with: under an application-role owner the `groups` /
+    // `group_memberships` / `security_events` writes fail CLOSED (42501, loud);
+    // under the migrating superuser (a no-opped `OWNER TO`) they keep working
+    // with more authority than intended (083's case). Registered so the re-own
+    // ratchet sees every 164 definer.
+    ("epigraph_create_team_group", 164),
+    ("epigraph_team_group_add_member", 164),
+    ("epigraph_team_group_remove_member", 164),
+    ("epigraph_team_group_set_member_role", 164),
+    // 164 (review), the roster guard on `group_memberships`. It reads
+    // `groups` (FORCEd) to decide whether a row belongs to a verb-made group.
+    // Under a non-member owner that read is filtered for an application
+    // caller, so every group reads as "not verb-made" and the guard admits
+    // every application write (QUIET, the direction that reopens the roster
+    // to any stamped admin or creator). The gate itself keys on
+    // `session_user`, which no owner changes.
+    ("epigraph_team_group_roster_verbs_only", 164),
+    // 077's viewer group-set read, re-stated by 164 (a verb-made group's row
+    // counts only while its member belongs to a registered human). It reads
+    // `group_memberships` and `groups` (FORCEd) for a caller that has no
+    // principal stamped yet (`Viewer::resolve` runs before the stamp exists):
+    // under a non-member owner both reads are filtered to nothing, and every
+    // viewer resolves to public-only (loud, fail-closed).
+    ("epigraph_live_memberships", 164),
+    // 165, role-derived group membership. The four table triggers of
+    // `group_role_bindings` read `platform_roles` and `groups` and write
+    // `security_events` (`platform.` family): under a non-member owner the
+    // audit insert is refused by 123's privileged-prefix policy (loud), and
+    // the guards' catalog read is unfiltered (`platform_roles` is public).
+    ("epigraph_group_role_bindings_guard_insert", 165),
+    ("epigraph_group_role_bindings_guard_update", 165),
+    ("epigraph_group_role_bindings_refuse_delete", 165),
+    ("epigraph_group_role_bindings_audit", 165),
+    // The three binding verbs write `agents`, `platform_roles` and the
+    // bindings: under an application-role owner each write fails CLOSED
+    // (42501); under the migrating superuser they keep working with more
+    // authority than intended (083's case).
+    ("epigraph_bind_group_role", 165),
+    ("epigraph_define_group_role", 165),
+    ("epigraph_end_group_role_binding", 165),
+    // The derivation and the roster read the
+    // FORCEd `group_role_bindings`, `role_assignments` and `group_memberships`
+    // through `epigraph_definer_bypass()`: under a non-member owner every
+    // read is filtered to nothing, so nobody derives anything (fail-closed,
+    // QUIET: role members silently lose the group).
+    ("epigraph_role_derived_memberships", 165),
+    ("epigraph_group_role_roster", 165),
     // 166, role-attached agents. `role_agents` is FORCEd and admits only a
     // privileged session or a maintenance-owned definer frame. The guards and
     // the audit run in a definer frame: under a non-member owner the insert
@@ -2575,6 +2627,65 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_backfill_legacy_agent_keys",
             "public.epigraph_backfill_legacy_agent_keys()",
+            false,
+        ),
+        // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
+        // it on the request DSN.
+        (
+            "epigraph_live_memberships",
+            "public.epigraph_live_memberships(uuid)",
+            true,
+        ),
+        // 164: creating a team group and changing its roster are maintenance
+        // acts; the request DSN must never call them.
+        (
+            "epigraph_create_team_group",
+            "public.epigraph_create_team_group(text, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_add_member",
+            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_remove_member",
+            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_set_member_role",
+            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
+            false,
+        ),
+        // 165: binding a role to a group is a maintenance act, and the
+        // derivation and the roster answer for any principal (a roster
+        // oracle); the request DSN calls none of them. It reaches the
+        // derivation only through `epigraph_live_memberships` and the claims
+        // trigger's writer scope, both maintenance-owned.
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+            false,
+        ),
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            false,
+        ),
+        (
+            "epigraph_end_group_role_binding",
+            "public.epigraph_end_group_role_binding(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_role_derived_memberships",
+            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_group_role_roster",
+            "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
             false,
         ),
         // 166: attaching and detaching a role's agents is a maintenance act;
@@ -3265,6 +3376,10 @@ mod definer_register_tests {
         // registration. It runs as whichever maintenance-owned definer calls it
         // (or as a maintenance session); EXECUTE is the maintenance role's alone.
         "epigraph_link_operator_body",
+        // 164: the team-group verbs' audit `actor`, read from the caller's
+        // own transaction-local setting; EXECUTE is the maintenance role's
+        // alone.
+        "epigraph_team_group_actor",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
@@ -3280,7 +3395,8 @@ mod definer_register_tests {
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
         "epigraph_is_group_admin",
-        "epigraph_live_memberships",
+        // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
+        // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",
         "epigraph_ensure_personal_group",
         "epigraph_provision_oauth_agent",

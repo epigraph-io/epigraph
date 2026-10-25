@@ -697,6 +697,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    // The role-to-group bindings (165), FORCEd by the migration that creates
+    // them, on the same precedent.
+    "group_role_bindings",
     // Role-attached agents (166), FORCEd by the migration that creates it, on
     // the same precedent.
     "role_agents",

@@ -1199,6 +1199,116 @@ scopes; arming is an operator step (`docs/deploy.md`).
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
 
+## Keyless team groups (migration 164)
+
+A team group is a visibility boundary, not an encryption one: it carries no
+key, no key epoch and no wrapped shares. The operator creates one, and changes
+its roster, on the maintenance DSN only:
+
+```bash
+epigraph-operator create-group --kind team --name "<name>" --admin <person agent id> \
+    --reason "<why>" [--apply]
+epigraph-operator group-member add --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member set-role --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member remove --group <id> --agent <agent id> \
+    --reason "<why>" [--apply]
+```
+
+Every command is a dry run without `--apply` (the definer runs and its
+transaction, audit row included, is rolled back). The rules live in the
+database functions these commands call:
+
+* the creator and every `admin` is a registered human operator;
+* a member belongs to a live human: the human itself, or an agent with a LIVE
+  operator link (or a client allowance) to one; unbound and retired-linked
+  agents are refused;
+* an operated agent is a member, at any role, only of a group its operator
+  writes, and an operator cannot be removed or demoted to `reader` while one
+  of its agents is a live member (remove the agents first);
+* the last live admin cannot be removed or demoted;
+* a removal sets `revoked_at` and keeps the row; adding the agent back writes
+  a new row;
+* every applied act writes one `group.*` `security_events` row.
+
+* a group the commands created (its `did_key` is `did:epigraph:group:<id>`)
+  has ONE writer, these commands: no application session, whatever principal
+  it is stamped as (the group's admin, its creator, demoted or not), can
+  insert or change one of its membership rows or change its group row, and no
+  application session can create a keyless team group or one in that
+  namespace (42501, from the triggers migration 164 adds). The REST routes
+  therefore cannot change such a roster either: add needs a key epoch, and
+  remove is refused like any other application write;
+* a member's access LAPSES with the binding that admitted it: a verb-made
+  group's live row counts in a viewer's group set only while the member still
+  belongs to a registered human operator, so revoking a client allowance or a
+  human's registration (or suspending its human client) ends the member's
+  claim reads and writes (everything decided from its resolved viewer) at its
+  next resolve. The row itself stays until `group-member remove` revokes it,
+  and the REST group routes that read the roster table directly (the
+  group-admin check, group info) still see it until then; the roster itself
+  stays closed to them;
+* the last-admin rule counts only admins that are still registered humans;
+* each audit row also carries `actor`: the CLI's tool, command, version and
+  process identity (real and login uid), since `session_user` is a shared
+  login.
+
+Two limits remain. Row security reads the SESSION's group set, so a session
+stamped before a removal (a cached viewer, a long-lived connection) still
+reads the group until it re-resolves; a removal takes effect at the next
+resolve. And the application DSN is not the boundary for anything an
+application session may do, for the reason "Arming, and the valve" gives: a
+holder of it can stamp any principal. That is why a verb-made group's roster
+is closed to every application session rather than to some principals.
+
+
+## Group membership that follows a role (migration 165)
+
+A group's membership can follow a platform role instead of a hand-kept list.
+The operator binds a NON-ELEVATING role to the group, then grants the role to
+humans for a window, on the maintenance DSN:
+
+```bash
+epigraph-operator define-group-role --key role:<key> --description "<what it is>" \
+    --group <group id> --member-role writer --include-agents --reason "<why>" [--apply]
+epigraph-operator grant-role --role role:<key> --holder <person agent id> \
+    (--valid-to <RFC3339> | --open-ended) --reason "<why>" [--apply]
+epigraph-operator group-roster --group <group id> [--at <RFC3339>]
+epigraph-operator end-group-role-binding --binding <binding id> --reason "<why>" [--apply]
+```
+
+While the binding is live, a registered human holding a live assignment of the
+role reads (and, at `writer`, writes) the group; with `--include-agents`, so
+does every agent registered to such a human: an agent with an ACTING live
+operator link, or a service client allowed for that human
+(`allow-author-binding-client`). A retired link, an agent whose acting row was
+revoked, and anyone whose human was revoked or whose human client was
+suspended never derive. A binding never confers `admin`, and a role that
+elevates or reads the audit trail cannot be bound. Once the operator binding
+is armed, the database's claim-write check (OPL02) asks the same question,
+keyed on the WRITING principal itself: an agent that does not derive the group
+is refused a claim write into it even with a forged stamp, and even with its
+session's link valve open.
+
+Nothing is written to the group's roster for these members. Membership is
+computed each time a viewer is resolved, so it LAPSES at the assignment's
+`valid_to` (or its `end-role-assignment`, or the binding's end) with no job:
+reads at the next request, tool call or worker job; claim writes, once the
+operator binding is armed, at the first statement after `valid_to`, even
+inside a transaction opened before it, whatever the session's stamp says
+(OPL02). A request already in flight reads on its old stamp.
+
+Two consequences to know:
+
+* readers of the roster TABLE itself (the REST group routes, the consolidate
+  act's membership test, a profile's detail check) see explicit rows only, so
+  a derived member is refused there; use `group-roster` to see who holds a
+  group through its bindings;
+* an explicit membership is never granted on the strength of a derived one:
+  `group-member add` of a teammate's agent still requires the teammate's own
+  explicit writer row (GRP03), so no explicit row outlives a window.
+
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
 `ownership` was the pre-tenancy ACL table: one row per node, naming an agent and

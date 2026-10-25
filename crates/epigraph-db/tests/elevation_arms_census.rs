@@ -111,6 +111,11 @@ const EXCLUDED: &[(&str, &str)] = &[
          only through the prompt-history definer, which has its own admin arm",
     ),
     (
+        "group_role_bindings",
+        "role-to-group bindings (165): maintenance-written governance, read only by the \
+         derivation definers",
+    ),
+    (
         "role_agents",
         "role attachments (166): maintenance-written, read only through the role-agent \
          definers; an attachment confers no read and widens nothing",
