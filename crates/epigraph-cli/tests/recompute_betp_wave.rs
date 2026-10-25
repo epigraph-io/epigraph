@@ -183,6 +183,30 @@ async fn agent(pool: &PgPool, name: &str) -> Uuid {
     .expect("seed agent")
 }
 
+/// An agent registered as the `workflow-ingest` system agent (migration 148):
+/// the only author whose `source_type: workflow` root stamp makes a tree
+/// procedural (the property alone is caller-set). Planted with triggers off
+/// (one per test database: the role is the registry's primary key).
+async fn workflow_ingest_agent(pool: &PgPool, name: &str) -> Uuid {
+    let id = agent(pool, name).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'cohort-v2 test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    tx.commit().await.expect("commit");
+    id
+}
+
 /// Get-or-create a two-hypothesis frame by name (`frames.name` is UNIQUE).
 async fn frame(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query(
@@ -500,7 +524,10 @@ async fn a_template_only_atom_is_never_in_the_wave_cohort(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("supersede");
-    let procedural = claim(&pool, owner, "evidenced workflow thesis").await;
+    // A workflow root is procedural only when the registered workflow-ingest
+    // system agent authored it; the stamp alone is caller-set.
+    let workflow_ingest = workflow_ingest_agent(&pool, "cohort-workflow-ingest").await;
+    let procedural = claim(&pool, workflow_ingest, "evidenced workflow thesis").await;
     insert_row(&pool, procedural, &evidence_row(bin, source, 0.7, None)).await;
     sqlx::query(
         "UPDATE claims SET properties = '{\"source_type\": \"workflow\"}'::jsonb WHERE id = $1",
