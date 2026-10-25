@@ -3206,3 +3206,69 @@ async fn a_batch_truth_update_over_an_attached_agents_claim_fails_whole(pool: Pg
         "the refused batch touched nothing: {untouched}"
     );
 }
+
+/// `sql` (`$1` the claim) on an `epigraph_app` connection stamped as `who`,
+/// inside one transaction at `isolation`, rolled back.
+async fn update_in_txn(
+    pool: &PgPool,
+    who: Uuid,
+    group: Uuid,
+    isolation: &'static str,
+    sql: &'static str,
+    claim: Uuid,
+) -> Result<u64, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, who, &[group]).await;
+        sqlx::query(&format!("BEGIN ISOLATION LEVEL {isolation}"))
+            .execute(&mut *conn)
+            .await
+            .expect("begin");
+        let r = sqlx::query(sql)
+            .bind(claim)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("rollback");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The author arm under a stale snapshot. Under REPEATABLE READ the gate's
+/// `unattached` for a claim's author may predate an attach, so the arm
+/// checks an ATTACHABLE author whatever the gate says: a human's change to
+/// what an unattached agent's claim says is refused ROL01 there.
+/// CONTROLS, same human, same level: its own claim's content, and the
+/// agent's claim's derived belief cache alone, land; under READ COMMITTED the
+/// content change to the agent's claim lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn under_repeatable_read_the_author_arm_checks_an_attachable_author(pool: PgPool) {
+    const CONTENT: &str = "UPDATE claims SET content = content || ' (edited)' WHERE id = $1";
+    const CACHE: &str = "UPDATE claims SET belief = 0.3 WHERE id = $1";
+    let (h, h_group) = human(&pool, "holder").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    arm(&pool).await;
+    let theirs = insert_claim(&pool, plain, h_group).await.expect("claim");
+    let own = insert_claim(&pool, h, h_group).await.expect("claim");
+
+    assert_rol01(
+        &update_in_txn(&pool, h, h_group, "REPEATABLE READ", CONTENT, theirs).await,
+        "a human's content change to an attachable agent's claim under REPEATABLE READ",
+    );
+    for (what, level, sql, claim) in [
+        ("its own claim's content", "REPEATABLE READ", CONTENT, own),
+        ("the agent's derived cache", "REPEATABLE READ", CACHE, theirs),
+        ("the agent's claim's content", "READ COMMITTED", CONTENT, theirs),
+    ] {
+        let r = update_in_txn(&pool, h, h_group, level, sql, claim).await;
+        assert_eq!(
+            r.as_ref().ok(),
+            Some(&1),
+            "CONTROL: the human changes {what} under {level}: {r:?}"
+        );
+    }
+}
