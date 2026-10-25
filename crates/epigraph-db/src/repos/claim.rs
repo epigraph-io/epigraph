@@ -704,6 +704,37 @@ pub const DEDUP_IDENTITY_KEY_RESERVED: &str =
     "properties.dedup is reserved for the identity edge a dedup act writes \
      (mark_duplicate); nothing was written";
 
+/// The tool the legacy raw-SQL marks name in `claims.properties.deduped_by`:
+/// `scripts/fuzzy_dedup_claims.py` before it marked through the dedup endpoint.
+pub const LEGACY_FUZZY_DEDUP_TOOL: &str = "fuzzy_dedup_claims";
+
+/// The `run_tag` of an identity edge the legacy backfill wrote
+/// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]).
+pub const LEGACY_IDENTITY_BACKFILL_RUN_TAG: &str = "legacy_identity_backfill";
+
+/// One duplicate the legacy identity-edge backfill selected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegacyDuplicate {
+    /// The retired duplicate.
+    pub duplicate: Uuid,
+    /// The claim its `supersedes` (and its legacy `deduped_into`) names.
+    pub canonical: Uuid,
+    /// The identity edge written for it (`None` on a dry run).
+    pub identity_edge: Option<Uuid>,
+}
+
+/// What [`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`] found
+/// and, with `apply`, wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LegacyIdentityBackfill {
+    /// Whether the edges were written (false: a dry run, nothing written).
+    pub applied: bool,
+    /// Every selected duplicate, in id order.
+    pub duplicates: Vec<LegacyDuplicate>,
+    /// Identity edges written.
+    pub inserted: u64,
+}
+
 /// Who marked a duplicate, through which tool, and by which rule: the
 /// `properties.dedup` of the `same_as` identity edge the act writes. The act
 /// adds `marked_at` (the transaction's `now()`), and `marked_by` from the
@@ -8182,6 +8213,133 @@ impl ClaimRepository {
         Ok(repair)
     }
 
+    /// Backfill the `same_as` identity edge of every duplicate the legacy
+    /// raw-SQL `fuzzy_dedup_claims` marked (backlog d5781a48). Dry run unless
+    /// `apply`; an operator runs it (`epigraph-cli backfill_dedup_identity_edges`).
+    ///
+    /// Before 2026-10 that script retired a duplicate with its own
+    /// `UPDATE claims` and wrote no identity edge, so no reader of the dedup
+    /// identity (the index view [`Self::marked_duplicates_of`], the un-mark)
+    /// sees the mark. Selected, and nothing else: a claim carrying the
+    /// `deduped` label with `properties.deduped_by =`
+    /// [`LEGACY_FUZZY_DEDUP_TOOL`], retired (`is_current = false`), whose
+    /// `supersedes` is still the `properties.deduped_into` the mark wrote, and
+    /// that has no in-force identity edge to it. A consolidation source or a
+    /// supersession (no marker), a soft-marked duplicate still current, a mark
+    /// whose claim was since re-pointed elsewhere, and a dedup act's mark (it
+    /// has its edge) are all left alone, and a second run finds nothing.
+    ///
+    /// The edge carries [`DuplicateProvenance`] under
+    /// [`DUPLICATE_IDENTITY_PROPERTY`] with the legacy tool, the
+    /// [`LEGACY_IDENTITY_BACKFILL_RUN_TAG`], the mark's own `deduped_at` as
+    /// `marked_at` and a `backfilled_at`; no `marked_by`, which the legacy mark
+    /// never recorded. The legacy `deduped_at` is Postgres timestamp text
+    /// (`now()::text`); `marked_at` is re-encoded as the act writes it
+    /// (`to_jsonb` of the `timestamptz`), and left out when the text is not
+    /// timestamp-shaped, so a stray non-timestamp value does not abort the
+    /// run's single transaction. Like the act's edge it is written after the
+    /// retirement, so `edges_auto_factor` mints no factor for it.
+    ///
+    /// It does NOT make the mark reversible: the legacy script kept no repair
+    /// record, so the administrative un-mark still refuses it
+    /// (`UnmarkRefusal::NoRecord`).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session (the selection is
+    /// corpus-wide, and row security would hide most of it);
+    /// `DbError::QueryFailed` on a failed statement.
+    pub async fn backfill_legacy_dedup_identity_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        apply: bool,
+    ) -> Result<LegacyIdentityBackfill, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "backfill_legacy_dedup_identity_edges_conn (it selects and writes across every owner)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; the selection is a corpus-wide maintenance backfill.
+             SELECT c.id, c.supersedes FROM claims c
+              WHERE 'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[]))
+                AND c.properties->>'deduped_by' = $1
+                AND NOT COALESCE(c.is_current, true)
+                AND c.supersedes IS NOT NULL
+                AND c.supersedes::text = c.properties->>'deduped_into'
+                AND NOT EXISTS (
+                    SELECT 1 FROM edges e
+                     WHERE e.source_id = c.id AND e.source_type = 'claim'
+                       AND e.target_id = c.supersedes AND e.target_type = 'claim'
+                       AND e.relationship = $2 AND e.valid_to IS NULL
+                       AND e.properties ? $3)
+              ORDER BY c.id
+              FOR UPDATE OF c"#,
+        )
+        .bind(LEGACY_FUZZY_DEDUP_TOOL)
+        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+        .bind(DUPLICATE_IDENTITY_PROPERTY)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = LegacyIdentityBackfill {
+            applied: apply,
+            duplicates: selected
+                .iter()
+                .map(|(duplicate, canonical)| LegacyDuplicate {
+                    duplicate: *duplicate,
+                    canonical: *canonical,
+                    identity_edge: None,
+                })
+                .collect(),
+            inserted: 0,
+        };
+        if !apply || selected.is_empty() {
+            tx.rollback().await?;
+            return Ok(out);
+        }
+        let provenance = DuplicateProvenance::new(LEGACY_FUZZY_DEDUP_TOOL, "legacy_fuzzy_dedup")
+            .run_tag(LEGACY_IDENTITY_BACKFILL_RUN_TAG)
+            .reason(Some(
+                "identity edge backfilled for a duplicate fuzzy_dedup_claims retired by raw SQL \
+                 before identity edges were recorded; no repair record exists for this mark",
+            ));
+        let provenance_json =
+            serde_json::to_value(&provenance).map_err(|e| DbError::InvalidData {
+                reason: format!("legacy identity backfill: provenance does not serialize: {e}"),
+            })?;
+        let duplicate_ids: Vec<Uuid> = selected.iter().map(|(d, _)| *d).collect();
+        let written: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+             SELECT c.id, 'claim', c.supersedes, 'claim', $2,
+                    jsonb_build_object($3::text,
+                        $4::jsonb
+                        || jsonb_strip_nulls(jsonb_build_object(
+                               'marked_at', CASE WHEN c.properties->>'deduped_at'
+                                   ~ '^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?\s*(Z|[+-]\d{2}(:?\d{2})?)?\s*$'
+                                   THEN to_jsonb((c.properties->>'deduped_at')::timestamptz)
+                                   END,
+                               'backfilled_at', now())))
+               FROM claims c WHERE c.id = ANY($1)
+             RETURNING source_id, id"#,
+        )
+        .bind(&duplicate_ids)
+        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+        .bind(DUPLICATE_IDENTITY_PROPERTY)
+        .bind(&provenance_json)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        for d in &mut out.duplicates {
+            d.identity_edge = written
+                .iter()
+                .find(|(dup, _)| *dup == d.duplicate)
+                .map(|(_, edge)| *edge);
+        }
+        out.inserted = written.len() as u64;
+        Ok(out)
+    }
+
     /// The un-mark's own act, on the CALLER's stamped transaction: `dup` is
     /// current again (`is_current = true`, `supersedes = NULL`) and the act's
     /// `same_as` identity edge is retracted. The database decides write
@@ -11708,6 +11866,29 @@ async fn repair_marked_duplicate(
     .fetch_all(&mut *conn)
     .await?;
     let resourced_rows_ids: Vec<Uuid> = resourced_rows.iter().map(|r| r.0).collect();
+
+    // The BP factor graph (backlog ddb231b7). The act's retirement of the
+    // duplicate deleted every factor naming it (`claims_deactivate_factors`),
+    // and the two re-points above are UPDATEs, which `edges_auto_factor`
+    // (INSERT only) never sees: without this, belief propagation never sees
+    // an edge the canonical inherited. Mint each moved edge's factor as the
+    // trigger would now, and only those (an existing `(type, pair)` slot on
+    // the canonical is kept, as the trigger's ON CONFLICT keeps it). The
+    // un-mark's stale-factor DELETE removes these again by `source_edge_id`.
+    let moved_edges: Vec<Uuid> = retargeted_ids
+        .iter()
+        .chain(resourced_rows_ids.iter())
+        .copied()
+        .collect();
+    if !moved_edges.is_empty() {
+        sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+            .bind(canon_uuid)
+            .bind(canon_uuid)
+            .bind(Vec::<String>::new())
+            .bind(Some(&moved_edges))
+            .execute(&mut *conn)
+            .await?;
+    }
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
         .into_iter()
         .filter(|(_, _, _, target_type)| target_type == "claim")
@@ -11938,6 +12119,7 @@ async fn reverse_marked_duplicate(
         .bind(dup_uuid)
         .bind(canon_uuid)
         .bind(&freed_slots)
+        .bind(None::<Vec<Uuid>>)
         .execute(&mut *conn)
         .await?;
 
@@ -12115,10 +12297,18 @@ async fn reverse_marked_duplicate(
 /// each edge were inserted now, for every in-force claim-claim edge whose
 /// endpoints are both current and that either touches the claim `$1` or
 /// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
-/// (as `type:lo,hi`). For the un-mark, which puts edges back by UPDATE (which
-/// that INSERT trigger never sees) onto a claim made current again: `$1` is
-/// the duplicate, `$2` its canonical and `$3` the slots the stale-factor
-/// DELETE freed there.
+/// (as `type:lo,hi`), and, when `$4` (`uuid[]`) is not NULL, is one of the
+/// edges it lists. Both dedup directions move edges by UPDATE, which that
+/// INSERT trigger never sees:
+///
+/// * the un-mark puts edges back onto a claim made current again: `$1` is the
+///   duplicate, `$2` its canonical, `$3` the slots the stale-factor DELETE
+///   freed there, `$4` NULL;
+/// * the mark's repair ([`repair_marked_duplicate`]) re-points the retired
+///   duplicate's edges onto the canonical, whose factors the retirement
+///   deleted (`claims_deactivate_factors`): `$1` and `$2` are the canonical,
+///   `$3` empty and `$4` the edges it moved, so only those are minted and a
+///   canonical edge whose factor something else removed stays without one.
 ///
 /// It is the body of migration 038's `auto_create_factor_from_edge`, over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
@@ -12177,6 +12367,7 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                 -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
                 AND (e.valid_to IS NULL OR e.valid_to > now())
                 AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
+                AND ($4::uuid[] IS NULL OR e.id = ANY($4::uuid[]))
                 AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
                 AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
                 AND m.ft IS NOT NULL

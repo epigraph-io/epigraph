@@ -2075,6 +2075,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "backfill_legacy_dedup_identity_edges_conn",
+        "WRITE, privileged only (refuses otherwise). The operator backfill of the identity \
+         edge of legacy fuzzy_dedup_claims duplicates; its selection over claims and edges is \
+         corpus-wide by design and runs on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
         "require_privileged_session",
         "Reads no table and filters nothing: it asks the session one boolean, \
          `epigraph_session_is_privileged_writer()`, before a privileged-only write.",

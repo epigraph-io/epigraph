@@ -306,6 +306,20 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
         gone,
         "calibration: the collision-retracted edge's BBA was deleted"
     );
+    // The mark's repair, on the `epigraph_maintenance` login, gives the
+    // canonical the BP factor of the edge it inherited (backlog ddb231b7).
+    let inherited: Vec<Vec<Uuid>> = sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text",
+    )
+    .bind(e_other)
+    .fetch_all(&pool)
+    .await
+    .expect("factors");
+    assert_eq!(
+        inherited,
+        vec![vec![other.min(canonical), other.max(canonical)]],
+        "the moved edge's factor, minted on the canonical as epigraph_maintenance"
+    );
 
     sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
         .execute(&pool)
