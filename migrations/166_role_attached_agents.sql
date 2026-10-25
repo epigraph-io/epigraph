@@ -285,11 +285,15 @@
 -- succession escape this step exists to close). The accepted cost is
 -- availability: while the role has no holder, the shared identity is dormant
 -- in EVERY group that runs it, which is what "agents attached to a role
--- cannot run" means. So the registration's audit row FLAGS it
+-- cannot run" means. And a shared child that step 5 left UNLINKED (its first
+-- registration had no parent) has no human to hold the role, so it is
+-- refused even while the role IS held, in every group, until an operator
+-- links it by hand. So the registration's audit row FLAGS it
 -- (`role_attachments_shared = 'shared_identity'`, beside
 -- `role_attachments_copied`) and the lineage follow (section 2) writes one
 -- `platform.role_agent_copied_shared` security event per shared successor it
--- attaches, for the host to alert every affected group. Neither is written
+-- attaches, for the host to alert every affected group (and, for an
+-- unlinked one, to say it needs a manual link). Neither is written
 -- again by a repeat start, which copies nothing. 161's result columns are
 -- unchanged (the host and the repository read them): the flag is in the
 -- audit, and `inherit_reason` already says `shared_identity` for an unlinked

@@ -1505,7 +1505,9 @@ restart.
   5b). A SHARED successor (one that runs in another group folder) is copied
   too, fail closed, and flagged (`role_attachments_shared` on the
   registration audit row, `platform.role_agent_copied_shared` on the
-  lineage path) so the host alerts every affected group; an attach and a
+  lineage path) so the host alerts every affected group (an unlinked
+  shared successor stays refused, even while the role is held, until it is
+  linked by hand); an attach and a
   successor's registration serialise on the registration's lock. Once
   armed, every write an application session STAMPED as an attached agent
   makes is refused `ROL01` unless every live attachment's role is held now
