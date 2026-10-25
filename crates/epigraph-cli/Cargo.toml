@@ -241,6 +241,13 @@ name = "backfill_dedup_identity_edges"
 path = "src/bin/backfill_dedup_identity_edges.rs"
 required-features = ["db"]
 
+# Spawns the `db`-gated binary above; without `db` its CARGO_BIN_EXE_* does
+# not exist and the test would not compile.
+[[test]]
+name = "backfill_dedup_identity_edges_bin"
+path = "tests/backfill_dedup_identity_edges_bin.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
