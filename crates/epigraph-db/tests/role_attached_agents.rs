@@ -1013,7 +1013,14 @@ async fn an_attachment_committed_after_a_snapshot_still_refuses_the_write(pool: 
         );
     }
     assert_rol01(
-        &write_in_txn(&pool, late_rc, h_group, "READ COMMITTED", Between::Attach(late_rc)).await,
+        &write_in_txn(
+            &pool,
+            late_rc,
+            h_group,
+            "READ COMMITTED",
+            Between::Attach(late_rc),
+        )
+        .await,
         "CONTROL: under READ COMMITTED the committed attachment is seen",
     );
     write_in_txn(&pool, plain, h_group, "READ COMMITTED", Between::Nothing)
@@ -1850,7 +1857,11 @@ async fn a_shared_successor_inherits_the_attachment_and_the_audit_flags_it(pool:
     let before = flags(pool.clone()).await;
     register(&pool, &shared_key, Some(parent), "g-166-own").await;
     assert_eq!(
-        (before, flags(pool.clone()).await, live_attachments(&pool, shared).await.len()),
+        (
+            before,
+            flags(pool.clone()).await,
+            live_attachments(&pool, shared).await.len()
+        ),
         (1, 1, 1),
         "a repeat registration copies nothing and flags nothing new"
     );
@@ -2838,7 +2849,10 @@ async fn an_attach_racing_a_registration_still_attaches_the_child(pool: PgPool) 
 
     let other = pool.clone();
     let (child, row) = fixture::as_role(&pool, ATTESTOR, |mut conn| async move {
-        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .expect("begin");
         let child: Uuid = sqlx::query_scalar(
             "SELECT agent_id FROM public.epigraph_register_agent_identity( \
                  $1, $2, 'test-model-166', $3, 'g-166-race', NULL, $4)",
@@ -2872,7 +2886,10 @@ async fn an_attach_racing_a_registration_still_attaches_the_child(pool: PgPool) 
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        sqlx::query("COMMIT").execute(&mut *conn).await.expect("commit");
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .expect("commit");
         let row = attaching.await.expect("the attach task");
         (conn, (child, row))
     })
@@ -3134,7 +3151,10 @@ async fn a_humans_supersede_of_an_attached_agents_claim_is_refused_after_the_end
         async move {
             fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
                 stamp(&mut conn, h, &[h_group]).await;
-                sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+                sqlx::query("BEGIN")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("begin");
                 let r = epigraph_db::ClaimRepository::supersede_act_conn(
                     &mut conn,
                     epigraph_core::ClaimId::from(claim),
@@ -3158,7 +3178,10 @@ async fn a_humans_supersede_of_an_attached_agents_claim_is_refused_after_the_end
         .expect("CONTROL: the human supersedes its unattached agent's claim");
     let refused = supersede(theirs).await;
     assert!(
-        matches!(refused, Err(epigraph_db::DbError::RoleHolderRequired { .. })),
+        matches!(
+            refused,
+            Err(epigraph_db::DbError::RoleHolderRequired { .. })
+        ),
         "the human's supersede of the attached agent's claim after the end: {refused:?}"
     );
 }
@@ -3261,8 +3284,18 @@ async fn under_repeatable_read_the_author_arm_checks_an_attachable_author(pool: 
     );
     for (what, level, sql, claim) in [
         ("its own claim's content", "REPEATABLE READ", CONTENT, own),
-        ("the agent's derived cache", "REPEATABLE READ", CACHE, theirs),
-        ("the agent's claim's content", "READ COMMITTED", CONTENT, theirs),
+        (
+            "the agent's derived cache",
+            "REPEATABLE READ",
+            CACHE,
+            theirs,
+        ),
+        (
+            "the agent's claim's content",
+            "READ COMMITTED",
+            CONTENT,
+            theirs,
+        ),
     ] {
         let r = update_in_txn(&pool, h, h_group, level, sql, claim).await;
         assert_eq!(
