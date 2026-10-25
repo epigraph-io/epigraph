@@ -159,6 +159,19 @@ jobs:
           --exclude epigraph-engine
           --exclude epigraph-mcp
           --exclude epigraph-embeddings
+      - name: Purge linked test executables
+        # Each test step links its package's test binaries (hundreds, tens to
+        # hundreds of MB each) and nothing deletes them, so on a staging-sized
+        # tree the runner's disk filled during a later step's link (#690:
+        # "mold: failed to write to an output file. Disk full?" in the
+        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
+        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
+        # gate does the same between steps (purge_test_executables).
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          df -h /
       - name: Test (epigraph-db, parallel within package)
         # Packages still run SEQUENTIALLY -- one cargo invocation at a time --
         # which is what prevents the cross-binary _sqlx_migrations race
@@ -222,14 +235,66 @@ jobs:
         # packages not yet cleared, and libtest's CLI argument is what overrides
         # that env var. Removing this flag silently re-serializes the package.
         run: cargo test -p epigraph-db --locked -- --test-threads=4
+      - name: Purge linked test executables
+        # Each test step links its package's test binaries (hundreds, tens to
+        # hundreds of MB each) and nothing deletes them, so on a staging-sized
+        # tree the runner's disk filled during a later step's link (#690:
+        # "mold: failed to write to an output file. Disk full?" in the
+        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
+        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
+        # gate does the same between steps (purge_test_executables).
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          df -h /
       - name: Test (epigraph-api, serialized)
         run: cargo test -p epigraph-api --locked -- --test-threads=1
+      - name: Purge linked test executables
+        # Each test step links its package's test binaries (hundreds, tens to
+        # hundreds of MB each) and nothing deletes them, so on a staging-sized
+        # tree the runner's disk filled during a later step's link (#690:
+        # "mold: failed to write to an output file. Disk full?" in the
+        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
+        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
+        # gate does the same between steps (purge_test_executables).
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          df -h /
       - name: Test (epigraph-engine, serialized)
         run: cargo test -p epigraph-engine --locked -- --test-threads=1
+      - name: Purge linked test executables
+        # Each test step links its package's test binaries (hundreds, tens to
+        # hundreds of MB each) and nothing deletes them, so on a staging-sized
+        # tree the runner's disk filled during a later step's link (#690:
+        # "mold: failed to write to an output file. Disk full?" in the
+        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
+        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
+        # gate does the same between steps (purge_test_executables).
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          df -h /
       - name: Test (epigraph-mcp, serialized)
         # claim_helper_tests adds a temporary CHECK constraint on `edges`
         # that would race with sibling tests under parallel execution.
         run: cargo test -p epigraph-mcp --locked -- --test-threads=1
+      - name: Purge linked test executables
+        # Each test step links its package's test binaries (hundreds, tens to
+        # hundreds of MB each) and nothing deletes them, so on a staging-sized
+        # tree the runner's disk filled during a later step's link (#690:
+        # "mold: failed to write to an output file. Disk full?" in the
+        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
+        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
+        # gate does the same between steps (purge_test_executables).
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          df -h /
       - name: Test (epigraph-embeddings, serialized)
         # pgvector tests use #[sqlx::test] which races with parallel siblings
         # on _sqlx_migrations whenever a new migration is added.
