@@ -69,11 +69,18 @@ pub struct EvolveStepResponse {
 /// `Conflict` (superseding a step that is no longer current) is the caller's
 /// to fix, INVALID_PARAMS as name-mode's retired-head refusal is, rather than
 /// the INTERNAL_ERROR [`crate::errors::db_caller_error`] gives a variant it
-/// does not know. Everything else, including `InvalidData` (an edge_type
+/// does not know. So is its `NotFound`: the parent's `FOR UPDATE` read finds
+/// no row both for a `parent_id` that names no claim and for one the caller
+/// cannot see, and the two get the same wording (naming only the id the
+/// caller sent), so the refusal does not tell them apart, as the HTTP route's
+/// 404 does not. Everything else, including `InvalidData` (an edge_type
 /// outside the vocabulary), maps as `db_caller_error` maps it.
 fn evolve_caller_error(e: epigraph_db::DbError) -> McpError {
     match e {
         epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
+        epigraph_db::DbError::NotFound { id, .. } => {
+            invalid_params(format!("parent step {id} not found"))
+        }
         other => crate::errors::db_caller_error(other),
     }
 }
