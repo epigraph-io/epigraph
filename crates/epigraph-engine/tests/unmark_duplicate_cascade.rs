@@ -165,7 +165,20 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
 
     // The record names other writers' rows, so the TRIGGERING principal must
     // not be able to read it; since migration 169 it does not read the applied
-    // row it is named on either. Calibrated on a plain event naming it.
+    // row it is named on either. Calibrated on a plain event naming it, and on
+    // the applied row being what the zero below is about: the author's
+    // `cascade.admin_applied` row (read on the superuser pool).
+    let (named, kind): (Option<Uuid>, String) =
+        sqlx::query_as("SELECT agent_id, event_type::text FROM security_events WHERE id = $1")
+            .bind(dedup_row)
+            .fetch_one(&pool)
+            .await
+            .expect("the applied dedup row");
+    assert_eq!(
+        (named, kind.as_str()),
+        (Some(author), "cascade.admin_applied"),
+        "calibration: the applied row names the author"
+    );
     let probe: Uuid = sqlx::query_scalar(
         "INSERT INTO security_events (event_type, agent_id, success) \
          VALUES ('test.unmark_probe', $1, true) RETURNING id",

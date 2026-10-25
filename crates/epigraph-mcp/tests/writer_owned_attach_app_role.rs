@@ -2311,7 +2311,7 @@ async fn applied_ids_row(pool: &PgPool, applied: Uuid) -> (Option<Uuid>, serde_j
 }
 
 /// The triggering agent reads its deferral for `cause` (so the check below is
-/// not vacuous) and no applied row (migration 169), and no cascade row it can
+/// not vacuous) and no applied or belief row (migration 169), and no cascade row it can
 /// read names any of `edges`; it cannot read the companion row. The applied
 /// row's counts are checked by each caller on the superuser pool.
 fn assert_trigger_reads_no_edge_ids(
@@ -2325,8 +2325,9 @@ fn assert_trigger_reads_no_edge_ids(
         "calibration: the triggering agent reads its own deferral: {rows:?}"
     );
     assert!(
-        rows.iter().all(|(t, _)| t != "cascade.admin_applied"),
-        "the triggering agent reads no applied row (migration 169): {rows:?}"
+        rows.iter()
+            .all(|(t, _)| t != "cascade.admin_applied" && t != "cascade.belief_rederived"),
+        "the triggering agent reads no applied or belief row (migration 169): {rows:?}"
     );
     for (id, what) in edges {
         for (t, d) in rows {
@@ -2339,6 +2340,40 @@ fn assert_trigger_reads_no_edge_ids(
     assert!(
         rows.iter().all(|(t, _)| t != "cascade.admin_applied_ids"),
         "the triggering agent cannot read the companion row: {rows:?}"
+    );
+}
+
+/// The applied row (`applied`, `who`) and the belief rows following it, read
+/// on the superuser pool, all name `agent`: so the trigger reading none of
+/// them (above) is the read policy's doing, not a row that stopped naming it.
+/// `belief_rows` is how many belief rows the path writes (measured: one for
+/// dedup and supersede, none for consolidate, whose belief exclusion above is
+/// therefore forward-looking only).
+async fn assert_cascade_rows_name(
+    pool: &PgPool,
+    applied: Uuid,
+    who: Option<Uuid>,
+    agent: Uuid,
+    belief_rows: usize,
+) {
+    assert_eq!(
+        who,
+        Some(agent),
+        "the applied row names the triggering agent"
+    );
+    let belief: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT agent_id FROM security_events \
+          WHERE event_type = 'cascade.belief_rederived' \
+            AND details->>'applied_event_id' = $1::text",
+    )
+    .bind(applied)
+    .fetch_all(pool)
+    .await
+    .expect("the belief rows of the applied row");
+    assert_eq!(
+        belief,
+        vec![Some(agent); belief_rows],
+        "the belief rows following the applied row name the triggering agent"
     );
 }
 
@@ -2385,7 +2420,8 @@ async fn a_dedup_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) {
         ],
     );
 
-    let (applied_id, _, details) = applied_row(&pool, "dedup", f.dup).await;
+    let (applied_id, who, details) = applied_row(&pool, "dedup", f.dup).await;
+    assert_cascade_rows_name(&pool, applied_id, who, agent, 1).await;
     assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
     assert_eq!(details["touched"]["edges_retracted"], 1, "{details}");
@@ -2437,7 +2473,8 @@ async fn a_supersede_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) 
         ],
     );
 
-    let (applied_id, _, details) = applied_row(&pool, "supersede", f.old).await;
+    let (applied_id, who, details) = applied_row(&pool, "supersede", f.old).await;
+    assert_cascade_rows_name(&pool, applied_id, who, agent, 1).await;
     assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
     let (who, ids) = applied_ids_row(&pool, applied_id).await;
@@ -2483,7 +2520,8 @@ async fn a_consolidate_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool
         ],
     );
 
-    let (applied_id, _, details) = applied_row(&pool, "consolidate", merged).await;
+    let (applied_id, who, details) = applied_row(&pool, "consolidate", merged).await;
+    assert_cascade_rows_name(&pool, applied_id, who, agent, 0).await;
     assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_migrated"], 2, "{details}");
     let (who, ids) = applied_ids_row(&pool, applied_id).await;
