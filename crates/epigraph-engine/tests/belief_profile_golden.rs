@@ -112,7 +112,7 @@ fn fold_under(c: &fixtures::Case, global: &BeliefProfile) -> fixtures::FoldBits 
             reliability: persp.as_ref(),
         },
     );
-    let ctx = FramedBeliefContext::new(profile);
+    let ctx = FramedBeliefContext::from_profile(profile);
     let rows = fixtures::rows(c);
     let alphas: Vec<f64> = rows
         .iter()

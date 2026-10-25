@@ -26,6 +26,7 @@
 
 use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -49,6 +50,11 @@ struct Cli {
     /// this RFC 3339 instant (e.g. the deploy time of the new BBA shape)
     #[arg(long)]
     written_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Proceed with a writing run although this process's belief modes differ
+    /// from the API's `/health` report (or cannot be read). For tests and a
+    /// deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq)]
@@ -68,6 +74,18 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Before the database: a writing run must show its belief modes match the
+    // API's (SPEC §10.2). A dry run writes nothing and is exempt.
+    let intent = if cli.dry_run {
+        RunIntent::WritesNothing
+    } else {
+        RunIntent::Writes
+    };
+    enforce_or_exit("backfill_factors", intent, cli.allow_mode_skew).await;
+    // Agreement on the flag is not enough: this build's cache writers fold only
+    // the legacy way, so a writing run under another fold refuses.
+    enforce_build_fold_or_exit("backfill_factors", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a

@@ -812,6 +812,62 @@ async fn hierarchical_workflow_result(
         None
     };
 
+    // `steps` above is the FROZEN plan (backlog 563165f2): the claims the
+    // `executes` edges named at ingest, never lineage heads, which the
+    // workflow-pin programme relies on. Disclose, additively, which of those
+    // steps have since been evolved and to what, plus the lineage's newest
+    // generation, so a caller following `steps` is not silently running stale
+    // text. Best-effort: a failed lookup leaves the fields absent rather than
+    // dropping the result.
+    let (has_evolved_steps, evolved_steps) =
+        match WorkflowRepository::resolve_steps_to_heads(pool, viewer, row.id).await {
+            Ok(resolved) => {
+                let evolved: Vec<EvolvedStep> = resolved
+                    .into_iter()
+                    .filter_map(|s| {
+                        // The head named is the one name-mode `evolve_step` /
+                        // `update_with_evidence` act on
+                        // (`WorkflowRepository::resolve_step_claim`): the
+                        // newest CURRENT head. Only when no head is current is
+                        // the newest (retired) one shown, flagged
+                        // `is_current=false`, never presented as current.
+                        let head = s
+                            .heads
+                            .iter()
+                            .find(|h| h.is_current)
+                            .or_else(|| s.heads.first())?;
+                        if s.heads.len() == 1 && head.id == s.frozen_claim_id {
+                            return None;
+                        }
+                        Some(EvolvedStep {
+                            step_index: s.step_index,
+                            frozen_claim_id: s.frozen_claim_id.to_string(),
+                            head_claim_id: head.id.to_string(),
+                            head_content: head.content.clone(),
+                            is_current: head.is_current,
+                            pending_resolution: s.pending_resolution,
+                        })
+                    })
+                    .collect();
+                (
+                    Some(!evolved.is_empty()),
+                    (!evolved.is_empty()).then_some(evolved),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id = %row.id, "resolve_steps_to_heads failed: {e}");
+                (None, None)
+            }
+        };
+    let latest_generation =
+        match WorkflowRepository::max_generation_by_canonical(pool, &row.canonical_name).await {
+            Ok(max) => max.map(i64::from),
+            Err(e) => {
+                tracing::warn!(workflow_id = %row.id, "max_generation_by_canonical failed: {e}");
+                None
+            }
+        };
+
     Some(FindWorkflowResult {
         workflow_id: row.id.to_string(),
         goal: row.goal.clone(),
@@ -829,6 +885,9 @@ async fn hierarchical_workflow_result(
         // claim's `properties.promotion`; hierarchical rows have no equivalent
         // field, so it stays absent rather than being faked as `false`.
         promotable: None,
+        has_evolved_steps,
+        evolved_steps,
+        latest_generation,
     })
 }
 
@@ -919,6 +978,11 @@ async fn enrich_workflow_result(
         behavioral_success_rate,
         behavioral_execution_count,
         promotable,
+        // Flat workflow claims carry their steps inline; there is no step
+        // lineage to disclose.
+        has_evolved_steps: None,
+        evolved_steps: None,
+        latest_generation: None,
     })
 }
 

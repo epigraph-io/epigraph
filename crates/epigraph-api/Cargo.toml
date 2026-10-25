@@ -257,3 +257,9 @@ path = "tests/integration/skip_embed_host_telemetry.rs"
 [[test]]
 name = "idempotency_2p5_tests"
 path = "tests/integration/idempotency_2p5_tests.rs"
+
+# Builds an MCP server beside the router; `epigraph-mcp` is a `db` dependency.
+[[test]]
+name = "belief_modes_surfaces_agree"
+path = "tests/belief_modes_surfaces_agree.rs"
+required-features = ["db"]

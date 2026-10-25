@@ -2251,6 +2251,9 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "elevation_sessions",
     "elevated_access",
     "pending_admin_acts",
+    "agent_prompt_blobs",
+    "agent_prompt_snapshots",
+    "agent_succession",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2333,6 +2336,17 @@ const ELEVATED_ACCESS_TABLES: &[&str] = &["elevated_access"];
 /// `owner_group_id` columns, so it does not join `tier_a`.
 const ADMIN_ACT_TABLES: &[&str] = &["pending_admin_acts"];
 
+/// Agent identity lineage, which migration 161 creates and FORCEs: the
+/// content-addressed prompt blobs, the prompt snapshots and the succession
+/// record. A TENTH TERM for the same reason as the nine above: FORCEd by the
+/// migration that creates them, none of the earlier kinds, and carrying no
+/// `visibility` / `owner_group_id` columns, so none joins `tier_a`.
+const AGENT_IDENTITY_TABLES: &[&str] = &[
+    "agent_prompt_blobs",
+    "agent_prompt_snapshots",
+    "agent_succession",
+];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2387,6 +2401,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(ELEVATION_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ELEVATED_ACCESS_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ADMIN_ACT_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(AGENT_IDENTITY_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

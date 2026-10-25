@@ -94,7 +94,9 @@ pub async fn evolve_step(
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
-            .map_err(internal_error)?
+            // `InvalidData` (every head of the step's lineage is retired) is
+            // the caller's to fix, not an internal error.
+            .map_err(crate::errors::db_caller_error)?
             .ok_or_else(|| {
                 invalid_params(format!(
                     "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"

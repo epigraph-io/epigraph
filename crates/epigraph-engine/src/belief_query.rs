@@ -312,8 +312,28 @@ pub async fn get_perspective_belief(
 /// not claim-scoped. [`get_perspective_belief_batch`] resolves the context
 /// once and the pure combine ([`combine_framed_bbas`]) touches the DB zero
 /// more times.
+///
+/// It is also the lens context of the atom fold
+/// ([`crate::atom_items::atom_axiom_rows`], SPEC §3.3 "Lens context"): there
+/// the global profile and the perspective tier apply, while each row's frame
+/// tier comes from that row's own frame, because the atom fold reads several
+/// frames at once. That is what [`Self::profile_for_frame`] resolves: the
+/// context's base profile, the row frame's tier, then this context's
+/// perspective tier, in one resolution, so the tier order (perspective over
+/// frame over global) holds per row. The context's own frame tier (from
+/// [`Self::resolve`]) is not read there. A context built by [`Self::new`],
+/// [`Self::global`] or [`Self::for_perspective`] carries no frame tier.
 #[derive(Debug, Clone)]
 pub struct FramedBeliefContext {
+    /// The global profile, before any frame or perspective tier: what
+    /// [`Self::profile_for_frame`] resolves a row's frame tier over.
+    base: BeliefProfile,
+    /// The perspective tier's reliability maps (`None`: no lens).
+    perspective: Option<PerspectiveReliability>,
+    /// The perspective tier's `belief_profile` override object.
+    perspective_overrides: Option<serde_json::Value>,
+    /// The resolved profile: `base`, then this context's frame tier (if any),
+    /// then the perspective tier.
     profile: BeliefProfile,
     /// The named global profile the lens was resolved over (provenance; not
     /// part of the hash).
@@ -321,14 +341,115 @@ pub struct FramedBeliefContext {
 }
 
 impl FramedBeliefContext {
+    /// A lens context with no frame tier: the global profile of
+    /// `calibration` ([`BeliefProfile::from_calibration`]), and the querying
+    /// perspective's reliability overrides when there is a lens (`None` is
+    /// the global, no-lens read).
+    #[must_use]
+    pub fn new(
+        calibration: crate::calibration::CalibrationConfig,
+        perspective: Option<PerspectiveReliability>,
+    ) -> Self {
+        Self::over(
+            BeliefProfile::from_calibration(&calibration),
+            FrameTier::default(),
+            perspective,
+            None,
+        )
+    }
+
     /// A context over an already-resolved profile, resolved over the default
     /// named profile ([`DEFAULT_PROFILE_NAME`], the only one served today).
+    /// It carries no tier inputs of its own: [`Self::profile_for_frame`]
+    /// resolves a frame tier over `profile` itself.
     #[must_use]
-    pub fn new(profile: BeliefProfile) -> Self {
+    pub fn from_profile(profile: BeliefProfile) -> Self {
         Self {
+            base: profile.clone(),
+            perspective: None,
+            perspective_overrides: None,
             profile,
             name: DEFAULT_PROFILE_NAME,
         }
+    }
+
+    /// The global (no-lens) context over the served profile
+    /// ([`BeliefProfile::served`]: the workspace calibration, falling back to
+    /// the built-in calibration when `calibration.toml` cannot be loaded,
+    /// exactly as the cache recompute does).
+    #[must_use]
+    pub fn global() -> Self {
+        Self::from_profile(BeliefProfile::served().clone())
+    }
+
+    /// The lens context of `perspective_id` with no frame tier: the served
+    /// profile (as [`Self::global`]) under the perspective's tier (its
+    /// reliability maps and its `belief_profile` override object), resolved
+    /// exactly as [`get_perspective_belief`] resolves them (an unknown or
+    /// empty perspective is no opinion). `None` is the global context.
+    ///
+    /// This is the context a compound read under a lens passes to
+    /// [`crate::compound_belief::derive_compound_belief_batch`], so a compound
+    /// under lens P is derived from its leaves under lens P (SPEC §3.3).
+    ///
+    /// # Errors
+    /// `Db` if the perspective read fails.
+    pub async fn for_perspective(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Self, BeliefQueryError> {
+        let Some(pid) = perspective_id else {
+            return Ok(Self::global());
+        };
+        let (perspective, perspective_overrides) =
+            perspective_tier_inputs(pool, viewer, pid).await?;
+        Ok(Self::over(
+            BeliefProfile::served().clone(),
+            FrameTier::default(),
+            Some(perspective),
+            perspective_overrides,
+        ))
+    }
+
+    /// `base` resolved under `frame`, then the perspective tier; the
+    /// perspective tier inputs are kept for [`Self::profile_for_frame`].
+    fn over(
+        base: BeliefProfile,
+        frame: FrameTier<'_>,
+        perspective: Option<PerspectiveReliability>,
+        perspective_overrides: Option<serde_json::Value>,
+    ) -> Self {
+        let profile = base.resolve(
+            frame,
+            PerspectiveTier {
+                overrides: perspective_overrides.as_ref(),
+                reliability: perspective.as_ref(),
+            },
+        );
+        Self {
+            base,
+            perspective,
+            perspective_overrides,
+            profile,
+            name: DEFAULT_PROFILE_NAME,
+        }
+    }
+
+    /// The profile a row of the frame whose tier is `frame` folds under in
+    /// this lens: the context's base profile, then `frame`, then this
+    /// context's perspective tier (one [`BeliefProfile::resolve`], so a
+    /// perspective's named weight still displaces the frame's dedicated
+    /// weight). The context's own frame tier, if any, is not applied.
+    #[must_use]
+    pub fn profile_for_frame(&self, frame: FrameTier<'_>) -> BeliefProfile {
+        self.base.resolve(
+            frame,
+            PerspectiveTier {
+                overrides: self.perspective_overrides.as_ref(),
+                reliability: self.perspective.as_ref(),
+            },
+        )
     }
 
     /// The read's profile identity `{name, hash}`: what `BeliefView.profile`
@@ -381,31 +502,46 @@ impl FramedBeliefContext {
                 .ok()
                 .flatten();
         let (perspective, perspective_overrides) = match perspective_id {
-            Some(pid) => match PerspectiveRepository::get_by_id(pool, viewer, pid).await? {
-                Some(p) => (
-                    PerspectiveReliability {
-                        source_reliability: p.source_reliability().unwrap_or_default(),
-                        locality_reliability: p.locality_reliability().unwrap_or_default(),
-                    },
-                    p.properties.as_ref().and_then(overrides_in).cloned(),
-                ),
-                None => (PerspectiveReliability::default(), None),
-            },
-            None => (PerspectiveReliability::default(), None),
+            Some(pid) => {
+                let (p, o) = perspective_tier_inputs(pool, viewer, pid).await?;
+                (Some(p), o)
+            }
+            None => (None, None),
         };
-        let profile = BeliefProfile::served().resolve(
+        Ok(Self::over(
+            BeliefProfile::served().clone(),
             FrameTier {
                 overrides: overrides_in(&frame_row.properties),
                 intra_evidence_locality_factor: per_frame_intra,
                 evidence_type_weights: per_frame_weights.as_ref(),
             },
-            PerspectiveTier {
-                overrides: perspective_overrides.as_ref(),
-                reliability: Some(&perspective),
-            },
-        );
-        Ok(Self::new(profile))
+            perspective,
+            perspective_overrides,
+        ))
     }
+}
+
+/// The perspective tier's inputs from its row: the reliability maps and the
+/// `belief_profile` override object. An unknown perspective is no opinion
+/// (empty maps, no object), so a lensed read over an un-configured observer
+/// equals the global read.
+async fn perspective_tier_inputs(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    perspective_id: Uuid,
+) -> Result<(PerspectiveReliability, Option<serde_json::Value>), BeliefQueryError> {
+    Ok(
+        match PerspectiveRepository::get_by_id(pool, viewer, perspective_id).await? {
+            Some(p) => (
+                PerspectiveReliability {
+                    source_reliability: p.source_reliability().unwrap_or_default(),
+                    locality_reliability: p.locality_reliability().unwrap_or_default(),
+                },
+                p.properties.as_ref().and_then(overrides_in).cloned(),
+            ),
+            None => (PerspectiveReliability::default(), None),
+        },
+    )
 }
 
 /// Combine a claim's stored BBAs into one mass function — the pure (no-DB) core
@@ -594,3 +730,65 @@ async fn perspective_belief_for_claim(
 // its source (`effective_source_strength_unit`, `belief_profile_golden`).
 // The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
 // is covered by the `perspective_frame_function` sqlx integration test.
+
+/// The `shadow` view of one claim under `mode` (SPEC §7.1): `None` in
+/// [`CompoundBeliefMode::Legacy`](crate::belief_view::CompoundBeliefMode),
+/// which issues no query at all. In `Shadow`, the claim's
+/// [`BeliefView`](crate::belief_view::BeliefView) under the global lens: a
+/// compound's derived value (R-DEP over the viewer's visible leaves, with its
+/// `not_all` valuation), or an atom's or standalone's AEF value. A procedural
+/// or rule claim, or a claim the viewer cannot see, has none.
+///
+/// The shadow never changes or fails the served read: a computation error is
+/// logged and the view omitted. It is always the `binary_truth` value under
+/// the global lens, whatever frame or lens the served read used.
+///
+/// **Known gap, carried from the atom reader** (`atom_axiom`'s module doc):
+/// on an application session row security can hide a compound's whole
+/// decomposition from a viewer; the role read then finds no compound, so that
+/// compound's own rows fold as an atom's and its frozen cache can be read as a
+/// `Legacy` leaf. The derivation is exact on a connection that bypasses row
+/// security. Per-request reads close this before any mode serves derived
+/// values (the read-dispatch PR fails closed or reads roles with definer
+/// rights); the shadow, off by default, is diagnostic only until then.
+pub async fn shadow_belief(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    mode: crate::belief_view::CompoundBeliefMode,
+) -> Option<crate::belief_view::BeliefView> {
+    if mode != crate::belief_view::CompoundBeliefMode::Shadow {
+        return None;
+    }
+    match shadow_view(pool, viewer, claim_id).await {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(claim = %claim_id, %error, "shadow belief omitted");
+            None
+        }
+    }
+}
+
+/// [`shadow_belief`]'s computation: the compound derivation first, then the
+/// atom view.
+async fn shadow_view(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<crate::belief_view::BeliefView>, String> {
+    let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
+    let ctx = FramedBeliefContext::global();
+    let ids = [claim_id];
+    if let Some(view) =
+        crate::compound_belief::derive_compound_belief_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id)
+    {
+        return Ok(Some(view));
+    }
+    Ok(
+        crate::compound_belief::atom_belief_view_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id),
+    )
+}

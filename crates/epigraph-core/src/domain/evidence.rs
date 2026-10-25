@@ -12,6 +12,20 @@ use epigraph_crypto::SIGNATURE_SIZE;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
+/// Values writers put in a DOI slot to mean "this document has no DOI". They
+/// are ABSENT, not an identity: keying on them collapses every DOI-less
+/// document onto one shared key (issue #356). Ingest's document key and the
+/// belief engine's source key both reject them.
+pub const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
+
+/// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`]
+/// (trimmed, ASCII case-insensitive).
+#[must_use]
+pub fn is_placeholder_id(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || DOI_PLACEHOLDERS.contains(&t.to_ascii_lowercase().as_str())
+}
+
 /// Types of evidence with their specific attributes
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]

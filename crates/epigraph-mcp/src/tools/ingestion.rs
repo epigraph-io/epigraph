@@ -215,6 +215,9 @@ pub async fn ingest_document(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
+    if params.wait.unwrap_or(false) {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
@@ -305,6 +308,7 @@ pub async fn ingest_document_inline(
     params: IngestDocumentInlineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    let wait = params.wait.unwrap_or(false);
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
@@ -323,6 +327,9 @@ pub async fn ingest_document_inline(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
+    if wait {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
@@ -344,6 +351,43 @@ pub async fn ingest_document_inline(
         }
     });
     success_json(&queued_response(&doi, &title, paper_id))
+}
+
+/// The `wait: true` arm of the two detached ingest handlers: run the walk IN
+/// the request and hand its result, or its error, to the caller.
+///
+/// Detached, a walk that fails past [`preflight_write_authority`] (a constraint
+/// on one of the document's rows, a refused trace, a malformed axis) reaches
+/// only the server log, and the caller, already told `queued`, can infer it
+/// only from `query_paper`'s claim_count staying 0 (backlog b1924b39). Waiting
+/// is what `ingest_document_spine` already does.
+///
+/// Called AFTER the same `refuse_elevated` / `detach_scoped` / preflight the
+/// detached arm runs, so both modes author under exactly the same authority.
+/// It skips `ensure_paper_node`: `do_ingest_document` gets-or-creates the row
+/// itself, after its verbatim and axis guards, so a guard refusal here leaves
+/// no `papers` row at all. A failure later in the walk can still leave that
+/// row (it is written on the pool, outside the walk's transaction), and the
+/// error says so.
+async fn ingest_in_request(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    doi: &str,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_document(server, viewer, extraction, auth)
+        .await
+        .map_err(|e| McpError {
+            code: e.code,
+            message: std::borrow::Cow::from(format!(
+                "{}. The ingest walk is one transaction, so no claims or edges were written \
+                 for document_key {doi:?}; its papers row may exist with 0 claims. Fix the \
+                 cause and retry: a retry is safe and converges on existing nodes.",
+                e.message
+            )),
+            data: e.data,
+        })
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -408,10 +452,7 @@ pub async fn paper_already_ingested(
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
-    let Some(prior) = PaperRepository::find_by_doi(pool, doi)
-        .await
-        .map_err(internal_error)?
-    else {
+    let Some(prior) = find_paper_by_document_key(pool, doi).await? else {
         return Ok(None);
     };
     if PaperRepository::has_processed_by_edge(pool, viewer, prior.id, pipeline_version)
@@ -474,9 +515,7 @@ pub async fn check_already_ingested(
             (exact, paper_id, matched)
         }
         None => {
-            let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
-                .await
-                .map_err(internal_error)?;
+            let paper = find_paper_by_document_key(&server.pool, &params.doi).await?;
             let matched = match &paper {
                 Some(p) => PaperRepository::processed_by_pipelines_in_family(
                     &server.pool,
@@ -1559,17 +1598,13 @@ fn doi_to_slug(doi: &str) -> String {
 /// URN prefix for a synthesized (non-DOI) document identity key.
 const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 
-/// Values callers pass to mean "this document has no DOI". Treated as ABSENT,
-/// not as an identity: keying on them collapsed every DOI-less document onto a
-/// single shared `papers` row (issue #356 — one node had accrued 1244 claims
-/// from at least four unrelated sources, with their author lists unioned).
-const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
-
-/// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`].
-fn is_placeholder_id(s: &str) -> bool {
-    let t = s.trim();
-    t.is_empty() || DOI_PLACEHOLDERS.contains(&t.to_ascii_lowercase().as_str())
-}
+// Values callers pass to mean "this document has no DOI" are treated as
+// ABSENT, not as an identity: keying on them collapsed every DOI-less document
+// onto a single shared `papers` row (issue #356 — one node had accrued 1244
+// claims from at least four unrelated sources, with their author lists
+// unioned). The list lives in epigraph-core so the belief engine's source key
+// rejects exactly the same values.
+use epigraph_core::domain::evidence::is_placeholder_id;
 
 /// Legible-but-bounded slug for the human-readable half of a synthetic key:
 /// lowercased, non-alphanumerics collapsed to single `-`, capped at 48 bytes on
@@ -1674,15 +1709,117 @@ fn ingest_claim_labels(
     Ok(labels)
 }
 
+/// Resolver prefixes a caller may put in front of a DOI. Matched
+/// case-insensitively; `doi:` also tolerates whitespace before the DOI.
+const DOI_KEY_PREFIXES: [&str; 7] = [
+    "https://doi.org/",
+    "http://doi.org/",
+    "https://dx.doi.org/",
+    "http://dx.doi.org/",
+    "https://www.doi.org/",
+    "http://www.doi.org/",
+    "doi:",
+];
+
+/// True for a bare DOI: `10.` + a 4-9 digit registrant + `/` + a non-empty
+/// suffix.
+fn is_bare_doi(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("10.") else {
+        return false;
+    };
+    let Some((registrant, suffix)) = rest.split_once('/') else {
+        return false;
+    };
+    (4..=9).contains(&registrant.len())
+        && registrant.bytes().all(|b| b.is_ascii_digit())
+        && !suffix.trim().is_empty()
+}
+
+/// The canonical spelling of a document identity key: trimmed, with a DOI
+/// resolver prefix (`https://doi.org/`, `dx.doi.org`, `doi:`, ...) removed
+/// when what follows is a bare DOI. Anything else is returned trimmed and
+/// otherwise unchanged.
+///
+/// Without it, `https://doi.org/10.1021/acsnano.9b05650` was stored verbatim
+/// as `papers.doi`, so the same DOI could be keyed twice and a `query_paper`
+/// on the bare DOI found nothing. NOT lowercased: DOIs are case-insensitive,
+/// but existing rows and their `doi:<key>` labels carry the caller's case, and
+/// folding it would re-key them.
+///
+/// TODO: consolidate with the engine's `normalize_doi` (belief source keys)
+/// once that lands; kept local so the `papers` key does not depend on it.
+pub(crate) fn canonical_document_key(raw: &str) -> String {
+    let t = raw.trim();
+    for prefix in DOI_KEY_PREFIXES {
+        let Some(head) = t.get(..prefix.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(prefix) {
+            let rest = t[prefix.len()..].trim_start();
+            if is_bare_doi(rest) {
+                return rest.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// Find the `papers` row a caller-supplied document key names: the
+/// [`canonical_document_key`] first, then the key as given (trimmed), then,
+/// for a bare DOI, each [`DOI_KEY_PREFIXES`] spelling of it. A row written
+/// under a resolver-URL spelling before keys were canonicalized is thus found
+/// by that spelling AND by the bare DOI, which is what the monitor's dedup
+/// probe asks with. The legacy spellings are exact-match: a row keyed on a
+/// case variant of a prefix (`HTTPS://DOI.ORG/...`) is found only as given.
+pub(crate) async fn find_paper_by_document_key(
+    pool: &sqlx::PgPool,
+    raw: &str,
+) -> Result<Option<epigraph_db::PaperRow>, McpError> {
+    let canonical = canonical_document_key(raw);
+    if let Some(row) = PaperRepository::find_by_doi(pool, &canonical)
+        .await
+        .map_err(internal_error)?
+    {
+        return Ok(Some(row));
+    }
+    let as_given = raw.trim();
+    if as_given != canonical {
+        if let Some(row) = PaperRepository::find_by_doi(pool, as_given)
+            .await
+            .map_err(internal_error)?
+        {
+            return Ok(Some(row));
+        }
+    }
+    if !is_bare_doi(&canonical) {
+        return Ok(None);
+    }
+    for prefix in DOI_KEY_PREFIXES {
+        let legacy = format!("{prefix}{canonical}");
+        if legacy == as_given {
+            continue;
+        }
+        if let Some(row) = PaperRepository::find_by_doi(pool, &legacy)
+            .await
+            .map_err(internal_error)?
+        {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
 /// Priority: real DOI → arXiv id parsed from `uri` → `uri` → synthesized key.
+/// A DOI given as a resolver URL or `doi:` (in `doi` or in `uri`) is keyed on
+/// the bare DOI ([`canonical_document_key`]).
 /// Placeholder DOIs/URIs (`"unknown"`, `"n/a"`, empty, …) are treated as absent
 /// so they fall through to synthesis instead of becoming a shared bucket.
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
         if !is_placeholder_id(d) {
-            return d.trim().to_string();
+            return canonical_document_key(d);
         }
         tracing::warn!(
             doi = %d,
@@ -1696,7 +1833,7 @@ fn resolve_doi(extraction: &DocumentExtraction) -> String {
             if let Some(arxiv) = find_arxiv_id(uri) {
                 return format!("10.48550/arXiv.{arxiv}");
             }
-            return uri.trim().to_string();
+            return canonical_document_key(uri);
         }
     }
     synthetic_document_key(&extraction.source)
@@ -2496,6 +2633,68 @@ mod tests {
         let key = resolve_doi(&extraction_of(s));
         assert_eq!(key, "10.1000/xyz123");
         assert!(!is_synthetic_key(&key));
+    }
+
+    fn key_for_doi(doi: &str) -> String {
+        let mut s = src("A paper");
+        s.doi = Some(doi.to_string());
+        resolve_doi(&extraction_of(s))
+    }
+
+    fn key_for_uri(uri: &str) -> String {
+        let mut s = src("A paper");
+        s.uri = Some(uri.to_string());
+        resolve_doi(&extraction_of(s))
+    }
+
+    /// A resolver-URL or `doi:` spelling of a DOI keys the SAME `papers` row as
+    /// the bare DOI. Observed: `https://doi.org/10.1021/acsnano.9b05650` was
+    /// stored verbatim, so a `query_paper` on the bare DOI found nothing and
+    /// the same DOI could exist under two keys.
+    #[test]
+    fn resolve_doi_strips_doi_org_url_prefix() {
+        let bare = "10.1021/acsnano.9b05650";
+        for spelled in [
+            "https://doi.org/10.1021/acsnano.9b05650",
+            "http://doi.org/10.1021/acsnano.9b05650",
+            "https://dx.doi.org/10.1021/acsnano.9b05650",
+            "http://dx.doi.org/10.1021/acsnano.9b05650",
+            "HTTPS://DOI.ORG/10.1021/acsnano.9b05650",
+            "doi:10.1021/acsnano.9b05650",
+            "DOI: 10.1021/acsnano.9b05650",
+            "  https://doi.org/10.1021/acsnano.9b05650  ",
+        ] {
+            assert_eq!(key_for_doi(spelled), bare, "source.doi = {spelled:?}");
+            assert_eq!(key_for_uri(spelled), bare, "source.uri = {spelled:?}");
+        }
+        // The suffix's case is part of the stored key: it is NOT lowercased
+        // (that would re-key existing rows and their `doi:` labels).
+        assert_eq!(
+            key_for_doi("https://doi.org/10.1103/PhysRevLett.116.061102"),
+            "10.1103/PhysRevLett.116.061102"
+        );
+        // A doi.org link to an arXiv DOI converges with the arXiv-uri key.
+        assert_eq!(
+            key_for_uri("https://doi.org/10.48550/arXiv.2606.04990"),
+            key_for_uri("https://arxiv.org/abs/2606.04990"),
+        );
+    }
+
+    /// Only a prefix in front of a DOI-shaped remainder is stripped; anything
+    /// else keeps the verbatim key it always had.
+    #[test]
+    fn resolve_doi_leaves_non_doi_keys_verbatim() {
+        for verbatim in [
+            "https://doi.org/about",
+            "https://doi.org/10.1021",
+            "https://doi.org/10.12/short-registrant",
+            "https://example.com/report/10.1021/x",
+            "https://example.org/eln/entry-42",
+        ] {
+            assert_eq!(key_for_uri(verbatim), verbatim, "source.uri = {verbatim:?}");
+            assert_eq!(key_for_doi(verbatim), verbatim, "source.doi = {verbatim:?}");
+        }
+        assert_eq!(key_for_doi("10.1000/xyz123"), "10.1000/xyz123");
     }
 
     #[test]

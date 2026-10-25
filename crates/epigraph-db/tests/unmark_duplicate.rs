@@ -971,3 +971,374 @@ async fn unmark_reports_and_leaves_rows_a_later_write_changed(pool: PgPool) {
         .expect("edge");
     assert_eq!(target, canonical, "a retracted edge is not re-pointed");
 }
+
+/// The BP factors `edges_auto_factor` minted from `edge` (migration 038 keys
+/// each one to its edge in `properties.source_edge_id`), as their sorted
+/// variable pairs.
+async fn factors_of_edge(pool: &PgPool, edge: Uuid) -> Vec<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "SELECT variable_ids FROM factors WHERE properties->>'source_edge_id' = $1::text \
+          ORDER BY id",
+    )
+    .bind(edge)
+    .fetch_all(pool)
+    .await
+    .expect("factors")
+}
+
+fn sorted_pair(a: Uuid, b: Uuid) -> Vec<Uuid> {
+    vec![a.min(b), a.max(b)]
+}
+
+/// A factor row as the BP engine reads it, every column but its id and
+/// creation time: type, variables, potential, description, properties, frame.
+type FactorRow = (
+    String,
+    Vec<Uuid>,
+    serde_json::Value,
+    Option<String>,
+    serde_json::Value,
+    Option<Uuid>,
+);
+
+/// Every factor keyed to `edge`, whole.
+async fn factor_rows(pool: &PgPool, edge: Uuid) -> Vec<FactorRow> {
+    sqlx::query_as(
+        "SELECT factor_type, variable_ids, potential, description, properties, frame_id \
+           FROM factors WHERE properties->>'source_edge_id' = $1::text ORDER BY id",
+    )
+    .bind(edge)
+    .fetch_all(pool)
+    .await
+    .expect("factor rows")
+}
+
+/// The one factor keyed to `edge`'s `potential[key]`.
+async fn strength_of(pool: &PgPool, edge: Uuid, key: &str) -> Option<f64> {
+    let rows = factor_rows(pool, edge).await;
+    assert_eq!(rows.len(), 1, "one factor keyed to edge {edge}");
+    rows[0].2[key].as_f64()
+}
+
+/// An edge whose `properties` the insert trigger reads (the matcher override).
+async fn edge_with_props(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    rel: &str,
+    props: serde_json::Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', $3, $4) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(rel)
+    .bind(props)
+    .fetch_one(pool)
+    .await
+    .expect("seed edge with properties")
+}
+
+/// Retiring the duplicate deletes every BP factor naming it
+/// (`claims_deactivate_factors`); the un-mark makes it current again and puts
+/// its edges back by UPDATE, which `edges_auto_factor` (INSERT only) never
+/// sees. So the reversal re-mints them, and each re-minted row must be the
+/// row the insert trigger minted, column for column, on every branch of the
+/// trigger: a directional edge each way, a mutual exclusion, a constant
+/// strength, the cross-source matcher's clamped score override (both clamps
+/// and a numeric string, which the trigger's cast accepts), a `CORROBORATES`
+/// edge not tagged by the matcher (constant strength despite its score), and
+/// a redundant copy the mark retracted rather than moved. The canonical's own
+/// copy keeps its one factor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_restores_the_duplicates_bp_factors(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let mut other = Vec::new();
+    for tag in [
+        "supporter",
+        "supported",
+        "rival",
+        "variant",
+        "high matcher",
+        "low matcher",
+        "string matcher",
+        "manual corroborator",
+        "twin",
+    ] {
+        other.push(fixture::seed_public_claim(&pool, a, tag).await);
+    }
+    let matcher = |score: serde_json::Value| serde_json::json!({"source": "cross_source_matcher", "score": score});
+    let e_in = edge(&pool, other[0], dup, "supports").await;
+    let e_out = edge(&pool, dup, other[1], "supports").await;
+    let e_con = edge(&pool, dup, other[2], "contradicts").await;
+    let e_var = edge(&pool, other[3], dup, "variant_of").await;
+    let e_hi = edge_with_props(
+        &pool,
+        other[4],
+        dup,
+        "CORROBORATES",
+        matcher(serde_json::json!(1.7)),
+    )
+    .await;
+    let e_lo = edge_with_props(
+        &pool,
+        dup,
+        other[5],
+        "CORROBORATES",
+        matcher(serde_json::json!(-0.5)),
+    )
+    .await;
+    let e_str = edge_with_props(
+        &pool,
+        other[6],
+        dup,
+        "CORROBORATES",
+        matcher(serde_json::json!("0.4")),
+    )
+    .await;
+    let e_manual = edge_with_props(
+        &pool,
+        other[7],
+        dup,
+        "CORROBORATES",
+        serde_json::json!({"score": 0.1}),
+    )
+    .await;
+    let e_twin_dup = edge(&pool, other[8], dup, "supports").await;
+    let e_twin_can = edge(&pool, other[8], canonical, "supports").await;
+    let dup_edges = [
+        e_in, e_out, e_con, e_var, e_hi, e_lo, e_str, e_manual, e_twin_dup,
+    ];
+
+    // Calibration: the insert trigger minted one row per edge, on each branch.
+    let mut before = Vec::new();
+    for e in dup_edges.iter().chain([&e_twin_can]) {
+        let rows = factor_rows(&pool, *e).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "calibration: the trigger minted edge {e}'s factor"
+        );
+        before.push(rows);
+    }
+    assert_eq!(before[0][0].0, "directional_support");
+    assert_eq!(before[2][0].0, "mutual_exclusion");
+    assert_eq!(before[2][0].2, serde_json::json!({}));
+    assert_eq!(strength_of(&pool, e_var, "strength").await, Some(0.65));
+    assert_eq!(strength_of(&pool, e_hi, "strength").await, Some(1.0));
+    assert_eq!(strength_of(&pool, e_lo, "strength").await, Some(0.0));
+    assert_eq!(strength_of(&pool, e_str, "strength").await, Some(0.4));
+    assert_eq!(strength_of(&pool, e_manual, "strength").await, Some(0.85));
+
+    let repair = mark(&pool, dup, canonical).await;
+    for e in &dup_edges {
+        assert!(
+            factor_rows(&pool, *e).await.is_empty(),
+            "calibration: retiring the duplicate deleted edge {e}'s factor"
+        );
+    }
+    let twin_in_force: bool =
+        sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(e_twin_dup)
+            .fetch_one(&pool)
+            .await
+            .expect("twin edge");
+    assert!(
+        !twin_in_force,
+        "calibration: the mark retracted the duplicate's redundant copy"
+    );
+
+    unmark(&pool, dup, &repair.revert).await;
+    for (e, rows) in dup_edges.iter().chain([&e_twin_can]).zip(&before) {
+        assert_eq!(
+            &factor_rows(&pool, *e).await,
+            rows,
+            "the un-mark re-mints edge {e}'s factor exactly as the insert trigger minted it"
+        );
+    }
+    let on_canonical_pair: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM factors WHERE variable_ids = $1")
+            .bind(sorted_pair(other[8], canonical))
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(
+        on_canonical_pair, 1,
+        "the canonical's own copy keeps one factor"
+    );
+}
+
+/// A chain un-marked in reverse order: each edge follows the chain back, and
+/// its factor follows the edge, on both sides of the duplicate. Un-marking c1
+/// re-mints the incoming and the outgoing edge's factors on c1 (the edges are
+/// on c1 then); un-marking d1 moves them on to d1, so those factors are stale
+/// and go, and d1's are minted. No factor keyed to an edge is left naming a
+/// claim the edge no longer touches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chain_unmark_leaves_no_factor_on_a_claim_the_edge_left(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let c2 = fixture::seed_public_claim(&pool, a, "newest canonical").await;
+    let c1 = fixture::seed_public_claim(&pool, a, "first canonical").await;
+    let d1 = fixture::seed_public_claim(&pool, a, "first duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let supported = fixture::seed_public_claim(&pool, a, "supported").await;
+    let e = edge(&pool, supporter, d1, "supports").await;
+    let e_out = edge(&pool, d1, supported, "supports").await;
+
+    let r1 = mark(&pool, d1, c1).await;
+    let r2 = mark(&pool, c1, c2).await;
+    unmark(&pool, c1, &r2.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e).await,
+        vec![sorted_pair(supporter, c1)],
+        "with the edge back on c1, c1 is in the factor graph through it"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_out).await,
+        vec![sorted_pair(c1, supported)],
+        "and through the outgoing edge"
+    );
+    unmark(&pool, d1, &r1.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e).await,
+        vec![sorted_pair(supporter, d1)],
+        "the edge is on d1 again: one factor, on d1, and none left on c1"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_out).await,
+        vec![sorted_pair(d1, supported)],
+        "the outgoing edge too: re-sourced back, its factor on d1 and none on c1"
+    );
+}
+
+/// The stale factor the chain un-mark deletes frees its `(type, pair)` slot
+/// on the canonical. A parallel edge of the same factor type the canonical
+/// gained meanwhile could not mint there (the unique slot was taken, and the
+/// trigger's insert did nothing); it owns the slot now.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_freed_slot_on_the_canonical_goes_to_its_parallel_edge(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let c2 = fixture::seed_public_claim(&pool, a, "newest canonical").await;
+    let c1 = fixture::seed_public_claim(&pool, a, "first canonical").await;
+    let d1 = fixture::seed_public_claim(&pool, a, "first duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let e = edge(&pool, supporter, d1, "supports").await;
+
+    let r1 = mark(&pool, d1, c1).await;
+    let r2 = mark(&pool, c1, c2).await;
+    unmark(&pool, c1, &r2.revert).await;
+    let parallel = edge(&pool, supporter, c1, "provides_evidence").await;
+    assert!(
+        factors_of_edge(&pool, parallel).await.is_empty(),
+        "calibration: the slot was held by the un-marked edge's factor"
+    );
+    unmark(&pool, d1, &r1.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e).await,
+        vec![sorted_pair(supporter, d1)]
+    );
+    assert_eq!(
+        factors_of_edge(&pool, parallel).await,
+        vec![sorted_pair(supporter, c1)],
+        "the freed slot on the canonical is re-minted for its parallel edge"
+    );
+}
+
+/// The un-mark rebuilds the duplicate's factors and the slots it frees on the
+/// canonical, and nothing else: a canonical edge whose factor something else
+/// removed (here a `decomposes_to` factor, as a sweep of those would) stays
+/// without one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_leaves_the_canonicals_other_factors_as_it_found_them(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let atom = fixture::seed_public_claim(&pool, a, "atom").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let e_dec = edge(&pool, canonical, atom, "decomposes_to").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_dec)
+        .execute(&pool)
+        .await
+        .expect("remove the decomposition's factor");
+    let e_sup = edge(&pool, supporter, dup, "supports").await;
+
+    let repair = mark(&pool, dup, canonical).await;
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_sup).await,
+        vec![sorted_pair(supporter, dup)],
+        "calibration: the un-mark re-minted the duplicate's factor"
+    );
+    assert!(
+        factors_of_edge(&pool, e_dec).await.is_empty(),
+        "the un-mark mints nothing for a canonical edge it did not move"
+    );
+}
+
+/// A matcher edge whose score was later changed to something the trigger's
+/// cast would reject (properties can be patched after the INSERT the trigger
+/// saw) does not make the un-mark fail: the re-mint falls back to the
+/// constant strength, as the trigger does for a missing score.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_malformed_matcher_score_does_not_block_the_unmark(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let source = fixture::seed_public_claim(&pool, a, "matched source").await;
+    let e = edge_with_props(
+        &pool,
+        source,
+        dup,
+        "CORROBORATES",
+        serde_json::json!({"source": "cross_source_matcher", "score": 0.9}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE edges SET properties = jsonb_set(properties, '{score}', '\"high\"') WHERE id = $1",
+    )
+    .bind(e)
+    .execute(&pool)
+    .await
+    .expect("patch the score");
+
+    let repair = mark(&pool, dup, canonical).await;
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
+}
+
+/// A patched matcher score that is decimal-shaped but whose exponent
+/// overflows `numeric` (e.g. "1e999999") must not abort the un-mark either:
+/// the cast would raise "value overflows numeric format", so the shape guard
+/// has to reject it and the re-mint falls back to the constant strength.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_overflowing_matcher_score_exponent_does_not_block_the_unmark(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let source = fixture::seed_public_claim(&pool, a, "matched source").await;
+    let e = edge_with_props(
+        &pool,
+        source,
+        dup,
+        "CORROBORATES",
+        serde_json::json!({"source": "cross_source_matcher", "score": 0.9}),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE edges SET properties = jsonb_set(properties, '{score}', '\"1e999999\"') WHERE id = $1",
+    )
+    .bind(e)
+    .execute(&pool)
+    .await
+    .expect("patch the score");
+
+    let repair = mark(&pool, dup, canonical).await;
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
+}

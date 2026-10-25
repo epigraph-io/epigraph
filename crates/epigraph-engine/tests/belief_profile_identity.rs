@@ -33,9 +33,9 @@ fn a_context_reports_the_global_profiles_name_and_its_resolved_hash() {
         },
     );
 
-    let plain = FramedBeliefContext::new(global.clone()).profile_identity();
-    let moved = FramedBeliefContext::new(lensed.clone()).profile_identity();
-    let same = FramedBeliefContext::new(restated).profile_identity();
+    let plain = FramedBeliefContext::from_profile(global.clone()).profile_identity();
+    let moved = FramedBeliefContext::from_profile(lensed.clone()).profile_identity();
+    let same = FramedBeliefContext::from_profile(restated).profile_identity();
 
     assert_eq!(plain.name, DEFAULT_PROFILE_NAME);
     assert_eq!(moved.name, DEFAULT_PROFILE_NAME);

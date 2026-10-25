@@ -18,16 +18,20 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
+pub mod belief_modes;
 pub mod belief_profile;
 pub mod belief_query;
+pub mod belief_view;
 pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
 pub mod cdst_sheaf;
 pub mod classifier;
+pub mod compound_belief;
 pub mod confidence;
 pub mod cospan;
 pub mod counterfactual;

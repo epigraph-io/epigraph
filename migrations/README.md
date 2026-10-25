@@ -1404,6 +1404,94 @@ restart.
   it an admin (PR-18). Slot 159 per the drain's slot register; 154-158 are
   claimed elsewhere. **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **162**: public `agent_key_retire_closes_window`. Re-states 118's
+  `epigraph_agent_key_set_status(uuid, text, text, uuid)` (`CREATE OR
+  REPLACE`, same signature; owner and grant re-asserted idempotently, as 140
+  does) with ONE change: both transitions (active -> rotated, anything but
+  revoked -> revoked) also set `valid_until = LEAST(valid_until, now())`.
+  Before it, a rotated or revoked key kept an open-ended validity window, so
+  a "key valid at the claim's created_at" check would keep binding signatures
+  made after the key was retired. `LEAST` ignores NULL, so an open window
+  ends at the transition and an already-ended window keeps its earlier end.
+  The rotate handler opens the new key's window no earlier than the returned
+  `valid_until`. Pinned by `epigraph-api/tests/agent_mutation_auth_test.rs`
+  (`*_closes_*_window`, `revoke_agent_key_never_reopens_or_extends_a_closed_window`)
+  and, for the app role's transitions, `epigraph-db/tests/app_role_table_lockdown.rs`.
+  Existing retired rows keep `valid_until` NULL (not reconstructed). Undo:
+  re-run 118's `CREATE OR REPLACE FUNCTION public.epigraph_agent_key_set_status`
+  block. Slot: 160 and 161 are carried by open PR branches, so 162 is the
+  first number free on `main` and on every open PR branch; an apply before
+  160/161 is harmless (sqlx applies a lower pending version, and neither of
+  them touches this function). **Deploy order:** none against the binaries (an
+  older binary ignores the returned `valid_until`). **Applied to throwaway
+  databases only, NOT to any deployed database.**
+
+- **161**: public `agent_identity_lineage` (agent identity lineage design
+  D2-D4, slice S1). Creates the role `epigraph_identity_attestor` NOLOGIN and
+  a member of nothing (operations grants LOGIN and a password out of band; no
+  migration carries one), and REFUSES to apply if the role already exists and
+  `epigraph_identity_attestor_faults()` names anything (an elevated attribute,
+  a membership, or another role able to act as it); where the migration
+  cannot create the role, the header's section 2 lists the grants operations
+  run after provisioning it; the FORCE-RLS tables `agent_prompt_blobs`
+  (content-addressed zstd; UPDATE, DELETE and TRUNCATE refused for every
+  role, a superuser included, short of disabling triggers),
+  `agent_prompt_snapshots` (only `last_seen` moves, forward; no TRUNCATE) and
+  `agent_succession` (append-only, no TRUNCATE), each readable and writable
+  by a maintenance-owned definer frame only; moves `epigraph_link_operator`'s body unchanged into the
+  maintenance-only invoker `epigraph_link_operator_body(uuid, uuid, jsonb)`
+  (the entry point keeps its owner, ACL and edge properties); adds the
+  definer `epigraph_register_agent_identity(...)`, EXECUTE-able by the
+  attestor ALONE (PUBLIC, `epigraph_app` and its owner revoked), which finds
+  or creates the identity (checked against its own snapshots, never against
+  app-writable properties), stores the snapshot, records the succession,
+  binds the signing key once (a different key while one is active is AID08)
+  and inherits a LIVE-linked parent's operator, except into an unlinked
+  identity already running in another group (`shared_identity`) or where the
+  link body refuses (`link_refused`); the result reports `inherited`,
+  `link_live` and a reason (AID03 / AID05 / AID07 / AID08 refuse and change
+  nothing); adds the definer `epigraph_agent_prompt_history(uuid)` for the
+  request DSN (operator or admin; AID06 otherwise), whose lineage walk is
+  breadth-first, one step per member; reserves the `agent.identity_` audit
+  family; guards `agent_keys` so that `signing` and `identity-legacy` rows
+  are written, and their status moved, only by the attested registration or
+  a maintenance session (`epigraph_agent_key_set_status` gains that gate);
+  and backfills one active `identity-legacy` `agent_keys` row per existing
+  agent through the re-runnable maintenance function
+  `epigraph_backfill_legacy_agent_keys()`, which the cut-over (S5) runs
+  again.
+  Behaviour in `epigraph-db/tests/agent_identity_lineage.rs` and
+  `agent_identity_repo.rs`; `operator_link.rs` pins the entry point unchanged.
+  Undo is in the file's header. Slot: 160 is carried by a non-PR remote branch,
+  so 161 is the first number free on `main`, on every open PR branch and on
+  every remote branch. **Deploy order:** AFTER the rotate-route caller check
+  (slice S0) and with a binary whose `AgentKeyRepository::get_active_key`
+  reads only `signing` keys (this PR). The backfill gives every agent an
+  active `identity-legacy` key, so it changes what the live list-keys and
+  rotate routes see. 161's guard already refuses the application role any
+  write to that key type, and to `signing` keys; the HTTP rotate and revoke
+  routes therefore cannot touch either type after 161, and rotating or
+  revoking one is a maintenance act. The attestor login is provisioned after
+  the migration. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+
+- **163**: public `agent_key_set_status_closes_window` (agent identity
+  lineage design D2, slice S2). Re-states `epigraph_agent_key_set_status`
+  from 161's body (the AK02 attested-key gate included) so that both
+  transitions, to `rotated` and to `revoked`, also set
+  `valid_until = LEAST(valid_until, now())`: a rotated signing key then keeps
+  binding, in `verify_claim`, the claims it signed while active, and binds
+  nothing dated after the rotation. Owner and ACL unchanged. Pinned by
+  `epigraph-mcp/tests/verify_claim_key_binding.rs`
+  (`a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation`).
+  The rotate-route caller-check slice carries a `162` making the same window
+  change to 118's body without the AK02 gate; 163 is the union and, as the
+  higher number, applies last in either order, so every database converges
+  on both. Undo: re-run 161's `CREATE OR REPLACE FUNCTION` block. Slot: 162 is
+  carried by that slice's branch; 163 is free on `main` and on every remote
+  branch. **Deploy order:** with or after 161, and after that 162 if it has
+  been applied. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 

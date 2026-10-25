@@ -1014,3 +1014,166 @@ async fn a_missing_canonical_row_is_never_created_at_request_time(pool: PgPool) 
         "a refused call writes no BBA"
     );
 }
+
+// ── the per-write refresh inherits the bulk recompute guard ──
+//
+// assess refreshes the claim's cache through
+// `recompute_claim_cached_belief`, so it resolves the owner frame through the
+// same guarded lookup as the bulk recomputers. These arms pin the two
+// agent-visible consequences. Like the rest of this file they run on the
+// superuser harness, where row security does not apply, so they pin the
+// guard's SQL, not how row security filters it on an app connection.
+
+/// Every cache column, as one comparable string.
+async fn full_cache(pool: &PgPool, claim: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT row_to_json(x)::text FROM ( \
+             SELECT belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, \
+                    belief_frame_id, classification \
+               FROM claims WHERE id = $1) x",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("read the full cache")
+}
+
+/// A cache no fold in this file produces, recorded on `frame`.
+async fn set_sentinel_cache(pool: &PgPool, claim: Uuid, frame: Option<Uuid>) -> String {
+    sqlx::query(
+        "UPDATE claims SET belief = 0.613, plausibility = 0.887, pignistic_prob = 0.741, \
+                mass_on_empty = 0.017, mass_on_missing = 0.029, belief_frame_id = $2, \
+                classification = 'sentinel' \
+          WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(frame)
+    .execute(pool)
+    .await
+    .expect("set the sentinel cache");
+    full_cache(pool, claim).await
+}
+
+async fn decomposes_to(pool: &PgPool, parent: Uuid, child: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(parent)
+    .bind(child)
+    .execute(pool)
+    .await
+    .expect("seed decomposes_to edge");
+}
+
+/// Assessing a (non-workflow) compound still stores the assessment row and
+/// returns that frame's numbers, but leaves the compound's cache exactly as it
+/// was. A standalone twin assessed the same way IS refreshed (calibration).
+///
+/// Base: the refresh refolds the compound's own rows into its cache.
+#[sqlx::test(migrations = "../../migrations")]
+async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) {
+    let (compound, _viewer, caller) = seed_claim(&pool, "assess a compound").await;
+    let leaf = seed_public_claim(&pool, caller, "assess a compound: its leaf").await;
+    decomposes_to(&pool, compound, leaf).await;
+    let twin = seed_public_claim(&pool, caller, "assess a standalone twin").await;
+
+    let twin_before = set_sentinel_cache(&pool, twin, None).await;
+    assess(&pool, caller, twin, request(true, 0.8, None)).await;
+    assert_ne!(
+        full_cache(&pool, twin).await,
+        twin_before,
+        "CALIBRATION: assess refreshes a standalone's cache"
+    );
+
+    let before = set_sentinel_cache(&pool, compound, None).await;
+    let rows_before = mass_function_count(&pool, compound).await;
+    let resp = assess(&pool, caller, compound, request(true, 0.8, None)).await;
+
+    assert_eq!(
+        mass_function_count(&pool, compound).await,
+        rows_before + 1,
+        "the assessment row is still stored on a compound"
+    );
+    assert!(
+        resp.pignistic_prob.is_some(),
+        "the response still reports the frame's numbers"
+    );
+    assert_eq!(
+        full_cache(&pool, compound).await,
+        before,
+        "assess must not refold a compound's own rows into its cache"
+    );
+}
+
+/// The claim's earliest input is the ingest template on `research_validity`,
+/// and its cache is recorded there. An assessment on a non-canonical frame
+/// gives it its one real input. The refresh must hand the cache to the frame
+/// that holds the real input, and the cache must equal that of a twin claim
+/// with no template assessed the same way, not a refold of the template's
+/// frame.
+///
+/// Base: the recorded `research_validity` frame keeps ownership (it still
+/// holds an input) and the cache becomes the template's fold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assessment_moves_ownership_off_a_frame_holding_only_the_ingest_template(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess over an ingest template").await;
+    let (ingest, _) = seed_agent_with_group(&pool, "assess-ingest").await;
+    let rv: Uuid =
+        match sqlx::query_scalar("SELECT id FROM frames WHERE name = 'research_validity'")
+            .fetch_optional(&pool)
+            .await
+            .expect("look up research_validity")
+        {
+            Some(id) => id,
+            None => create_frame(&pool, "research_validity", &["TRUE", "FALSE"]).await,
+        };
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
+         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(claim)
+    .bind(rv)
+    .execute(&pool)
+    .await
+    .expect("assign the claim to research_validity");
+    // The ingest template's shape: no method, source strength 0.3, 0.9 on Θ.
+    sqlx::query(
+        "INSERT INTO mass_functions \
+           (claim_id, frame_id, source_agent_id, masses, conflict_k, combination_method, \
+            source_strength, evidence_type, locality_tag, created_at) \
+         VALUES ($1, $2, $3, '{\"0\": 0.1, \"0,1\": 0.9}'::jsonb, 0.0, NULL, 0.3, NULL, \
+                 'unknown', now() - interval '1 hour')",
+    )
+    .bind(claim)
+    .bind(rv)
+    .bind(ingest)
+    .execute(&pool)
+    .await
+    .expect("seed the ingest template row");
+    set_sentinel_cache(&pool, claim, Some(rv)).await;
+
+    let paper = create_frame(&pool, "paper_validity_x", &["supported", "refuted"]).await;
+    let resp = assess(&pool, caller, claim, request_on(paper, true, 0.8)).await;
+    assert_eq!(
+        resp.frame_id, paper,
+        "CALIBRATION: the explicit frame is used"
+    );
+
+    let (owner, betp) = cache(&pool, claim).await;
+    assert_eq!(
+        owner,
+        Some(paper),
+        "a frame holding only the ingest template kept the cache"
+    );
+    assert_ne!(betp, Some(0.741), "the refresh wrote the cache");
+
+    let twin = seed_public_claim(&pool, caller, "assess with no ingest template").await;
+    set_sentinel_cache(&pool, twin, Some(rv)).await;
+    assess(&pool, caller, twin, request_on(paper, true, 0.8)).await;
+    assert_eq!(
+        full_cache(&pool, claim).await,
+        full_cache(&pool, twin).await,
+        "the cache must be the real frame's fold, exactly as on a twin with no template"
+    );
+}

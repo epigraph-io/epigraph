@@ -122,7 +122,8 @@ const ROUTES: &str = "crates/epigraph-api/src/routes";
 /// stamped; delete it at zero. Never raise one.
 const UNSTAMPED: &[(&str, usize)] = &[
     ("assess.rs", 3),
-    ("belief.rs", 6),
+    // `belief.rs` (6) is gone: `submit_evidence`'s WITHIN_FRAME, SCOPED_BY
+    // and CONTRIBUTES_TO edges are written on its stamped transaction (fb9cff66).
     ("claims.rs", 3),
     ("community.rs", 1),
     // 6 before the W12b revise, which stamped `share_skill`'s and

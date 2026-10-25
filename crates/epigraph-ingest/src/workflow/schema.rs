@@ -40,6 +40,11 @@ pub struct WorkflowSource {
     pub authors: Vec<AuthorEntry>,
     #[serde(default)]
     pub expected_outcome: Option<String>,
+    /// Recorded on the workflows row as `metadata.tags` (trimmed, empties
+    /// dropped, de-duplicated, appended after any caller `metadata.tags`
+    /// array) when the row is first created and `metadata` is absent, null or
+    /// an object; re-ingesting an existing `(canonical_name, generation)`
+    /// keeps the original tags.
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]

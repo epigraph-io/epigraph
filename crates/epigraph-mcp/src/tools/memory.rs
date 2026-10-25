@@ -30,6 +30,9 @@ pub async fn memorize(
     params: MemorizeParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // Same content cap as submit_claim and the HTTP twins, checked before the
+    // author is resolved, the content is embedded, or anything is written.
+    crate::tools::claims::check_claim_content_length(&params.content)?;
     // Author = the request's principal (batch H-b, D1); signer = this server.
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
@@ -1062,13 +1065,13 @@ async fn recall_post_embed(
     //  * AFTER the audit block — that block derives `returned_claim_ids` from
     //    `results`, and this consumes `results` by value.
     //
-    // The score is the SAME `truth_value` `min_truth` gates on above, read out
-    // of the already-built result rather than recomputed, so the threshold and
-    // the gate cannot come to disagree about what a claim's belief is.
+    // The score is `belief_score`, the value `min_truth` gated on above, read
+    // out of the already-built result through `RecallGatedSignals` rather than
+    // chosen here: this site used to pass `truth_value`, which the gate stopped
+    // reading when it moved to the DS cache, so the threshold and the gate
+    // disagreed on every claim whose evidence has moved it.
     let (results, epistemic_partition) =
-        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
-            (r.truth_value, r.is_contested)
-        });
+        crate::types::split_epistemic(results, params.epistemic_partition);
 
     success_json(&RecallEnvelope {
         results,

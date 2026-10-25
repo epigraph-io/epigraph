@@ -200,6 +200,25 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The largest claim content, in bytes, the claim-writing tools accept. The
+/// same cap as the HTTP twins (`epigraph-api` `routes/submit.rs` and
+/// `routes/batch.rs`, `MAX_CLAIM_CONTENT_LENGTH`), so the two transports agree
+/// on what a claim may be. Document ingest (`ingest_document*`) has its own,
+/// larger cap and does not go through this check.
+pub const MAX_CLAIM_CONTENT_LENGTH: usize = 65_536;
+
+/// Refuse claim `content` longer than [`MAX_CLAIM_CONTENT_LENGTH`] bytes as the
+/// caller's error. Run it before anything is resolved, embedded or written.
+pub(crate) fn check_claim_content_length(content: &str) -> Result<(), McpError> {
+    if content.len() > MAX_CLAIM_CONTENT_LENGTH {
+        return Err(invalid_params(format!(
+            "content is {} bytes; the maximum is {MAX_CLAIM_CONTENT_LENGTH} bytes",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -363,6 +382,11 @@ async fn prepare_submission(
     mut params: SubmitClaimParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<PreparedSubmission, McpError> {
+    // The size cap FIRST: before the author is resolved, before the novelty
+    // gate embeds the content and before any write. `submit_claim`,
+    // `batch_submit_claims` (per entry) and `resolve_backlog_item` all pass
+    // through here.
+    check_claim_content_length(&params.content)?;
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
@@ -1180,25 +1204,40 @@ pub async fn verify_claim(
 
     // Authenticity: the stored Ed25519 signature over the stored digest,
     // checked against the SIGNER's public key (resolved by `get_by_id` through
-    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
-    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
-    // could never pass for any claim.
+    // `claims.signer_id -> agents.public_key`) and, since agent identity
+    // lineage design D2, against the attested `agent_keys` rows (`signing`,
+    // `identity-legacy`) of the claim's signer and author. In the
+    // separate-signing-key mode the signer's `agents.public_key` is its
+    // IDENTITY key, which signs nothing, so the signature verifies only under
+    // its registered signing key. `key_bound` then asks whether that key is
+    // the AUTHOR's and was valid at `created_at` (`bind_signature`).
     //
     // `signed` keeps "no signature to check" distinguishable from "signature
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
-    let signature_valid = match claim.signature {
-        Some(sig) => {
-            epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
-                .unwrap_or(false)
-        }
-        None => false,
+    let keys = if signed {
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&server.pool, viewer, id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
     };
+    let binding = crate::signing_identity::bind_signature(
+        &claim.content_hash,
+        claim.signature.as_ref(),
+        &claim.public_key,
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        &keys,
+    );
+    let signature_valid = binding.signature_valid;
 
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
         signed,
+        key_bound: binding.key_bound,
+        key_kind: binding.key_kind,
         hash_check,
         hash_matches: match hash_check {
             HashCheck::Match => Some(true),
@@ -1229,7 +1268,9 @@ pub async fn update_with_evidence(
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
-            .map_err(internal_error)?
+            // `InvalidData` (every head of the step's lineage is retired) is
+            // the caller's to fix, not an internal error.
+            .map_err(crate::errors::db_caller_error)?
             .ok_or_else(|| {
                 invalid_params(format!(
                     "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"

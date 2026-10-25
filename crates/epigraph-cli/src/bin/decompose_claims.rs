@@ -141,7 +141,10 @@
 //!   LLM is called, the mapping printed, a manifest written (`--manifest`),
 //!   nothing else. `--retarget --apply` writes through the API;
 //!   `--retarget --apply-plan <manifest>` applies a reviewed manifest with no
-//!   LLM call.
+//!   LLM call. Both retarget writing modes first check this process's belief
+//!   modes against the API's `/health` and refuse on any difference, before
+//!   the database or the token mint (`epigraph_cli::belief_mode_check`, SPEC
+//!   §10.2); the retarget dry run is exempt.
 //!
 //! Every writing mode resolves API auth BEFORE any LLM call (gh-375).
 //!
@@ -294,6 +297,11 @@ struct Cli {
     /// `retarget-manifest-<UTC timestamp>.jsonl`). Refused if it exists.
     #[arg(long)]
     manifest: Option<PathBuf>,
+    /// With --retarget --apply / --apply-plan: proceed although this process's
+    /// belief modes differ from the API's `/health` report (or cannot be
+    /// read). For tests and a deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
     /// With --retarget: also revisit edges already marked `retargeted_to`
     /// (fully wired ones included). An edge that already has atom edges is
     /// resumed from them and re-checked, not re-asked of the LLM.
@@ -331,6 +339,12 @@ impl Mode {
             Mode::Run => provider_writes_to_api(provider),
             Mode::ApplyPlan(_) | Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_) => true,
         }
+    }
+
+    /// Whether this mode is a retarget WRITE, which runs the belief-mode check
+    /// (SPEC §10.2). Decomposition modes are not wave runs and are not checked.
+    fn is_retarget_write(&self) -> bool {
+        matches!(self, Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_))
     }
 
     /// The OAuth scope a minted token must carry for this mode's writes.
@@ -538,18 +552,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
 
-/// API base precedence: `EPIGRAPH_API` (explicit override) first,
-/// `EPIGRAPH_API_URL` (the container-standard name epiclaw-host exposes)
-/// second, `http://127.0.0.1:8080` otherwise. Takes already-read env values
-/// (rather than reading `std::env::var` itself) so it's a pure function —
-/// testable without mutating global process env, which races under
-/// parallel test execution. Set-but-empty values are treated as absent
-/// (see [`non_empty`]).
-fn resolve_api_base(epigraph_api: Option<String>, epigraph_api_url: Option<String>) -> String {
-    non_empty(epigraph_api)
-        .or_else(|| non_empty(epigraph_api_url))
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
-}
+// API base precedence (`EPIGRAPH_API`, then `EPIGRAPH_API_URL`, then
+// `http://127.0.0.1:8080`): one spelling, shared with the belief-mode check,
+// so the API a retarget write checks is the API it writes to.
+use epigraph_cli::belief_mode_check::resolve_api_base;
 
 /// OAuth token endpoint precedence: explicit `EPIGRAPH_OAUTH_TOKEN_URL`
 /// first (matches the epiclaw-host `container.rs` convention of constructing
@@ -875,6 +881,16 @@ fn fresh_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mode = resolve_mode(&cli, chrono::Utc::now())?;
+    // A retarget write is a wave run: before the database, the ledger and the
+    // token mint, its belief modes must match the API's (SPEC §10.2).
+    if mode.is_retarget_write() {
+        epigraph_cli::belief_mode_check::enforce_or_exit(
+            "decompose_claims --retarget",
+            epigraph_cli::belief_mode_check::RunIntent::Writes,
+            cli.allow_mode_skew,
+        )
+        .await;
+    }
     // Before the DB, auth and any LLM call: a ledger path a recording mode
     // cannot write must fail now, not after the verdicts are paid for.
     let mut ledger = open_singleton_ledger(cli.singleton_ledger.as_deref(), &mode)?;

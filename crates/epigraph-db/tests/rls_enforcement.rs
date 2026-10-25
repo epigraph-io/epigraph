@@ -271,6 +271,50 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE policy default-denies every non-superuser role, and 130 grants DELETE to \
          nobody.",
     ),
+    // ---- Migration 161: agent identity lineage. -----------------------------
+    (
+        "agent_prompt_blobs",
+        "UPDATE",
+        "A prompt blob (161) is content-addressed by the BLAKE3 of its raw bytes, so the \
+         content under a hash must never change. Under FORCE the absent UPDATE policy \
+         default-denies every non-superuser role, 161 grants UPDATE to nobody, and its \
+         append-only guards refuse UPDATE, DELETE and TRUNCATE for every role, \
+         a superuser included, short of disabling triggers.",
+    ),
+    (
+        "agent_prompt_blobs",
+        "DELETE",
+        "A prompt blob (161) is referenced by the snapshots that ran it and is never \
+         deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
+         role, 161 grants DELETE to nobody, and its append-only guards refuse UPDATE, \
+         DELETE and TRUNCATE for every role, a superuser included, short of disabling \
+         triggers.",
+    ),
+    (
+        "agent_prompt_snapshots",
+        "DELETE",
+        "A prompt snapshot (161) is the record of what an agent ran and when; it is never \
+         deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
+         role, 161 grants DELETE to nobody, and its guards refuse DELETE and TRUNCATE for \
+         every role, a superuser included, short of disabling triggers.",
+    ),
+    (
+        "agent_succession",
+        "UPDATE",
+        "A succession row (161) is a host attestation recorded once; nothing edits it. Under \
+         FORCE the absent UPDATE policy default-denies every non-superuser role, 161 grants \
+         UPDATE to nobody, and its append-only guards refuse UPDATE, DELETE and TRUNCATE \
+         for every role, a superuser included, short of disabling triggers.",
+    ),
+    (
+        "agent_succession",
+        "DELETE",
+        "A succession row (161) is the lineage record the history read walks; it is never \
+         deleted. Under FORCE the absent DELETE policy default-denies every non-superuser \
+         role, 161 grants DELETE to nobody, and its append-only guards refuse UPDATE, \
+         DELETE and TRUNCATE for every role, a superuser included, short of disabling \
+         triggers.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -339,6 +383,9 @@ const PROTECTED: &[&str] = &[
     "elevation_sessions",
     "elevated_access",
     "pending_admin_acts",
+    "agent_prompt_blobs",
+    "agent_prompt_snapshots",
+    "agent_succession",
 ];
 
 // ===========================================================================
@@ -1499,6 +1546,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              non-cascade row still needs 077's attribution arms; a `cascade.*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or the deferral definer.",
+        ),
+        (
+            "security_events_agent_identity_privileged",
+            "agent.identity_",
+            "161's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 15) <> \
+             'agent.identity_'`) says WHICH rows the restriction applies to, and grants nothing. \
+             A restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             other row still needs 077's attribution arms; an `agent.identity_*` row needs one of \
+             the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
+             i.e. the maintenance session or 161's registration definer.",
         ),
     ];
 

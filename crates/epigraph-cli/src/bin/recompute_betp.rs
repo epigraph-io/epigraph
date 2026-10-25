@@ -28,8 +28,19 @@
 //! operator binary this one's frame-handling mirrors).
 //!
 //! Usage:
-//!     recompute_betp --dry-run
+//!     recompute_betp --dry-run [--target-fold legacy|aef_standalone|aef]
 //!     recompute_betp
+//!
+//! A writing run (no `--dry-run`) first reads the API's `/health` →
+//! `belief_modes` (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`) and refuses, exit
+//! 3, when this process's belief modes differ or cannot be compared (SPEC
+//! §10.2; `epigraph_cli::belief_mode_check`). A dry run writes
+//! nothing and is exempt, so `--dry-run --target-fold <fold>` can run while
+//! the server is still on another fold. This build previews only the legacy
+//! fold; an AEF target reports the cohort and previews nothing. For the same
+//! reason a writing run also refuses, exit 3, when its own
+//! `EPIGRAPH_ATOM_FOLD` is not `legacy`, even if the API agrees: this build
+//! writes only the legacy fold.
 //!
 //! `--dry-run` prints, per cohort claim, the cached `pignistic_prob` before
 //! the run alongside what the current combine pipeline would recompute it
@@ -43,7 +54,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::recompute_betp::{predict_cached_after, run_claim, select_cohort};
+use epigraph_engine::belief_modes::AtomFold;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,6 +74,24 @@ struct Cli {
     /// Print a progress line every N completions. Default 100.
     #[arg(long, default_value_t = 100)]
     progress_every: usize,
+    /// With --dry-run: the atom fold the preview is for (`legacy`,
+    /// `aef_standalone`, `aef`), whatever the server's `EPIGRAPH_ATOM_FOLD`
+    /// is, so a wave can be reviewed before its flag flips (SPEC §10.3).
+    /// A dry run writes nothing, so it is exempt from the mode check.
+    #[arg(long, requires = "dry_run", value_parser = parse_target_fold)]
+    target_fold: Option<AtomFold>,
+    /// Proceed with a writing run although this process's belief modes differ
+    /// from the API's `/health` report (or cannot be read). For tests and a
+    /// deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
+}
+
+fn parse_target_fold(raw: &str) -> Result<AtomFold, String> {
+    AtomFold::parse_value(raw).ok_or_else(|| {
+        let all: Vec<&str> = AtomFold::ALL.iter().map(|f| f.as_str()).collect();
+        format!("unknown fold {raw:?}; one of {}", all.join(", "))
+    })
 }
 
 #[tokio::main]
@@ -71,6 +102,18 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Before the database: a writing run must show its belief modes match the
+    // API's (SPEC §10.2). A dry run writes nothing and is exempt.
+    let intent = if cli.dry_run {
+        RunIntent::WritesNothing
+    } else {
+        RunIntent::Writes
+    };
+    enforce_or_exit("recompute_betp", intent, cli.allow_mode_skew).await;
+    // Agreement on the flag is not enough: this build's cache writers fold only
+    // the legacy way, so a writing run under another fold refuses.
+    enforce_build_fold_or_exit("recompute_betp", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
@@ -107,7 +150,20 @@ async fn run(
     }
 
     if cli.dry_run {
-        run_dry(&pool, viewer, &cohort).await?;
+        match cli.target_fold {
+            None | Some(AtomFold::Legacy) => run_dry(&pool, viewer, &cohort).await?,
+            Some(fold) => {
+                // This build has no AEF fold to preview under; printing the
+                // legacy fold's numbers under an AEF label would mislead a
+                // wave review. The change that adds the fold to this bin fills it in.
+                println!("DRY-RUN — no writes");
+                println!(
+                    "target fold {fold}: this build cannot compute the {fold} fold; \
+                     no values previewed for {} cohort claims",
+                    cohort.len()
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -130,6 +186,7 @@ async fn run_dry(
     );
     let mut previewed = 0usize;
     let mut unchanged = 0usize;
+    let mut skipped = 0usize;
     for &claim_id in cohort {
         let cached_before: Option<f64> =
             sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
@@ -141,7 +198,12 @@ async fn run_dry(
         // A real run caches only the owner frame's value (`run_claim` ->
         // `recompute_claim_cached_belief`); report that as "what a real run
         // would leave cached".
+        //
+        // No owner: a real run writes nothing for this claim (no BBA, only
+        // ingest templates, or a compound). Counted, so the report tells a
+        // guarded claim from an absent one.
         let Some((_, owned)) = predict_cached_after(pool, viewer, claim_id).await? else {
+            skipped += 1;
             continue;
         };
         let recomputed_after = owned.pignistic_prob;
@@ -170,7 +232,9 @@ async fn run_dry(
         }
     }
     println!(
-        "dry-run summary: {previewed} claims previewed, {unchanged} unchanged (of {} cohort claims)",
+        "dry-run summary: {previewed} claims previewed, {unchanged} unchanged, {skipped} with no \
+         recomputable input (no BBA, only ingest templates, or a compound; a real run leaves \
+         their cache as it is) (of {} cohort claims)",
         cohort.len()
     );
     Ok(())
@@ -270,7 +334,8 @@ async fn run_for_real(
         .await;
 
     println!(
-        "done: {} claims recomputed across {} (claim, frame) writes, {} had no BBAs, {} errors (of {total})",
+        "done: {} claims recomputed across {} (claim, frame) writes, {} had no recomputable input \
+         (no BBA, only ingest templates, or a compound; cache left as it was), {} errors (of {total})",
         claims_with_work.load(Ordering::Relaxed),
         frame_writes.load(Ordering::Relaxed),
         claims_empty.load(Ordering::Relaxed),
