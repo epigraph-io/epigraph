@@ -1456,14 +1456,18 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
     }
 
     // Nor does any cascade row the CALLER can read: `security_events_read`
-    // admits the rows naming it (its deferral, the applied row, the belief
-    // row), so those carry counts and the ids live on agent-less rows.
+    // admits the rows naming it except the applied and belief rows (migration
+    // 169), so it reads its deferral, and the ids live on rows it cannot read.
     let readable = cascade_rows_readable_by(&pool, agent).await;
+    assert!(
+        readable.iter().any(|(t, _)| t == "cascade.deferred"),
+        "calibration: the caller reads its own deferral: {readable:?}"
+    );
     assert!(
         readable
             .iter()
-            .any(|(t, _)| t == "cascade.belief_rederived"),
-        "the caller reads its own belief row: {readable:?}"
+            .all(|(t, _)| t != "cascade.admin_applied" && t != "cascade.belief_rederived"),
+        "the caller reads no applied or belief row (migration 169): {readable:?}"
     );
     for (event_type, d) in &readable {
         for (id, what) in [
@@ -2261,11 +2265,12 @@ async fn the_admin_cascade_keeps_another_writers_edge_its_writers(pool: PgPool) 
 
 // ===========================================================================
 // What the triggering agent can read of an applied cascade (backlog 2587cb67).
-// `security_events_read` (129) admits a row whose `agent_id` is the session's
-// principal, and the applied row names the triggering agent, so its `touched`
-// must carry COUNTS, never the ids of the edges the cascade moved (most of them
-// other writers'). The ids are kept on an agent-less companion row
-// (`cascade.admin_applied_ids`) that privileged and admin sessions read.
+// The applied row names the triggering agent, so its `touched` carries COUNTS,
+// never the ids of the edges the cascade moved (most of them other writers').
+// The ids are kept on an agent-less companion row (`cascade.admin_applied_ids`)
+// that privileged and admin sessions read. Since migration 169 (backlog
+// 9d6f21c5 part 2) `security_events_read` no longer shows the triggering agent
+// the applied row itself either.
 // ===========================================================================
 
 /// Every `cascade.*` row `principal` can read, as the application role stamped
@@ -2305,22 +2310,23 @@ async fn applied_ids_row(pool: &PgPool, applied: Uuid) -> (Option<Uuid>, serde_j
     .expect("exactly one companion row for the applied row")
 }
 
-/// The triggering agent reads its applied row for `cause` (so the check below
-/// is not vacuous), and no cascade row it can read names any of `edges`; its
-/// `touched` holds no array; it cannot read the companion row.
+/// The triggering agent reads its deferral for `cause` (so the check below is
+/// not vacuous) and no applied row (migration 169), and no cascade row it can
+/// read names any of `edges`; it cannot read the companion row. The applied
+/// row's counts are checked by each caller on the superuser pool.
 fn assert_trigger_reads_no_edge_ids(
     rows: &[(String, serde_json::Value)],
     cause: &str,
     edges: &[(Uuid, &str)],
 ) {
-    let applied: Vec<_> = rows
-        .iter()
-        .filter(|(t, d)| t == "cascade.admin_applied" && d["cause"] == cause)
-        .collect();
-    assert_eq!(
-        applied.len(),
-        1,
-        "the triggering agent reads its own applied row: {rows:?}"
+    assert!(
+        rows.iter()
+            .any(|(t, d)| t == "cascade.deferred" && d["cause"] == cause),
+        "calibration: the triggering agent reads its own deferral: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(t, _)| t != "cascade.admin_applied"),
+        "the triggering agent reads no applied row (migration 169): {rows:?}"
     );
     for (id, what) in edges {
         for (t, d) in rows {
@@ -2330,16 +2336,21 @@ fn assert_trigger_reads_no_edge_ids(
             );
         }
     }
-    let touched = &applied[0].1["touched"];
+    assert!(
+        rows.iter().all(|(t, _)| t != "cascade.admin_applied_ids"),
+        "the triggering agent cannot read the companion row: {rows:?}"
+    );
+}
+
+/// The applied row's `touched` carries counts only (read on the superuser
+/// pool): the row names the triggering agent, whatever reads it.
+fn assert_touched_counts_only(details: &serde_json::Value) {
+    let touched = &details["touched"];
     assert!(
         touched
             .as_object()
             .is_some_and(|o| !o.is_empty() && o.values().all(|v| !v.is_array())),
-        "the agent-visible `touched` carries counts only: {touched}"
-    );
-    assert!(
-        rows.iter().all(|(t, _)| t != "cascade.admin_applied_ids"),
-        "the triggering agent cannot read the companion row: {rows:?}"
+        "the applied row's `touched` carries counts only: {touched}"
     );
 }
 
@@ -2375,6 +2386,7 @@ async fn a_dedup_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) {
     );
 
     let (applied_id, _, details) = applied_row(&pool, "dedup", f.dup).await;
+    assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
     assert_eq!(details["touched"]["edges_retracted"], 1, "{details}");
     let (who, ids) = applied_ids_row(&pool, applied_id).await;
@@ -2426,6 +2438,7 @@ async fn a_supersede_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) 
     );
 
     let (applied_id, _, details) = applied_row(&pool, "supersede", f.old).await;
+    assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
     let (who, ids) = applied_ids_row(&pool, applied_id).await;
     assert_eq!(who, None, "the companion row is agent-less");
@@ -2471,6 +2484,7 @@ async fn a_consolidate_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool
     );
 
     let (applied_id, _, details) = applied_row(&pool, "consolidate", merged).await;
+    assert_touched_counts_only(&details);
     assert_eq!(details["touched"]["edges_migrated"], 2, "{details}");
     let (who, ids) = applied_ids_row(&pool, applied_id).await;
     assert_eq!(who, None, "the companion row is agent-less");

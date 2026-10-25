@@ -776,6 +776,128 @@ async fn arming_turns_the_standing_admin_read_arms_into_elevated_ones(pool: PgPo
 }
 
 // =====================================================================
+// Applied-cascade audit rows are read by custodians only (migration 169)
+// =====================================================================
+
+/// What `conn` reads of `ids`: `count(*)` per id, in order.
+async fn read_events(conn: &mut sqlx::PgConnection, ids: &[Uuid]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(count_row(conn, "security_events", "id", *id).await);
+    }
+    out
+}
+
+/// Migration 169 (backlog 9d6f21c5 part 2): a `cascade.admin_applied` or
+/// `cascade.belief_rederived` row is no longer read by the agent it names.
+/// Rows written before the agent-less `*_ids` companion rows existed carry
+/// the edge and claim ids the cascade touched (most of them other writers')
+/// on the row itself, and they stay as written. So B, the triggering agent,
+/// reads neither, while it still reads its own deferral and its own
+/// non-cascade event (the calibration that its stamp works). A custodian
+/// reads all four through the standing arm, ids intact, unarmed; armed, the
+/// same custodian reads none of them unelevated and all of them elevated.
+///
+/// Verified to fail on the base (129's `security_events_read`): B reads its
+/// applied and belief rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn applied_cascade_rows_are_read_by_custodians_not_by_their_trigger(pool: PgPool) {
+    let p = holder(&pool, "cascade-read-p", 22).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "cascade-read-b").await;
+    let (other_edge, other_claim) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut ids = Vec::new();
+    for (event_type, details) in [
+        (
+            "cascade.admin_applied",
+            serde_json::json!({"cause": "supersede",
+                               "touched": {"edges_retargeted": [other_edge]}}),
+        ),
+        (
+            "cascade.belief_rederived",
+            serde_json::json!({"cause": "supersede",
+                               "belief": {"recomputed": [other_claim]}}),
+        ),
+        (
+            "cascade.deferred",
+            serde_json::json!({"cause": "supersede"}),
+        ),
+        ("test.cascade_read", serde_json::json!({})),
+    ] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, $2, true, $3) RETURNING id",
+        )
+        .bind(event_type)
+        .bind(b)
+        .bind(details)
+        .fetch_one(&pool)
+        .await
+        .expect("B's event");
+        ids.push(id);
+    }
+
+    let b_reads = as_app(&pool, Some(b), |mut conn| {
+        let ids = ids.clone();
+        async move {
+            let r = read_events(&mut conn, &ids).await;
+            (conn, r)
+        }
+    })
+    .await;
+    assert_eq!(
+        b_reads,
+        [0, 0, 1, 1],
+        "B reads its deferral and its own event (calibration), and neither its \
+         `cascade.admin_applied` nor its `cascade.belief_rederived` row"
+    );
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &plain).await;
+    let unarmed = read_events(&mut conn, &ids).await;
+    let kept: Vec<String> = sqlx::query_scalar(
+        "SELECT details::text FROM public.security_events WHERE id = ANY($1) \
+          ORDER BY event_type",
+    )
+    .bind(&ids[..2])
+    .fetch_all(&mut *conn)
+    .await
+    .expect("the custodian reads the rows");
+    release(conn).await;
+    assert_eq!(
+        unarmed,
+        [1, 1, 1, 1],
+        "unarmed, custodian P reads all four through the standing arm"
+    );
+    assert!(
+        kept.len() == 2
+            && kept[0].contains(&other_edge.to_string())
+            && kept[1].contains(&other_claim.to_string()),
+        "the legacy rows keep their id lists (no redaction): {kept:?}"
+    );
+
+    set_switch(&pool, true).await;
+    let mut conn = app_conn(&s, &plain).await;
+    let armed_plain = read_events(&mut conn, &ids).await;
+    release(conn).await;
+    assert_eq!(
+        armed_plain,
+        [0, 0, 0, 0],
+        "armed, P unelevated reads none of B's rows"
+    );
+    let mut conn = app_conn(&s, &elevated).await;
+    let armed_elevated = read_events(&mut conn, &ids).await;
+    release(conn).await;
+    assert_eq!(
+        armed_elevated,
+        [1, 1, 1, 1],
+        "armed, P elevated reads all four"
+    );
+}
+
+// =====================================================================
 // ADM02 follows the admin-scope switch (plan EL-10)
 // =====================================================================
 

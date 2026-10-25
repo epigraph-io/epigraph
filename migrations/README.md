@@ -1493,6 +1493,21 @@ restart.
   been applied. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **169**: public `cascade_audit_reads_admin_only` (backlog 9d6f21c5 part 2,
+  operator ruling R-6). Recreates `security_events_read` from 129's body
+  with the own-row arm narrowed: a principal no longer reads the
+  `cascade.admin_applied` / `cascade.belief_rederived` rows naming it. Those
+  rows (the ones written before the agent-less `*_ids` companion rows carry
+  other writers' edge and claim ids) are kept as written; instance admins /
+  custodians read them through 129's standing arm (unarmed) or elevated
+  (armed), and the session arms are unchanged. Pinned by
+  `epigraph-db/tests/elevated_arms.rs`
+  (`applied_cascade_rows_are_read_by_custodians_not_by_their_trigger`). Undo
+  in the file's header (129's block; run it before `129-undo.sql`). Slot:
+  164, 165, 166 and 168 are carried by open branches; 169 is free on `main`
+  and on every remote branch. No deploy order. **Applied to throwaway
+  databases only, NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
