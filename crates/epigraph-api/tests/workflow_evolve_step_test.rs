@@ -419,3 +419,227 @@ async fn evolve_step_revises_runs_no_cascade() {
         "the branched-from step keeps its edges"
     );
 }
+
+// ── refusal status mapping (backlog 769989ae) ───────────────────────────────
+//
+// A request the caller must change is a 4xx, not a 500: the MCP twin refuses
+// the same requests as INVALID_PARAMS (`crates/epigraph-mcp/tests/
+// step_versioning.rs`). Each arm also checks that nothing was written, so a
+// 4xx that still wrote the step would fail.
+
+/// A `claims:write` token whose principal is `agent_id`, in the shape
+/// `/oauth/token` mints (see `evolve_step_supersedes_creates_new_claim_and_edge`).
+fn principal_token(agent_id: Uuid) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    cfg.issue_access_token(
+        Uuid::new_v4(),
+        vec!["claims:write".into()],
+        "service",
+        None,
+        Some(agent_id),
+        chrono::Duration::minutes(60),
+        epigraph_auth::AccessTokenBinding::NONE,
+    )
+    .expect("test JWT")
+    .0
+}
+
+/// POST an evolve of `parent` with `body`; returns (status, body text) and the
+/// number of claims the parent's lineage gained a `supersedes` / `revises`
+/// edge from.
+async fn post_evolve(
+    pool: &sqlx::PgPool,
+    addr: std::net::SocketAddr,
+    token: &str,
+    parent: Uuid,
+    body: serde_json::Value,
+) -> (u16, String, i64) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/workflows/steps/{parent}/evolve"
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    let children: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 \
+           AND relationship IN ('supersedes', 'revises')",
+    )
+    .bind(parent)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (status, text, children)
+}
+
+/// An `edge_type` outside `supersedes` / `revises` is the caller's error: 400
+/// naming the field's vocabulary, nothing written. Before the fix the repo's
+/// refusal was a `QueryFailed` and the route answered 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn evolve_step_unknown_edge_type_returns_400() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent_id = common::seed_system_agent(&pool).await;
+    let parent = common::seed_claim(&pool, "a step for a bogus edge type").await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (status, text, children) = post_evolve(
+        &pool,
+        addr,
+        &principal_token(agent_id),
+        parent,
+        serde_json::json!({
+            "parent_id": parent,
+            "content": "never written",
+            "edge_type": "BOGUS",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "an unknown edge_type is a 400; body={text}");
+    assert!(
+        text.contains("supersedes") && text.contains("revises"),
+        "the refusal names the accepted edge types; body={text}"
+    );
+    assert_eq!(children, 0, "a refused evolve writes nothing");
+}
+
+/// Superseding a step that is no longer current is a conflict with the
+/// graph's state, not a server fault: 409, the parent untouched. The same
+/// request with `revises` is the legitimate control (a retired step can still
+/// be branched from), so the 409 is the currency check and not a blanket
+/// refusal of the parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn evolve_step_supersede_of_a_non_current_step_returns_409() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent_id = common::seed_system_agent(&pool).await;
+    let parent = common::seed_claim(&pool, "a retired step").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = principal_token(agent_id);
+
+    let (status, text, children) = post_evolve(
+        &pool,
+        addr,
+        &token,
+        parent,
+        serde_json::json!({
+            "parent_id": parent,
+            "content": "supersede a retired step",
+            "edge_type": "supersedes",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "superseding a non-current step is a conflict; body={text}"
+    );
+    assert!(
+        text.contains("non-current"),
+        "the refusal says why; body={text}"
+    );
+    assert_eq!(children, 0, "a refused evolve writes nothing");
+
+    let (status, text, children) = post_evolve(
+        &pool,
+        addr,
+        &token,
+        parent,
+        serde_json::json!({
+            "parent_id": parent,
+            "content": "branch from a retired step",
+            "edge_type": "revises",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "revises is not gated on currency; body={text}");
+    assert_eq!(children, 1);
+}
+
+/// `level` outside 2 (step) / 3 (operation) is refused 400 with nothing
+/// written, as MCP `evolve_step` refuses it. Before the fix the route wrote a
+/// step at any level.
+#[tokio::test(flavor = "multi_thread")]
+async fn evolve_step_level_outside_2_or_3_returns_400() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent_id = common::seed_system_agent(&pool).await;
+    let parent = common::seed_claim(&pool, "a step for a bad level").await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (status, text, children) = post_evolve(
+        &pool,
+        addr,
+        &principal_token(agent_id),
+        parent,
+        serde_json::json!({
+            "parent_id": parent,
+            "content": "a step at level seven",
+            "edge_type": "revises",
+            "level": 7,
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "level 7 is a 400; body={text}");
+    assert!(
+        text.contains("level"),
+        "the refusal names the field; body={text}"
+    );
+    assert_eq!(children, 0, "a refused evolve writes nothing");
+}
+
+/// Blank `content` is refused 400, as MCP `evolve_step` refuses it. Before the
+/// fix it reached the `claims_content_not_empty` CHECK and surfaced as 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn evolve_step_blank_content_returns_400() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent_id = common::seed_system_agent(&pool).await;
+    let parent = common::seed_claim(&pool, "a step for blank content").await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (status, text, children) = post_evolve(
+        &pool,
+        addr,
+        &principal_token(agent_id),
+        parent,
+        serde_json::json!({
+            "parent_id": parent,
+            "content": "   ",
+            "edge_type": "revises",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "blank content is a 400; body={text}");
+    assert!(
+        text.contains("content"),
+        "the refusal names the field; body={text}"
+    );
+    assert_eq!(children, 0, "a refused evolve writes nothing");
+}

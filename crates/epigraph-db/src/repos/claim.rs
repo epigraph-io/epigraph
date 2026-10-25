@@ -7755,11 +7755,16 @@ impl ClaimRepository {
         level: u32,
         agent_id: Uuid,
     ) -> Result<EvolveStepResult, DbError> {
+        // The two refusals below are the CALLER's to fix (backlog 769989ae):
+        // `InvalidData` (HTTP 400, MCP INVALID_PARAMS) for a request outside
+        // the vocabulary and `Conflict` (HTTP 409) for a parent that is no
+        // longer current. A `QueryFailed` here read as a server fault on both
+        // transports.
         if !matches!(edge_type, "supersedes" | "revises") {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::InvalidData {
+                reason: format!(
                     "evolve_step: edge_type must be 'supersedes' or 'revises', got {edge_type}"
-                )),
+                ),
             });
         }
         let parent_uuid: Uuid = parent.into();
@@ -7811,10 +7816,8 @@ impl ClaimRepository {
             }
         };
         if edge_type == "supersedes" && !parent_current {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "evolve_step: cannot supersede a non-current step {parent_uuid}"
-                )),
+            return Err(DbError::Conflict {
+                reason: format!("evolve_step: cannot supersede a non-current step {parent_uuid}"),
             });
         }
         let lineage_id = match existing_lineage {
