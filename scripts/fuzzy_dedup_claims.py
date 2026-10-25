@@ -103,8 +103,8 @@ def load_groups(path: str) -> list[dict]:
 def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None:
     """Pick the canonical claim id for a cluster.
 
-    Only a live member (exists, current, not labelled `deduped`) can be the
-    canonical. Prefers the rep id from the input snapshot when it is live;
+    Only a live member (exists, current) can be the canonical; the `deduped`
+    label of a pre-2026-10 mark counts only while the claim is retired. Prefers the rep id from the input snapshot when it is live;
     otherwise picks by (trace_count, mf_count, edge_count) descending. Returns
     None only when no member is live: a cluster with one live member is still
     handed to `merge_cluster`, which reports the members it skips (a member
@@ -134,7 +134,10 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
         }
         for r in cur.fetchall()
     ]
-    live = [r for r in rows if not r["is_deduped"] and r["is_current"]]
+    # The `deduped` label a pre-2026-10 mark left counts only while the claim
+    # is retired (so `is_current` alone decides): an un-marked legacy claim
+    # (operator ruling R-7) is current again, label and all, and live.
+    live = [r for r in rows if r["is_current"]]
     if not live:
         return None  # no member can be the canonical
     suggested = next((r for r in live if r["id"] == suggested_rep), None)
@@ -203,8 +206,10 @@ def merge_cluster(
         if row is None:
             continue  # claim was hard-deleted between the snapshot and now
         is_deduped, supersedes, is_current = row
-        if is_deduped:
-            continue  # already deduped (a pre-2026-10 mark by this script)
+        if is_deduped and not is_current:
+            # Still retired by a pre-2026-10 mark of this script. Once un-marked
+            # (current again, the label left on it) it is an ordinary member.
+            continue
         if supersedes is not None and str(supersedes) == canonical_id:
             continue  # already marked onto this canonical (an earlier run)
         if supersedes is not None or not is_current:
