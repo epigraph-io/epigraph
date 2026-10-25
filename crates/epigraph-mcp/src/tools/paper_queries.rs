@@ -7,6 +7,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
 use epigraph_crypto::ContentHasher;
+use epigraph_db::repos::claim::LabelCursor;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -330,6 +331,28 @@ pub async fn query_claims_by_label(
             data: None,
         });
     }
+    // `after` present (even "") selects the keyset response shape; absent
+    // keeps the legacy bare array (backlog 6f072833).
+    let keyset = params.after.is_some();
+    let after = match params.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(LabelCursor::decode(token).ok_or(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Borrowed(
+                "malformed `after` cursor; pass back the previous response's next_cursor unchanged",
+            ),
+            data: None,
+        })?),
+    };
+    if after.is_some() && offset > 0 {
+        return Err(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Borrowed(
+                "`after` and a non-zero `offset` cannot be combined; page with `after` alone",
+            ),
+            data: None,
+        });
+    }
 
     let rows = ClaimRepository::list_by_labels(
         &server.pool,
@@ -341,11 +364,12 @@ pub async fn query_claims_by_label(
             min_truth,
             limit,
             offset,
-            after: None,
+            after,
         },
     )
     .await
     .map_err(internal_error)?;
+    let next_cursor = LabelCursor::next_page(&rows, limit).map(|c| c.encode());
 
     // Opt-in only: without the flag no evidence query runs and the response
     // carries no `source_urls` key (backlog 43ab8c73).
@@ -382,5 +406,18 @@ pub async fn query_claims_by_label(
         });
     }
 
+    if keyset {
+        /// The `after`-mode response: a page plus the cursor of the next one
+        /// (`null` once the set is exhausted).
+        #[derive(serde::Serialize)]
+        struct KeysetPage {
+            claims: Vec<ClaimWithSources>,
+            next_cursor: Option<String>,
+        }
+        return success_json(&KeysetPage {
+            claims: results,
+            next_cursor,
+        });
+    }
     success_json(&results)
 }

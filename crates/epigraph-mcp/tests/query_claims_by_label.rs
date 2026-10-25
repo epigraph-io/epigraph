@@ -43,6 +43,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             min_truth: None,
             limit: Some(10),
             offset: None,
+            after: None,
             include_source_urls: false,
         },
     )
@@ -89,6 +90,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             min_truth: None,
             limit: Some(10),
             offset: None,
+            after: None,
             include_source_urls: false,
         },
     )
@@ -115,6 +117,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             min_truth: None,
             limit: Some(10),
             offset: None,
+            after: None,
             include_source_urls: false,
         },
     )
@@ -141,6 +144,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             min_truth: None,
             limit: Some(10),
             offset: None,
+            after: None,
             include_source_urls: false,
         },
     )
@@ -195,6 +199,7 @@ async fn query_by_label_hides_private_content_from_strangers(pool: PgPool) {
         min_truth: None,
         limit: Some(10),
         offset: None,
+        after: None,
         include_source_urls: false,
     };
 
