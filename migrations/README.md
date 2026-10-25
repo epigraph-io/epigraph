@@ -1634,8 +1634,9 @@ restart.
   166 runs; on `security_events` every operation but INSERT, so an actor's
   own audit row lands), a `claims` row trigger for the claim's author (an
   UPDATE of anything but the caches the database derives from everyone's
-  evidence, or a DELETE), and re-stated 123 `epigraph_require_writer_scope`
-  / `epigraph_require_attributable` for a claim INSERT, re-open or
+  evidence, or a DELETE), and re-stated `epigraph_require_writer_scope`
+  (165's body, its role-derived writer arm kept verbatim) and 123's
+  `epigraph_require_attributable` for a claim INSERT, re-open or
   re-attribution. An agent that could be attached writes only under READ
   COMMITTED, attached or not (a stale snapshot misses an attach or an end).
   A privileged session is exempt; a retired author identity is the one
@@ -1654,9 +1655,15 @@ restart.
   Behaviour in `epigraph-db/tests/role_attached_agents.rs` and
   `epigraph-mcp/tests/role_agent_boot_refusal.rs`. Undo:
   `docs/runbooks/166-undo.sql` (tested: it returns the whole `public`
-  catalog to below 166). Slot: 166 is free on `main` and on every remote
-  branch (164 is carried by another branch). Depends on 123, 153 and 161.
-  **Deploy order:** the migration BEFORE any epigraph-mcp built against it
+  catalog to below 166, restoring 165's writer-scope body). Slot: 166 is
+  free on `main` and on every remote branch (164 is carried by another
+  branch). Depends on 123, 153, 161 and 165. A precondition checks the md5
+  of the three bodies it re-states (165's writer scope, 123's attribution
+  check, 161's registration) and RAISEs `55000` (changing nothing) when
+  another body is in place, so applying 166 before 165, or over a later
+  re-statement, cannot silently drop that migration's arm; any edit to one
+  of those three bodies must update 166's expected md5.
+  **Deploy order:** after 165, and the migration BEFORE any epigraph-mcp built against it
   (that binary calls `epigraph_role_agent_may_run` at boot and exits when it
   is absent), and an attached identity is attached only AFTER the host has
   registered it (otherwise its registration aborts `AID09`). Where the

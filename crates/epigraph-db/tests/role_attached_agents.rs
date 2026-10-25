@@ -2962,10 +2962,10 @@ async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
 
 /// `docs/runbooks/166-undo.sql`, applied twice to a database migrated through
 /// 166, returns the catalog to exactly what it was below 166: every function
-/// body, owner and ACL (123's two checks and 161's registration restored
-/// byte for byte), no trigger, table, index or policy of 166's left (no
-/// `role_agent_write_check` on any table, whose function is gone), and
-/// nothing else touched. Measured over the whole `public` catalog, so a
+/// body, owner and ACL (165's writer scope, 123's attribution check and 161's
+/// registration restored byte for byte), no trigger, table, index or policy
+/// of 166's left (no `role_agent_write_check` on any table, whose function is
+/// gone), and nothing else touched. Measured over the whole `public` catalog, so a
 /// helper a later revision of 166 adds without undoing it fails here.
 /// After the undo, an armed application write by an agent that WAS attached
 /// lands (no leftover trigger refuses it, or calls a dropped function).
@@ -3008,6 +3008,90 @@ async fn the_166_undo_restores_the_catalog_below_166(pool: PgPool) {
     write_as(&pool, attached, attached, h_group)
         .await
         .expect("after the undo the formerly attached agent's armed write lands");
+}
+
+/// The source (`prosrc`) of `public.epigraph_require_writer_scope(uuid, uuid)`.
+async fn writer_scope_src(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p \
+          WHERE p.oid = to_regprocedure('public.epigraph_require_writer_scope(uuid, uuid)')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the writer scope exists")
+}
+
+/// Re-body the writer scope with `src` (signature, language, volatility,
+/// security and search path as every migration states them).
+async fn set_writer_scope_src(pool: &PgPool, src: &str) {
+    assert!(
+        !src.contains("$body$"),
+        "the source must not close the quote"
+    );
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid) \
+         RETURNS void LANGUAGE plpgsql STABLE SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $body${src}$body$"
+    ))
+    .execute(pool)
+    .await
+    .expect("re-body the writer scope");
+}
+
+/// 166 re-states three functions whole (165's writer scope, 123's attribution
+/// check, 161's registration), so it first checks that each still carries the
+/// body it was written from. With ANY other writer-scope body in place (here
+/// 165's plus one comment line, standing in for a re-statement applied out of
+/// order), 166 refuses with 55000, names the function and changes nothing (no
+/// `role_agents`, no 166 row in `_sqlx_migrations`). POSITIVE CONTROL: with
+/// 165's exact body restored, the same migration applies.
+#[sqlx::test(migrations = false)]
+async fn migration_166_refuses_to_restate_a_body_it_was_not_written_from(pool: PgPool) {
+    migrate(&pool, &up_to_below(166)).await;
+    let original = writer_scope_src(&pool).await;
+    assert!(
+        original.contains("epigraph_role_derived_memberships(p_agent, clock_timestamp())"),
+        "CALIBRATION: below 166 the writer scope is 165's, with the derived arm"
+    );
+    set_writer_scope_src(
+        &pool,
+        &format!("{original}-- an out-of-order re-statement\n"),
+    )
+    .await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = up_to_below(167)
+        .run(&mut *conn)
+        .await
+        .expect_err("166 must refuse over a writer scope it was not written from");
+    drop(conn);
+    let db = match &err {
+        sqlx::migrate::MigrateError::ExecuteMigration(e, 166) => e,
+        other => panic!("expected the migration to fail in the database, got {other}"),
+    };
+    assert_eq!(sqlstate(db).as_deref(), Some("55000"), "{db}");
+    assert!(
+        db.to_string()
+            .contains("public.epigraph_require_writer_scope(uuid, uuid) is not the body 166"),
+        "the refusal names the function: {db}"
+    );
+    let applied: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.role_agents') IS NOT NULL \
+             OR EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 166)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe");
+    assert!(!applied, "a refused 166 changed nothing");
+
+    // Restore 165's exact source.
+    set_writer_scope_src(&pool, &original).await;
+    migrate(&pool, &up_to_below(167)).await;
+    let applied: bool = sqlx::query_scalar("SELECT to_regclass('public.role_agents') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("probe");
+    assert!(applied, "POSITIVE CONTROL: over 165's body, 166 applies");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

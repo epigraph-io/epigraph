@@ -155,12 +155,18 @@
 --   * The same function as a BEFORE UPDATE OR DELETE row trigger on
 --     `claims` (`claims_role_agent_author`), on the row's author (old and,
 --     on a re-attribution, new).
---   * The operator-binding path, by re-stating 123's
---     `epigraph_require_writer_scope` (which the claims trigger calls on the
---     author when the writer is the author or no principal is stamped, and on
---     the writer otherwise) and `epigraph_require_attributable` (the author,
---     when the writer is someone else); 153's trigger body is not touched.
---     These reach the author of an insert, a re-open and a re-attribution.
+--   * The operator-binding path, by re-stating
+--     `epigraph_require_writer_scope` FROM 165'S BODY (which the claims
+--     trigger calls on the author when the writer is the author or no
+--     principal is stamped, and on the writer otherwise; 165's role-derived
+--     writer arm is kept verbatim) and 123's `epigraph_require_attributable`
+--     (the author, when the writer is someone else); 153's trigger body is not
+--     touched. These reach the author of an insert, a re-open and a
+--     re-attribution. A precondition at the top of this file checks the md5 of
+--     each body it re-states (the writer scope, the attribution check and
+--     161's registration) and refuses (55000, nothing changed) when another
+--     body is in place, so applying 166 before 165, or over a later
+--     re-statement, can never drop that migration's arm.
 -- THE ONE RELIEF on an author: a RETIRED identity (`epigraph_agent_is_retired`).
 -- A restatement of a RETIRED predecessor (the supersede act's
 -- inherited author) is relieved of the check on that author ONLY when the
@@ -309,8 +315,9 @@
 -- ===================================================================
 -- 6. UNDO
 --
--- `docs/runbooks/166-undo.sql` restores 123's two check bodies and 161's
--- registration body, then drops what this file creates. Roll back first any
+-- `docs/runbooks/166-undo.sql` restores 165's writer-scope body, 123's
+-- attribution body and 161's registration body, then drops what this file
+-- creates. Roll back first any
 -- epigraph-mcp built against this file: it calls
 -- `epigraph_role_agent_may_run` at boot and fails closed without it.
 
@@ -322,6 +329,48 @@ DO $$ BEGIN
         RAISE EXCEPTION '166 needs PostgreSQL 14 or later (multiranges); this server is %',
                         current_setting('server_version');
     END IF;
+END $$;
+
+-- -------------------------------------------------------------------
+-- Precondition: the three functions this file RE-STATES still carry the
+-- bodies it was written from (165's `epigraph_require_writer_scope`, 123's
+-- `epigraph_require_attributable`, 161's `epigraph_register_agent_identity`).
+-- CREATE OR REPLACE replaces a body whole, so applying this file over any
+-- other body (an older one, e.g. 165 not yet applied, or a later
+-- re-statement applied out of version order) would silently drop that
+-- migration's arm. Refuse instead, naming what was found; the fix is a
+-- reconciling migration that re-states each function with every delta. The
+-- md5 is of `prosrc`, i.e. the exact text between the predecessor's dollar
+-- quotes, so any edit to one of those bodies must update the value here.
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    v_found text;
+    v_check record;
+BEGIN
+    FOR v_check IN
+        SELECT * FROM (VALUES
+            ('public.epigraph_require_writer_scope(uuid, uuid)', '165',
+             '90d42ea680d353f3f5136aff1841111b'),
+            ('public.epigraph_require_attributable(uuid, uuid, boolean)', '123',
+             'f9b96d7970cc35ddd3ad427465bbab45'),
+            ('public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)',
+             '161', '0e97f73ffde04d8c6c36cf24c16a4867')
+        ) AS c(signature, origin, expected)
+    LOOP
+        SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
+         WHERE p.oid = to_regprocedure(v_check.signature);
+        IF v_found IS DISTINCT FROM v_check.expected THEN
+            RAISE EXCEPTION '166: % is not the body 166 re-states (%''s, md5 %); found md5 %. '
+                            'Another migration re-bodied it, or its predecessor is not '
+                            'applied; nothing was changed',
+                            v_check.signature, v_check.origin, v_check.expected,
+                            COALESCE(v_found, '(absent)')
+                USING ERRCODE = '55000',
+                      HINT = 'Apply a reconciling migration that re-states the function with '
+                             'every delta instead of this one.';
+        END IF;
+    END LOOP;
 END $$;
 
 -- ===================================================================
@@ -837,10 +886,13 @@ SET search_path = public, pg_temp AS $$
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_agent_is_retired(uuid) FROM PUBLIC;
 
--- The two 123 checks the claims trigger calls, re-stated (signatures, owner
--- and grants unchanged: CREATE OR REPLACE keeps both) with the 166 lines. A
+-- The two checks the claims trigger calls, re-stated (signatures, owner and
+-- grants unchanged: CREATE OR REPLACE keeps both) with the 166 lines. A
 -- later migration that re-bodies either starts from these bodies.
--- 123's claims-path writer scope (122's, with 123's HINT); delta: the 166 line.
+-- The claims-path writer scope as 165 left it (122's body, 123's HINT, 165's
+-- derived arm, verbatim); delta: the 166 line, right after the arming test.
+-- The precondition at the top of this file refuses to run over any other
+-- body.
 CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
 RETURNS void
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -856,6 +908,14 @@ BEGIN
     PERFORM public.epigraph_require_role_holder(p_agent);
     v_human := public.epigraph_human_of(p_agent, false);
     IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
+        RETURN;
+    END IF;
+    -- 165: the principal's own derived membership, by the viewer's rule, at
+    -- this statement's clock (a transaction opened in the window does not
+    -- keep writing past its end).
+    IF EXISTS (SELECT 1
+                 FROM public.epigraph_role_derived_memberships(p_agent, clock_timestamp()) d
+                WHERE d.group_id = p_group AND d.role = 'writer') THEN
         RETURN;
     END IF;
     IF public.epigraph_operator_scope_exempt() THEN

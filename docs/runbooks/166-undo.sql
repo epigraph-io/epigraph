@@ -10,7 +10,8 @@
 -- `epigraph_role_agent_may_run` at boot and refuses to start without it.
 --
 -- WHAT IT DOES
---   * Restores migration 123's bodies of `epigraph_require_writer_scope` and
+--   * Restores migration 165's body of `epigraph_require_writer_scope` (with
+--     165's role-derived writer arm), migration 123's body of
 --     `epigraph_require_attributable`, and migration 161's body of
 --     `epigraph_register_agent_identity`, byte for byte (CREATE OR REPLACE
 --     keeps their owners and ACLs).
@@ -22,7 +23,8 @@
 --     functions, triggers and `role_agents` (its rows go with it; export them
 --     first if the attachment history is wanted).
 --
--- ORDER: newest first. Run this BEFORE `153-undo.sql` and `123-undo.sql`.
+-- ORDER: newest first. Run this BEFORE 165's undo (its file header),
+-- `153-undo.sql` and `123-undo.sql`.
 --
 -- WHAT IT LEAVES: 166's `_sqlx_migrations` row and the `platform.role_agent_*`
 -- audit rows (security_events is immutable). Re-introducing the rule is a NEW
@@ -31,8 +33,9 @@
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 
--- Migration 123's two check bodies, verbatim.
--- 122's claims-path writer scope; delta: the HINT.
+-- The two check bodies as they stood below 166, verbatim.
+-- Migration 165's claims-path writer scope (122's body, 123's HINT, 165's
+-- role-derived writer arm).
 CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
 RETURNS void
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -45,6 +48,14 @@ BEGIN
     END IF;
     v_human := public.epigraph_human_of(p_agent, false);
     IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
+        RETURN;
+    END IF;
+    -- 165: the principal's own derived membership, by the viewer's rule, at
+    -- this statement's clock (a transaction opened in the window does not
+    -- keep writing past its end).
+    IF EXISTS (SELECT 1
+                 FROM public.epigraph_role_derived_memberships(p_agent, clock_timestamp()) d
+                WHERE d.group_id = p_group AND d.role = 'writer') THEN
         RETURN;
     END IF;
     IF public.epigraph_operator_scope_exempt() THEN
