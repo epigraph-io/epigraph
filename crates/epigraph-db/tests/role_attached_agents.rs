@@ -2779,3 +2779,67 @@ async fn an_attached_agents_own_audit_row_lands_in_its_gap(pool: PgPool) {
         "the attached agent's own audit row lands in its gap: {audit:?}"
     );
 }
+
+/// An attach and a registration of a successor of the attached identity can
+/// run at the same time. Each must see the other: the attach's lineage walk
+/// reads `agent_succession`, and the registration's copy reads `role_agents`.
+/// If neither waits for the other, each reads before the other commits and
+/// the child ends up unattached (fail open). Here the registration is held
+/// open while the attach is issued on another connection; once both commit,
+/// the child is attached to the parent's row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attach_racing_a_registration_still_attaches_the_child(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-race").await;
+    link(&pool, parent, h).await;
+    let child_key = random32();
+    let hash = blake3::hash(&child_key).to_hex().to_string();
+
+    let other = pool.clone();
+    let (child, row) = fixture::as_role(&pool, ATTESTOR, |mut conn| async move {
+        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin");
+        let child: Uuid = sqlx::query_scalar(
+            "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                 $1, $2, 'test-model-166', $3, 'g-166-race', NULL, $4)",
+        )
+        .bind(&child_key)
+        .bind(parent)
+        .bind(&hash)
+        .bind(json!({"in_prompt": {}}))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the registration, held open");
+        let attaching = tokio::spawn({
+            let other = other.clone();
+            async move { attach(&other, ROLE, parent).await }
+        });
+        // Until the attach has finished, or waits on a lock (bounded).
+        for _ in 0..200 {
+            if attaching.is_finished() {
+                break;
+            }
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                                 WHERE datname = current_database() \
+                                   AND wait_event_type = 'Lock' AND pid <> pg_backend_pid())",
+            )
+            .fetch_one(&other)
+            .await
+            .expect("lock waits");
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await.expect("commit");
+        let row = attaching.await.expect("the attach task");
+        (conn, (child, row))
+    })
+    .await;
+    assert_eq!(
+        live_attachments(&pool, child).await,
+        vec![(ROLE.to_string(), Some(row))],
+        "the child registered while its parent was being attached is attached"
+    );
+}
