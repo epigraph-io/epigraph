@@ -464,7 +464,13 @@ CREATE POLICY challenges_claim_readable ON public.challenges
 --     the session cannot read its claim, with ONE text for both, so this is
 --     no existence oracle for a private claim (R-CH1b);
 --   * CR03 (42501) a session that cannot WRITE the claim's owning group (the
---     outsider itself, a stranger, a reader member of the claim's group).
+--     outsider itself, a stranger, a reader member of the claim's group);
+--   * CR06 (55000) a challenge whose CURRENT state is `withdrawn`: withdrawal
+--     is the challenger's act, and setting a resolution status must not
+--     overturn it. Checked after CR02/CR03, so it tells a non-reader nothing.
+--     A row already `accepted` / `rejected` MAY be re-resolved by the claim's
+--     owner (each such write is audited); whether to forbid that is left to
+--     an operator ruling.
 --
 -- Insiders' challenges (owned by the claim's group) take the same path: the
 -- claim's owner can already UPDATE them directly, and through here the write
@@ -518,6 +524,12 @@ BEGIN
             USING ERRCODE = '42501',
                   DETAIL = 'CR03: only a writer of the challenged claim''s owning group sets '
                            'a challenge''s resolution status';
+    END IF;
+    -- After CR02/CR03, so a non-reader learns nothing of a hidden row's state.
+    IF v_before = 'withdrawn' THEN
+        RAISE EXCEPTION 'CR06: the challenger withdrew this challenge; a withdrawn challenge '
+            'takes no resolution status; nothing was written'
+            USING ERRCODE = '55000';
     END IF;
     IF p_state IS NULL OR p_state NOT IN ('under_review', 'accepted', 'rejected') THEN
         RAISE EXCEPTION 'CR04: % is not a resolution status (under_review, accepted, '

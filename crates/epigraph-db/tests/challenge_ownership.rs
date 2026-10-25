@@ -868,3 +868,95 @@ async fn only_a_writer_of_the_claims_group_sets_a_challenges_status(pool: PgPool
         "one audit record, the owner's; none for the refused calls"
     );
 }
+
+/// The whole row, read on the harness connection.
+async fn whole_row(pool: &PgPool, id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar("SELECT to_jsonb(ch) FROM challenges ch WHERE ch.id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("read challenge {id}: {e}"))
+}
+
+/// A WITHDRAWN challenge is not resolved by the claim's owner. Withdrawal is
+/// the challenger's act (the outsider's own plain UPDATE of its own row, which
+/// 077 admits), and R-3 lets the claim's owner set a RESOLUTION status, not
+/// overturn the challenger's withdrawal: the definer refuses a row whose
+/// CURRENT state is `withdrawn` (CR06, 55000), for every resolver state, and
+/// writes nothing (the row is byte-identical and no audit row exists). The
+/// same owner's call on a live challenge then lands (the calibration: the
+/// refusal is the withdrawal, not a malformed call).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claims_owner_does_not_resolve_a_withdrawn_challenge(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-wd-owner").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-wd-out").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "withdrawn").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (withdrawn, live) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let w = challenge(&mut conn, claim, outsider, "later withdrawn")
+            .await
+            .expect("the outsider's challenge lands");
+        let l = challenge(&mut conn, claim, outsider, "still live")
+            .await
+            .expect("the outsider's second challenge lands");
+        let n = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(w)
+            .execute(&mut *conn)
+            .await
+            .expect("the outsider withdraws its own challenge")
+            .rows_affected();
+        assert_eq!(n, 1, "CALIBRATION: the withdrawal landed");
+        (conn, (w, l))
+    })
+    .await;
+    assert_eq!(
+        resolution(&pool, withdrawn).await.0,
+        "withdrawn",
+        "CALIBRATION: the row is withdrawn before the owner acts"
+    );
+    let before = whole_row(&pool, withdrawn).await;
+
+    let p = pool.clone();
+    let (refused, then_live) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let mut refused = Vec::new();
+        for state in ["under_review", "accepted", "rejected"] {
+            let r = ChallengeRepository::resolve_as_claim_owner(&mut *conn, withdrawn, state, None)
+                .await;
+            refused.push((state, r));
+        }
+        let l =
+            ChallengeRepository::resolve_as_claim_owner(&mut *conn, live, "rejected", None).await;
+        (conn, (refused, l))
+    })
+    .await;
+
+    for (state, r) in &refused {
+        let e = r
+            .as_ref()
+            .expect_err("the owner does not overturn the challenger's withdrawal");
+        assert_eq!(
+            sqlstate(e).as_deref(),
+            Some("55000"),
+            "{state}: refused because the challenge is withdrawn: {e}"
+        );
+        assert!(
+            e.to_string().contains("CR06"),
+            "{state}: refused by the withdrawn-row check, not another one: {e}"
+        );
+    }
+    assert_eq!(
+        whole_row(&pool, withdrawn).await,
+        before,
+        "the withdrawn row is byte-identical"
+    );
+    assert!(
+        resolution_audit(&pool, withdrawn).await.is_empty(),
+        "a refusal writes no audit record"
+    );
+    then_live.expect("CALIBRATION: the owner resolves the challenger's live challenge");
+    assert_eq!(resolution(&pool, live).await.0, "rejected");
+}

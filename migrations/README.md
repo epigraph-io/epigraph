@@ -1513,8 +1513,8 @@ restart.
   `accepted`, `rejected`), `resolved_by` (the session principal),
   `resolved_at` and `resolution_details`, and nothing else, with one
   `security_events` row (`challenges.claim_owner_resolution`) naming the
-  resolver; it refuses an elevated session and answers an unreadable claim's
-  challenge as "not found". Pinned by `epigraph-db/tests/challenge_ownership.rs`
+  resolver; it refuses an elevated session and a challenge its challenger
+  withdrew, and answers an unreadable claim's challenge as "not found". Pinned by `epigraph-db/tests/challenge_ownership.rs`
   and `elevated_arms.rs`. Undo: drop the function, the policy and the two
   triggers, re-run 114 section 3b and 122 section 8, then drop the column.
   **Deploy order:** after 114, 115 and 122, independent of 154 and later; apply

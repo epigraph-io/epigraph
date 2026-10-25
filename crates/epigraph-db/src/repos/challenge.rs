@@ -270,7 +270,9 @@ impl ChallengeRepository {
     ///   session that cannot write the claim's owning group (CR03);
     /// * `P0002` "challenge not found" when the challenge does not exist OR
     ///   the session cannot read its claim, indistinguishably (CR02);
-    /// * `22023` a state outside the three above (CR04).
+    /// * `22023` a state outside the three above (CR04);
+    /// * `55000` a challenge its challenger withdrew (CR06): a withdrawal is
+    ///   the challenger's act, not overturned by a resolution.
     pub async fn resolve_as_claim_owner<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         challenge_id: Uuid,
