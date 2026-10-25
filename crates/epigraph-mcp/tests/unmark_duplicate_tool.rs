@@ -528,3 +528,58 @@ async fn the_sweep_records_its_rule_on_the_identity_edge(pool: PgPool) {
         "{props}"
     );
 }
+
+/// A duplicate the legacy raw-SQL `fuzzy_dedup_claims` marked is un-markable
+/// through the tool once the operator backfill has reconstructed its identity
+/// edge (operator ruling R-7), and the answer says it was a legacy mark (no
+/// repair record, nothing restored).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backfilled_legacy_mark_unmarks_through_the_tool(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let canonical = seed_claim(&pool, "r7 legacy canonical", 0.5).await;
+    let dup = seed_claim(&pool, "r7 legacy duplicate", 0.5).await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let backfilled =
+        epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, true)
+            .await
+            .expect("backfill");
+    assert_eq!(backfilled.inserted, 1, "calibration: {backfilled:?}");
+    drop(conn);
+    let (auth, viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let r = unmark_duplicate(
+        &server,
+        &viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("a backfilled legacy mark is un-markable");
+    let b = body(&r);
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(b["cascade"]["touched"]["legacy_mark"], true, "{b}");
+    assert_eq!(state(&pool, dup).await, (None, true, 0));
+}

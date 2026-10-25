@@ -677,6 +677,12 @@ pub struct UnmarkedDuplicate {
     pub canonical: Uuid,
     /// The identity edge the act retracted.
     pub identity_edge: Uuid,
+    /// The identity edge is one the legacy backfill wrote
+    /// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]): a mark
+    /// the raw-SQL `fuzzy_dedup_claims` made, which kept no repair record.
+    /// Read from the edge's reserved `properties.dedup` (only the act and the
+    /// backfill write it), never from the claim's patchable properties.
+    pub legacy_backfill: bool,
 }
 
 /// The relationship of the identity edge a dedup's act writes,
@@ -711,6 +717,19 @@ pub const LEGACY_FUZZY_DEDUP_TOOL: &str = "fuzzy_dedup_claims";
 /// The `run_tag` of an identity edge the legacy backfill wrote
 /// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]).
 pub const LEGACY_IDENTITY_BACKFILL_RUN_TAG: &str = "legacy_identity_backfill";
+
+/// The legacy backfill's selection of a claim `c` whose `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]: what the legacy mark wrote is all still there
+/// (the `deduped` label, the claim retired, and its `supersedes` still the
+/// `deduped_into` the mark named), so its identity edge can be reconstructed.
+/// One fragment for the backfill and the un-mark's refusal
+/// ([`legacy_mark_refusal`]), so the two cannot disagree on which marks the
+/// backfill reaches.
+const LEGACY_MARK_RECONSTRUCTABLE_SQL: &str = "\
+    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])) \
+    AND NOT COALESCE(c.is_current, true) \
+    AND c.supersedes IS NOT NULL \
+    AND c.supersedes::text = c.properties->>'deduped_into'";
 
 /// One duplicate the legacy identity-edge backfill selected.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -8237,9 +8256,12 @@ impl ClaimRepository {
     /// run's single transaction. Like the act's edge it is written after the
     /// retirement, so `edges_auto_factor` mints no factor for it.
     ///
-    /// It does NOT make the mark reversible: the legacy script kept no repair
-    /// record, so the administrative un-mark still refuses it
-    /// (`UnmarkRefusal::NoRecord`).
+    /// Once its edge is written the mark is an ordinary dedup record
+    /// (operator ruling R-7): the administrative un-mark makes the duplicate
+    /// current again and retracts the edge. The legacy script kept no repair
+    /// record, so that un-mark has nothing to put back (it reports
+    /// `legacy_mark`); a legacy mark this selection does not reach is refused
+    /// with the reason ([`ClaimRepository::unmark_duplicate_act_conn`]).
     ///
     /// # Errors
     /// `DbError::InvalidData` on a non-privileged session (the selection is
@@ -8256,14 +8278,11 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
-        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        let select_sql = format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; the selection is a corpus-wide maintenance backfill.
              SELECT c.id, c.supersedes FROM claims c
-              WHERE 'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[]))
-                AND c.properties->>'deduped_by' = $1
-                AND NOT COALESCE(c.is_current, true)
-                AND c.supersedes IS NOT NULL
-                AND c.supersedes::text = c.properties->>'deduped_into'
+              WHERE c.properties->>'deduped_by' = $1
+                AND {LEGACY_MARK_RECONSTRUCTABLE_SQL}
                 AND NOT EXISTS (
                     SELECT 1 FROM edges e
                      WHERE e.source_id = c.id AND e.source_type = 'claim'
@@ -8271,13 +8290,14 @@ impl ClaimRepository {
                        AND e.relationship = $2 AND e.valid_to IS NULL
                        AND e.properties ? $3)
               ORDER BY c.id
-              FOR UPDATE OF c"#,
-        )
-        .bind(LEGACY_FUZZY_DEDUP_TOOL)
-        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
-        .bind(DUPLICATE_IDENTITY_PROPERTY)
-        .fetch_all(&mut *tx)
-        .await?;
+              FOR UPDATE OF c"#
+        );
+        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(&select_sql)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .fetch_all(&mut *tx)
+            .await?;
         let mut out = LegacyIdentityBackfill {
             applied: apply,
             duplicates: selected
@@ -8343,10 +8363,13 @@ impl ClaimRepository {
     /// authority over both rows.
     ///
     /// Only a duplicate a dedup act marked can be un-marked: one with an
-    /// in-force identity edge to the claim its `supersedes` names. A claim
-    /// retired some other way (a consolidation source, a mark made before
-    /// identity edges existed) is refused, because there is no record of
-    /// which rows a reversal would have to put back.
+    /// in-force identity edge to the claim its `supersedes` names (a legacy
+    /// `fuzzy_dedup_claims` mark has one once the backfill wrote it, and is
+    /// then an ordinary record, `legacy_backfill`). A claim retired some other
+    /// way (a consolidation source, a supersession) is refused, because there
+    /// is no record of which rows a reversal would have to put back; so is a
+    /// legacy mark without its edge, saying whether the backfill can still
+    /// reconstruct it or why it cannot.
     ///
     /// The embeddings stay NULL: the caller re-embeds after commit
     /// (best-effort, as every write path does), or a backfill does.
@@ -8390,19 +8413,24 @@ impl ClaimRepository {
             _ => return Err(not_marked("is not a retired duplicate")),
         };
         let sql = viewer.splice(
-            "SELECT e.id FROM edges e \
+            "SELECT e.id, \
+                    COALESCE(e.properties->$4->>'tool' = $5 \
+                             AND e.properties->$4->>'run_tag' = $6, false) \
+               FROM edges e \
               WHERE e.source_id = $1 AND e.source_type = 'claim' \
                 AND e.target_id = $2 AND e.target_type = 'claim' \
                 AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
                 /* {EDGE_VISIBILITY:e} */ \
               ORDER BY e.created_at DESC, e.id DESC LIMIT 1 FOR UPDATE",
-            5,
+            7,
         );
-        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+        let mut q = sqlx::query_as::<_, (Uuid, bool)>(&sql)
             .bind(dup_uuid)
             .bind(canonical)
             .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
-            .bind(DUPLICATE_IDENTITY_PROPERTY);
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(LEGACY_IDENTITY_BACKFILL_RUN_TAG);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -8425,7 +8453,10 @@ impl ClaimRepository {
                 "supersedes {canonical}, which is itself retired; un-mark {canonical} first"
             )));
         }
-        let Some(identity_edge) = identity_edge else {
+        let Some((identity_edge, legacy_backfill)) = identity_edge else {
+            if let Some(why) = legacy_mark_refusal(&mut tx, viewer, dup_uuid).await? {
+                return Err(not_marked(&why));
+            }
             return Err(not_marked(
                 "has no dedup identity edge to the claim it supersedes (it was retired by \
                  another act, or marked before identity edges were recorded)",
@@ -8462,6 +8493,7 @@ impl ClaimRepository {
         Ok(UnmarkedDuplicate {
             canonical,
             identity_edge,
+            legacy_backfill,
         })
     }
 
@@ -11266,6 +11298,67 @@ impl ClaimRepository {
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
     }
+}
+
+/// Why the un-mark refuses `dup`, retired with no dedup identity edge, when it
+/// is a legacy `fuzzy_dedup_claims` mark (its `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]); `None` for any other claim. Says whether the
+/// backfill can still reconstruct the edge (by its own selection,
+/// [`LEGACY_MARK_RECONSTRUCTABLE_SQL`]) and, if not, why not. Read through the
+/// un-mark's viewer, like every read of the act.
+async fn legacy_mark_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<Option<String>, DbError> {
+    let sql = viewer.splice(
+        &format!(
+            "SELECT ({LEGACY_MARK_RECONSTRUCTABLE_SQL}), \
+                    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])), \
+                    c.properties->>'deduped_into', c.supersedes \
+               FROM claims c \
+              WHERE c.id = $1 AND c.properties->>'deduped_by' = $2 /* {{VISIBILITY:c}} */"
+        ),
+        3,
+    );
+    let mut q = sqlx::query_as::<_, (bool, bool, Option<String>, Option<Uuid>)>(&sql)
+        .bind(dup)
+        .bind(LEGACY_FUZZY_DEDUP_TOOL);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    let Some((reconstructable, labelled, deduped_into, supersedes)) =
+        q.fetch_optional(&mut *conn).await?
+    else {
+        return Ok(None);
+    };
+    let head = format!(
+        "is a legacy {LEGACY_FUZZY_DEDUP_TOOL} mark (made by raw SQL, without an identity edge)"
+    );
+    if reconstructable {
+        return Ok(Some(format!(
+            "{head} whose same_as identity edge has not been reconstructed yet; an operator's \
+             `backfill_dedup_identity_edges --apply` writes it, after which the mark can be \
+             un-marked"
+        )));
+    }
+    let why = if !labelled {
+        "it no longer carries the `deduped` label the mark wrote".to_string()
+    } else {
+        match (deduped_into, supersedes) {
+            (None, _) => "it records no deduped_into".to_string(),
+            (Some(into), Some(sup)) if into != sup.to_string() => {
+                format!("its supersedes {sup} is no longer the claim the mark named (deduped_into {into})")
+            }
+            (Some(into), _) => {
+                format!("it no longer supersedes the claim the mark named (deduped_into {into})")
+            }
+        }
+    };
+    Ok(Some(format!(
+        "{head} that backfill_dedup_identity_edges cannot reconstruct: {why}; it cannot be \
+         un-marked"
+    )))
 }
 
 /// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.

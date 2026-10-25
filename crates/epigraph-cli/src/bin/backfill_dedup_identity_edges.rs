@@ -10,9 +10,11 @@
 //! DRY RUN BY DEFAULT: without `--apply` it prints the duplicates it would
 //! give an edge and writes nothing. A re-run after `--apply` selects nothing.
 //!
-//! It does NOT make those marks reversible: the legacy script kept no repair
-//! record, so `unmark_duplicate` still refuses them (as "no record of this
-//! dedup's repair" instead of "no identity edge").
+//! Once a mark has its edge it is an ordinary dedup record (operator ruling
+//! R-7): `unmark_duplicate` makes the duplicate current again and retracts the
+//! edge. The legacy script kept no repair record, so there is nothing to put
+//! back; the un-mark says so (`legacy_mark`). A legacy mark this binary cannot
+//! reach is refused by the un-mark with the reason.
 //!
 //! # Authority
 //!

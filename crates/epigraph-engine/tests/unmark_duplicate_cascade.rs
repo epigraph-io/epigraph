@@ -342,12 +342,13 @@ async fn an_unmark_without_a_record_is_refused_and_changes_nothing(pool: PgPool)
 }
 
 /// A duplicate the legacy raw-SQL `fuzzy_dedup_claims` marked gets its
-/// identity edge from the operator backfill (backlog d5781a48), so the un-mark's
-/// act now finds it; but no repair record was ever kept for that mark, so the
-/// un-mark is still refused, as `NoRecord`, and changes nothing. A reversal
-/// of a legacy mark needs an operator decision (what to put back), not this.
+/// identity edge from the operator backfill (backlog d5781a48), and from then on
+/// it is an ordinary dedup record (operator ruling R-7): the un-mark makes it
+/// current again and retracts the backfilled edge. The legacy script kept no
+/// repair record, so there is nothing to put back; the audit row and the
+/// caller's copy say so (`legacy_mark`), rather than reading as a reversal.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_backfilled_legacy_mark_is_found_but_not_reversed(pool: PgPool) {
+async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool) {
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let author = new_agent(&pool).await;
     let canonical = new_claim(&pool, author, "legacy canonical").await;
@@ -372,25 +373,85 @@ async fn a_backfilled_legacy_mark_is_found_but_not_reversed(pool: PgPool) {
         .await
         .expect("backfill");
     assert_eq!(backfilled.inserted, 1, "calibration: {backfilled:?}");
+    let edge = backfilled.duplicates[0].identity_edge.expect("edge");
 
+    let ut = trigger(CascadeCause::Undedup, author, dup, None);
+    let (outcome, report) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect("a backfilled legacy mark is un-markable");
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(outcome.canonical_id, canonical);
+    assert_eq!(current(&pool, dup).await, (None, true), "current again");
+    let edge_in_force: bool =
+        sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("identity edge");
+    assert!(!edge_in_force, "the backfilled identity edge is retracted");
+
+    let caller_copy = serde_json::to_value(&outcome).expect("outcome");
+    assert_eq!(
+        caller_copy["cascade"]["touched"]["legacy_mark"],
+        serde_json::json!(true),
+        "the caller is told this was a legacy mark with nothing to restore: {caller_copy}"
+    );
+    let undedup: serde_json::Value =
+        sqlx::query_scalar("SELECT details FROM security_events WHERE id = $1")
+            .bind(outcome.cascade.audit_event_id.expect("undedup row"))
+            .fetch_one(&pool)
+            .await
+            .expect("undedup row");
+    assert_eq!(undedup["outcome"], "applied", "{undedup}");
+    assert_eq!(
+        undedup["identity_edge"],
+        serde_json::json!(edge),
+        "{undedup}"
+    );
+    assert_eq!(undedup["legacy_mark"], serde_json::json!(true), "{undedup}");
+    assert_eq!(
+        undedup["reversed_event_id"],
+        serde_json::Value::Null,
+        "{undedup}"
+    );
+}
+
+/// The legacy exemption keys on the identity EDGE the backfill wrote (its
+/// reserved `properties.dedup`), never on the claim's own, application-patchable
+/// `deduped_by`: a repository-path mark (no audit row, no record) whose claim
+/// merely CARRIES the legacy marker is still refused as `NoRecord`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_marker_on_the_claim_alone_does_not_make_a_mark_unmarkable(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("repository mark, no audit row");
+    sqlx::query(
+        "UPDATE claims SET labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims') \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("forge the legacy marker on the claim");
     let ut = trigger(CascadeCause::Undedup, author, dup, None);
     let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
         .await
-        .expect_err("no repair record for a legacy mark");
+        .expect_err("no record");
     assert_eq!(err, UnmarkRefusal::NoRecord);
-    assert_eq!(
-        current(&pool, dup).await,
-        (Some(canonical), false),
-        "nothing changed"
-    );
-    let edge_in_force: bool = sqlx::query_scalar(
-        "SELECT valid_to IS NULL FROM edges WHERE source_id = $1 AND relationship = 'same_as'",
-    )
-    .bind(dup)
-    .fetch_one(&pool)
-    .await
-    .expect("identity edge");
-    assert!(edge_in_force, "the backfilled identity edge stays");
+    assert_eq!(current(&pool, dup).await, (Some(canonical), false));
 }
 
 /// The caller's authority was checked against the canonical it read. If the

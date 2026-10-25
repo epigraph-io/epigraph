@@ -844,7 +844,8 @@ pub struct UnmarkOutcome {
 pub enum UnmarkRefusal {
     /// The act refused: not a dedup-marked duplicate, or not writable.
     Act(String),
-    /// No applied repair record and no open cascade for this mark: there is
+    /// No applied repair record and no open cascade for this mark, and it is
+    /// not a legacy mark the operator backfill gave its identity edge: there is
     /// nothing to reverse it from.
     NoRecord,
     /// Any other failure of the reversal or its audit row.
@@ -937,6 +938,26 @@ pub async fn apply_unmark(
             .map_err(|e| failed(e.to_string()))?;
             (Some(event_id), reversal)
         }
+        // A legacy `fuzzy_dedup_claims` mark whose identity edge the operator
+        // backfill reconstructed is an ordinary dedup record (operator ruling
+        // R-7). Its raw-SQL repair kept no record, so the reversal has nothing
+        // to put back; it still runs, with the empty record, so the duplicate's
+        // own edges get their BP factors back as on every un-mark.
+        None if unmarked.legacy_backfill => {
+            let rec = epigraph_db::DedupRevert {
+                identity_edge: Some(unmarked.identity_edge),
+                ..Default::default()
+            };
+            let reversal = ClaimRepository::reverse_marked_duplicate_conn(
+                &mut tx,
+                ClaimId::from_uuid(dup_id),
+                ClaimId::from_uuid(canonical_id),
+                &rec,
+            )
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+            (None, reversal)
+        }
         // The mark's repair never ran (its cascade is still deferred or
         // failed): there is nothing to put back, only the cascade to retire.
         None if !open.is_empty() => (
@@ -960,7 +981,7 @@ pub async fn apply_unmark(
     }
     // Counts only: this row names the caller (`agent_id`), who may read it,
     // and the reversal's ids are other writers' rows.
-    let touched = serde_json::json!({
+    let mut touched = serde_json::json!({
         "edges_resourced_back": reversal.resourced_back.len(),
         "edges_retargeted_back": reversal.retargeted_back.len(),
         "edges_unretracted": reversal.unretracted_edges.len(),
@@ -971,8 +992,17 @@ pub async fn apply_unmark(
         "drifted": reversal.drifted.len(),
         "cascades_retired": open.len(),
     });
+    let legacy_mark = reversed_event_id.is_none() && unmarked.legacy_backfill;
+    if legacy_mark {
+        // Said, not left to read as an exact reversal: the legacy script moved
+        // or deleted the duplicate's rows and recorded none of it.
+        touched["legacy_mark"] = serde_json::json!(true);
+    }
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("applied");
+    if legacy_mark {
+        details["legacy_mark"] = serde_json::json!(true);
+    }
     details["identity_edge"] = serde_json::json!(unmarked.identity_edge);
     details["reversed_event_id"] = serde_json::json!(reversed_event_id);
     details["touched"] = touched.clone();
