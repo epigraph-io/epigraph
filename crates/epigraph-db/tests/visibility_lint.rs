@@ -2860,6 +2860,19 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          byte-identical and was not re-derived.",
     ),
     (
+        "challenge.rs",
+        "resolve_as_claim_owner",
+        "`SELECT public.epigraph_resolve_challenge(..)` (migration 168 section 7, ruling R-3). A \
+         WRITE of four resolution columns of one `challenges` row, through a maintenance-owned \
+         definer, and it returns nothing, so a `&Viewer` would be spent on nothing: there is no \
+         FROM and no marker to fill. The read control is inside the definer, from the same \
+         session GUCs a Viewer is stamped from: the challenge's CLAIM must be public or in \
+         `epigraph_session_groups()` (else 'challenge not found', the same text as a random id), \
+         and the claim's owner must be in `epigraph_writable_groups()`. It needs the stamped \
+         transaction of `ScopedPool::begin_as` (an unstamped session has no principal and is \
+         refused CR01). Pinned by `challenge_ownership.rs` and `elevated_arms.rs`.",
+    ),
+    (
         "frame.rs",
         "assign_claim",
         "INSERT INTO `claim_frames` (ON CONFLICT DO UPDATE). A write with the same control as the \
