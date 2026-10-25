@@ -9,6 +9,9 @@
 #   deprecate   DELETE /api/v1/workflows/:id on a legacy FLAT workflow claim
 #   outcome     POST /api/v1/workflows/:id/outcome on a legacy FLAT workflow claim
 #   propagate   POST /api/v1/bp/propagate with apply_updates=true, scalar mode
+#               (BP apply is retired: refused with 409 unless the server runs
+#               with EPIGRAPH_BP_APPLY=on, which this probe sets so the arm
+#               still exercises the stamped write; see the server launch below)
 #   theme       POST /api/v1/themes/create-with-centroid
 #
 # WHY THIS PROBE EXISTS. Each of these routes answered 2xx on config A while
@@ -112,8 +115,10 @@ claim() {  # $1 author, $2 visibility, $3 owner group, $4 tag, [$5 labels litera
 SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 : > "$PROVIDERS"
 : > "$LOG"
+# EPIGRAPH_BP_APPLY=on: the propagate arm probes BP apply's stamped write,
+# which a default server refuses with 409 before writing anything.
 env -u EPIGRAPH_ALLOW_INSECURE_SECRET -u MAINTENANCE_DATABASE_URL \
-  DATABASE_URL="$E2E_APP_DSN" \
+  DATABASE_URL="$E2E_APP_DSN" EPIGRAPH_BP_APPLY=on \
   EPIGRAPH_JWT_SECRET="$SECRET" EPIGRAPH_ENV=test \
   EPIGRAPH_PROVIDERS_CONFIG="$PROVIDERS" EPIGRAPH_PORT="$PORT" EPIGRAPH_METRICS_ADDR=127.0.0.1:0 \
   OPENAI_API_KEY= RUST_LOG=warn "$BIN" >> "$LOG" 2>&1 &
@@ -210,7 +215,7 @@ if want propagate; then
   bp() {  # $1 case, $2 token, $3 claim to watch
     local before; before="$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
     req POST "/api/v1/bp/propagate" "$2" '{"apply_updates":true,"mode":"scalar"}'
-    line "$1" "applied=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('applied'), 'written', d.get('applied_count'), 'skipped', d.get('skipped_not_visible'))" "$BODY" 2>/dev/null) listed=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('updated_beliefs') or []))" "$BODY" 2>/dev/null) betp=$before->$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
+    line "$1" "applied=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('applied'), 'written', d.get('applied_count'), 'skipped', d.get('skipped_not_visible'), 'compounds', d.get('skipped_compounds'))" "$BODY" 2>/dev/null) listed=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('updated_beliefs') or []))" "$BODY" 2>/dev/null) betp=$before->$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
   }
   bp owner/own-factor "$T_OWNER" "$P2"
   # A factor naming an id that is not a claim (`factors.variable_ids` has no

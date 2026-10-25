@@ -370,8 +370,17 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
     // would drop it), and 0 pins that neither body revives. RVK01 / RVK02 from
     // the call abort the link: `operator_link.rs::a_link_to_an_operator_with_only_a_revoked_own_row_is_refused`
     // and `a_squatted_personal_group_is_not_the_operators` (ARM B).
+    // Migration 161 moved `epigraph_link_operator`'s body, unchanged, into
+    // `epigraph_link_operator_body` (shared with the attested registration's
+    // inherited link). The entry point must still go through that body, and
+    // the body carries the call and the no-revival contract.
     (
         "epigraph_link_operator",
+        0,
+        &["public.epigraph_link_operator_body(p_agent,p_operator,"],
+    ),
+    (
+        "epigraph_link_operator_body",
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),

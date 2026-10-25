@@ -397,6 +397,19 @@ pub async fn supersede_claim(
             );
             return crate::errors::write_refused("claim");
         }
+        // The session reads the claim as current but its retirement matched
+        // no row (an UPDATE policy that hides it): a denial, and the act wrote
+        // nothing. `From<DbError>` answers it 403.
+        if matches!(e, epigraph_db::DbError::WriteRefused { .. }) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "supersede_claim",
+                claim = %claim_id,
+                error = %e,
+                "the database refused to retire the claim"
+            );
+            return ApiError::from(e);
+        }
         // Map DB errors to appropriate API errors
         let msg = e.to_string();
         if msg.contains("not found") {

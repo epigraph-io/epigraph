@@ -18,6 +18,8 @@ fn mcp_bin() -> &'static str {
 #[test]
 fn rejects_dev_literal_jwt_secret() {
     let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -56,6 +58,8 @@ fn rejects_dev_literal_jwt_secret() {
 #[test]
 fn rejects_unauthenticated_tcp_listener() {
     let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -100,6 +104,8 @@ fn rejects_unauthenticated_writes_without_an_unauthenticated_listener() {
         vec!["--allow-unauthenticated-writes"],
     ] {
         let out = Command::new(mcp_bin())
+            .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+            .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
             .args([
                 "--database-url",
                 "postgres://invalid:invalid@127.0.0.1:1/nope",

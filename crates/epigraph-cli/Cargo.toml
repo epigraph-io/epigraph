@@ -21,6 +21,25 @@ name = "recompute_betp"
 path = "src/bin/recompute_betp.rs"
 required-features = ["db"]
 
+# SPEC §10.8 snapshot tooling: the belief-cache snapshot and its
+# compare-and-swap restore. Both run on the maintenance connection.
+[[bin]]
+name = "belief_snapshot"
+path = "src/bin/belief_snapshot.rs"
+required-features = ["db"]
+
+[[bin]]
+name = "restore_belief_cache"
+path = "src/bin/restore_belief_cache.rs"
+required-features = ["db"]
+
+# The atom-level belief shadow report (SPEC §10.4): reads only, on a
+# read-only session; writes its files under --out.
+[[bin]]
+name = "belief_shadow_report"
+path = "src/bin/belief_shadow_report.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
@@ -138,6 +157,27 @@ required-features = ["db"]
 [[test]]
 name = "bulk_recompute_guard"
 path = "tests/bulk_recompute_guard.rs"
+required-features = ["db"]
+
+[[test]]
+name = "belief_cache_restore"
+path = "tests/belief_cache_restore.rs"
+required-features = ["db"]
+
+[[test]]
+name = "belief_cache_bins"
+path = "tests/belief_cache_bins.rs"
+required-features = ["db"]
+
+# Spawns the wave bins (`db`-gated) against a fixture `/health`.
+[[test]]
+name = "belief_mode_check_bins"
+path = "tests/belief_mode_check_bins.rs"
+required-features = ["db"]
+
+[[test]]
+name = "belief_shadow_report"
+path = "tests/belief_shadow_report.rs"
 required-features = ["db"]
 
 # Runs most of this crate's `db`-gated binaries' `--help`; without `db` their
@@ -273,7 +313,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: `belief_cache` reads cache floats from their JSON text with
+# `str::parse::<f64>` (correctly rounded). serde_json's default float parse is
+# not round-trip exact, and a restore's compare-and-swap needs the exact bits.
+# Adds a type only; it changes no other parse. Already enabled in the build
+# graph through sqlx-core's `json` feature.
+serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true }
 csv = { workspace = true }
 reqwest = { workspace = true }

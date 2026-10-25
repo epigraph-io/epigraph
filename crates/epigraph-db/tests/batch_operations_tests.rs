@@ -376,12 +376,12 @@ async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
     assert_eq!(updated.truth_value.value(), 0.9);
 }
 
-/// Test: Batch update uses CASE WHEN for efficiency
+/// Test: Batch update assigns each claim its own value
 ///
 /// **Evidence**: Different values for different claims in single query
 /// **Reasoning**: Single round-trip to database for all updates
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
+async fn test_batch_update_truth_values_assigns_each_claim_its_own_value(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -419,6 +419,154 @@ async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
 
         assert_eq!(claim.truth_value.value(), expected_truth.value());
     }
+}
+
+/// Test: Batch update of more items than Postgres's bind-parameter limit
+///
+/// **Evidence**: the statement used to be built with two `$N` placeholders per
+/// item (`CASE id WHEN $1 THEN $2 …` plus `WHERE id IN ($1, $3, …)`), so its
+/// text varied with batch size and any batch above 32767 items exceeded the
+/// 65535-bind limit of the wire protocol: the call failed before reaching the
+/// database.
+/// **Reasoning**: one static `unnest($1::uuid[], $2::float8[])` statement binds
+/// two arrays whatever the batch size. The batch is mostly ids that name no
+/// row (skipped by the join, as for a small batch) so the test exercises the
+/// statement's size limit without paying for 33k per-row UPDATE triggers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_update_truth_values_handles_more_than_bind_limit(pool: PgPool) {
+    const N: usize = 33_000;
+    const REAL: i64 = 64;
+    let agent: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'bind-limit', 'system') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let real: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         SELECT 'bind-limit claim ' || i, sha256(('bind-limit claim ' || i)::bytea), 0.5, $1 \
+           FROM generate_series(1, $2) AS i \
+         RETURNING id",
+    )
+    .bind(agent)
+    .bind(REAL)
+    .fetch_all(&pool)
+    .await
+    .expect("seed claims");
+    assert_eq!(real.len() as i64, REAL);
+
+    // Real ids spread through the batch, with the first at index 0 and the
+    // last at index N - 1, so both ends of the arrays carry a real row.
+    let tv = |v: f64| TruthValue::new(v).unwrap();
+    let mut updates: Vec<(ClaimId, TruthValue)> = (0..N)
+        .map(|_| (ClaimId::from_uuid(uuid::Uuid::new_v4()), tv(0.9)))
+        .collect();
+    let stride = (N - 1) / (real.len() - 1);
+    for (k, id) in real.iter().enumerate() {
+        let pos = if k + 1 == real.len() {
+            N - 1
+        } else {
+            k * stride
+        };
+        let value = if k % 2 == 0 { 0.25 } else { 0.75 };
+        updates[pos] = (ClaimId::from_uuid(*id), tv(value));
+    }
+    assert_eq!(updates.len(), N);
+
+    let affected = ClaimRepository::batch_update_truth_values(&pool, &updates)
+        .await
+        .expect("a batch above the bind-parameter limit must succeed");
+    assert_eq!(
+        affected as i64, REAL,
+        "every existing claim in the batch is updated"
+    );
+
+    let (low, high): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE truth_value = 0.25), \
+                count(*) FILTER (WHERE truth_value = 0.75) \
+           FROM claims WHERE agent_id = $1",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (low, high),
+        (REAL / 2, REAL / 2),
+        "each claim got its own value"
+    );
+    let first: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(real[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first, 0.25, "the real id at index 0");
+    let last: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(real[real.len() - 1])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(last, 0.75, "the real id at index N - 1");
+}
+
+/// Test: an id listed twice is updated once, with its FIRST value
+///
+/// **Evidence**: the previous `CASE id WHEN $1 THEN $2 …` form resolved a
+/// repeated id to its first matching arm; `UPDATE … FROM unnest(…)` joining one
+/// row to two source rows applies an unspecified one of them.
+/// **Reasoning**: the input is deduplicated first-wins before the statement,
+/// so the contract survives the change of statement shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_update_truth_values_keeps_the_first_value_of_a_repeated_id(pool: PgPool) {
+    let agent: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'repeated-id', 'system') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         SELECT 'repeated-id claim ' || i, sha256(('repeated-id claim ' || i)::bytea), 0.5, $1 \
+           FROM generate_series(1, 2) AS i \
+         RETURNING id",
+    )
+    .bind(agent)
+    .fetch_all(&pool)
+    .await
+    .expect("seed claims");
+    let (a, b) = (ids[0], ids[1]);
+    let tv = |v: f64| TruthValue::new(v).unwrap();
+    // `a` first with 0.2, then 32 more times with 0.8: a last-wins pick, or
+    // an arbitrary one among 33 source rows, lands on 0.8.
+    let mut updates = vec![
+        (ClaimId::from_uuid(a), tv(0.2)),
+        (ClaimId::from_uuid(b), tv(0.6)),
+    ];
+    for _ in 0..32 {
+        updates.push((ClaimId::from_uuid(a), tv(0.8)));
+    }
+
+    let affected = ClaimRepository::batch_update_truth_values(&pool, &updates)
+        .await
+        .expect("batch update");
+    assert_eq!(
+        affected, 2,
+        "two distinct existing claims are updated, once each"
+    );
+    let read = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, f64>("SELECT truth_value FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(read(a).await, 0.2, "a repeated id keeps its FIRST value");
+    assert_eq!(read(b).await, 0.6);
 }
 
 // ============================================================================

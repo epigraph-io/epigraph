@@ -134,3 +134,59 @@ async fn dedup_self_dedup_returns_400() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+/// Calling dedup onto a canonical that is no longer current → 409, and the
+/// duplicate is untouched: the act refuses to build a dedup chain onto a
+/// retired claim (it returns DbError::QueryFailed, which the handler maps to
+/// ApiError::Conflict).
+#[tokio::test(flavor = "multi_thread")]
+async fn dedup_onto_retired_canonical_returns_409() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let canonical = common::seed_claim(&pool, "retired canonical for 409 test").await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("retire the canonical");
+    let dup = common::seed_claim(&pool, "dup onto a retired canonical").await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
+
+    let body = serde_json::json!({
+        "canonical_id": canonical,
+        "reason": "test retired canonical",
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims/{dup}/dedup"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 409,
+        "expected 409 for a dedup onto a retired canonical; got {status} — body={text}"
+    );
+    let (sup, current): (Option<uuid::Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((sup, current), (None, true), "the duplicate is untouched");
+}

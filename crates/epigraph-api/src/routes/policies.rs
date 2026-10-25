@@ -150,17 +150,19 @@ pub async fn create_challenge(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
-    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve system agent: {e}"),
-        })?;
+    // Passed through as-is: the resolver's armed-and-unregistered refusal is an
+    // `InternalErrorStatic` the caller must read (it names the registry and the
+    // remedy), and re-wrapping it as `InternalError` would redact it.
+    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool).await?;
 
+    // No protocol IS "any": normalized once, so the content (and its dedup
+    // hash) and the stored `properties.protocol` say the same thing. The
+    // content format is unchanged byte for byte: existing challenges' hashes
+    // must keep matching the idempotent lookup below.
+    let protocol = req.protocol.as_deref().unwrap_or("any");
     let content = format!(
-        "Network access challenge: {}:{} ({})",
-        req.host,
-        req.port,
-        req.protocol.as_deref().unwrap_or("any")
+        "Network access challenge: {}:{} ({protocol})",
+        req.host, req.port
     );
     let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
@@ -252,7 +254,7 @@ pub async fn create_challenge(
         .bind(serde_json::json!({
             "host": req.host,
             "port": req.port,
-            "protocol": req.protocol,
+            "protocol": protocol,
             "status": "pending",
         }))
         .bind(decl.visibility_bind())
@@ -300,11 +302,17 @@ pub async fn get_challenge(
         id: id.to_string(),
     })?;
 
+    // A challenge stored before the protocol was normalized at create time
+    // carries JSON null for "no protocol", which is "any" (its content says so).
+    let protocol = match properties.get("protocol") {
+        None | Some(serde_json::Value::Null) => serde_json::json!("any"),
+        Some(p) => p.clone(),
+    };
     Ok(Json(serde_json::json!({
         "id": id,
         "host": properties.get("host"),
         "port": properties.get("port"),
-        "protocol": properties.get("protocol"),
+        "protocol": protocol,
         "status": properties.get("status"),
     })))
 }
@@ -796,6 +804,58 @@ mod tests {
             1,
             "a repeat must write nothing"
         );
+    }
+
+    /// GET one challenge through the policy router.
+    async fn get_challenge_body(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        let response = policy_router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/policy-challenges/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        parse_body(response).await
+    }
+
+    /// No protocol means "any": the content (and so the dedup hash) already
+    /// says `(any)`, so the stored and served protocol must say it too. Before,
+    /// `None` stored JSON null while hashing identically to `"any"`, so which
+    /// of the two requests arrived FIRST decided what GET answered for both.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_challenge_without_protocol_stores_any(pool: PgPool) {
+        let bare = serde_json::json!({ "host": "noproto.example", "port": 443 });
+        let first = create_ok(test_state(pool.clone()), &bare, "no-protocol").await;
+        let body = get_challenge_body(&pool, first).await;
+        assert_eq!(body["protocol"], "any", "{body}");
+
+        // Dedup is unchanged: an explicit "any" is the same challenge.
+        let explicit =
+            serde_json::json!({ "host": "noproto.example", "port": 443, "protocol": "any" });
+        let second = create_ok(test_state(pool.clone()), &explicit, "explicit-any").await;
+        assert_eq!(second, first, "None and \"any\" are one challenge");
+        assert_eq!(challenge_rows(&pool, &bare).await, 1, "and one row");
+
+        // A row stored before this fix (protocol JSON null) reads as "any" too.
+        let content = "Network access challenge: legacy.example:443 (any)";
+        let legacy: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4) RETURNING id",
+        )
+        .bind(content)
+        .bind(epigraph_crypto::ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(ensure_system_agent(&pool).await)
+        .bind(serde_json::json!({
+            "host": "legacy.example", "port": 443, "protocol": null, "status": "pending",
+        }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let body = get_challenge_body(&pool, legacy).await;
+        assert_eq!(body["protocol"], "any", "a legacy null row: {body}");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

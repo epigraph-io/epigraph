@@ -5,7 +5,7 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::FromRow;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -36,9 +36,9 @@ impl DivergenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn store(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn store<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         pignistic_prob: f64,
@@ -72,7 +72,7 @@ impl DivergenceRepository {
         .bind(bayesian_posterior)
         .bind(kl_divergence)
         .bind(frame_version)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.0)

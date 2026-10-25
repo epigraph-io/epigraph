@@ -92,6 +92,13 @@
 //!   frame a real claim's BBA, a factor, a child frame, a cached belief or an
 //!   edge still depends on. Audited (`operator.frames_deleted`).
 //!
+//! And an OAuth cleanup (backlog d3cdd376; see [`dcr_sweep`]):
+//!
+//! * `sweep-dcr-clients` — revoke the dynamically registered (RFC 7591)
+//!   clients that never completed an authorization and are older than a floor
+//!   (default 24 h), one `oauth.dcr_client_swept` audit row each;
+//!   `list-dcr-clients` — the read-only census behind it.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -127,6 +134,7 @@ pub mod binding_client;
 pub mod client_scope;
 pub mod confirmations;
 pub mod custodian;
+pub mod dcr_sweep;
 pub mod delete_frames;
 pub mod elevation;
 pub mod hide;

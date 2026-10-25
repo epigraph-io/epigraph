@@ -50,8 +50,9 @@
 //! `SessionGucMode::Transaction` a `ScopedRead` IS a transaction, so on a
 //! pooler deployment that is one open transaction and one pinned pool slot per
 //! in-flight search. This is the class `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-//! owns (`routes/lineage.rs::get_lineage`); that entry stays open and this shard
-//! does not discharge it. `rolling_success_rate` and `find_lineage_root` are
+//! described (`routes/lineage.rs::get_lineage`). That entry is now closed by the
+//! lineage walk's own projection, which does not touch this handler: its
+//! footprint above is unchanged. `rolling_success_rate` and `find_lineage_root` are
 //! both batchable over `r.claim_id`, which would collapse the ~100 to 2, but
 //! that is a separable change with its own acceptance.
 //!
@@ -136,6 +137,10 @@ pub struct StoreWorkflowRequest {
     pub prerequisites: Option<Vec<String>>,
     pub expected_outcome: Option<String>,
     pub confidence: Option<f64>,
+    /// Stored on the workflows row as `metadata.tags` (trimmed, empties
+    /// dropped, de-duplicated) on the first store only: a re-store of the
+    /// same goal is a no-op that keeps the original tags. Not added as claim
+    /// labels.
     pub tags: Option<Vec<String>>,
 }
 
@@ -157,6 +162,10 @@ pub struct ListWorkflowsQuery {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportOutcomeRequest {
+    /// `true` only if the workflow's goal or expected outcome was achieved:
+    /// every gate and check passed. A run that ran every step but a gate or
+    /// check failed is `success=false`; record what the steps did in
+    /// `outcome_details` / `step_executions` instead.
     pub success: bool,
     pub outcome_details: String,
     pub quality: Option<f64>,
@@ -189,7 +198,10 @@ pub struct HierarchicalSearchQuery {
     #[serde(default)]
     pub resolve_to_latest: bool,
     /// Minimum `truth_value` to surface. Defaults to 0.3 so rows
-    /// deprecated via `deprecate_workflow` (truth=0.05) drop out.
+    /// deprecated via `deprecate_workflow` (truth=0.05) drop out. Exception:
+    /// with `resolve_to_latest=true` the lineage head of each matched
+    /// `canonical_name` is always returned, flagged `lineage_head_deprecated`
+    /// when its truth is below `min_truth`.
     pub min_truth: Option<f64>,
 }
 
@@ -197,6 +209,8 @@ pub struct HierarchicalSearchQuery {
 #[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
+    /// `true` only if the run's goal or expected outcome was achieved: every
+    /// gate and check passed. Running every step is not success.
     pub success: bool,
     pub step_beliefs: serde_json::Value,
     pub tool_pattern: Vec<String>,
@@ -228,6 +242,18 @@ pub struct HierarchicalWorkflowResult {
     pub truth_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_steps: Option<Vec<ResolvedStepResult>>,
+    /// `resolve_to_latest` only: this row is its lineage's head, the highest
+    /// `generation` of its `canonical_name` (what `improve_workflow_hierarchy`
+    /// builds on). The head of every matched lineage is always returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_lineage_head: Option<bool>,
+    /// `resolve_to_latest` only: the head's generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_generation: Option<i32>,
+    /// `resolve_to_latest` only: the head's `truth_value` is below
+    /// `min_truth` (deprecated). It is returned anyway, so this says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_deprecated: Option<bool>,
 }
 
 /// Per-step resolution result within [`HierarchicalWorkflowResult`].
@@ -247,6 +273,9 @@ pub struct LineageHeadResult {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `false` for a head retired without a `supersedes` edge: it is still the
+    /// lineage's head, but `evolve_step` refuses to supersede it.
+    pub is_current: bool,
 }
 
 // ── Handlers ──
@@ -1103,6 +1132,13 @@ pub async fn report_outcome(
 /// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
 /// ordered newest first. Limit defaults to 10, max 50.
 ///
+/// With `resolve_to_latest=true` the lineage head (highest `generation`) of
+/// every matched `canonical_name` is always returned, even when its goal does
+/// not match `q`, it has no goal embedding, or its truth is below `min_truth`;
+/// each entry carries `is_lineage_head`, `lineage_head_generation` and
+/// `lineage_head_deprecated`. The result can then exceed `limit` by one head
+/// per matched lineage.
+///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -1197,18 +1233,33 @@ pub async fn find_workflow_hierarchical(
         })?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name, so the highest generation per group in `rows` IS the
+    // lineage head (`lineage_heads_in`).
+    let heads = params
+        .resolve_to_latest
+        .then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
     let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()
-        .map(|r| HierarchicalWorkflowResult {
-            workflow_id: r.id,
-            canonical_name: r.canonical_name,
-            generation: r.generation,
-            goal: r.goal,
-            parent_id: r.parent_id,
-            metadata: r.metadata,
-            created_at: r.created_at,
-            truth_value: r.truth_value,
-            resolved_steps: None,
+        .map(|r| {
+            let lineage = heads
+                .as_ref()
+                .and_then(|h| h.get(&r.canonical_name))
+                .copied();
+            HierarchicalWorkflowResult {
+                is_lineage_head: lineage.map(|(id, _, _)| id == r.id),
+                lineage_head_generation: lineage.map(|(_, generation, _)| generation),
+                lineage_head_deprecated: lineage.map(|(_, _, truth)| truth < min_truth),
+                workflow_id: r.id,
+                canonical_name: r.canonical_name,
+                generation: r.generation,
+                goal: r.goal,
+                parent_id: r.parent_id,
+                metadata: r.metadata,
+                created_at: r.created_at,
+                truth_value: r.truth_value,
+                resolved_steps: None,
+            }
         })
         .collect();
 
@@ -1243,6 +1294,7 @@ pub async fn find_workflow_hierarchical(
                                 content: h.content,
                                 truth_value: h.truth_value,
                                 created_at: h.created_at,
+                                is_current: h.is_current,
                             })
                             .collect(),
                         pending_resolution: s.pending_resolution,
@@ -1271,7 +1323,9 @@ pub async fn find_workflow_hierarchical(
 /// (best-effort) onto every step row so the report feeds behavioral affinity.
 /// NOT idempotent: a retried report counts twice.
 ///
-/// Returns 404 if the id does not correspond to a `workflows` row. Use
+/// Returns 404 if the id does not correspond to a `workflows` row, or if the
+/// caller can read none of the workflow's `executes` edges (the two are not
+/// told apart, and nothing is written). Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
 ///
 /// # Authority
@@ -1286,10 +1340,14 @@ pub async fn find_workflow_hierarchical(
 /// The whole report runs on one transaction stamped with the caller's viewer
 /// ([`AppState::write_as`]). `workflows` and `behavioral_executions` have no
 /// row security, so that changes nothing about the two writes; it changes the
-/// step LOOKUP, which reads `claims` and `edges`. On the plain transaction this
-/// used to run on, row security admitted only public rows, so a group's own
-/// member got every row of a group-private workflow written with a NULL
-/// `step_claim_id`, silently. Now a member resolves its group's steps, and any
+/// reads of `claims` and `edges`. On the plain transaction this used to run
+/// on, row security admitted only public rows, so a group's own member got
+/// every row of a group-private workflow written with a NULL `step_claim_id`,
+/// silently. A caller that reads NONE of the plan's `executes` edges
+/// (`WorkflowRepository::viewer_reads_any_executes_edge`) is refused with the
+/// missing-id 404 before anything is written: `workflows` has no row security,
+/// so without that check any `claims:write` holder could move the counters of
+/// a workflow it cannot read. A reader of the plan resolves its steps, and any
 /// `step_index` that matches no step the caller can read is listed in
 /// `unresolved_step_indices` with a `warning` (out of range and not visible are
 /// deliberately not told apart). Shared with MCP:
@@ -1306,7 +1364,7 @@ pub async fn find_workflow_hierarchical(
         (status = 400, description = "quality outside [0, 1]"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write"),
-        (status = 404),
+        (status = 404, description = "no such workflow, or the caller reads none of its plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1385,15 +1443,28 @@ pub async fn report_hierarchical_outcome(
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflows lookup failed: {e}"),
             })?;
+    let not_found = || ApiError::NotFound {
+        entity: "hierarchical workflow".into(),
+        id: workflow_id.to_string(),
+    };
     let mut metadata = match row {
         Some((m,)) => m,
-        None => {
-            return Err(ApiError::NotFound {
-                entity: "hierarchical workflow".into(),
-                id: workflow_id.to_string(),
-            });
-        }
+        None => return Err(not_found()),
     };
+    // A caller that reads none of the plan's `executes` edges cannot read this
+    // workflow (`workflows` has no row security; its plan does): 404 exactly
+    // like a missing id, before any write. Shared with MCP.
+    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
+        &mut tx,
+        &viewer,
+        workflow_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow visibility check failed: {e}"),
+    })? {
+        return Err(not_found());
+    }
 
     // 2. Compute deltas
     let success = request.success;
@@ -2035,7 +2106,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2245,11 +2316,16 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
                 "write refused: could not establish the workflow-ingest-system agent's write \
                  authority. Nothing was written."
             );
-            ApiError::InternalError {
-                message: format!(
-                    "{route}: could not establish the workflow-ingest-system agent's write \
-                     authority: {e}. Nothing was written."
-                ),
+            match e {
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                    system_agent_unregistered(role)
+                }
+                e => ApiError::InternalError {
+                    message: format!(
+                        "{route}: could not establish the workflow-ingest-system agent's write \
+                         authority: {e}. Nothing was written."
+                    ),
+                },
             }
         })?;
 
@@ -2296,9 +2372,35 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
     })?;
     epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
+        .map_err(|e| match e {
+            epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                system_agent_unregistered(role)
+            }
+            other => ApiError::InternalError {
+                message: other.to_string(),
+            },
         })
+}
+
+/// The armed-and-unregistered refusal (migration 148), as a 500 the CALLER
+/// can read: its text is the operator's remedy, not a driver error, so it is
+/// [`ApiError::InternalErrorStatic`] and survives the 500 body redaction that
+/// every other `InternalError` gets. One literal per
+/// [`epigraph_db::SystemAgentRole`]; `role` is that enum's `as_str()`.
+#[cfg(feature = "db")]
+pub(crate) fn system_agent_unregistered(role: &'static str) -> ApiError {
+    ApiError::InternalErrorStatic {
+        message: if role == epigraph_db::SystemAgentRole::WorkflowIngest.as_str() {
+            "the workflow-ingest system agent is not registered in system_agents and this \
+             database is armed (migration 122): workflow ingest is refused until a maintenance \
+             session registers it (epigraph-operator register-system-agent --role \
+             workflow-ingest --agent <id> --reason <text> --apply). Nothing was written"
+        } else {
+            "a system agent is not registered in system_agents and this database is armed \
+             (migration 122): the request is refused until a maintenance session registers it \
+             (epigraph-operator register-system-agent). Nothing was written"
+        },
+    }
 }
 
 /// Embed the claims a workflow ingest just committed. This runs post-commit and
@@ -2544,8 +2646,8 @@ pub struct DeleteStepRequest {
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
 /// detail logged and kept out of the body. A content-less generation
-/// (`EmptyGeneration`, U032) is the caller's payload error: 400. Everything
-/// else stays a 500.
+/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
+/// the caller's payload errors: 400. Everything else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2565,10 +2667,21 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
                 message: format!("workflow ingest: {e}"),
             }
         }
+        // Blank claim content in the payload (thesis, phase, step or
+        // operation), refused by the executor's pre-flight: 400 naming the
+        // field.
+        e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
         // A declared group the caller, or the system agent, does not write.
         e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
             reason: format!("workflow ingest: {e}"),
         },
+        epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+            system_agent_unregistered(role)
+        }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
         },
@@ -2603,6 +2716,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
         {
             ApiError::from(db)
         }
+        E::Executor(epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered {
+            role,
+        }) => system_agent_unregistered(role),
         E::Db(e) => ApiError::InternalError {
             message: format!("db: {e}"),
         },
@@ -3252,6 +3368,29 @@ mod tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
+    /// Backlog 563165f2 (HTTP twin of the MCP `success` definition): the
+    /// OpenAPI schema of the outcome body both outcome routes take must say
+    /// that `success` means the goal was achieved, not that the steps ran.
+    #[test]
+    fn report_outcome_success_is_defined_as_goal_achieved() {
+        let schema =
+            serde_json::to_value(<ReportOutcomeRequest as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let d = schema["properties"]["success"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`success` carries a description: {schema}"));
+        for needle in [
+            "goal or expected outcome was achieved",
+            "every gate and check passed",
+            "ran every step but a gate or",
+        ] {
+            assert!(
+                d.contains(needle),
+                "`success` must say {needle:?}; got: {d}"
+            );
+        }
+    }
+
     /// U032: a step-less new generation (or an empty plan) is the caller's
     /// payload error — 400 with the executor's reason, not a 500 that invites
     /// a retry (the retry loop is what minted the empty generations).
@@ -3272,6 +3411,122 @@ mod tests {
                 "{message}"
             ),
             other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// The executor's pre-flight refusal of blank claim content in the
+    /// caller's payload is a 400 carrying the field path, not a 500 that
+    /// invites a retry of a payload that can never succeed.
+    #[test]
+    fn blank_claim_content_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::InvalidContent {
+                path: "phases[0].steps[0].operations[0]".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.starts_with("workflow ingest: ")
+                    && message.contains("blank claim content at phases[0].steps[0].operations[0]"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Render an `ApiError` the way a route answers it: status and JSON body.
+    async fn rendered(e: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = axum::response::IntoResponse::into_response(e);
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("an in-memory body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON error body"),
+        )
+    }
+
+    /// The armed-and-unregistered refusal (migration 148) is the operator's
+    /// remedy, so it is answered verbatim through the 500 redaction on both
+    /// executor mapping sites, while any other executor 500 keeps its detail
+    /// out of the body.
+    #[tokio::test]
+    async fn the_unregistered_system_agent_remedy_survives_the_500_redaction() {
+        let role = epigraph_db::SystemAgentRole::WorkflowIngest.as_str();
+        let unregistered =
+            || epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role };
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(unregistered()),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    unregistered(),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert_eq!(body["error"], "InternalError", "{site}: {body}");
+            let text = body.to_string();
+            assert!(
+                text.contains("not registered in system_agents")
+                    && text.contains("register-system-agent --role workflow-ingest"),
+                "{site}: the remedy reaches the caller: {body}"
+            );
+        }
+
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                ),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert!(
+                !body.to_string().contains("secret-detail-3e91"),
+                "{site}: any other executor 500 is redacted: {body}"
+            );
+        }
+    }
+
+    /// `system_agent_unregistered` hand-copies the executor's `Display` text
+    /// (the variant needs a `&'static str`). Pin the copy to the source for
+    /// every registered role, so an edit to the executor's remedy (CLI flags,
+    /// migration number), or a new role landing on the generic fallback,
+    /// fails here instead of drifting from what HTTP callers read.
+    #[test]
+    fn the_unregistered_system_agent_literal_matches_the_executor_text() {
+        for role in epigraph_db::SystemAgentRole::ALL {
+            let role = role.as_str();
+            let ApiError::InternalErrorStatic { message } = system_agent_unregistered(role) else {
+                panic!("{role}: expected InternalErrorStatic");
+            };
+            assert_eq!(
+                message,
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role }
+                    .to_string(),
+                "{role}: the HTTP literal drifted from the executor's error text"
+            );
         }
     }
 
@@ -3563,6 +3818,53 @@ mod tests {
         assert!(body["canonical_name"].as_str().is_some());
     }
 
+    /// Through the route: a payload whose only step has a blank `compound` is
+    /// answered 400 naming the field, and no `workflows` row is written.
+    /// Positive control: the same payload with its content intact is a 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_refuses_blank_step_content_as_400(pool: PgPool) {
+        let post = |app: axum::Router, payload: serde_json::Value| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/workflows/ingest")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let count = |pool: PgPool, name: &'static str| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let app = test_router(pool.clone()).await;
+
+        let mut blank = ingest_payload("http-blank-step-content");
+        blank["phases"][0]["steps"][0]["compound"] = serde_json::json!("   ");
+        let (status, text) = post(app.clone(), blank).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("blank claim content at phases[0].steps[0]"),
+            "the 400 names the field: {text}"
+        );
+        assert_eq!(count(pool.clone(), "http-blank-step-content").await, 0);
+
+        let (status, text) = post(app, ingest_payload("http-intact-step-content")).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(count(pool, "http-intact-step-content").await, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
         let app = test_router(pool).await;
@@ -3610,6 +3912,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(&pool, workflow_id).await;
 
         // Build a minimal axum app with just the outcome route, on a state
         // that can stamp the report's transaction (the route refuses to run
@@ -3654,6 +3957,37 @@ mod tests {
         assert_eq!(metadata["success_count"], 1);
     }
 
+    /// Give a bare test root the one thing the outcome route requires of a
+    /// workflow besides its row: a plan claim the reporter can read. One public
+    /// level-0 (thesis) claim at `plan_index` 0, so no `step_index` resolves
+    /// and the row counts these tests assert are unchanged.
+    async fn attach_public_thesis(pool: &PgPool, workflow_id: uuid::Uuid) {
+        // Inserted with its level rather than updated afterwards: the
+        // route-layer write ratchet (`tests/viewer_route_table_lint.rs`) counts
+        // an `UPDATE` of `claims` anywhere in this file.
+        let content = format!("outcome test thesis {workflow_id}");
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        let thesis = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, properties) \
+             VALUES ($1, $2, $3, 0.5, jsonb_build_object('level', 0)) RETURNING id",
+        )
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(ensure_system_agent(pool).await)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', 0))",
+        )
+        .bind(workflow_id)
+        .bind(thesis)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// The caller every outcome-route test reports as: an agent token holding
     /// `claims:write`, the scope the route requires. Its principal belongs to
     /// no group; the superuser test pool filters nothing, so these tests pin
@@ -3690,6 +4024,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
         let state = scoped_test_state(pool).await;
         let app = axum::Router::new()
             .route(
@@ -3760,9 +4095,18 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_is_all_or_nothing_when_a_step_row_fails(pool: PgPool) {
         let (app, workflow_id) = outcome_fixture(&pool, "outcome-atomic-http").await;
+        // A SEQUENCE counts the step-row INSERTs the trigger saw: `nextval` is
+        // not transactional, so the count survives the rollback and ties the
+        // 500 to step B's refusal (the 500 body is redacted, so the error
+        // text can no longer do that).
+        sqlx::query("CREATE SEQUENCE u033_http_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE FUNCTION u033_http_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             BEGIN PERFORM nextval('u033_http_attempts'); \
+             IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
              RETURN NEW; END $$",
         )
         .execute(&pool)
@@ -3792,12 +4136,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Tie the 500 to the injected refusal of step B, so an unrelated
-        // early error (begin, lookup) cannot satisfy this test.
+        // early error (begin, lookup) cannot satisfy this test: the trigger
+        // saw BOTH step rows, and step B's always raises.
+        let attempts: i64 = sqlx::query_scalar("SELECT last_value FROM u033_http_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "the 500 must come from step B's refused row, after step A's INSERT ran"
+        );
+        // And the 500 body does not carry the database's error text
+        // (F-route-error-text-remainder).
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&body);
         assert!(
-            body.contains("behavioral_executions write failed") && body.contains("u033 injected"),
-            "the error must carry the step-row refusal: {body}"
+            !body.contains("u033 injected"),
+            "the 500 body must not carry the database's error text: {body}"
         );
         let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
         assert!(
@@ -3910,6 +4265,7 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
         let state = scoped_test_state(pool)
             .await
             .with_embedding_service(std::sync::Arc::new(MockProvider::new(

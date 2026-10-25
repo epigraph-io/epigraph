@@ -619,10 +619,12 @@ pub struct RecallParams {
 
     #[schemars(
         description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
-                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       object grouping the same hits into `confirmed` (belief_score >= 0.75 and \
                        not contested), `open_question` (is_contested — any live \
-                       contradicts/refutes), and `uncertain` (everything else). Contest is \
-                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       contradicts/refutes), and `uncertain` (everything else). The score is \
+                       each hit's `belief_score`, the same value `min_truth` gates on, not its \
+                       authored `truth_value`. Contest is \
+                       checked FIRST, so a high-scoring claim carrying a live refutation is \
                        reported as an open question rather than as confirmed. Ranking is \
                        UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
                        and the union of the three buckets is exactly the flat list — this \
@@ -772,7 +774,9 @@ pub struct StoreWorkflowParams {
     )]
     pub confidence: Option<f64>,
 
-    #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
+    #[schemars(
+        description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows']). Stored on the workflows row as metadata.tags (trimmed, empties dropped, de-duplicated) on the FIRST store only: a re-store of the same goal is a no-op that keeps the original tags. Not added as claim labels."
+    )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
@@ -840,7 +844,9 @@ pub struct ReportWorkflowOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(description = "Step-by-step execution log: planned vs actual")]
@@ -933,12 +939,12 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and order results by (canonical_name ASC, generation DESC) so the newest variant per lineage is first. Defaults to false (frozen step references, newest-created-at first)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth), and the head leads its lineage group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
 
     #[schemars(
-        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows."
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when its truth is below min_truth."
     )]
     pub min_truth: Option<f64>,
 }
@@ -970,7 +976,9 @@ pub struct ReportHierarchicalOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed.")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(
@@ -1414,8 +1422,11 @@ pub enum HashCheck {
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
-    /// Whether the stored Ed25519 signature verifies against the signer's
-    /// `agents.public_key` over the **stored** `content_hash`.
+    /// Whether the stored Ed25519 signature verifies over the **stored**
+    /// `content_hash`, under the signer's `agents.public_key` or under an
+    /// attested `agent_keys` key (`signing`, `identity-legacy`) of the claim's
+    /// signer or author. See [`Self::key_bound`] for whether that key vouches
+    /// for the author.
     ///
     /// `false` covers two very different states — read it together with
     /// [`Self::signed`]: `signed = false` means the claim carries no signature
@@ -1436,6 +1447,39 @@ pub struct VerifyResponse {
     /// `signed = true, signature_valid = true`. Claims written before that, and
     /// by paths that store no signature, report `signed = false`.
     pub signed: bool,
+    /// Whether the key that verifies the signature is BOUND to the claim's
+    /// AUTHOR (agent identity lineage design D2): an attested `agent_keys` key
+    /// of `claims.agent_id` (`signing`, or migration 161's `identity-legacy`)
+    /// whose window holds the claim's `created_at` (`[valid_from - 60 s,
+    /// valid_until)`, the 60 s absorbing clock skew; active, or rotated /
+    /// expired with a recorded `valid_until`; never revoked or pending).
+    ///
+    /// `false` with `signature_valid = true` is a real signature by a key that
+    /// does not vouch for the author: a key no attested row carries, a key of
+    /// the SIGNER that is not the author's (an HTTP claim authored by its
+    /// caller and signed by the server), a revoked key, or a claim dated
+    /// outside the key's window.
+    ///
+    /// What `true` does NOT prove:
+    /// * that the author asserted THIS claim. The signature covers
+    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
+    ///   evidence distinction (evidence rows are signed the same way). Someone
+    ///   who can write the database directly can copy the author's signature
+    ///   from any claim or evidence row with the same bytes onto a row naming
+    ///   that author, and it reports bound.
+    /// * the date. `created_at` is set by the writer and is not signed, so the
+    ///   window test trusts it: a backdated row passes it.
+    /// * anything, under an `identity-legacy` key: its private half is
+    ///   computable from public inputs, so such a signature, bound or not, is
+    ///   never evidence of authorship.
+    pub key_bound: bool,
+    /// Which kind of key verified the signature: `"signing"` (a registered
+    /// random signing key), `"identity-legacy"` (an agent's pre-existing
+    /// identity key; under the unkeyed scheme its private half is computable
+    /// from public inputs, so such a signature is forgeable), or
+    /// `"unattested"` (only the signer's `agents.public_key` verifies it, and
+    /// no attested row carries that key). `null` when no key verifies.
+    pub key_kind: Option<&'static str>,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
     pub hash_check: HashCheck,
@@ -1662,8 +1706,15 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 ///   independent signals; a corpus can hold a 0.9 claim and a live refutation
 ///   of it at the same time, and that pair is precisely what the caller must
 ///   not be told is settled.
-/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `confirmed` — not contested AND gated score `>= `[`CONFIRMED_SCORE`].
 /// * `uncertain` — everything else.
+///
+/// The score is the GATED score: the value `min_truth` compared against
+/// (`RecallGatedSignals::gated_score`), never the authored `truth_value`.
+/// The two differ whenever evidence has moved a claim's DS cache away from
+/// what its author asserted, and a partition that read the authored value
+/// would call a claim `confirmed` that the gate rates 0.4, or `uncertain` a
+/// claim the gate admitted at 0.9.
 ///
 /// Within each bucket the caller's ranking order is PRESERVED (items are
 /// pushed in the order they were given), so bucketing re-groups the page
@@ -1677,7 +1728,7 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 /// without it, and only the JSON shape differs.
 #[derive(Debug, Clone, Serialize)]
 pub struct EpistemicPartition<T> {
-    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    /// Uncontested, with a gated score at or above [`CONFIRMED_SCORE`].
     pub confirmed: Vec<T>,
     /// Neither confirmed nor contested — believed, but not settled.
     pub uncertain: Vec<T>,
@@ -1685,19 +1736,38 @@ pub struct EpistemicPartition<T> {
     pub open_question: Vec<T>,
 }
 
+/// The two signals [`EpistemicPartition`] buckets a recall hit by.
+///
+/// A trait rather than a caller-supplied closure: the
+/// closure let each call site choose which number to partition on, and both
+/// sites chose the authored `truth_value` while their `min_truth` gate read
+/// `belief_score`. Implementing this on the hit type puts the choice in ONE
+/// place per type, next to the field the gate writes.
+pub(crate) trait RecallGatedSignals {
+    /// The score `min_truth` was compared against for this hit: the DS
+    /// pignistic probability when the claim carries a DS cache, else the
+    /// authored `truth_value` (a hit with no DS state falls back exactly as
+    /// the gate does).
+    fn gated_score(&self) -> f64;
+    /// Whether the dispute post-pass found a live `contradicts`/`refutes`.
+    fn is_contested(&self) -> bool;
+}
+
+impl RecallGatedSignals for RecallResult {
+    fn gated_score(&self) -> f64 {
+        self.belief_score
+    }
+    fn is_contested(&self) -> bool {
+        self.is_contested
+    }
+}
+
 impl<T> EpistemicPartition<T> {
-    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
-    /// `signals`.
-    ///
-    /// `signals` is a closure rather than a trait bound because the two recall
-    /// surfaces carry the same two numbers under different field names
-    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
-    /// live in different modules — and because the score this partitions on
-    /// must stay the SAME score `min_truth` gates on, which is a decision the
-    /// call site owns, not this type.
-    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    /// Bucket `items` by their gated score and contest flag.
+    pub(crate) fn from_ranked<I>(items: I) -> Self
     where
         I: IntoIterator<Item = T>,
+        T: RecallGatedSignals,
     {
         let mut out = Self {
             confirmed: Vec::new(),
@@ -1705,7 +1775,7 @@ impl<T> EpistemicPartition<T> {
             open_question: Vec::new(),
         };
         for item in items {
-            let (score, is_contested) = signals(&item);
+            let (score, is_contested) = (item.gated_score(), item.is_contested());
             if is_contested {
                 out.open_question.push(item);
             } else if score >= CONFIRMED_SCORE {
@@ -1810,13 +1880,12 @@ pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid:
 /// the flag off the response is byte-identical to what it was before this
 /// parameter existed — `Some(vec![])` still serializes as `"results": []`,
 /// which an empty-page caller relies on.
-pub(crate) fn split_epistemic<T>(
+pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     items: Vec<T>,
     partition: bool,
-    signals: impl Fn(&T) -> (f64, bool),
 ) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
     if partition {
-        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+        (None, Some(EpistemicPartition::from_ranked(items)))
     } else {
         (Some(items), None)
     }
@@ -1834,6 +1903,12 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
@@ -1848,6 +1923,12 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
@@ -2165,6 +2246,14 @@ pub struct LinkEpistemicResponse {
     pub owned_by_caller: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// Why `belief_wired` is false (backlog 0a996437); omitted when it is
+    /// true. One of `source_has_no_belief`, `structural_relationship`,
+    /// `vacuous_source_mass`, `already_wired` or `refused_or_failed` (the
+    /// wiring was refused, e.g. a target this caller cannot write, or failed);
+    /// `edge_retracted` and `source_author_unresolved` are defensive values
+    /// seen only under a concurrent retraction or removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_wired_reason: Option<&'static str>,
     /// The claim `target_belief` describes, and the one the belief wire
     /// recomputed.
     ///
@@ -2329,6 +2418,50 @@ pub struct FindWorkflowResult {
     /// when never evaluated. Advisory — callers may prefer promoted variants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotable: Option<bool>,
+    /// Hierarchical results only (absent for flat workflow claims). `steps` is
+    /// the FROZEN plan text: the claims the workflow's `executes` edges named
+    /// at ingest. `Some(true)` when at least one of those steps has since been
+    /// evolved (`evolve_step`), so its lineage head differs from the frozen
+    /// claim; the heads are in [`Self::evolved_steps`]. Absent when the
+    /// lineage lookup failed (best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_evolved_steps: Option<bool>,
+    /// The steps whose lineage head is not the frozen claim, indexed the way
+    /// `evolve_step` / `report_hierarchical_outcome` index steps. Absent when
+    /// nothing evolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evolved_steps: Option<Vec<EvolvedStep>>,
+    /// Hierarchical results only: the highest `generation` that exists for
+    /// this workflow's `canonical_name`. Greater than `generation` when a newer
+    /// generation of the same lineage exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_generation: Option<i64>,
+}
+
+/// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
+/// has moved on: listed when the lineage has more than one head, or its single
+/// head is not the frozen claim. A step whose sole head is the frozen claim is
+/// not listed, even when that claim is retired (it never evolved).
+#[derive(Debug, Serialize)]
+pub struct EvolvedStep {
+    /// The index `evolve_step` / `report_hierarchical_outcome` take. It counts
+    /// the `executes` edges the caller can see, so it is not guaranteed to be
+    /// the position of the same step in [`FindWorkflowResult::steps`]; match on
+    /// `frozen_claim_id` when that matters.
+    pub step_index: usize,
+    pub frozen_claim_id: String,
+    /// The newest head with `is_current=true`, which is the claim name-mode
+    /// `evolve_step` and `update_with_evidence` act on. When no head of the
+    /// lineage is current, the newest head, with [`Self::is_current`] false.
+    pub head_claim_id: String,
+    pub head_content: String,
+    /// `false` when every head of the lineage is retired (`is_current=false`
+    /// with no `supersedes` edge): the step cannot be evolved or take
+    /// evidence by name until it is revived or re-ingested.
+    pub is_current: bool,
+    /// The lineage has more than one head (concurrent `revises`); the head
+    /// shown is the newest, and the caller must reconcile before relying on it.
+    pub pending_resolution: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2453,6 +2586,15 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// What this call did to the caller's BBA for this (claim, frame,
+    /// perspective_id): `inserted` (none existed), `unchanged` (an identical
+    /// BBA was already stored, so nothing new was combined) or `replaced` (an
+    /// earlier, different BBA was overwritten in place, same id). Backlog
+    /// bcbe34b2.
+    pub write_outcome: String,
+    /// True iff `write_outcome` is `unchanged`: an identical resubmission is
+    /// stored once, not combined again.
+    pub deduplicated: bool,
     /// Human-readable notes about inputs that were ACCEPTED but do not do what
     /// their name suggests (e.g. a non-default `combination_method` or any
     /// `gamma`, neither of which changes the returned belief). Omitted when
@@ -2484,6 +2626,14 @@ pub struct BeliefResponse {
     /// top-level belief/plausibility/etc remain the global (unlensed) values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<LensedBelief>,
+    /// The claim's belief under the atom-level model, beside the served value
+    /// (`EPIGRAPH_COMPOUND_BELIEF=shadow` only; omitted, not null, otherwise,
+    /// so a get_belief in the default mode is byte-identical to today). A
+    /// compound carries `basis: "derived"`: computed from its visible atoms,
+    /// not evidence about the claim. The top-level fields stay the served
+    /// values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<epigraph_engine::belief_view::BeliefView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3484,4 +3634,8 @@ pub struct LabelDedupIndexViewParams {
         description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
     )]
     pub max_claims: Option<i64>,
+    #[schemars(
+        description = "Leave out a duplicate whose author has another owner than the canonical's, as the plan does (default true); each one left out is listed in foreign_duplicates_ignored. false returns every duplicate"
+    )]
+    pub same_owner_only: Option<bool>,
 }

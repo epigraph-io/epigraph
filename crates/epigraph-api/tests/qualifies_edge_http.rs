@@ -11,8 +11,8 @@
 //! The HTTP twin of MCP
 //! `link_epistemic_smoke.rs::qualifies_edge_is_created_but_does_not_move_belief`.
 //! The REST path has a belief side effect the MCP tool does not: the legacy BP
-//! `factors` row (the route's own INSERT plus the `edges_auto_factor`
-//! trigger). Neutrality is pinned on it and on the DS wire, against a target
+//! `factors` row (the `edges_auto_factor` trigger; the route's own INSERT was
+//! removed under atom-level belief). Neutrality is pinned on it and on the DS wire, against a target
 //! that already HAS a belief the wire could move, each with a positive control
 //! on a parallel pair: a `refutes` edge that does move belief, and a
 //! `supports` edge that does create a factor. The route's 1-hop dependent
@@ -119,8 +119,8 @@ async fn bbas_on(pool: &PgPool, edge: Uuid) -> i64 {
         .expect("count edge BBAs")
 }
 
-/// Legacy BP factors over the pair, whichever writer made them: the route's
-/// own INSERT or the `edges_auto_factor` trigger.
+/// Legacy BP factors over the pair, whichever writer made them (today only
+/// the `edges_auto_factor` trigger).
 async fn factors_over(pool: &PgPool, a: Uuid, b: Uuid) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM factors WHERE variable_ids @> ARRAY[$1, $2]::uuid[]")
         .bind(a)

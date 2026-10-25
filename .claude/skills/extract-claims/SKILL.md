@@ -111,10 +111,11 @@ path, only when the source explicitly states them (see the schema below).
 
 ### Stage 4: Submit (`ingest_document_inline`)
 
-Pass the enriched `DocumentExtraction` directly to **`ingest_document_inline`**:
+Pass the enriched `DocumentExtraction` directly to **`ingest_document_inline`**,
+with `wait: true` so the call reports whether the write landed:
 
 ```
-ingest_document_inline({ extraction: <the enriched DocumentExtraction> })
+ingest_document_inline({ extraction: <the enriched DocumentExtraction>, wait: true })
 ```
 
 Because `structure_source` populated `source_text` and per-node `span`s, the
@@ -128,19 +129,36 @@ embeddings, and CDST mass functions for atoms.
 that must stage JSON on disk first, but `ingest_document_inline` is the primary,
 inline path and the one this flow uses.)
 
-#### Fire-and-forget — response is a queue acknowledgement, not confirmation
+#### Use `wait: true` — the default is a queue acknowledgement, not confirmation
 
-`ingest_document_inline` (and `ingest_document`) return **immediately** after
-spawning a detached Tokio task; the response is:
+With **`wait: true`**, `ingest_document_inline` (and `ingest_document`) run the
+all-or-nothing walk in the request and return its own result:
 
 ```json
-{ "status": "queued", "doi": "...", "title": "...", "note": "..." }
+{ "doi": "<document_key>", "paper_id": "...", "claims_ingested": <n>,
+  "claims_skipped_dedup": <n>, "relationships_created": <n>, ... }
 ```
 
-**The write may still be in flight when you receive this.** Always verify with
-`check_already_ingested` (or `query_paper`) before treating the paper as landed.
-Do not fire a second ingest call based on a timeout — the background task is
-still running. One write at a time per paper is the correct pattern.
+The result's `doi` is the document_key. If the walk fails (verbatim-guard
+mismatch, malformed axis, a rejected row, an owner-group refusal) the call
+returns an **error** naming the cause and the document_key; no claims or edges
+were written (the papers row may exist with 0 claims), so fix the cause and
+retry: a retry is safe and converges on existing nodes.
+
+**Without `wait`** (the default) the call returns immediately after spawning a
+detached task:
+
+```json
+{ "status": "queued", "document_key": "...", "paper_id": "...", "note": "..." }
+```
+
+The write may still be in flight, and if it fails the error reaches only the
+server log. Confirm a detached ingest only by `query_paper(document_key)`'s
+`claim_count` rising: the paper row exists as soon as the call returns, and
+`check_already_ingested` can already be true from an earlier spine or ingest
+of the same document, so neither proves the write landed. Do not fire a second
+ingest call based on a timeout — the background task may still be running.
+One write at a time per paper is the correct pattern.
 
 `ingest_document_spine`, by contrast, IS synchronous — it must return
 `new_paragraph_paths` before the atomization LLM call can proceed. Spine writes

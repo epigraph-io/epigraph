@@ -71,6 +71,9 @@ rand = "0.8"
 subtle = "2"
 bs58 = "0.5"
 hex = "0.4"
+# zstd: the agent prompt-history blobs (migration 161) are stored zstd-compressed;
+# epigraph-db compresses them on registration and decompresses them on read.
+zstd = { version = "0.13", default-features = false }
 hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
