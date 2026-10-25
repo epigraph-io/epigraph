@@ -28,9 +28,23 @@
 -- So the database enforces the ruling only against a writer that does not
 -- choose its own principal (the API, which stamps the authenticated
 -- viewer). A container that holds the application DSN directly can stamp
--- itself as another principal; it is held by the host's skip, not by this
--- file. Section 3 says which writes the rule covers: every write an
--- application session makes.
+-- itself as another principal, or none, or change the stamp in the middle
+-- of a statement (a `set_config` in a subquery runs after the statement
+-- check below has read it, so rows of a table other than `claims` can then
+-- be written as the attached agent itself); it is held by the host's skip,
+-- not by this file.
+-- AND ONLY A STAMPED WRITE. The statement check reads the session's stamped
+-- principal. A write the application makes on a connection that carries NO
+-- principal (the request-path sites still on the raw pool, which the
+-- `no_unscoped_pool` ratchet counts down, and epigraph-mcp's raw-pool
+-- writes, e.g. `publish_event` into `events`) is not checked on its writer,
+-- even when the row names the attached agent as its actor. For `claims` the
+-- author is still checked (an insert, a re-open, a re-attribution, and
+-- every change to what the claim says); for every other table such a write
+-- after the holder's end lands until that site stamps its caller. The
+-- epigraph-mcp boot refusal and the host's skip hold a run that starts in a
+-- gap; a run in progress keeps that hole for its unstamped writes. Section 3
+-- says which writes the rule covers.
 --
 -- `role_agents` CONFERS NOTHING. It only adds a refusal. An attachment never
 -- grants an agent a group, a scope or a read; whatever the agent may do, it
@@ -67,9 +81,13 @@
 -- SHARED successor (one that runs in more than one group folder) is attached
 -- alike and flagged (section 5). An operator who attaches an identity read
 -- from a stale list therefore still attaches the identity that runs now. A
--- detach does
--- not follow (a successor stays attached until it is detached itself: the
--- direction that only refuses).
+-- detach does not follow (a successor stays attached until it is detached
+-- itself: the direction that only refuses), in either direction: an
+-- identity registered AGAIN as the successor of a still-attached identity (a
+-- reverted prompt re-derives an earlier key) is attached again from that
+-- successor's row.
+-- So retiring a stale lineage (an identity linked to a previous holder)
+-- means detaching every identity of it that is still attached.
 -- Each attach and each detach writes one `security_events` row
 -- (`platform.role_agent_attached` / `platform.role_agent_detached`), whatever
 -- path wrote it. The `platform.` prefix is already reserved to a privileged
@@ -161,7 +179,8 @@
 -- valve, which relieves OPL01 only. An agent with no live attachment, and an
 -- attached agent while its human holds the role, write exactly as before.
 --
--- COVERAGE: COMPLETE for the application role. The ruling refuses EVERY
+-- COVERAGE: EVERY TABLE, for a STAMPED write (section 1 says why an
+-- unstamped one is not). The ruling refuses EVERY
 -- write a run makes after its holder's assignment ends, and every table the
 -- application role can INSERT, UPDATE or DELETE carries the statement
 -- trigger: 79 tables on a database migrated to this file, measured from the
@@ -177,8 +196,8 @@
 -- role's INSERT for that reason), so an attached agent's own audit row in
 -- its gap lands while the act it records is refused; the rows are immutable
 -- (082) and the `platform.` prefix is reserved (123), so the INSERT opens no
--- other write. Its UPDATE, DELETE and TRUNCATE stay checked. The catalog ratchet in
--- `role_attached_agents.rs` (`every_table_the_app_role_writes_carries_the_
+-- other write. Its UPDATE, DELETE and TRUNCATE stay checked. The catalog
+-- ratchet in `role_attached_agents.rs` (`every_table_the_app_role_writes_carries_the_
 -- role_holder_write_check`) re-measures the set, so a table a later
 -- migration hands the application role (077's default privileges do) fails
 -- it until it carries the trigger or an exemption with a concrete harm.
@@ -191,17 +210,30 @@
 -- (elevation, passkeys, admin acts), and a person is never attached (ROL02);
 -- `revoked_access_tokens` takes a token revocation (any client, an agent
 -- included, may revoke its own token), which only ever takes authority away.
--- THE REMAINING STATED LIMIT is section 1's: a container that holds the
--- application DSN can stamp itself as another principal (or as none, for a
--- table other than `claims`), and nothing here can tell that from the other
--- identity's own write. The host's skip holds it.
+-- THE STATED LIMITS are section 1's: an UNSTAMPED application write is not
+-- checked on its writer (outside `claims`' author), and a container that
+-- holds the application DSN can stamp itself as another principal, or as
+-- none, or change the stamp mid-statement, and nothing here can tell that
+-- from the other identity's own write. The host's skip holds the second;
+-- stamping each remaining raw-pool site closes the first.
+-- ONE CHECK PER STATEMENT. The statement check runs once, when the
+-- statement starts, at that `clock_timestamp()`: a single statement on a
+-- table other than `claims` that starts before `valid_to` is admitted whole,
+-- however long it runs ("every write after the end" holds statement by
+-- statement). On `claims` the author checks run per row.
 -- A write that changes what an attached agent's claim says (its
--- `truth_value` included, so a belief recompute that rewrites it), or
--- retires or deletes it, fails as a whole in that agent's gap (a multi-row
--- UPDATE included; a human's supersede of the claim too, because it retires
--- the predecessor); a custodial correction runs on the maintenance DSN.
--- DEPLOY: creating 80 triggers takes a SHARE ROW EXCLUSIVE lock on each
--- table under this file's 3 s `lock_timeout`; on a busy database a timeout
+-- `truth_value` included), or retires or deletes it, fails as a whole in
+-- that agent's gap, whoever writes it: a multi-row UPDATE included; another
+-- principal's evidence-driven truth update of the claim (MCP
+-- `update_with_evidence`, the API's belief propagation, a packet's
+-- evidence), which rolls back the evidence with it; a `resolved` label
+-- another principal adds; a dedup, a consolidation or a supersede that
+-- retires it (a human's supersede too, because it retires the predecessor).
+-- Only the derived caches above stay writable by others. The job queue
+-- drains on the maintenance DSN (`drain_jobs`), which is exempt, so a gap
+-- stops no recompute job; a custodial correction runs there too.
+-- DEPLOY: creating the triggers (80 on a clean migrate, more where the
+-- catalog adds tables) takes a SHARE ROW EXCLUSIVE lock on each table under this file's 3 s `lock_timeout`; on a busy database a timeout
 -- rolls the whole migration back, and it is re-run.
 --
 -- ===================================================================
