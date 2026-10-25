@@ -1053,9 +1053,15 @@ async fn seed_processed_paper(
     key: &str,
     title: &str,
 ) -> uuid::Uuid {
-    let paper_id = epigraph_db::PaperRepository::get_or_create(pool, key, Some(title), None)
-        .await
-        .expect("seed a paper row");
+    // A raw INSERT, not `PaperRepository::get_or_create`: that writer stores
+    // the canonical key, and this seed must reproduce the verbatim legacy one.
+    let paper_id: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $2) RETURNING id")
+            .bind(key)
+            .bind(title)
+            .fetch_one(pool)
+            .await
+            .expect("seed a paper row");
     let agent = server.server_agent_id().await.expect("server agent");
     let mut conn = pool.acquire().await.expect("acquire");
     epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(

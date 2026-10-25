@@ -884,9 +884,26 @@ impl EvidenceRepository {
     ///
     /// A `WHERE` predicate decides which ROW a statement may touch. It says
     /// nothing about the VALUES the `SET` clause assigns. This function only
-    /// ever assigns `raw_content`, so the gap is not reachable here — but a
-    /// future write fn that lets a caller assign `owner_group_id` is not made
-    /// safe by carrying this marker.
+    /// ever assigns `raw_content` and the `content_hash` derived from it, so
+    /// the gap is not reachable here — but a future write fn that lets a
+    /// caller assign `owner_group_id` is not made safe by carrying this marker.
+    ///
+    /// # `content_hash` moves with the body
+    ///
+    /// `content_hash` is set to BLAKE3(`raw_content`) in the same statement
+    /// (backlog 9e7a9a96). `POST /api/v1/evidence` refuses a stored digest
+    /// that disagrees with its body; rewriting the body alone left exactly
+    /// that row behind, where no create-time check could see it. Computed
+    /// here, not in the handler, so no caller can update one column without
+    /// the other. A new body equal to a sibling row's on the same claim now
+    /// collides on `UNIQUE (content_hash, claim_id)` and is refused
+    /// (`DbError::DuplicateKey`), writing nothing. Backfilling a body onto
+    /// external evidence (stored with `raw_content` NULL and a caller-supplied
+    /// digest) replaces that digest with BLAKE3(body), deliberately: the row
+    /// then describes, and can be checked against, the body it holds.
+    ///
+    /// A row holding the seal sentinel (its claim is sealed) is not
+    /// rewritten and reports `false`, like an unwritable row.
     ///
     /// # Returns
     ///
@@ -904,16 +921,26 @@ impl EvidenceRepository {
         id: EvidenceId,
         raw_content: &str,
     ) -> Result<bool, DbError> {
+        // `$4` is the seal sentinel: a sealed claim's evidence is refused like
+        // an unwritable row. Unseal writes the original body back and keeps
+        // the original digest, so a PUT here would leave plaintext over a seal
+        // and, after unseal, a digest that is not BLAKE3(raw_content).
         let sql = viewer.splice_write(
-            "UPDATE evidence AS e SET raw_content = $2 \
+            "UPDATE evidence AS e SET raw_content = $2, content_hash = $3 \
              WHERE e.id = $1 \
+               AND e.raw_content IS DISTINCT FROM $4 \
                /* {WRITABLE:e} */",
-            3,
+            5,
         );
         let uuid: Uuid = id.into();
-        let mut q = sqlx::query(&sql).bind(uuid).bind(raw_content);
+        let content_hash = blake3::hash(raw_content.as_bytes());
+        let mut q = sqlx::query(&sql)
+            .bind(uuid)
+            .bind(raw_content)
+            .bind(content_hash.as_bytes().as_slice())
+            .bind(crate::repos::privatization::SEAL_EVIDENCE_SENTINEL);
         // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "` and
-        // the statement therefore has no `$3` to fill. Binding unconditionally
+        // the statement therefore has no `$5` to fill. Binding unconditionally
         // would over-supply the maintenance path by one parameter.
         if let Some(w) = viewer.writable_bind() {
             q = q.bind(w);
