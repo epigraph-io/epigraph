@@ -490,3 +490,87 @@ async fn undedup_of_a_legacy_mark_is_refused_with_the_reason_until_backfilled() 
     assert_eq!(b["cascade"]["touched"]["legacy_mark"], true, "{b}");
     assert_eq!(dup_state(&pool, pending).await, (None, true));
 }
+
+async fn supersede(pool: &sqlx::PgPool, old: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+        &mut conn,
+        epigraph_core::ClaimId::from_uuid(old),
+        &format!("revised {old} {}", Uuid::new_v4()),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, replacement)
+        .await
+        .expect("edge migration");
+    replacement
+}
+
+/// A canonical replaced TWICE since the mark (C superseded by N1, N1 by N2):
+/// the route follows the whole chain to the current canonical N2 (operator
+/// ruling R-11), not one step to the retired N1, and the dup's edge, carried on
+/// to N2 by both migrations, comes back from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn undedup_follows_a_chain_of_replacements_to_the_current_canonical() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
+    let tag = Uuid::new_v4();
+    let canonical = common::seed_claim(&pool, &format!("r11 chain canonical {tag}")).await;
+    let dup =
+        common::seed_claim_with_agent(&pool, &format!("r11 chain duplicate {tag}"), client_id)
+            .await;
+    let supporter = common::seed_claim(&pool, &format!("r11 chain supporter {tag}")).await;
+    let e = edge(&pool, supporter, dup).await;
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/dedup"),
+        &token,
+        serde_json::json!({"canonical_id": canonical}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let n1 = supersede(&pool, canonical).await;
+    let n2 = supersede(&pool, n1).await;
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(target, n2, "calibration: the edge rode both supersessions");
+
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/undedup"),
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(
+        b["current_canonical_id"],
+        serde_json::json!(n2),
+        "restored against the current canonical, two replacements on: {b}"
+    );
+    assert_eq!(b["cascade"]["touched"]["drifted"], 0, "{b}");
+    assert_eq!(dup_state(&pool, dup).await, (None, true));
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(
+        target, dup,
+        "the edge is back on the duplicate, taken from N2"
+    );
+}
