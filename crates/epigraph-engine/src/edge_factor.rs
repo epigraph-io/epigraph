@@ -555,7 +555,16 @@ where
         MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
             .await
             .map_err(|e| format!("get_for_claim_frame: {e}"))?;
-    compute_combined_belief_over(conn, viewer, claim_id, frame_id, &frame, adjust(stored)).await
+    compute_combined_belief_over(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+        adjust(stored),
+    )
+    .await
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
@@ -1012,17 +1021,28 @@ async fn compute_combined_belief(
         MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
             .await
             .map_err(|e| format!("get_for_claim_frame: {e}"))?;
-    compute_combined_belief_over(conn, viewer, claim_id, frame_id, frame, all_rows).await
+    compute_combined_belief_over(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        frame_overrides,
+        all_rows,
+    )
+    .await
 }
 
 /// [`compute_combined_belief`] over the given rows of (claim, frame) instead
-/// of the stored ones. `None` when `all_rows` is empty.
+/// of the stored ones, under the same frame tier (`frame_overrides`). `None`
+/// when `all_rows` is empty.
 async fn compute_combined_belief_over(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
     all_rows: Vec<MassFunctionRow>,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
     if all_rows.is_empty() {
