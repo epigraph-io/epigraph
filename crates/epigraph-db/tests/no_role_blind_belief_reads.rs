@@ -23,9 +23,12 @@
 //!   `.pignistic_prob` access in a unit that names a **claim row type** or
 //!   calls one of its producers. The claim row types are DERIVED, not listed:
 //!   a struct in `crates/epigraph-db/src` with one of those fields that some
-//!   `epigraph-db` fn returns ([`ROW_TYPES`] pins the derived set). Files
-//!   whose path names `belief_view` are the sanctioned home of these reads
-//!   and are not scanned for them.
+//!   `epigraph-db` fn returns, that fn not itself dispatching on role
+//!   ([`ROW_TYPES`] pins the derived set). A struct only role-dispatched fns
+//!   return (such as the non-compound `AtomCache`, whose one producer splices
+//!   the compound predicate) holds rows the role already filtered, so its
+//!   field reads are not role-blind. Files whose path names `belief_view`
+//!   are the sanctioned home of these reads and are not scanned for them.
 //!
 //! # Classified, registered, or a finding
 //!
@@ -43,7 +46,9 @@
 //!
 //! # Known limits, stated so a green run is not read as more
 //!
-//! * A role marker classifies the whole unit, not each statement in it.
+//! * A role marker classifies the whole unit, not each statement in it, and
+//!   a producer's marker takes its row type out of the claim row types,
+//!   whichever way the predicate filters (the marker is not parsed).
 //! * SQL kept in a `const` is classified by the `const`, which cannot carry
 //!   a role marker (the predicate needs `render`); move the role splice to
 //!   the fn that builds the statement and the `const` stays registered.
@@ -302,7 +307,9 @@ fn sql_kinds(sql: &str) -> BTreeSet<String> {
 
 /// The claim row types and their producers, derived from the
 /// `crates/epigraph-db/src` sources in `rust`: `(row types, producers)`,
-/// a producer being `(impl type, fn name)`.
+/// a producer being `(impl type, fn name)`. A fn whose code names a role
+/// marker is role-dispatched and produces no claim row type: a struct only
+/// such fns return is not one.
 fn claim_row_types(rust: &[Source]) -> (BTreeSet<String>, BTreeSet<(Option<String>, String)>) {
     let mut candidates = BTreeSet::new();
     let mut fns_by_file = Vec::new();
@@ -344,6 +351,10 @@ fn claim_row_types(rust: &[Source]) -> (BTreeSet<String>, BTreeSet<(Option<Strin
     let mut producers = BTreeSet::new();
     for (code, fns) in &fns_by_file {
         for f in fns {
+            let text = f.text(code);
+            if ROLE_MARKERS.iter().any(|m| text.contains(m)) {
+                continue;
+            }
             let ret = f.return_type(code);
             for t in &candidates {
                 if has_word(ret, t) {
@@ -731,6 +742,45 @@ fn the_claim_row_types_are_the_derived_set() {
             "semantic_search_flat".to_string()
         )),
         "semantic_search_flat must be a producer of a claim row type"
+    );
+}
+
+/// A struct only role-dispatched fns return is not a claim row type, so
+/// reading its fields is not a finding; one unmarked producer of it makes it
+/// a row type again, and its readers findings. `AtomCache` is that struct
+/// today: its one producer, `atom_cache_batch`, splices the compound
+/// predicate, and the compound derivation reads its fields.
+#[test]
+fn a_row_type_is_role_blind_once_one_producer_is_unmarked() {
+    let rust = rust_sources();
+    let scripts = script_sources();
+    let reader = (
+        "crates/epigraph-engine/src/compound_belief.rs".to_string(),
+        "legacy_item".to_string(),
+    );
+    let (types, _) = claim_row_types(&rust);
+    assert!(!types.contains("AtomCache"), "{types:?}");
+    assert!(
+        !measure(&rust, &scripts).contains_key(&reader),
+        "a field read on rows a role-dispatched producer returns is not role-blind"
+    );
+
+    let path = "crates/epigraph-db/src/repos/scratch_atom_cache.rs";
+    let src = r#"
+use super::compound_valuation::AtomCache;
+pub async fn every_cache(pool: &sqlx::PgPool) -> Vec<AtomCache> {
+    let _ = sqlx::query("SELECT c.belief, c.plausibility FROM claims c").fetch_all(pool).await;
+    Vec::new()
+}
+"#;
+    let rust = with_scratch(&rust, path, src);
+    let (types, _) = claim_row_types(&rust);
+    assert!(types.contains("AtomCache"), "{types:?}");
+    let f = findings(&measure(&rust, &scripts));
+    assert!(
+        f.iter()
+            .any(|l| l.contains("compound_belief.rs::legacy_item")),
+        "with an unmarked producer, legacy_item's AtomCache field reads are role-blind; got {f:#?}"
     );
 }
 
