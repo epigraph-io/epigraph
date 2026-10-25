@@ -390,9 +390,11 @@ pub(crate) struct UnmarkGate {
     /// The canonical, then each claim that replaced it since, ending with the
     /// current one the duplicate is restored against (operator ruling R-11);
     /// the caller's authority was checked over every one of them. `Err` with
-    /// the reason when there is no current canonical (one of the chain is
-    /// itself a marked duplicate, or was deprecated): the un-mark refuses
-    /// then, and a batch that un-marks that claim first may still proceed.
+    /// the reason when the duplicate has no dedup identity edge (reported
+    /// first, as the act does: R-7), or there is no current canonical (one of
+    /// the chain is itself a marked duplicate, or was deprecated): the un-mark
+    /// refuses then, and a batch that un-marks that claim first may still
+    /// proceed.
     pub chain: Result<Vec<uuid::Uuid>, String>,
     author: uuid::Uuid,
     content: String,
@@ -444,7 +446,7 @@ pub(crate) async fn unmark_gate(
         // A canonical superseded or consolidated since is followed to its
         // current replacement, and the reversal acts on every claim of that
         // chain, so the caller's authority is checked over each below.
-        let chain = ClaimRepository::canonical_chain_conn(&mut tx, viewer, canonical)
+        let chain = ClaimRepository::unmark_chain_conn(&mut tx, viewer, dup, canonical)
             .await
             .map_err(internal_error)?;
         (

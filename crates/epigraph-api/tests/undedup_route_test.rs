@@ -351,3 +351,142 @@ async fn undedup_follows_a_superseded_canonical_to_its_replacement() {
         .expect("edge");
     assert_eq!(target, dup, "the edge is back on the duplicate");
 }
+
+/// Retire `dup` onto `canonical` exactly as the legacy raw-SQL
+/// `fuzzy_dedup_claims` did before 2026-10: no identity edge.
+async fn legacy_mark(pool: &sqlx::PgPool, dup: Uuid, canonical: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(pool)
+    .await
+    .expect("legacy raw-SQL mark");
+}
+
+async fn undedup_rows_for(pool: &sqlx::PgPool, dup: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE details->>'cause' = 'undedup' AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(dup.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("count undedup rows")
+}
+
+/// Operator ruling R-7 over HTTP, in ONE test because the backfill is
+/// corpus-wide on this shared database: a legacy `fuzzy_dedup_claims` mark
+/// without its identity edge is refused with 409 carrying the specific reason
+/// and nothing written (one the backfill can still reconstruct names
+/// `backfill_dedup_identity_edges --apply`, even when its canonical is itself
+/// retired since; one it cannot says why), and once the backfill has written
+/// the edge the same route un-marks it (200, `legacy_mark`).
+#[tokio::test(flavor = "multi_thread")]
+async fn undedup_of_a_legacy_mark_is_refused_with_the_reason_until_backfilled() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
+    let tag = Uuid::new_v4();
+    let canonical = common::seed_claim(&pool, &format!("r7 http canonical {tag}")).await;
+    let pending = common::seed_claim(&pool, &format!("r7 http pending {tag}")).await;
+    legacy_mark(&pool, pending, canonical).await;
+    let retired = common::seed_claim(&pool, &format!("r7 http retired canonical {tag}")).await;
+    let over_retired = common::seed_claim(&pool, &format!("r7 http over retired {tag}")).await;
+    legacy_mark(&pool, over_retired, retired).await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(retired)
+    .execute(&pool)
+    .await
+    .expect("retire the second canonical with no replacement");
+    let unlabelled = common::seed_claim(&pool, &format!("r7 http unlabelled {tag}")).await;
+    legacy_mark(&pool, unlabelled, canonical).await;
+    sqlx::query("UPDATE claims SET labels = array_remove(labels, 'deduped') WHERE id = $1")
+        .bind(unlabelled)
+        .execute(&pool)
+        .await
+        .expect("drop the label");
+
+    let undedup = |dup: Uuid| {
+        let token = token.clone();
+        async move {
+            post(
+                &addr,
+                format!("/api/v1/claims/{dup}/undedup"),
+                &token,
+                serde_json::json!({}),
+            )
+            .await
+        }
+    };
+    for (dup, canon) in [(pending, canonical), (over_retired, retired)] {
+        let (status, b) = undedup(dup).await;
+        assert_eq!(status, 409, "{b}");
+        let text = b.to_string();
+        assert!(
+            text.contains("legacy fuzzy_dedup_claims mark")
+                && text.contains("backfill_dedup_identity_edges --apply")
+                && text.contains("not been reconstructed")
+                && !text.contains("no replacement"),
+            "a reconstructable legacy mark names the backfill, before anything about its \
+             canonical: {b}"
+        );
+        assert_eq!(dup_state(&pool, dup).await, (Some(canon), false));
+        assert_eq!(undedup_rows_for(&pool, dup).await, 0, "nothing recorded");
+    }
+    let (status, b) = undedup(unlabelled).await;
+    assert_eq!(status, 409, "{b}");
+    let text = b.to_string();
+    assert!(
+        text.contains("cannot reconstruct") && text.contains("`deduped` label"),
+        "an unreconstructable legacy mark says why: {b}"
+    );
+    assert_eq!(dup_state(&pool, unlabelled).await, (Some(canonical), false));
+    assert_eq!(undedup_rows_for(&pool, unlabelled).await, 0);
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let backfilled =
+        epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, true)
+            .await
+            .expect("backfill");
+    drop(conn);
+    assert!(
+        backfilled
+            .duplicates
+            .iter()
+            .any(|d| d.duplicate == pending && d.identity_edge.is_some()),
+        "calibration: the backfill gave the pending mark its edge: {backfilled:?}"
+    );
+    assert!(
+        !backfilled
+            .duplicates
+            .iter()
+            .any(|d| d.duplicate == unlabelled),
+        "calibration: the backfill cannot reach the unlabelled mark"
+    );
+
+    let (status, b) = undedup(pending).await;
+    assert_eq!(status, 200, "a backfilled legacy mark is un-markable: {b}");
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(b["cascade"]["touched"]["legacy_mark"], true, "{b}");
+    assert_eq!(dup_state(&pool, pending).await, (None, true));
+}

@@ -975,15 +975,15 @@ pub async fn unmark_duplicate(
         // A canonical superseded or consolidated since is followed to its
         // current replacement, and the reversal acts on every claim of that
         // chain (operator ruling R-11), so the caller's authority is checked
-        // over each of them below as over the canonical.
-        let chain = ClaimRepository::canonical_chain_conn(&mut read, &viewer, canonical_id)
+        // over each of them below as over the canonical. A mark with no
+        // identity edge is refused first, with its reason (R-7); either
+        // refusal is answered only after the caller's authority over the
+        // duplicate and the canonical is checked.
+        let chain = ClaimRepository::unmark_chain_conn(&mut read, &viewer, dup_id, canonical_id)
             .await
-            .map_err(db)?
-            .map_err(|why| ApiError::Conflict {
-                reason: format!("claim {dup_id} {why}; nothing was written"),
-            })?;
+            .map_err(db)?;
         let mut replacement_targets = Vec::new();
-        for id in chain.iter().skip(1) {
+        for id in chain.iter().flatten().skip(1) {
             let target = ClaimRepository::write_target_of(&mut *read, &viewer, *id)
                 .await
                 .map_err(db)?
@@ -1021,6 +1021,9 @@ pub async fn unmark_duplicate(
         canonical_id,
         "un-mark a duplicate of",
     )?;
+    let chain = chain.map_err(|why| ApiError::Conflict {
+        reason: format!("claim {dup_id} {why}; nothing was written"),
+    })?;
     for (id, (author, owner_group)) in &replacement_targets {
         crate::middleware::scopes::require_claim_act_authority(
             &auth,

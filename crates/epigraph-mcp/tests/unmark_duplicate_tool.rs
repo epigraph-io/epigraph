@@ -681,3 +681,106 @@ async fn unmarking_onto_a_merged_canonical_needs_authority_over_the_merged_claim
         "nothing was written"
     );
 }
+
+/// Retire `dup` onto `canonical` exactly as the legacy raw-SQL
+/// `fuzzy_dedup_claims` did before 2026-10: no identity edge.
+async fn legacy_mark(pool: &PgPool, dup: Uuid, canonical: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(pool)
+    .await
+    .expect("legacy raw-SQL mark");
+}
+
+/// The tool's refusal of a legacy `fuzzy_dedup_claims` mark WITHOUT its
+/// identity edge carries the specific reason to the caller (operator ruling
+/// R-7): one the backfill can still reconstruct names
+/// `backfill_dedup_identity_edges --apply` (also when its canonical is itself
+/// retired since: the missing edge is reported first), and one it cannot says
+/// why. Nothing is written and no audit row is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unbackfilled_legacy_mark_is_refused_with_its_reason(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let canonical = seed_claim(&pool, "r7 legacy canonical", 0.5).await;
+    let pending = seed_claim(&pool, "r7 legacy, not yet backfilled", 0.5).await;
+    legacy_mark(&pool, pending, canonical).await;
+    let retired = seed_claim(&pool, "r7 legacy canonical retired since", 0.5).await;
+    let over_retired = seed_claim(&pool, "r7 legacy mark over it", 0.5).await;
+    legacy_mark(&pool, over_retired, retired).await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(retired)
+    .execute(&pool)
+    .await
+    .expect("retire the second canonical with no replacement");
+    let unlabelled = seed_claim(&pool, "r7 legacy, label removed since", 0.5).await;
+    legacy_mark(&pool, unlabelled, canonical).await;
+    sqlx::query("UPDATE claims SET labels = array_remove(labels, 'deduped') WHERE id = $1")
+        .bind(unlabelled)
+        .execute(&pool)
+        .await
+        .expect("drop the label");
+    let (auth, viewer) = common::granted_server_admin(&server, &pool).await;
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM security_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+
+    let refuse = |dup: Uuid| {
+        let (server, viewer, auth) = (&server, &viewer, &auth);
+        async move {
+            unmark_duplicate(
+                server,
+                viewer,
+                UnmarkDuplicateParams {
+                    claim_id: dup.to_string(),
+                },
+                Some(auth),
+            )
+            .await
+            .expect_err("no identity edge: refused")
+            .message
+            .to_string()
+        }
+    };
+    for (dup, canon) in [(pending, canonical), (over_retired, retired)] {
+        let m = refuse(dup).await;
+        assert!(
+            m.contains("legacy fuzzy_dedup_claims mark")
+                && m.contains("backfill_dedup_identity_edges --apply")
+                && m.contains("not been reconstructed")
+                && !m.contains("no replacement"),
+            "a reconstructable legacy mark names the backfill, before anything about its \
+             canonical: {m}"
+        );
+        assert_eq!(state(&pool, dup).await, (Some(canon), false, 0));
+    }
+    let m = refuse(unlabelled).await;
+    assert!(
+        m.contains("cannot reconstruct") && m.contains("`deduped` label"),
+        "an unreconstructable legacy mark says why: {m}"
+    );
+    assert_eq!(state(&pool, unlabelled).await, (Some(canonical), false, 0));
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM security_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(events_after, events_before, "no audit row either");
+}

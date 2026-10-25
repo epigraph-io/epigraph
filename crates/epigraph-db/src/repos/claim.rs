@@ -678,7 +678,7 @@ pub struct UnmarkedDuplicate {
     /// That canonical, then each claim that replaced it in turn (supersession
     /// or consolidation), ending with the CURRENT canonical the duplicate is
     /// restored against (operator ruling R-11); `[canonical]` when the
-    /// canonical is still current ([`ClaimRepository::canonical_chain_conn`]).
+    /// canonical is still current ([`ClaimRepository::unmark_chain_conn`]).
     pub chain: Vec<Uuid>,
     /// The identity edge the act retracted.
     pub identity_edge: Uuid,
@@ -1026,7 +1026,7 @@ async fn require_privileged_session(
 /// later superseded (or consolidated) therefore keeps its edge to the retired
 /// canonical, and stays marked: its un-mark follows the supersession (or
 /// merge) to the current canonical and restores the duplicate against that one
-/// (operator ruling R-11, [`ClaimRepository::canonical_chain_conn`]).
+/// (operator ruling R-11, [`ClaimRepository::unmark_chain_conn`]).
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -8386,7 +8386,7 @@ impl ClaimRepository {
     /// reconstruct it or why it cannot.
     ///
     /// A canonical superseded or consolidated since the mark is followed to
-    /// its current replacement ([`Self::canonical_chain_conn`]), and the
+    /// its current replacement ([`Self::unmark_chain_conn`]), and the
     /// reversal restores the duplicate against that one; a canonical that
     /// was itself marked a duplicate is refused (un-mark it first).
     ///
@@ -8454,21 +8454,21 @@ impl ClaimRepository {
             q = q.bind(g);
         }
         let identity_edge = q.fetch_optional(&mut *tx).await?;
+        // No identity edge is refused FIRST, with its reason (a legacy mark
+        // says whether the backfill can still write it, operator ruling R-7),
+        // before anything about the canonical: the missing edge is what blocks
+        // this un-mark whatever became of the canonical since.
+        let Some((identity_edge, legacy_backfill)) = identity_edge else {
+            return Err(not_marked(
+                &no_identity_edge_refusal(&mut tx, viewer, dup_uuid).await?,
+            ));
+        };
         // A canonical superseded or consolidated since is followed to its
         // current replacement (operator ruling R-11); one that was itself
         // marked a duplicate is refused (un-mark it first).
         let chain = match canonical_chain(&mut tx, viewer, canonical).await? {
             Ok(chain) => chain,
             Err(why) => return Err(not_marked(&why)),
-        };
-        let Some((identity_edge, legacy_backfill)) = identity_edge else {
-            if let Some(why) = legacy_mark_refusal(&mut tx, viewer, dup_uuid).await? {
-                return Err(not_marked(&why));
-            }
-            return Err(not_marked(
-                "has no dedup identity edge to the claim it supersedes (it was retired by \
-                 another act, or marked before identity edges were recorded)",
-            ));
         };
         // Both writes carry the write predicate: on an application session the
         // viewer's writable groups, on the maintenance session (a bypass
@@ -8506,22 +8506,48 @@ impl ClaimRepository {
         })
     }
 
-    /// The canonical a duplicate of `canonical` is restored against, read
-    /// through `viewer`: `Ok` with `canonical`, then each claim that replaced
-    /// it in turn (supersession or consolidation), ending with the current
-    /// one (`[canonical]` when it is current); `Err` with the reason there is
-    /// none (a claim of the chain was itself marked a duplicate, was
-    /// deprecated, or has two replacements). The un-mark's act resolves it
-    /// (operator ruling R-11), and the request paths resolve it first to
-    /// check the caller's authority over every claim the reversal acts on.
+    /// What an un-mark of `dup`, marked a duplicate of `canonical`, restores
+    /// it against, read through `viewer`, with the act's refusals in the
+    /// act's order: `Err` with the reason when `dup` has no in-force dedup
+    /// identity edge to `canonical` (a legacy `fuzzy_dedup_claims` mark says
+    /// whether the backfill can still write it, operator ruling R-7), then
+    /// the canonical chain's verdict: `Ok` with `canonical`, then each claim
+    /// that replaced it in turn (supersession or consolidation), ending with
+    /// the current one (`[canonical]` when it is current), or `Err` with the
+    /// reason there is none (a claim of the chain was itself marked a
+    /// duplicate, was deprecated, or has two replacements; operator ruling
+    /// R-11). The request paths resolve it before the act, to check the
+    /// caller's authority over every claim the reversal acts on, so they
+    /// refuse with the act's own reason.
     ///
     /// # Errors
     /// `DbError::QueryFailed` on a failed query.
-    pub async fn canonical_chain_conn(
+    pub async fn unmark_chain_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
+        dup: Uuid,
         canonical: Uuid,
     ) -> Result<Result<Vec<Uuid>, String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT 1",
+            5,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(dup)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *conn).await?.is_none() {
+            return Ok(Err(no_identity_edge_refusal(conn, viewer, dup).await?));
+        }
         canonical_chain(conn, viewer, canonical).await
     }
 
@@ -11448,6 +11474,24 @@ async fn canonical_chain(
             }
         }
     }
+}
+
+/// Why the un-mark refuses `dup`, retired with no in-force dedup identity edge
+/// to the claim it supersedes: [`legacy_mark_refusal`]'s reason for a legacy
+/// `fuzzy_dedup_claims` mark, otherwise that it was retired by another act.
+async fn no_identity_edge_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<String, DbError> {
+    if let Some(why) = legacy_mark_refusal(conn, viewer, dup).await? {
+        return Ok(why);
+    }
+    Ok(
+        "has no dedup identity edge to the claim it supersedes (it was retired by another \
+        act, or marked before identity edges were recorded)"
+            .to_string(),
+    )
 }
 
 /// Why the un-mark refuses `dup`, retired with no dedup identity edge, when it

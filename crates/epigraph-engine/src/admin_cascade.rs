@@ -919,7 +919,7 @@ pub async fn apply_unmark(
 
 /// [`apply_unmark`] for a request path that checked the caller's authority
 /// over every claim of the canonical's chain
-/// ([`ClaimRepository::canonical_chain_conn`], read on the caller's own
+/// ([`ClaimRepository::unmark_chain_conn`], read on the caller's own
 /// transaction): `authorized_chain` is that chain, and an act that resolves
 /// any other (the canonical was replaced again since) is refused as
 /// [`UnmarkRefusal::Act`], as a different canonical is.
