@@ -312,6 +312,29 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?
     .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
+    // Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis goes
+    // to the frame its readers read, `research_validity` (writers follow the
+    // readers, operator ruling R-8; `POST /frames/:id/evidence` does the same).
+    // The target has the named frame's hypothesis count (refused otherwise), so
+    // the masses parsed above address it unchanged.
+    let named_frame = frame_id;
+    let frame_id = match epigraph_engine::promotion::promoted_hypothesis_evidence_frame(
+        &mut tx, viewer, claim_id, frame_id,
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        Some(target) => {
+            warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
+                claim_id,
+                named_frame,
+                target.id,
+            ));
+            target.id
+        }
+        None => frame_id,
+    };
+
     // Migration 114: on a public claim this caller does not own, the BBA is the
     // caller's own row, but the claim's frame assignment and its cached belief
     // stay the owner's. Say so in the response rather than let a kept
