@@ -922,6 +922,18 @@ pub const SEAL_DELETE_TABLES: &[&str] = &[
     "experiment_triples",
 ];
 
+/// The [`SEAL_DELETE_TABLES`] whose WRITER-OWNED rows a seal KEEPS.
+///
+/// Operator ruling R-5 (2026-10-25): an OUTSIDER's challenge (migration 168,
+/// `challenges.writer_owned = true`) is not a derived extraction of the
+/// claim's plaintext but the outsider's own objection, owned by the
+/// outsider's group, so sealing the claim keeps it rather than deleting it.
+/// It stays hidden from every session that cannot read the claim by 168's
+/// `challenges_claim_readable` policy (and the repo's in-query claim
+/// predicate). An insider's (inherited) challenge is still deleted, so
+/// `challenges` stays in [`SEAL_DELETE_TABLES`].
+pub const SEAL_KEEPS_WRITER_OWNED: &[&str] = &["challenges"];
+
 /// One claim's plaintext trusted computing base, as the seal manifest serves it.
 ///
 /// This is the only shape in the system that carries plaintext the requesting
@@ -3204,7 +3216,8 @@ impl PrivatizationRepository {
     ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
     ///    this table omits and the applied schema requires.
     /// 7. The derived-extraction DELETEs, over
-    ///    [`SEAL_DELETE_TABLES`].
+    ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
+    ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
     /// 8. `harvester_fragments`, through the provenance join. Not recoverable
     ///    on unseal, which the preview states.
     ///
@@ -3377,10 +3390,16 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 7. The derived extractions. Deleted, not encrypted.
+        // 7. The derived extractions. Deleted, not encrypted. EXCEPT an
+        //    outsider's challenge (ruling R-5): see [`SEAL_KEEPS_WRITER_OWNED`].
         for table in SEAL_DELETE_TABLES {
+            let keep = if SEAL_KEEPS_WRITER_OWNED.contains(table) {
+                " AND NOT writer_owned"
+            } else {
+                ""
+            };
             sqlx::query(&format!(
-                "DELETE FROM public.{table} WHERE claim_id = ANY($1)"
+                "DELETE FROM public.{table} WHERE claim_id = ANY($1){keep}"
             ))
             .bind(&sealed)
             .execute(&mut *conn)

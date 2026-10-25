@@ -345,6 +345,11 @@ pub struct SideEffects {
 /// `epigraph-api/tests/privatization_seal.rs::the_preview_names_exactly_the_tables_the_seal_deletes`.
 /// Drift here is a preview that under-reports what a seal destroys, which is
 /// consent the operator did not give.
+///
+/// `challenges` names the INSIDER (claim-inherited) challenges: an outsider's
+/// challenge is kept by the seal (ruling R-5, the repo layer's
+/// `SEAL_KEEPS_WRITER_OWNED`), so for that table the list over-reports, never
+/// under-reports.
 pub const SEAL_DESTROYS: &[&str] = &[
     "triples",
     "entity_mentions",

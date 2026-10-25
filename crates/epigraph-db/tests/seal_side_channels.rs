@@ -1545,6 +1545,161 @@ async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(po
     );
 }
 
+/// Stamp `conn` for `agent` exactly as `ScopedPool::begin_as` would.
+async fn stamp_as(conn: &mut sqlx::PgConnection, pool: &PgPool, agent: Uuid) {
+    let v = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve viewer");
+    let csv = |ids: &[Uuid]| {
+        ids.iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(groups)
+    .bind(writable)
+    .bind(agent.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp session gucs");
+}
+
+/// Operator ruling R-5: sealing a claim KEEPS an outsider-owned challenge
+/// (`writer_owned`, migration 168) instead of deleting it, and deletes an
+/// insider's (inherited) challenge as before.
+///
+/// The flow is the real one: the claim starts PUBLIC in the seal target's
+/// group, an outsider challenges it as the non-bypassing application role
+/// (168's attach rule makes the row the outsider's), an insider challenge
+/// inherits the claim's tenancy, the claim is RESTRICTED (081 refuses to seal
+/// a public claim), then sealed. The outsider's row is byte-identical after
+/// the seal, the insider's is gone, and the kept row stays hidden from every
+/// non-reader of the claim by 168's `challenges_claim_readable` (the stranger
+/// and the outsider itself read nothing; a member of the claim's group, the
+/// positive control, reads it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_keeps_an_outsiders_challenge_and_deletes_an_insiders(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let (outsider, outsider_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "seal-outsider").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-stranger").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a public finding, later sealed', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(world.author)
+    .bind(world.group)
+    .execute(&pool)
+    .await
+    .expect("seed a public claim in the seal target's group");
+
+    let p = pool.clone();
+    let theirs: Uuid = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, outsider).await;
+        let id = epigraph_db::ChallengeRepository::create(
+            &mut *conn,
+            claim,
+            Some(outsider),
+            "factual_error",
+            "the outsider's own objection",
+        )
+        .await;
+        (conn, id)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    let insiders: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'factual_error', 'an insider objection', 'pending') RETURNING id",
+    )
+    .bind(claim)
+    .bind(world.author)
+    .fetch_one(&pool)
+    .await
+    .expect("an insider's challenge inherits the claim's tenancy");
+
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("restrict the claim before sealing it");
+
+    let row = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT to_jsonb(ch) FROM challenges ch WHERE ch.id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .expect("read a challenge")
+        }
+    };
+    // CALIBRATION, BEFORE THE SEAL: both rows exist, the outsider's is
+    // writer-owned and public, the insider's followed the claim.
+    let before = row(theirs).await.expect("the outsider's row exists");
+    assert_eq!(before["writer_owned"], true);
+    assert_eq!(before["owner_group_id"], outsider_group.to_string());
+    assert_eq!(before["visibility"], "public");
+    let insider_before = row(insiders).await.expect("the insider's row exists");
+    assert_eq!(insider_before["writer_owned"], false);
+    assert_eq!(insider_before["owner_group_id"], world.group.to_string());
+
+    let payload = seal_payload(&pool, claim).await;
+    let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+    assert_eq!(sealed, vec![claim], "CALIBRATION: the claim was sealed");
+
+    assert_eq!(
+        row(theirs).await,
+        Some(before),
+        "the seal must KEEP the outsider's challenge, unchanged (R-5)"
+    );
+    assert_eq!(
+        row(insiders).await,
+        None,
+        "the insider's inherited challenge is deleted as before"
+    );
+
+    let p = pool.clone();
+    let author = world.author;
+    let seen = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let mut out = Vec::new();
+        for (who, agent) in [
+            ("stranger", stranger),
+            ("outsider", outsider),
+            ("claim group member", author),
+        ] {
+            stamp_as(&mut conn, &p, agent).await;
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM challenges WHERE id = $1")
+                .bind(theirs)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read the kept challenge");
+            out.push((who, n));
+        }
+        (conn, out)
+    })
+    .await;
+    assert_eq!(
+        seen,
+        vec![("stranger", 0), ("outsider", 0), ("claim group member", 1)],
+        "the kept row is read only with the sealed claim"
+    );
+}
+
 #[test]
 fn the_fixture_seeds_exactly_the_tables_the_seal_deletes() {
     assert_eq!(
