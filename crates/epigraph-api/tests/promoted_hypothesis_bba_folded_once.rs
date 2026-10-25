@@ -522,8 +522,21 @@ async fn evidence_analyzed_after_promotion_lands_on_research_validity(
         "CALIBRATION: the promotion left nothing on hypothesis_assessment"
     );
 
+    // The promoted hypothesis's READER, before and after: what the writers
+    // follow is what `GET /hypothesis/:id/status` reads.
+    let before = status_of(r.addr, agent, r.claim).await;
+
     // A later analysis, by another member, refuting the hypothesis.
     analyze_new_result(&pool, r.addr, later, r.claim, "refutes").await;
+
+    let after = status_of(r.addr, agent, r.claim).await;
+    assert_eq!(after["status"], "promoted", "CALIBRATION: {after}");
+    assert!(
+        after["belief"]["unsupported"].as_f64() > before["belief"]["unsupported"].as_f64()
+            && after["belief"]["supported"].as_f64() < before["belief"]["supported"].as_f64(),
+        "the promoted hypothesis's status reads the later, refuting analysis: \
+         before {before}, after {after}"
+    );
 
     assert!(
         rows(&pool, r.claim, r.hyp_frame).await.is_empty(),
