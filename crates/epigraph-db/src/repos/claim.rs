@@ -671,12 +671,31 @@ impl DedupReversal {
 }
 
 /// A marked duplicate an un-mark's act restored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmarkedDuplicate {
     /// The canonical it had been marked a duplicate of.
     pub canonical: Uuid,
+    /// That canonical, then each claim that replaced it in turn (supersession
+    /// or consolidation), ending with the CURRENT canonical the duplicate is
+    /// restored against (operator ruling R-11); `[canonical]` when the
+    /// canonical is still current ([`ClaimRepository::unmark_chain_conn`]).
+    pub chain: Vec<Uuid>,
     /// The identity edge the act retracted.
     pub identity_edge: Uuid,
+    /// The identity edge is one the legacy backfill wrote
+    /// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]): a mark
+    /// the raw-SQL `fuzzy_dedup_claims` made, which kept no repair record.
+    /// Read from the edge's reserved `properties.dedup` (only the act and the
+    /// backfill write it), never from the claim's patchable properties.
+    pub legacy_backfill: bool,
+}
+
+impl UnmarkedDuplicate {
+    /// The current canonical: the last claim of [`Self::chain`].
+    #[must_use]
+    pub fn current_canonical(&self) -> Uuid {
+        self.chain.last().copied().unwrap_or(self.canonical)
+    }
 }
 
 /// The relationship of the identity edge a dedup's act writes,
@@ -711,6 +730,19 @@ pub const LEGACY_FUZZY_DEDUP_TOOL: &str = "fuzzy_dedup_claims";
 /// The `run_tag` of an identity edge the legacy backfill wrote
 /// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]).
 pub const LEGACY_IDENTITY_BACKFILL_RUN_TAG: &str = "legacy_identity_backfill";
+
+/// The legacy backfill's selection of a claim `c` whose `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]: what the legacy mark wrote is all still there
+/// (the `deduped` label, the claim retired, and its `supersedes` still the
+/// `deduped_into` the mark named), so its identity edge can be reconstructed.
+/// One fragment for the backfill and the un-mark's refusal
+/// ([`legacy_mark_refusal`]), so the two cannot disagree on which marks the
+/// backfill reaches.
+const LEGACY_MARK_RECONSTRUCTABLE_SQL: &str = "\
+    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])) \
+    AND NOT COALESCE(c.is_current, true) \
+    AND c.supersedes IS NOT NULL \
+    AND c.supersedes::text = c.properties->>'deduped_into'";
 
 /// One duplicate the legacy identity-edge backfill selected.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -992,8 +1024,9 @@ async fn require_privileged_session(
 /// it names the claim its duplicate's `supersedes` names, and the un-mark and
 /// the index view read it by that pointer. A duplicate of a canonical that is
 /// later superseded (or consolidated) therefore keeps its edge to the retired
-/// canonical, and stays marked: the un-mark refuses it while that canonical is
-/// retired, and the canonical, retired by another act, has no mark to undo.
+/// canonical, and stays marked: its un-mark follows the supersession (or
+/// merge) to the current canonical and restores the duplicate against that one
+/// (operator ruling R-11, [`ClaimRepository::unmark_chain_conn`]).
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -8243,9 +8276,12 @@ impl ClaimRepository {
     /// run's single transaction. Like the act's edge it is written after the
     /// retirement, so `edges_auto_factor` mints no factor for it.
     ///
-    /// It does NOT make the mark reversible: the legacy script kept no repair
-    /// record, so the administrative un-mark still refuses it
-    /// (`UnmarkRefusal::NoRecord`).
+    /// Once its edge is written the mark is an ordinary dedup record
+    /// (operator ruling R-7): the administrative un-mark makes the duplicate
+    /// current again and retracts the edge. The legacy script kept no repair
+    /// record, so that un-mark has nothing to put back (it reports
+    /// `legacy_mark`); a legacy mark this selection does not reach is refused
+    /// with the reason ([`ClaimRepository::unmark_duplicate_act_conn`]).
     ///
     /// # Errors
     /// `DbError::InvalidData` on a non-privileged session (the selection is
@@ -8262,14 +8298,11 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
-        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        let select_sql = format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; the selection is a corpus-wide maintenance backfill.
              SELECT c.id, c.supersedes FROM claims c
-              WHERE 'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[]))
-                AND c.properties->>'deduped_by' = $1
-                AND NOT COALESCE(c.is_current, true)
-                AND c.supersedes IS NOT NULL
-                AND c.supersedes::text = c.properties->>'deduped_into'
+              WHERE c.properties->>'deduped_by' = $1
+                AND {LEGACY_MARK_RECONSTRUCTABLE_SQL}
                 AND NOT EXISTS (
                     SELECT 1 FROM edges e
                      WHERE e.source_id = c.id AND e.source_type = 'claim'
@@ -8277,13 +8310,14 @@ impl ClaimRepository {
                        AND e.relationship = $2 AND e.valid_to IS NULL
                        AND e.properties ? $3)
               ORDER BY c.id
-              FOR UPDATE OF c"#,
-        )
-        .bind(LEGACY_FUZZY_DEDUP_TOOL)
-        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
-        .bind(DUPLICATE_IDENTITY_PROPERTY)
-        .fetch_all(&mut *tx)
-        .await?;
+              FOR UPDATE OF c"#
+        );
+        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(&select_sql)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .fetch_all(&mut *tx)
+            .await?;
         let mut out = LegacyIdentityBackfill {
             applied: apply,
             duplicates: selected
@@ -8349,10 +8383,18 @@ impl ClaimRepository {
     /// authority over both rows.
     ///
     /// Only a duplicate a dedup act marked can be un-marked: one with an
-    /// in-force identity edge to the claim its `supersedes` names. A claim
-    /// retired some other way (a consolidation source, a mark made before
-    /// identity edges existed) is refused, because there is no record of
-    /// which rows a reversal would have to put back.
+    /// in-force identity edge to the claim its `supersedes` names (a legacy
+    /// `fuzzy_dedup_claims` mark has one once the backfill wrote it, and is
+    /// then an ordinary record, `legacy_backfill`). A claim retired some other
+    /// way (a consolidation source, a supersession) is refused, because there
+    /// is no record of which rows a reversal would have to put back; so is a
+    /// legacy mark without its edge, saying whether the backfill can still
+    /// reconstruct it or why it cannot.
+    ///
+    /// A canonical superseded or consolidated since the mark is followed to
+    /// its current replacement ([`Self::unmark_chain_conn`]), and the
+    /// reversal restores the duplicate against that one; a canonical that
+    /// was itself marked a duplicate is refused (un-mark it first).
     ///
     /// The embeddings stay NULL: the caller re-embeds after commit
     /// (best-effort, as every write path does), or a backfill does.
@@ -8364,6 +8406,26 @@ impl ClaimRepository {
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         dup: ClaimId,
+    ) -> Result<UnmarkedDuplicate, DbError> {
+        Self::unmark_duplicate_act_authorized_conn(conn, viewer, dup, None).await
+    }
+
+    /// [`Self::unmark_duplicate_act_conn`] for a request path that checked the
+    /// caller's authority over every claim of the canonical's chain, read
+    /// through the CALLER ([`Self::unmark_chain_conn`]): `authorized_chain` is
+    /// that chain. An act whose own read (under `viewer`, on the request paths
+    /// the maintenance connection's bypass viewer) resolves any other chain,
+    /// or none, is refused with nothing written: the canonical was replaced
+    /// again since the caller was checked. That refusal names no claim of the
+    /// chain the act read, which the caller may not be able to read.
+    ///
+    /// # Errors
+    /// As [`Self::unmark_duplicate_act_conn`].
+    pub async fn unmark_duplicate_act_authorized_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: ClaimId,
+        authorized_chain: Option<&[Uuid]>,
     ) -> Result<UnmarkedDuplicate, DbError> {
         use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
@@ -8396,46 +8458,56 @@ impl ClaimRepository {
             _ => return Err(not_marked("is not a retired duplicate")),
         };
         let sql = viewer.splice(
-            "SELECT e.id FROM edges e \
+            "SELECT e.id, \
+                    COALESCE(e.properties->$4->>'tool' = $5 \
+                             AND e.properties->$4->>'run_tag' = $6, false) \
+               FROM edges e \
               WHERE e.source_id = $1 AND e.source_type = 'claim' \
                 AND e.target_id = $2 AND e.target_type = 'claim' \
                 AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
                 /* {EDGE_VISIBILITY:e} */ \
               ORDER BY e.created_at DESC, e.id DESC LIMIT 1 FOR UPDATE",
-            5,
+            7,
         );
-        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+        let mut q = sqlx::query_as::<_, (Uuid, bool)>(&sql)
             .bind(dup_uuid)
             .bind(canonical)
             .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
-            .bind(DUPLICATE_IDENTITY_PROPERTY);
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(LEGACY_IDENTITY_BACKFILL_RUN_TAG);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let identity_edge = q.fetch_optional(&mut *tx).await?;
-        let sql = viewer.splice(
-            "SELECT COALESCE(c.is_current, true) FROM claims c \
-              WHERE c.id = $1 /* {VISIBILITY:c} */",
-            2,
-        );
-        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(canonical);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let canonical_current = q.fetch_optional(&mut *tx).await?;
-        if canonical_current == Some(false) {
-            // A chain (this duplicate's canonical was itself marked, or
-            // retired): this mark's repaired rows have moved on from the
-            // canonical, so reversing it now would only report them drifted.
-            return Err(not_marked(&format!(
-                "supersedes {canonical}, which is itself retired; un-mark {canonical} first"
-            )));
-        }
-        let Some(identity_edge) = identity_edge else {
+        // No identity edge is refused FIRST, with its reason (a legacy mark
+        // says whether the backfill can still write it, operator ruling R-7),
+        // before anything about the canonical: the missing edge is what blocks
+        // this un-mark whatever became of the canonical since.
+        let Some((identity_edge, legacy_backfill)) = identity_edge else {
             return Err(not_marked(
-                "has no dedup identity edge to the claim it supersedes (it was retired by \
-                 another act, or marked before identity edges were recorded)",
+                &no_identity_edge_refusal(&mut tx, viewer, dup_uuid).await?,
             ));
+        };
+        // A canonical superseded or consolidated since is followed to its
+        // current replacement (operator ruling R-11); one that was itself
+        // marked a duplicate is refused (un-mark it first).
+        let chain = match (
+            canonical_chain(&mut tx, viewer, canonical, ChainLock::ForShare).await?,
+            authorized_chain,
+        ) {
+            (Ok(chain), None) => chain,
+            (Err(why), None) => return Err(not_marked(&why)),
+            (Ok(chain), Some(authorized)) if chain.as_slice() == authorized => chain,
+            // Said without the claims this read found: under the maintenance
+            // viewer they may include a replacement the caller cannot read.
+            (_, Some(_)) => {
+                return Err(not_marked(
+                    "has a canonical that was replaced again since the caller's authority was \
+                     checked (the chain the un-mark would follow is no longer the one checked); \
+                     retry the un-mark",
+                ))
+            }
         };
         // Both writes carry the write predicate: on an application session the
         // viewer's writable groups, on the maintenance session (a bypass
@@ -8467,8 +8539,55 @@ impl ClaimRepository {
         tx.commit().await?;
         Ok(UnmarkedDuplicate {
             canonical,
+            chain,
             identity_edge,
+            legacy_backfill,
         })
+    }
+
+    /// What an un-mark of `dup`, marked a duplicate of `canonical`, restores
+    /// it against, read through `viewer`, with the act's refusals in the
+    /// act's order: `Err` with the reason when `dup` has no in-force dedup
+    /// identity edge to `canonical` (a legacy `fuzzy_dedup_claims` mark says
+    /// whether the backfill can still write it, operator ruling R-7), then
+    /// the canonical chain's verdict: `Ok` with `canonical`, then each claim
+    /// that replaced it in turn (supersession or consolidation), ending with
+    /// the current one (`[canonical]` when it is current), or `Err` with the
+    /// reason there is none (a claim of the chain was itself marked a
+    /// duplicate, was deprecated, or has two replacements; operator ruling
+    /// R-11). The request paths resolve it before the act, to check the
+    /// caller's authority over every claim the reversal acts on, so they
+    /// refuse with the act's own reason.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn unmark_chain_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+        canonical: Uuid,
+    ) -> Result<Result<Vec<Uuid>, String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT 1",
+            5,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(dup)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *conn).await?.is_none() {
+            return Ok(Err(no_identity_edge_refusal(conn, viewer, dup).await?));
+        }
+        canonical_chain(conn, viewer, canonical, ChainLock::None).await
     }
 
     /// Whether THIS session may un-mark `dup` from `canonical`: a privileged
@@ -8524,7 +8643,10 @@ impl ClaimRepository {
         Self::session_may_unmark_conn(conn, dup, canonical).await
     }
 
-    /// Put back what a dedup repair did, from its [`DedupRevert`] record:
+    /// Put back what a dedup repair did, from its [`DedupRevert`] record, along
+    /// `canonical_chain` (the recorded canonical first, the current one last:
+    /// [`UnmarkedDuplicate::chain`]; a supersession or merge since the mark
+    /// carried some of the repaired rows on to a replacement and left others):
     /// re-source and re-target its edges onto `dup`, return its moved BBAs
     /// with their old tenancy, re-insert the BBAs it deleted, put its
     /// retracted edges back in force, and remove the frame bindings it added
@@ -8544,7 +8666,7 @@ impl ClaimRepository {
     pub async fn reverse_marked_duplicate_conn(
         conn: &mut sqlx::PgConnection,
         dup: ClaimId,
-        canonical: ClaimId,
+        canonical_chain: &[Uuid],
         record: &DedupRevert,
     ) -> Result<DedupReversal, DbError> {
         use sqlx::Acquire;
@@ -8554,7 +8676,7 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
-        let out = reverse_marked_duplicate(&mut tx, dup.into(), canonical.into(), record).await?;
+        let out = reverse_marked_duplicate(&mut tx, dup.into(), canonical_chain, record).await?;
         tx.commit().await?;
         Ok(out)
     }
@@ -8590,7 +8712,7 @@ impl ClaimRepository {
             });
         }
         let reversal =
-            reverse_marked_duplicate(&mut tx, dup.into(), unmarked.canonical, record).await?;
+            reverse_marked_duplicate(&mut tx, dup.into(), &unmarked.chain, record).await?;
         tx.commit().await?;
         Ok((unmarked, reversal))
     }
@@ -11274,6 +11396,222 @@ impl ClaimRepository {
     }
 }
 
+/// Whether [`canonical_chain`] locks the claims it walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainLock {
+    /// A plain read (the request paths, on the caller's read transaction).
+    None,
+    /// `FOR SHARE OF c` on each claim of the chain (the un-mark's act).
+    ForShare,
+}
+
+/// The most replacements [`canonical_chain`] follows from one canonical: far
+/// above any real supersession depth, as the version-chain walk's cap.
+const CANONICAL_CHAIN_MAX: usize = 100;
+
+/// `canonical`, then each claim that replaced it in turn, ending with the
+/// current one; or why there is no current canonical to restore a duplicate
+/// against. Read through `viewer` (an unreadable `canonical` is taken as it
+/// is, as the act always has).
+///
+/// The replacement of a retired claim `C` is the source `N` of an in-force
+/// claim-to-claim `supersedes` edge targeting `C` whose rows agree: a
+/// supersession (`N.supersedes = C`, [`ClaimRepository::supersede_act_conn`])
+/// or a consolidation (`C.supersedes = N`,
+/// [`ClaimRepository::consolidate_act_conn`]); both write that edge, `N -> C`,
+/// and no dedup does. Refused: a claim of the chain that is itself a marked
+/// duplicate (it carries a dedup identity edge; un-mark it first), one retired
+/// with no replacement (a deprecation), one with two, a cycle, and a chain
+/// longer than [`CANONICAL_CHAIN_MAX`].
+///
+/// [`ChainLock::ForShare`] (the un-mark's act, on the maintenance connection)
+/// holds every claim of the chain `FOR SHARE` until the act's transaction
+/// ends, so none can be retired while the reversal re-mints factors on the
+/// head; the request paths read it without locks.
+async fn canonical_chain(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    canonical: Uuid,
+    lock: ChainLock,
+) -> Result<Result<Vec<Uuid>, String>, DbError> {
+    let mut chain = vec![canonical];
+    loop {
+        let at = *chain.last().unwrap_or(&canonical);
+        let which = if at == canonical {
+            "which".to_string()
+        } else {
+            format!("whose replacement {at}")
+        };
+        let mut sql = viewer.splice(
+            "SELECT COALESCE(c.is_current, true) FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        if lock == ChainLock::ForShare {
+            sql.push_str(" FOR SHARE OF c");
+        }
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(at);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *conn).await? != Some(false) {
+            return Ok(Ok(chain));
+        }
+        if chain.len() > CANONICAL_CHAIN_MAX {
+            return Ok(Err(format!(
+                "supersedes {canonical}, which was replaced more than {CANONICAL_CHAIN_MAX} \
+                 times; refusing to follow the chain further"
+            )));
+        }
+        let sql = viewer.splice(
+            "SELECT e.target_id FROM edges e JOIN claims c ON c.id = e.source_id \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3 \
+                AND e.target_id = c.supersedes \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT 1",
+            4,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(at)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if let Some(of) = q.fetch_optional(&mut *conn).await? {
+            return Ok(Err(format!(
+                "supersedes {canonical}, {which} is itself retired (a marked duplicate of \
+                 {of}); un-mark {at} first"
+            )));
+        }
+        let sql = viewer.splice(
+            "SELECT e.source_id FROM edges e \
+               JOIN claims n ON n.id = e.source_id \
+               JOIN claims o ON o.id = e.target_id \
+              WHERE e.target_id = $1 AND e.target_type = 'claim' AND e.source_type = 'claim' \
+                AND e.relationship = 'supersedes' AND e.valid_to IS NULL \
+                AND e.source_id <> e.target_id \
+                AND (n.supersedes = o.id OR o.supersedes = n.id) \
+                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:n} */ \
+              ORDER BY e.source_id",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(at);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let mut next: Vec<Uuid> = q.fetch_all(&mut *conn).await?;
+        next.dedup();
+        match next.as_slice() {
+            [] => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, {which} is retired with no replacement (it was \
+                     deprecated, or retired by another act); there is no current canonical to \
+                     restore it against"
+                )))
+            }
+            [n] if chain.contains(n) => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, whose replacements form a cycle at {n}; refusing \
+                     to follow it"
+                )))
+            }
+            [n] => chain.push(*n),
+            many => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, {which} has {} replacements ({}); refusing to pick \
+                     one",
+                    many.len(),
+                    many.iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// Why the un-mark refuses `dup`, retired with no in-force dedup identity edge
+/// to the claim it supersedes: [`legacy_mark_refusal`]'s reason for a legacy
+/// `fuzzy_dedup_claims` mark, otherwise that it was retired by another act.
+async fn no_identity_edge_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<String, DbError> {
+    if let Some(why) = legacy_mark_refusal(conn, viewer, dup).await? {
+        return Ok(why);
+    }
+    Ok(
+        "has no dedup identity edge to the claim it supersedes (it was retired by another \
+        act, or marked before identity edges were recorded)"
+            .to_string(),
+    )
+}
+
+/// Why the un-mark refuses `dup`, retired with no dedup identity edge, when it
+/// is a legacy `fuzzy_dedup_claims` mark (its `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]); `None` for any other claim. Says whether the
+/// backfill can still reconstruct the edge (by its own selection,
+/// [`LEGACY_MARK_RECONSTRUCTABLE_SQL`]) and, if not, why not. Read through the
+/// un-mark's viewer, like every read of the act.
+async fn legacy_mark_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<Option<String>, DbError> {
+    let sql = viewer.splice(
+        &format!(
+            "SELECT COALESCE(({LEGACY_MARK_RECONSTRUCTABLE_SQL}), false), \
+                    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])), \
+                    c.properties->>'deduped_into', c.supersedes \
+               FROM claims c \
+              WHERE c.id = $1 AND c.properties->>'deduped_by' = $2 /* {{VISIBILITY:c}} */"
+        ),
+        3,
+    );
+    let mut q = sqlx::query_as::<_, (bool, bool, Option<String>, Option<Uuid>)>(&sql)
+        .bind(dup)
+        .bind(LEGACY_FUZZY_DEDUP_TOOL);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    let Some((reconstructable, labelled, deduped_into, supersedes)) =
+        q.fetch_optional(&mut *conn).await?
+    else {
+        return Ok(None);
+    };
+    let head = format!(
+        "is a legacy {LEGACY_FUZZY_DEDUP_TOOL} mark (made by raw SQL, without an identity edge)"
+    );
+    if reconstructable {
+        return Ok(Some(format!(
+            "{head} whose same_as identity edge has not been reconstructed yet; an operator's \
+             `backfill_dedup_identity_edges --apply` writes it, after which the mark can be \
+             un-marked"
+        )));
+    }
+    let why = if !labelled {
+        "it no longer carries the `deduped` label the mark wrote".to_string()
+    } else {
+        match (deduped_into, supersedes) {
+            (None, _) => "it records no deduped_into".to_string(),
+            (Some(into), Some(sup)) if into != sup.to_string() => {
+                format!("its supersedes {sup} is no longer the claim the mark named (deduped_into {into})")
+            }
+            (Some(into), _) => {
+                format!("it no longer supersedes the claim the mark named (deduped_into {into})")
+            }
+        }
+    };
+    Ok(Some(format!(
+        "{head} that backfill_dedup_identity_edges cannot reconstruct: {why}; it cannot be \
+         un-marked"
+    )))
+}
+
 /// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.
 /// The callers ([`ClaimRepository::mark_duplicate_act_attributed_conn`],
 /// [`ClaimRepository::mark_duplicate_with_repair_attributed_conn`]) own the
@@ -11290,8 +11628,8 @@ async fn mark_duplicate_act(
         });
     }
     // The canonical must exist and be CURRENT: a mark onto a retired claim
-    // builds a dedup chain the caller never saw, which the un-mark then
-    // refuses while that canonical stays retired. A plain read, not FOR SHARE
+    // names a canonical the caller never saw as one, which the un-mark then
+    // has to follow or refuse. A plain read, not FOR SHARE
     // (that would take the UPDATE policy on the caller's stamped session); a
     // concurrent retirement after it makes an ordinary chain, which the
     // un-mark already orders.
@@ -11978,9 +12316,19 @@ const MOVE_BBAS_ONTO_CANONICAL_SQL: &str = "\
 async fn reverse_marked_duplicate(
     conn: &mut sqlx::PgConnection,
     dup_uuid: Uuid,
-    canon_uuid: Uuid,
+    canonical_chain: &[Uuid],
     record: &DedupRevert,
 ) -> Result<DedupReversal, DbError> {
+    // The recorded canonical (where the repair bound frames) and the current
+    // one (whose BP factor slots the un-mark frees); a repaired row is taken
+    // back from wherever along the chain it now is.
+    let (Some(&canon_uuid), Some(&head_uuid)) = (canonical_chain.first(), canonical_chain.last())
+    else {
+        return Err(DbError::InvalidData {
+            reason: "reverse_marked_duplicate: an empty canonical chain".into(),
+        });
+    };
+    let chain: Vec<Uuid> = canonical_chain.to_vec();
     let mut out = DedupReversal::default();
     let mut drifted: Vec<Uuid> = Vec::new();
     let note_drift = |asked: &[Uuid], done: &[Uuid], drifted: &mut Vec<Uuid>| {
@@ -11992,10 +12340,10 @@ async fn reverse_marked_duplicate(
     let resourced: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
          UPDATE edges SET source_id = $2
-          WHERE id = ANY($3) AND source_id = $1 AND source_type = 'claim' AND valid_to IS NULL
+          WHERE id = ANY($3) AND source_id = ANY($1) AND source_type = 'claim' AND valid_to IS NULL
          RETURNING id, target_id, relationship, target_type"#,
     )
-    .bind(canon_uuid)
+    .bind(&chain)
     .bind(dup_uuid)
     .bind(&record.resourced_edges)
     .fetch_all(&mut *conn)
@@ -12011,10 +12359,10 @@ async fn reverse_marked_duplicate(
     out.retargeted_back = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
          UPDATE edges SET target_id = $2
-          WHERE id = ANY($3) AND target_id = $1 AND target_type = 'claim' AND valid_to IS NULL
+          WHERE id = ANY($3) AND target_id = ANY($1) AND target_type = 'claim' AND valid_to IS NULL
          RETURNING id"#,
     )
-    .bind(canon_uuid)
+    .bind(&chain)
     .bind(dup_uuid)
     .bind(&record.retargeted_edges)
     .fetch_all(&mut *conn)
@@ -12113,14 +12461,14 @@ async fn reverse_marked_duplicate(
                 AND f.properties->>'source_edge_id' = ANY($2)
              RETURNING f.factor_type || ':' || array_to_string(f.variable_ids, ',')"#,
         )
-        .bind(canon_uuid)
+        .bind(head_uuid)
         .bind(&moved_back)
         .fetch_all(&mut *conn)
         .await?
     };
     sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
         .bind(dup_uuid)
-        .bind(canon_uuid)
+        .bind(head_uuid)
         .bind(&freed_slots)
         .bind(None::<Vec<Uuid>>)
         .execute(&mut *conn)
@@ -12145,13 +12493,13 @@ async fn reverse_marked_duplicate(
              DELETE FROM mass_functions k
               USING mass_functions m
               WHERE k.claim_id = $2 AND {}
-                AND m.id = ANY($3) AND m.claim_id = $1
+                AND m.id = ANY($3) AND m.claim_id = ANY($1)
                 AND m.frame_id = k.frame_id
                 AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
                 AND m.perspective_id IS NOT DISTINCT FROM k.perspective_id"#,
             crate::repos::mass_function::cached_combination_predicate("k.")
         ))
-        .bind(canon_uuid)
+        .bind(&chain)
         .bind(dup_uuid)
         .bind(&moved_ids)
         .execute(&mut *conn)
@@ -12170,14 +12518,14 @@ async fn reverse_marked_duplicate(
                FROM jsonb_to_recordset($3)
                     AS r(id uuid, owner_group_id uuid, visibility text, writer_owned boolean),
                     claims d
-              WHERE d.id = $2 AND mf.id = r.id AND mf.claim_id = $1
+              WHERE d.id = $2 AND mf.id = r.id AND mf.claim_id = ANY($1)
                 AND NOT EXISTS (SELECT 1 FROM mass_functions k
                                  WHERE k.claim_id = $2 AND k.frame_id = mf.frame_id
                                    AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id
                                    AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id)
              RETURNING mf.id"#,
         )
-        .bind(canon_uuid)
+        .bind(&chain)
         .bind(dup_uuid)
         .bind(&moved_json)
         .fetch_all(&mut *conn)
@@ -12272,9 +12620,14 @@ async fn reverse_marked_duplicate(
         note_drift(&record.copied_frames, &done, &mut drifted);
     }
 
-    // Claims whose BBA set changed: both endpoints, and every far-end claim a
-    // restored BBA landed on.
-    let mut stale = vec![dup_uuid, canon_uuid];
+    // Claims whose BBA set changed: the duplicate, every claim of the chain,
+    // and every far-end claim a restored BBA landed on.
+    let mut stale = vec![dup_uuid];
+    for c in &chain {
+        if !stale.contains(c) {
+            stale.push(*c);
+        }
+    }
     if !out.restored_bbas.is_empty() {
         let targets: Vec<Uuid> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.

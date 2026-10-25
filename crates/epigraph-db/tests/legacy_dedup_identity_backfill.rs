@@ -7,7 +7,8 @@
 //! deduped_by / deduped_at`) and wrote no `same_as` identity edge. Every reader
 //! of the dedup identity keys on that edge: the index view
 //! (`marked_duplicates_of`) does not list such a duplicate under its canonical,
-//! and the un-mark refuses it as "marked before identity edges were recorded".
+//! and the un-mark refuses it (naming the backfill that would make it
+//! un-markable, operator ruling R-7).
 //!
 //! `ClaimRepository::backfill_legacy_dedup_identity_edges_conn` writes the
 //! missing edge for exactly those rows: dry run unless `apply`, idempotent, and
@@ -318,4 +319,181 @@ async fn the_backfill_runs_on_the_maintenance_login(pool: PgPool) {
     let edges = identity_edges(&pool, dup).await;
     assert_eq!(edges.len(), 1, "{edges:?}");
     assert_eq!(edges[0].1, canonical);
+}
+
+/// The un-mark's refusal of a legacy mark WITHOUT an identity edge says which
+/// of the two it is (operator ruling R-7): one the backfill can still
+/// reconstruct (an operator runs it, then the mark is an ordinary dedup
+/// record), and one it cannot (and why). A mark the backfill reconstructed is
+/// un-marked: `epigraph-engine/tests/unmark_duplicate_cascade.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreconstructed_legacy_mark_is_refused_with_its_reason(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r7-refusal").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r7 legacy canonical").await;
+    let pending = fixture::seed_public_claim(&pool, a, "r7 not yet backfilled").await;
+    legacy_mark(&pool, pending, canonical, "fuzzy_dedup_claims", false).await;
+    let repointed = fixture::seed_public_claim(&pool, a, "r7 re-pointed since").await;
+    legacy_mark(&pool, repointed, canonical, "fuzzy_dedup_claims", false).await;
+    let elsewhere = fixture::seed_public_claim(&pool, a, "r7 the claim it now supersedes").await;
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(elsewhere)
+        .bind(repointed)
+        .execute(&pool)
+        .await
+        .expect("re-point the duplicate");
+    let unlabelled = fixture::seed_public_claim(&pool, a, "r7 label removed since").await;
+    legacy_mark(&pool, unlabelled, canonical, "fuzzy_dedup_claims", false).await;
+    sqlx::query("UPDATE claims SET labels = array_remove(labels, 'deduped') WHERE id = $1")
+        .bind(unlabelled)
+        .execute(&pool)
+        .await
+        .expect("drop the label");
+
+    let viewer = fixture::bypass(&pool).await.1;
+    let refusal = |dup: Uuid| {
+        let pool = pool.clone();
+        let viewer = &viewer;
+        async move {
+            let mut conn = pool.acquire().await.expect("acquire");
+            let e = ClaimRepository::unmark_duplicate_act_conn(
+                &mut conn,
+                viewer,
+                epigraph_core::ClaimId::from_uuid(dup),
+            )
+            .await
+            .expect_err("no identity edge: refused");
+            e.to_string()
+        }
+    };
+
+    let e = refusal(pending).await;
+    assert!(
+        e.contains("legacy fuzzy_dedup_claims mark")
+            && e.contains("backfill_dedup_identity_edges --apply")
+            && e.contains("not been reconstructed"),
+        "a reconstructable legacy mark names the backfill that makes it un-markable: {e}"
+    );
+    let e = refusal(repointed).await;
+    assert!(
+        e.contains("legacy fuzzy_dedup_claims mark")
+            && e.contains("cannot reconstruct")
+            && e.contains(&format!("supersedes {elsewhere}"))
+            && e.contains(&format!("deduped_into {canonical}")),
+        "a re-pointed legacy mark says why the backfill cannot reconstruct it: {e}"
+    );
+    let e = refusal(unlabelled).await;
+    assert!(
+        e.contains("cannot reconstruct") && e.contains("`deduped` label"),
+        "an unlabelled legacy mark says why the backfill cannot reconstruct it: {e}"
+    );
+
+    // CALIBRATION: the classification is the backfill's own selection.
+    let selected: Vec<Uuid> = backfill(&pool, false)
+        .await
+        .duplicates
+        .iter()
+        .map(|d| d.duplicate)
+        .collect();
+    assert_eq!(selected, vec![pending]);
+    for dup in [pending, repointed, unlabelled] {
+        let still: (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("read");
+        assert!(!still.0, "a refused un-mark changes nothing");
+    }
+}
+
+/// A legacy mark without its identity edge whose canonical is ITSELF retired
+/// (here with no replacement) is refused with the legacy reason, not with the
+/// canonical chain's: the missing edge is what blocks the un-mark first, and
+/// the chain's remedy ("no current canonical to restore it against") would
+/// send an operator after the wrong fix (operator ruling R-7's clear, specific
+/// message).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_mark_over_a_retired_canonical_is_refused_with_the_legacy_reason(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r7-order").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r7 canonical retired since").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r7 legacy mark over it").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("retire the canonical with no replacement");
+
+    let viewer = fixture::bypass(&pool).await.1;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let e = ClaimRepository::unmark_duplicate_act_conn(
+        &mut conn,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(dup),
+    )
+    .await
+    .expect_err("no identity edge: refused")
+    .to_string();
+    assert!(
+        e.contains("legacy fuzzy_dedup_claims mark")
+            && e.contains("backfill_dedup_identity_edges --apply")
+            && !e.contains("no replacement"),
+        "the missing identity edge is reported first, with the legacy remedy: {e}"
+    );
+    // The request paths resolve the same verdict, in the same order, before
+    // they check the caller's authority over the chain.
+    let verdict = ClaimRepository::unmark_chain_conn(&mut conn, &viewer, dup, canonical)
+        .await
+        .expect("read");
+    let why = verdict.expect_err("refused");
+    assert!(
+        why.contains("legacy fuzzy_dedup_claims mark") && !why.contains("no replacement"),
+        "{why}"
+    );
+    let still: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+    assert!(!still, "a refused un-mark changes nothing");
+}
+
+/// A legacy mark whose `deduped_into` property is gone cannot be reconstructed
+/// (the backfill needs it to know which claim the mark named): the un-mark says
+/// exactly that (operator ruling R-7).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_mark_without_deduped_into_is_refused_with_that_reason(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r7-no-into").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r7 canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r7 deduped_into removed since").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    sqlx::query("UPDATE claims SET properties = properties - 'deduped_into' WHERE id = $1")
+        .bind(dup)
+        .execute(&pool)
+        .await
+        .expect("drop deduped_into");
+    assert!(
+        !backfill(&pool, false)
+            .await
+            .duplicates
+            .iter()
+            .any(|d| d.duplicate == dup),
+        "calibration: the backfill cannot select it"
+    );
+    let viewer = fixture::bypass(&pool).await.1;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let e = ClaimRepository::unmark_duplicate_act_conn(
+        &mut conn,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(dup),
+    )
+    .await
+    .expect_err("refused")
+    .to_string();
+    assert!(
+        e.contains("cannot reconstruct") && e.contains("records no deduped_into"),
+        "{e}"
+    );
 }

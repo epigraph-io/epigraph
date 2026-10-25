@@ -1099,24 +1099,37 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
             .contains(&dup),
         "the index view lists the duplicate under the claim it supersedes"
     );
-    // The un-mark reads the same pointer: it finds the identity edge and
-    // refuses for the documented terminal state (the canonical is retired),
-    // writing nothing.
+    // The un-mark reads the same pointer: it finds the identity edge, and
+    // follows the canonical's supersession to its replacement (operator ruling
+    // R-11) instead of refusing while the canonical is retired.
     let bypass = fixture::bypass(&pool).await.1;
-    let refusal =
-        ClaimRepository::unmark_duplicate_act_conn(&mut conn, &bypass, ClaimId::from_uuid(dup))
-            .await
-            .expect_err("the un-mark refuses while the canonical is retired");
+    let (unmarked, reversal) = ClaimRepository::unmark_duplicate_with_reversal_conn(
+        &mut conn,
+        &bypass,
+        ClaimId::from_uuid(dup),
+        &r.revert,
+    )
+    .await
+    .expect("the un-mark follows the canonical's replacement");
+    assert_eq!(unmarked.canonical, canonical, "the claim the mark named");
     assert!(
-        format!("{refusal:?}")
-            .contains(&format!("supersedes {canonical}, which is itself retired")),
-        "the refusal names the retired canonical: {refusal:?}"
+        reversal.stale_claims.contains(&replacement),
+        "the reversal ran against the current canonical: {:?}",
+        reversal.stale_claims
     );
+    assert!(reversal.drifted.is_empty(), "{:?}", reversal.drifted);
+    let (identity_source, identity_target, identity_in_force) = edge_target(&pool, identity).await;
     assert_eq!(
-        edge_target(&pool, identity).await,
-        (dup, canonical, true),
-        "the refused un-mark leaves the identity edge in force"
+        (identity_source, identity_target, identity_in_force),
+        (dup, canonical, false),
+        "the un-mark retracts the identity edge it found"
     );
+    let dup_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("dup");
+    assert!(dup_current, "the duplicate is current again");
 }
 
 /// The outgoing direction of the same migration: a claim that was itself a
@@ -1230,4 +1243,190 @@ async fn consolidating_a_canonical_leaves_its_duplicates_identity_edge(pool: PgP
         !duplicates_listed_under(&pool, merged).await.contains(&dup),
         "the index view must not list the duplicate under the merged claim"
     );
+}
+
+/// Supersede `old` through the act, as the supersede routes do (edges carried
+/// on); returns the replacement.
+async fn supersede_canonical(pool: &PgPool, old: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let (replacement, _) = ClaimRepository::supersede_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(old),
+        &format!("revised {old} {}", Uuid::new_v4()),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, replacement)
+        .await
+        .expect("edge migration");
+    replacement
+}
+
+/// The un-mark's act holds the claims of the canonical's chain against a
+/// concurrent retirement until it commits (operator ruling R-11): the reversal
+/// re-mints BP factors on the chain's head, so a supersession of the head that
+/// committed between the chain read and the reversal would leave factors on a
+/// retired claim after its `claims_deactivate_factors` trigger ran. While the
+/// act's transaction is open, retiring the head waits (here: times out).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_act_holds_the_chain_against_a_concurrent_retirement(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-lock").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 lock canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 lock duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    let head = supersede_canonical(&pool, canonical).await;
+    let retire_head = "UPDATE claims SET is_current = false, embedding = NULL, \
+                       embedding_3072 = NULL WHERE id = $1";
+
+    // CALIBRATION: with no un-mark in flight the head can be retired at once.
+    let mut other = pool.acquire().await.expect("acquire");
+    sqlx::query("SET lock_timeout = '500ms'")
+        .execute(&mut *other)
+        .await
+        .expect("lock_timeout");
+    let mut probe = sqlx::Acquire::begin(&mut *other).await.expect("begin");
+    sqlx::query(retire_head)
+        .bind(head)
+        .execute(&mut *probe)
+        .await
+        .expect("calibration: nothing holds the head");
+    probe.rollback().await.expect("rollback");
+
+    let bypass = fixture::bypass(&pool).await.1;
+    let mut act = pool.begin().await.expect("begin the act's transaction");
+    let unmarked =
+        ClaimRepository::unmark_duplicate_act_conn(&mut act, &bypass, ClaimId::from_uuid(dup))
+            .await
+            .expect("the act follows the chain");
+    assert_eq!(unmarked.chain, vec![canonical, head], "calibration");
+
+    let err = sqlx::query(retire_head)
+        .bind(head)
+        .execute(&mut *other)
+        .await
+        .expect_err("the head is held until the un-mark commits");
+    let code = err
+        .as_database_error()
+        .and_then(|e| e.code().map(|c| c.to_string()));
+    assert_eq!(
+        code.as_deref(),
+        Some("55P03"),
+        "a lock wait, not another refusal: {err}"
+    );
+    act.rollback().await.expect("rollback the act");
+}
+
+/// The un-mark act's refusal of `dup`, as text.
+async fn unmark_refusal(pool: &PgPool, dup: Uuid) -> String {
+    let bypass = fixture::bypass(pool).await.1;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::unmark_duplicate_act_conn(&mut conn, &bypass, ClaimId::from_uuid(dup))
+        .await
+        .expect_err("refused")
+        .to_string()
+}
+
+/// A canonical retired since the mark with NO replacement (deprecated) leaves
+/// no current canonical to follow to (operator ruling R-11): the un-mark is
+/// refused, saying so, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_over_a_deprecated_canonical_is_refused(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-deprecated").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 canonical deprecated since").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 its duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("deprecate the canonical");
+
+    let e = unmark_refusal(&pool, dup).await;
+    assert!(
+        e.contains(&format!("supersedes {canonical}"))
+            && e.contains("retired with no replacement")
+            && e.contains("no current canonical"),
+        "{e}"
+    );
+    let (sup, cur): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!((sup, cur), (Some(canonical), false), "nothing written");
+}
+
+/// A canonical with TWO replacements (here a supersession N1, and a
+/// consolidation-shaped replacement N2: `C.supersedes = N2` with N2's
+/// `supersedes` edge) has no single current canonical: the un-mark refuses to
+/// pick one, naming both, and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_over_a_canonical_with_two_replacements_is_refused(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-fork").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 forked canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 its duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    let n1 = supersede_canonical(&pool, canonical).await;
+    let n2 = fixture::seed_public_claim(&pool, a, "r11 a second replacement").await;
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(n2)
+        .bind(canonical)
+        .execute(&pool)
+        .await
+        .expect("C points at N2, as a consolidation source does");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supersedes')",
+    )
+    .bind(n2)
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("N2's supersedes edge");
+
+    let e = unmark_refusal(&pool, dup).await;
+    assert!(
+        e.contains("has 2 replacements")
+            && e.contains(&n1.to_string())
+            && e.contains(&n2.to_string())
+            && e.contains("refusing to pick"),
+        "{e}"
+    );
+    let (sup, cur): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!((sup, cur), (Some(canonical), false), "nothing written");
 }

@@ -100,18 +100,17 @@ struct Ready {
     rv_frame: Uuid,
 }
 
-/// Bring `claim` to a promotable state through the real `analyze` route: a
-/// completed experiment whose result has an analysis with an explicit scope,
-/// and the `error_derived` BBA that route writes (untyped, no `evidence_id`)
-/// as the latest `hypothesis_assessment` row.
-async fn make_promotable(
+/// Seed a fresh experiment and result on `claim` and run the real `analyze`
+/// route over it (the hypothesis-evidence writer), as `agent`, in
+/// `direction`; the experiment is then marked complete. Returns the route's
+/// JSON body.
+async fn analyze_new_result(
     pool: &PgPool,
-    conn_opts: &PgConnectOptions,
+    addr: SocketAddr,
     agent: Uuid,
     claim: Uuid,
-) -> Ready {
-    let hyp_frame = ensure_frame(pool, "hypothesis_assessment").await;
-    let rv_frame = ensure_frame(pool, "research_validity").await;
+    direction: &str,
+) -> serde_json::Value {
     let experiment: Uuid = sqlx::query_scalar(
         "INSERT INTO experiments (hypothesis_id, created_by, status) \
          VALUES ($1, $2, 'collecting') RETURNING id",
@@ -134,7 +133,6 @@ async fn make_promotable(
     .await
     .expect("seed result");
 
-    let (addr, shutdown) = spawn_app(conn_opts).await;
     let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
     let resp = reqwest::Client::new()
         .post(format!(
@@ -143,7 +141,7 @@ async fn make_promotable(
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "agent_id": agent,
-            "direction": "supports",
+            "direction": direction,
             "scope_limitations": [{"type": "small_sample_size"}],
             "expected_value": 0.0,
         }))
@@ -158,6 +156,23 @@ async fn make_promotable(
         .execute(pool)
         .await
         .expect("complete the experiment");
+    body
+}
+
+/// Bring `claim` to a promotable state through the real `analyze` route: a
+/// completed experiment whose result has an analysis with an explicit scope,
+/// and the `error_derived` BBA that route writes (untyped, no `evidence_id`)
+/// as the latest `hypothesis_assessment` row.
+async fn make_promotable(
+    pool: &PgPool,
+    conn_opts: &PgConnectOptions,
+    agent: Uuid,
+    claim: Uuid,
+) -> Ready {
+    let hyp_frame = ensure_frame(pool, "hypothesis_assessment").await;
+    let rv_frame = ensure_frame(pool, "research_validity").await;
+    let (addr, shutdown) = spawn_app(conn_opts).await;
+    analyze_new_result(pool, addr, agent, claim, "supports").await;
 
     let source = rows(pool, claim, hyp_frame).await;
     assert_eq!(
@@ -465,5 +480,86 @@ async fn a_promoted_hypothesis_is_not_promoted_again(
     assert_eq!(
         after, promoted,
         "the refused promotion leaves research_validity as the first one left it"
+    );
+}
+
+/// Evidence filed against a hypothesis AFTER its promotion goes where the
+/// promoted hypothesis's readers look, `research_validity` (operator ruling
+/// R-8: writers follow the readers). The hypothesis-evidence writer here is the
+/// real `analyze` route; filed on `hypothesis_assessment` instead, the new
+/// analysis is invisible to the status read and to the promotion's frame.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evidence_analyzed_after_promotion_lands_on_research_validity(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "r8-http-analyze").await;
+    let (later, _) = viewer_fixture::seed_agent_with_group(&pool, "r8-http-analyze-later").await;
+    // A second member of the hypothesis's group, so the later analysis is by
+    // someone who reads (and writes) the hypothesis.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(group)
+    .bind(later)
+    .execute(&pool)
+    .await
+    .expect("the later analyst joins the group");
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "r8 hypothesis analyzed later").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert!(status.is_success(), "promote: {status} {body}");
+    let promoted = rows(&pool, r.claim, r.rv_frame).await;
+    assert_eq!(promoted.len(), 1, "CALIBRATION: one promoted row");
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame).await.is_empty(),
+        "CALIBRATION: the promotion left nothing on hypothesis_assessment"
+    );
+
+    // The promoted hypothesis's READER, before and after: what the writers
+    // follow is what `GET /hypothesis/:id/status` reads.
+    let before = status_of(r.addr, agent, r.claim).await;
+
+    // A later analysis, by another member, refuting the hypothesis.
+    analyze_new_result(&pool, r.addr, later, r.claim, "refutes").await;
+
+    let after = status_of(r.addr, agent, r.claim).await;
+    assert_eq!(after["status"], "promoted", "CALIBRATION: {after}");
+    assert!(
+        after["belief"]["unsupported"].as_f64() > before["belief"]["unsupported"].as_f64()
+            && after["belief"]["supported"].as_f64() < before["belief"]["supported"].as_f64(),
+        "the promoted hypothesis's status reads the later, refuting analysis: \
+         before {before}, after {after}"
+    );
+
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame).await.is_empty(),
+        "evidence analyzed after the promotion must not land on hypothesis_assessment, \
+         which no reader of a promoted hypothesis reads"
+    );
+    let on_rv = rows(&pool, r.claim, r.rv_frame).await;
+    let new_row = on_rv
+        .iter()
+        .find(|row| row.source_agent_id == Some(later))
+        .unwrap_or_else(|| panic!("the later analysis is on research_validity: {on_rv:?}"));
+    assert_eq!(
+        new_row.combination_method.as_deref(),
+        Some("error_derived"),
+        "it is the analyze route's error-derived BBA"
+    );
+    assert!(
+        mass(&new_row.masses, "1") > 0.0 && mass(&new_row.masses, "0") == 0.0,
+        "with the refuting masses: {:?}",
+        new_row.masses
+    );
+    assert!(
+        on_rv.iter().any(|row| row.id == promoted[0].id),
+        "beside the promoted evidence, not over it"
     );
 }

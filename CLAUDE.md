@@ -204,8 +204,10 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 database. Duplicates it marked before 2026-10 with its own `claims` UPDATE have
 no `same_as` identity edge until an operator runs
 `backfill_dedup_identity_edges --apply` (epigraph-cli, dry run by default).
-Either way they cannot be un-marked: that script kept no repair record, so
-`unmark_duplicate` refuses them. On the re-embed side,
+Once backfilled they are ordinary dedup records and `unmark_duplicate` makes
+them current again; that script kept no repair record, so the un-mark puts
+nothing back and says so (`legacy_mark`). A legacy mark the backfill cannot
+reconstruct is refused with the reason. On the re-embed side,
 `crates/epigraph-cli/src/reembed.rs::fetch_batch` selects only current claims
 (`ReembedTarget::eligible_predicate`), so `epigraph-cli reembed` never writes a
 3072 vector back onto a retired claim.

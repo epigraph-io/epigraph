@@ -44,10 +44,15 @@ the canonical with a revert record. The database connection is read-only; it
 only picks canonicals and skips retired members.
 
 Until 2026-10 the script marked with its own SQL (a raw `UPDATE claims` plus
-lossy re-pointing) and wrote no identity edge, so those marks cannot be
-un-marked and the index view does not see them (rows carrying
-`properties->>'deduped_by' = 'fuzzy_dedup_claims'`). Backfilling their identity
-edges is a separate operator task.
+lossy re-pointing) and wrote no identity edge (rows carrying
+`properties->>'deduped_by' = 'fuzzy_dedup_claims'`). Once an operator's
+`backfill_dedup_identity_edges --apply` (epigraph-cli, dry run by default) has
+written the edge they are ordinary dedup records: the index view lists them,
+and `unmark_duplicate` makes the claim current again and restores nothing (that
+SQL kept no repair record; the answer says `legacy_mark`). A legacy mark the
+backfill cannot reconstruct is refused with the reason. An un-marked legacy
+claim keeps its `deduped` label; the script treats that label as a mark only
+while the claim is retired.
 
 `--execute` needs a bearer token (`--token` or `EPIGRAPH_TOKEN`) and refuses to
 start without one; `EPIGRAPH_API_BASE` (or `--api-base`) names the API. The

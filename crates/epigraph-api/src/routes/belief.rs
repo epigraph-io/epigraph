@@ -1128,6 +1128,23 @@ pub async fn submit_evidence(
         });
     }
 
+    // 0b. Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis
+    //     goes to the frame its readers read, `research_validity` (writers
+    //     follow the readers, operator ruling R-8; MCP `submit_ds_evidence`
+    //     does the same). Read as the caller, before anything is written.
+    let named_frame = frame_id;
+    let redirected = {
+        let mut read = state.read_as(&viewer).await?;
+        epigraph_engine::promotion::promoted_hypothesis_evidence_frame(
+            &mut read,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+    };
+    let frame_id = redirected.as_ref().map_or(frame_id, |f| f.id);
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
@@ -1616,6 +1633,13 @@ pub async fn submit_evidence(
             })?
             .flatten();
     let mut warnings = deprecated_parameter_warnings(&request);
+    if redirected.is_some() {
+        warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
+            request.claim_id,
+            named_frame,
+            frame_id,
+        ));
+    }
     match write_outcome {
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged => warnings.push(
             "this BBA is identical to the one this agent already stored for this claim, frame \

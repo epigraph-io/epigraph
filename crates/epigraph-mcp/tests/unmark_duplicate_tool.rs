@@ -528,3 +528,365 @@ async fn the_sweep_records_its_rule_on_the_identity_edge(pool: PgPool) {
         "{props}"
     );
 }
+
+/// A duplicate the legacy raw-SQL `fuzzy_dedup_claims` marked is un-markable
+/// through the tool once the operator backfill has reconstructed its identity
+/// edge (operator ruling R-7), and the answer says it was a legacy mark (no
+/// repair record, nothing restored).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backfilled_legacy_mark_unmarks_through_the_tool(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let canonical = seed_claim(&pool, "r7 legacy canonical", 0.5).await;
+    let dup = seed_claim(&pool, "r7 legacy duplicate", 0.5).await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let backfilled =
+        epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, true)
+            .await
+            .expect("backfill");
+    assert_eq!(backfilled.inserted, 1, "calibration: {backfilled:?}");
+    drop(conn);
+    let (auth, viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let r = unmark_duplicate(
+        &server,
+        &viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("a backfilled legacy mark is un-markable");
+    let b = body(&r);
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(b["cascade"]["touched"]["legacy_mark"], true, "{b}");
+    assert_eq!(state(&pool, dup).await, (None, true, 0));
+}
+
+/// A public claim authored by `agent` and owned by its personal group.
+async fn owned_public_claim(pool: &PgPool, agent: Uuid, tag: &str) -> Uuid {
+    let group = common::personal_group_of(pool, agent).await;
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             labels, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("{tag} {id}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed owned claim");
+    id
+}
+
+/// Un-marking follows a canonical's consolidation to the merged claim
+/// (operator ruling R-11), and the reversal moves the duplicate's rows off THAT
+/// claim, so the caller needs the same authority over it as over the
+/// canonical. A merge by another agent leaves the caller writing the
+/// duplicate and the canonical, not the merged claim: the un-mark is refused,
+/// naming the merged claim, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmarking_onto_a_merged_canonical_needs_authority_over_the_merged_claim(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (a, a_auth, a_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let (b, _, _) = common::seed_caller(&pool, &["claims:write"]).await;
+    let canonical = owned_public_claim(&pool, a, "r11 canonical").await;
+    let dup = owned_public_claim(&pool, a, "r11 duplicate").await;
+    let partner = owned_public_claim(&pool, b, "r11 merge partner").await;
+    mark_duplicate(
+        &server,
+        &a_viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller marks its own duplicate onto its own canonical");
+    assert_eq!(state(&pool, dup).await, (Some(canonical), false, 1));
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+        &mut conn,
+        &[canonical, partner],
+        &format!("r11 merged by another agent {}", Uuid::new_v4()),
+        0.5,
+        epigraph_db::repos::claim::ConsolidateMode::Merge,
+        "merge",
+        b,
+    )
+    .await
+    .expect("another agent merges the canonical")
+    .merged_id;
+    epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+        &mut conn,
+        merged,
+        &[canonical, partner],
+    )
+    .await
+    .expect("edge migration");
+    drop(conn);
+
+    let err = unmark_duplicate(
+        &server,
+        &a_viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect_err("the caller does not write the merged claim");
+    assert!(
+        err.message.contains(&merged.to_string()) && !err.message.contains("itself retired"),
+        "the refusal names the merged claim the reversal would act on: {}",
+        err.message
+    );
+    assert_eq!(
+        state(&pool, dup).await,
+        (Some(canonical), false, 1),
+        "nothing was written"
+    );
+}
+
+/// Retire `dup` onto `canonical` exactly as the legacy raw-SQL
+/// `fuzzy_dedup_claims` did before 2026-10: no identity edge.
+async fn legacy_mark(pool: &PgPool, dup: Uuid, canonical: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
+                           embedding_3072 = NULL, \
+                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text) \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(pool)
+    .await
+    .expect("legacy raw-SQL mark");
+}
+
+/// The tool's refusal of a legacy `fuzzy_dedup_claims` mark WITHOUT its
+/// identity edge carries the specific reason to the caller (operator ruling
+/// R-7): one the backfill can still reconstruct names
+/// `backfill_dedup_identity_edges --apply` (also when its canonical is itself
+/// retired since: the missing edge is reported first), and one it cannot says
+/// why. Nothing is written and no audit row is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unbackfilled_legacy_mark_is_refused_with_its_reason(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let canonical = seed_claim(&pool, "r7 legacy canonical", 0.5).await;
+    let pending = seed_claim(&pool, "r7 legacy, not yet backfilled", 0.5).await;
+    legacy_mark(&pool, pending, canonical).await;
+    let retired = seed_claim(&pool, "r7 legacy canonical retired since", 0.5).await;
+    let over_retired = seed_claim(&pool, "r7 legacy mark over it", 0.5).await;
+    legacy_mark(&pool, over_retired, retired).await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(retired)
+    .execute(&pool)
+    .await
+    .expect("retire the second canonical with no replacement");
+    let unlabelled = seed_claim(&pool, "r7 legacy, label removed since", 0.5).await;
+    legacy_mark(&pool, unlabelled, canonical).await;
+    sqlx::query("UPDATE claims SET labels = array_remove(labels, 'deduped') WHERE id = $1")
+        .bind(unlabelled)
+        .execute(&pool)
+        .await
+        .expect("drop the label");
+    let (auth, viewer) = common::granted_server_admin(&server, &pool).await;
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM security_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+
+    let refuse = |dup: Uuid| {
+        let (server, viewer, auth) = (&server, &viewer, &auth);
+        async move {
+            unmark_duplicate(
+                server,
+                viewer,
+                UnmarkDuplicateParams {
+                    claim_id: dup.to_string(),
+                },
+                Some(auth),
+            )
+            .await
+            .expect_err("no identity edge: refused")
+            .message
+            .to_string()
+        }
+    };
+    for (dup, canon) in [(pending, canonical), (over_retired, retired)] {
+        let m = refuse(dup).await;
+        assert!(
+            m.contains("legacy fuzzy_dedup_claims mark")
+                && m.contains("backfill_dedup_identity_edges --apply")
+                && m.contains("not been reconstructed")
+                && !m.contains("no replacement"),
+            "a reconstructable legacy mark names the backfill, before anything about its \
+             canonical: {m}"
+        );
+        assert_eq!(state(&pool, dup).await, (Some(canon), false, 0));
+    }
+    let m = refuse(unlabelled).await;
+    assert!(
+        m.contains("cannot reconstruct") && m.contains("`deduped` label"),
+        "an unreconstructable legacy mark says why: {m}"
+    );
+    assert_eq!(state(&pool, unlabelled).await, (Some(canonical), false, 0));
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM security_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(events_after, events_before, "no audit row either");
+}
+
+/// The success path of R-11 through the tool, for a `claims:write` caller with
+/// no admin scope who writes every claim of the chain (it merged the canonical
+/// itself): the un-mark follows the consolidation to the merged claim, answers
+/// both ids, makes the duplicate current, and takes its edge back from the
+/// merged claim, where the merge's edge migration had carried it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmarking_onto_its_own_merged_canonical_restores_the_duplicate(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (a, a_auth, a_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let canonical = owned_public_claim(&pool, a, "r11 own canonical").await;
+    let dup = owned_public_claim(&pool, a, "r11 own duplicate").await;
+    let partner = owned_public_claim(&pool, a, "r11 own merge partner").await;
+    let supporter = seed_claim(&pool, "r11 supporter", 0.5).await;
+    let e = edge(&pool, supporter, dup).await;
+    mark_duplicate(
+        &server,
+        &a_viewer,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller marks its own duplicate");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+        &mut conn,
+        &[canonical, partner],
+        &format!("r11 merged by the caller {}", Uuid::new_v4()),
+        0.5,
+        epigraph_db::repos::claim::ConsolidateMode::Merge,
+        "merge",
+        a,
+    )
+    .await
+    .expect("the caller merges its canonical")
+    .merged_id;
+    epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+        &mut conn,
+        merged,
+        &[canonical, partner],
+    )
+    .await
+    .expect("edge migration");
+    drop(conn);
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(target, merged, "calibration: the edge followed the merge");
+
+    let r = unmark_duplicate(
+        &server,
+        &a_viewer,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&a_auth),
+    )
+    .await
+    .expect("the caller writes every claim of the chain");
+    let b = body(&r);
+    assert_eq!(b["canonical_id"], serde_json::json!(canonical), "{b}");
+    assert_eq!(b["current_canonical_id"], serde_json::json!(merged), "{b}");
+    assert_eq!(b["cascade"]["status"], "applied", "{b}");
+    assert_eq!(b["cascade"]["touched"]["drifted"], 0, "{b}");
+    assert_eq!(state(&pool, dup).await, (None, true, 0));
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(e)
+        .fetch_one(&pool)
+        .await
+        .expect("edge");
+    assert_eq!(
+        target, dup,
+        "the edge is back on the duplicate, from the merged claim"
+    );
+}
+
+/// The tool's description says which marks it un-marks and what the answer
+/// carries (operator rulings R-7 and R-11), so an agent knows to look for
+/// them.
+#[test]
+fn unmark_duplicate_description_names_legacy_marks_and_the_current_canonical() {
+    let d = epigraph_mcp::server::EpiGraphMcpFull::static_tools()
+        .iter()
+        .find(|t| t.name == "unmark_duplicate")
+        .and_then(|t| t.description.as_deref().map(str::to_string))
+        .expect("unmark_duplicate is in the manifest and has a description");
+    for needle in [
+        "legacy fuzzy_dedup_claims mark whose edge backfill_dedup_identity_edges reconstructed",
+        "cascade.touched.legacy_mark",
+        "followed to its current replacement (current_canonical_id)",
+        "every claim of that chain",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}
