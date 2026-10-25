@@ -142,10 +142,13 @@ async fn a_malformed_cursor_and_a_cursor_with_offset_are_invalid_params(pool: Pg
         .expect_err("`after` with a non-zero offset must be refused");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
 
+    // offset=0 is what existing callers send by default; it composes with `after`.
+    let mut zero = params("mcp-refuse", 2, Some(cursor));
+    zero.offset = Some(0);
     let last = parse(
-        &query_claims_by_label(&server, &viewer, params("mcp-refuse", 2, Some(cursor)))
+        &query_claims_by_label(&server, &viewer, zero)
             .await
-            .expect("second page"),
+            .expect("`after` with offset=0 is the second page"),
     );
     assert_eq!(last["claims"].as_array().map(Vec::len), Some(1));
     assert_eq!(
@@ -155,15 +158,87 @@ async fn a_malformed_cursor_and_a_cursor_with_offset_are_invalid_params(pool: Pg
     );
 }
 
-#[test]
-fn after_is_accepted_from_json_arguments() {
-    let p: QueryClaimsByLabelParams =
-        serde_json::from_value(serde_json::json!({"labels": ["x"], "after": "k1.0.0"}))
-            .expect("`after` deserializes");
-    assert_eq!(p.after.as_deref(), Some("k1.0.0"));
-    let p: QueryClaimsByLabelParams =
-        serde_json::from_value(serde_json::json!({"labels": ["x"]})).expect("legacy args");
-    assert_eq!(p.after, None);
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_offset_walk_keeps_the_same_total_order(pool: PgPool) {
+    // OFFSET stays accepted for compatibility (R-9). With the shared ORDER BY
+    // now `(created_at DESC, id DESC)`, offset pages split the created_at tie
+    // the same way the cursor walk does, so each row is still served once.
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let t = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let mut seeded: Vec<(DateTime<Utc>, Uuid)> = Vec::new();
+    for at in [t + Duration::seconds(1), t, t, t, t - Duration::seconds(1)] {
+        seeded.push((at, seed_claim_at(&pool, agent, "mcp-offset", at).await));
+    }
+    seeded.sort_by(|a, b| b.cmp(a));
+    let expected: Vec<String> = seeded.iter().map(|(_, id)| id.to_string()).collect();
+    let server = build_test_server(pool.clone());
+
+    let mut walked: Vec<String> = Vec::new();
+    for offset in [0, 2, 4] {
+        let mut p = params("mcp-offset", 2, None);
+        p.offset = Some(offset);
+        let body = parse(
+            &query_claims_by_label(&server, &viewer, p)
+                .await
+                .expect("offset page"),
+        );
+        let rows = body
+            .as_array()
+            .unwrap_or_else(|| panic!("without `after` the response is a bare array: {body}"));
+        walked.extend(rows.iter().map(|c| c["id"].as_str().unwrap().to_string()));
+    }
+    assert_eq!(
+        walked, expected,
+        "offset 0/2/4 at limit 2 must serve every row once, newest first, ties by id DESC"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn keyset_page_still_carries_source_urls_when_asked(pool: PgPool) {
+    // The {claims, next_cursor} envelope wraps the same rows, so the opt-in
+    // `include_source_urls` must survive it.
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let t = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let claim = seed_claim_at(&pool, agent, "mcp-keyset-urls", t).await;
+    let evidence = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, content_hash, evidence_type, source_url, claim_id, \
+                               properties, created_at) \
+         VALUES ($1, $2, 'document', $3, $4, '{}'::jsonb, $5)",
+    )
+    .bind(evidence)
+    .bind(evidence.as_bytes().repeat(2))
+    .bind("https://example.org/keyset/source")
+    .bind(claim)
+    .bind(t)
+    .execute(&pool)
+    .await
+    .expect("seed evidence");
+    let server = build_test_server(pool.clone());
+
+    let mut p = params("mcp-keyset-urls", 2, Some(String::new()));
+    p.include_source_urls = true;
+    let body = parse(
+        &query_claims_by_label(&server, &viewer, p)
+            .await
+            .expect("keyset page with source_urls"),
+    );
+    let claims = body["claims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("with `after`, the response is {{claims, next_cursor}}: {body}"));
+    assert_eq!(claims.len(), 1, "{body}");
+    assert_eq!(
+        claims[0]["source_urls"],
+        serde_json::json!(["https://example.org/keyset/source"]),
+        "keyset mode must keep the evidence URLs: {body}"
+    );
+    assert_eq!(
+        body["next_cursor"],
+        Value::Null,
+        "a short page ends the walk"
+    );
 }
 
 fn parse(result: &CallToolResult) -> Value {

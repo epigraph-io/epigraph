@@ -2,7 +2,7 @@
 //! 6f072833, ruling R-9): a full page carries an `X-Next-Cursor` header, the
 //! body stays the legacy bare JSON array, and `after=<cursor>` resumes
 //! strictly after the previous page's last row in `(created_at DESC, id DESC)`
-//! order. The MCP twin is `crates/epigraph-mcp/tests/query_claims_by_label.rs`.
+//! order. The MCP twin is `crates/epigraph-mcp/tests/query_claims_by_label_cursor.rs`.
 #![cfg(feature = "db")]
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -104,6 +104,34 @@ async fn by_labels_refuses_a_malformed_cursor_and_a_cursor_with_offset() {
     let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
     let base = format!("http://{addr}/api/v1/claims/by-labels?labels={label}&limit=2");
 
+    // Refusals first, from literal tokens, so they are checked whether or not
+    // the server hands out a cursor; every status is collected before the one
+    // assertion, so a failure shows all of them.
+    let well_formed = "k1.1790000000000000.0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    let refused = [
+        "after=garbage".to_string(),
+        "after=k1.1.not-a-uuid".to_string(),
+        "after=k9.0.00000000000000000000000000000000".to_string(),
+        // `after` with a non-zero `offset` is ambiguous.
+        format!("after={well_formed}&offset=2"),
+    ];
+    let mut statuses: Vec<(String, u16)> = Vec::new();
+    for query in &refused {
+        let resp = client
+            .get(format!("{base}&{query}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        statuses.push((query.clone(), resp.status().as_u16()));
+    }
+    let all_400: Vec<(String, u16)> = refused.iter().map(|q| (q.clone(), 400)).collect();
+    assert_eq!(
+        statuses, all_400,
+        "a malformed cursor, and `after` with a non-zero offset, must each be a 400 \
+         (not a 500, and not a silent first page)"
+    );
+
     let first = client.get(&base).bearer_auth(&token).send().await.unwrap();
     assert_eq!(first.status().as_u16(), 200);
     let cursor = first
@@ -113,36 +141,6 @@ async fn by_labels_refuses_a_malformed_cursor_and_a_cursor_with_offset() {
         .to_str()
         .unwrap()
         .to_string();
-
-    for bad in [
-        "garbage",
-        "k1.1.not-a-uuid",
-        "k9.0.00000000000000000000000000000000",
-    ] {
-        let resp = client
-            .get(format!("{base}&after={bad}"))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            400,
-            "a malformed cursor {bad:?} must be a 400, not a 500 or a silent first page"
-        );
-    }
-
-    let both = client
-        .get(format!("{base}&after={cursor}&offset=2"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        both.status().as_u16(),
-        400,
-        "`after` with a non-zero `offset` is ambiguous and must be refused"
-    );
 
     // offset=0 is what existing clients always send; it composes with `after`.
     let ok = client
@@ -158,6 +156,46 @@ async fn by_labels_refuses_a_malformed_cursor_and_a_cursor_with_offset() {
     );
     let body: Value = ok.json().await.unwrap();
     assert_eq!(body.as_array().map(Vec::len), Some(1), "one row remains");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn by_labels_legacy_offset_walk_keeps_the_same_total_order() {
+    // OFFSET stays accepted for compatibility (R-9). With the ORDER BY now
+    // `(created_at DESC, id DESC)`, offset pages split the created_at tie the
+    // same way the cursor walk does, so each row is still served once.
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let agent = seed_agent(&pool).await;
+    let label = format!("offset-walk-{}", Uuid::new_v4().simple());
+    let t = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let mut seeded: Vec<(DateTime<Utc>, Uuid)> = Vec::new();
+    for at in [t + Duration::seconds(1), t, t, t, t - Duration::seconds(1)] {
+        seeded.push((at, seed_claim_at(&pool, agent, &label, at).await));
+    }
+    seeded.sort_by(|a, b| b.cmp(a));
+    let expected: Vec<String> = seeded.iter().map(|(_, id)| id.to_string()).collect();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let client = reqwest::Client::new();
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let mut walked: Vec<String> = Vec::new();
+    for offset in [0, 2, 4] {
+        let req =
+            format!("http://{addr}/api/v1/claims/by-labels?labels={label}&limit=2&offset={offset}");
+        let resp = client.get(&req).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{req}");
+        let body: Value = resp.json().await.unwrap();
+        let rows = body.as_array().expect("bare JSON array");
+        walked.extend(rows.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+    }
+    assert_eq!(
+        walked, expected,
+        "offset 0/2/4 at limit 2 must serve every row once, newest first, ties by id DESC"
+    );
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
