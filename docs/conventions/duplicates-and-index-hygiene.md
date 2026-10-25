@@ -95,8 +95,17 @@ deferred, and the replay timer applies it.
   claim (nothing is written); a chain is built only by marking a claim that
   already has duplicates onto a current canonical.
 - Un-mark a chain from the canonical end: first the duplicate whose canonical
-  is current. `unmark_duplicate` refuses a duplicate whose canonical is still
-  retired.
+  is current. `unmark_duplicate` refuses a duplicate whose canonical is itself
+  still a marked duplicate (un-mark that one first).
+- A canonical superseded or consolidated after the mark is followed to its
+  current replacement, and the duplicate is restored against that one
+  (`current_canonical_id`); you need the same write authority over every claim
+  of that chain as over the canonical.
+- A duplicate the pre-2026-10 raw-SQL `fuzzy_dedup_claims` marked is
+  un-markable once `backfill_dedup_identity_edges --apply` has written its
+  identity edge. That script kept no repair record, so nothing is put back
+  (`legacy_mark`); a legacy mark the backfill cannot reconstruct is refused
+  with the reason.
 - A compound canonical takes none of the duplicate's belief inputs.
 - Write authority:
   - you must write the groups that own both claims, or hold `claims:admin`;
