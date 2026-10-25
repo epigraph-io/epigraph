@@ -247,6 +247,47 @@ impl ChallengeRepository {
         Ok(())
     }
 
+    /// Set a challenge's RESOLUTION STATUS as a writer of the CHALLENGED
+    /// CLAIM's owning group (operator ruling R-3, migration 168 section 7).
+    ///
+    /// An outsider's challenge is owned by the outsider (R-CH1), so 077's
+    /// `WITH CHECK` refuses the claim's owner a plain UPDATE of it. This goes
+    /// through `epigraph_resolve_challenge`, which changes ONLY `state`,
+    /// `resolved_by` (always the session principal: the caller cannot name
+    /// another resolver), `resolved_at` and `resolution_details`, and appends
+    /// one `security_events` row (`challenges.claim_owner_resolution`) naming
+    /// the resolver. The outsider's text, challenger, claim and ownership are
+    /// not reachable from here, and nothing on this surface deletes a row.
+    ///
+    /// `state` is one of `under_review`, `accepted`, `rejected`. Run it on the
+    /// STAMPED transaction of the request (`ScopedPool::begin_as`): an
+    /// unstamped connection has no principal to name and is refused.
+    ///
+    /// # Errors
+    ///
+    /// The definer's refusals, as `sqlx::Error::Database`:
+    /// * `42501` no session principal (CR01), an elevated session (CR05), or a
+    ///   session that cannot write the claim's owning group (CR03);
+    /// * `P0002` "challenge not found" when the challenge does not exist OR
+    ///   the session cannot read its claim, indistinguishably (CR02);
+    /// * `22023` a state outside the three above (CR04);
+    /// * `55000` a challenge its challenger withdrew (CR06): a withdrawal is
+    ///   the challenger's act, not overturned by a resolution.
+    pub async fn resolve_as_claim_owner<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        challenge_id: Uuid,
+        state: &str,
+        resolution_details: Option<&serde_json::Value>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT public.epigraph_resolve_challenge($1, $2, $3)")
+            .bind(challenge_id)
+            .bind(state)
+            .bind(resolution_details)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// Insert a gap-originated challenge with event emission.
     pub async fn insert_gap_challenge(
         pool: &PgPool,
