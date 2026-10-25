@@ -56,7 +56,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("scripts/backfill_locality_tag.py", "<module>", 2, "rewrites the locality_tag metadata column only; masses untouched"),
     ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); frozen, not edited"),
     ("scripts/e2e/probe-batch-h.sh", "<file>", 1, "end-to-end probe seeding one BBA in its own throwaway database"),
-    ("scripts/fuzzy_dedup_claims.py", "merge_cluster", 2, "SPEC §4.1 W14 script: dedup moves and drops a duplicate's BBAs"),
     ("scripts/link_mass_function_evidence.py", "<module>", 1, "SPEC §4.1 W13 script: rewrites evidence_id, so item keys; frozen, not edited"),
     ("scripts/migrate_mixed_bbas.py", "main", 1, "SPEC §4.1 W13 script: splits mixed BBAs; frozen, not edited"),
     ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; frozen, not edited"),
@@ -349,7 +348,11 @@ fn the_spec_named_writers_are_measured() {
         "scripts/backfill_source_strength.py",
         "scripts/backfill_intra_source_evidence_discount.py",
         "scripts/migrate_mixed_bbas.py",
-        "scripts/fuzzy_dedup_claims.py",
+        // SPEC §4.1 W14 names `scripts/fuzzy_dedup_claims.py`. The script now
+        // marks duplicates through the REST dedup act and writes no BBA
+        // itself; the act's BBA moves are this file's
+        // `MOVE_BBAS_ONTO_CANONICAL_SQL` and the dedup repair / reverse.
+        "crates/epigraph-db/src/repos/claim.rs",
     ] {
         assert!(
             measured.keys().any(|(p, _)| p == path),
