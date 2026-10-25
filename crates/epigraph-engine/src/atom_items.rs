@@ -529,8 +529,13 @@ pub fn drift_legacy_grouping_betp(
     if items.is_empty() {
         return Ok(EvidencedInterval::unproven().pignistic_prob());
     }
-    let (combined, _) = crate::source_dependence::combine_with_source_dependence(items, 0.9)
-        .map_err(|e| format!("combine_with_source_dependence: {e}"))?;
+    // The legacy fold's conflict threshold, from the served profile as the
+    // atom fold here takes it ([`atom_fold`]).
+    let (combined, _) = crate::source_dependence::combine_with_source_dependence(
+        items,
+        BeliefProfile::served().combination.conflict_threshold,
+    )
+    .map_err(|e| format!("combine_with_source_dependence: {e}"))?;
     Ok(measures::pignistic_probability(&combined, 0))
 }
 
