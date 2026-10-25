@@ -960,3 +960,97 @@ async fn the_claims_owner_does_not_resolve_a_withdrawn_challenge(pool: PgPool) {
     then_live.expect("CALIBRATION: the owner resolves the challenger's live challenge");
     assert_eq!(resolution(&pool, live).await.0, "rejected");
 }
+
+/// A caller that cannot read a challenge's claim neither learns that the
+/// challenge exists nor waits on it. The row is the shape ruling R-5 keeps:
+/// an outsider's PUBLIC, writer-owned challenge on a claim that has since been
+/// restricted (arm (d) leaves the row where it is). While another transaction
+/// holds a lock on that row, a stranger and the outsider itself (neither can
+/// read the restricted claim) get, at once, exactly the error a random id
+/// gets: the definer filters on the claim's readability BEFORE it locks
+/// anything, and locks the claim before the challenge (the order arm (d)'s
+/// propagation takes). Nothing is written or audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_claims_challenge_is_neither_found_nor_waited_on(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-lk-owner").await;
+    let (outsider, outsider_group) = fixture::seed_agent_with_group(&pool, "ch-lk-out").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "ch-lk-stranger").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "restricted later").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "on a claim restricted later").await;
+        (conn, t)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("restrict the claim");
+    assert_eq!(
+        tenancy(&pool, theirs).await,
+        (outsider_group, "public".to_string(), true),
+        "CALIBRATION: the kept row is the outsider's and public on a restricted claim"
+    );
+    let before = whole_row(&pool, theirs).await;
+
+    let mut held = pool.begin().await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM challenges WHERE id = $1 FOR UPDATE")
+        .bind(theirs)
+        .execute(&mut *held)
+        .await
+        .expect("hold a lock on the hidden challenge");
+
+    let missing = Uuid::new_v4();
+    let p = pool.clone();
+    let answers = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SET lock_timeout = '300ms'")
+            .execute(&mut *conn)
+            .await
+            .expect("bound the wait");
+        let mut answers = Vec::new();
+        for (who, agent) in [("stranger", stranger), ("outsider", outsider)] {
+            stamp(&mut conn, &p, agent).await;
+            let hidden =
+                ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, "accepted", None)
+                    .await;
+            let random =
+                ChallengeRepository::resolve_as_claim_owner(&mut *conn, missing, "accepted", None)
+                    .await;
+            answers.push((who, hidden, random));
+        }
+        sqlx::query("RESET lock_timeout")
+            .execute(&mut *conn)
+            .await
+            .expect("reset the bound");
+        (conn, answers)
+    })
+    .await;
+    held.rollback().await.expect("release the holder");
+
+    for (who, hidden, random) in &answers {
+        let hidden = hidden
+            .as_ref()
+            .expect_err("a non-reader resolves nothing on a hidden challenge");
+        let random = random.as_ref().expect_err("a random id resolves nothing");
+        assert_eq!(
+            (sqlstate(hidden), hidden.to_string()),
+            (sqlstate(random), random.to_string()),
+            "{who}: the hidden challenge answers exactly as a random id (no wait, no oracle)"
+        );
+        assert_eq!(sqlstate(random).as_deref(), Some("P0002"), "{who}");
+    }
+    assert_eq!(
+        whole_row(&pool, theirs).await,
+        before,
+        "the hidden row is untouched"
+    );
+    assert!(
+        resolution_audit(&pool, theirs).await.is_empty(),
+        "a refusal writes no audit record"
+    );
+}

@@ -462,7 +462,8 @@ CREATE POLICY challenges_claim_readable ON public.challenges
 --     the way around it;
 --   * CR02 (P0002) "challenge not found" when the challenge does not exist OR
 --     the session cannot read its claim, with ONE text for both, so this is
---     no existence oracle for a private claim (R-CH1b);
+--     no existence oracle for a private claim (R-CH1b); readability filters
+--     the locking read, so such a caller also takes and waits on no lock;
 --   * CR03 (42501) a session that cannot WRITE the claim's owning group (the
 --     outsider itself, a stranger, a reader member of the claim's group);
 --   * CR06 (55000) a challenge whose CURRENT state is `withdrawn`: withdrawal
@@ -507,16 +508,28 @@ BEGIN
         RAISE EXCEPTION 'CR05: an elevated session writes no challenge; nothing was written'
             USING ERRCODE = '42501';
     END IF;
-    SELECT ch.claim_id, ch.owner_group_id, ch.writer_owned, ch.state,
-           c.owner_group_id, c.visibility
-      INTO v_claim, v_row_owner, v_writer_owned, v_before, v_claim_owner, v_claim_vis
-      FROM public.challenges ch
-      JOIN public.claims c ON c.id = ch.claim_id
-     WHERE ch.id = p_challenge
-       FOR UPDATE OF ch;
+    -- The CLAIM first, and only if this session can read it: the readability
+    -- predicate is in the WHERE, so a caller that cannot read the claim locks
+    -- nothing and never waits on a hidden row (a wait would tell a hidden id
+    -- from a random one). FOR SHARE holds the claim's tenancy (owner,
+    -- visibility) still until the write commits, so the CR03 check and the
+    -- UPDATE see the same claim; claim before challenge is the order arm (d)'s
+    -- propagation takes (the claims row, then its challenges).
+    SELECT c.id, c.owner_group_id, c.visibility
+      INTO v_claim, v_claim_owner, v_claim_vis
+      FROM public.claims c
+     WHERE c.id = (SELECT ch.claim_id FROM public.challenges ch WHERE ch.id = p_challenge)
+       AND (c.visibility = 'public' OR c.owner_group_id = ANY (public.epigraph_session_groups()))
+       FOR SHARE OF c;
+    IF FOUND THEN
+        SELECT ch.owner_group_id, ch.writer_owned, ch.state
+          INTO v_row_owner, v_writer_owned, v_before
+          FROM public.challenges ch
+         WHERE ch.id = p_challenge AND ch.claim_id = v_claim
+           FOR UPDATE OF ch;
+    END IF;
     -- Not found and not readable give the SAME answer: no existence oracle.
-    IF NOT FOUND OR NOT (v_claim_vis = 'public'
-                         OR v_claim_owner = ANY (public.epigraph_session_groups())) THEN
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'CR02: challenge not found' USING ERRCODE = 'P0002';
     END IF;
     IF NOT (v_claim_owner = ANY (public.epigraph_writable_groups())) THEN
