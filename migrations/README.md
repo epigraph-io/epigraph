@@ -1502,34 +1502,47 @@ restart.
   follows the identity's registered lineage forward (`agent_succession`),
   and 161's registration copies a parent's live attachments to a new child
   over every gap the child's own rows leave (re-stated with one marked step,
-  5b); a SHARED identity (one that runs in another group folder) inherits
-  none, and the audit says why. Once armed, EVERY write an application
-  session stamped as an attached agent makes is refused `ROL01` unless every
-  live attachment's role is held now (`clock_timestamp()`, READ COMMITTED
-  only) by the agent's live-linked human: a statement trigger
-  (`role_agent_write_check`) on all 79 tables the application role writes,
-  a `claims` row trigger for the claim's author (an UPDATE of anything but
-  the caches the database derives from everyone's evidence, or a DELETE), and
-  re-stated 123 `epigraph_require_writer_scope` /
-  `epigraph_require_attributable` for a claim INSERT, re-open or
-  re-attribution. A privileged session is exempt; a retired author identity
-  is the one relief. Adds `epigraph_role_agent_may_run(uuid)` for
-  `epigraph_app` (epigraph-mcp's boot check) and
-  `epigraph_identity_attestor` (the host). Coverage is complete for the
-  application role (a catalog ratchet in `role_attached_agents.rs` pins the
-  table set); the stated limit is that a holder of the application DSN can
-  stamp itself as another principal (header sections 1 and 3). Needs
-  PostgreSQL 14+ (multiranges). Behaviour in
-  `epigraph-db/tests/role_attached_agents.rs` and
+  5b). A SHARED successor (one that runs in another group folder) is copied
+  too, fail closed, and flagged (`role_attachments_shared` on the
+  registration audit row, `platform.role_agent_copied_shared` on the
+  lineage path) so the host alerts every affected group; an attach and a
+  successor's registration serialise on the registration's lock. Once
+  armed, every write an application session STAMPED as an attached agent
+  makes is refused `ROL01` unless every live attachment's role is held now
+  (`clock_timestamp()`) by the agent's live-linked human: a statement
+  trigger (`role_agent_write_check`) on every table the application role
+  writes (79 on a clean migrate, plus whatever the catalog grants it when
+  166 runs; on `security_events` every operation but INSERT, so an actor's
+  own audit row lands), a `claims` row trigger for the claim's author (an
+  UPDATE of anything but the caches the database derives from everyone's
+  evidence, or a DELETE), and re-stated 123 `epigraph_require_writer_scope`
+  / `epigraph_require_attributable` for a claim INSERT, re-open or
+  re-attribution. An agent that could be attached writes only under READ
+  COMMITTED, attached or not (a stale snapshot misses an attach or an end).
+  A privileged session is exempt; a retired author identity is the one
+  relief. Adds `epigraph_role_agent_may_run(uuid)` for `epigraph_app`
+  (epigraph-mcp's boot check) and `epigraph_identity_attestor` (the host).
+  A catalog ratchet in `role_attached_agents.rs` pins the table set on a
+  clean migrate and `epigraph-tenancy-backfill verify` re-measures it on a
+  deployed database. STATED LIMITS (header sections 1 and 3): an UNSTAMPED
+  application write (the raw-pool sites `no_unscoped_pool` counts, and
+  epigraph-mcp's raw-pool writes such as `publish_event`) is not checked on
+  its writer outside `claims`' author; a holder of the application DSN can
+  stamp another principal, none, or change the stamp mid-statement; and the
+  statement check runs once per statement. Another principal's change to
+  what an attached agent's claim says (its `truth_value` included) is
+  refused in that agent's gap. Needs PostgreSQL 14+ (multiranges).
+  Behaviour in `epigraph-db/tests/role_attached_agents.rs` and
   `epigraph-mcp/tests/role_agent_boot_refusal.rs`. Undo:
-  `docs/runbooks/166-undo.sql`. Slot: 166 is free on `main` and on every
-  remote branch (164 is carried by another branch). Depends on
-  123, 153 and 161. **Deploy order:** the migration BEFORE any epigraph-mcp
-  built against it (that binary calls `epigraph_role_agent_may_run` at boot
-  and exits when it is absent), and an attached identity is attached only
-  AFTER the host has registered it (otherwise its registration aborts
-  `AID09`). Where the attestor login is created after this migration, add
-  `GRANT EXECUTE ON FUNCTION public.epigraph_role_agent_may_run(uuid) TO
+  `docs/runbooks/166-undo.sql` (tested: it returns the whole `public`
+  catalog to below 166). Slot: 166 is free on `main` and on every remote
+  branch (164 is carried by another branch). Depends on 123, 153 and 161.
+  **Deploy order:** the migration BEFORE any epigraph-mcp built against it
+  (that binary calls `epigraph_role_agent_may_run` at boot and exits when it
+  is absent), and an attached identity is attached only AFTER the host has
+  registered it (otherwise its registration aborts `AID09`). Where the
+  attestor login is created after this migration, add `GRANT EXECUTE ON
+  FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
