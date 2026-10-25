@@ -115,12 +115,16 @@
 -- `clock_timestamp()`, not `now()`: `now()` is the transaction's start, so a
 -- long-running transaction opened inside the window would keep writing past
 -- `valid_to`. The ruling is "every write after the end is refused".
--- READ COMMITTED only: an attached agent's write under REPEATABLE READ or
--- SERIALIZABLE is refused `ROL01` even while its human holds the role. An
--- assignment ended by a handover is REVOKED (123's
--- `epigraph_end_role_assignment`), which is a visibility question, and an
--- older snapshot would still see it live. An unattached agent may use any
--- isolation level.
+-- READ COMMITTED only: a write whose acting agent COULD be attached (any
+-- agent: not a human operator, not a human or role node) under REPEATABLE
+-- READ or SERIALIZABLE is refused `ROL01`, attached or not, and even while
+-- its human holds the role. An assignment ended by a handover is REVOKED
+-- (123's `epigraph_end_role_assignment`), and an attachment is a new row:
+-- both are visibility questions, and an older snapshot would still see the
+-- assignment live, or no attachment at all. The test is decided before the
+-- gate and on what no attach changes, because every read in the
+-- transaction, the gate's included, uses that older snapshot. A human may
+-- use any isolation level. (No application write path uses another level.)
 --
 -- WHERE: one shared check, `epigraph_require_role_holder(agent)`, reached
 -- three ways.
@@ -725,23 +729,30 @@ BEGIN
     IF p_agent IS NULL OR public.epigraph_bypass() THEN
         RETURN;
     END IF;
-    SELECT g.* INTO v_gate FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g;
-    -- An attached agent writes only on a FRESH snapshot. Under REPEATABLE
-    -- READ or SERIALIZABLE every statement reads the transaction's first
-    -- snapshot, so an assignment ended (revoked) after it would still read as
-    -- live for as long as the transaction stays open (123's CUS06 refuses a
-    -- grant under REPEATABLE READ for the same reason). SERIALIZABLE does not
-    -- save it: the revoke reads no row this write writes, so no conflict is
-    -- detected. An unattached agent is untouched.
-    IF v_gate.may_run AND v_gate.reason = 'held'
-       AND current_setting('transaction_isolation') <> 'read committed' THEN
-        RAISE EXCEPTION 'ROL01: agent % is attached to role %, and a role''s agent writes only '
+    -- An agent that COULD be attached writes only on a FRESH snapshot, and
+    -- this is decided BEFORE the gate, on something no attach can change.
+    -- Under REPEATABLE READ or SERIALIZABLE every statement, and every read
+    -- in this definer, uses the transaction's first snapshot: an assignment
+    -- ended (revoked) after it would still read as live, and an attachment
+    -- committed after it would not be seen at all (the gate would answer
+    -- `unattached`), for as long as the transaction stays open (123's CUS06
+    -- refuses a grant under REPEATABLE READ for the same reason). SERIALIZABLE
+    -- does not save it: the revoke or the attach reads no row this write
+    -- writes, so no conflict is detected. So the test is "attachable"
+    -- (ROL02's: not a human operator, not a human or role node), not
+    -- "attached". A human, which is never attached, may use any level.
+    IF current_setting('transaction_isolation') <> 'read committed'
+       AND NOT public.epigraph_is_human_operator(p_agent)
+       AND NOT EXISTS (SELECT 1 FROM public.agents a
+                        WHERE a.id = p_agent AND a.agent_type IN ('human', 'role')) THEN
+        RAISE EXCEPTION 'ROL01: agent % could be attached to a role, and an agent writes only '
                         'under READ COMMITTED (this transaction is %): an older snapshot would '
-                        'still see an assignment that has since ended', p_agent, v_gate.role,
+                        'miss an attachment, or an assignment end, committed since', p_agent,
                         current_setting('transaction_isolation')
             USING ERRCODE = 'ROL01',
                   HINT = 'Nothing was written. Write under READ COMMITTED (the default).';
     END IF;
+    SELECT g.* INTO v_gate FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g;
     IF v_gate.may_run THEN
         RETURN;
     END IF;
@@ -912,9 +923,14 @@ BEGIN
             -- the author (the stamped principal was checked above). Nested,
             -- so the cheap gate answer comes first and the row comparison
             -- only runs for an attached author.
-            IF (SELECT g.reason
-                  FROM public.epigraph_role_agent_gate(OLD.agent_id, clock_timestamp()) g)
-               IS DISTINCT FROM 'unattached' THEN
+            -- Under any isolation but READ COMMITTED the gate's `unattached`
+            -- may be a stale snapshot's, so the author is checked whatever
+            -- it answers (`epigraph_require_role_holder` refuses an
+            -- attachable author there).
+            IF current_setting('transaction_isolation') <> 'read committed'
+               OR (SELECT g.reason
+                     FROM public.epigraph_role_agent_gate(OLD.agent_id, clock_timestamp()) g)
+                  IS DISTINCT FROM 'unattached' THEN
                 IF NOT public.epigraph_agent_is_retired(OLD.agent_id) THEN
                     IF TG_OP = 'DELETE'
                        OR (to_jsonb(NEW) - c_derived) IS DISTINCT FROM (to_jsonb(OLD) - c_derived)
