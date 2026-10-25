@@ -233,9 +233,9 @@ async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
         warnings(&replaced).iter().any(|x| x.contains("REPLACED")),
         "a replacement says so: {replaced}"
     );
+    let replaced_row = stored(&w.pool, &replaced["mass_function_id"]).await;
     assert_ne!(
-        stored(&w.pool, &replaced["mass_function_id"]).await.0,
-        first_row.0,
+        replaced_row.0, first_row.0,
         "CALIBRATION: the replacement did change the stored masses"
     );
 
@@ -245,9 +245,49 @@ async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
     retyped["evidence_type"] = serde_json::json!("testimonial");
     let retyped = post(&w, &token_a, retyped).await;
     assert_eq!(retyped["write_outcome"], "replaced", "{retyped}");
+    let retyped_row = stored(&w.pool, &retyped["mass_function_id"]).await;
+    assert_eq!(
+        retyped_row.0, replaced_row.0,
+        "CALIBRATION: only evidence_type differs from the previous write"
+    );
+    assert_ne!(
+        retyped_row.1, replaced_row.1,
+        "CALIBRATION: the stored evidence_type did change"
+    );
 
     // Another agent's identical BBA is its own slot.
-    let other = post(&w, &token_b, body).await;
+    let other = post(&w, &token_b, body.clone()).await;
     assert_eq!(other["write_outcome"], "inserted", "{other}");
     assert_ne!(other["mass_function_id"], first["mass_function_id"]);
+
+    // So is the same agent's identical BBA under a perspective: the key's
+    // other half. A perspective the caller owns, with its confidence
+    // calibration cleared (the column defaults to 0.5, a further discount),
+    // so the stored masses equal those in the slot without a perspective and
+    // only the key tells the two writes apart.
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("6f82db4f-p-{}", Uuid::new_v4()))
+    .bind(a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed perspective");
+    let mut in_perspective = body;
+    in_perspective["perspective_id"] = serde_json::json!(perspective);
+    let scoped = post(&w, &token_a, in_perspective).await;
+    assert_eq!(scoped["write_outcome"], "inserted", "{scoped}");
+    assert_eq!(scoped["deduplicated"], false, "{scoped}");
+    assert_ne!(scoped["mass_function_id"], first["mass_function_id"]);
+    assert_eq!(
+        stored(&w.pool, &scoped["mass_function_id"]).await,
+        first_row,
+        "CALIBRATION: the perspective's row stores what the first write stored"
+    );
+    assert_eq!(
+        stored(&w.pool, &first["mass_function_id"]).await,
+        retyped_row,
+        "the perspective's write left the slot without a perspective as it was"
+    );
 }
