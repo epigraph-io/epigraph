@@ -759,11 +759,13 @@ async fn list_by_labels_serves_the_viewers_own_group_private_claim(pool: PgPool)
             min_truth: None,
             limit: Some(100),
             offset: None,
+            after: None,
         }),
     )
     .await
     .expect("list_by_labels")
-    .0;
+    .1
+     .0;
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     assert_eq!(

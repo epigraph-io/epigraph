@@ -2534,11 +2534,22 @@ pub struct ClaimsByLabelsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     /// Skip the first N matching claims (default 0; negative values clamped to 0).
-    /// Combine with `limit` to page through large result sets — claims are
-    /// ordered by `created_at DESC`.
+    /// Kept for compatibility; prefer `after`. Claims are ordered by
+    /// `(created_at DESC, id DESC)`.
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Opaque keyset cursor: the `X-Next-Cursor` response header of the
+    /// previous page, passed back unchanged. Returns the claims strictly after
+    /// that page's last row, so a page boundary does not drift under
+    /// concurrent writes. Empty = first page. Cannot be combined with a
+    /// non-zero `offset`.
+    #[serde(default)]
+    pub after: Option<String>,
 }
+
+/// Response header of `GET /api/v1/claims/by-labels` carrying the opaque
+/// next-page cursor: present only on a full page, passed back as `after`.
+pub const NEXT_CURSOR_HEADER: &str = "x-next-cursor";
 
 /// Response row for `GET /api/v1/claims/by-labels`.
 ///
@@ -2568,12 +2579,20 @@ pub struct ClaimByLabelsResponse {
 /// caller, and as of this shard the read runs on a viewer-stamped connection,
 /// so the rows returned are the caller's own visible set rather than "public
 /// claim metadata". The scripts named above authenticate.
+///
+/// # Paging
+/// A full page (as many rows as the clamped `limit`) carries the
+/// [`NEXT_CURSOR_HEADER`] response header; pass it back as `after` for the next
+/// page. No header means the set is exhausted. The body stays a bare JSON
+/// array, so a client that ignores the header is unaffected, and `offset`
+/// still works (it re-reads skipped rows and drifts under writes).
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
+) -> Result<(axum::http::HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
+    use epigraph_db::repos::claim::LabelCursor;
     let labels: Vec<String> = q
         .labels
         .split(',')
@@ -2601,6 +2620,23 @@ pub async fn list_by_labels(
         .unwrap_or(DEFAULT_PAGE_LIMIT)
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
+    let after = match q.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(
+            LabelCursor::decode(token).ok_or_else(|| ApiError::BadRequest {
+                message: format!(
+                    "malformed `after` cursor; pass back the {NEXT_CURSOR_HEADER} header of the \
+                 previous page unchanged"
+                ),
+            })?,
+        ),
+    };
+    if after.is_some() && offset > 0 {
+        return Err(ApiError::BadRequest {
+            message: "`after` and a non-zero `offset` cannot be combined; page with `after` alone"
+                .into(),
+        });
+    }
 
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -2624,7 +2660,7 @@ pub async fn list_by_labels(
             min_truth,
             limit,
             offset,
-            after: None,
+            after,
         },
     )
     .await
@@ -2632,7 +2668,17 @@ pub async fn list_by_labels(
         message: e.to_string(),
     })?;
 
-    Ok(Json(
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(next) = LabelCursor::next_page(&rows, limit) {
+        let value = axum::http::HeaderValue::from_str(&next.encode()).map_err(|e| {
+            ApiError::InternalError {
+                message: format!("next cursor is not a header value: {e}"),
+            }
+        })?;
+        headers.insert(NEXT_CURSOR_HEADER, value);
+    }
+
+    let body = Json(
         rows.into_iter()
             .map(|(c, claim_labels)| ClaimByLabelsResponse {
                 id: c.id.as_uuid(),
@@ -2645,16 +2691,17 @@ pub async fn list_by_labels(
                 supersedes: c.supersedes.map(|s| s.as_uuid()),
             })
             .collect(),
-    ))
+    );
+    Ok((headers, body))
 }
 
-/// Stub for non-db builds — returns an empty list.
+/// Stub for non-db builds — returns an empty list (and so no cursor).
 #[cfg(not(feature = "db"))]
 pub async fn list_by_labels(
     State(_state): State<AppState>,
     Query(_q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
-    Ok(Json(vec![]))
+) -> Result<(axum::http::HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
+    Ok((axum::http::HeaderMap::new(), Json(vec![])))
 }
 
 #[cfg(test)]
