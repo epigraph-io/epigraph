@@ -563,3 +563,308 @@ async fn a_privatized_claims_outsider_challenge_reads_only_with_the_claim(pool: 
         );
     }
 }
+
+// =========================================================================
+// Operator ruling R-3: the claim's owner sets an outsider's challenge's
+// resolution status, and nothing else.
+// =========================================================================
+
+/// The SQLSTATE of a database error, or `None` for any other error.
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
+}
+
+/// Every column of one challenge EXCEPT the four resolution columns
+/// (`state`, `resolved_by`, `resolved_at`, `resolution_details`), read on the
+/// harness connection: the outsider's text, its type, its challenger, its
+/// claim, its tenancy and its flag.
+async fn content_columns(pool: &PgPool, id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(ch) - 'state' - 'resolved_by' - 'resolved_at' - 'resolution_details' \
+           FROM challenges ch WHERE ch.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("read challenge {id}: {e}"))
+}
+
+/// `(state, resolved_by, resolved_at IS NOT NULL, resolution_details)`.
+async fn resolution(
+    pool: &PgPool,
+    id: Uuid,
+) -> (String, Option<Uuid>, bool, Option<serde_json::Value>) {
+    sqlx::query_as(
+        "SELECT state::text, resolved_by, resolved_at IS NOT NULL, resolution_details \
+           FROM challenges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("read challenge {id}: {e}"))
+}
+
+/// The `security_events` rows recording a claim-owner resolution of `id`:
+/// `(agent_id, details)`.
+async fn resolution_audit(pool: &PgPool, id: Uuid) -> Vec<(Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'challenges.claim_owner_resolution' \
+            AND details->>'challenge_id' = $1::text \
+          ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .expect("read the resolution audit")
+}
+
+/// R-3's main arm. An outsider challenges a public claim; the claim's owner
+/// sets the challenge's resolution status through
+/// `ChallengeRepository::resolve_as_claim_owner`, as the non-bypassing
+/// application role. The status lands, `resolved_by` names the owner (the
+/// session principal, not a caller-supplied id), and one append-only
+/// `security_events` row names the resolver. Every other column (the
+/// outsider's text, its challenger, its claim, its owner and flag) is
+/// byte-identical: the outsider keeps ownership.
+///
+/// The same owner, by plain SQL, can neither edit the outsider's text nor
+/// re-own the row (077's WITH CHECK, 115's owner guard), nor delete it (115's
+/// restrictive DELETE policy filters the row, so the DELETE affects nothing).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claims_owner_sets_an_outsiders_challenge_status_and_nothing_else(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-res-owner").await;
+    let (outsider, outsider_group) = fixture::seed_agent_with_group(&pool, "ch-res-out").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "resolution").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "the outsider's own words").await;
+        (conn, t)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    assert_eq!(
+        tenancy(&pool, theirs).await,
+        (outsider_group, "public".to_string(), true),
+        "CALIBRATION: the row is outsider-owned before the owner acts"
+    );
+    let before = content_columns(&pool, theirs).await;
+
+    let details = serde_json::json!({ "reason": "the cited figure is correct" });
+    let d = details.clone();
+    let p = pool.clone();
+    let (resolved, edit, reown, deleted) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, owner).await;
+            let r = ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn,
+                theirs,
+                "rejected",
+                Some(&d),
+            )
+            .await;
+            let edit = sqlx::query("UPDATE challenges SET explanation = 'rewritten' WHERE id = $1")
+                .bind(theirs)
+                .execute(&mut *conn)
+                .await;
+            let reown = sqlx::query("UPDATE challenges SET owner_group_id = $2 WHERE id = $1")
+                .bind(theirs)
+                .bind(owner_group)
+                .execute(&mut *conn)
+                .await;
+            let deleted = sqlx::query("DELETE FROM challenges WHERE id = $1")
+                .bind(theirs)
+                .execute(&mut *conn)
+                .await
+                .expect("a filtered DELETE is not an error")
+                .rows_affected();
+            (conn, (r, edit, reown, deleted))
+        })
+        .await;
+
+    resolved.expect(
+        "the claim's owner sets the status of an outsider's challenge (R-3); a plain UPDATE \
+         is refused by 077's WITH CHECK because the row is the outsider's",
+    );
+    assert_eq!(
+        resolution(&pool, theirs).await,
+        ("rejected".to_string(), Some(owner), true, Some(details)),
+        "status, resolver (the session principal), time and details are set"
+    );
+    let audit = resolution_audit(&pool, theirs).await;
+    assert_eq!(audit.len(), 1, "exactly one audit record: {audit:?}");
+    assert_eq!(
+        audit[0].0,
+        Some(owner),
+        "the audit record names the resolver"
+    );
+    assert_eq!(audit[0].1["resolver_agent_id"], owner.to_string());
+    assert_eq!(audit[0].1["claim_id"], claim.to_string());
+    assert_eq!(audit[0].1["claim_owner_group_id"], owner_group.to_string());
+    assert_eq!(
+        audit[0].1["challenge_owner_group_id"],
+        outsider_group.to_string()
+    );
+    assert_eq!(audit[0].1["state_before"], "pending");
+    assert_eq!(audit[0].1["state_after"], "rejected");
+
+    assert!(
+        edit.is_err(),
+        "the owner cannot edit the outsider's text: {edit:?}"
+    );
+    assert!(
+        reown.is_err(),
+        "the owner cannot re-own the outsider's row: {reown:?}"
+    );
+    assert_eq!(
+        deleted, 0,
+        "the owner cannot delete the outsider's challenge"
+    );
+    assert_eq!(
+        content_columns(&pool, theirs).await,
+        before,
+        "every non-resolution column, the outsider's text and ownership included, is unchanged"
+    );
+}
+
+/// Only a WRITER of the challenged claim's owning group sets the status, only
+/// to a resolver's state, and an unreadable claim's challenge answers exactly
+/// as a nonexistent id. The outsider itself, a stranger, and a READER member
+/// of the claim's group are refused (42501); `withdrawn` (the challenger's
+/// act) and a state outside the core set are refused (22023); a stranger
+/// asking about a private claim's challenge gets the same error, code and
+/// text, as for a random id. Nothing is written by any refusal, and the same
+/// call by the owner then lands (the refusals were not malformed calls).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_writer_of_the_claims_group_sets_a_challenges_status(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-rs-owner").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-rs-out").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "ch-rs-stranger").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "ch-rs-member").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(owner_group)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("reader membership");
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "status refusals").await;
+    let private = fixture::seed_group_claim(&pool, owner, owner_group, "rs private").await;
+    let on_private: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'factual_error', 'an insider on a private claim', 'pending') \
+         RETURNING id",
+    )
+    .bind(private)
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a challenge on the private claim");
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "status refusals").await;
+        (conn, t)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+
+    let missing = Uuid::new_v4();
+    let p = pool.clone();
+    let (by_who, bad_states, hidden, nonexistent, then_owner) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let mut by_who = Vec::new();
+            for (who, agent) in [
+                ("outsider", outsider),
+                ("stranger", stranger),
+                ("reader member", member),
+            ] {
+                stamp(&mut conn, &p, agent).await;
+                let r = ChallengeRepository::resolve_as_claim_owner(
+                    &mut *conn, theirs, "accepted", None,
+                )
+                .await;
+                by_who.push((who, r));
+            }
+            stamp(&mut conn, &p, owner).await;
+            let mut bad_states = Vec::new();
+            for state in ["withdrawn", "resolved", "pending"] {
+                let r =
+                    ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, state, None)
+                        .await;
+                bad_states.push((state, r));
+            }
+            stamp(&mut conn, &p, stranger).await;
+            let hidden = ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn, on_private, "accepted", None,
+            )
+            .await;
+            let nonexistent =
+                ChallengeRepository::resolve_as_claim_owner(&mut *conn, missing, "accepted", None)
+                    .await;
+            stamp(&mut conn, &p, owner).await;
+            let then_owner = ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn,
+                theirs,
+                "under_review",
+                None,
+            )
+            .await;
+            (conn, (by_who, bad_states, hidden, nonexistent, then_owner))
+        })
+        .await;
+
+    for (who, r) in &by_who {
+        let e = r.as_ref().expect_err(who);
+        assert_eq!(
+            sqlstate(e).as_deref(),
+            Some("42501"),
+            "{who}: refused as a non-writer of the claim's group: {e}"
+        );
+    }
+    for (state, r) in &bad_states {
+        let e = r.as_ref().expect_err(state);
+        assert_eq!(
+            sqlstate(e).as_deref(),
+            Some("22023"),
+            "{state}: not a resolution status the claim's owner sets: {e}"
+        );
+    }
+    let hidden = hidden.expect_err("a stranger cannot resolve a private claim's challenge");
+    let nonexistent = nonexistent.expect_err("a random id resolves nothing");
+    assert_eq!(
+        (sqlstate(&hidden), hidden.to_string()),
+        (sqlstate(&nonexistent), nonexistent.to_string()),
+        "a private claim's challenge answers exactly as a random id"
+    );
+    assert_eq!(
+        resolution(&pool, on_private).await,
+        ("pending".to_string(), None, false, None),
+        "the private claim's challenge is untouched"
+    );
+    assert!(
+        resolution_audit(&pool, on_private).await.is_empty(),
+        "a refusal writes no audit record"
+    );
+
+    then_owner.expect("CALIBRATION: the owner's well-formed call lands");
+    assert_eq!(
+        resolution(&pool, theirs).await,
+        ("under_review".to_string(), Some(owner), false, None),
+        "only the owner's call changed the status"
+    );
+    assert_eq!(
+        resolution_audit(&pool, theirs).await.len(),
+        1,
+        "one audit record, the owner's; none for the refused calls"
+    );
+}

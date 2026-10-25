@@ -23,7 +23,8 @@
 -- 1. THE RULE, BY REUSING 114's WRITER-OWNED MACHINERY
 -- ===================================================================
 --
--- No new function. `challenges` joins 114's writer-owned rows:
+-- No new function here (section 7's resolution definer is the file's one new
+-- function). `challenges` joins 114's writer-owned rows:
 --
 --   * a `writer_owned` column (the name the operator CLI's table specs read
 --     from the catalog, `epigraph_cli::operator::tables`);
@@ -81,10 +82,14 @@
 --   * It does not touch 126's elevated arms on `challenges` (read arm and the
 --     three write refusals), 077's policy or 115's DELETE and owner guards; it
 --     ADDS one restrictive read policy (section 6).
---   * It does not give the claim's owner a way to RESOLVE an outsider's
+--   * It does not let the claim's owner EDIT or DELETE an outsider's
 --     challenge: `ChallengeRepository::update_state` on a row the owner cannot
---     write is refused by 077 like any other cross-group UPDATE. No route
---     resolves a user challenge today; that is a follow-up.
+--     write is refused by 077 like any other cross-group UPDATE, and a DELETE
+--     is filtered by 115. What the owner MAY do (ruling R-3) is set the row's
+--     RESOLUTION STATUS, through the one definer of section 7, which changes
+--     only the four resolution columns and audits the resolver. No HTTP or MCP
+--     route calls it yet (`ChallengeRepository::resolve_as_claim_owner` is the
+--     repo surface); that is a follow-up.
 --
 -- ===================================================================
 -- 4. DEPLOY
@@ -102,9 +107,11 @@
 -- insiders inherit as before, its outsiders are refused by name as before,
 -- and its challenge reads are additionally narrowed by section 6.
 --
--- UNDO: DROP the two triggers, re-run 114's section 3b and 122's section 8
--- (`CREATE OR REPLACE` from their text), then DROP COLUMN writer_owned on
--- `challenges` (after deciding what to do with any outsider-owned row).
+-- UNDO: DROP FUNCTION epigraph_resolve_challenge(uuid, text, jsonb) (section
+-- 7), DROP POLICY challenges_claim_readable (section 6), DROP the two
+-- triggers, re-run 114's section 3b and 122's section 8 (`CREATE OR REPLACE`
+-- from their text), then DROP COLUMN writer_owned on `challenges` (after
+-- deciding what to do with any outsider-owned row).
 --
 -- Checked before claiming: no `origin/main` migration and no open PR carries a
 -- `168`.
@@ -423,3 +430,131 @@ CREATE POLICY challenges_claim_readable ON public.challenges
         (SELECT public.epigraph_bypass())
         OR (SELECT public.epigraph_definer_bypass())
         OR EXISTS (SELECT 1 FROM public.claims c WHERE c.id = challenges.claim_id));
+
+-- ===================================================================
+-- 7. THE CLAIM'S OWNER SETS A CHALLENGE'S RESOLUTION STATUS (ruling R-3)
+-- ===================================================================
+--
+-- An outsider's challenge is the outsider's (section 1), so 077's WITH CHECK
+-- refuses the claim's owner any UPDATE of it, and 115's restrictive DELETE
+-- policy any DELETE. The ruling (R-3, 2026-10-25): the challenged claim's
+-- owner group may set the RESOLUTION STATUS of an outsider-owned challenge,
+-- with an audit record naming the resolver, but may NOT edit or delete the
+-- outsider's text, and the outsider keeps ownership.
+--
+-- So no policy arm is widened: a widened UPDATE arm would admit every column.
+-- This definer is the one path, and it can change only the four resolution
+-- columns because they are the only ones its UPDATE names:
+--
+--   * `state`, from the resolver's states only (`under_review`, `accepted`,
+--     `rejected`; `withdrawn` is the challenger's act, `pending` is not a
+--     resolution), else CR04 (22023);
+--   * `resolved_by` := the SESSION PRINCIPAL, never a caller-supplied id;
+--   * `resolved_at` := now() on `accepted` / `rejected`, as
+--     `ChallengeRepository::update_state` sets it;
+--   * `resolution_details` := the caller's JSON (may be NULL).
+--
+-- It refuses, before writing anything:
+--   * CR01 (42501) no session principal: nothing to name as the resolver;
+--   * CR05 (42501) an ELEVATED session: 126's `challenges_elevated_no_update`
+--     refuses an elevated application session every UPDATE of `challenges`,
+--     and this definer (whose owner 126's policy does not name) must not be
+--     the way around it;
+--   * CR02 (P0002) "challenge not found" when the challenge does not exist OR
+--     the session cannot read its claim, with ONE text for both, so this is
+--     no existence oracle for a private claim (R-CH1b);
+--   * CR03 (42501) a session that cannot WRITE the claim's owning group (the
+--     outsider itself, a stranger, a reader member of the claim's group).
+--
+-- Insiders' challenges (owned by the claim's group) take the same path: the
+-- claim's owner can already UPDATE them directly, and through here the write
+-- is attributed and audited the same way.
+--
+-- Each write appends one `security_events` row (`event_type =
+-- 'challenges.claim_owner_resolution'`, `agent_id` = the resolver; details:
+-- the challenge, its claim, both owning groups, the state before and after,
+-- the resolver), in the same transaction. `security_events` is append-only
+-- and immutable (077, 082), which the row's own `resolved_by` is not: the
+-- outsider owns the row, so 077 lets it rewrite its own resolution columns.
+--
+-- Ownership and grants: owned by `epigraph_maintenance` (so the UPDATE runs
+-- with `epigraph_definer_bypass()` true), EXECUTE revoked from PUBLIC and
+-- granted to `epigraph_app` and `epigraph_maintenance`, in a guarded block
+-- as every such block since 060 is. Registered in `tenancy_backfill`'s
+-- `DEFERRED_DEFINER_FUNCTIONS`. Caller: `ChallengeRepository::
+-- resolve_as_claim_owner`.
+CREATE OR REPLACE FUNCTION public.epigraph_resolve_challenge(
+    p_challenge uuid, p_state text, p_details jsonb)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE v_principal uuid := public.epigraph_principal_id();
+        v_claim uuid; v_claim_owner uuid; v_claim_vis character varying(16);
+        v_row_owner uuid; v_writer_owned boolean; v_before character varying(20);
+BEGIN
+    IF v_principal IS NULL THEN
+        RAISE EXCEPTION 'CR01: setting a challenge''s resolution status needs a session '
+            'principal (epigraph.principal_id) to name as the resolver; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'CR05: an elevated session writes no challenge; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT ch.claim_id, ch.owner_group_id, ch.writer_owned, ch.state,
+           c.owner_group_id, c.visibility
+      INTO v_claim, v_row_owner, v_writer_owned, v_before, v_claim_owner, v_claim_vis
+      FROM public.challenges ch
+      JOIN public.claims c ON c.id = ch.claim_id
+     WHERE ch.id = p_challenge
+       FOR UPDATE OF ch;
+    -- Not found and not readable give the SAME answer: no existence oracle.
+    IF NOT FOUND OR NOT (v_claim_vis = 'public'
+                         OR v_claim_owner = ANY (public.epigraph_session_groups())) THEN
+        RAISE EXCEPTION 'CR02: challenge not found' USING ERRCODE = 'P0002';
+    END IF;
+    IF NOT (v_claim_owner = ANY (public.epigraph_writable_groups())) THEN
+        RAISE EXCEPTION 'new row violates row-level security policy for table "challenges"'
+            USING ERRCODE = '42501',
+                  DETAIL = 'CR03: only a writer of the challenged claim''s owning group sets '
+                           'a challenge''s resolution status';
+    END IF;
+    IF p_state IS NULL OR p_state NOT IN ('under_review', 'accepted', 'rejected') THEN
+        RAISE EXCEPTION 'CR04: % is not a resolution status (under_review, accepted, '
+            'rejected); nothing was written', COALESCE(p_state, 'NULL')
+            USING ERRCODE = '22023';
+    END IF;
+    UPDATE public.challenges
+       SET state = p_state,
+           resolved_by = v_principal,
+           resolution_details = p_details,
+           resolved_at = CASE WHEN p_state IN ('accepted', 'rejected') THEN now()
+                              ELSE resolved_at END
+     WHERE id = p_challenge;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('challenges.claim_owner_resolution', v_principal, true,
+            jsonb_build_object(
+                'challenge_id',             p_challenge,
+                'claim_id',                 v_claim,
+                'claim_owner_group_id',     v_claim_owner,
+                'challenge_owner_group_id', v_row_owner,
+                'writer_owned',             v_writer_owned,
+                'state_before',             v_before,
+                'state_after',              p_state,
+                'resolver_agent_id',        v_principal,
+                'migration',                168));
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_resolve_challenge(uuid, text, jsonb) FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_resolve_challenge(uuid, text, jsonb) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_resolve_challenge(uuid, text, jsonb) '
+                'TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_resolve_challenge(uuid, text, jsonb) '
+                'TO epigraph_app';
+    END IF;
+END $$;

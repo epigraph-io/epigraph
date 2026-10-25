@@ -1609,6 +1609,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_lock_public_claim_for_attach", 114),
     ("epigraph_dedup_move_bbas", 114),
     ("epigraph_reown_legacy_writer_bbas", 114),
+    // 168 (ruling R-3), the claim owner's challenge-resolution definer, kept
+    // beside the 114 machinery 168 reuses. Fails CLOSED under a non-member
+    // owner: its `challenges` read is filtered by 168's claim-readable policy
+    // and its UPDATE by 077's WITH CHECK (the outsider's row is not the
+    // owner's), so every resolution is refused "not found" or 42501 (loud).
+    ("epigraph_resolve_challenge", 168),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
