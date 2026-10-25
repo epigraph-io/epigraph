@@ -1548,6 +1548,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_definer_bypass()`), i.e. the maintenance session or 148's audit trigger.",
         ),
         (
+            "challenges_claim_readable",
+            "challenges.claim_id",
+            "168's RESTRICTIVE read policy (ruling R-CH1b): its arm `EXISTS (SELECT 1 FROM \
+             claims c WHERE c.id = challenges.claim_id)` names no session helper itself, but the \
+             subquery reads `claims` with the reader's own rights, so it is `claims`' policies \
+             (077's session arms, 126's elevated read) that answer it: session-derived through \
+             the subquery. A restrictive policy is AND-ed with the permissive \
+             `challenges_tenancy` and grants nothing; the two session arms beside it keep the \
+             maintenance session and the definers unfiltered.",
+        ),
+        (
             "security_events_cascade_privileged",
             "cascade.",
             "117's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 8) <> \

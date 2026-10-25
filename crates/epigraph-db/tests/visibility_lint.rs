@@ -2853,10 +2853,11 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          policy for table \"challenges\"` and writing nothing. The only connection that can \
          satisfy that check comes from `ScopedPool::begin_as`, which hands back a transaction. \
          WHOSE group: the row is claim-derived, so 074's `epigraph_derived_require_tenancy` fills \
-         its tenancy from the CHALLENGED CLAIM and 070 arm (c) re-stamps it unconditionally — the \
-         check is about the claim's owning group, not the challenger's, and \
-         `tool_write_tables_require_a_stamp.rs` pins all three directions of that. SCOPE: the \
-         executor widened, the SQL is byte-identical and was not re-derived.",
+         its tenancy from the CHALLENGED CLAIM for an insider; since migration 168 (ruling R-CH1) \
+         an outsider's challenge on a PUBLIC claim is owned by the challenger's own write group \
+         (114's attach rule), and `tool_write_tables_require_a_stamp.rs` / \
+         `challenge_ownership.rs` pin both. SCOPE: the executor widened, the SQL is \
+         byte-identical and was not re-derived.",
     ),
     (
         "frame.rs",
