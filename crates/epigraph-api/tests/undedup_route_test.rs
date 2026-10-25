@@ -574,3 +574,103 @@ async fn undedup_follows_a_chain_of_replacements_to_the_current_canonical() {
         "the edge is back on the duplicate, taken from N2"
     );
 }
+
+/// The reversal moves the duplicate's rows off every claim of the canonical's
+/// chain, so the route checks the caller's authority over each claim that
+/// replaced the canonical as over the canonical (operator ruling R-11). A
+/// `claims:write` caller (no admin) who writes the duplicate and the canonical
+/// but not the claim another agent merged the canonical into is refused with
+/// 403 naming the merged claim; the duplicate stays marked, its identity edge
+/// in force, and no un-mark is recorded. (The HTTP twin of the MCP
+/// `unmarking_onto_a_merged_canonical_needs_authority_over_the_merged_claim`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn undedup_onto_a_merged_canonical_needs_authority_over_the_merged_claim() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let (_, other_client) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let other: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(other_client)
+        .fetch_one(&pool)
+        .await
+        .expect("the other client's agent");
+    let tag = Uuid::new_v4();
+    let canonical = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("r11 merged canonical {tag}"),
+        client_id,
+    )
+    .await;
+    let dup = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("r11 merged duplicate {tag}"),
+        client_id,
+    )
+    .await;
+    let partner = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("r11 merge partner {tag}"),
+        other_client,
+    )
+    .await;
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/dedup"),
+        &token,
+        serde_json::json!({"canonical_id": canonical}),
+    )
+    .await;
+    assert_eq!(status, 200, "the caller marks its own duplicate: {b}");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+        &mut conn,
+        &[canonical, partner],
+        &format!("r11 merged by another agent {tag}"),
+        0.5,
+        epigraph_db::repos::claim::ConsolidateMode::Merge,
+        "merge",
+        other,
+    )
+    .await
+    .expect("another agent merges the canonical")
+    .merged_id;
+    epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+        &mut conn,
+        merged,
+        &[canonical, partner],
+    )
+    .await
+    .expect("edge migration");
+    drop(conn);
+
+    let (status, b) = post(
+        &addr,
+        format!("/api/v1/claims/{dup}/undedup"),
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 403, "{b}");
+    assert!(
+        b.to_string().contains(&merged.to_string()),
+        "the refusal names the merged claim the reversal would act on: {b}"
+    );
+    assert_eq!(dup_state(&pool, dup).await, (Some(canonical), false));
+    let in_force: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'same_as' \
+            AND valid_to IS NULL",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edge");
+    assert_eq!(in_force, 1, "the identity edge is still in force");
+    assert_eq!(undedup_rows_for(&pool, dup).await, 0, "no un-mark recorded");
+}
