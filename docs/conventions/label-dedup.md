@@ -341,12 +341,19 @@ included.
   extra id, where the canonical is.
 - It reads through the caller's viewer, as the plan does. An unreadable
   canonical is listed in `missing`.
-- Each duplicate carries its `agent_id`. Unlike the plan, the view does not
-  leave out a duplicate of another owner: a reader that takes dates from it
-  should do the same.
+- Each duplicate carries its `agent_id`. Like the plan, the view leaves out a
+  duplicate whose author has another owner than the canonical's, and lists it
+  in `foreign_duplicates_ignored` (`{canonical, id}`), so a reader that takes
+  dates from the view cannot be moved by a stranger's mark. The plan and the
+  view share one owner check. `same_owner_only: false` returns every
+  duplicate (and an empty `foreign_duplicates_ignored`). The owner rule runs
+  after the `max_claims` cap.
 - It takes any claim ids; it does not check the index-family allowlist.
 - `max_claims` caps the duplicates read; `truncated` reports a read that hit
-  the cap.
+  the cap, or a chain deeper than the walk follows (16 marks,
+  `MAX_DUPLICATE_CHAIN_DEPTH`). The duplicates past that depth are not
+  returned. The plan reports the same as `coverage.truncated`, so apply
+  refuses it.
 
 ## `probe_label_dedup` (claims:read)
 

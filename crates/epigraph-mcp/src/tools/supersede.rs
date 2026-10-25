@@ -26,6 +26,9 @@ pub async fn supersede_claim(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let old = parse_uuid(&params.claim_id)?;
+    // The replacement's size cap, before the act's transaction opens: a refusal
+    // leaves the old claim current.
+    crate::tools::claims::check_claim_content_length(&params.content)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
     // The gate read, the authority decision and the stamped transaction the
@@ -56,7 +59,12 @@ pub async fn supersede_claim(
         &params.reason,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| match e {
+        // Readable as current but not retirable by this session: a denial of
+        // authority (INVALID_REQUEST), with nothing written.
+        e @ epigraph_db::DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
+        other => internal_error(other),
+    })?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Supersede,

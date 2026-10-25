@@ -426,6 +426,7 @@ async fn main() {
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
+            .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
@@ -740,6 +741,31 @@ async fn main() {
     tracing::info!("Server listening on {}", addr);
 
     axum::serve(listener, app).await.expect("Server error");
+}
+
+/// `EPIGRAPH_BP_APPLY`, read once at boot: whether `POST /api/v1/bp/propagate`
+/// may write its results (`epigraph_api::state::BpApply`). BP apply is retired
+/// and OFF by default; logged when ON, so a journal shows which processes were
+/// armed.
+#[cfg(feature = "db")]
+fn bp_apply_from_env() -> epigraph_api::state::BpApply {
+    use epigraph_api::state::{BpApply, BP_APPLY_ENV};
+    let raw = std::env::var(BP_APPLY_ENV).ok();
+    if BpApply::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_BP_APPLY is set to a value that is neither `on` nor `off`: BP apply stays \
+             OFF on this process (only `on` enables it)"
+        );
+    }
+    let switch = BpApply::parse(raw.as_deref());
+    if switch == BpApply::On {
+        tracing::warn!(
+            "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \
+             claims (BP apply is retired; compounds are never written)"
+        );
+    }
+    switch
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

@@ -128,7 +128,10 @@ impl AtomFoldMode {
 }
 
 /// Read one switch from the environment ([`flag_value`]).
-fn read_flag<T: Default + std::fmt::Debug>(env: &str, parse: fn(&str) -> Option<T>) -> T {
+pub(crate) fn read_flag<T: Default + std::fmt::Debug>(
+    env: &str,
+    parse: fn(&str) -> Option<T>,
+) -> T {
     flag_value(env, std::env::var(env).ok().as_deref(), parse)
 }
 
@@ -391,9 +394,10 @@ pub async fn atom_axiom_rows_under(
     ctx: &FramedBeliefContext,
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
+    let kept = select_atom_rows(&mut *conn, viewer, ids, mode, compound_source_edges).await?;
     let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
-    for r in read_rows(conn, viewer, ids, mode, ctx, compound_source_edges).await? {
-        out.entry(r.axiom.atom_id).or_default().push(r.axiom);
+    for row in key_and_discount(conn, viewer, kept, ctx).await? {
+        out.entry(row.atom_id).or_default().push(row);
     }
     Ok(out)
 }
@@ -458,28 +462,32 @@ pub async fn atom_drift_rows(
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<HashMap<Uuid, Vec<DriftRow>>, String> {
     let ctx = FramedBeliefContext::global();
-    let rows = read_rows(
+    let kept = select_atom_rows(
         &mut *conn,
         viewer,
         ids,
         AxiomMode::Display,
-        &ctx,
         compound_source_edges,
     )
     .await?;
-    let stored: Vec<epigraph_db::MassFunctionRow> = rows.iter().map(|r| r.stored.clone()).collect();
+    let stored: Vec<epigraph_db::MassFunctionRow> =
+        kept.iter().map(|(r, _, _)| r.row.clone()).collect();
+    // In input order, one per kept row: aligned with `stored`.
+    let rows = key_and_discount_two_sided(&mut *conn, viewer, kept, &ctx).await?;
     let keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &stored)
         .await
         .map_err(|e| format!("evidence source_url read: {e}"))?;
+    debug_assert_eq!(rows.len(), stored.len());
+    debug_assert_eq!(keys.len(), stored.len());
     let mut out: HashMap<Uuid, Vec<DriftRow>> = HashMap::new();
-    for (r, legacy_key) in rows.into_iter().zip(keys) {
-        out.entry(r.axiom.atom_id).or_default().push(DriftRow {
-            frame_id: r.stored.frame_id,
-            perspective_id: r.stored.perspective_id,
-            attributed: r.stored.combination_method.as_deref()
+    for (((axiom, two_sided_bba), stored), legacy_key) in rows.into_iter().zip(stored).zip(keys) {
+        out.entry(axiom.atom_id).or_default().push(DriftRow {
+            frame_id: stored.frame_id,
+            perspective_id: stored.perspective_id,
+            attributed: stored.combination_method.as_deref()
                 == Some(crate::source_dependence::ATTRIBUTED_METHOD),
-            axiom: r.axiom,
-            two_sided_bba: r.two_sided_bba,
+            axiom,
+            two_sided_bba,
             legacy_key,
         });
     }
@@ -568,25 +576,20 @@ pub fn drift_scope_fold(
     atom_fold(&axioms).map(Some)
 }
 
-/// One kept row of [`read_rows`]: the [`AxiomRow`] the fold reads, plus what
-/// the drift decomposition needs to fold it the ways the fold does not.
-struct ReadRow {
-    axiom: AxiomRow,
-    /// The stored row.
-    stored: epigraph_db::MassFunctionRow,
-    /// Discounted by the same α, WITHOUT the one-sided read of a positive
-    /// compound-source edge row (equal to `axiom.bba` on every other row).
-    two_sided_bba: MassFunction,
-}
-
-/// The pipeline behind [`atom_axiom_rows_under`] and [`atom_drift_rows`],
-/// in row order. See [`atom_axiom_rows_under`] for the steps.
-async fn read_rows(
+/// Steps 1 to 4 of [`atom_axiom_rows_under`] (see there): the stored rows
+/// some fold of `ids` reads under `mode` and `compound_source_edges`, each
+/// classified and coarsened by [`read_rows`], in row order, not yet
+/// discounted or keyed. [`atom_axiom_rows_under`] and [`atom_drift_rows`]
+/// both select through this, so the drift decomposition reads exactly the
+/// rows the single atom-cache writer folds.
+///
+/// # Errors
+/// A database read.
+async fn select_atom_rows(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     ids: &[Uuid],
     mode: AxiomMode,
-    ctx: &FramedBeliefContext,
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<Vec<ReadRow>, String> {
     let inputs = atom_input_rows(&mut *conn, viewer, ids, CLAIM_VALIDITY_FRAME_ID)
@@ -599,26 +602,12 @@ async fn read_rows(
     // Step 1, the class of each row, and its coarsening. A row that cannot be
     // read is skipped (and logged) here, before the seed rule, so it is no
     // input and never fails another row or another atom of the batch.
-    let binary = binary_frame()?;
-    let mut kept: Vec<(AtomInputRow, AxiomClass, MassFunction)> = inputs
-        .into_iter()
-        .filter(reads_this_side_of_promotion)
-        .filter_map(|r| match coarsen_to_binary(&r, &binary) {
-            Ok(coarse) => {
-                let class = classify(&r);
-                Some((r, class, coarse))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    row = %r.row.id,
-                    claim = %r.row.claim_id,
-                    error = %e,
-                    "atom fold: skipping a stored BBA it cannot read"
-                );
-                None
-            }
-        })
-        .collect();
+    let mut kept: Vec<ReadRow> = read_rows(
+        inputs
+            .into_iter()
+            .filter(reads_this_side_of_promotion)
+            .collect(),
+    )?;
 
     // Step 2: compound-source edge rows. Under `Excluded` none is read.
     if compound_source_edges == CompoundSourceEdges::Excluded {
@@ -663,10 +652,77 @@ async fn read_rows(
     if mode == AxiomMode::Pure {
         kept.retain(|(_, class, _)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
     }
+    Ok(kept)
+}
+
+/// A stored row read for a fold: the row, its class, and its BBA coarsened to
+/// `binary_truth`.
+pub(crate) type ReadRow = (AtomInputRow, AxiomClass, MassFunction);
+
+/// Classify each row and coarsen it to `binary_truth`. A row that cannot be
+/// read is skipped and logged (with its row id): it is no input, so it never
+/// fails another row or another claim of the batch.
+///
+/// # Errors
+/// Only when the `binary_truth` frame itself cannot be built.
+pub(crate) fn read_rows(inputs: Vec<AtomInputRow>) -> Result<Vec<ReadRow>, String> {
+    let binary = binary_frame()?;
+    Ok(inputs
+        .into_iter()
+        .filter_map(|r| match coarsen_to_binary(&r, &binary) {
+            Ok(coarse) => {
+                let class = classify(&r);
+                Some((r, class, coarse))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    row = %r.row.id,
+                    claim = %r.row.claim_id,
+                    error = %e,
+                    "atom fold: skipping a stored BBA it cannot read"
+                );
+                None
+            }
+        })
+        .collect())
+}
+
+/// Discount each read row by α under the lens of `ctx` (each row's own
+/// frame's overrides) and key it by its canonical source, as `viewer` sees
+/// the evidence it cites. A positive compound-source edge row is read
+/// one-sided first. Rows come back in input order.
+///
+/// # Errors
+/// A database read, or a discount that errors.
+pub(crate) async fn key_and_discount(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    kept: Vec<ReadRow>,
+    ctx: &FramedBeliefContext,
+) -> Result<Vec<AxiomRow>, String> {
+    Ok(key_and_discount_two_sided(conn, viewer, kept, ctx)
+        .await?
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect())
+}
+
+/// [`key_and_discount`], each row paired with its BBA discounted by the same
+/// α WITHOUT the one-sided read of a positive compound-source edge row (the
+/// row's own `bba` on every other row), which the drift decomposition folds
+/// at SPEC §10.4 stage (3). Rows come back in input order, one per input.
+///
+/// # Errors
+/// As [`key_and_discount`].
+async fn key_and_discount_two_sided(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    kept: Vec<ReadRow>,
+    ctx: &FramedBeliefContext,
+) -> Result<Vec<(AxiomRow, MassFunction)>, String> {
     if kept.is_empty() {
         return Ok(Vec::new());
     }
-
     // Per-frame reliability overrides, once per frame.
     let mut overrides: HashMap<Uuid, FrameOverrides> = HashMap::new();
     for frame_id in kept
@@ -697,7 +753,7 @@ async fn read_rows(
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
     let no_lens = PerspectiveReliability::default();
-    let mut out: Vec<ReadRow> = Vec::with_capacity(kept.len());
+    let mut out: Vec<(AxiomRow, MassFunction)> = Vec::with_capacity(kept.len());
     for (r, class, two_sided) in kept {
         let one_sided = matches!(
             class,
@@ -745,8 +801,8 @@ async fn read_rows(
             (None, Some(id)) if r.row.evidence_id.is_none() => ItemKey::Evidence(id),
             (None, _) => item_key(&r.row, None, None),
         };
-        out.push(ReadRow {
-            axiom: AxiomRow {
+        out.push((
+            AxiomRow {
                 row_id: r.row.id,
                 atom_id: r.row.claim_id,
                 key,
@@ -755,8 +811,7 @@ async fn read_rows(
                 bba,
             },
             two_sided_bba,
-            stored: r.row,
-        });
+        ));
     }
     Ok(out)
 }
@@ -780,8 +835,9 @@ const HYPOTHESIS_FRAME_NAME: &str = "hypothesis_assessment";
 const PROMOTED_FRAME_NAME: &str = "research_validity";
 
 /// Step 1: a promoted hypothesis reads its promoted copy, any other claim its
-/// assessment; never both.
-fn reads_this_side_of_promotion(r: &AtomInputRow) -> bool {
+/// assessment; never both. A compound's own rows (`compound_belief`) follow
+/// the same rule.
+pub(crate) fn reads_this_side_of_promotion(r: &AtomInputRow) -> bool {
     if r.hypothesis_promoted {
         r.frame_name != HYPOTHESIS_FRAME_NAME
     } else {

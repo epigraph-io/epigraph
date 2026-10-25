@@ -30,6 +30,10 @@ serde_json = { workspace = true }
 # Migration 130: an admin act's args digest (SHA-256 of their canonical text),
 # recomputed by the maintenance CLI and compared with the database's.
 sha2 = { workspace = true }
+# Migration 161: agent prompt-history blobs are zstd frames. `AgentIdentityRepository`
+# compresses a prompt file before registering it and decompresses it on the
+# history read (the database cannot run zstd).
+zstd = { workspace = true }
 
 [features]
 # TEST SUPPORT ONLY: `ScopedPool::connect_downgraded_for_tests`. Enabled by

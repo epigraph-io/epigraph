@@ -72,12 +72,14 @@
 //!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator delete-frames --ids-file frames.txt [--companion-claims-file claims.txt] \
 //!         --reason TEXT [--apply --confirm-delete N]
+//!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
+//!     epigraph-operator list-dcr-clients [--older-than-hours 24]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    delete_frames, elevation, hide, human, legacy, link, passkey, reown, reown_linked, restrict,
-    reverse, system_agent,
+    dcr_sweep, delete_frames, elevation, hide, human, legacy, link, passkey, reown, reown_linked,
+    restrict, reverse, system_agent,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -395,6 +397,11 @@ enum Command {
         /// The lowercase-hex BLAKE3 prompt hash (`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`).
         #[arg(long)]
         agent_system_prompt_hash: Option<String>,
+        /// A keyed identity's 32-byte identity public key, as 64 hex chars
+        /// (`EPIGRAPH_AGENT_IDENTITY_PUBKEY`). The agent must already exist
+        /// (the host's registration creates it); it is never created here.
+        #[arg(long)]
+        identity_pubkey: Option<String>,
         /// The human operator's agent id.
         #[arg(long)]
         operator: Uuid,
@@ -635,6 +642,28 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Revoke every dynamically registered (RFC 7591) client that never
+    /// completed an authorization and is older than the floor. Audited, one
+    /// row per client. Without `--apply`, the change is rolled back.
+    SweepDcrClients {
+        /// Only clients registered more than this many hours ago (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u32,
+        /// Recorded in each audit row.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Commit the revocations and their audit rows.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List every dynamically registered client (any status) with its
+    /// authorization-code count and whether `sweep-dcr-clients` would take it.
+    /// Read-only.
+    ListDcrClients {
+        /// The floor the `sweepable` column is computed for (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u32,
+    },
     /// Arm migration 128's admin-scope switch: from then on every mint strips
     /// the admin-only scopes and every path that hands scopes out refuses
     /// them. Audited. Without `--apply`, the change is rolled back.
@@ -702,6 +731,15 @@ async fn main_inner() -> anyhow::Result<i32> {
     // Refuse a blank switch reason before any connection is made.
     if let Command::ArmAdminScopes(a) | Command::DisarmAdminScopes(a) = &cli.command {
         admin_scopes::validate_reason(&a.reason)?;
+    }
+    // Refuse an age floor that could cut off a first authorization, before
+    // any connection is made.
+    if let Command::SweepDcrClients {
+        older_than_hours, ..
+    }
+    | Command::ListDcrClients { older_than_hours } = &cli.command
+    {
+        dcr_sweep::validate_age(*older_than_hours)?;
     }
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
@@ -1210,11 +1248,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             agent,
             agent_model,
             agent_system_prompt_hash,
+            identity_pubkey,
             operator: op,
             revoke_foreign_writes,
             apply,
         } => {
-            let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
+            let spec = bind::AgentSpec::from_flags(
+                agent,
+                agent_model,
+                agent_system_prompt_hash,
+                identity_pubkey,
+            )?;
             let outcome = bind::run(
                 db.pool(),
                 &mut conn,
@@ -1464,6 +1508,29 @@ async fn main_inner() -> anyhow::Result<i32> {
             };
             let report = delete_frames::run(&mut conn, &opts, &mut stdout).await?;
             Ok(if report.refused.is_empty() { 0 } else { 3 })
+        }
+        Command::SweepDcrClients {
+            older_than_hours,
+            reason,
+            apply,
+        } => {
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome =
+                dcr_sweep::run(&mut conn, older_than_hours, apply, reason.as_deref(), &who).await?;
+            for line in dcr_sweep::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Command::ListDcrClients { older_than_hours } => {
+            let rows = dcr_sweep::census(&mut conn, older_than_hours).await?;
+            if rows.is_empty() {
+                println!("no DCR clients");
+            }
+            for row in &rows {
+                println!("{}", dcr_sweep::describe_census(row));
+            }
+            Ok(0)
         }
         cmd @ (Command::ArmAdminScopes(_) | Command::DisarmAdminScopes(_)) => {
             let (arm, a) = match cmd {

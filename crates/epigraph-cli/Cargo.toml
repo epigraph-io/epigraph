@@ -33,6 +33,13 @@ name = "restore_belief_cache"
 path = "src/bin/restore_belief_cache.rs"
 required-features = ["db"]
 
+# The atom-level belief shadow report (SPEC §10.4): reads only, on a
+# read-only session; writes its files under --out.
+[[bin]]
+name = "belief_shadow_report"
+path = "src/bin/belief_shadow_report.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
@@ -172,6 +179,11 @@ required-features = ["db"]
 [[test]]
 name = "belief_mode_check_bins"
 path = "tests/belief_mode_check_bins.rs"
+required-features = ["db"]
+
+[[test]]
+name = "belief_shadow_report"
+path = "tests/belief_shadow_report.rs"
 required-features = ["db"]
 
 # Runs most of this crate's `db`-gated binaries' `--help`; without `db` their

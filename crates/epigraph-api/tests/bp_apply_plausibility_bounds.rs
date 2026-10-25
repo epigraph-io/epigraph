@@ -201,7 +201,9 @@ async fn cdst_bp_apply_clamps_drifted_plausibility() {
 
     seed_evidential_support_factor(&pool, frame_id, claim_drift, claim_companion).await;
 
-    let (addr, _shutdown) = common::spawn_app(&url).await;
+    // BP apply is retired and refused (409) unless the process runs with
+    // `EPIGRAPH_BP_APPLY=on`; this test audits the write path itself.
+    let (addr, _shutdown) = common::spawn_app_with_bp_apply(&url).await;
     let token = common::test_bearer_token_with_scopes(&["claims:write", "graph:read"]);
 
     let resp = reqwest::Client::new()

@@ -46,9 +46,51 @@ async fn seed(pool: &PgPool) -> Seed {
     .fetch_one(pool)
     .await
     .expect("seed agent");
+    plant_workflow_ingest_agent(pool, agent).await;
     Seed {
         agent,
         world: fixture::world_group(pool).await,
+    }
+}
+
+/// Register `agent` as the `workflow-ingest` system agent (migration 148), the
+/// only author whose `source_type: workflow` root stamp makes a tree
+/// procedural. Planted directly, with triggers off, so the registry's own
+/// definer (which this test does not exercise) is not in the way. One plant
+/// per test database: the role is the registry's primary key.
+async fn plant_workflow_ingest_agent(pool: &PgPool, agent: Uuid) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    let planted = sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'claim-role test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(agent)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    assert_eq!(planted.rows_affected(), 1);
+    tx.commit().await.expect("commit");
+}
+
+/// A second author, NOT the registered system agent, writing into the same
+/// world group as `s`.
+async fn stranger(pool: &PgPool, s: &Seed) -> Seed {
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'claim-role stranger', 'ai', \
+                 ARRAY['test']) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("seed stranger");
+    Seed {
+        agent,
+        world: s.world,
     }
 }
 
@@ -805,12 +847,14 @@ async fn a_workflow_rooted_tree_is_procedural(pool: PgPool) {
     assert_one_spelling(&pool, &all).await;
 }
 
-/// A git-history tree as `ingest_git` writes it (repository root stamped
-/// `source: git-history`, a PR node, a commit) is procedural at every node.
-/// The stamp exempts a tree only from its ROOT: a git-stamped claim under an
-/// ordinary compound stays a compound.
+/// A git-history tree as `ingest_git` writes it (a repository root stamped
+/// `source: git-history`, `node: repo`; a PR node; a commit) is an ORDINARY
+/// compound tree. Its procedural marker is still pending (SPEC §2.1, Q-F1),
+/// and `source` / `node` are caller-set properties (`PATCH
+/// /api/v1/claims/:id` merges them), so no git stamp exempts a tree, not even
+/// one authored by the registered system agent.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
+async fn a_git_history_stamp_exempts_nothing_while_its_marker_is_pending(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let s = seed(&pool).await;
 
@@ -838,30 +882,95 @@ async fn a_git_history_rooted_tree_is_procedural(pool: PgPool) {
     decomposes_to(&pool, repo, pr).await;
     decomposes_to(&pool, pr, commit).await;
 
-    let ordinary = claim(&pool, &s, "ordinary compound").await;
-    let stamped = claim_with(
+    let ids = [repo, pr, commit];
+    let got = roles(&pool, &viewer, &ids).await;
+    assert_eq!(got[&repo], ClaimRole::Compound { spine: false });
+    assert_eq!(got[&pr], ClaimRole::Compound { spine: false });
+    assert_eq!(got[&commit], ClaimRole::Atom);
+
+    assert_one_spelling(&pool, &ids).await;
+}
+
+/// The workflow stamp counts only on a root AUTHORED by the registered
+/// `workflow-ingest` system agent. `source_type` is a caller-set property, so
+/// any other author (a claim created with it, or an ordinary claim patched to
+/// carry it later) would otherwise opt its own tree, and any claim it can
+/// attach beneath that root, out of the atom program. The identical tree
+/// authored by the system agent stays procedural (positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_stamp_by_any_other_author_exempts_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let s = seed(&pool).await;
+    let x = stranger(&pool, &s).await;
+
+    // Created stamped by a stranger.
+    let thesis = claim_with(
         &pool,
-        &s,
-        "git-stamped, not a root",
-        serde_json::json!({"source": "git-history", "node": "pr"}),
+        &x,
+        "stranger's workflow-stamped thesis",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
     )
     .await;
-    let below = claim(&pool, &s, "below the stamped node").await;
-    decomposes_to(&pool, ordinary, stamped).await;
-    decomposes_to(&pool, stamped, below).await;
+    let phase = claim_with(
+        &pool,
+        &x,
+        "stranger's workflow-stamped phase",
+        serde_json::json!({"level": 1, "source_type": "workflow"}),
+    )
+    .await;
+    let leaf = claim(&pool, &x, "leaf under the stranger's tree").await;
+    decomposes_to(&pool, thesis, phase).await;
+    decomposes_to(&pool, phase, leaf).await;
 
-    let ids = [repo, pr, commit, ordinary, stamped, below];
+    // An ordinary root, stamped afterwards the way a properties merge would.
+    let patched = claim(&pool, &x, "ordinary root, stamped later").await;
+    let patched_leaf = claim(&pool, &x, "leaf under the patched root").await;
+    decomposes_to(&pool, patched, patched_leaf).await;
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"source_type\": \"workflow\"}' \
+          WHERE id = $1",
+    )
+    .bind(patched)
+    .execute(&pool)
+    .await
+    .expect("stamp the root afterwards");
+
+    // Positive control: the same shape authored by the system agent.
+    let sys_thesis = claim_with(
+        &pool,
+        &s,
+        "system workflow thesis",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
+    )
+    .await;
+    let sys_leaf = claim(&pool, &s, "leaf under the system thesis").await;
+    decomposes_to(&pool, sys_thesis, sys_leaf).await;
+
+    let ids = [
+        thesis,
+        phase,
+        leaf,
+        patched,
+        patched_leaf,
+        sys_thesis,
+        sys_leaf,
+    ];
     let got = roles(&pool, &viewer, &ids).await;
-    for id in [repo, pr, commit] {
-        assert_eq!(
-            got[&id],
-            ClaimRole::Procedural,
-            "{id} of a git tree is procedural"
-        );
-    }
-    assert!(matches!(got[&ordinary], ClaimRole::Compound { .. }));
-    assert!(matches!(got[&stamped], ClaimRole::Compound { .. }));
-    assert_eq!(got[&below], ClaimRole::Atom);
+    assert_eq!(
+        got[&thesis],
+        ClaimRole::Compound { spine: true },
+        "a stranger's stamped thesis is an ordinary (spine) compound"
+    );
+    assert_eq!(got[&phase], ClaimRole::Compound { spine: true });
+    assert_eq!(
+        got[&leaf],
+        ClaimRole::Atom,
+        "its leaf stays in the atom program"
+    );
+    assert_eq!(got[&patched], ClaimRole::Compound { spine: false });
+    assert_eq!(got[&patched_leaf], ClaimRole::Atom);
+    assert_eq!(got[&sys_thesis], ClaimRole::Procedural);
+    assert_eq!(got[&sys_leaf], ClaimRole::Procedural);
 
     assert_one_spelling(&pool, &ids).await;
 }
@@ -914,7 +1023,7 @@ async fn a_decomposed_lone_commit_is_a_compound_over_its_atoms(pool: PgPool) {
 ///
 /// * `shared`: under a workflow thesis and under an ordinary root.
 /// * `m`: a mid node of a paper (`paper -> section -> m -> atoms`) with a
-///   foreign git repository root attached above it.
+///   foreign workflow-stamped root attached above it.
 ///
 /// The stamped roots themselves stay procedural (calibration: the exemption
 /// is narrowed, not removed).
@@ -938,7 +1047,7 @@ async fn a_node_under_an_ordinary_root_is_not_procedural_whatever_else_is_above_
     decomposes_to(&pool, ordinary, shared).await;
     decomposes_to(&pool, shared, shared_leaf).await;
 
-    // paper -> section -> m -> {a1, a2}, and a foreign repository root -> m
+    // paper -> section -> m -> {a1, a2}, and a foreign stamped root -> m
     let paper = claim_with(&pool, &s, "paper thesis", serde_json::json!({"level": 0})).await;
     let section = claim_with(&pool, &s, "paper section", serde_json::json!({"level": 1})).await;
     let m = claim(&pool, &s, "paragraph").await;
@@ -951,8 +1060,8 @@ async fn a_node_under_an_ordinary_root_is_not_procedural_whatever_else_is_above_
     let foreign = claim_with(
         &pool,
         &s,
-        "foreign repository root",
-        serde_json::json!({"source": "git-history", "node": "repo"}),
+        "foreign workflow root",
+        serde_json::json!({"level": 0, "source_type": "workflow"}),
     )
     .await;
     decomposes_to(&pool, foreign, m).await;

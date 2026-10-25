@@ -91,8 +91,9 @@ deferred, and the replay timer applies it.
 
 - Keep the claim with the most evidence and the best content, not the oldest
   or the newest by default.
-- Pick a CURRENT canonical. `mark_duplicate` does not require one, but marking
-  onto a retired claim makes a chain.
+- Pick a CURRENT canonical. `mark_duplicate` refuses a mark onto a retired
+  claim (nothing is written); a chain is built only by marking a claim that
+  already has duplicates onto a current canonical.
 - Un-mark a chain from the canonical end: first the duplicate whose canonical
   is current. `unmark_duplicate` refuses a duplicate whose canonical is still
   retired.

@@ -2036,4 +2036,89 @@ mod tests {
         );
         assert_eq!(obs.obstruction_kind, ObstructionKind::IgnoranceDrift);
     }
+
+    // ── relationship spelling ─────────────────────────────────────────────
+
+    /// The sheaf pair queries return `edges.relationship` as stored, and
+    /// writers store both `supports` and `SUPPORTS` (likewise the other
+    /// epistemic names). Every consumer passes that string straight to
+    /// `compute_cdst_edge_inconsistency`, so the restriction lookup must fold
+    /// case: an upper- or mixed-case epistemic edge must restrict exactly like
+    /// its lower-case spelling, never as `Neutral` (which would make the edge
+    /// count toward H⁰ but never become an obstruction).
+    #[test]
+    fn test_edge_inconsistency_folds_relationship_case() {
+        let src = EpistemicInterval::new(0.9, 0.9, 0.0);
+        let tgt = EpistemicInterval::new(0.1, 0.2, 0.0);
+        let run = |rel: &str| {
+            compute_cdst_edge_inconsistency(Uuid::nil(), Uuid::nil(), src, tgt, rel, &sci())
+        };
+
+        // Control: a non-epistemic relationship is Neutral, whose expected
+        // interval IS the target. The guard below depends on this.
+        assert_eq!(
+            run("DERIVED_FROM").expected_interval,
+            tgt,
+            "control: an unknown relationship restricts as Neutral (expected = target)"
+        );
+
+        for lower in [
+            "supports",
+            "refutes",
+            "contradicts",
+            "corroborates",
+            "elaborates",
+            "specializes",
+            "generalizes",
+            "frame_validates",
+        ] {
+            let base = run(lower);
+            assert_ne!(
+                base.expected_interval, tgt,
+                "{lower}: the lower-case spelling must not restrict as Neutral, \
+                 otherwise the comparisons below are vacuous"
+            );
+
+            let mut mixed: String = lower.to_string();
+            mixed[..1].make_ascii_uppercase();
+            for spelling in [lower.to_ascii_uppercase(), mixed] {
+                let got = run(&spelling);
+                assert_eq!(
+                    got.expected_interval, base.expected_interval,
+                    "{spelling} must restrict like {lower}"
+                );
+                for (field, a, b) in [
+                    (
+                        "interval_inconsistency",
+                        got.interval_inconsistency,
+                        base.interval_inconsistency,
+                    ),
+                    (
+                        "conflict_component",
+                        got.conflict_component,
+                        base.conflict_component,
+                    ),
+                    (
+                        "ignorance_component",
+                        got.ignorance_component,
+                        base.ignorance_component,
+                    ),
+                    (
+                        "open_world_component",
+                        got.open_world_component,
+                        base.open_world_component,
+                    ),
+                ] {
+                    assert!(
+                        (a - b).abs() < 1e-12,
+                        "{spelling} vs {lower}: {field} {a} != {b}"
+                    );
+                }
+                assert_eq!(
+                    got.obstruction_kind, base.obstruction_kind,
+                    "{spelling} vs {lower}: obstruction kind"
+                );
+            }
+        }
+    }
 }

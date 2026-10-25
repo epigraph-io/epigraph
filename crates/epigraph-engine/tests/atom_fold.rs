@@ -69,6 +69,30 @@ async fn claim(pool: &PgPool, author: Uuid, what: &str) -> Uuid {
     fixture::seed_public_claim(pool, author, &format!("aef {what} {}", Uuid::new_v4())).await
 }
 
+/// Register `agent` as the `workflow-ingest` system agent (migration 148): a
+/// `source_type: workflow` root stamp makes a tree procedural only when that
+/// agent authored the root (`claim_role`). Planted directly, with triggers
+/// off, as `epigraph-db/tests/claim_role.rs` does. One plant per test
+/// database: the role is the registry's primary key.
+async fn plant_workflow_ingest_agent(pool: &PgPool, agent: Uuid) {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    let planted = sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'atom-fold test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(agent)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    assert_eq!(planted.rows_affected(), 1);
+    tx.commit().await.expect("commit");
+}
+
 async fn frame(pool: &PgPool, name: &str, hyps: &[&str]) -> Uuid {
     if let Some(f) = FrameRepository::get_by_name(pool, &fixture::public_viewer(pool).await, name)
         .await
@@ -1932,7 +1956,9 @@ async fn an_aef_write_stores_classification_and_open_world_mass_and_skips_what_i
         "the fold's `~` mass is stored, got {missing:?}"
     );
 
-    let procedural = claim(&pool, author, "workflow root").await;
+    let workflow_ingest = agent(&pool).await;
+    plant_workflow_ingest_agent(&pool, workflow_ingest).await;
+    let procedural = claim(&pool, workflow_ingest, "workflow root").await;
     sqlx::query(
         "UPDATE claims SET properties = properties || '{\"source_type\": \"workflow\"}' \
          WHERE id = $1",

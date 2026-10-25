@@ -72,13 +72,9 @@ const REGISTER: &[(&str, usize)] = &[
     // 6 before U027 deleted assess's discarded "combined result" store, which
     // sat on the input BBA's key and overwrote it.
     ("assess.rs", 5),
-    // 16 before U024 moved `submit_evidence`'s writes onto its stamped
-    // transaction. Of the four gone, the combined system BBA (`store`) was
-    // deleted outright; the `claim_frames` INSERT, the Beta UPDATE and the
-    // global `ScopedBeliefRepository::upsert` are STILL best-effort, under a
-    // SAVEPOINT with the refusal logged, a form this register does not see:
-    // lowered because the `let _ =` writes are gone.
-    ("belief.rs", 12),
+    // `belief.rs` (16, then 12 after U024) is gone: `submit_evidence`'s edges,
+    // perspective/community scoped beliefs and divergence record moved onto
+    // stamped transactions, each under a logged SAVEPOINT (fb9cff66).
     ("challenge.rs", 1),
     ("claims.rs", 3),
     ("community.rs", 1),

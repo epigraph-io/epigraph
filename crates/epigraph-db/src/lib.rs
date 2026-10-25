@@ -83,9 +83,14 @@ pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
+    agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
+    PromptBlobRead, PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot,
+    PromptSnapshotIndex,
+};
+pub use repos::{
     carries_dedup_identity_key, ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken,
     AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow,
-    AlternativeSetRepository, AnalysisRecord, AnalysisRepository, AuthorOperator,
+    AlternativeSetRepository, AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
@@ -106,11 +111,11 @@ pub use repos::{
     GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,
     HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository, InstanceAdminRow,
     KeyEpochRow, LabelFamilyRow, LabelQuery, LearningEventRepository, LearningEventRow,
-    LevelAndSourceType, LineageHead, LineageRepository, MarkedDuplicateRow, MassFunctionRepository,
-    MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow, MethodCapability,
-    MethodEvidenceStrength, MethodFailureModes, MethodForCapability, MethodRecord,
-    MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample, MovedBba,
-    NearestClaimHit, NeighbourhoodThemeCoverage, NewRecallEvent, OAuthClientRepository,
+    LevelAndSourceType, LineageHead, LineageRepository, MarkedDuplicateRow, MarkedDuplicates,
+    MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
+    MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
+    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
+    MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage, NewRecallEvent, OAuthClientRepository,
     OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff,
     PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
     ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,

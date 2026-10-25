@@ -158,6 +158,11 @@ pub fn executor_caller_error(
         e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
             invalid_params(format!("{context}: {e}"))
         }
+        // The pre-flight refused blank claim content (a blank thesis, phase,
+        // step or operation): the caller's payload error, naming the field.
+        e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
+            invalid_params(format!("{context}: {e}"))
+        }
         // A declared-tenancy refusal (the caller, or the system agent, does not
         // write the declared group): a denial, as OPL02 is.
         e if e.is_declared_tenancy_refusal() => McpError {
@@ -266,6 +271,29 @@ mod tests {
             e.message.contains("empty workflow generation")
                 && e.message.contains("weekly-capability-audit")
                 && e.message.contains("Nothing was written"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The executor's pre-flight refusal of blank claim content (a blank
+    /// thesis, phase, step or operation in the caller's payload) is the
+    /// caller's error: INVALID_PARAMS with the executor's text, which names the
+    /// field. As INTERNAL_ERROR it told an agent to retry a payload that can
+    /// never succeed.
+    #[test]
+    fn blank_claim_content_is_invalid_params() {
+        let e = executor_caller_error(
+            "workflow ingest",
+            epigraph_ingest_executor::IngestExecutorError::InvalidContent {
+                path: "phases[0].steps[1]".to_string(),
+            },
+        );
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.starts_with("workflow ingest: ")
+                && e.message
+                    .contains("blank claim content at phases[0].steps[1]"),
             "{}",
             e.message
         );

@@ -8,7 +8,7 @@
 //!
 //! | role | predicate |
 //! |---|---|
-//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'`) or a git-history tree (its repository node: `properties.source = 'git-history'` and `properties.node = 'repo'`); and no root the walk reaches is unstamped |
+//! | [`ClaimRole::Procedural`] | the claim, or an ancestor at most [`ROLE_MAX_DEPTH`] `decomposes_to` hops above it, is a ROOT (no in-force `decomposes_to` in-edge from a current claim), reached over in-force edges from current parents, and stamped as a workflow tree (`properties.source_type = 'workflow'` on a root AUTHORED by the registered `workflow-ingest` system agent; the property alone is caller-set); and no root the walk reaches is unstamped. A git-history tree is not procedural while its marker is pending |
 //! | [`ClaimRole::Rule`] | labelled `rule` AND an in-force `rule_conclusion` out-edge to a current claim |
 //! | [`ClaimRole::Compound`] | an in-force `decomposes_to` out-edge to a current claim |
 //! | [`ClaimRole::Atom`] | an in-force `decomposes_to` in-edge from a current claim, and none out |
@@ -131,23 +131,30 @@ macro_rules! is_decomposed_from {
 }
 
 /// The procedural root stamp, over the `claims` row aliased `$root`: a
-/// workflow tree's root (the workflow builder stamps `source_type: workflow`
-/// on its thesis) or a git-history tree's root, the repository node
-/// `ingest_git` writes (`source: git-history` AND `node: repo`). `ingest_git`
-/// puts `source: git-history` on every claim it writes, commits included, so
-/// the source alone would make a flat commit that `decompose_claims` later
-/// decomposes a procedural root. Never NULL, so its negation is "unstamped" on
-/// a claim with neither stamp.
+/// workflow tree's root, i.e. a claim stamped `source_type: workflow` (the
+/// workflow builder stamps its thesis) AND authored by the registered
+/// `workflow-ingest` system agent (migration 148's `system_agents`).
+///
+/// `properties` is caller-set: `PATCH /api/v1/claims/:id` merges any keys, so
+/// the property alone would let any author opt its own tree, and any claim it
+/// can attach beneath that root, out of the atom program. The author is not
+/// caller-set: the operator binding (migration 122) binds an application
+/// session's author to its caller, and nothing but the workflow ingest path
+/// authors as the system agent.
+///
+/// A git-history tree (`ingest_git`) is NOT procedural until its marker is
+/// ruled (SPEC §2.1, "marker pending"): its `source` / `node` properties are
+/// caller-set too, and no system role writes it. Never NULL, so its negation
+/// is "unstamped" on a claim with no stamp.
 macro_rules! procedural_root_stamp {
     ($root:literal) => {
         concat!(
             "COALESCE(",
             $root,
-            ".properties->>'source_type' = 'workflow' OR (",
+            ".properties->>'source_type' = 'workflow' AND ",
             $root,
-            ".properties->>'source' = 'git-history' AND ",
-            $root,
-            ".properties->>'node' = 'repo'), false)"
+            ".agent_id IN (SELECT role_sa.agent_id FROM system_agents role_sa \
+                            WHERE role_sa.role = 'workflow-ingest'), false)"
         )
     };
 }
@@ -313,7 +320,8 @@ pub enum ClaimRole {
     /// than [`SPINE_LEAF_CAP`] leaves the viewer can see; a spine compound is
     /// served a profile, never a conjunction.
     Compound { spine: bool },
-    /// A node of a workflow or git-history tree: out of scope, today's
+    /// A node of a workflow tree rooted at a claim the registered
+    /// `workflow-ingest` system agent authored: out of scope, today's
     /// behaviour.
     Procedural,
     /// A rule claim (label `rule` and a `rule_conclusion` edge).

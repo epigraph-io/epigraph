@@ -45,6 +45,7 @@
 //! ```
 
 pub mod combination;
+pub mod conjunction;
 pub mod errors;
 pub mod frame;
 pub mod mass;
