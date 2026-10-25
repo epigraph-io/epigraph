@@ -2795,12 +2795,84 @@ async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result
     Ok(1)
 }
 
+/// 166: every public table the application role can write carries the
+/// role-holder write check (`role_agent_write_check`, a BEFORE ... FOR EACH
+/// STATEMENT trigger) on INSERT, UPDATE, DELETE and TRUNCATE, except
+/// `security_events`' INSERT (an actor's own audit record). The migration
+/// installs it on the set it measures when it runs; a table handed to the
+/// application role AFTER that (a later grant, a default privilege, a table
+/// created by hand) carries none, and an attached agent writes it freely in
+/// its role's gap. Skipped on a database without the check (before 166) or
+/// without the application role.
+async fn verify_role_holder_write_check_coverage(pool: &PgPool) -> anyhow::Result<usize> {
+    let applies: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.epigraph_role_agent_write_check()') IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !applies {
+        return Ok(0);
+    }
+    // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32.
+    let uncovered: Vec<(String, i32, i32)> = sqlx::query_as(
+        "WITH writable AS (
+             SELECT c.oid, c.relname::text AS t
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+                AND (has_table_privilege('epigraph_app', c.oid, 'INSERT')
+                     OR has_table_privilege('epigraph_app', c.oid, 'UPDATE')
+                     OR has_table_privilege('epigraph_app', c.oid, 'DELETE')
+                     OR EXISTS (SELECT 1 FROM pg_attribute a
+                                 WHERE a.attrelid = c.oid AND a.attnum > 0
+                                   AND NOT a.attisdropped
+                                   AND (has_column_privilege('epigraph_app', c.oid,
+                                                             a.attnum, 'INSERT')
+                                        OR has_column_privilege('epigraph_app', c.oid,
+                                                                a.attnum, 'UPDATE'))))),
+         covered AS (
+             SELECT t.tgrelid, bit_or(t.tgtype::int & 60) AS bits
+               FROM pg_trigger t
+              WHERE NOT t.tgisinternal AND t.tgenabled <> 'D'
+                AND t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure
+                AND (t.tgtype & 3) = 2
+              GROUP BY 1),
+         judged AS (
+             SELECT w.t, COALESCE(c.bits, 0) AS bits,
+                    CASE WHEN w.t = 'security_events' THEN 56 ELSE 60 END AS needs
+               FROM writable w LEFT JOIN covered c ON c.tgrelid = w.oid)
+         SELECT t, bits, needs FROM judged WHERE bits & needs <> needs ORDER BY t",
+    )
+    .fetch_all(pool)
+    .await?;
+    if uncovered.is_empty() {
+        return Ok(0);
+    }
+    let listed: Vec<String> = uncovered
+        .iter()
+        .map(|(t, bits, needs)| format!("{t} (covers {bits}, needs {needs})"))
+        .collect();
+    eprintln!(
+        "FAIL: {} table(s) the application role can write carry no complete role-holder write \
+         check (migration 166; INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32): {}. An agent \
+         attached to a role writes them freely while no human holds the role. Re-run 166's \
+         trigger-install DO block on the migration DSN (it measures the catalog), or for each: \
+         CREATE TRIGGER role_agent_write_check BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON \
+         public.<table> FOR EACH STATEMENT EXECUTE FUNCTION \
+         public.epigraph_role_agent_write_check().",
+        uncovered.len(),
+        listed.join(", ")
+    );
+    Ok(1)
+}
+
 async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
+    failures += verify_role_holder_write_check_coverage(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL
@@ -3630,5 +3702,62 @@ mod definer_register_tests {
                 "public.{name} is exempt as dropped by {version}, but {recreated:?} name it again"
             );
         }
+    }
+
+    /// `verify`'s 166 coverage check passes on a database migrated to head,
+    /// and fails for a table the application role is handed after the
+    /// migration ran (the deployed-database drift a clean-migrate ratchet
+    /// cannot see) and for a table whose trigger was dropped. CONTROL:
+    /// covering the new table with the trigger passes again.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_an_app_writable_table_without_the_role_holder_write_check(
+        pool: sqlx::PgPool,
+    ) {
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            0,
+            "a database migrated to head is covered"
+        );
+        for stmt in [
+            "CREATE TABLE public.rol_probe_after_166 (id integer)",
+            "GRANT INSERT ON public.rol_probe_after_166 TO epigraph_app",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a table granted to the application role after 166 is reported"
+        );
+        sqlx::query(
+            "CREATE TRIGGER role_agent_write_check \
+             BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.rol_probe_after_166 \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_role_agent_write_check()",
+        )
+        .execute(&pool)
+        .await
+        .expect("cover it");
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            0,
+            "CONTROL: covered, it passes"
+        );
+        sqlx::query("DROP TRIGGER role_agent_write_check ON public.events")
+            .execute(&pool)
+            .await
+            .expect("drop one");
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a table whose trigger was dropped is reported"
+        );
     }
 }
