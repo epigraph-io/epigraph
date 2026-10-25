@@ -713,13 +713,58 @@ async fn the_claims_owner_sets_an_outsiders_challenge_status_and_nothing_else(po
     assert_eq!(audit[0].1["state_before"], "pending");
     assert_eq!(audit[0].1["state_after"], "rejected");
 
-    assert!(
-        edit.is_err(),
-        "the owner cannot edit the outsider's text: {edit:?}"
+    // The audit record is the trustworthy one: the outsider (which owns the
+    // row, and so may rewrite the row's own resolution columns) cannot rewrite
+    // or delete it, nor can the resolver.
+    for agent in [outsider, owner] {
+        let p = pool.clone();
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, agent).await;
+            let _ = sqlx::query(
+                "UPDATE security_events SET agent_id = NULL, details = '{}'::jsonb \
+                  WHERE event_type = 'challenges.claim_owner_resolution'",
+            )
+            .execute(&mut *conn)
+            .await;
+            let _ = sqlx::query(
+                "DELETE FROM security_events \
+                  WHERE event_type = 'challenges.claim_owner_resolution'",
+            )
+            .execute(&mut *conn)
+            .await;
+            (conn, ())
+        })
+        .await;
+    }
+    assert_eq!(
+        resolution_audit(&pool, theirs).await,
+        audit,
+        "no application session rewrites or deletes the resolution audit"
+    );
+
+    let edit = edit.expect_err("the owner cannot edit the outsider's text");
+    assert_eq!(
+        (sqlstate(&edit).as_deref(), edit.to_string()),
+        (
+            Some("42501"),
+            "error returned from database: new row violates row-level security policy for \
+             table \"challenges\""
+                .to_string()
+        ),
+        "the edit is refused by 077's WITH CHECK (the row is the outsider's)"
+    );
+    let reown = reown.expect_err("the owner cannot re-own the outsider's row");
+    assert_eq!(
+        sqlstate(&reown).as_deref(),
+        Some("42501"),
+        "re-owning is refused: {reown}"
     );
     assert!(
-        reown.is_err(),
-        "the owner cannot re-own the outsider's row: {reown:?}"
+        reown.to_string().contains(
+            "epigraph tenancy: an UPDATE of challenges changes owner_group_id or \
+             co_owner_group_id; only a maintenance session re-owns a row"
+        ),
+        "the re-own is refused by 115's owner guard (challenges_owner_immutable): {reown}"
     );
     assert_eq!(
         deleted, 0,
@@ -732,16 +777,29 @@ async fn the_claims_owner_sets_an_outsiders_challenge_status_and_nothing_else(po
     );
 }
 
-/// Only a WRITER of the challenged claim's owning group sets the status, only
-/// to a resolver's state, and an unreadable claim's challenge answers exactly
-/// as a nonexistent id. The outsider itself, a stranger, and a READER member
-/// of the claim's group are refused (42501); `withdrawn` (the challenger's
-/// act) and a state outside the core set are refused (22023); a stranger
-/// asking about a private claim's challenge gets the same error, code and
-/// text, as for a random id. Nothing is written by any refusal, and the same
-/// call by the owner then lands (the refusals were not malformed calls).
+/// THE DEFINER PATH (`epigraph_resolve_challenge`): only a WRITER of the
+/// challenged claim's owning group sets a status through it, only to a
+/// resolver's state, and an unreadable claim's challenge answers exactly as a
+/// nonexistent id. The outsider itself, a stranger, and a READER member of the
+/// claim's group are refused (42501); `withdrawn` (the challenger's act) and a
+/// state outside the core set are refused (22023); a stranger asking about a
+/// private claim's challenge gets the same error, code and text, as for a
+/// random id. Nothing is written by any refusal, and the same call by the
+/// owner then lands (the refusals were not malformed calls).
+///
+/// `resolved` is refused although the ruling's text lists it as an example
+/// status: the schema's vocabulary (`ChallengeState`: pending, under_review,
+/// accepted, rejected, withdrawn) has no `resolved`, and the ruling's
+/// "resolved" is a resolution, i.e. `accepted` or `rejected`.
+///
+/// What this does NOT pin: exclusivity of the resolution columns. The outsider
+/// OWNS its row (R-CH1), so 077 still lets it UPDATE its own row's `state` /
+/// `resolved_by` / `resolved_at` / `resolution_details` by plain SQL; the
+/// ruling is silent on that and it is escalated to the operator. The record
+/// that names the resolver and that no application session can rewrite is the
+/// `security_events` row (see the main arm).
 #[sqlx::test(migrations = "../../migrations")]
-async fn only_a_writer_of_the_claims_group_sets_a_challenges_status(pool: PgPool) {
+async fn only_a_writer_of_the_claims_group_sets_a_status_through_the_definer(pool: PgPool) {
     let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-rs-owner").await;
     let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-rs-out").await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "ch-rs-stranger").await;
@@ -1053,4 +1111,66 @@ async fn an_unreadable_claims_challenge_is_neither_found_nor_waited_on(pool: PgP
         resolution_audit(&pool, theirs).await.is_empty(),
         "a refusal writes no audit record"
     );
+}
+
+/// CR01: a session with groups but NO principal sets no status. It has
+/// nothing to name as the resolver, so the definer refuses before anything
+/// else: the call is stamped with the claim owner's groups (readable and
+/// writable, so CR02 and CR03 would both pass) and an empty principal, which
+/// isolates the principal check. Nothing is written and no audit row exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_without_a_principal_sets_no_challenge_status(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-np-owner").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-np-out").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "no principal").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "no principal").await;
+        (conn, t)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    let before = whole_row(&pool, theirs).await;
+
+    let p = pool.clone();
+    let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("drop the principal, keep the owner's groups");
+        let r =
+            ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, "accepted", None).await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("a principal-less session sets no status");
+    assert_eq!(sqlstate(&e).as_deref(), Some("42501"), "{e}");
+    assert!(
+        e.to_string().contains("CR01"),
+        "refused for the missing principal, not by another check: {e}"
+    );
+    assert_eq!(
+        whole_row(&pool, theirs).await,
+        before,
+        "the row is byte-identical"
+    );
+    assert!(
+        resolution_audit(&pool, theirs).await.is_empty(),
+        "a refusal writes no audit record"
+    );
+
+    let p = pool.clone();
+    let then_owner = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let o =
+            ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, "accepted", None).await;
+        (conn, o)
+    })
+    .await;
+    then_owner.expect("CALIBRATION: the same groups WITH the principal set the status");
+    assert_eq!(resolution(&pool, theirs).await.1, Some(owner));
 }
