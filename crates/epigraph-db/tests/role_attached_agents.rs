@@ -3272,3 +3272,41 @@ async fn under_repeatable_read_the_author_arm_checks_an_attachable_author(pool: 
         );
     }
 }
+
+/// The install covers what THIS database's catalog says the application role
+/// can write when 166 runs, not only the list measured on a clean migrate: a
+/// table granted to `epigraph_app` beforehand, at table level (INSERT) or at
+/// column level only (UPDATE of one column), carries the write check on every
+/// operation once 166 has run.
+#[sqlx::test(migrations = false)]
+async fn a_table_granted_to_the_app_role_before_166_runs_is_covered(pool: PgPool) {
+    migrate(&pool, &up_to_below(166)).await;
+    for stmt in [
+        "CREATE TABLE public.rol_probe_table_grant (id integer)",
+        "GRANT INSERT ON public.rol_probe_table_grant TO epigraph_app",
+        "CREATE TABLE public.rol_probe_column_grant (id integer, note text)",
+        "GRANT UPDATE (note) ON public.rol_probe_column_grant TO epigraph_app",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    migrate(&pool, &up_to_below(167)).await;
+    let covered: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT t.tgrelid::regclass::text, bit_or(t.tgtype::int & 60) FROM pg_trigger t \
+          WHERE t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure \
+            AND (t.tgtype & 3) = 2 \
+            AND t.tgrelid IN ('public.rol_probe_table_grant'::regclass, \
+                              'public.rol_probe_column_grant'::regclass) \
+          GROUP BY 1 ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("triggers");
+    assert_eq!(
+        covered,
+        vec![
+            ("rol_probe_column_grant".to_string(), 60),
+            ("rol_probe_table_grant".to_string(), 60)
+        ],
+        "both tables the catalog hands the application role carry the check on every operation"
+    );
+}
