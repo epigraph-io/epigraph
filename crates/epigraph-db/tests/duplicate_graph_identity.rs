@@ -1325,3 +1325,108 @@ async fn the_unmark_act_holds_the_chain_against_a_concurrent_retirement(pool: Pg
     );
     act.rollback().await.expect("rollback the act");
 }
+
+/// The un-mark act's refusal of `dup`, as text.
+async fn unmark_refusal(pool: &PgPool, dup: Uuid) -> String {
+    let bypass = fixture::bypass(pool).await.1;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::unmark_duplicate_act_conn(&mut conn, &bypass, ClaimId::from_uuid(dup))
+        .await
+        .expect_err("refused")
+        .to_string()
+}
+
+/// A canonical retired since the mark with NO replacement (deprecated) leaves
+/// no current canonical to follow to (operator ruling R-11): the un-mark is
+/// refused, saying so, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_over_a_deprecated_canonical_is_refused(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-deprecated").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 canonical deprecated since").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 its duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("deprecate the canonical");
+
+    let e = unmark_refusal(&pool, dup).await;
+    assert!(
+        e.contains(&format!("supersedes {canonical}"))
+            && e.contains("retired with no replacement")
+            && e.contains("no current canonical"),
+        "{e}"
+    );
+    let (sup, cur): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!((sup, cur), (Some(canonical), false), "nothing written");
+}
+
+/// A canonical with TWO replacements (here a supersession N1, and a
+/// consolidation-shaped replacement N2: `C.supersedes = N2` with N2's
+/// `supersedes` edge) has no single current canonical: the un-mark refuses to
+/// pick one, naming both, and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_over_a_canonical_with_two_replacements_is_refused(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r11-fork").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r11 forked canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r11 its duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark");
+    drop(conn);
+    let n1 = supersede_canonical(&pool, canonical).await;
+    let n2 = fixture::seed_public_claim(&pool, a, "r11 a second replacement").await;
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(n2)
+        .bind(canonical)
+        .execute(&pool)
+        .await
+        .expect("C points at N2, as a consolidation source does");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supersedes')",
+    )
+    .bind(n2)
+    .bind(canonical)
+    .execute(&pool)
+    .await
+    .expect("N2's supersedes edge");
+
+    let e = unmark_refusal(&pool, dup).await;
+    assert!(
+        e.contains("has 2 replacements")
+            && e.contains(&n1.to_string())
+            && e.contains(&n2.to_string())
+            && e.contains("refusing to pick"),
+        "{e}"
+    );
+    let (sup, cur): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!((sup, cur), (Some(canonical), false), "nothing written");
+}
