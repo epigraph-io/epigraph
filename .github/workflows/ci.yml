@@ -21,7 +21,10 @@ jobs:
     # with the MT-C elevation suites (2026-10-05), which would leave a staging
     # stack under 10 minutes of headroom. 120 keeps a hang cut off with a named
     # cause while a real, larger suite still finishes.
-    timeout-minutes: 120
+    # 2026-10-25: 150. With the static checks moved to the `lint` job, `test`
+    # alone took 1h55m on a main-sized tree (#691) and ~111 min of test steps on
+    # a staging-sized one (#690): 120 cut real suites off. 150 still bounds a hang.
+    timeout-minutes: 150
     services:
       postgres:
         image: pgvector/pgvector:pg16
