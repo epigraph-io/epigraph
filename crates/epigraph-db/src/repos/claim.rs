@@ -5280,7 +5280,12 @@ impl ClaimRepository {
     /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
     ///   taken from the previous page with [`LabelCursor::next_page`]. A
     ///   boundary does not drift when rows are inserted or retired between
-    ///   pages, and the database never reads and discards skipped rows.
+    ///   pages, and the sort keeps `limit` rows rather than `limit + offset`.
+    ///   It is not an index seek: there is no `(created_at, id)` index and
+    ///   the predicate is optional (`$7 IS NULL OR ...`), so the planner may
+    ///   still read every matching row (via the labels GIN index) and top-N
+    ///   sort it. A composite index is a follow-up if a re-measure shows the
+    ///   scan itself matters.
     /// - `offset` (compatibility): skip N rows. It still applies when `after`
     ///   is set, but the API surfaces refuse that combination.
     ///

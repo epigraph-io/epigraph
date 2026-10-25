@@ -734,7 +734,7 @@ pub struct QueryClaimsByLabelParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "Skip the first N matching claims (default 0). Kept for compatibility; prefer `after`, which does not re-read skipped rows or drift under concurrent writes. Results are ordered by `(created_at DESC, id DESC)`."
+        description = "Skip the first N matching claims (default 0). Kept for compatibility; prefer `after`, whose page boundaries do not drift under concurrent writes. Results are ordered by `(created_at DESC, id DESC)`."
     )]
     #[serde(default)]
     pub offset: Option<i64>,
