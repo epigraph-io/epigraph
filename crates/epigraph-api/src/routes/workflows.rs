@@ -1750,13 +1750,17 @@ pub async fn evolve_step(
             id: id.to_string(),
         },
         // The repo's refusals are the caller's to act on (backlog 769989ae):
-        // `InvalidData` (an edge_type outside the vocabulary) is a 400,
-        // `Conflict` (superseding a non-current step) a 409, `WriteRefused`
-        // (row security let the caller see the parent but not retire it) a
-        // 403, as `From<DbError>` maps them everywhere else.
-        e @ (epigraph_db::DbError::InvalidData { .. }
-        | epigraph_db::DbError::Conflict { .. }
-        | epigraph_db::DbError::WriteRefused { .. }) => ApiError::from(e),
+        // `InvalidData` (an edge_type outside the vocabulary) is a 400 and
+        // `Conflict` (superseding a non-current step) a 409, as
+        // `From<DbError>` maps them everywhere else. These are the only two
+        // refusals `evolve_step_conn` raises besides `NotFound`. Its other
+        // `InvalidData`, a parent whose stored visibility is outside the
+        // vocabulary, is a data fault but also reads as a 400: the column is
+        // NOT NULL with a CHECK, so it is unreachable unless that constraint
+        // is dropped out of band.
+        e @ (epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::Conflict { .. }) => {
+            ApiError::from(e)
+        }
         e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {
             message: other.to_string(),
