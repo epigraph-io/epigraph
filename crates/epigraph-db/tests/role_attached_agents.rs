@@ -2738,3 +2738,44 @@ async fn an_attachment_before_the_first_registration_aborts_it(pool: PgPool) {
         fresh
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Completion round: the audit trail, the attach/registration race, the undo
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An actor never suppresses its own audit record (077; 123 section 4 keeps
+/// the application role's INSERT on `security_events` for that reason). So an
+/// attached agent in its gap, whose claim write is refused ROL01, still
+/// records its own audit row on the same stamped session. The `platform.`
+/// prefix stays reserved (123), and `security_events` rows stay immutable
+/// (082), so the exemption is INSERT of an ordinary audit row only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agents_own_audit_row_lands_in_its_gap(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    arm(&pool).await;
+
+    let (audit, claim) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, attached, &[h_group]).await;
+        let claim = insert_claim(&mut *conn, attached, h_group).await;
+        let audit = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ('auth.write_refused', $1, false, '{\"probe\": \"166\"}'::jsonb)",
+        )
+        .bind(attached)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        unstamp(&mut conn).await;
+        (conn, (audit, claim))
+    })
+    .await;
+    assert_rol01(&claim, "the attached agent's claim in its gap");
+    assert_eq!(
+        audit.as_ref().ok(),
+        Some(&1),
+        "the attached agent's own audit row lands in its gap: {audit:?}"
+    );
+}
