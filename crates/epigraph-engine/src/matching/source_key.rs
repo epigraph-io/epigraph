@@ -34,7 +34,8 @@ pub struct SourceFilterConfig {
 ///
 /// A non-paper claim (memorize, telemetry, RFP, ...) has no asserting paper,
 /// so `paper_doi` is `None` (`papers.doi` is NOT NULL, so `None` means "no
-/// `paper -asserts-> claim` edge", never "a paper without a DOI"). For such a
+/// `paper -asserts->` edge on the claim or on any `decomposes_to` ancestor",
+/// never "a paper without a DOI"; see [`derive_source_key`]). For such a
 /// claim the authoring agent is the only source signal besides the ingestion
 /// run and derivation root, so two of them by one agent are a restatement,
 /// not independent corroboration. A pair with a paper claim on either side
@@ -59,7 +60,8 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     false
 }
 
-/// Look up a claim's [`SourceKey`] by querying its row and chasing the
+/// Look up a claim's [`SourceKey`] by querying its row, resolving the paper
+/// that asserts it or its nearest `decomposes_to` ancestor, and chasing the
 /// `derived_from` edge chain to a root (acyclic, capped at depth 32).
 pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKey, sqlx::Error> {
     let (agent_id, props): (Uuid, serde_json::Value) =
@@ -80,10 +82,35 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     // provenance would make a claim's own source unresolvable, which is a
     // different and much worse failure than the one retraction exists to fix.
     // No code path retracts an `asserts` edge.
+    //
+    // DECOMPOSITION ANCESTRY. An atom that `decompose_claims` splits out of a
+    // paper-asserted compound gets the parent's `agent_id` and a
+    // `parent -decomposes_to-> atom` edge, but no `asserts` edge of its own
+    // (its derivation link is an evidence row, not a walkable edge). Without
+    // following `decomposes_to` upward, two atoms of different papers by the
+    // ingesting agent would resolve no paper and be dropped as same-agent
+    // non-paper claims, and two atoms of one paper by different agents would
+    // pass as cross-source. So walk the ancestry (capped at depth 32, like
+    // the derivation walk below) and take the nearest asserting paper: a
+    // direct `asserts` edge (depth 0) always wins, so a directly asserted
+    // claim keeps exactly today's DOI. `ORDER BY depth, doi` makes the pick
+    // deterministic for an atom with several parents. The `decomposes_to`
+    // edges are lineage too, so they are not filtered on `valid_to` either.
     let paper_doi = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT p.doi FROM edges e JOIN papers p ON p.id = e.source_id \
-         WHERE e.target_id = $1 AND e.source_type = 'paper' \
-         AND e.relationship = 'asserts' LIMIT 1",
+        "WITH RECURSIVE ancestry(id, depth) AS ( \
+             SELECT $1::uuid, 0 \
+             UNION \
+             SELECT d.source_id, a.depth + 1 \
+             FROM edges d JOIN ancestry a ON d.target_id = a.id \
+             WHERE d.relationship = 'decomposes_to' \
+               AND d.source_type = 'claim' AND d.target_type = 'claim' \
+               AND a.depth < 32 \
+         ) \
+         SELECT p.doi FROM ancestry a \
+         JOIN edges e ON e.target_id = a.id AND e.source_type = 'paper' \
+              AND e.relationship = 'asserts' \
+         JOIN papers p ON p.id = e.source_id \
+         ORDER BY a.depth, p.doi LIMIT 1",
     )
     .bind(claim_id)
     .fetch_optional(pool)
