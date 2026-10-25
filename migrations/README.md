@@ -1508,7 +1508,8 @@ restart.
   live attachment's role is held now (`clock_timestamp()`, READ COMMITTED
   only) by the agent's live-linked human: a statement trigger
   (`role_agent_write_check`) on all 79 tables the application role writes,
-  a `claims` row trigger for the claim's author (any UPDATE or DELETE), and
+  a `claims` row trigger for the claim's author (an UPDATE of anything but
+  the caches the database derives from everyone's evidence, or a DELETE), and
   re-stated 123 `epigraph_require_writer_scope` /
   `epigraph_require_attributable` for a claim INSERT, re-open or
   re-attribution. A privileged session is exempt; a retired author identity
