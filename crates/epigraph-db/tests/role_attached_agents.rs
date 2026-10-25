@@ -3162,3 +3162,47 @@ async fn a_humans_supersede_of_an_attached_agents_claim_is_refused_after_the_end
         "the human's supersede of the attached agent's claim after the end: {refused:?}"
     );
 }
+
+/// A multi-row truth UPDATE in the shape `ClaimRepository::
+/// batch_update_truth_values` issues fails AS A WHOLE when one of its claims
+/// is an attached agent's in that agent's gap (section 3's stated
+/// consequence), and touches nothing. CONTROL: the same batch over two
+/// unattached claims lands both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_batch_truth_update_over_an_attached_agents_claim_fails_whole(pool: PgPool) {
+    const BATCH: &str = "UPDATE claims SET truth_value = CASE id WHEN $1 THEN 0.81 \
+                                                                 WHEN $2 THEN 0.82 END, \
+                                updated_at = NOW() \
+                          WHERE id IN ($1, $2)";
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    attach(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let theirs = insert_claim(&pool, attached, h_group).await.expect("claim");
+    let own = insert_claim(&pool, plain, h_group).await.expect("claim");
+    let own2 = insert_claim(&pool, plain, h_group).await.expect("claim");
+    end_assignment(&pool, assignment).await;
+
+    assert_eq!(
+        run_as(&pool, Some(h), h_group, BATCH, own, own2).await.ok(),
+        Some(2),
+        "CONTROL: the batch over two unattached claims lands both"
+    );
+    let own3 = insert_claim(&pool, plain, h_group).await.expect("claim");
+    assert_rol01(
+        &run_as(&pool, Some(h), h_group, BATCH, own3, theirs).await,
+        "a batch that includes the attached agent's claim, after the end",
+    );
+    let untouched: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(own3)
+        .fetch_one(&pool)
+        .await
+        .expect("truth");
+    assert!(
+        (untouched - 0.5).abs() < 1e-9,
+        "the refused batch touched nothing: {untouched}"
+    );
+}
