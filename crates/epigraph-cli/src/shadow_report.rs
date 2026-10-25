@@ -25,7 +25,7 @@
 //!
 //! * Today: the gate score is the served cache (else `truth_value`),
 //!   `contested` is a live refuting edge, `confirmed` is uncontested and a
-//!   score of at least [`CONFIRMED_SCORE`].
+//!   score of at least [`confirmed_score`].
 //! * An atom with AEF input the viewer can see (P1), whose role the target
 //!   fold covers, gates and ranks on its fold's `BetP`; any other atom keeps
 //!   today's value (a kept cache is served `Legacy`).
@@ -69,8 +69,16 @@ use epigraph_engine::compound_belief::{
 };
 use epigraph_engine::source_dependence::ATTRIBUTED_METHOD;
 
-/// The `confirmed` partition's threshold (SPEC §3.2).
-pub const CONFIRMED_SCORE: f64 = 0.75;
+/// The `confirmed` partition's threshold (SPEC §3.2): the served belief
+/// profile's `gates.confirmed_score` (built-in default 0.75), the same
+/// parameter recall's `confirmed` partition reads, so the report's `today`
+/// replay and recall cannot disagree on what "confirmed" means.
+#[must_use]
+pub fn confirmed_score() -> f64 {
+    epigraph_engine::belief_profile::BeliefProfile::served()
+        .gates
+        .confirmed_score
+}
 /// A recall event's gate when its params carry no `min_truth`.
 pub const DEFAULT_MIN_TRUTH: f64 = 0.3;
 /// The tolerance of the served-versus-fold comparison (SPEC §1.3).
@@ -473,7 +481,7 @@ impl RunSettings {
             owner_preview: opts.owner_preview,
             s0_given: opts.s0.is_some(),
             graph_view_exposure_given: opts.graph_view_exposure.is_some(),
-            confirmed_score: CONFIRMED_SCORE,
+            confirmed_score: confirmed_score(),
             default_min_truth: DEFAULT_MIN_TRUTH,
         }
     }
@@ -554,7 +562,7 @@ impl Cand {
             basis: "served",
             gate: s,
             rank: s,
-            confirmed: !b.contested && s >= CONFIRMED_SCORE,
+            confirmed: !b.contested && s >= confirmed_score(),
             contested: b.contested,
             iv: Interval {
                 bel: b.cache.bel.unwrap_or(s),
@@ -936,7 +944,7 @@ async fn eval_atoms(
                         basis: "axiom",
                         gate: aef.betp,
                         rank: aef.betp,
-                        confirmed: !base.contested && aef.betp >= CONFIRMED_SCORE,
+                        confirmed: !base.contested && aef.betp >= confirmed_score(),
                         contested: base.contested,
                         iv: Interval {
                             bel: aef.bel,
@@ -1094,8 +1102,8 @@ async fn eval_compounds(
         let proven = match leaves {
             [only] => single_evals
                 .get(only)
-                .map_or(view.bel >= CONFIRMED_SCORE, |e| e.strict.confirmed),
-            _ => view.bel >= CONFIRMED_SCORE,
+                .map_or(view.bel >= confirmed_score(), |e| e.strict.confirmed),
+            _ => view.bel >= confirmed_score(),
         };
         let strict = Cand {
             basis: if view.basis == Basis::Profile {
