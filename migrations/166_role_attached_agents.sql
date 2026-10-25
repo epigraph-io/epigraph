@@ -175,11 +175,12 @@
 -- A write the application role makes THROUGH a maintenance-owned definer
 -- into one of these tables meets the trigger too (it reads the session's
 -- principal, not the role). The tables only such definers write, and the
--- application role cannot (`elevation_sessions`, `elevation_tickets`,
--- `elevated_access`, `pending_admin_acts`, `person_authenticators`,
--- `passkey_enrollments`, `revoked_access_tokens`), are PERSON flows:
--- elevation, passkeys, admin acts, token revocation. A person is never
--- attached (ROL02), so no write there is a role agent's.
+-- application role cannot, are not checked: `elevation_sessions`,
+-- `elevation_tickets`, `elevated_access`, `pending_admin_acts`,
+-- `person_authenticators` and `passkey_enrollments` are PERSON flows
+-- (elevation, passkeys, admin acts), and a person is never attached (ROL02);
+-- `revoked_access_tokens` takes a token revocation (any client, an agent
+-- included, may revoke its own token), which only ever takes authority away.
 -- THE REMAINING STATED LIMIT is section 1's: a container that holds the
 -- application DSN can stamp itself as another principal (or as none, for a
 -- table other than `claims`), and nothing here can tell that from the other
