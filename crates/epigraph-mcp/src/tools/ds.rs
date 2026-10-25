@@ -354,13 +354,14 @@ pub async fn submit_ds_evidence(
     // submission. Read this agent's row for the key first, on the same
     // transaction, and report what the write does to it. (The caller's row
     // has an agent, so the cached-combination exclusion never hides it.)
-    let prior = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
+    // The key's prior row is picked by the probe the REST twin shares
+    // (`bba_write_outcome::prior_for`), so the transports agree on it.
+    use epigraph_db::bba_write_outcome::{prior_for, BbaWriteOutcome};
+    let rows = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
         .await
-        .map_err(internal_error)?
-        .into_iter()
-        .find(|row| row.source_agent_id == Some(agent_id) && row.perspective_id == perspective_id);
-    let write_outcome = match &prior {
-        None => "inserted",
+        .map_err(internal_error)?;
+    let write_outcome = match prior_for(&rows, Some(agent_id), perspective_id) {
+        None => BbaWriteOutcome::Inserted,
         Some(row)
             if restates_bba(
                 row,
@@ -370,24 +371,24 @@ pub async fn submit_ds_evidence(
                 stored_locality_tag,
             ) =>
         {
-            "unchanged"
+            BbaWriteOutcome::Unchanged
         }
-        Some(_) => "replaced",
+        Some(_) => BbaWriteOutcome::Replaced,
     };
     match write_outcome {
-        "unchanged" => warnings.push(
+        BbaWriteOutcome::Unchanged => warnings.push(
             "this BBA is identical to the one this agent already stored for this claim, frame \
              and perspective_id; it is stored once and was not combined again, so the belief \
              did not move on its account."
                 .to_string(),
         ),
-        "replaced" => warnings.push(
+        BbaWriteOutcome::Replaced => warnings.push(
             "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
              perspective_id (same mass_function_id); it was not added beside it. To add \
              independent evidence, submit it under a distinct perspective_id."
                 .to_string(),
         ),
-        _ => {}
+        BbaWriteOutcome::Inserted => {}
     }
     let mf_id = MassFunctionRepository::store_with_perspective(
         &mut *tx,
@@ -579,8 +580,8 @@ pub async fn submit_ds_evidence(
         mass_on_missing,
         bba_count: bba_count as i64,
         method_used: method_name,
-        write_outcome: write_outcome.to_string(),
-        deduplicated: write_outcome == "unchanged",
+        write_outcome: write_outcome.as_str().to_string(),
+        deduplicated: write_outcome.deduplicated(),
         warnings,
         unknown_keys,
     })
