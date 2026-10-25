@@ -609,25 +609,35 @@ async fn an_elevated_claim_owner_sets_no_challenge_status(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("P's public claim");
-    let theirs: Uuid = sqlx::query_scalar(
-        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
-         VALUES ($1, $2, 'factual_error', 'an outsider objects', 'pending') RETURNING id",
-    )
-    .bind(claim)
-    .bind(outsider)
-    .fetch_one(&pool)
-    .await
-    .expect("the outsider's challenge");
-    sqlx::query(
-        "UPDATE challenges SET owner_group_id = $2, visibility = 'public', writer_owned = true \
-          WHERE id = $1",
-    )
-    .bind(theirs)
-    .bind(outsider_group)
-    .execute(&pool)
-    .await
-    .expect("make it outsider-owned, as 168's attach rule does");
+    // The real attach path: the outsider's own stamped application session
+    // (ScopedPool::acquire_as + epigraph_app), so 168's attach rule makes the
+    // row the outsider's, exactly as a production challenge lands.
     let s = scoped(&pool).await;
+    let outsider_viewer = Viewer::resolve(&pool, outsider)
+        .await
+        .expect("resolve the outsider");
+    let mut conn = app_conn(&s, &outsider_viewer).await;
+    let theirs = epigraph_db::ChallengeRepository::create(
+        &mut *conn,
+        claim,
+        Some(outsider),
+        "factual_error",
+        "an outsider objects",
+    )
+    .await;
+    release(conn).await;
+    let theirs = theirs.expect("the outsider's challenge lands");
+    let (owner, owned): (Uuid, bool) =
+        sqlx::query_as("SELECT owner_group_id, writer_owned FROM challenges WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("read the challenge's tenancy");
+    assert_eq!(
+        (owner, owned),
+        (outsider_group, true),
+        "CALIBRATION: 168's attach rule made the row the outsider's"
+    );
     let live = session(&pool, &p).await;
     let (elevated, plain) = viewers(&pool, &p, live).await;
 
