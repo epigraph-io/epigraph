@@ -3094,3 +3094,262 @@ async fn migration_131_admin_act_reader_is_owned_and_granted(pool: PgPool) {
         assert_eq!(can, expected, "{role} EXECUTE on {signature}");
     }
 }
+
+/// Migration 165 (role-derived group membership): every function it adds or
+/// re-bodies is a SECURITY DEFINER owned by `epigraph_maintenance` with an
+/// explicit ACL that excludes PUBLIC; the application role executes only the
+/// two re-bodied reads it already called (the viewer's group-set read and the
+/// claims-path writer scope), never the derivation, the roster or the
+/// binding verbs; the binding table is SELECT-only for the app (and row
+/// security shows it nothing) and SELECT/INSERT plus the end columns for
+/// maintenance; the one-live-binding index is partial; and the
+/// four guard/audit triggers exist. Pinned here because the harness migrates
+/// as a superuser, so a silently no-opped `OWNER TO` or a PUBLIC grant would
+/// pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_live_memberships",
+            "public.epigraph_live_memberships(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_writer_scope",
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_role_derived_memberships",
+            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_group_role_roster",
+            "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_end_group_role_binding",
+            "public.epigraph_end_group_role_binding(uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_group_role_bindings_guard_insert",
+            "public.epigraph_group_role_bindings_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_group_role_bindings_guard_update",
+            "public.epigraph_group_role_bindings_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_group_role_bindings_refuse_delete",
+            "public.epigraph_group_role_bindings_refuse_delete()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_group_role_bindings_audit",
+            "public.epigraph_group_role_bindings_audit()",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(signature)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("{signature} must exist (migration 165)"));
+        assert!(secdef, "{name} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+
+    for (role, privilege, expected) in [
+        ("epigraph_app", "SELECT", true),
+        ("epigraph_app", "INSERT", false),
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_app", "TRUNCATE", false),
+        ("epigraph_maintenance", "SELECT", true),
+        ("epigraph_maintenance", "INSERT", true),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+        ("epigraph_maintenance", "TRUNCATE", false),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+            .bind(role)
+            .bind("public.group_role_bindings")
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .expect("table privilege");
+        assert_eq!(can, expected, "{role} {privilege} on group_role_bindings");
+    }
+    for (col, expected) in [
+        ("revoked_at", true),
+        ("revoked_by", true),
+        ("revoked_reason", true),
+        ("group_id", false),
+        ("role", false),
+        ("member_role", false),
+        ("include_agents", false),
+        ("reason", false),
+        ("created_at", false),
+        ("created_by", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege('epigraph_maintenance', \
+             'public.group_role_bindings', $1, 'UPDATE')",
+        )
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .expect("column privilege");
+        assert_eq!(
+            can, expected,
+            "maintenance UPDATE of group_role_bindings.{col}"
+        );
+    }
+
+    let (rls, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+          WHERE oid = 'public.group_role_bindings'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row security flags");
+    assert!(
+        rls && forced,
+        "group_role_bindings must ENABLE and FORCE row security"
+    );
+
+    let partial: Option<bool> = sqlx::query_scalar(
+        "SELECT i.indisunique AND i.indpred IS NOT NULL FROM pg_index i \
+           JOIN pg_class c ON c.oid = i.indexrelid \
+          WHERE c.relname = 'group_role_bindings_one_live'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("index lookup");
+    assert_eq!(
+        partial,
+        Some(true),
+        "the one-live-binding-per-(group, role) index must exist, unique and partial"
+    );
+
+    for trigger in [
+        "group_role_bindings_guard_insert",
+        "group_role_bindings_guard_update",
+        "group_role_bindings_refuse_delete",
+        "group_role_bindings_audit",
+    ] {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_trigger t \
+                             WHERE t.tgrelid = 'public.group_role_bindings'::regclass \
+                               AND t.tgname = $1 AND NOT t.tgisinternal)",
+        )
+        .bind(trigger)
+        .fetch_one(&pool)
+        .await
+        .expect("trigger lookup");
+        assert!(
+            present,
+            "trigger {trigger} must exist on group_role_bindings"
+        );
+    }
+}
+
+/// Migration 165's two re-stated functions still carry its arms AT HEAD.
+/// `CREATE OR REPLACE` replaces a body whole, so a later migration that
+/// re-states `epigraph_require_writer_scope` or `epigraph_live_memberships`
+/// from an older body silently drops the role-derived arm: role members lose
+/// the group (fail-closed, but quiet). 165 itself refuses to apply over a
+/// body it was not written from (its precondition block); this pin is the
+/// other order, a re-statement applied after 165. A reconciling migration
+/// keeps every fragment below (and adds its own to this list).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
+    for (signature, fragments) in [
+        (
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            &[
+                // 122's direct arm, checked first.
+                "public.epigraph_operator_writes_group(v_human, p_group)",
+                // 165's derived arm: the writing principal itself, at the
+                // statement's clock.
+                "public.epigraph_role_derived_memberships(p_agent, clock_timestamp())",
+                "d.role = 'writer'",
+            ][..],
+        ),
+        (
+            "public.epigraph_live_memberships(uuid)",
+            &[
+                // 164's verb-made-group conjunct.
+                "did:epigraph:group:%",
+                // 165's derived rows.
+                "public.epigraph_role_derived_memberships(p_agent, now())",
+            ][..],
+        ),
+    ] {
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT p.prosrc FROM pg_proc p WHERE p.oid = to_regprocedure($1)")
+                .bind(signature)
+                .fetch_optional(&pool)
+                .await
+                .expect("pg_proc lookup");
+        let body = body.unwrap_or_else(|| panic!("{signature} must exist"));
+        for fragment in fragments {
+            assert!(
+                body.contains(fragment),
+                "{signature} at head lost {fragment:?}: a later re-statement dropped an arm \
+                 (re-state it from the head body, keeping every delta)"
+            );
+        }
+    }
+}

@@ -217,6 +217,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          only the one revoke.",
     ),
     (
+        "group_role_bindings",
+        "DELETE",
+        "A role-to-group binding (165) is ended by its `revoked_at` stamp, never deleted: \
+         the row is the record that a role conferred a group's membership, from when to \
+         when. The bypass-only INSERT and UPDATE pair stops short of FOR ALL on purpose \
+         (123's role_assignments pair is the template), 165 grants DELETE to nobody, its \
+         update guard admits only the one end, and its delete guard refuses every role.",
+    ),
+    (
         "passkey_enrollments",
         "DELETE",
         "An enrollment ticket (124) is never deleted: it ends by expiring or by its one \
@@ -386,6 +395,7 @@ const PROTECTED: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "group_role_bindings",
 ];
 
 // ===========================================================================
@@ -1556,6 +1566,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              other row still needs 077's attribution arms; an `agent.identity_*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or 161's registration definer.",
+        ),
+        (
+            "security_events_group_roster_privileged",
+            "group.",
+            "164's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 6) <> \
+             'group.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             other row still needs 077's attribution arms; a `group.*` row needs one of the two \
+             session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the \
+             maintenance session or one of 164's team-group definers.",
         ),
     ];
 

@@ -1493,6 +1493,123 @@ restart.
   been applied. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
+- **164**: public `keyless_team_group_verbs`. Relaxes `groups_public_key_shape`
+  (060) so a `kind = 'team'` group may carry 0 OR 32 key bytes (keyed groups
+  stay valid), reserves the `group.` `security_events` family to a privileged
+  session or definer frame (RESTRICTIVE insert policy
+  `security_events_group_roster_privileged`, the 123/148 shape), and adds four
+  SECURITY DEFINERs owned by `epigraph_maintenance`, EXECUTE revoked from
+  PUBLIC and `epigraph_app` and granted to the maintenance role only:
+  `epigraph_create_team_group(text, uuid, text)`,
+  `epigraph_team_group_add_member(uuid, uuid, text, text)`,
+  `epigraph_team_group_remove_member(uuid, uuid, text)` and
+  `epigraph_team_group_set_member_role(uuid, uuid, text, text)`. A created
+  group is keyless (empty `public_key`, no `group_key_epochs` row, empty
+  shares, `did_key = did:epigraph:group:<id>`) and its creator and first admin
+  is a registered human operator. Because a maintenance session switches off
+  109's and 122's membership triggers, each verb restates the rules in its
+  body, armed or not: SQLSTATE `GRP01` (an admin must be a Person), `GRP02`
+  (the last live admin stays, decided under the `groups` row lock), `GRP03`
+  (an operated agent is a member, at any role, only where its operator writes;
+  an operator is not removed or demoted to reader under its live agents),
+  `GRP04` (a member must belong to a live human operator: unbound and
+  retired-linked agents are refused), `GRP05` (member verbs act only on
+  active team groups in the verbs' `did:epigraph:group:` namespace) and
+  `GRP06` (one active verb-made team group per normalised name; the refusal
+  names the holder). `GRP02` counts only admins that are still registered
+  humans, decided under a `FOR NO KEY UPDATE` lock on the `groups` row.
+  Removal is a revoke; a re-add inserts a new row at the next epoch, so a
+  revoked row is never revived. One `group.*` audit row per applied act, with
+  the CLI's process context under `actor` (read from the transaction-local
+  `epigraph.operator_actor`, via the invoker `epigraph_team_group_actor()`).
+  The verbs are the ONLY writer of a verb-made group: the definer trigger
+  `group_memberships_team_roster_verbs_only` (owned by maintenance) and the
+  invoker triggers `groups_team_verbs_only_insert` / `_update` refuse (42501)
+  every non-maintenance write to such a group's roster or row, and any new
+  keyless team group, whatever principal the session is stamped as (so the
+  REST remove route is refused on these groups too). It also re-states 077's
+  `epigraph_live_memberships(uuid)`: a verb-made group's live row counts in a
+  viewer's group set only while the member still belongs to a registered
+  human operator, so a revoked allowance or registration ends claim access at
+  the next resolve without a write (REST group routes that read the roster
+  table directly still see the row until it is removed). Callers: `epigraph-operator create-group` and
+  `group-member add|remove|set-role`. Pinned by
+  `epigraph-db/tests/team_group_verbs.rs` and
+  `epigraph-cli/tests/operator_team_group.rs`; registered in
+  `tenancy_backfill.rs` (definer register, grant list, the invoker exemption,
+  and `epigraph_live_memberships` moved out of the frozen pre-register list),
+  `locked_decisions.rs` (call needles) and `rls_enforcement.rs` (the policy's
+  row-only arm). Undo in the file's header. Slot: 164 is free on `main`
+  (highest 163) and in every open PR; a non-PR remote branch carries 166, so
+  166 is not free to take. **Deploy
+  order:** none against other migrations or the binaries (new functions,
+  triggers that only touch groups no binary creates, a widened CHECK, and a
+  re-stated `epigraph_live_memberships` whose signature and answers for every
+  existing group are unchanged). The CLI subcommands need the migration
+  applied. **Deploy precondition:** confirm the deployed `groups` table
+  carries 060's `groups_public_key_shape` (the re-added, looser CHECK then
+  validates trivially); if it does not, count the rows the new CHECK would
+  refuse before applying. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
+- **165**: public `group_role_membership`. Group membership DERIVED from 123's
+  time-windowed role assignments. Adds `group_role_bindings (group_id, role,
+  member_role reader|writer, include_agents, reason, created_*, revoked_*)`:
+  ENABLE+FORCE row security (read by a privileged session or a
+  maintenance-owned definer frame; written by a maintenance session; no
+  DELETE), the partial unique index `group_role_bindings_one_live`, and four
+  triggers: `_guard_insert` (`GRB01` the role elevates or reads the audit
+  trail; `GRB02` the group is personal, world, seed or not active; recorded
+  live, stamped by the database), `_guard_update` (only an end, once),
+  `_refuse_delete`, and `_audit` (`platform.group_role_bound` /
+  `platform.group_role_unbound`). Three maintenance-only definers:
+  `epigraph_define_group_role(text, text, uuid, text, boolean, text)` (a role
+  node, a catalog row with `elevates`/`reads_audit` forced false, and the
+  binding; `GRB03` on an existing key), `epigraph_bind_group_role(text, uuid,
+  text, boolean, text)` and `epigraph_end_group_role_binding(uuid, text)`. No
+  role or binding is seeded: a fresh database keeps 123's two catalog roles.
+  The derivation `epigraph_role_derived_memberships(uuid, timestamptz)`
+  (maintenance-owned, NOT app-executable): for each live binding, the
+  principal when it holds a live assignment of the role, and (with
+  `include_agents`) an agent whose ACTING live link (107's
+  `epigraph_operator_actor`) or live 149 allowance names such a human.
+  Re-states `epigraph_live_memberships(uuid)` as 164's body UNION the derived
+  rows at `now()` (signature, result, owner and app grant unchanged), and
+  123's `epigraph_require_writer_scope` (OPL02, armed only) to admit, after
+  122's direct test, the WRITING PRINCIPAL's own derived `writer` membership
+  (the viewer's rule, so a retired-linked or deactivated agent of a role
+  holder is refused even with a forged stamp or its OPL01 valve open). 122's
+  `epigraph_operator_writes_group` (the membership door, the team-group
+  verbs) is NOT changed: it stays direct-only so no explicit row can outlive
+  a window. `epigraph_group_role_roster(uuid, timestamptz)` (maintenance only)
+  answers a group's derived members at an instant. Nothing is written for a
+  derived member; a membership lapses at `valid_to` on the next viewer
+  resolution (claim writes, armed: the first statement after it, at
+  `clock_timestamp()`, even inside an older transaction). Callers:
+  `epigraph-operator define-group-role`, `bind-group-role`,
+  `end-group-role-binding`, `group-roster`; `grant-role` now reads the role
+  catalog. Pinned by `epigraph-db/tests/group_role_membership.rs`,
+  `schema_contract.rs::migration_165_role_membership_definers_are_owned_and_granted`
+  and `epigraph-cli/tests/operator_group_role.rs`; registered in
+  `tenancy_backfill.rs`, `locked_decisions.rs` (call needles, request-path
+  read bans, the FORCEd set), `rls_enforcement.rs`, `elevation_arms_census.rs`,
+  `app_role_table_lockdown.rs`, `epigraph_api::state::FORCE_PROTECTED_SET` and
+  `docs/runbooks/079-undo.sql`. Undo in the file's header. **Deploy order:**
+  after 164 (it re-states 164's `epigraph_live_memberships` body). A LATER
+  migration that re-states `epigraph_live_memberships` or
+  `epigraph_require_writer_scope` must start from 165's body, or the derived
+  arm is silently dropped (fail-closed: role members lose the group);
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head` fails if
+  it is. The other order is refused by 165 itself: it checks the md5 of both
+  functions' current bodies against 123's and 164's and RAISEs `55000`
+  (changing nothing) when another migration re-bodied either first, so an
+  out-of-order apply can never drop that migration's delta. A consequence:
+  any edit to 164's `epigraph_live_memberships` body or 123's writer scope
+  body must update 165's expected md5. No binary change is needed for the
+  derivation itself; the CLI subcommands need
+  the migration applied. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
