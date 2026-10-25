@@ -47,10 +47,10 @@
 -- drop-before-create, rerunnable. No data changes. A binary built before this
 -- migration keeps working against it.
 --
--- UNDO: recreate `security_events_read` with 129's body (129's file, the
--- `security_events_read` block, verbatim). Run it BEFORE
--- `docs/runbooks/129-undo.sql` if that is undone too: 129-undo recreates
--- 083's body, which has the unnarrowed own-row arm.
+-- UNDO: `docs/runbooks/169-undo.sql` recreates `security_events_read` with
+-- the body of the migration before 169 that last created it (129 today).
+-- Run it BEFORE `docs/runbooks/129-undo.sql` if that is undone too: 129-undo
+-- recreates 083's body, which has the unnarrowed own-row arm.
 
 SET LOCAL lock_timeout = '3s';
 

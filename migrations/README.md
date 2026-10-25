@@ -1502,11 +1502,12 @@ restart.
   custodians read them through 129's standing arm (unarmed) or elevated
   (armed), and the session arms are unchanged. Pinned by
   `epigraph-db/tests/elevated_arms.rs`
-  (`applied_cascade_rows_are_read_by_custodians_not_by_their_trigger`). Undo
-  in the file's header (129's block; run it before `129-undo.sql`). Slot:
-  164, 165, 166 and 168 are carried by open branches; 169 is free on `main`
-  and on every remote branch. No deploy order. **Applied to throwaway
-  databases only, NOT to any deployed database.**
+  (`applied_cascade_rows_are_read_by_custodians_not_by_their_trigger`) and
+  `epigraph-db/tests/admin_scope_enforcement.rs`
+  (`the_169_upgrade_keeps_legacy_cascade_rows_and_its_undo_restores_the_read`).
+  Undo: `docs/runbooks/169-undo.sql` (run it before `129-undo.sql`). No
+  deploy order. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 
