@@ -813,7 +813,7 @@ impl IngestTx<'_> {
                 author = %agent_id,
                 "{why}"
             );
-            internal_error(format!("{tool_name}: {why}"))
+            crate::errors::internal_error_text(format!("{tool_name}: {why}"))
         };
         // 1. The claims trigger's first question, asked of EVERY author: is it
         //    bound to a registered human operator? OPL01 by name once armed.

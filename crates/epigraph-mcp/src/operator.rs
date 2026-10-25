@@ -79,7 +79,7 @@
 //! ownership of every HTTP caller's claims (either kind), and both are the
 //! failure the listener must not serve through.
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
 use epigraph_db::{
     AgentRepository, AuthorOperator, OperatorLinkOutcome, CLIENT_ALLOWLIST_BINDING,
@@ -282,7 +282,7 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
                 retired = link.retired,
                 "refusing an HTTP tool call: {reason}"
             );
-            Err(internal_error(format!("refused: {reason}")))
+            Err(internal_error_text(format!("refused: {reason}")))
         }
         Err(e) => {
             tracing::error!(
@@ -290,9 +290,9 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
                 error = %e,
                 "refusing an HTTP tool call: could not check the signer's operator link"
             );
-            Err(internal_error(format!(
+            Err(internal_error_text(format!(
                 "refused: could not verify that this HTTP listener's signer agent {agent_id} \
-                 has no operator link: {e}"
+                 has no operator link"
             )))
         }
     }
@@ -310,7 +310,7 @@ async fn refuse_operator_http_signer(
         Ok(true) => {
             let reason = operator_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
-            Err(internal_error(format!("refused: {reason}")))
+            Err(internal_error_text(format!("refused: {reason}")))
         }
         Err(e) => {
             tracing::error!(
@@ -318,9 +318,9 @@ async fn refuse_operator_http_signer(
                 error = %e,
                 "refusing an HTTP tool call: could not check whether the signer is an operator"
             );
-            Err(internal_error(format!(
+            Err(internal_error_text(format!(
                 "refused: could not verify that this HTTP listener's signer agent {agent_id} \
-                 is no agent's operator: {e}"
+                 is no agent's operator"
             )))
         }
     }
@@ -337,12 +337,12 @@ async fn refuse_human_http_signer(
         Ok(b) if b.as_deref() == Some(HUMAN_OPERATOR_BINDING) => {
             let reason = human_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
-            Err(internal_error(format!("refused: {reason}")))
+            Err(internal_error_text(format!("refused: {reason}")))
         }
         Ok(b) if b.as_deref() == Some(CLIENT_ALLOWLIST_BINDING) => {
             let reason = allowlisted_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
-            Err(internal_error(format!("refused: {reason}")))
+            Err(internal_error_text(format!("refused: {reason}")))
         }
         Ok(_) => Ok(()),
         Err(e) => {
@@ -351,9 +351,9 @@ async fn refuse_human_http_signer(
                 error = %e,
                 "refusing an HTTP tool call: could not check whether the signer is a human operator"
             );
-            Err(internal_error(format!(
+            Err(internal_error_text(format!(
                 "refused: could not verify that this HTTP listener's signer agent {agent_id} \
-                 is not a registered human operator: {e}"
+                 is not a registered human operator"
             )))
         }
     }

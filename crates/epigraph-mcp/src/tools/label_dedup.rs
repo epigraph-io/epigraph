@@ -591,7 +591,7 @@ async fn read_family(
     cap: usize,
 ) -> Result<FamilyRead, McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
-        internal_error(
+        crate::errors::internal_error_text(
             "label-dedup reads need a ScopedPool (EpiGraphMcpFull::with_scoped_pool): an \
              unstamped read would silently drop the caller's own group-private rows",
         )
@@ -1030,10 +1030,9 @@ async fn write_check(
             return Ok((writes, unit_check));
         }
     };
-    let scoped = server
-        .scoped
-        .as_ref()
-        .ok_or_else(|| internal_error("label-dedup write_check needs a ScopedPool"))?;
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        crate::errors::internal_error_text("label-dedup write_check needs a ScopedPool")
+    })?;
     let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
     // The act's authority is the write identity's: asked on ITS stamped
     // transaction, which writes nothing and is rolled back.
@@ -1696,10 +1695,9 @@ async fn review_foreign_matches(
         return Ok(verdicts);
     }
     let caller = server.write_identity(auth, viewer).await;
-    let scoped = server
-        .scoped
-        .as_ref()
-        .ok_or_else(|| internal_error("probe_label_dedup needs a ScopedPool"))?;
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        crate::errors::internal_error_text("probe_label_dedup needs a ScopedPool")
+    })?;
     let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
     for v in verdicts.iter_mut().filter(|v| skips(v)) {
         let Some(id) = v.matched_id else { continue };
@@ -1883,10 +1881,9 @@ async fn preflight_unmarks(
     auth: Option<&epigraph_auth::AuthContext>,
     unmarks: &[AppliedMark],
 ) -> Result<(), McpError> {
-    let scoped = server
-        .scoped
-        .as_ref()
-        .ok_or_else(|| internal_error("revert_label_dedup needs a ScopedPool"))?;
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        crate::errors::internal_error_text("revert_label_dedup needs a ScopedPool")
+    })?;
     let mut refused = Vec::new();
     let mut undone_first = std::collections::BTreeSet::new();
     for m in unmarks {
@@ -1962,10 +1959,9 @@ pub async fn label_dedup_index_view(
         .map(|id| parse_id(id))
         .collect::<Result<Vec<_>, McpError>>()?;
     let max = MaxClaims::resolve(server.label_dedup.max_claims_cap, params.max_claims)?;
-    let scoped = server
-        .scoped
-        .as_ref()
-        .ok_or_else(|| internal_error("label_dedup_index_view needs a ScopedPool"))?;
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        crate::errors::internal_error_text("label_dedup_index_view needs a ScopedPool")
+    })?;
     let mut read = scoped.read_as(viewer).await.map_err(db_caller_error)?;
     let mut found = Vec::with_capacity(ids.len());
     let mut missing = Vec::new();

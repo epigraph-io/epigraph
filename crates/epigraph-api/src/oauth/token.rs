@@ -400,7 +400,9 @@ async fn handle_external_grant(
                 ProviderError::JwksFetch(msg) => ApiError::ServiceUnavailable {
                     service: format!("JWKS unavailable: {msg}"),
                 },
-                ProviderError::Upstream(msg) => ApiError::BadGateway { reason: msg },
+                ProviderError::Upstream(msg) => {
+                    crate::oauth::providers::upstream_bad_gateway("external_grant", &msg)
+                }
                 ProviderError::Config(msg) => ApiError::InternalError { message: msg },
             });
         }

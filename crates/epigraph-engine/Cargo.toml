@@ -49,6 +49,7 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true }  # Test claim/edge ID generation
 epigraph-ds = { workspace = true }  # DS types for frame/mass/measures tests
+tracing-test = { version = "0.2", features = ["no-env-filter"] }  # log assertions on library warns
 
 [[bench]]
 name = "engine_benchmarks"

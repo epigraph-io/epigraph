@@ -28,7 +28,9 @@ pub async fn get_workflow_plan(
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
     let scoped = server.scoped.as_ref().ok_or_else(|| {
-        internal_error("get_workflow_plan needs a tenancy-aware pool; this server has none")
+        crate::errors::internal_error_text(
+            "get_workflow_plan needs a tenancy-aware pool; this server has none",
+        )
     })?;
     let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
     let plan = epigraph_ingest_executor::workflow_plan::frozen_plan(&mut read, viewer, workflow_id)

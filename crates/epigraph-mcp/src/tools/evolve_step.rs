@@ -252,9 +252,10 @@ async fn require_lineage_authority(
         epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut *conn, parent)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "evolve_step: could not read the workflows executing the step's lineage: {e}"
-                ))
+                crate::errors::internal_error_logged(
+                    "evolve_step: could not read the workflows executing the step's lineage",
+                    e,
+                )
             })?;
     let mut grants = Vec::with_capacity(workflows.len());
     for workflow in workflows {
