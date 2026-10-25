@@ -1970,3 +1970,94 @@ async fn the_roster_follows_the_window_and_the_binding(pool: PgPool) {
         "derived again"
     );
 }
+
+// =====================================================================
+// Migration 166 re-states the same writer scope after this one.
+// =====================================================================
+
+/// Attach `agent` to `role` on a maintenance session (166's verb), open-ended.
+async fn attach_to_role(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'role membership test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// Migration 166 (role-attached agents) re-states the claims-path writer
+/// scope after this migration, to add its ROL01 line. The body in force at
+/// head must still carry this migration's derived arm, and both deltas must
+/// work together. Armed, with the stamp FORGED to name the group (so the
+/// stamp never decides and the writer scope does), and the role holder having
+/// NO roster row in the group (its write authority there is the derived
+/// membership alone):
+///
+/// * inside the assignment's window, the holder's agent writes into the group
+///   (the derived arm admits it), and so does a second agent of the same
+///   human ATTACHED to the bound role (166's check passes: its human holds the
+///   role now), while an agent of a human without the role is refused OPL02
+///   the same way (so the forged stamp alone admits nothing);
+/// * after `valid_to`, the unattached agent is refused OPL02 by the writer
+///   scope (the derived arm lapsed at the statement's clock) and the attached
+///   one ROL01 (166: no holder now), while the first agent still writes into
+///   its human's personal group (the lapse is scoped to the bound group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_the_head_writer_scope_keeps_the_derived_arm_beside_the_role_holder_check(
+    pool: PgPool,
+) {
+    let (h, personal) = human(&pool, "head-h").await;
+    let a = operated(&pool, h, "head-a").await;
+    let attached = operated(&pool, h, "head-attached").await;
+    let (outsider, _) = human(&pool, "head-outsider").await;
+    let oa = operated(&pool, outsider, "head-outsider-a").await;
+    let (group, _) = bound_group(&pool, "Synthetic Head Scope Team", "writer", true).await;
+    attach_to_role(&pool, ROLE, attached).await;
+    assert!(
+        roster_rows(&pool, group)
+            .await
+            .iter()
+            .all(|(agent, ..)| ![h, a, attached].contains(agent)),
+        "PREMISE: no explicit roster row, so only the derived membership can admit"
+    );
+    arm(&pool).await;
+    grant(&pool, ROLE, h, 0, Some(5)).await;
+
+    write_forged(&pool, a, group)
+        .await
+        .expect("the derived arm admits the holder's agent inside the window");
+    write_forged(&pool, attached, group)
+        .await
+        .expect("an agent attached to the held role writes through the derived arm too");
+    assert_refused(
+        &write_forged(&pool, oa, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "NEGATIVE CONTROL: an agent of a human without the role, same forged stamp",
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the holder's agent after valid_to",
+    );
+    assert_refused(
+        &write_forged(&pool, attached, group).await,
+        "ROL01",
+        "",
+        "the attached agent after valid_to, refused by 166's role-holder check",
+    );
+    write_forged(&pool, a, personal)
+        .await
+        .expect("POSITIVE CONTROL: the agent still writes where its human writes directly");
+}
