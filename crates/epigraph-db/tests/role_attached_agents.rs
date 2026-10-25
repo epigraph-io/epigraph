@@ -888,16 +888,27 @@ async fn rol01_is_named_and_the_repository_asks_may_run(pool: PgPool) {
 // Review round: snapshots, lineage and ownership
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What another connection does, and commits, after a transaction's snapshot
+/// is taken and before its write.
+#[derive(Clone, Copy)]
+enum Between {
+    Nothing,
+    /// End this assignment.
+    End(Uuid),
+    /// Attach this agent to [`ROLE`].
+    Attach(Uuid),
+}
+
 /// One claim by `agent` on an `epigraph_app` connection stamped as `agent`,
 /// inside a transaction at `isolation`. After the transaction's snapshot is
-/// taken, `end_between` (an assignment) is ended on ANOTHER connection and
-/// committed. Always rolled back.
+/// taken, `between` runs on ANOTHER connection and commits. Always rolled
+/// back.
 async fn write_in_txn(
     pool: &PgPool,
     agent: Uuid,
     group: Uuid,
     isolation: &'static str,
-    end_between: Option<Uuid>,
+    between: Between,
 ) -> Result<Uuid, sqlx::Error> {
     let other = pool.clone();
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
@@ -910,8 +921,12 @@ async fn write_in_txn(
             .execute(&mut *conn)
             .await
             .expect("the transaction's snapshot");
-        if let Some(assignment) = end_between {
-            end_assignment(&other, assignment).await;
+        match between {
+            Between::Nothing => {}
+            Between::End(assignment) => end_assignment(&other, assignment).await,
+            Between::Attach(who) => {
+                attach(&other, ROLE, who).await;
+            }
         }
         let r = insert_claim(&mut *conn, agent, group).await;
         sqlx::query("ROLLBACK")
@@ -928,10 +943,11 @@ async fn write_in_txn(
 /// its FIRST snapshot, so an assignment ended (revoked) by a handover after
 /// that snapshot would still read as live for as long as the transaction
 /// stays open: the "run in progress" would keep writing after the end. So an
-/// attached agent writes only under READ COMMITTED (as 123's CUS06 refuses a
-/// grant under REPEATABLE READ). POSITIVE CONTROLS: the same agent writes under
-/// READ COMMITTED, and an unattached agent writes under REPEATABLE READ and
-/// SERIALIZABLE.
+/// agent that COULD be attached (any agent: not a human, not a role node)
+/// writes only under READ COMMITTED, attached or not (as 123's CUS06 refuses
+/// a grant under REPEATABLE READ). POSITIVE CONTROLS: the attached agent
+/// writes under READ COMMITTED, and a human (never attached) writes under
+/// REPEATABLE READ and SERIALIZABLE.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     seed_role(&pool, ROLE).await;
@@ -942,16 +958,20 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     let assignment = grant(&pool, ROLE, h, None).await;
     arm(&pool).await;
 
-    write_in_txn(&pool, attached, h_group, "READ COMMITTED", None)
+    write_in_txn(&pool, attached, h_group, "READ COMMITTED", Between::Nothing)
         .await
         .expect("CONTROL: the holder's agent writes under READ COMMITTED");
     for level in ["REPEATABLE READ", "SERIALIZABLE"] {
-        write_in_txn(&pool, plain, h_group, level, None)
+        write_in_txn(&pool, h, h_group, level, Between::Nothing)
             .await
-            .unwrap_or_else(|e| panic!("CONTROL: an unattached agent writes under {level}: {e}"));
+            .unwrap_or_else(|e| panic!("CONTROL: a human writes under {level}: {e}"));
         assert_rol01(
-            &write_in_txn(&pool, attached, h_group, level, None).await,
+            &write_in_txn(&pool, attached, h_group, level, Between::Nothing).await,
             &format!("an attached agent under {level}"),
+        );
+        assert_rol01(
+            &write_in_txn(&pool, plain, h_group, level, Between::Nothing).await,
+            &format!("an unattached agent under {level} (it may be attached after its snapshot)"),
         );
     }
     // The case the rule exists for: the assignment ends after the snapshot.
@@ -961,11 +981,44 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
             attached,
             h_group,
             "REPEATABLE READ",
-            Some(assignment),
+            Between::End(assignment),
         )
         .await,
         "a REPEATABLE READ run whose holder's assignment ended after its snapshot",
     );
+}
+
+/// The other half of the snapshot rule: an agent ATTACHED after a
+/// transaction's snapshot was taken. Under REPEATABLE READ or SERIALIZABLE the
+/// gate reads `role_agents` through that snapshot, sees no attachment, and
+/// would answer `unattached`; SERIALIZABLE detects nothing either (the attach
+/// reads no row the write writes). So the agent's next write in that
+/// transaction, with nobody holding the role, is refused ROL01.
+/// CONTROL: under READ COMMITTED the same sequence is refused because the
+/// committed attachment is visible; and with no attach in between, the same
+/// unattached agent's READ COMMITTED write lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attachment_committed_after_a_snapshot_still_refuses_the_write(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let late_rc = agent_of(&pool, h, "attached-late-rc").await;
+    let plain = agent_of(&pool, h, "plain").await;
+    arm(&pool).await;
+
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let who = agent_of(&pool, h, &format!("attached-late {level}")).await;
+        assert_rol01(
+            &write_in_txn(&pool, who, h_group, level, Between::Attach(who)).await,
+            &format!("an agent attached after its {level} snapshot, in a gap"),
+        );
+    }
+    assert_rol01(
+        &write_in_txn(&pool, late_rc, h_group, "READ COMMITTED", Between::Attach(late_rc)).await,
+        "CONTROL: under READ COMMITTED the committed attachment is seen",
+    );
+    write_in_txn(&pool, plain, h_group, "READ COMMITTED", Between::Nothing)
+        .await
+        .expect("CONTROL: an unattached agent writes under READ COMMITTED");
 }
 
 /// A detach is final, and a repeat registration naming the same parent does
