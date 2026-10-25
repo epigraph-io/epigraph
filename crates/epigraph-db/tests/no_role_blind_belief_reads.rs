@@ -152,6 +152,9 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-api/src/routes/policies.rs", "resolve_challenge", Tag::Writer("one UPDATE moves a challenged claim's truth_value from its own value; it serves no belief")),
     ("crates/epigraph-api/src/routes/search.rs", "semantic_search", Tag::Todo { pr: "PR-R5", why: "REST /search/semantic maps c.belief / c.plausibility per hit; SPEC §7.2 BeliefView per hit" }),
     // --- epigraph-cli -------------------------------------------------------
+    ("crates/epigraph-cli/src/belief_cache.rs", "read_cache_columns", Tag::Todo { pr: "unassigned", why: "PR-C1's CAS restore reads every listed claim's raw cache columns to compare bit-exact; it must stay role-blind (compound caches are restored too); D5 counts it until the operator rules on snapshot tooling" }),
+    ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::Writer("PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote; it serves no belief")),
+    ("crates/epigraph-cli/src/belief_cache.rs", "write_snapshot", Tag::Todo { pr: "unassigned", why: "PR-C1's snapshot copies every current claim's raw cache columns, compounds included (the compound-cache cleanup NULLs them only after a snapshot); must stay role-blind; D5 counts it until the operator rules" }),
     ("crates/epigraph-cli/src/bin/analyze_graph.rs", "main", Tag::Todo { pr: "unassigned", why: "operator analysis report buckets claims by truth_value; no plan row converts it" }),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", Tag::Todo { pr: "PR-W4", why: "dekg migrate reads claim Pl to bootstrap raw BBAs; SPEC §4.1 W13" }),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", Tag::Todo { pr: "PR-W4", why: "CLI hypothesis prior from neighbours' cached Bel/Pl; SPEC §4.1 W13" }),
