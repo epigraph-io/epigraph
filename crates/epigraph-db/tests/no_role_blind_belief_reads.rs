@@ -56,6 +56,9 @@
 //!   the row type or calls its producer; a row handed to a helper that names
 //!   neither is not seen. Units with the same name in one file share a key.
 //! * Lower-case SQL is not SQL to this scan; the tree has none today.
+//! * A column list assembled at runtime (`format!` over a const array such as
+//!   `CACHE_COLUMN_NAMES`) is not measured as a read, so a unit that reads
+//!   only through such a list measures as write-only.
 
 mod belief_lint;
 
@@ -122,6 +125,10 @@ enum Tag {
     Writer(&'static str),
     /// A reader, converted by the named plan PR.
     Todo { pr: &'static str, why: &'static str },
+    /// A reader that stays role-blind BY DESIGN, on an operator ruling: it
+    /// must read every claim's raw cache columns, compounds included, for a
+    /// bit-exact record or restore. Not D5 debt; the reason names the ruling.
+    ByDesign(&'static str),
 }
 
 /// Every role-blind belief reader (and writer) in the tree today, measured
@@ -152,10 +159,10 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-api/src/routes/policies.rs", "resolve_challenge", Tag::Writer("one UPDATE moves a challenged claim's truth_value from its own value; it serves no belief")),
     ("crates/epigraph-api/src/routes/search.rs", "semantic_search", Tag::Todo { pr: "PR-R5", why: "REST /search/semantic maps c.belief / c.plausibility per hit; SPEC §7.2 BeliefView per hit" }),
     // --- epigraph-cli -------------------------------------------------------
-    ("crates/epigraph-cli/src/belief_cache.rs", "read_cache_columns", Tag::Todo { pr: "unassigned", why: "PR-C1's CAS restore reads every listed claim's raw cache columns to compare bit-exact; it must stay role-blind (compound caches are restored too); D5 counts it until the operator rules on snapshot tooling" }),
-    ("crates/epigraph-cli/src/belief_cache.rs", "restore_scoped", Tag::Todo { pr: "unassigned", why: "PR-C2's CAS restore of a wave's ds_combined_beliefs rows by row id; its probe compares the raw stored columns for the report; must stay role-blind like the snapshot readers; D5 counts it until the operator rules" }),
-    ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::Writer("PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote; it serves no belief")),
-    ("crates/epigraph-cli/src/belief_cache.rs", "write_snapshot", Tag::Todo { pr: "unassigned", why: "PR-C1's snapshot copies every current claim's raw cache columns, compounds included (the compound-cache cleanup NULLs them only after a snapshot); must stay role-blind; D5 counts it until the operator rules" }),
+    ("crates/epigraph-cli/src/belief_cache.rs", "read_cache_columns", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; reads the raw cache columns of listed claims for a bit-exact record (the wave writer's before/after rows that the CAS restore takes as input) and serves no belief")),
+    ("crates/epigraph-cli/src/belief_cache.rs", "restore_scoped", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; PR-C2's compare-and-swap restore of a wave's ds_combined_beliefs rows by row id, whose probe compares the raw stored columns; it serves no belief")),
+    ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::Writer("PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote; its probe compares the stored columns through a format!-built list (see Known limits), operator ruling D5 (2026-10-25): stays role-blind by design; it serves no belief")),
+    ("crates/epigraph-cli/src/belief_cache.rs", "write_snapshot", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; the snapshot copies every current claim's raw cache columns, compounds included (the compound-cache cleanup NULLs them only after a snapshot), so it must be bit-exact")),
     ("crates/epigraph-cli/src/bin/analyze_graph.rs", "main", Tag::Todo { pr: "unassigned", why: "operator analysis report buckets claims by truth_value; no plan row converts it" }),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", Tag::Todo { pr: "PR-W4", why: "dekg migrate reads claim Pl to bootstrap raw BBAs; SPEC §4.1 W13" }),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", Tag::Todo { pr: "PR-W4", why: "CLI hypothesis prior from neighbours' cached Bel/Pl; SPEC §4.1 W13" }),
@@ -522,7 +529,11 @@ fn d5_status() -> (usize, usize) {
         .iter()
         .filter(|(_, _, t)| matches!(t, Tag::Writer(_)))
         .count();
-    (writers, REGISTER.len() - writers)
+    let by_design = REGISTER
+        .iter()
+        .filter(|(_, _, t)| matches!(t, Tag::ByDesign(_)))
+        .count();
+    (writers, REGISTER.len() - writers - by_design)
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +814,18 @@ fn every_entry_is_tagged_with_a_plan_pr_and_a_reason() {
                 bad.push(format!("{path}::{unit}: a Writer needs a reason"));
             }
             Tag::Writer(_) => {}
+            Tag::ByDesign(why) => {
+                if !why.contains("operator ruling") || why.len() <= 40 {
+                    bad.push(format!(
+                        "{path}::{unit}: a ByDesign entry names the operator ruling and its reason"
+                    ));
+                }
+                if !reads {
+                    bad.push(format!(
+                        "{path}::{unit} is tagged ByDesign (a reader) but measures as write-only; tag it Writer"
+                    ));
+                }
+            }
             Tag::Todo { pr, why } => {
                 if !PLAN_PRS.contains(pr) {
                     bad.push(format!(
@@ -822,7 +845,11 @@ fn every_entry_is_tagged_with_a_plan_pr_and_a_reason() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     let (writers, readers) = d5_status();
-    assert_eq!(writers + readers, REGISTER.len());
+    let by_design = REGISTER
+        .iter()
+        .filter(|(_, _, t)| matches!(t, Tag::ByDesign(_)))
+        .count();
+    assert_eq!(writers + readers + by_design, REGISTER.len());
     assert!(
         writers > 0,
         "the cache writers are registered as writers, so D5 has a defined end state"
