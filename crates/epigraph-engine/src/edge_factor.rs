@@ -1704,13 +1704,15 @@ pub async fn vacate_atom_cache(
         return Ok(refused);
     }
     let ctx = crate::belief_query::FramedBeliefContext::global();
+    // The classifier reads the same profile the fold runs under.
+    let thresholds = ctx.profile().classifier.thresholds();
     let written = write_atom_cache(
         conn,
         viewer,
         claim_id,
         &crate::atom_items::EvidencedInterval::unproven(),
         false,
-        &ctx.calibration,
+        &thresholds,
     )
     .await?;
     Ok(VacateOutcome::Vacated { written })
