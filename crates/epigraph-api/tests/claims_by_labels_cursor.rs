@@ -45,7 +45,7 @@ async fn by_labels_cursor_walk_visits_each_row_once_over_http() {
     let mut walked: Vec<String> = Vec::new();
     let mut after: Option<String> = None;
     let mut pages = 0;
-    let mut last_page_len = 0;
+    let mut page_lens: Vec<usize> = Vec::new();
     loop {
         pages += 1;
         assert!(pages <= MAX_PAGES, "cursor walk did not terminate");
@@ -63,7 +63,7 @@ async fn by_labels_cursor_walk_visits_each_row_once_over_http() {
         let rows = body
             .as_array()
             .expect("the body stays the legacy bare JSON array");
-        last_page_len = rows.len();
+        page_lens.push(rows.len());
         walked.extend(rows.iter().map(|r| r["id"].as_str().unwrap().to_string()));
         match next {
             Some(n) => after = Some(n),
@@ -79,8 +79,9 @@ async fn by_labels_cursor_walk_visits_each_row_once_over_http() {
         "following X-Next-Cursor must visit every labelled row once, newest first, ties by id DESC"
     );
     assert_eq!(
-        last_page_len, 1,
-        "the walk ends on the short page, which carries no cursor"
+        page_lens,
+        vec![2, 2, 1],
+        "two full pages carry a cursor; the walk ends on the short page, which carries none"
     );
 }
 
