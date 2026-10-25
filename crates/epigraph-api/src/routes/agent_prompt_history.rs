@@ -424,11 +424,11 @@ pub async fn get_prompt_history_blob(
                 %reason,
                 "a stored prompt file failed verification; withheld"
             );
-            Err(ApiError::InternalError {
-                message: format!(
-                    "prompt history: the stored file {} failed verification and is withheld",
-                    hex::encode(key)
-                ),
+            // Caller-facing by design, so `InternalErrorStatic`: an
+            // `InternalError` body is redacted. The hash is the caller's own
+            // `:hash` and is logged above.
+            Err(ApiError::InternalErrorStatic {
+                message: "prompt history: the stored file failed verification and is withheld",
             })
         }
     }

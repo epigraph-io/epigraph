@@ -87,6 +87,20 @@ impl IntoResponse for RateLimitResponse {
                 .parse()
                 .expect("Numeric retry_after is valid header"),
         );
+        // Never cached. This middleware wraps the whole merged router, so a 429
+        // never passes through the inner routers' layers; on /oauth/* and
+        // /.well-known/* that includes `routes::oauth_response_headers`, whose
+        // no-store / no-cache RFC 6749 section 5.1 requires there. Set here, on
+        // every route's 429: a refusal that a cache replayed would refuse a
+        // client after its window has reopened.
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::PRAGMA,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
 
         response
     }
@@ -408,5 +422,10 @@ mod tests {
 
         assert_eq!(http_response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(http_response.headers().get("Retry-After").unwrap(), "30");
+        assert_eq!(
+            http_response.headers().get("cache-control").unwrap(),
+            "no-store"
+        );
+        assert_eq!(http_response.headers().get("pragma").unwrap(), "no-cache");
     }
 }

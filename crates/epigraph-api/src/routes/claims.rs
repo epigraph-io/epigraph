@@ -68,11 +68,12 @@
 //!
 //! `viewer_route_table_lint.rs::TEST_ONLY_INLINE_READS` still carries
 //! `("claims.rs", 3)` and `ROUTE_LAYER_WRITES` `("claims.rs", 4)`; no inline
-//! statement was relocated by this shard. Two open entries brush this file and
-//! are neither discharged nor worsened by an executor swap —
-//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`) and
-//! `F-get-by-id-conn-duplicates-get-by-id`. Analysis held outside this
-//! repository.
+//! statement was relocated by this shard. One open entry brushes this file and
+//! is neither discharged nor worsened by an executor swap —
+//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`).
+//! Analysis held outside this repository. A second,
+//! `F-get-by-id-conn-duplicates-get-by-id`, is closed: `get_by_id_conn` now
+//! delegates to `get_by_id`, so the reads below that use it run one SQL text.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -801,20 +802,22 @@ pub(crate) async fn create_claim_core(
     };
     let claim_uuid = Uuid::from(created_claim.id);
 
-    // Apply optional content_hash override and properties only when we inserted
-    // a new row. Mutating an existing canonical noun-claim from a different
-    // caller's request would bypass ownership/authorisation checks and can
-    // clobber metadata that another agent set previously. See
+    // Verify the optional content_hash and apply optional properties only when
+    // we inserted a new row. Mutating an existing canonical noun-claim from a
+    // different caller's request would bypass ownership/authorisation checks
+    // and can clobber metadata that another agent set previously. See
     // docs/architecture/noun-claims-and-verb-edges.md §"if_not_exists semantics".
-    if was_created && (request.content_hash.is_some() || request.properties.is_some()) {
-        let content_hash_bytes: Option<Vec<u8>> = if let Some(ref hex_hash) = request.content_hash {
+    if was_created {
+        // `content_hash` is VERIFY-ONLY: it must equal the server-computed
+        // BLAKE3(content) and is never written (the row already carries that
+        // digest). A freshly-created claim can never already be a
+        // compound/parent in a decomposes_to edge at insert time, so this
+        // handler always operates on a non-compound claim.
+        if let Some(ref hex_hash) = request.content_hash {
             let decoded = hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
                 field: "content_hash".to_string(),
                 reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
             })?;
-            // A freshly-created claim can never already be a compound/parent in a
-            // decomposes_to edge at insert time, so this handler always operates
-            // on a non-compound claim: the override must equal BLAKE3(content).
             let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
             if decoded.as_slice() != expected_hash.as_slice() {
                 return Err(ApiError::ValidationError {
@@ -822,41 +825,24 @@ pub(crate) async fn create_claim_core(
                     reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
                 });
             }
-            // Verified equal to the server-computed hash — a no-op for the
-            // UPDATE's COALESCE below either way, so just skip setting it.
-            None
-        } else {
-            None
-        };
+        }
 
-        sqlx::query(
-            "UPDATE claims SET content_hash = COALESCE($1, content_hash), properties = COALESCE($2, properties) WHERE id = $3"
-        )
-        .bind(content_hash_bytes.as_deref())
-        .bind(&request.properties)
-        .bind(claim_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match e {
-            // Post-107: the override sets a content_hash already used by another
-            // row of the same agent. Spec §API surface (line 116) specifies this
-            // surfaces as 409 Conflict from the UPDATE on the
-            // if_not_exists: false path. Pre-107 this branch is unreachable.
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                ApiError::Conflict {
-                    reason: "content_hash override collides with an existing claim for this agent".to_string(),
-                }
-            }
-            other => ApiError::DatabaseError {
-                message: format!("Failed to set content_hash/properties: {other}"),
-            },
-        })?;
+        if let Some(ref properties) = request.properties {
+            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
+                .bind(properties)
+                .bind(claim_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to set properties: {e}"),
+                })?;
+        }
     }
 
     // Apply optional labels within the same transaction.
     //
-    // Guarded on `was_created` for the same reason the content_hash/properties
-    // write above is: on an `if_not_exists` dedup hit this handler returns a row
+    // Guarded on `was_created` for the same reason the properties write above
+    // is: on an `if_not_exists` dedup hit this handler returns a row
     // it did not create, and a caller-supplied label array must not rewrite that
     // row's labels. `policies.rs` uses `'policy:active' = ANY(labels)` as an
     // UPDATE predicate, so an unguarded write here silently detaches a policy
@@ -1482,6 +1468,90 @@ pub async fn list_claims(
         limit: pagination.limit,
         offset: pagination.offset,
     }))
+}
+
+/// Query keys `GET /claims` receives but has no predicate for.
+///
+/// [`PaginationParams`] carries no `deny_unknown_fields`, so each of these
+/// used to be dropped in silence: `?created_after=2999-…` answered the
+/// unfiltered newest-first page with the whole visible corpus as `total`, an
+/// answer that looks filtered and is not. They are the
+/// filters the two endpoints that DO honour them accept, so a caller sending
+/// one plainly meant it. Every other key stays accepted: a blanket
+/// `deny_unknown_fields` would break callers that send harmless extras, and
+/// `agent_id` is accepted-and-ignored for wire compatibility.
+#[cfg(feature = "db")]
+const LEGACY_LIST_UNHONORED_FILTERS: &[&str] = &[
+    "label",
+    "labels",
+    "tags",
+    "exclude_labels",
+    "created_after",
+    "created_before",
+    "date",
+    "truth_min",
+    "truth_max",
+    "is_current",
+    "exclude_agent_id",
+    "sort_by",
+    "sort_order",
+    "content_contains",
+    "methodology",
+    "evidence_type",
+];
+
+/// Refuse the first query key in `unhonored` with a 400 naming it, rather than
+/// let a listing handler drop a filter it cannot apply and answer as if it had.
+///
+/// Reads the raw query string, so it sees keys the typed `Query<…>` struct has
+/// no field for (which is exactly the set it exists to catch).
+#[cfg(feature = "db")]
+pub(crate) fn refuse_unhonored_filters(
+    raw_query: Option<&str>,
+    unhonored: &[&str],
+    hint: &str,
+) -> Result<(), ApiError> {
+    let Some(raw) = raw_query else {
+        return Ok(());
+    };
+    for (key, _) in url::form_urlencoded::parse(raw.as_bytes()) {
+        // `labels[]=x` and `Label=x` are the same intent as `labels=x`; serde
+        // drops them just as silently, so they are refused the same way.
+        let key = key.strip_suffix("[]").unwrap_or(&key).to_ascii_lowercase();
+        if let Some(name) = unhonored.iter().find(|name| **name == key) {
+            return Err(ApiError::ValidationError {
+                field: (*name).to_string(),
+                reason: format!(
+                    "`{name}` is not a filter this endpoint applies, so it would be \
+                     silently ignored. {hint}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The handler `GET /claims` is routed to: [`list_claims`] behind a refusal of
+/// the filters it cannot honour ([`LEGACY_LIST_UNHONORED_FILTERS`]).
+///
+/// A wrapper rather than an extra extractor on `list_claims` itself so that
+/// handler's signature, which tests call directly, is unchanged.
+#[cfg(feature = "db")]
+pub async fn list_claims_route(
+    viewer: crate::middleware::bearer::ViewerExtractor,
+    state: State<AppState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    params: Query<PaginationParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<PaginatedResponse<ClaimResponse>>, ApiError> {
+    refuse_unhonored_filters(
+        raw_query.as_deref(),
+        LEGACY_LIST_UNHONORED_FILTERS,
+        "GET /claims applies only limit, offset, search and group_id. Use GET \
+         /api/v1/claims for time, truth, currency, author and sort filters, or GET \
+         /api/v1/claims/by-labels for label filters.",
+    )?;
+    list_claims(viewer, state, params, auth_ctx).await
 }
 
 /// List claims with pagination (placeholder - no database)

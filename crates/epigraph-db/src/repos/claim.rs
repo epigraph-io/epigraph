@@ -218,6 +218,31 @@ pub struct MarkedDuplicateRow {
 /// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
 pub const MAX_DUPLICATE_CHAIN_DEPTH: i32 = 16;
 
+/// What [`ClaimRepository::marked_duplicates_of`] read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkedDuplicates {
+    /// At most `cap + 1` rows, none deeper than [`MAX_DUPLICATE_CHAIN_DEPTH`].
+    pub rows: Vec<MarkedDuplicateRow>,
+    /// Whether some chain went on past [`MAX_DUPLICATE_CHAIN_DEPTH`]: the
+    /// duplicates beyond it are not in `rows`, so the read is incomplete.
+    pub chain_truncated: bool,
+}
+
+/// One row of the walk behind [`ClaimRepository::marked_duplicates_of`]: the
+/// truncation flag, and a duplicate when there is one (the statement always
+/// returns at least the flag row).
+#[derive(sqlx::FromRow)]
+struct MarkedDuplicateWalkRow {
+    chain_truncated: bool,
+    canonical: Option<Uuid>,
+    id: Option<Uuid>,
+    content: Option<String>,
+    labels: Option<Vec<String>>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    agent_id: Option<Uuid>,
+    canonical_agent_id: Option<Uuid>,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -468,6 +493,13 @@ pub struct LineageHead {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `COALESCE(claims.is_current, true)`. Headship (no incoming
+    /// `supersedes` edge) and `is_current` are independent: a claim retired
+    /// without a supersedes edge (a deprecated workflow's step reused by a
+    /// later generation, a marked duplicate) is still a head, and
+    /// `evolve_step_conn` refuses to supersede it. Flagged, not filtered: a
+    /// sole lineage member would otherwise vanish from the lineage silently.
+    pub is_current: bool,
 }
 
 /// Result of a successful [`ClaimRepository::evolve_step`] call.
@@ -773,6 +805,13 @@ impl DuplicateProvenance {
     }
 }
 
+/// Labels a supersession does NOT carry from the retired claim onto its
+/// replacement ([`ClaimRepository::supersede_act_conn`] carries every other
+/// one). `near-duplicate` is the novelty gate's flag on one submission (its
+/// content was near another claim's); on the replacement, whose content is
+/// new, it would read as pointing at its own predecessor.
+pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -915,6 +954,15 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// Neither direction moves a dedup identity edge
+/// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
+/// [`DUPLICATE_IDENTITY_PROPERTY`]), as [`repair_marked_duplicate`] does not:
+/// it names the claim its duplicate's `supersedes` names, and the un-mark and
+/// the index view read it by that pointer. A duplicate of a canonical that is
+/// later superseded (or consolidated) therefore keeps its edge to the retired
+/// canonical, and stays marked: the un-mark refuses it while that canonical is
+/// retired, and the canonical, retired by another act, has no mark to undo.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -970,6 +1018,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -988,6 +1037,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1087,9 +1137,10 @@ pub struct PatchClaimDiff {
 /// tampered body verified clean.
 ///
 /// Callers that expose or verify crypto state MUST extend their `SELECT` and
-/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly three
-/// do: [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
-/// [`ClaimRepository::get_by_id_with_labels`].
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly two
+/// do: [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`];
+/// [`ClaimRepository::get_by_id_conn`] delegates to the first.
 ///
 /// # The residual set is NOT just the bulk readers
 ///
@@ -1240,6 +1291,74 @@ fn post_fix_crypto_columns(claim: &mut Claim, cols: RowCryptoColumns) -> Result<
     };
 
     Ok(())
+}
+
+/// One claim row as the single-claim readers project it: the seven
+/// `claim_from_row` columns plus the retirement state and the crypto columns
+/// both post-fixes read. Shared by [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`] (and, through delegation,
+/// [`ClaimRepository::get_by_id_conn`]) so the mapping exists once.
+///
+/// Decoded through `query_as` + `FromRow`, never `sqlx::Row::get`: `Row::get`
+/// panics on a missing column or a type mismatch, where a `FromRow` decode
+/// returns `Err` for the same row.
+#[derive(sqlx::FromRow)]
+struct SingleClaimRow {
+    id: Uuid,
+    content: String,
+    truth_value: f64,
+    agent_id: Uuid,
+    trace_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    is_current: bool,
+    supersedes: Option<Uuid>,
+    content_hash: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<Vec<u8>>,
+}
+
+impl SingleClaimRow {
+    /// Build the `Claim` and post-fix it with the row's real retirement state
+    /// (instead of `claim_from_row`'s `is_current = true, supersedes = None`)
+    /// and its stored crypto columns (instead of the recomputed digest and
+    /// blank signature).
+    ///
+    /// # Errors
+    /// * [`DbError::CoreError`] if `truth_value` is outside `[0, 1]`.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    fn into_claim(self) -> Result<Claim, DbError> {
+        let truth_value = TruthValue::new(self.truth_value)?;
+        let mut claim = claim_from_row(
+            self.id,
+            self.content,
+            self.agent_id,
+            self.trace_id,
+            truth_value,
+            self.created_at,
+            self.updated_at,
+        );
+        claim.is_current = self.is_current;
+        claim.supersedes = self.supersedes.map(ClaimId::from_uuid);
+        post_fix_crypto_columns(
+            &mut claim,
+            RowCryptoColumns {
+                content_hash: self.content_hash,
+                signature: self.signature,
+                signer_public_key: self.signer_public_key,
+            },
+        )?;
+        Ok(claim)
+    }
+}
+
+/// [`SingleClaimRow`] plus `claims.labels`, for
+/// [`ClaimRepository::get_by_id_with_labels`].
+#[derive(sqlx::FromRow)]
+struct SingleClaimRowWithLabels {
+    #[sqlx(flatten)]
+    row: SingleClaimRow,
+    labels: Vec<String>,
 }
 
 impl ClaimRepository {
@@ -2938,14 +3057,18 @@ impl ClaimRepository {
     /// body verified clean) and `signature = None` (so the signature check
     /// could never pass).
     ///
-    /// Uses a runtime `query_as` with a local `Row` rather than `sqlx::query!`,
-    /// mirroring [`Self::list`]: the `LEFT JOIN agents` needed to resolve
-    /// `signer_id → public_key` would otherwise require regenerating `.sqlx`,
-    /// which is a serialized, separately owned step in this repo.
+    /// Uses a runtime `query_as` over [`SingleClaimRow`] rather than
+    /// `sqlx::query!`, mirroring [`Self::list`]: the `LEFT JOIN agents` needed
+    /// to resolve `signer_id → public_key` would otherwise require regenerating
+    /// `.sqlx`, which is a serialized, separately owned step in this repo.
+    /// [`Self::get_by_id_with_labels`] decodes the same row type, so the
+    /// mapping and both post-fixes exist once.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
     /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     ///
     /// # Not a `sqlx::query!` macro site any more
     ///
@@ -2972,22 +3095,6 @@ impl ClaimRepository {
     ) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            content: String,
-            truth_value: f64,
-            agent_id: Uuid,
-            trace_id: Option<Uuid>,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-            is_current: bool,
-            supersedes: Option<Uuid>,
-            content_hash: Vec<u8>,
-            signature: Option<Vec<u8>>,
-            signer_public_key: Option<Vec<u8>>,
-        }
-
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -3002,45 +3109,21 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRow>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.truth_value)?;
-                let mut claim = claim_from_row(
-                    row.id,
-                    row.content,
-                    row.agent_id,
-                    row.trace_id,
-                    truth_value,
-                    row.created_at,
-                    row.updated_at,
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults (is_current=true,
-                // supersedes=None).
-                claim.is_current = row.is_current;
-                claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.content_hash,
-                        signature: row.signature,
-                        signer_public_key: row.signer_public_key,
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        row.map(SingleClaimRow::into_claim).transpose()
     }
 
-    /// Fetch only the labels for a single claim. Used by MCP `get_claim` to
-    /// surface labels without re-fetching the whole Claim.
+    /// Fetch only the labels for a single claim.
+    ///
+    /// No production caller remains: MCP and REST `get_claim` read the claim
+    /// and its labels in one statement through [`Self::get_by_id_with_labels`].
+    /// Kept as a test oracle (it answers `[]` for a row the viewer cannot see,
+    /// which several tests rely on).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -3071,8 +3154,15 @@ impl ClaimRepository {
     /// Postgres MVCC, so this is the atomic alternative for callers (e.g. MCP
     /// `get_claim`) that need both together.
     ///
+    /// Decodes through [`SingleClaimRowWithLabels`] (`query_as` + `FromRow`),
+    /// the same row type and post-fixes [`Self::get_by_id`] uses, so a
+    /// drifted column is an `Err` rather than a `sqlx::Row::get` panic.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     #[instrument(skip(executor, viewer))]
     pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -3081,7 +3171,6 @@ impl ClaimRepository {
     ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
         let uuid: Uuid = id.into();
 
-        use sqlx::Row;
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -3096,51 +3185,17 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    truth_value,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, for the same reason. MCP
-                // `get_claim` renders this `content_hash` to the caller as hex
-                // as the claim's stable identity; serving a digest recomputed
-                // from the body there is the same fabrication `verify_claim`
-                // was caught on. (It was also fed to `redact_content` until
-                // PR-14 deleted redaction — a non-visible row is now absent
-                // rather than blanked, so the hex rendering is the only
-                // surviving reader.)
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                let labels: Vec<String> = row.get("labels");
-                Ok(Some((claim, labels)))
-            }
-            None => Ok(None),
-        }
+        // The crypto post-fix matters here as much as in `get_by_id`: MCP
+        // `get_claim` renders this `content_hash` to the caller as hex as the
+        // claim's stable identity, and serving a digest recomputed from the
+        // body there is the same fabrication `verify_claim` was caught on.
+        row.map(|r| Ok((r.row.into_claim()?, r.labels))).transpose()
     }
 
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
@@ -4218,95 +4273,35 @@ impl ClaimRepository {
     /// Get a claim by ID on a caller-supplied connection.
     ///
     /// The connection-taking twin of [`Self::get_by_id`], and — since PR-23 —
-    /// the shape a request handler reaches through `AppState::read_as`. It
-    /// takes the `Viewer` and splices `/* {VISIBILITY:c} */`, so it is
-    /// visibility-equivalent to its pool-taking sibling.
+    /// the shape a request handler reaches through `AppState::read_as`.
     ///
-    /// # It is now FIELD-equivalent too, and it was not before
+    /// Delegates to the generic form, which accepts any executor — `&mut
+    /// PgConnection` included — so the visibility predicate, the projection
+    /// and the retirement / crypto post-fix exist in exactly one SQL text and
+    /// one decode. The same shape as [`Self::list_conn`] and
+    /// [`Self::count_conn`].
     ///
-    /// This function used to select seven columns where `get_by_id` selects
-    /// nine, leaving `claim_from_row`'s defaults (`is_current = true`,
-    /// `supersedes = None`) in place. That is a *widening* default rather than
-    /// a visibility defect — a superseded claim read as current — and it is
-    /// invisible to every gate, because the dropped fields default to plausible
-    /// values instead of erroring. The projection and the post-fix below are
-    /// now the same as `get_by_id`'s, per the `claim_from_row` rule in
-    /// `CLAUDE.md`: extend the caller's `SELECT` and post-fix the `Claim`.
+    /// # Why this is a delegator and not a copy
     ///
-    /// **A `*_conn` sibling is not automatically a drop-in for its pool-taking
-    /// twin.** A conversion shard must diff the projected columns as well as
-    /// the visibility marker.
-    ///
-    /// # …and CRYPTO-equivalent, which is the same argument one column further
-    ///
-    /// Backlog `49c17386` added `content_hash` / `signature` /
-    /// `signer_public_key` to `get_by_id` because `claim_from_row` fabricates
-    /// the first (recomputing it from `content`, so `computed == stored`
-    /// compared a value against itself) and blanks the second. That is the
-    /// identical *widening-default* class the section above names, and leaving
-    /// it here would have made this function a drop-in that silently verifies
-    /// clean. The `LEFT JOIN agents` is why this is a spliced runtime query
-    /// rather than a macro site — see [`Self::get_by_id`].
+    /// It used to be a hand-written second copy of `get_by_id`'s SQL, and that
+    /// copy drifted once already: it projected seven columns where its twin
+    /// projected nine, so a superseded claim read back as current. No gate
+    /// sees that class — `visibility_lint.rs` checks that each SQL text carries
+    /// a marker, never that two texts agree — so the copy is gone rather than
+    /// re-synchronised (backlog `fd47651c`). The reason it was once left as a
+    /// copy (`get_by_id` being a `sqlx::query!` macro site with a fixed bind
+    /// arity) stopped holding when `get_by_id` moved to a spliced runtime
+    /// `query_as`. `tests/get_by_id_conn_delegates_to_get_by_id.rs` pins both
+    /// the delegation and the field-for-field equivalence.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
-    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// As [`Self::get_by_id`].
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<Claim>, DbError> {
-        let uuid: Uuid = id.into();
-
-        use sqlx::Row;
-        let sql = viewer.splice(
-            r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                      c.created_at, c.updated_at, c.is_current, c.supersedes,
-                      c.content_hash, c.signature,
-                      s.public_key AS signer_public_key
-            FROM claims c
-            LEFT JOIN agents s ON s.id = c.signer_id
-            WHERE c.id = $1 /* {VISIBILITY:c} */"#,
-            2,
-        );
-        let mut q = sqlx::query(&sql).bind(uuid);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let row = q.fetch_optional(&mut *conn).await?;
-
-        match row {
-            Some(row) => {
-                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    tv,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state, exactly as `get_by_id` does.
-                // `claims.is_current` is NOT NULL in the schema, so the plain
-                // `bool` decode is safe; `supersedes` is nullable.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, also exactly as `get_by_id` does.
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        Self::get_by_id(&mut *conn, viewer, id).await
     }
 
     /// List claims with pagination
@@ -4866,6 +4861,53 @@ impl ClaimRepository {
         Ok(live as usize == distinct.len())
     }
 
+    /// Each of `ids` the viewer reads, with whether it is current, LOCKED
+    /// `FOR NO KEY UPDATE` (in id order) until the caller's transaction ends.
+    ///
+    /// The locking twin of [`Self::are_all_current`], for a check that a later
+    /// write in the same transaction relies on (a dedup mark onto a canonical
+    /// that must stay current). Supersede, deprecate, consolidate and mark
+    /// retire a claim with a plain `UPDATE` (itself a `FOR NO KEY UPDATE`
+    /// lock), which this conflicts with: a retirement that has not committed
+    /// when this runs is waited for and its result read; one that starts
+    /// afterwards waits for the caller's commit. `FOR KEY SHARE` would not
+    /// conflict with it at all. `FOR SHARE` would, but two callers would then
+    /// both hold the row and deadlock when each goes on to `UPDATE` it (a
+    /// label-dedup unit relabels its canonical after marking onto it), where
+    /// `FOR NO KEY UPDATE` makes the second wait for the first and then read
+    /// its result. It does not conflict with `FOR KEY SHARE`, so a foreign-key
+    /// check against the row is not blocked.
+    ///
+    /// `is_current` is returned, not filtered on: under READ COMMITTED a row
+    /// retired while this waited is re-read and comes back `false`, rather
+    /// than vanishing. An id absent from the result is missing, invisible, or
+    /// not lockable by the session (a locking read takes the UPDATE row
+    /// policy, which admits only rows in the session's writable groups).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn current_state_locked<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, COALESCE(is_current, true) FROM claims \
+             WHERE id = ANY($1) \
+             /* {VISIBILITY:claims} */ \
+             ORDER BY id FOR NO KEY UPDATE OF claims",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, bool)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Fetch `(id, content)` for a batch of claim ids, current rows only.
     ///
     /// Lightweight companion to the structural enrichment in
@@ -5313,6 +5355,10 @@ impl ClaimRepository {
     /// retracted edge of an un-marked duplicate, is not followed). Only
     /// non-current claims are returned (a marked duplicate is retired).
     ///
+    /// The walk looks one step past the bound: a duplicate found there is not
+    /// returned, and [`MarkedDuplicates::chain_truncated`] says the chain went
+    /// on, so a caller never takes a cut-off chain for a whole one.
+    ///
     /// Filtered by `viewer` on every edge and claim it reads: a duplicate the
     /// viewer cannot read is not returned, so a caller that needs every
     /// duplicate must use a viewer that reads them all.
@@ -5327,15 +5373,18 @@ impl ClaimRepository {
         viewer: &crate::visibility::Viewer,
         canonicals: &[Uuid],
         cap: i64,
-    ) -> Result<Vec<MarkedDuplicateRow>, DbError> {
+    ) -> Result<MarkedDuplicates, DbError> {
         if cap < 0 {
             return Err(DbError::InvalidData {
                 reason: format!("an index-view read needs a non-negative cap, got {cap}"),
             });
         }
         if canonicals.is_empty() {
-            return Ok(Vec::new());
+            return Ok(MarkedDuplicates::default());
         }
+        // `walk` goes to depth $4 + 1; `hits` keeps what the viewer reads and
+        // marks the rows past the bound; `kept` is the capped answer. The
+        // final LEFT JOIN returns the flag even when nothing is kept.
         let sql = viewer.splice(
             r#"
             WITH RECURSIVE walk(canonical, dup, depth) AS (
@@ -5351,24 +5400,39 @@ impl ClaimRepository {
                   JOIN edges e ON e.target_id = w.dup
                  WHERE e.target_type = 'claim' AND e.source_type = 'claim'
                    AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
-                   AND w.depth < $4
+                   AND w.depth <= $4
                    /* {EDGE_VISIBILITY:e} */
+            ),
+            hits AS (
+                SELECT w.canonical, c.id, c.content,
+                       COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
+                       c.agent_id, k.agent_id AS canonical_agent_id,
+                       w.depth > $4 AS beyond
+                  FROM walk w
+                  JOIN claims c ON c.id = w.dup
+                  JOIN claims k ON k.id = w.canonical
+                 WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
+                   /* {VISIBILITY:c} */
+                   /* {VISIBILITY:k} */
+            ),
+            kept AS (
+                SELECT DISTINCT canonical, id, content, labels, created_at,
+                       agent_id, canonical_agent_id
+                  FROM hits
+                 WHERE NOT beyond
+                 ORDER BY canonical, id
+                 LIMIT $5
             )
-            SELECT DISTINCT w.canonical, c.id, c.content,
-                   COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
-                   c.agent_id, k.agent_id AS canonical_agent_id
-              FROM walk w
-              JOIN claims c ON c.id = w.dup
-              JOIN claims k ON k.id = w.canonical
-             WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
-               /* {VISIBILITY:c} */
-               /* {VISIBILITY:k} */
-             ORDER BY w.canonical, c.id
-             LIMIT $5
+            SELECT EXISTS (SELECT 1 FROM hits WHERE beyond) AS chain_truncated,
+                   kept.canonical, kept.id, kept.content, kept.labels, kept.created_at,
+                   kept.agent_id, kept.canonical_agent_id
+              FROM (SELECT 1) AS one
+              LEFT JOIN kept ON true
+             ORDER BY kept.canonical, kept.id
             "#,
             6,
         );
-        let mut q = sqlx::query_as::<_, MarkedDuplicateRow>(&sql)
+        let mut q = sqlx::query_as::<_, MarkedDuplicateWalkRow>(&sql)
             .bind(canonicals)
             .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
             .bind(DUPLICATE_IDENTITY_PROPERTY)
@@ -5377,7 +5441,26 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+        let walked = q.fetch_all(executor).await?;
+        let chain_truncated = walked.first().is_some_and(|r| r.chain_truncated);
+        let rows = walked
+            .into_iter()
+            .filter_map(|r| {
+                Some(MarkedDuplicateRow {
+                    canonical: r.canonical?,
+                    id: r.id?,
+                    content: r.content?,
+                    labels: r.labels?,
+                    created_at: r.created_at?,
+                    agent_id: r.agent_id?,
+                    canonical_agent_id: r.canonical_agent_id?,
+                })
+            })
+            .collect();
+        Ok(MarkedDuplicates {
+            rows,
+            chain_truncated,
+        })
     }
 
     /// The in-force dedup identity edge out of `dup` (`same_as` carrying
@@ -5806,8 +5889,12 @@ impl ClaimRepository {
 
     /// Batch update truth values for multiple claims in a single query
     ///
-    /// Uses PostgreSQL UPDATE with CASE WHEN for efficient bulk updates.
-    /// Only updates claims that exist - non-existent IDs are silently skipped.
+    /// One static `UPDATE … FROM unnest($1::uuid[], $2::float8[])` statement,
+    /// so the SQL text and the bind count (two) do not depend on the batch
+    /// size. Only updates claims that exist - non-existent IDs are silently
+    /// skipped. An id listed more than once is updated once, with the value
+    /// of its FIRST occurrence (the contract the previous `CASE id WHEN …`
+    /// form had: its first matching arm won).
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -5842,35 +5929,32 @@ impl ClaimRepository {
             return Ok(0);
         }
 
-        // Build UPDATE with CASE WHEN for efficiency
-        // UPDATE claims SET truth_value = CASE id
-        //   WHEN uuid1 THEN value1
-        //   WHEN uuid2 THEN value2
-        // END, updated_at = NOW()
-        // WHERE id IN (uuid1, uuid2, ...)
+        // One static statement over two parallel arrays. The previous form
+        // built `CASE id WHEN $1 THEN $2 …` plus `WHERE id IN ($1, $3, …)` with
+        // two placeholders per item, so its text varied with the batch size
+        // (one prepared statement per size) and a batch above 32767 items
+        // exceeded the protocol's 65535-bind limit. `unnest` binds two arrays
+        // whatever the size.
+        //
+        // Deduplicated here, first occurrence kept: `UPDATE … FROM` joining a
+        // target row to several source rows applies an unspecified one of
+        // them, so the old first-wins contract has to be made explicit.
+        let mut seen = std::collections::HashSet::with_capacity(updates.len());
+        let (ids, values): (Vec<Uuid>, Vec<f64>) = updates
+            .iter()
+            .map(|(claim_id, truth_value)| (Uuid::from(*claim_id), truth_value.value()))
+            .filter(|(id, _)| seen.insert(*id))
+            .unzip();
 
-        let mut case_builder = String::from("UPDATE claims SET truth_value = CASE id ");
-        let mut where_ids = Vec::with_capacity(updates.len());
-        let mut param_idx = 1;
-
-        for _ in updates {
-            case_builder.push_str(&format!("WHEN ${} THEN ${} ", param_idx, param_idx + 1));
-            where_ids.push(format!("${}", param_idx));
-            param_idx += 2;
-        }
-
-        case_builder.push_str("END, updated_at = NOW() WHERE id IN (");
-        case_builder.push_str(&where_ids.join(", "));
-        case_builder.push(')');
-
-        let mut query = sqlx::query(&case_builder);
-
-        for (claim_id, truth_value) in updates {
-            let uuid: Uuid = (*claim_id).into();
-            query = query.bind(uuid).bind(truth_value.value());
-        }
-
-        let result = query.execute(pool).await?;
+        let result = sqlx::query(
+            "UPDATE claims c SET truth_value = u.tv, updated_at = NOW() \
+             FROM unnest($1::uuid[], $2::float8[]) AS u(id, tv) \
+             WHERE c.id = u.id",
+        )
+        .bind(&ids)
+        .bind(&values)
+        .execute(pool)
+        .await?;
 
         Ok(result.rows_affected() as usize)
     }
@@ -6084,51 +6168,77 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(new_content.as_bytes());
         let new_truth_val = new_truth.value();
 
-        // Verify old claim exists and is current; also pull labels so the new
-        // claim can inherit them. Without the label carry, downstream consumers
-        // that filter by labels (e.g. find_workflow's `labels @> ['workflow']`
-        // predicate) silently lose the replacement. Properties are NOT carried
+        // Retire the old claim and read what the replacement inherits in ONE
+        // statement. `AND is_current` is what makes two concurrent
+        // supersessions of one claim mutually exclusive: under READ COMMITTED
+        // the second blocks on the first's row lock, re-evaluates the WHERE
+        // once the first commits, and matches nothing. A separate unlocked
+        // `SELECT is_current` followed by `UPDATE … WHERE id = $1` let both
+        // pass and insert two current successors.
+        //
+        // Both embedding columns are nulled in this same statement: the CHECK
+        // constraint `chk_deprecated_no_embedding` (migration 052) fires
+        // per-statement, not per-transaction, so a two-step update would
+        // violate it between statements.
+        //
+        // Labels are carried so that downstream consumers that filter by
+        // labels (e.g. find_workflow's `labels @> ['workflow']` predicate) do
+        // not silently lose the replacement. Properties are NOT carried
         // forward: if the supersession is fixing something that lived in
         // `properties` (e.g. a stale `confidence_source`), blanket copy would
         // propagate the bug the supersede was meant to correct. Callers that
         // want to preserve specific properties on the new claim should set
         // them via a follow-up `patch_claim`.
-        let old_row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT agent_id, COALESCE(is_current, true),
-                    COALESCE(labels, ARRAY[]::text[])
-             FROM claims WHERE id = $1"#,
+        let retired: Option<(Uuid, Vec<String>)> = sqlx::query_as(
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+             updated_at = NOW() WHERE id = $1 AND is_current \
+             RETURNING agent_id, COALESCE(labels, ARRAY[]::text[])",
         )
         .bind(old_uuid)
         .fetch_optional(&mut *conn)
         .await?;
 
-        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
-            entity: "Claim".to_string(),
-            id: old_uuid,
-        })?;
-
-        if !is_current {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "Claim {} has already been superseded",
-                    old_uuid
-                )),
-            });
-        }
-
-        // Mark old claim as non-current and null both embedding columns in one
-        // statement. Combining all three in a single UPDATE is required by the
-        // CHECK constraint `chk_deprecated_no_embedding` (migration 052) which
-        // fires per-statement, not per-transaction: a two-step update would
-        // violate it between statements.
-        sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
-             updated_at = NOW() WHERE id = $1",
-        )
-        .bind(old_uuid)
-        .execute(&mut *conn)
-        .await?;
+        let (agent_id, mut old_labels) = match retired {
+            Some(r) => r,
+            None => {
+                // Nothing retired: tell a missing claim from a retired one, the
+                // two refusals this function has always distinguished.
+                let is_current: Option<bool> = sqlx::query_scalar(
+                    r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read classifies the refusal of the mutation it guards, not a disclosure to a caller.
+                     SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
+                )
+                .bind(old_uuid)
+                .fetch_optional(&mut *conn)
+                .await?;
+                return Err(match is_current {
+                    None => DbError::NotFound {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                    },
+                    Some(false) => DbError::QueryFailed {
+                        source: sqlx::Error::Protocol(format!(
+                            "Claim {} has already been superseded",
+                            old_uuid
+                        )),
+                    },
+                    // Visible and current, yet the UPDATE matched no row: the
+                    // session may read it but not retire it (an UPDATE policy
+                    // whose USING hides the row, e.g. an elevated session's
+                    // `claims_elevated_no_update`). Refuse rather than insert
+                    // a successor next to a still-current claim; both
+                    // transports map `WriteRefused` to a denial (HTTP 403,
+                    // MCP INVALID_REQUEST).
+                    Some(true) => DbError::WriteRefused {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                        action: "supersede".to_string(),
+                    },
+                });
+            }
+        };
+        // Per-submission review flags describe the OLD content, not the
+        // replacement's, so they do not carry (see `NON_CARRIED_LABELS`).
+        old_labels.retain(|l| !NON_CARRIED_LABELS.contains(&l.as_str()));
 
         // Insert new claim with supersedes link, carrying forward only labels
         // from the old row. Embeddings are intentionally NOT copied: the new
@@ -6881,7 +6991,8 @@ impl ClaimRepository {
         // would return MORE, and wrong. Only `c` carries the predicate.
         let sql = viewer.splice(
             r#"
-            SELECT c.id, c.content, c.truth_value, c.created_at
+            SELECT c.id, c.content, c.truth_value, c.created_at,
+                   COALESCE(c.is_current, true) AS is_current
             FROM claims c
             WHERE c.step_lineage_id = $1
               AND NOT EXISTS (
@@ -8334,7 +8445,7 @@ impl ClaimRepository {
     ///
     /// The function stays atomic on its own. The body opens `conn.begin()`, which
     /// is a real transaction on a bare connection and a SAVEPOINT inside a caller's
-    /// transaction. The FOR UPDATE read and the up-to-three UPDATEs therefore land
+    /// transaction. The FOR UPDATE read and the (at most two) UPDATEs therefore land
     /// together in both shapes. A `&mut Transaction` caller still compiles
     /// unchanged through deref coercion.
     pub async fn patch_claim_atomic_conn(
@@ -8358,22 +8469,28 @@ impl ClaimRepository {
         let before_props: serde_json::Value = row.get("properties");
         let before_trace: Option<Uuid> = row.get("trace_id");
 
-        let mut after_trace = before_trace;
-        if let Some(t) = patch.trace_id {
-            sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
-                .bind(t)
-                .bind(id_uuid)
-                .execute(&mut *tx)
-                .await?;
-            after_trace = Some(t);
-        }
-
+        // trace_id and properties land in ONE statement, issued only when the
+        // patch sets either. `PatchClaimInput::trace_id` is `Option<Uuid>` and
+        // `None` means "leave it", never "clear it", so `COALESCE($2, trace_id)`
+        // is exactly the old `if let Some(t)` write; the CASE keeps the column
+        // untouched when no properties were supplied and otherwise applies the
+        // same shallow `||` merge as before.
+        let after_trace = patch.trace_id.or(before_trace);
         let mut after_props = before_props.clone();
-        if let Some(p) = &patch.properties {
+        if patch.trace_id.is_some() || patch.properties.is_some() {
             sqlx::query(
-                "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2"
+                "UPDATE claims SET trace_id = COALESCE($2::uuid, trace_id), \
+                 properties = CASE WHEN $3::jsonb IS NULL THEN properties \
+                                   ELSE COALESCE(properties, '{}'::jsonb) || $3::jsonb END \
+                 WHERE id = $1",
             )
-            .bind(p).bind(id_uuid).execute(&mut *tx).await?;
+            .bind(id_uuid)
+            .bind(patch.trace_id)
+            .bind(patch.properties.as_ref())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(p) = &patch.properties {
             if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
                 for (k, v) in po {
                     merged.insert(k.clone(), v.clone());
@@ -10674,6 +10791,10 @@ async fn migrate_consolidated_edges(
     // a redundant copy. The test is on the source endpoint's own row (a
     // missing row counting as non-public), so the deferred replay gives the
     // same result.
+    //
+    // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
+    // candidate either: it names the claim its duplicate supersedes, so it is
+    // neither moved nor retracted (see `migrate_superseded_edges`).
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -10686,6 +10807,7 @@ async fn migrate_consolidated_edges(
           AND e.valid_to IS NULL
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
+          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11003,18 +11125,35 @@ async fn mark_duplicate_act(
             source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
         });
     }
-    let canon_exists: bool = sqlx::query_scalar(
+    // The canonical must exist and be CURRENT: a mark onto a retired claim
+    // builds a dedup chain the caller never saw, which the un-mark then
+    // refuses while that canonical stays retired. A plain read, not FOR SHARE
+    // (that would take the UPDATE policy on the caller's stamped session); a
+    // concurrent retirement after it makes an ordinary chain, which the
+    // un-mark already orders.
+    let canon_current: Option<bool> = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+        SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
     )
     .bind(canon_uuid)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    if !canon_exists {
-        return Err(DbError::NotFound {
-            entity: "Claim".into(),
-            id: canon_uuid,
-        });
+    match canon_current {
+        None => {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: canon_uuid,
+            })
+        }
+        Some(false) => {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
+                     dedup chain onto a retired claim"
+                )),
+            })
+        }
+        Some(true) => {}
     }
     let row: Option<(Option<Uuid>,)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -11759,6 +11898,46 @@ async fn reverse_marked_duplicate(
     let done = out.unretracted_edges.clone();
     note_drift(&record.retracted_edges, &done, &mut drifted);
 
+    // The BP factor graph. Retiring the duplicate deleted every factor naming
+    // it (`claims_deactivate_factors`), and the edges came back above by
+    // UPDATE, which `edges_auto_factor` (INSERT only) never sees. A factor
+    // keyed to an edge just moved back off the canonical names the canonical
+    // (one an earlier un-mark in a chain minted there) and is stale; it goes
+    // first, and the `(type, pair)` slots it held on the canonical are kept.
+    // Then the duplicate's edges are re-minted, and on the canonical only
+    // those freed slots: the un-mark leaves every other canonical factor as
+    // it found it. Two statements, not one data-modifying CTE: in one
+    // statement the INSERT's ON CONFLICT would still see the rows being
+    // deleted and leave the freed slot empty.
+    let moved_back: Vec<String> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .map(|id| id.to_string())
+        .collect();
+    let freed_slots: Vec<String> = if moved_back.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM factors f
+              WHERE f.variable_ids @> ARRAY[$1]::uuid[]
+                AND f.properties->>'source_edge_id' = ANY($2)
+             RETURNING f.factor_type || ':' || array_to_string(f.variable_ids, ',')"#,
+        )
+        .bind(canon_uuid)
+        .bind(&moved_back)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+        .bind(dup_uuid)
+        .bind(canon_uuid)
+        .bind(&freed_slots)
+        .execute(&mut *conn)
+        .await?;
+
     // BBAs moved onto the canonical go back with their old tenancy while the
     // duplicate is still public (its audience then is what it was); on a
     // duplicate that has since gone non-public a row becomes the claim's own,
@@ -11928,6 +12107,81 @@ async fn reverse_marked_duplicate(
     out.drifted = drifted;
     Ok(out)
 }
+
+/// The INSERT minting the BP factors `edges_auto_factor` would mint, as if
+/// each edge were inserted now, for every in-force claim-claim edge whose
+/// endpoints are both current and that either touches the claim `$1` or
+/// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
+/// (as `type:lo,hi`). For the un-mark, which puts edges back by UPDATE (which
+/// that INSERT trigger never sees) onto a claim made current again: `$1` is
+/// the duplicate, `$2` its canonical and `$3` the slots the stale-factor
+/// DELETE freed there.
+///
+/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// set, and must stay that: a migration that changes the trigger's mapping,
+/// potentials, description or properties changes this too (the
+/// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
+/// Like the trigger it mints `decomposes_to` factors, on the duplicate's
+/// edges. A dedup identity edge is skipped (the act writes it after retiring
+/// the duplicate, so it never had one). One factor per `(factor_type, pair)`,
+/// from the earliest edge, and an existing one is kept
+/// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
+const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         INSERT INTO factors (factor_type, variable_ids, potential, description, properties)
+         SELECT DISTINCT ON (x.ft, x.var_ids) x.ft, x.var_ids, x.pot, x.descr, x.props
+           FROM (
+             SELECT e.id, e.created_at, m.ft, (e.source_id = $1 OR e.target_id = $1) AS on_dup,
+                    CASE WHEN e.source_id < e.target_id
+                         THEN ARRAY[e.source_id, e.target_id]
+                         ELSE ARRAY[e.target_id, e.source_id] END AS var_ids,
+                    CASE WHEN m.ft = 'mutual_exclusion' THEN '{}'::jsonb
+                         WHEN m.ft = 'directional_support' THEN jsonb_build_object(
+                              'forward_strength', m.fwd, 'reverse_strength', m.rev,
+                              'source_var', e.source_id::text)
+                         ELSE jsonb_build_object('strength', m.fwd) END AS pot,
+                    format('Auto-generated from %s edge %s', e.relationship, e.id) AS descr,
+                    jsonb_build_object('source_edge_id', e.id, 'relationship', e.relationship,
+                                       'edge_source_id', e.source_id,
+                                       'edge_target_id', e.target_id) AS props
+               FROM edges e
+               JOIN claims s ON s.id = e.source_id
+               JOIN claims t ON t.id = e.target_id
+               CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+               -- 038's override: a cross-source matcher's evidential_support
+               -- edge carries its own strength in properties.score, clamped
+               -- to [0, 1]. The trigger casts it at INSERT; properties can be
+               -- patched since, so a score that is not a decimal number falls
+               -- back to the constant (as a missing one does) instead of
+               -- failing the whole un-mark. The exponent is bounded to three
+               -- digits so the numeric cast itself cannot overflow (numeric_in
+               -- raises on e.g. "1e999999"); clamped as numeric, then cast, so
+               -- a large in-range exponent cannot overflow the double either.
+               CROSS JOIN LATERAL (
+                 SELECT ft.factor_type AS ft,
+                        COALESCE(ms.score, ft.forward_strength) AS fwd,
+                        COALESCE(ms.score, ft.reverse_strength) AS rev
+                   FROM (SELECT CASE WHEN ft.factor_type = 'evidential_support'
+                                      AND e.properties ? 'source'
+                                      AND e.properties->>'source' = 'cross_source_matcher'
+                                      AND e.properties ? 'score'
+                                      AND e.properties->>'score'
+                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,3})?\s*$'
+                                     THEN GREATEST(0.0, LEAST(1.0,
+                                              (e.properties->>'score')::numeric))::double precision
+                                END AS score) ms
+               ) m
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+                -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
+                AND (e.valid_to IS NULL OR e.valid_to > now())
+                AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
+                AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
+                AND m.ft IS NOT NULL
+           ) x
+          WHERE x.on_dup
+             OR (x.ft || ':' || array_to_string(x.var_ids, ',')) = ANY($3)
+          ORDER BY x.ft, x.var_ids, x.created_at, x.id
+         ON CONFLICT DO NOTHING"#;
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
 /// keyed to any edge (those follow their edge, or stay with it), not an

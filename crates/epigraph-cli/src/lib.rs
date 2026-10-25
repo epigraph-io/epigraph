@@ -24,6 +24,8 @@ pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;
 pub mod retarget;
+#[cfg(feature = "db")]
+pub mod shadow_report;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;

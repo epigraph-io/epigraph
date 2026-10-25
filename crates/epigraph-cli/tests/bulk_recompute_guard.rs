@@ -190,6 +190,30 @@ async fn agent(pool: &PgPool, name: &str) -> Uuid {
     .expect("seed agent")
 }
 
+/// An agent registered as the `workflow-ingest` system agent (migration 148):
+/// the only author whose `source_type: workflow` root stamp makes a tree
+/// procedural. Planted with triggers off (one per test database: the role is
+/// the registry's primary key).
+async fn workflow_ingest_agent(pool: &PgPool, name: &str) -> Uuid {
+    let id = agent(pool, name).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'bulk-guard test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    tx.commit().await.expect("commit");
+    id
+}
+
 /// Get-or-create a two-hypothesis frame by name (`frames.name` is UNIQUE).
 async fn frame(pool: &PgPool, name: &str) -> Uuid {
     sqlx::query(
@@ -623,7 +647,7 @@ async fn a_retired_or_dangling_decomposition_does_not_make_a_compound(pool: PgPo
 /// under it, each against a standalone twin carrying the same row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -661,6 +685,76 @@ async fn workflow_rooted_compound_is_still_recomputed(pool: PgPool) {
                 "{caller:?}: the {what} must fold its own row exactly as a standalone does"
             );
         }
+    }
+}
+
+/// A git-history tree, shaped the way `ingest_git` writes one (a repository
+/// root stamped `source: git-history`, `node: repo`; a PR node under it; a
+/// commit under the PR), is an ORDINARY compound tree: its procedural marker
+/// is still pending (SPEC §2.1, Q-F1), and `source` / `node` are caller-set
+/// properties. Its compounds stay frozen like any compound, even when the
+/// registered system agent authored them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_git_history_stamped_compound_is_frozen_like_any_compound(pool: PgPool) {
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let repo = claim_with_properties(
+            &pool,
+            owner,
+            "repository root",
+            serde_json::json!({ "source": "git-history", "node": "repo", "repo": "o/r" }),
+        )
+        .await;
+        let pr = claim_with_properties(
+            &pool,
+            owner,
+            "pull request",
+            serde_json::json!({ "source": "git-history", "node": "pr", "pr_number": 1 }),
+        )
+        .await;
+        let commit = claim_with_properties(
+            &pool,
+            owner,
+            "commit",
+            serde_json::json!({ "source": "git-history", "commit_type": "fix" }),
+        )
+        .await;
+        decomposes_to(&pool, repo, pr, false).await;
+        decomposes_to(&pool, pr, commit, false).await;
+        for c in [repo, pr] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+        assert_frozen(&pool, caller, repo, bt, "a git repository root").await;
+        assert_frozen(&pool, caller, pr, bt, "a PR node under it").await;
+    }
+}
+
+/// A workflow stamp on a root authored by anyone but the registered
+/// `workflow-ingest` system agent exempts nothing: `source_type` is a
+/// caller-set property, so the stamped root and the compound under it stay
+/// frozen. (`workflow_rooted_compound_is_still_recomputed` is the positive
+/// control: the same tree authored by the system agent is recomputed.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_stamp_by_any_other_author_exempts_nothing(pool: PgPool) {
+    let _registered = workflow_ingest_agent(&pool, "the real workflow-ingest agent").await;
+    let stranger = agent(&pool, "stranger").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let root = workflow_claim(&pool, stranger, "stranger's workflow-stamped thesis").await;
+        let mid = claim(&pool, stranger, "step under it").await;
+        let leaf = claim(&pool, stranger, "atom under it").await;
+        decomposes_to(&pool, root, mid, false).await;
+        decomposes_to(&pool, mid, leaf, false).await;
+        for c in [root, mid] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+        assert_frozen(&pool, caller, root, bt, "a stranger's stamped root").await;
+        assert_frozen(&pool, caller, mid, bt, "a compound under it").await;
     }
 }
 
@@ -855,7 +949,7 @@ async fn workflow_claim(pool: &PgPool, owner: Uuid, what: &str) -> Uuid {
 /// * a compound whose only link up to a workflow root was retired.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_workflow_stamp_off_the_root_or_behind_a_retired_edge_exempts_nothing(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -899,7 +993,7 @@ async fn a_workflow_stamp_off_the_root_or_behind_a_retired_edge_exempts_nothing(
 /// procedural (recomputed like a standalone twin) and n7 is frozen.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -946,7 +1040,7 @@ async fn the_workflow_root_search_reaches_six_hops_and_no_further(pool: PgPool) 
 /// without walking the cycle, and an uncapped walk would go unnoticed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
-    let owner = agent(&pool, "guard-owner").await;
+    let owner = workflow_ingest_agent(&pool, "guard-owner").await;
     let source = agent(&pool, "guard-source").await;
     let bt = frame(&pool, "binary_truth").await;
 
@@ -984,6 +1078,94 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
     }
 }
 
+// ── (7b) what the shared role spelling changed in the guard ────────────────
+
+/// An in-force `relationship` edge `source -> target` between claims.
+async fn claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            valid_from) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', $3, now() - interval '2 days')",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed claim edge");
+}
+
+/// The guard reads the one role spelling, where `rule` outranks `compound`
+/// (SPEC §2.1): a rule claim (label `rule` AND an in-force `rule_conclusion`
+/// edge) with a decomposition is NOT a compound, and its cache is refolded
+/// from its own rows, like a standalone twin's. Control: the same shape
+/// without the `rule` label is a compound and stays frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposed_rule_is_recomputed_and_a_decomposed_non_rule_is_not(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let conclusion = claim(&pool, owner, "rule conclusion").await;
+
+        let rule = claim(&pool, owner, "decomposed rule").await;
+        sqlx::query("UPDATE claims SET labels = ARRAY['rule'] WHERE id = $1")
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .expect("label the rule");
+        claim_edge(&pool, rule, conclusion, "rule_conclusion").await;
+        let premise = claim(&pool, owner, "rule part").await;
+        decomposes_to(&pool, rule, premise, false).await;
+
+        let unlabelled = claim(&pool, owner, "same shape, no rule label").await;
+        claim_edge(&pool, unlabelled, conclusion, "rule_conclusion").await;
+        let part = claim(&pool, owner, "its part").await;
+        decomposes_to(&pool, unlabelled, part, false).await;
+
+        let twin = claim(&pool, owner, "standalone twin").await;
+        for c in [rule, unlabelled, twin] {
+            insert_row(&pool, c, &evidence_row(bt, source, "auto_wire")).await;
+        }
+
+        assert_recomputed_like_twin(&pool, caller, rule, twin, bt, "a decomposed rule").await;
+        assert_frozen(
+            &pool,
+            caller,
+            unlabelled,
+            bt,
+            "a decomposed claim with a conclusion edge but no rule label",
+        )
+        .await;
+    }
+}
+
+/// Only an `ingest_git` repository node (`source: git-history` AND
+/// `node: repo`) roots a procedural git tree. `ingest_git` stamps
+/// `source: git-history` on every commit too, so a flat commit that was later
+/// decomposed is an ordinary compound and stays frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_decomposed_git_commit_is_a_frozen_compound(pool: PgPool) {
+    let owner = agent(&pool, "guard-owner").await;
+    let source = agent(&pool, "guard-source").await;
+    let bt = frame(&pool, "binary_truth").await;
+
+    for caller in CALLERS {
+        let commit = claim_with_properties(
+            &pool,
+            owner,
+            "lone commit",
+            serde_json::json!({ "source": "git-history", "commit_type": "fix" }),
+        )
+        .await;
+        let atom = claim(&pool, owner, "commit atom").await;
+        decomposes_to(&pool, commit, atom, false).await;
+        insert_row(&pool, commit, &evidence_row(bt, source, "auto_wire")).await;
+        assert_frozen(&pool, caller, commit, bt, "a decomposed git commit").await;
+    }
+}
+
 // ── (8) the role is decided without a viewer splice ─────────────────────────
 
 /// A PUBLIC compound whose only decomposition edge points at a group-private
@@ -994,7 +1176,7 @@ async fn a_decomposition_cycle_terminates_and_stays_frozen(pool: PgPool) {
 /// The test harness connects as a superuser, where row security does not
 /// apply, so this pins the SQL: no `VISIBILITY` splice on the compound test.
 /// (On a connection where row security applies, the server's own filtering
-/// still hides the edge; see `frozen_compound_predicate`.) The two public
+/// still hides the edge; see the `claim_role` module doc.) The two public
 /// viewer callers are the arms that can see a splice; the MCP caller runs on a
 /// maintenance session and is kept for completeness.
 #[sqlx::test(migrations = "../../migrations")]

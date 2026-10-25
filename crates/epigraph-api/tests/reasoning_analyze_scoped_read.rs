@@ -245,11 +245,10 @@ async fn analyze_requires_the_analysis_reasoning_scope(pool: PgPool) {
 
 // ── Direct handler invocation ──
 //
-// The arms below call the handler as a function. Two need an `AppState` the
-// router fixture cannot build: one with entries in the in-memory
-// `claim_store`, one whose raw pool is a different session from its scoped
-// pool. The third needs a request the router cannot deliver: a resolved
-// viewer with no `AuthContext`.
+// The arms below call the handler as a function. One needs an `AppState` the
+// router fixture cannot build: one whose raw pool is a different session from
+// its scoped pool. The other needs a request the router cannot deliver: a
+// resolved viewer with no `AuthContext`.
 
 use axum::extract::State;
 use axum::{Extension, Json};
@@ -297,101 +296,194 @@ async fn analyze_as(state: AppState, pool: &PgPool, agent: Uuid, req: AnalyzeReq
     serde_json::to_value(resp).expect("serialize response")
 }
 
-/// An in-memory claim with `id` and `truth`.
-fn store_claim(id: Uuid, truth: f64) -> epigraph_core::Claim {
-    let now = chrono::Utc::now();
-    epigraph_core::Claim::with_id(
-        epigraph_core::ClaimId::from_uuid(id),
-        format!("store claim {id}"),
-        epigraph_core::AgentId::new(),
-        [0u8; 32],
-        [0u8; 32],
-        None,
-        None,
-        epigraph_core::TruthValue::new(truth).expect("truth in range"),
-        now,
-        now,
+/// Give a seeded claim a known score input. With `pignistic` set, the claim
+/// carries a complete DS state (`belief`, `plausibility`, `pignistic_prob`) and
+/// its effective belief is that pignistic value; without it, the DS columns are
+/// cleared and its effective belief is `truth`.
+async fn set_score(pool: &PgPool, claim: Uuid, truth: f64, pignistic: Option<f64>) {
+    let (belief, plausibility) = match pignistic {
+        Some(p) => (Some(p - 0.1), Some(p + 0.1)),
+        None => (None, None),
+    };
+    sqlx::query(
+        "UPDATE claims SET truth_value = $2, belief = $3, plausibility = $4, \
+         pignistic_prob = $5 WHERE id = $1",
     )
+    .bind(claim)
+    .bind(truth)
+    .bind(belief)
+    .bind(plausibility)
+    .bind(pignistic)
+    .execute(pool)
+    .await
+    .expect("set claim score");
 }
 
-/// The in-memory claim set is filtered by the caller's viewer too: an entry
-/// naming another group's private claim contributes neither its id nor its
-/// truth value to a stranger's analysis, whichever request shape asks — with
-/// or without `claim_ids`, and with the caller's own `edges`.
+/// The single connected component's `avg_truth`, asserting there is one.
+fn sole_component_avg(body: &Value) -> f64 {
+    let comps = body["connected_components"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response has no connected_components: {body}"));
+    assert_eq!(comps.len(), 1, "expected exactly one component: {body}");
+    comps[0]["avg_truth"]
+        .as_f64()
+        .expect("avg_truth is a number")
+}
+
+fn unsupported(body: &Value) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = body["unsupported_claims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response has no unsupported_claims: {body}"))
+        .iter()
+        .map(|v| Uuid::parse_str(v.as_str().expect("id is a string")).expect("uuid"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The claims the engine analyses are the PERSISTED claims, read as the
+/// caller: the request's `claim_ids`, or the endpoints of the edges being
+/// analysed when it names none. Each claim enters with its effective belief
+/// (the pignistic probability when its DS state is complete, its truth value
+/// otherwise).
+///
+/// Nothing writes the in-memory claim store in a database build, so an
+/// analysis built from it loads zero claims whatever is in the database:
+/// `claims_loaded` is 0, every component's `avg_truth` is 0.0 and no claim is
+/// ever reported unsupported.
 #[sqlx::test(migrations = "../../migrations")]
-async fn analyze_drops_a_stored_claim_the_caller_cannot_read(pool: PgPool) {
-    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "store-owner").await;
-    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "store-stranger").await;
-    let private = viewer_fixture::seed_group_claim(&pool, owner, group, "store private").await;
-    let public = viewer_fixture::seed_public_claim(&pool, owner, "store public").await;
-    // A stored entry naming no `claims` row: nobody can be shown to read it, so
-    // it is dropped for every caller (the fail-closed reading), the owner too.
-    let orphan = Uuid::new_v4();
+async fn analyze_reads_persisted_claims_with_their_effective_belief(pool: PgPool) {
+    let c = corpus(&pool).await;
+    set_score(&pool, c.p1, 0.8, None).await;
+    set_score(&pool, c.p2, 0.6, None).await;
+    // Truth 0.9, but a complete DS state whose pignistic probability is 0.2:
+    // the analysis must use 0.2.
+    set_score(&pool, c.p3, 0.9, Some(0.2)).await;
 
-    let state_with_store = || async {
-        let mut state = AppState::with_scoped_pool(
-            viewer_fixture::scoped_pool(&pool).await,
-            ApiConfig::default(),
-        );
-        let mut store = std::collections::HashMap::new();
-        store.insert(private, store_claim(private, 0.9));
-        store.insert(public, store_claim(public, 0.4));
-        store.insert(orphan, store_claim(orphan, 0.7));
-        state.claim_store = std::sync::Arc::new(tokio::sync::RwLock::new(store));
-        state
-    };
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let owner_token = common::mint_token_with_agent(&["analysis:reasoning"], c.owner_agent);
+    let stranger_token = common::mint_token_with_agent(&["analysis:reasoning"], c.stranger_agent);
 
-    // The third shape supplies its own edges, so the handler skips the edge
-    // auto-load. The stored-claim filter must hold on that path too: a caller
-    // who sends one edge of its own is still reading the stored claim set. Both
-    // endpoints are fresh ids, neither stored claim, so the caller's own input
-    // cannot put `private` in the body and `public` stays unsupported.
-    let own_edge = json!([{
-        "source_id": Uuid::new_v4(),
-        "target_id": Uuid::new_v4(),
-        "relationship": "supports",
-        "strength": 0.5,
-    }]);
-    let shapes: [(&str, Value); 3] = [
-        ("unscoped", json!({ "claim_ids": null })),
-        (
-            "claim_ids",
-            json!({ "claim_ids": [private, public, orphan] }),
-        ),
-        ("caller_edges", json!({ "edges": own_edge })),
-    ];
-
-    for (arm, shape) in shapes {
-        let req =
-            || -> AnalyzeRequest { serde_json::from_value(shape.clone()).expect("AnalyzeRequest") };
-
-        // Non-vacuity: the owner's analysis carries both stored claims.
-        let mine = analyze_as(state_with_store().await, &pool, owner, req()).await;
+    for (arm, body) in [
+        ("edge endpoints", json!({})),
+        ("claim_ids", json!({ "claim_ids": [c.p1, c.p2, c.p3] })),
+    ] {
+        let (status, owner) = analyze(addr, &owner_token, body).await;
+        assert_eq!(status, 200, "[{arm}] owner analyze must succeed: {owner}");
         assert_eq!(
-            mine["stats"]["claims_loaded"], 2,
-            "[{arm}] the owner must load both stored claims, and not the \
-             entry that names no claims row: {mine}"
+            owner["stats"]["claims_loaded"], 3,
+            "[{arm}] the owner's analysis must load the three persisted claims: {owner}"
         );
+        let avg = sole_component_avg(&owner);
         assert!(
-            !mine.to_string().contains(&orphan.to_string()),
-            "[{arm}] a stored entry naming no claims row must be dropped: {mine}"
-        );
-
-        let theirs = analyze_as(state_with_store().await, &pool, stranger, req()).await;
-        assert_eq!(
-            theirs["stats"]["claims_loaded"], 1,
-            "[{arm}] a stranger must load only the public stored claim: {theirs}"
+            (avg - (0.8 + 0.6 + 0.2) / 3.0).abs() < 1e-9,
+            "[{arm}] avg_truth must average the effective beliefs 0.8, 0.6 and 0.2 \
+             (p3's pignistic, not its 0.9 truth value); got {avg}: {owner}"
         );
         assert_eq!(
-            theirs["unsupported_claims"],
-            json!([public.to_string()]),
-            "[{arm}] the stranger's unsupported set must be the public claim alone"
-        );
-        assert!(
-            !theirs.to_string().contains(&private.to_string()),
-            "[{arm}] another group's private claim id leaked into a stranger's analysis: {theirs}"
+            unsupported(&owner),
+            vec![c.p1],
+            "[{arm}] p1 heads the chain and is the one unsupported claim: {owner}"
         );
     }
+
+    // The stranger reads one edge (p2 -> p3), so its claim set is that edge's
+    // endpoints.
+    let (status, stranger) = analyze(addr, &stranger_token, json!({})).await;
+    assert_eq!(status, 200, "stranger analyze must succeed: {stranger}");
+    assert_eq!(
+        stranger["stats"]["claims_loaded"], 2,
+        "the stranger's claim set is the endpoints of the one edge it can read: {stranger}"
+    );
+    let avg = sole_component_avg(&stranger);
+    assert!(
+        (avg - (0.6 + 0.2) / 2.0).abs() < 1e-9,
+        "the stranger's component averages p2 and p3 only; got {avg}: {stranger}"
+    );
+    assert_eq!(
+        unsupported(&stranger),
+        vec![c.p2],
+        "for the stranger p2 heads the chain: {stranger}"
+    );
+}
+
+/// A claim the caller cannot read contributes neither its id nor its score,
+/// whichever request shape names it: listed in `claim_ids`, or an endpoint of
+/// an edge the caller supplied. An id naming no `claims` row is dropped for
+/// every caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn analyze_excludes_a_claim_the_caller_cannot_read(pool: PgPool) {
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "persist-owner").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "persist-stranger").await;
+    let private = viewer_fixture::seed_group_claim(&pool, owner, group, "persist private").await;
+    let public = viewer_fixture::seed_public_claim(&pool, owner, "persist public").await;
+    set_score(&pool, private, 0.9, None).await;
+    set_score(&pool, public, 0.4, None).await;
+    let orphan = Uuid::new_v4();
+
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let owner_token = common::mint_token_with_agent(&["analysis:reasoning"], owner);
+    let stranger_token = common::mint_token_with_agent(&["analysis:reasoning"], stranger);
+
+    // Arm 1: the hidden claim and an orphan named in claim_ids.
+    let named = json!({ "claim_ids": [private, public, orphan] });
+    let (status, mine) = analyze(addr, &owner_token, named.clone()).await;
+    assert_eq!(status, 200, "owner analyze must succeed: {mine}");
+    assert_eq!(
+        mine["stats"]["claims_loaded"], 2,
+        "the owner loads its two claims and not the orphan id: {mine}"
+    );
+    assert_eq!(unsupported(&mine), {
+        let mut v = vec![private, public];
+        v.sort();
+        v
+    });
+    assert!(
+        !mine.to_string().contains(&orphan.to_string()),
+        "an id naming no claims row must be dropped: {mine}"
+    );
+    let (status, theirs) = analyze(addr, &stranger_token, named).await;
+    assert_eq!(status, 200, "stranger analyze must succeed: {theirs}");
+    assert_eq!(
+        theirs["stats"]["claims_loaded"], 1,
+        "a stranger loads only the public claim: {theirs}"
+    );
+    assert_eq!(unsupported(&theirs), vec![public]);
+    assert!(
+        !theirs.to_string().contains(&private.to_string()),
+        "another group's private claim id leaked into a stranger's analysis: {theirs}"
+    );
+
+    // Arm 2: the caller supplies an edge whose source is the hidden claim. The
+    // edge is the caller's own input and is analysed as given, but the hidden
+    // endpoint is not a loaded claim, so its score stays out of the average.
+    let edges = json!({ "edges": [{
+        "source_id": private,
+        "target_id": public,
+        "relationship": "supports",
+        "strength": 0.5,
+    }] });
+    let (status, mine) = analyze(addr, &owner_token, edges.clone()).await;
+    assert_eq!(status, 200, "owner analyze must succeed: {mine}");
+    assert_eq!(mine["stats"]["claims_loaded"], 2, "{mine}");
+    let avg = sole_component_avg(&mine);
+    assert!(
+        (avg - 0.65).abs() < 1e-9,
+        "the owner averages both claims (0.9, 0.4); got {avg}: {mine}"
+    );
+    let (status, theirs) = analyze(addr, &stranger_token, edges).await;
+    assert_eq!(status, 200, "stranger analyze must succeed: {theirs}");
+    assert_eq!(
+        theirs["stats"]["claims_loaded"], 1,
+        "a stranger's supplied edge must not load the hidden endpoint: {theirs}"
+    );
+    let avg = sole_component_avg(&theirs);
+    assert!(
+        (avg - 0.4).abs() < 1e-9,
+        "the hidden claim's 0.9 must not reach a stranger's average; got {avg}: {theirs}"
+    );
 }
 
 /// The edge read runs on the caller's viewer-stamped connection, not the raw

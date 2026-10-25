@@ -463,6 +463,7 @@ fn refused_as_elevated<T: std::fmt::Debug>(r: &Result<T, rmcp::model::ErrorData>
 
 fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
     epigraph_mcp::types::IngestDocumentInlineParams {
+        wait: None,
         extraction: serde_json::from_value(serde_json::json!({
             "source": {"title": format!("Elevated ingest {doi}"), "doi": doi,
                        "source_type": "Paper", "authors": []},

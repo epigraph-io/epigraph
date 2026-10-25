@@ -186,6 +186,10 @@ const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
 
+/// Migration 074's seed group, the other sentinel owner (062's
+/// `NOT IN (world, seed)` check). One spelling, shared with the operator tool.
+const SEED: Uuid = epigraph_cli::operator::SEED;
+
 /// The instance-wide registries (migration 077 section 2b): their writers
 /// declare `('public', world)` on purpose, so this binary stamps none of them,
 /// `verify` does not count their world-owned rows, and `settle_remaining`
@@ -1109,18 +1113,20 @@ async fn backfill_agent_keyed(
 /// residual this pass exists for is rows that were already on disk when 089
 /// applied, not new writes.
 ///
-/// # ⚠ The two predicates are NOT the same, and the difference is measured
+/// # The predicate is migration 089's, on purpose
 ///
-/// This one binds `f.owner_group_id = $1` with [`WORLD`] alone; 089's target side
-/// matches BOTH sentinels, `(world, seed)`. 089 names the seed sentinel because
-/// migration 074 made this table a parentless root whose seed arm COALESCEs an
-/// undeclared insert to `('public', <seed group>)` on a session that is a member
-/// of `epigraph_seed`. A seed-owned fragment already on disk is therefore
-/// reachable by NEITHER instrument: 089 fires only on a new provenance insert,
-/// and this predicate skips it. [`residual`] has the same world-only binding, so
-/// `verify` does not count those rows either. No code change here: widening this
-/// predicate changes what the backfill does to existing rows, which is outside
-/// this batch. Recorded as finding `F-089-D` in `docs/tenancy/progress.json`.
+/// TARGET: `f.owner_group_id IN (world, seed)`. 089 names the seed sentinel
+/// because migration 074 made this table a parentless root whose seed arm
+/// COALESCEs an undeclared insert to `('public', <seed group>)` on a session
+/// that is a member of `epigraph_seed`. A seed-owned fragment already on disk is
+/// reachable by no trigger (089 fires only on a new provenance insert), so this
+/// pass is its only repair. SOURCE: `c.owner_group_id <> world`, plus
+/// `(f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id,
+/// c.visibility)`, so a seed fragment on a seed claim is not rewritten in place
+/// (no inflated `rows_done`), a seed fragment on a WORLD claim is never stamped
+/// with the other sentinel, and a world fragment on a seed claim still moves as
+/// it always has. [`harvester_fragment_residual`] counts exactly the rows this
+/// statement can move (finding `F-089-D`).
 async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     let n = sqlx::query(
         "UPDATE harvester_fragments f
@@ -1128,10 +1134,12 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
            FROM harvester_claim_provenance p
            JOIN claims c ON c.id = p.claim_id
           WHERE f.id = p.fragment_id
-            AND f.owner_group_id = $1
-            AND c.owner_group_id <> $1",
+            AND f.owner_group_id IN ($1, $2)
+            AND c.owner_group_id <> $1
+            AND (f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)",
     )
     .bind(WORLD)
+    .bind(SEED)
     .execute(pool)
     .await?
     .rows_affected();
@@ -2698,11 +2706,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
 ///
 /// **The world group ONLY, which is narrower than "carries no real owner".** 062
 /// names two sentinels and 074's seed arm produces the other one, so a
-/// seed-stamped row is not counted here and `verify`'s tier-A residual line reads
-/// zero over it. Left as-is deliberately: this is the gate's reporting predicate,
-/// changing it changes what `verify` prints for every tier-A table, and the census
-/// that would replace it is an operator decision rather than a fix. Recorded with
-/// [`backfill_harvester_fragments`]' matching asymmetry as finding `F-089-D`.
+/// seed-stamped row is not counted here. Left as-is deliberately for the generic
+/// tier-A census: seed-owned rows that no repair in this binary can move would
+/// turn the gate red with nothing to run. `harvester_fragments` is the exception,
+/// because [`backfill_harvester_fragments`] does repair its seed-owned rows; it
+/// is counted by [`harvester_fragment_residual`] instead (finding `F-089-D`).
 async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE owner_group_id = $1"
@@ -2726,16 +2734,15 @@ async fn residual_for(
     table: &str,
     mode: Option<LegacyOwner>,
 ) -> anyhow::Result<i64> {
+    if table == "harvester_fragments" {
+        return harvester_fragment_residual(pool, mode).await;
+    }
     if mode != Some(LegacyOwner::Platform) {
         return residual(pool, table).await;
     }
     let extra = match table {
         "claims" => author_filter(LegacyOwner::Platform, "t.agent_id"),
         "recall_events" => author_filter(LegacyOwner::Platform, "t.agent_id"),
-        "harvester_fragments" => "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
-                                   JOIN claims c ON c.id = p.claim_id \
-                                  WHERE p.fragment_id = t.id AND c.owner_group_id <> $1)"
-            .to_string(),
         t if t == "evidence" || CLAIM_DERIVED.contains(&t) => {
             "EXISTS (SELECT 1 FROM claims c WHERE c.id = t.claim_id AND c.owner_group_id <> $1)"
                 .to_string()
@@ -2748,6 +2755,49 @@ async fn residual_for(
     .bind(WORLD)
     .fetch_one(pool)
     .await?)
+}
+
+/// `harvester_fragments` rows that SHOULD have moved: the rows
+/// [`backfill_harvester_fragments`] can repair, which is migration 089's
+/// predicate over rows already on disk (a sentinel-owned fragment linked to a
+/// non-world claim whose tenancy differs from it).
+///
+/// * `platform`: exactly those rows.
+/// * `None` / `operator` (strict): every world-owned fragment, as [`residual`]
+///   counts it, PLUS the repairable seed-owned ones. Seed-owned fragments the
+///   repair cannot move (no provenance, or only world or seed claims) are not
+///   counted, so a strict `verify` never fails on a row this binary has no way
+///   to fix.
+async fn harvester_fragment_residual(
+    pool: &PgPool,
+    mode: Option<LegacyOwner>,
+) -> anyhow::Result<i64> {
+    let filter = harvester_fragment_residual_filter(mode);
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM harvester_fragments t WHERE {filter}"
+    ))
+    .bind(WORLD)
+    .bind(SEED)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The `WHERE` clause (over `harvester_fragments t`, binding `$1` = [`WORLD`],
+/// `$2` = [`SEED`]) shared by [`harvester_fragment_residual`]'s count and
+/// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
+/// rows it counted.
+fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
+    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
+                                JOIN claims c ON c.id = p.claim_id \
+                               WHERE p.fragment_id = t.id \
+                                 AND c.owner_group_id <> $1 \
+                                 AND (t.owner_group_id, t.visibility) \
+                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
+    if mode == Some(LegacyOwner::Platform) {
+        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
+    } else {
+        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
+    }
 }
 
 /// The deploy pre-flight. Returns the number of FAILING checks.
@@ -3010,7 +3060,14 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
         let n = residual_for(pool, t, mode).await?;
         if n > 0 {
             failures += 1;
-            eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
+            if *t == "harvester_fragments" {
+                eprintln!(
+                    "FAIL: {n} row(s) in {t} still owned by a sentinel group (world, or seed \
+                     with a repairable claim); `run --entity harvester-fragments` moves them."
+                );
+            } else {
+                eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
+            }
             if !platform {
                 print_offenders(pool, t).await?;
             }
@@ -3076,6 +3133,23 @@ async fn linked_author_personal_residue(
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
 /// acceptance line implies.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
+    if table == "harvester_fragments" {
+        // Strict mode only (the caller skips this under `platform`): list the
+        // rows `harvester_fragment_residual` counted, seed-owned repairable
+        // ones included, not just the world-owned ones.
+        let filter = harvester_fragment_residual_filter(None);
+        let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT t.id FROM harvester_fragments t WHERE {filter} ORDER BY t.id LIMIT 20"
+        ))
+        .bind(WORLD)
+        .bind(SEED)
+        .fetch_all(pool)
+        .await?;
+        for id in ids {
+            eprintln!("    {table}.id = {id}");
+        }
+        return Ok(());
+    }
     let key = match table {
         "claim_frames" | "claim_cluster_membership" | "claim_neighborhood_membership" => "claim_id",
         _ => "id",

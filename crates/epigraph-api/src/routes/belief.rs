@@ -1075,11 +1075,31 @@ pub async fn submit_evidence(
 
     let pool = &state.db_pool;
 
+    // 0. Every BBA has an author, and it is the caller (operator ruling
+    //    2026-10-22). The body's `agent_id` is the BBA's author and half its
+    //    upsert key `(claim, frame, source_agent_id, perspective)`. Naming
+    //    another agent would attribute evidence to it and, where row security
+    //    lets the caller write that agent's row, overwrite its BBA, so it is
+    //    refused. An omitted `agent_id` is the caller's own: an agent-less BBA
+    //    shared one row per (claim, frame, perspective) under the `NULLS NOT
+    //    DISTINCT` key, so one caller's replaced another's (backlog 5a3ba157).
+    //    MCP `submit_ds_evidence` takes the author from the authenticated
+    //    identity for the same reason.
+    let Some(caller) = viewer.principal() else {
+        return Err(ApiError::Forbidden {
+            reason: "evidence needs an authenticated author".to_string(),
+        });
+    };
+    let named = request.agent_id;
+    let mut request = request;
+    request.agent_id = Some(caller);
+
     // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
     // addressable only through assess: a row keyed (agent, that agent's slot
-    // perspective) would overwrite or forge that owner's one assessment.
+    // perspective) would overwrite or forge that owner's one assessment. It is
+    // checked against the NAMED author first, so naming a slot stays a 400.
     if epigraph_db::repos::mass_function::is_assessment_slot(
-        request.agent_id,
+        named.or(Some(caller)),
         request.perspective_id,
     ) {
         return Err(ApiError::ValidationError {
@@ -1090,24 +1110,11 @@ pub async fn submit_evidence(
         });
     }
 
-    // 0. The body's `agent_id` is the BBA's author and half its upsert key
-    //    `(claim, frame, source_agent_id, perspective)`. A caller may name only
-    //    itself (or no one): naming another agent would attribute evidence to
-    //    it and, where row security lets the caller write that agent's row,
-    //    overwrite its BBA. MCP `submit_ds_evidence` takes the author from the
-    //    authenticated identity for the same reason. An OMITTED `agent_id` is
-    //    still accepted, and every agent-less BBA on one (claim, frame,
-    //    perspective) shares a single row under the `NULLS NOT DISTINCT` key,
-    //    so one caller's agent-less submission replaces another's. Closing that
-    //    changes attribution and combination for agent-less callers; it is a
-    //    separate decision.
-    if let Some(named) = request.agent_id {
-        if viewer.principal() != Some(named) {
-            return Err(ApiError::Forbidden {
-                reason: "agent_id must be the authenticated caller's own agent id, or omitted"
-                    .to_string(),
-            });
-        }
+    if named.is_some_and(|n| n != caller) {
+        return Err(ApiError::Forbidden {
+            reason: "agent_id must be the authenticated caller's own agent id, or omitted"
+                .to_string(),
+        });
     }
 
     // 1. Load and validate frame
