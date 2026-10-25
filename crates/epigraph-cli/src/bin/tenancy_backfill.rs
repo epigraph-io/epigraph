@@ -3721,7 +3721,10 @@ mod definer_register_tests {
             "a database migrated to head is covered"
         );
         for stmt in [
+            // 077's default privileges hand a new table full DML; take them
+            // back so the table carries exactly the grant named here.
             "CREATE TABLE public.rol_probe_after_166 (id integer)",
+            "REVOKE ALL ON public.rol_probe_after_166 FROM epigraph_app",
             "GRANT INSERT ON public.rol_probe_after_166 TO epigraph_app",
         ] {
             sqlx::query(stmt).execute(&pool).await.expect(stmt);

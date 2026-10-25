@@ -3282,9 +3282,13 @@ async fn under_repeatable_read_the_author_arm_checks_an_attachable_author(pool: 
 async fn a_table_granted_to_the_app_role_before_166_runs_is_covered(pool: PgPool) {
     migrate(&pool, &up_to_below(166)).await;
     for stmt in [
+        // 077's default privileges hand a new table full DML; take them
+        // back so each table carries exactly the grant it names.
         "CREATE TABLE public.rol_probe_table_grant (id integer)",
+        "REVOKE ALL ON public.rol_probe_table_grant FROM epigraph_app",
         "GRANT INSERT ON public.rol_probe_table_grant TO epigraph_app",
         "CREATE TABLE public.rol_probe_column_grant (id integer, note text)",
+        "REVOKE ALL ON public.rol_probe_column_grant FROM epigraph_app",
         "GRANT UPDATE (note) ON public.rol_probe_column_grant TO epigraph_app",
     ] {
         sqlx::query(stmt).execute(&pool).await.expect(stmt);
