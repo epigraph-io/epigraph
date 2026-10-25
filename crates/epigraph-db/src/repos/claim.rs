@@ -8401,6 +8401,26 @@ impl ClaimRepository {
         viewer: &crate::visibility::Viewer,
         dup: ClaimId,
     ) -> Result<UnmarkedDuplicate, DbError> {
+        Self::unmark_duplicate_act_authorized_conn(conn, viewer, dup, None).await
+    }
+
+    /// [`Self::unmark_duplicate_act_conn`] for a request path that checked the
+    /// caller's authority over every claim of the canonical's chain, read
+    /// through the CALLER ([`Self::unmark_chain_conn`]): `authorized_chain` is
+    /// that chain. An act whose own read (under `viewer`, on the request paths
+    /// the maintenance connection's bypass viewer) resolves any other chain,
+    /// or none, is refused with nothing written: the canonical was replaced
+    /// again since the caller was checked. That refusal names no claim of the
+    /// chain the act read, which the caller may not be able to read.
+    ///
+    /// # Errors
+    /// As [`Self::unmark_duplicate_act_conn`].
+    pub async fn unmark_duplicate_act_authorized_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: ClaimId,
+        authorized_chain: Option<&[Uuid]>,
+    ) -> Result<UnmarkedDuplicate, DbError> {
         use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let mut tx = conn.begin().await?;
@@ -8466,9 +8486,22 @@ impl ClaimRepository {
         // A canonical superseded or consolidated since is followed to its
         // current replacement (operator ruling R-11); one that was itself
         // marked a duplicate is refused (un-mark it first).
-        let chain = match canonical_chain(&mut tx, viewer, canonical).await? {
-            Ok(chain) => chain,
-            Err(why) => return Err(not_marked(&why)),
+        let chain = match (
+            canonical_chain(&mut tx, viewer, canonical).await?,
+            authorized_chain,
+        ) {
+            (Ok(chain), None) => chain,
+            (Err(why), None) => return Err(not_marked(&why)),
+            (Ok(chain), Some(authorized)) if chain.as_slice() == authorized => chain,
+            // Said without the claims this read found: under the maintenance
+            // viewer they may include a replacement the caller cannot read.
+            (_, Some(_)) => {
+                return Err(not_marked(
+                    "has a canonical that was replaced again since the caller's authority was \
+                     checked (the chain the un-mark would follow is no longer the one checked); \
+                     retry the un-mark",
+                ))
+            }
         };
         // Both writes carry the write predicate: on an application session the
         // viewer's writable groups, on the maintenance session (a bypass

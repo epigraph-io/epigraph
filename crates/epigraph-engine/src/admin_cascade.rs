@@ -939,10 +939,14 @@ pub async fn apply_unmark_authorized(
     let mut tx = sqlx::Acquire::begin(&mut *admin)
         .await
         .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
-    let unmarked = ClaimRepository::unmark_duplicate_act_conn(
+    // The act re-reads the canonical's chain and refuses one other than
+    // `authorized_chain` (the canonical was replaced again since the caller
+    // was checked) without naming what it read under the admin viewer.
+    let unmarked = ClaimRepository::unmark_duplicate_act_authorized_conn(
         &mut tx,
         admin_viewer,
         ClaimId::from_uuid(dup_id),
+        authorized_chain,
     )
     .await
     .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
@@ -954,14 +958,6 @@ pub async fn apply_unmark_authorized(
             "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
              {expected_canonical}, which the caller's authority was checked against; \
              nothing was changed"
-        )));
-    }
-    if let Some(authorized) = authorized_chain.filter(|c| *c != unmarked.chain.as_slice()) {
-        return Err(UnmarkRefusal::Act(format!(
-            "claim {dup_id}'s canonical {canonical_id} now leads to {}, not to {}, which the \
-             caller's authority was checked against; nothing was changed",
-            unmarked.current_canonical(),
-            authorized.last().copied().unwrap_or(canonical_id)
         )));
     }
     let current_canonical_id = unmarked.current_canonical();

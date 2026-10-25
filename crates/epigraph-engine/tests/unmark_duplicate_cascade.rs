@@ -9,7 +9,8 @@ use epigraph_core::ClaimId;
 use epigraph_db::repos::admin_cascade as audit;
 use epigraph_db::{ClaimRepository, FrameRepository, MassFunctionRepository, PgPool};
 use epigraph_engine::admin_cascade::{
-    apply_after_dedup, apply_unmark, record_deferral, CascadeCause, CascadeTrigger, UnmarkRefusal,
+    apply_after_dedup, apply_unmark, apply_unmark_authorized, record_deferral, CascadeCause,
+    CascadeTrigger, UnmarkRefusal,
 };
 use epigraph_engine::edge_factor::preview_claim_belief_on_frame;
 use uuid::Uuid;
@@ -1012,4 +1013,119 @@ async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool) {
             "{how:?}: {out}"
         );
     }
+}
+
+/// Supersede `old` through the act and carry its edges on, as the supersede
+/// routes do; returns the replacement.
+async fn supersede(conn: &mut sqlx::PgConnection, old: Uuid) -> Uuid {
+    let (replacement, _) = ClaimRepository::supersede_act_conn(
+        conn,
+        ClaimId::from_uuid(old),
+        &format!("revised {old} {}", Uuid::new_v4()),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+    )
+    .await
+    .expect("supersede act");
+    ClaimRepository::migrate_superseded_edges_conn(conn, old, replacement)
+        .await
+        .expect("edge migration");
+    replacement
+}
+
+/// A request path checks the caller's authority over the canonical's chain
+/// it read on the caller's own transaction, then the act re-reads the chain on
+/// the maintenance connection. If the canonical was replaced again in between
+/// (here: the caller was checked against `[C]`, and C has since been superseded
+/// by N), the un-mark is refused and nothing changes. The refusal does not
+/// name the claims the act read under the maintenance (bypass) viewer: N may
+/// be private to another group, and the caller was never shown it. Likewise
+/// when the chain the caller was checked against no longer leads to any
+/// current canonical (N deprecated since).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_authorized_unmark_refuses_a_chain_that_changed_without_naming_it(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+    let replacement = supersede(&mut conn, canonical).await;
+
+    let undedup_rows = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM security_events WHERE details->>'cause' = 'undedup'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    let err = apply_unmark_authorized(
+        &mut conn,
+        &viewer,
+        &viewer,
+        &ut,
+        dup,
+        canonical,
+        Some(&[canonical]),
+    )
+    .await
+    .expect_err("the chain changed since the caller was checked");
+    let UnmarkRefusal::Act(msg) = &err else {
+        panic!("an act refusal: {err:?}");
+    };
+    assert!(
+        msg.contains("replaced again") && !msg.contains(&replacement.to_string()),
+        "refused without naming the replacement the caller was never shown: {msg}"
+    );
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(canonical), false),
+        "nothing changed"
+    );
+    assert_eq!(undedup_rows(pool.clone()).await, 0, "no audit row");
+
+    // The chain the caller was checked against, [C, N], has since lost its
+    // current canonical: N was deprecated. Refused the same way.
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(replacement)
+    .execute(&pool)
+    .await
+    .expect("deprecate the replacement");
+    let err = apply_unmark_authorized(
+        &mut conn,
+        &viewer,
+        &viewer,
+        &ut,
+        dup,
+        canonical,
+        Some(&[canonical, replacement]),
+    )
+    .await
+    .expect_err("no current canonical any more");
+    let UnmarkRefusal::Act(msg) = &err else {
+        panic!("an act refusal: {err:?}");
+    };
+    assert!(
+        msg.contains("replaced again") && !msg.contains(&replacement.to_string()),
+        "refused without naming the claims the act read: {msg}"
+    );
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(canonical), false),
+        "nothing changed"
+    );
+    assert_eq!(undedup_rows(pool.clone()).await, 0, "no audit row");
 }
