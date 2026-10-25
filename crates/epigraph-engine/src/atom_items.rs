@@ -259,7 +259,9 @@ impl EvidencedInterval {
         Self {
             belief: 0.0,
             plausibility: 1.0,
+            // belief-profile: allow-literal (the vacuous interval's BetP on a binary frame)
             pignistic_prob: 0.5,
+            // belief-profile: allow-literal (the vacuous interval's BetP on a binary frame)
             pignistic_false: 0.5,
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
@@ -610,6 +612,7 @@ const SEED_METHOD: &str = "truth_value_seed";
 /// `combination_method` of the CDST auto-assessment.
 const AUTO_CDST_METHOD: &str = "auto_cdst";
 /// `combination_method`s of propagated BBAs.
+// belief-profile: allow-literal (array length of a fixed method list)
 const PROPAGATED_METHODS: [&str; 2] = ["propagated_from_parent", "propagated_from_neighbor"];
 /// `combination_method` of a hypothesis' experiment-derived BBA, and of its
 /// promoted `research_validity` copy.
@@ -731,6 +734,7 @@ fn coarsen_to_binary(
             *out.entry(to).or_insert(0.0) += m;
         }
     } else {
+        // belief-profile: allow-literal (the binary frame's hypothesis count)
         let swap = resolve_hypothesis_index(r.hypothesis_index, 2) == 1;
         for (fe, &m) in stored.focal_elements() {
             let subset = if swap {
@@ -776,9 +780,26 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
 /// goes to Θ (Bel 0, Pl 1). A derivation that must agree with this fold on
 /// one leaf (D11) has to use the same K = 1 convention.
 ///
+/// This is the fold under the served profile ([`BeliefProfile::served`]);
+/// a fold under a lens takes that lens's profile through
+/// [`atom_fold_under`].
+///
 /// # Errors
 /// Rows of more than one atom, or a Dempster step that errors.
 pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
+    atom_fold_under(rows, BeliefProfile::served())
+}
+
+/// [`atom_fold`] under `profile`: the Dempster fold across items takes the
+/// profile's `combination.conflict_threshold` (carried, and not consumed by
+/// `combine_multiple` today, like every fold's).
+///
+/// # Errors
+/// Rows of more than one atom, or a Dempster step that errors.
+pub fn atom_fold_under(
+    rows: &[AxiomRow],
+    profile: &BeliefProfile,
+) -> Result<EvidencedInterval, String> {
     let Some(first) = rows.first() else {
         return Ok(EvidencedInterval::unproven());
     };
@@ -801,7 +822,8 @@ pub fn atom_fold(rows: &[AxiomRow]) -> Result<EvidencedInterval, String> {
     let for_fold: Vec<MassFunction> = items.iter().filter_map(|it| it.on(atom).cloned()).collect();
     let n = for_fold.len();
     let (combined, conflict) =
-        dempster_across_items(for_fold, 0.9).map_err(|e| format!("atom_fold: {e}"))?;
+        dempster_across_items(for_fold, profile.combination.conflict_threshold)
+            .map_err(|e| format!("atom_fold: {e}"))?;
     let t = FocalElement::positive(BTreeSet::from([0]));
     Ok(EvidencedInterval {
         belief: measures::belief(&combined, &t),

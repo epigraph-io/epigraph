@@ -1507,7 +1507,7 @@ pub async fn recompute_atom_cache_with(
     legacy: LegacyFold,
     settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    use crate::atom_items::{atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode};
+    use crate::atom_items::{atom_axiom_rows_under, atom_fold_under, AtomFoldMode, AxiomMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     if let CacheWriteCause::EvidenceRemoved(before) = cause {
@@ -1600,7 +1600,7 @@ pub async fn recompute_atom_cache_with(
         return Ok(AtomCacheOutcome::KeptEmpty);
     }
 
-    let interval = atom_fold(&rows)?;
+    let interval = atom_fold_under(&rows, ctx.profile())?;
     let has_opposing = rows.iter().any(|r| {
         measures::pignistic_probability(r.coarse(), 1) > thresholds.has_opposing_threshold
     });

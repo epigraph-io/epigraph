@@ -60,7 +60,7 @@ use epigraph_db::repos::claim_role::{self, ClaimRole};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, MassFunctionRepository};
 use epigraph_engine::atom_items::{
-    atom_axiom_rows, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
+    atom_axiom_rows, atom_fold_under, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
 };
 use epigraph_engine::belief_query::FramedBeliefContext;
 use epigraph_engine::belief_view::{Basis, BeliefView};
@@ -842,6 +842,7 @@ fn compound_drift(base: &Base, view: &BeliefView, conjunction: Option<&BeliefVie
 async fn drift(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
+    ctx: &FramedBeliefContext,
     opts: &ReportOptions,
     id: Uuid,
     base: &Base,
@@ -876,7 +877,7 @@ async fn drift(
     let v3c = if without.is_empty() {
         base.score
     } else {
-        atom_fold(&without)?.pignistic_prob()
+        atom_fold_under(&without, ctx.profile())?.pignistic_prob()
     };
     stages.insert("3c", Some(v3c));
     stages.insert("4", Some(fold_betp));
@@ -919,7 +920,7 @@ async fn eval_atoms(
         let today = Cand::today(base);
         let eval = match rows.get(id).filter(|r| !r.is_empty()) {
             Some(rs) => {
-                let f = atom_fold(rs)?;
+                let f = atom_fold_under(rs, ctx.profile())?;
                 let aef = AefValue {
                     bel: f.belief(),
                     pl: f.plausibility(),
@@ -949,7 +950,20 @@ async fn eval_atoms(
                     today
                 };
                 let drift = if covered && with_drift {
-                    Some(drift(conn, viewer, opts, *id, base, rs, &attributed, aef.betp).await?)
+                    Some(
+                        drift(
+                            conn,
+                            viewer,
+                            ctx,
+                            opts,
+                            *id,
+                            base,
+                            rs,
+                            &attributed,
+                            aef.betp,
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };
