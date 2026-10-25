@@ -3347,3 +3347,48 @@ async fn a_table_granted_to_the_app_role_before_166_runs_is_covered(pool: PgPool
         "both tables the catalog hands the application role carry the check on every operation"
     );
 }
+
+/// The shared successor the copy rule is really about: one whose first
+/// registration had no parent, so 161's step 5 links it to NOBODY when a
+/// linked parent later names it (`shared_identity`). Step 5b attaches it
+/// anyway and flags it. An attached agent with no live link has no human to
+/// hold its role, so it is refused even WHILE the role is held, in every
+/// group, until an operator links it by hand (the flag is the host's prompt
+/// to say so); once linked to the holder, it writes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unlinked_shared_successor_stays_refused_until_it_is_linked(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-166-unlinked-own").await;
+    link(&pool, parent, h).await;
+    let parent_row = attach(&pool, ROLE, parent).await;
+    let shared_key = random32();
+    let shared = register(&pool, &shared_key, None, "g-166-unlinked-elsewhere").await;
+    assert_eq!(
+        register(&pool, &shared_key, Some(parent), "g-166-unlinked-own").await,
+        shared
+    );
+    assert_eq!(
+        live_attachments(&pool, shared).await,
+        vec![(ROLE.to_string(), Some(parent_row))],
+        "the unlinked shared successor is attached"
+    );
+    assert_eq!(
+        registration_audit(&pool, shared, parent).await,
+        (Some(1), Some("shared_identity".to_string())),
+        "and flagged"
+    );
+    grant(&pool, ROLE, h, None).await;
+    arm(&pool).await;
+    let held = may_run_as(&pool, "epigraph_app", shared)
+        .await
+        .expect("ask");
+    assert!(
+        !held.may_run && held.holder.is_none() && held.role.as_deref() == Some(ROLE),
+        "unlinked, it may not run even while the role is held: {held:?}"
+    );
+    link(&pool, shared, h).await;
+    write_as(&pool, shared, shared, h_group)
+        .await
+        .expect("linked to the holder by hand, it writes");
+}
