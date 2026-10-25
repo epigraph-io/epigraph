@@ -1931,11 +1931,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // agent as UNATTACHED, so it checks its own frame first and fails CLOSED
     // (loud: every armed claim write is refused ROL01 and epigraph-mcp
     // refuses to boot). The question and the check only call the gate.
-    // The lineage copy also reads FORCEd `agent_prompt_snapshots` to skip a
-    // SHARED successor: under a non-member owner it sees no snapshot and
-    // attaches the shared successor (quiet, but only ever a refusal). The
-    // registration's shared-identity skip reads `security_events` to audit
-    // each withheld row once. `epigraph_role_agent_write_check` (the
+    // The lineage copy also reads FORCEd `agent_prompt_snapshots` to FLAG a
+    // SHARED successor it attaches: under a non-member owner it sees no
+    // snapshot and writes no flag (quiet, audit only: the successor is
+    // attached either way). `epigraph_role_agent_write_check` (the
     // statement trigger on every app-writable table, and the claims author
     // arm) calls the maintenance-only check: under a non-member owner it is
     // denied EXECUTE and every armed application write fails 42501 (loud).
