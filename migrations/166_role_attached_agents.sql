@@ -322,6 +322,14 @@ RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 BEGIN
+    -- Every link write and every registration first (107 section 10), so an
+    -- attach and a registration of a successor never miss each other: the
+    -- registration holds this lock from its start, so an attach waits for it
+    -- to commit and its lineage walk then sees the new succession; an attach
+    -- that holds it first makes the registration wait, and its step 5b then
+    -- sees the attachment. Taken before the next lock, in the order the
+    -- registration takes them, so the two never deadlock.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     -- One attach (or copy) at a time, so two concurrent writers of the same
     -- (role, agent) see each other's row below.
     PERFORM pg_advisory_xact_lock(hashtext('epigraph.role_agents'));
