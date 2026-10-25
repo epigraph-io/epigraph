@@ -131,7 +131,8 @@
 --   * `epigraph_role_agent_write_check()`, a BEFORE INSERT OR UPDATE OR
 --     DELETE OR TRUNCATE ... FOR EACH STATEMENT trigger
 --     (`role_agent_write_check`) on every table the application role writes
---     (the list below), on the stamped principal. A statement trigger fires
+--     (the list below; on `security_events` not on INSERT, see COVERAGE),
+--     on the stamped principal. A statement trigger fires
 --     once per statement, whatever rows it touches (none included).
 --   * The same function as a BEFORE UPDATE OR DELETE row trigger on
 --     `claims` (`claims_role_agent_author`), on the row's author (old and,
@@ -165,14 +166,18 @@
 -- application role can INSERT, UPDATE or DELETE carries the statement
 -- trigger: 79 tables on a database migrated to this file, measured from the
 -- catalog (table- and column-level grants after 118 and every later
--- migration), with NO exemption. That includes `claims` (every column,
+-- migration), with ONE exemption. That includes `claims` (every column,
 -- `is_current` and a same-author retire included, and DELETE), `evidence`,
 -- `edges`, `mass_functions`, memberships and groups, the derived belief and
--- cluster tables, the audit and ledger tables (`security_events`,
--- `provenance_log`, `privatization_audit`: an audit row written for an
--- attached agent in its gap belongs to an act this check refuses), and the
--- OAuth, refresh-token and key tables (a token or a key minted for an
--- attached agent in its gap is that agent running). The catalog ratchet in
+-- cluster tables, the ledger tables (`provenance_log`,
+-- `privatization_audit`), and the OAuth, refresh-token and key tables (a
+-- token or a key minted for an attached agent in its gap is that agent
+-- running). THE EXEMPTION: an INSERT into `security_events`. An actor never
+-- suppresses its own audit record (077; 123 section 4 keeps the application
+-- role's INSERT for that reason), so an attached agent's own audit row in
+-- its gap lands while the act it records is refused; the rows are immutable
+-- (082) and the `platform.` prefix is reserved (123), so the INSERT opens no
+-- other write. Its UPDATE, DELETE and TRUNCATE stay checked. The catalog ratchet in
 -- `role_attached_agents.rs` (`every_table_the_app_role_writes_carries_the_
 -- role_holder_write_check`) re-measures the set, so a table a later
 -- migration hands the application role (077's default privileges do) fails
@@ -989,10 +994,17 @@ BEGIN
         IF to_regclass('public.' || v_table) IS NOT NULL THEN
             EXECUTE format('DROP TRIGGER IF EXISTS role_agent_write_check ON public.%I',
                            v_table);
+            -- `security_events`: never on INSERT. An actor never suppresses
+            -- its own audit record (077; 123 section 4), so an attached
+            -- agent's own audit row in its gap lands; the rows are immutable
+            -- (082) and the `platform.` prefix is reserved (123).
             EXECUTE format('CREATE TRIGGER role_agent_write_check '
-                           'BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.%I '
+                           'BEFORE %s ON public.%I '
                            'FOR EACH STATEMENT '
                            'EXECUTE FUNCTION public.epigraph_role_agent_write_check()',
+                           CASE WHEN v_table = 'security_events'
+                                THEN 'UPDATE OR DELETE OR TRUNCATE'
+                                ELSE 'INSERT OR UPDATE OR DELETE OR TRUNCATE' END,
                            v_table);
         END IF;
     END LOOP;

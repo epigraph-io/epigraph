@@ -2600,18 +2600,35 @@ async fn the_write_check_is_keyed_on_arming_and_spares_a_privileged_session(pool
     );
 }
 
-/// The tables the application role can write that carry NO role-holder write
-/// check, each with the concrete harm the check would do there. EMPTY: no
-/// table has one (an audit row, a token or a key written for an attached
-/// agent in its gap is that agent running, and every such write is part of,
-/// or follows, an act the same check refuses). Exact: an entry must name an
-/// app-writable table the check does not cover.
-const WRITE_CHECK_EXEMPT: &[(&str, &str)] = &[];
+/// The (table, operation) pairs the application role can write that carry NO
+/// role-holder write check, each with the concrete harm the check would do
+/// there. Exact: an entry must name an app-writable table whose trigger does
+/// not cover that operation.
+const WRITE_CHECK_EXEMPT: &[(&str, &str, &str)] = &[(
+    "security_events",
+    "INSERT",
+    "an actor never suppresses its own audit record (077; 123 section 4): an attached agent's \
+     own audit row in its gap must land. The rows are immutable (082) and the `platform.` \
+     prefix is reserved (123), so the INSERT opens no other write; UPDATE, DELETE and \
+     TRUNCATE stay checked",
+)];
+
+/// tgtype bit of a trigger operation.
+fn op_bit(op: &str) -> i32 {
+    match op {
+        "INSERT" => 4,
+        "DELETE" => 8,
+        "UPDATE" => 16,
+        "TRUNCATE" => 32,
+        other => panic!("unknown trigger operation {other}"),
+    }
+}
 
 /// THE COVERAGE RATCHET. Every public table the application role can INSERT,
 /// UPDATE or DELETE (at table or column level) carries the shared role-holder
-/// write check as a BEFORE ... FOR EACH STATEMENT trigger on INSERT, UPDATE
-/// and DELETE, or is on [`WRITE_CHECK_EXEMPT`] with its reason; and `claims`
+/// write check as a BEFORE ... FOR EACH STATEMENT trigger on INSERT, UPDATE,
+/// DELETE and TRUNCATE, except an operation [`WRITE_CHECK_EXEMPT`] names with
+/// its reason; and `claims`
 /// carries the AUTHOR arm as a BEFORE UPDATE OR DELETE row trigger. So a
 /// table a later migration hands the application role is refused here until
 /// it is covered or its exemption is argued.
@@ -2638,35 +2655,49 @@ async fn every_table_the_app_role_writes_carries_the_role_holder_write_check(poo
     .expect("app-writable tables")
     .into_iter()
     .collect();
-    // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16.
-    let checked: std::collections::BTreeSet<String> = sqlx::query_scalar(
-        "SELECT DISTINCT t.tgrelid::regclass::text FROM pg_trigger t \
+    // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16,
+    // TRUNCATE 32. The operations each table's BEFORE ... FOR EACH STATEMENT
+    // write-check triggers cover, OR-ed.
+    let covered: std::collections::BTreeMap<String, i32> = sqlx::query_as::<_, (String, i32)>(
+        "SELECT t.tgrelid::regclass::text, bit_or(t.tgtype::int & 60) FROM pg_trigger t \
           WHERE NOT t.tgisinternal AND t.tgenabled <> 'D' \
             AND t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure \
-            AND (t.tgtype & 1) = 0 AND (t.tgtype & 2) = 2 AND (t.tgtype & 28) = 28",
+            AND (t.tgtype & 1) = 0 AND (t.tgtype & 2) = 2 \
+          GROUP BY 1",
     )
     .fetch_all(&pool)
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|t: String| t.trim_start_matches("public.").to_string())
+    .map(|(t, bits)| (t.trim_start_matches("public.").to_string(), bits))
     .collect();
-    let exempt: std::collections::BTreeSet<String> = WRITE_CHECK_EXEMPT
-        .iter()
-        .map(|(t, _)| (*t).to_string())
-        .collect();
+    let exempt_bits = |table: &str| -> i32 {
+        WRITE_CHECK_EXEMPT
+            .iter()
+            .filter(|(t, _, _)| *t == table)
+            .map(|(_, op, _)| op_bit(op))
+            .sum()
+    };
 
-    let uncovered: Vec<&String> = writable
+    let uncovered: Vec<String> = writable
         .iter()
-        .filter(|t| !checked.contains(*t) && !exempt.contains(*t))
+        .filter_map(|t| {
+            let required = 60 & !exempt_bits(t);
+            let bits = covered.get(t).copied().unwrap_or(0);
+            (bits & required != required).then(|| format!("{t} (covers {bits}, needs {required})"))
+        })
         .collect();
     assert!(
         uncovered.is_empty(),
-        "app-writable tables with no role-holder write check and no exemption: {uncovered:?}"
+        "app-writable tables whose role-holder write check misses an operation (INSERT 4, \
+         DELETE 8, UPDATE 16, TRUNCATE 32) with no exemption: {uncovered:?}"
     );
-    let stale: Vec<&String> = exempt
+    let stale: Vec<String> = WRITE_CHECK_EXEMPT
         .iter()
-        .filter(|t| !writable.contains(*t) || checked.contains(*t))
+        .filter(|(t, op, _)| {
+            !writable.contains(*t) || covered.get(*t).copied().unwrap_or(0) & op_bit(op) != 0
+        })
+        .map(|(t, op, _)| format!("{t} {op}"))
         .collect();
     assert!(
         stale.is_empty(),
