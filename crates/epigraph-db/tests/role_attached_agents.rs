@@ -2843,3 +2843,112 @@ async fn an_attach_racing_a_registration_still_attaches_the_child(pool: PgPool) 
         "the child registered while its parent was being attached is attached"
     );
 }
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Every migration below `version`.
+fn up_to_below(version: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < version)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// The parts of the catalog a migration of this kind changes: every function
+/// in `public` (definition, owner, ACL), every user trigger, every relation
+/// in `public` (kind and ACL), every index and every row-security policy.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for sql in [
+        "SELECT 'function ' || p.oid::regprocedure::text || ' owner ' \
+                || p.proowner::regrole::text || ' acl ' || COALESCE(p.proacl::text, '-') \
+                || E'\\n' || pg_get_functiondef(p.oid) \
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p')",
+        "SELECT 'trigger ' || pg_get_triggerdef(t.oid) || ' enabled ' || t.tgenabled::text \
+           FROM pg_trigger t WHERE NOT t.tgisinternal",
+        "SELECT 'relation ' || c.relname || ' kind ' || c.relkind::text || ' acl ' \
+                || COALESCE(c.relacl::text, '-') \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S')",
+        "SELECT 'index ' || indexdef FROM pg_indexes WHERE schemaname = 'public'",
+        "SELECT 'policy ' || tablename || '.' || policyname || ' ' || cmd || ' ' \
+                || roles::text || ' ' || COALESCE(qual, '-') || ' ' || COALESCE(with_check, '-') \
+           FROM pg_policies WHERE schemaname = 'public'",
+    ] {
+        let rows: Vec<String> = sqlx::query_scalar(sql)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|e| panic!("catalog read failed: {e}\n{sql}"));
+        out.extend(rows);
+    }
+    out
+}
+
+/// `docs/runbooks/166-undo.sql`, applied twice to a database migrated through
+/// 166, returns the catalog to exactly what it was below 166: every function
+/// body, owner and ACL (123's two checks and 161's registration restored
+/// byte for byte), no trigger, table, index or policy of 166's left (no
+/// `role_agent_write_check` on any table, whose function is gone), and
+/// nothing else touched. Measured over the whole `public` catalog, so a
+/// helper a later revision of 166 adds without undoing it fails here.
+/// After the undo, an armed application write by an agent that WAS attached
+/// lands (no leftover trigger refuses it, or calls a dropped function).
+#[sqlx::test(migrations = false)]
+async fn the_166_undo_restores_the_catalog_below_166(pool: PgPool) {
+    migrate(&pool, &up_to_below(166)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to_below(167)).await;
+    let at_166 = catalog(&pool).await;
+    assert_ne!(at_166, before, "CALIBRATION: 166 changed the catalog");
+
+    seed_role(&pool, ROLE).await;
+    let (h, h_group) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    arm(&pool).await;
+    assert_rol01(
+        &write_as(&pool, attached, attached, h_group).await,
+        "CALIBRATION: at 166 the attached agent is refused in its gap",
+    );
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/166-undo.sql"),
+    )
+    .expect("166-undo.sql");
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the undo does not restore the catalog below 166.\nleft behind or changed: {left:#?}\n\
+         missing or changed: {lost:#?}"
+    );
+    write_as(&pool, attached, attached, h_group)
+        .await
+        .expect("after the undo the formerly attached agent's armed write lands");
+}
