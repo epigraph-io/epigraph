@@ -2412,7 +2412,10 @@ async fn others_refresh_an_attached_agents_derived_caches_in_its_gap(pool: PgPoo
     );
     let by_agent = refresh_belief_cache_as(&pool, attached, h_group, claim).await;
     assert!(
-        matches!(by_agent, Err(epigraph_db::DbError::RoleHolderRequired { .. })),
+        matches!(
+            by_agent,
+            Err(epigraph_db::DbError::RoleHolderRequired { .. })
+        ),
         "the attached agent's own refresh after the end: {by_agent:?}"
     );
     let mixed = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
