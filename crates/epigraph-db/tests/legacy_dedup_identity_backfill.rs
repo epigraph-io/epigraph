@@ -459,3 +459,41 @@ async fn a_legacy_mark_over_a_retired_canonical_is_refused_with_the_legacy_reaso
         .expect("read");
     assert!(!still, "a refused un-mark changes nothing");
 }
+
+/// A legacy mark whose `deduped_into` property is gone cannot be reconstructed
+/// (the backfill needs it to know which claim the mark named): the un-mark says
+/// exactly that (operator ruling R-7).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_mark_without_deduped_into_is_refused_with_that_reason(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r7-no-into").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "r7 canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "r7 deduped_into removed since").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    sqlx::query("UPDATE claims SET properties = properties - 'deduped_into' WHERE id = $1")
+        .bind(dup)
+        .execute(&pool)
+        .await
+        .expect("drop deduped_into");
+    assert!(
+        !backfill(&pool, false)
+            .await
+            .duplicates
+            .iter()
+            .any(|d| d.duplicate == dup),
+        "calibration: the backfill cannot select it"
+    );
+    let viewer = fixture::bypass(&pool).await.1;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let e = ClaimRepository::unmark_duplicate_act_conn(
+        &mut conn,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(dup),
+    )
+    .await
+    .expect_err("refused")
+    .to_string();
+    assert!(
+        e.contains("cannot reconstruct") && e.contains("records no deduped_into"),
+        "{e}"
+    );
+}

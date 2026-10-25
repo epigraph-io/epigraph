@@ -11558,7 +11558,7 @@ async fn legacy_mark_refusal(
 ) -> Result<Option<String>, DbError> {
     let sql = viewer.splice(
         &format!(
-            "SELECT ({LEGACY_MARK_RECONSTRUCTABLE_SQL}), \
+            "SELECT COALESCE(({LEGACY_MARK_RECONSTRUCTABLE_SQL}), false), \
                     'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])), \
                     c.properties->>'deduped_into', c.supersedes \
                FROM claims c \
