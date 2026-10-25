@@ -241,3 +241,36 @@ async fn the_backfill_refuses_a_non_privileged_session(pool: PgPool) {
     }
     assert!(identity_edges(&pool, dup).await.is_empty());
 }
+
+/// The function runs on the `epigraph_maintenance` login itself (not only a
+/// superuser): its `SELECT ... FOR UPDATE OF c` on claims and its INSERT on
+/// edges are within that role's grants and row security, over a GROUP-private
+/// mark in a group the session has no part in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_backfill_runs_on_the_maintenance_login(pool: PgPool) {
+    let (a, group) = fixture::seed_agent_with_group(&pool, "d5781a48-maint").await;
+    let canonical = fixture::seed_group_claim(&pool, a, group, "private canonical").await;
+    let dup = fixture::seed_group_claim(&pool, a, group, "private duplicate").await;
+    legacy_mark(&pool, dup, canonical, "fuzzy_dedup_claims", false).await;
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let mut conn = maint.acquire().await.expect("acquire");
+    let dry = ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, false)
+        .await
+        .expect("dry run as epigraph_maintenance");
+    assert_eq!(
+        dry.duplicates
+            .iter()
+            .map(|d| d.duplicate)
+            .collect::<Vec<_>>(),
+        vec![dup],
+        "the group-private mark is selected on the maintenance login"
+    );
+    let applied = ClaimRepository::backfill_legacy_dedup_identity_edges_conn(&mut conn, true)
+        .await
+        .expect("apply as epigraph_maintenance");
+    assert_eq!(applied.inserted, 1, "{applied:?}");
+    drop(conn);
+    let edges = identity_edges(&pool, dup).await;
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(edges[0].1, canonical);
+}
