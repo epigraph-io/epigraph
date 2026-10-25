@@ -119,3 +119,58 @@ async fn evidence_named_on_hypothesis_assessment_for_a_promoted_hypothesis_lands
     });
     assert!(warned, "the response says where the evidence went: {out}");
 }
+
+/// The redirect refuses a `research_validity` frame whose hypothesis count
+/// differs from the named frame's (the caller's masses would not address it):
+/// a CALLER error (invalid params, as the REST twin's 400), with the reason
+/// and nothing written, not an internal error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_redirect_onto_a_mismatched_research_validity_frame_is_a_caller_error(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let hyp_frame = ensure_frame(&pool, "hypothesis_assessment").await;
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('research_validity', \
+                ARRAY['valid','invalid','undetermined']::text[]) \
+         ON CONFLICT (name) DO UPDATE SET hypotheses = EXCLUDED.hypotheses",
+    )
+    .execute(&pool)
+    .await
+    .expect("a three-hypothesis research_validity frame");
+    let promoted = hypothesis(&pool, "promoted").await;
+
+    let err = tools::ds::submit_ds_evidence(
+        &server,
+        &viewer,
+        serde_json::from_value(serde_json::json!({
+            "claim_id": promoted.to_string(),
+            "frame_id": hyp_frame.to_string(),
+            "hypothesis_index": 0,
+            "masses": {"1": 0.7, "0,1": 0.3},
+        }))
+        .unwrap(),
+        None,
+    )
+    .await
+    .expect_err("the masses cannot address the target frame");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "a caller error, not an internal one: {err:?}"
+    );
+    assert!(
+        err.message.contains("research_validity") && err.message.contains("nothing was written"),
+        "{}",
+        err.message
+    );
+    assert!(
+        frames_with_bbas(&pool, promoted).await.is_empty(),
+        "nothing written"
+    );
+    let bound: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(promoted)
+        .fetch_one(&pool)
+        .await
+        .expect("claim_frames");
+    assert_eq!(bound, 0, "no frame binding either");
+}

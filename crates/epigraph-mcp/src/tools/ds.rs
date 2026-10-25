@@ -322,8 +322,15 @@ pub async fn submit_ds_evidence(
         &mut tx, viewer, claim_id, frame_id,
     )
     .await
-    .map_err(internal_error)?
-    {
+    // The redirect's refusals are the CALLER's (the masses cannot address the
+    // target frame, or it is missing), answered as invalid params like the
+    // REST twin's 400/404, with nothing written; anything else is internal.
+    .map_err(|e| match e {
+        epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::NotFound { .. } => {
+            invalid_params(e.to_string())
+        }
+        other => internal_error(other),
+    })? {
         Some(target) => {
             warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
                 claim_id,

@@ -153,3 +153,53 @@ async fn evidence_named_on_hypothesis_assessment_for_a_promoted_hypothesis_lands
     });
     assert!(warned, "the response says where the evidence went: {out}");
 }
+
+/// The redirect refuses a `research_validity` frame whose hypothesis count
+/// differs from the named frame's (the caller's masses would not address it):
+/// 400 with the reason, and nothing written. (The MCP twin answers invalid
+/// params.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_redirect_onto_a_mismatched_research_validity_frame_is_refused(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "r8-rest-mismatch").await;
+    let hyp_frame = ensure_frame(&pool, "hypothesis_assessment").await;
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('research_validity', \
+                ARRAY['valid','invalid','undetermined']::text[]) \
+         ON CONFLICT (name) DO UPDATE SET hypotheses = EXCLUDED.hypotheses",
+    )
+    .execute(&pool)
+    .await
+    .expect("a three-hypothesis research_validity frame");
+    let promoted = hypothesis(&pool, agent, group, "promoted").await;
+    let (addr, _shutdown) = spawn_app(&conn_opts).await;
+    let token = common::mint_token_with_agent(&["claims:write"], agent);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/frames/{hyp_frame}/evidence"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "claim_id": promoted,
+            "masses": {"1": 0.7, "0,1": 0.3},
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("body");
+    assert_eq!(status, 400, "{text}");
+    assert!(
+        text.contains("research_validity") && text.contains("nothing was written"),
+        "{text}"
+    );
+    assert!(
+        frames_with_bbas(&pool, promoted).await.is_empty(),
+        "nothing written"
+    );
+}
