@@ -1,5 +1,6 @@
 //! Integration test for union_block with source-filter.
 
+use epigraph_engine::matching::blocker::canonical;
 use epigraph_engine::matching::blocker::{
     content_hash_prefix::ContentHashBlocker, embedding_ann::EmbeddingAnnBlocker, union_block,
     Blocker,
@@ -241,5 +242,104 @@ async fn workflow_step_claims_are_excluded_by_hygiene(pool: PgPool) {
         ws_pairs.is_empty(),
         "workflow_step pair must be excluded by candidate hygiene, got {:?}",
         ws_pairs
+    );
+}
+
+/// R-12 (backlog c618e4fc): two NON-paper claims (no `paper -asserts->` edge on
+/// either side, no run id, no derivation chain) written by the SAME agent are
+/// same-source and must be dropped by `union_block` under the default config.
+/// Before the fix, `is_same_source` had no usable component for such a pair,
+/// so a same-agent restatement passed as a cross-source candidate.
+///
+/// Shape: same-agent DUPLICATE content (a shared `content_hash`), emitted by
+/// the real `ContentHashBlocker`. Migration 150 dropped the
+/// `(content_hash, agent_id)` UNIQUE constraint, so two rows by one agent with
+/// one hash are legal and exist in long-lived databases.
+///
+/// Positive control in the same run: an otherwise identical shared-hash
+/// non-paper pair by two DIFFERENT agents survives, so an empty result cannot
+/// come from the blocker emitting nothing or the filter dropping everything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn non_paper_same_agent_pair_is_filtered_out(pool: PgPool) {
+    let a1 = insert_agent(&pool).await;
+    let a2 = insert_agent(&pool).await;
+    let same_hash = [51u8; 32];
+    let cross_hash = [53u8; 32];
+    let same_l =
+        insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &same_hash).await;
+    let same_r =
+        insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &same_hash).await;
+    let cross_l =
+        insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &cross_hash).await;
+    let cross_r =
+        insert_claim_with_props_and_hash(&pool, a2, serde_json::json!({}), &cross_hash).await;
+    let cross = canonical(cross_l, cross_r).unwrap();
+
+    // Both pairs are emitted by the blocker; only the source filter can tell
+    // them apart.
+    let emitted = ContentHashBlocker
+        .candidates(&pool, &[same_l, cross_l])
+        .await
+        .expect("content-hash candidates");
+    assert_eq!(
+        emitted.len(),
+        2,
+        "ContentHashBlocker must emit both shared-hash pairs, got {:?}",
+        emitted
+    );
+    assert!(emitted.contains(&canonical(same_l, same_r).unwrap()));
+
+    let blockers: Vec<Box<dyn Blocker>> = vec![Box::new(ContentHashBlocker)];
+    let pairs = union_block(
+        &pool,
+        &blockers,
+        &[same_l, cross_l],
+        SourceFilterConfig::default(),
+        &EligibilityConfig::default(),
+    )
+    .await
+    .expect("union_block");
+
+    assert_eq!(
+        pairs,
+        vec![cross],
+        "same-agent non-paper pair must be dropped and the different-agent \
+         non-paper pair kept; got {:?}",
+        pairs
+    );
+}
+
+/// R-12 keeps today's rule for paper claims: two claims by the SAME agent with
+/// the same content, each asserted by a DIFFERENT paper, survive `union_block`
+/// as cross-source under the default config (same agent alone is not enough
+/// for paper claims). Emitted by the real `ContentHashBlocker`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn paper_claims_same_agent_different_papers_survive(pool: PgPool) {
+    let a = insert_agent(&pool).await;
+    let hash = [61u8; 32];
+    let l = insert_claim_with_props_and_hash(&pool, a, serde_json::json!({}), &hash).await;
+    let r = insert_claim_with_props_and_hash(&pool, a, serde_json::json!({}), &hash).await;
+    let paper_a = insert_paper(&pool, "10.1/r12-A").await;
+    let paper_b = insert_paper(&pool, "10.1/r12-B").await;
+    insert_asserts_edge(&pool, paper_a, l).await;
+    insert_asserts_edge(&pool, paper_b, r).await;
+    let pair = canonical(l, r).unwrap();
+
+    let blockers: Vec<Box<dyn Blocker>> = vec![Box::new(ContentHashBlocker)];
+    let pairs = union_block(
+        &pool,
+        &blockers,
+        &[l],
+        SourceFilterConfig::default(),
+        &EligibilityConfig::default(),
+    )
+    .await
+    .expect("union_block");
+
+    assert_eq!(
+        pairs,
+        vec![pair],
+        "same-agent claims from different papers must stay cross-source, got {:?}",
+        pairs
     );
 }
