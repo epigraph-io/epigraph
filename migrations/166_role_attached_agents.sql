@@ -97,8 +97,15 @@
 -- insert, a re-open and a re-attribution (the claims trigger, below) and on
 -- every UPDATE or DELETE of the row (the author arm), whoever writes it. A
 -- claim an attached agent authored is its output: after its holder's end no
--- application session rewrites or deletes it, the human and a session with no
--- principal included.
+-- application session changes what it says, retires it or deletes it, the
+-- human and a session with no principal included. The author arm does not
+-- check an UPDATE that changes only the DERIVED caches the database keeps on
+-- the row from everyone's evidence and jobs (the DS belief cache and its
+-- frame, classification, beta parameters, embeddings, theme, the matcher's
+-- scan mark, `updated_at`): that is another principal's evidence landing,
+-- not the agent speaking, and refusing it would stop every evidence
+-- submission on the agent's claims for the length of the gap. Every other
+-- column, one added later included, is what the author said.
 -- (b) also refuses an agent still linked to the PREVIOUS holder after a
 -- handover. A link is permanent (107 refuses a second operator for an agent),
 -- so such an agent stays refused: the remedies are to grant the role back to
@@ -177,9 +184,11 @@
 -- application DSN can stamp itself as another principal (or as none, for a
 -- table other than `claims`), and nothing here can tell that from the other
 -- identity's own write. The host's skip holds it.
--- A write that touches a claim an attached agent authored fails as a whole
--- in that agent's gap (a multi-row UPDATE included); a custodial correction
--- runs on the maintenance DSN.
+-- A write that changes what an attached agent's claim says (its
+-- `truth_value` included, so a belief recompute that rewrites it), or
+-- retires or deletes it, fails as a whole in that agent's gap (a multi-row
+-- UPDATE included; a human's supersede of the claim too, because it retires
+-- the predecessor); a custodial correction runs on the maintenance DSN.
 -- DEPLOY: creating 80 triggers takes a SHARE ROW EXCLUSIVE lock on each
 -- table under this file's 3 s `lock_timeout`; on a busy database a timeout
 -- rolls the whole migration back, and it is re-run.
@@ -873,17 +882,42 @@ CREATE OR REPLACE FUNCTION public.epigraph_role_agent_write_check()
 RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
+DECLARE
+    -- The claim columns the database DERIVES from everyone's evidence and
+    -- jobs, not from what the author said: the DS belief cache and its
+    -- frame, the classification, the beta parameters, the embeddings, the
+    -- theme, the matcher's scan mark, the generated text index and
+    -- `updated_at`. Every other column (a column added later included) is
+    -- what the author said.
+    c_derived constant text[] := ARRAY[
+        'belief', 'plausibility', 'mass_on_empty', 'pignistic_prob', 'mass_on_missing',
+        'open_world_mass', 'belief_frame_id', 'classification', 'beta_alpha', 'beta_beta',
+        'embedding', 'embedding_3072', 'theme_id', 'last_match_scan_at', 'content_tsv',
+        'updated_at'];
 BEGIN
     IF public.epigraph_operator_binding_armed() AND NOT public.epigraph_bypass() THEN
         IF TG_LEVEL = 'STATEMENT' THEN
             PERFORM public.epigraph_require_role_holder(public.epigraph_principal_id());
         ELSE
             -- `claims`: a claim an attached agent authored is its output, so
-            -- no application session rewrites or deletes it in the agent's
-            -- gap, whoever is stamped (the claims trigger checks the author
-            -- of an insert, a re-open and a re-attribution).
-            IF NOT public.epigraph_agent_is_retired(OLD.agent_id) THEN
-                PERFORM public.epigraph_require_role_holder(OLD.agent_id);
+            -- no application session changes what it says, or deletes it, in
+            -- the agent's gap, whoever is stamped (the claims trigger checks
+            -- the author of an insert, a re-open and a re-attribution). An
+            -- UPDATE of the derived caches alone is another principal's
+            -- evidence landing, not the agent speaking, and is not checked on
+            -- the author (the stamped principal was checked above). Nested,
+            -- so the cheap gate answer comes first and the row comparison
+            -- only runs for an attached author.
+            IF (SELECT g.reason
+                  FROM public.epigraph_role_agent_gate(OLD.agent_id, clock_timestamp()) g)
+               IS DISTINCT FROM 'unattached' THEN
+                IF NOT public.epigraph_agent_is_retired(OLD.agent_id) THEN
+                    IF TG_OP = 'DELETE'
+                       OR (to_jsonb(NEW) - c_derived) IS DISTINCT FROM (to_jsonb(OLD) - c_derived)
+                    THEN
+                        PERFORM public.epigraph_require_role_holder(OLD.agent_id);
+                    END IF;
+                END IF;
             END IF;
             IF TG_OP = 'UPDATE' AND NEW.agent_id IS DISTINCT FROM OLD.agent_id
                AND NOT public.epigraph_agent_is_retired(NEW.agent_id) THEN
