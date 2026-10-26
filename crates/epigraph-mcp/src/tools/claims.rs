@@ -423,7 +423,11 @@ async fn prepare_submission(
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
-    claim.signature = Some(server.signer.sign(&content_hash));
+    claim.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Claim, &content_hash),
+    );
 
     // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4). Runs
     // ONLY on genuinely new content: a read-only content-hash existence
@@ -640,7 +644,11 @@ async fn write_submission(
     );
     let evidence_with_sig = {
         let mut e = evidence;
-        e.signature = Some(server.signer.sign(&evidence_hash));
+        e.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
         e
     };
 
@@ -1348,7 +1356,11 @@ pub async fn update_with_evidence(
         Some(params.evidence_data),
         ClaimId::from_uuid(claim_id),
     );
-    evidence.signature = Some(server.signer.sign(&evidence_hash));
+    evidence.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+    );
 
     // HISTORY, kept short because the next block supersedes it: before D2 this
     // evidence INSERT was deliberately left UNSTAMPED. Stamped on its own it

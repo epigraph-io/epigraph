@@ -62,7 +62,11 @@ pub async fn memorize(
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
-    claim.signature = Some(server.signer.sign(&claim.content_hash));
+    claim.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Claim, &claim.content_hash),
+    );
 
     // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4) — same
     // shape as `submit_claim`'s wiring, see `crate::tools::novelty_gate`
@@ -213,7 +217,11 @@ pub async fn memorize(
             Some(evidence_text),
             claim.id,
         );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
+        evidence.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
 
         let trace = ReasoningTrace::new(
             agent_id_typed,

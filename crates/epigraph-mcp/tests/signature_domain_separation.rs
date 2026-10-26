@@ -11,14 +11,19 @@
 //! the MCP writers could only ever carry what those writers sign, and these
 //! tests pin what the VERIFIER accepts.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
-use common::build_test_server;
+use common::{build_scoped_test_server, build_test_server};
 use epigraph_core::{AgentId, Claim, TruthValue};
-use epigraph_crypto::{AgentSigner, ContentHasher, SignedEntity};
+use epigraph_crypto::{
+    AgentSigner, ContentHasher, SignatureScheme, SignatureVerifier, SignedEntity,
+};
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::verify_claim;
-use epigraph_mcp::types::VerifyClaimParams;
+use epigraph_mcp::types::{MemorizeParams, SubmitClaimParams, VerifyClaimParams};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -130,6 +135,126 @@ async fn create_strict_signed_stores_only_claim_signatures(pool: PgPool) {
             "{kind:?}-tagged signature stored = {stored} expected"
         );
     }
+}
+
+/// The writers: a claim written through MCP `submit_claim` carries a v1 CLAIM
+/// signature and its evidence row a v1 EVIDENCE signature, by the server key.
+/// The evidence signature is not a valid claim signature over the same digest.
+///
+/// RED before the writer switch: both were signed over the bare digest
+/// (`signature_scheme: legacy`, and the evidence signature verified as a claim
+/// signature).
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_claim_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, server_agent)
+        .await
+        .expect("viewer");
+    let content = "R-34 writer: submit_claim signs under v1";
+    let evidence_text = format!("evidence for {content}");
+    epigraph_mcp::tools::claims::submit_claim(
+        &server,
+        &viewer,
+        SubmitClaimParams {
+            content: content.to_string(),
+            methodology: "extraction".to_string(),
+            evidence_data: evidence_text.clone(),
+            evidence_type: "empirical".to_string(),
+            confidence: 0.7,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+            novelty_threshold: Some(0.0),
+        },
+        None,
+    )
+    .await
+    .expect("stdio submit");
+    let claim: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .expect("claim");
+
+    let resp = run_verify(&pool, claim).await;
+    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
+    assert_eq!(resp["signature_scheme"], "v1", "{resp}");
+
+    assert_evidence_signed_v1(&pool, claim, &evidence_text).await;
+}
+
+/// The same for `memorize` (its own sign sites in `tools/memory.rs`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn memorize_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, server_agent)
+        .await
+        .expect("viewer");
+    let content = "R-34 writer: memorize signs under v1";
+    epigraph_mcp::tools::memory::memorize(
+        &server,
+        &viewer,
+        MemorizeParams {
+            content: content.to_string(),
+            confidence: Some(0.7),
+            tags: None,
+            novelty_threshold: Some(0.0),
+        },
+        None,
+    )
+    .await
+    .expect("stdio memorize");
+    let claim: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .expect("claim");
+
+    let resp = run_verify(&pool, claim).await;
+    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
+    assert_eq!(resp["signature_scheme"], "v1", "{resp}");
+
+    let (evidence_text,): (String,) = sqlx::query_as(
+        "SELECT raw_content FROM evidence WHERE claim_id = $1 AND signature IS NOT NULL LIMIT 1",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("a signed evidence row");
+    assert_evidence_signed_v1(&pool, claim, &evidence_text).await;
+}
+
+/// The claim's signed evidence row: its signature verifies under the server
+/// key as a v1 EVIDENCE signature over its stored hash, and NOT as a claim
+/// signature over that hash under either rung.
+async fn assert_evidence_signed_v1(pool: &PgPool, claim: Uuid, evidence_text: &str) {
+    // The signer's registered key: these test servers sign with the key their
+    // agent row carries.
+    let (hash, sig, key): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT e.content_hash, e.signature, a.public_key FROM evidence e \
+           JOIN agents a ON a.id = e.signer_id \
+          WHERE e.claim_id = $1 AND e.raw_content = $2 AND e.signature IS NOT NULL",
+    )
+    .bind(claim)
+    .bind(evidence_text)
+    .fetch_one(pool)
+    .await
+    .expect("the claim's signed evidence row");
+    let hash: [u8; 32] = hash.try_into().expect("32-byte hash");
+    let sig: [u8; 64] = sig.try_into().expect("64-byte signature");
+    let key: [u8; 32] = key.try_into().expect("32-byte key");
+    assert_eq!(
+        SignatureVerifier::verify_entity(&key, SignedEntity::Evidence, &hash, &sig).unwrap(),
+        Some(SignatureScheme::V1),
+        "the evidence row is not signed as v1 evidence"
+    );
+    assert_eq!(
+        SignatureVerifier::verify_entity(&key, SignedEntity::Claim, &hash, &sig).unwrap(),
+        None,
+        "the evidence signature verifies as a claim signature over the same digest"
+    );
 }
 
 async fn run_verify(pool: &PgPool, claim_id: Uuid) -> Value {

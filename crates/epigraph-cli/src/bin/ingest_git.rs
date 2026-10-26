@@ -27,7 +27,7 @@
 //! | Commit hash          | Content hash       |
 
 use async_trait::async_trait;
-use epigraph_crypto::{AgentSigner, ContentHasher};
+use epigraph_crypto::{AgentSigner, ContentHasher, SignedEntity};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1321,7 +1321,7 @@ fn build_packet(
     // Create evidence from Evidence: bullets
     for bullet in &commit.evidence {
         let content_hash = ContentHasher::hash(bullet.as_bytes());
-        let sig = hex::encode(signer.sign(bullet.as_bytes()));
+        let sig = hex::encode(signer.sign_entity(SignedEntity::Evidence, &content_hash));
         evidence_items.push(EvidenceSubmission {
             content_hash: hex::encode(content_hash),
             evidence_type: EvidenceTypeSubmission::Document {
@@ -1336,7 +1336,7 @@ fn build_packet(
     // Create evidence from Verification: bullets
     for bullet in &commit.verification {
         let content_hash = ContentHasher::hash(bullet.as_bytes());
-        let sig = hex::encode(signer.sign(bullet.as_bytes()));
+        let sig = hex::encode(signer.sign_entity(SignedEntity::Evidence, &content_hash));
         evidence_items.push(EvidenceSubmission {
             content_hash: hex::encode(content_hash),
             evidence_type: EvidenceTypeSubmission::Document {
@@ -1460,7 +1460,10 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
             mime_type: "text/plain".into(),
         },
         raw_content: Some(evidence_text.clone()),
-        signature: Some(hex::encode(signer.sign(evidence_text.as_bytes()))),
+        signature: Some(hex::encode(signer.sign_entity(
+            SignedEntity::Evidence,
+            &ContentHasher::hash(evidence_text.as_bytes()),
+        ))),
     };
     EpistemicPacket {
         claim: ClaimSubmission {
@@ -3381,6 +3384,25 @@ fix(db): prevent SQL injection in claim search
             let sig = ev.signature.as_ref().expect("evidence should be signed");
             let sig_bytes = hex::decode(sig).expect("signature should be valid hex");
             assert_eq!(sig_bytes.len(), 64, "Ed25519 signature should be 64 bytes");
+            // Ruling R-34: a v1 EVIDENCE signature over the evidence's
+            // content hash, which is no claim signature over that hash.
+            let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+            let mut hash = [0u8; 32];
+            hex::decode_to_slice(&ev.content_hash, &mut hash).unwrap();
+            let check = |kind| {
+                epigraph_crypto::SignatureVerifier::verify_entity(
+                    &signer.public_key(),
+                    kind,
+                    &hash,
+                    &sig,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                check(SignedEntity::Evidence),
+                Some(epigraph_crypto::SignatureScheme::V1)
+            );
+            assert_eq!(check(SignedEntity::Claim), None);
         }
     }
 

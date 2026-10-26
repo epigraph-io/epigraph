@@ -1079,7 +1079,11 @@ pub async fn report_workflow_outcome(
         Some(evidence_text),
         epigraph_core::ClaimId::from_uuid(workflow_id),
     );
-    evidence.signature = Some(server.signer.sign(&evidence_hash));
+    evidence.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+    );
 
     // ── HISTORY: WHY THE EVIDENCE WRITE WAS ONCE LEFT UNSTAMPED ─────────
     //

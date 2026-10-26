@@ -136,12 +136,27 @@ async fn the_new_mode_signs_with_the_signing_key_and_attributes_to_the_identity(
         .try_into()
         .expect("64-byte signature");
     let digest = ContentHasher::hash(content.as_bytes());
-    assert!(
-        SignatureVerifier::verify(&signing.public_key(), &digest, &signature).unwrap_or(false),
-        "the stored signature is the signing key's"
+    // Ruling R-34: the server signs the claim-tagged v1 message.
+    assert_eq!(
+        SignatureVerifier::verify_entity(
+            &signing.public_key(),
+            epigraph_crypto::SignedEntity::Claim,
+            &digest,
+            &signature
+        )
+        .unwrap(),
+        Some(epigraph_crypto::SignatureScheme::V1),
+        "the stored signature is the signing key's, over the v1 claim message"
     );
-    assert!(
-        !SignatureVerifier::verify(&identity, &digest, &signature).unwrap_or(false),
+    assert_eq!(
+        SignatureVerifier::verify_entity(
+            &identity,
+            epigraph_crypto::SignedEntity::Claim,
+            &digest,
+            &signature
+        )
+        .unwrap(),
+        None,
         "and not an identity-key signature"
     );
     assert_eq!(
