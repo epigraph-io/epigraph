@@ -205,6 +205,85 @@ async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
     );
 }
 
+/// An evolve(supersedes) whose retirement of the predecessor the database
+/// refuses must be refused with nothing written, leaving the lineage with
+/// exactly one current head (backlog d34f5096).
+///
+/// Row security that refuses an UPDATE through its USING clause does not
+/// raise: the statement matches zero rows and reports success. Before the fix
+/// `evolve_step_conn` ignored the retire's row count, so it inserted the
+/// successor next to a predecessor that was still current: two live heads on
+/// a lineage that `supersedes` keeps linear. A `BEFORE UPDATE` trigger that
+/// skips only the predecessor's `is_current` change stands in for that policy
+/// deterministically (the lineage back-fill, which leaves `is_current` alone,
+/// still goes through), named to fire before every other `BEFORE UPDATE`
+/// trigger on `claims`. The caller's transaction is committed whatever the
+/// call left on it, so the assertions see what a caller that ignored the error
+/// would have persisted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let parent = seed_claim(&pool, agent, "predecessor that cannot be retired", 0.7).await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_step_retire() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_step_retire BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{parent}'::uuid AND NEW.is_current IS DISTINCT FROM OLD.is_current) \
+         EXECUTE FUNCTION aaa_test_skip_step_retire();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the retirement stand-in");
+
+    let mut tx = pool.begin().await.unwrap();
+    let r = ClaimRepository::evolve_step_conn(
+        &mut tx,
+        ClaimId::from_uuid(parent),
+        "successor of an unretirable step",
+        "supersedes",
+        Some("unretirable"),
+        2,
+        agent,
+    )
+    .await;
+    tx.commit().await.expect("commit");
+
+    let err = r.expect_err("a step whose predecessor this session cannot retire must not evolve");
+    assert!(
+        matches!(&err, epigraph_db::DbError::WriteRefused { id, .. } if *id == parent),
+        "a readable, current predecessor the session cannot retire is WriteRefused; got: {err:?}"
+    );
+    let (still_current, lineage): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(still_current, "the predecessor is untouched");
+    let heads: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims \
+         WHERE (id = $1 OR step_lineage_id = $2) AND COALESCE(is_current, true)",
+    )
+    .bind(parent)
+    .bind(lineage)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(heads, 1, "the lineage keeps exactly one current head");
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(successors, 0, "no successor row was inserted");
+    let edges: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE target_id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(edges, 0, "no supersedes edge was inserted");
+}
+
 // ── evolve_step(supersedes) and the supersede edge cascade (backlog 8d3b4527) ──
 //
 // evolve_step(supersedes) retires a step and writes its successor, but the

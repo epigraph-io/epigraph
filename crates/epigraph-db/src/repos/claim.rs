@@ -7778,6 +7778,11 @@ impl ClaimRepository {
     /// claims trigger sees the writing principal: once the database is armed
     /// it refuses a claim written by an application session with no
     /// principal.
+    ///
+    /// # Errors
+    /// `DbError::WriteRefused` (with nothing written) when a `supersedes`
+    /// parent is readable and current but the session's retirement of it
+    /// changed no row (row security refused the UPDATE).
     #[instrument(skip(conn))]
     pub async fn evolve_step_conn(
         conn: &mut sqlx::PgConnection,
@@ -7866,6 +7871,38 @@ impl ClaimRepository {
             }
         };
 
+        if edge_type == "supersedes" {
+            // Retire the predecessor BEFORE writing its successor, and refuse
+            // when the retire changed nothing (backlog d34f5096). Row security
+            // that refuses an UPDATE through its USING clause does not raise:
+            // the statement matches zero rows and reports success. The locked
+            // read above already proved the parent visible and current, so a
+            // zero-row retire can only be a refusal, and inserting the
+            // successor after it would leave the lineage with two current
+            // heads. Retiring first means a refusal has written nothing, as
+            // in `supersede_act_conn`.
+            //
+            // Also null both embedding columns so the retired step drops out
+            // of semantic search. Mirrors the invariant enforced by
+            // supersede() and mark_duplicate(): is_current=false → embedding
+            // (and embedding_3072) = NULL.
+            let retired = sqlx::query(
+                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                 updated_at = NOW() WHERE id = $1",
+            )
+            .bind(parent_uuid)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if retired != 1 {
+                return Err(DbError::WriteRefused {
+                    entity: "Claim".to_string(),
+                    id: parent_uuid,
+                    action: "supersede".to_string(),
+                });
+            }
+        }
+
         let new_uuid = Uuid::new_v4();
         let hash = ContentHasher::hash(new_content.as_bytes());
         let properties = serde_json::json!({
@@ -7908,20 +7945,6 @@ impl ClaimRepository {
         .bind(reason.unwrap_or(""))
         .execute(&mut *tx)
         .await?;
-
-        if edge_type == "supersedes" {
-            // Also null both embedding columns so the retired step drops out
-            // of semantic search. Mirrors the invariant enforced by
-            // supersede() and mark_duplicate(): is_current=false → embedding
-            // (and embedding_3072) = NULL.
-            sqlx::query(
-                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
-                 updated_at = NOW() WHERE id = $1",
-            )
-            .bind(parent_uuid)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         Ok(EvolveStepResult {
             new_claim_id: new_uuid,
