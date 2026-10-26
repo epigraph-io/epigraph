@@ -760,19 +760,19 @@ pub async fn auto_wire_ds_update(
             .await
             .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
     // Ruling R-22: this fold is written to the claim's cache (and, by the
-    // callers, to its `truth_value`), so a public claim folds only its
-    // public-derived BBAs, exactly as the recompute does
-    // (`epigraph_engine::derivation_scope`). The row just stored cites this
-    // call's own evidence; if even it is not public-derived (an evidence row
-    // narrowed to a private group), nothing public may be computed from it.
-    let all_rows =
-        epigraph_engine::derivation_scope::retain_for_cache(&mut *conn, claim_id, all_rows)
-            .await
-            .map_err(|e| format!("derivation scope read: {e}"))?;
+    // callers, to its `truth_value`), so it folds only the BBAs whose every
+    // source is at least as widely readable as the claim, exactly as the
+    // recompute does (`epigraph_engine::derivation_scope`). The row just
+    // stored cites this call's own evidence; if even it is not admissible (an
+    // evidence row narrowed to another group), nothing may be cached from it.
+    let all_rows = epigraph_engine::derivation_scope::retain_for_cache(&mut *conn, all_rows)
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
     if all_rows.is_empty() {
         return Err(format!(
-            "claim {claim_id} is public and none of its BBAs is derived from public sources \
-             (the cited evidence is not public), so no public belief can be written from them"
+            "none of claim {claim_id}'s BBAs is derived only from sources as widely readable \
+             as the claim (the cited evidence is narrower), so no cached belief can be written \
+             from them"
         ));
     }
 

@@ -115,7 +115,7 @@ async fn bp_apply_never_writes_a_public_claim_from_a_private_neighbour(pool: PgP
         "BP apply wrote a public claim's cache from a group-private neighbour: {body}"
     );
     assert_eq!(
-        body["skipped_non_public"].as_u64(),
+        body["skipped_less_readable_inputs"].as_u64(),
         Some(1),
         "the skip is reported: {body}"
     );
@@ -124,5 +124,91 @@ async fn bp_apply_never_writes_a_public_claim_from_a_private_neighbour(pool: PgP
     assert!(
         written >= 1,
         "the all-public component must still be applied: {body}"
+    );
+}
+
+async fn team_group(pool: &PgPool, label: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ($1, 'did:test:r22bp:' || gen_random_uuid(), decode(repeat('ab', 32), 'hex'), \
+                 'team') RETURNING id",
+    )
+    .bind(label)
+    .fetch_one(pool)
+    .await
+    .expect("team group")
+}
+
+/// The security review's generalisation: a GROUP claim beside ANOTHER group's
+/// claim in one component is not written either (each is less readable than
+/// the other's audience), while a component of one group's claims is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bp_apply_never_writes_a_group_claim_from_another_groups_neighbour(pool: PgPool) {
+    let (member, _) = seed_agent_with_group(&pool, "r22-bp-both").await;
+    let group_a = team_group(&pool, "r22 bp A").await;
+    let group_b = team_group(&pool, "r22 bp B").await;
+    for g in [group_a, group_b] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'admin')",
+        )
+        .bind(g)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .expect("membership");
+    }
+    let frame = epigraph_db::FrameRepository::create(
+        &pool,
+        "r22_bp_groups_frame",
+        None,
+        &["supported".to_string(), "unsupported".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let in_a = seed_group_claim(&pool, member, group_a, "r22 bp A beside B").await;
+    let in_b = seed_group_claim(&pool, member, group_b, "r22 bp B beside A").await;
+    let a_left = seed_group_claim(&pool, member, group_a, "r22 bp A left").await;
+    let a_right = seed_group_claim(&pool, member, group_a, "r22 bp A right").await;
+    for (c, p) in [(in_a, 0.3), (in_b, 0.95), (a_left, 0.9), (a_right, 0.3)] {
+        set_betp(&pool, c, p).await;
+    }
+    factor(&pool, frame, in_b, in_a).await;
+    factor(&pool, frame, a_left, a_right).await;
+
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(scoped_pool(&pool).await);
+    state.bp_apply = BpApply::On;
+    let viewer = Viewer::resolve(&pool, member).await.expect("member viewer");
+    let request: PropagateRequest = serde_json::from_value(serde_json::json!({
+        "frame_id": frame,
+        "apply_updates": true,
+        "mode": "scalar",
+        "max_iterations": 10,
+    }))
+    .expect("request");
+    let Json(body) = propagate_beliefs(ViewerExtractor(viewer), State(state), Json(request))
+        .await
+        .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
+
+    assert_eq!(
+        betp(&pool, in_a).await,
+        Some(0.3),
+        "BP apply wrote group A's claim from group B's neighbour: {body}"
+    );
+    assert_eq!(
+        betp(&pool, in_b).await,
+        Some(0.95),
+        "BP apply wrote group B's claim from group A's neighbour: {body}"
+    );
+    assert_eq!(
+        body["skipped_less_readable_inputs"].as_u64(),
+        Some(2),
+        "both skips are reported: {body}"
+    );
+    assert!(
+        body["applied_count"].as_u64().unwrap_or_default() >= 1,
+        "the one-group component must still be applied: {body}"
     );
 }

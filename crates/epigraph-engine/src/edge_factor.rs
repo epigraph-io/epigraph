@@ -1046,11 +1046,12 @@ async fn compute_combined_belief_over(
     all_rows: Vec<MassFunctionRow>,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
     // Ruling R-22: what this fold computes is the claim's CACHED belief (or a
-    // preview of it), which everyone who can read the claim is served, so a
-    // public claim folds only its public-derived BBAs
-    // (`crate::derivation_scope`). Filtered before anything reads the rows:
-    // the classification's `has_opposing` below iterates them too.
-    let all_rows = crate::derivation_scope::retain_for_cache(&mut *conn, claim_id, all_rows)
+    // preview of it), which everyone who can read the claim is served, so it
+    // folds only the BBAs whose every source is at least as widely readable
+    // as the claim (`crate::derivation_scope`). Filtered before anything
+    // reads the rows: the classification's `has_opposing` below iterates them
+    // too.
+    let all_rows = crate::derivation_scope::retain_for_cache(&mut *conn, all_rows)
         .await
         .map_err(|e| format!("derivation scope read: {e}"))?;
     if all_rows.is_empty() {

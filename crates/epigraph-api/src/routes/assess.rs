@@ -391,8 +391,9 @@ pub async fn assess_claim(
 
     // Retrieve all user-submitted BBAs for this (claim, frame). This fold is
     // stored as the claim's global scoped belief and returned as its updated
-    // belief, so on a public claim it takes only the public-derived BBAs
-    // (ruling R-22), as the cache refresh below does.
+    // belief, so it takes only the BBAs whose every source is at least as
+    // widely readable as the claim (ruling R-22), as the cache refresh below
+    // does.
     let all_rows =
         epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
             .await?;
@@ -400,7 +401,7 @@ pub async fn assess_claim(
         let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
             message: format!("acquire connection: {e}"),
         })?;
-        epigraph_engine::derivation_scope::retain_for_cache(&mut conn, claim_id, all_rows).await?
+        epigraph_engine::derivation_scope::retain_for_cache(&mut conn, all_rows).await?
     };
 
     let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows

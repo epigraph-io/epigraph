@@ -2433,24 +2433,13 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "derivation_scope.rs",
-        "claim_is_public",
-        "READ of one claim's `visibility = 'public'` (ruling R-22). Every row it can return true \
-         for is public, so a viewer predicate would admit it anyway; a claim the session cannot \
-         see reads false, which is the private answer the caller wants.",
-    ),
-    (
-        "derivation_scope.rs",
-        "public_claims_among",
-        "READ of which ids are PUBLIC claims (ruling R-22, BP apply guard). The WHERE requires \
-         `visibility = 'public'`, so it can only return rows every viewer may read.",
-    ),
-    (
-        "derivation_scope.rs",
-        "public_derived",
-        "READ of which BBAs are derived from PUBLIC sources only (ruling R-22). Every table it \
-         reads (`mass_functions`, `evidence`, `edges`, `claims`) is constrained to \
-         `visibility = 'public'`, so it returns only ids every viewer may read; its \
-         viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
+        "cache_admissible",
+        "READ that answers, for BBA rows the caller already read, which may enter THEIR \
+         claim's cached belief (ruling R-22, generalised): each row, its cited evidence, its \
+         edge and the edge's source claim are compared with the row's own claim (public, or \
+         the claim's owner group). It returns only a subset of the ids it was given, and the \
+         audience is the CLAIM's readers, not a viewer's, so there is no viewer predicate to \
+         splice; the viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
     ),
     (
         "admin_scope_enforcement.rs",

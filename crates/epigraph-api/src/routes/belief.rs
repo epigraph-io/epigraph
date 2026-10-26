@@ -286,7 +286,8 @@ struct ScopedBeliefWrite {
 /// A stored scoped belief (`ds_combined_beliefs`) of one scope: the scope's
 /// stored BBAs, as this handler always folded them (raw masses, no discount),
 /// restricted to the rows the claim's stored beliefs may be computed from
-/// (ruling R-22: a public claim's are its public-derived BBAs only), folded by
+/// (ruling R-22: those whose every source is at least as widely readable as
+/// the claim), folded by
 /// the engine's owner-aware rule (ruling R-36: sibling agents of one human
 /// are reduced cautiously, never multiplied). `None` when no row is left or
 /// the fold fails (best-effort, as before).
@@ -295,7 +296,6 @@ struct ScopedBeliefWrite {
 async fn scoped_belief_write(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
     ds_frame: &epigraph_ds::FrameOfDiscernment,
     h_idx: Option<i32>,
     rows: Vec<epigraph_db::MassFunctionRow>,
@@ -303,7 +303,7 @@ async fn scoped_belief_write(
     scope_type: &'static str,
     scope_id: Uuid,
 ) -> Option<ScopedBeliefWrite> {
-    let mut rows = epigraph_engine::derivation_scope::retain_for_cache(conn, claim_id, rows)
+    let mut rows = epigraph_engine::derivation_scope::retain_for_cache(conn, rows)
         .await
         .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope rows: {e}"))
         .ok()?;
@@ -2027,7 +2027,6 @@ pub async fn submit_evidence(
         if let Some(write) = scoped_belief_write(
             read,
             &viewer,
-            request.claim_id,
             &ds_frame,
             h_idx,
             perspective_rows,
@@ -2108,7 +2107,6 @@ pub async fn submit_evidence(
                     if let Some(write) = scoped_belief_write(
                         read,
                         &viewer,
-                        request.claim_id,
                         &ds_frame,
                         h_idx,
                         community_rows,

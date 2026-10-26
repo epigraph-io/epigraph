@@ -232,3 +232,91 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
         "the group member's own read must still fold both BBAs: {member_read} vs {public_only}"
     );
 }
+
+/// A team group with no members yet.
+async fn team_group(pool: &PgPool, label: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ($1, 'did:test:r22:' || gen_random_uuid(), decode(repeat('ab', 32), 'hex'), \
+                 'team') RETURNING id",
+    )
+    .bind(label)
+    .fetch_one(pool)
+    .await
+    .expect("team group")
+}
+
+async fn join(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, $3)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("membership");
+}
+
+/// The security review's generalisation of R-22: a GROUP claim's cache is
+/// read by every member of its group, so a BBA derived from ANOTHER group's
+/// private source must not enter it either. A member of only the claim's
+/// group reads the belief without it; a member of both still gets both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_groups_private_edge_factor_never_enters_a_group_claims_cache(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let group_a = team_group(&pool, "r22 group A").await;
+    let group_b = team_group(&pool, "r22 group B").await;
+    let (both, _) = fixture::seed_agent_with_group(&pool, "r22-both").await;
+    let (only_a, _) = fixture::seed_agent_with_group(&pool, "r22-only-a").await;
+    join(&pool, group_a, both, "admin").await;
+    join(&pool, group_b, both, "admin").await;
+    join(&pool, group_a, only_a, "reader").await;
+    let both_viewer = Viewer::resolve(&pool, both).await.expect("viewer");
+    let a_viewer = Viewer::resolve(&pool, only_a).await.expect("viewer");
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary_truth");
+
+    let target = fixture::seed_group_claim(&pool, both, group_a, "r22 group-A target").await;
+    let a_source = fixture::seed_group_claim(&pool, both, group_a, "r22 group-A source").await;
+    let b_source = fixture::seed_group_claim(&pool, both, group_b, "r22 group-B source").await;
+    with_interval(&pool, a_source, 0.6, 0.8).await;
+    with_interval(&pool, b_source, 0.9, 0.95).await;
+
+    // The group's own BBA: an edge between two of group A's claims.
+    let a_edge = fixture::seed_edge(&pool, a_source, target).await;
+    wire(&pool, &both_viewer, both, a_edge, a_source, target).await;
+    let own_only = cached_betp(&pool, target).await;
+    assert!(
+        (framed_betp(&pool, &a_viewer, target, frame).await - own_only).abs() < 1e-9,
+        "PREMISE: a group-A reader's framed read agrees with the cache"
+    );
+
+    // Group B's: an edge from group B's claim, which the trigger co-owns.
+    let b_edge = fixture::seed_edge(&pool, b_source, target).await;
+    wire(&pool, &both_viewer, both, b_edge, b_source, target).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    recompute_claim_cached_belief(&mut conn, &both_viewer, target)
+        .await
+        .expect("recompute as the member of both groups");
+    drop(conn);
+
+    let cached = cached_betp(&pool, target).await;
+    assert!(
+        (cached - own_only).abs() < 1e-9,
+        "group A's claim cached a BBA derived from group B's private claim: \
+         {own_only} -> {cached}"
+    );
+    let a_read = framed_betp(&pool, &a_viewer, target, frame).await;
+    assert!(
+        (a_read - own_only).abs() < 1e-9,
+        "a member of group A only folded group B's source: {own_only} -> {a_read}"
+    );
+    let both_read = framed_betp(&pool, &both_viewer, target, frame).await;
+    assert!(
+        both_read > own_only + 1e-3,
+        "a member of both groups must still fold both BBAs: {both_read} vs {own_only}"
+    );
+}
