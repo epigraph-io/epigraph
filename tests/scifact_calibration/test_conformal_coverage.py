@@ -85,6 +85,17 @@ def check_shipped(fx, path):
     end = text.find("\n[conformal]\n", start)
     assert start >= 0 and end > start, f"{path}: no {CONFORMAL_MARKER!r} comment above [conformal]"
     shipped_comment = text[start:end + 1]
+    # Positive pins on the claim itself, independent of the generator below: a
+    # later edit restoring the held-out-split wording in BOTH conformal_comment()
+    # and the toml would still pass the equality check, but not these.
+    assert f"on ALL {len(fx)} labelled" in shipped_comment and "the full corpus" in shipped_comment, (
+        f"{path}: the [conformal] comment must state that the shipped quantiles "
+        f"were fit on ALL {len(fx)} fixtures (the full corpus):\n{shipped_comment}"
+    )
+    assert "split-conformal, alpha" not in shipped_comment, (
+        f"{path}: the [conformal] comment describes the fit as a held-out split "
+        f"(\"split-conformal, alpha=...\"), but it is fit on ALL fixtures:\n{shipped_comment}"
+    )
     expected_comment = conformal_comment(n_full, len(fx))
     assert shipped_comment == expected_comment, (
         f"{path}: the [conformal] comment does not state the fit's population.\n"
