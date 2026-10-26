@@ -380,10 +380,22 @@ pub async fn add_measurements(
 pub async fn analyze_result(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path((experiment_id, result_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<AnalyzeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use epigraph_engine::{build_error_mass, ErrorBudget, EvidenceDirection, ScopeLimitation};
+
+    // An analysis files evidence (an analysis node, a `provides_evidence` edge
+    // and a BBA) on the hypothesis, so it takes the scope every other evidence
+    // writer takes (operator ruling R-52), before anything is read.
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "POST /api/v1/experiments/:eid/results/:rid/analyze requires authentication"
+                .into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     // Load result
     let result = epigraph_db::ExperimentResultRepository::get(&state.db_pool, result_id)
