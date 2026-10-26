@@ -62,7 +62,11 @@ pub const KEY_VALID_FROM_SKEW_SECS: i64 = 60;
 ///
 /// The ONE window rule: `epigraph-mcp`'s claim verifier and boot verdict and
 /// the edge verifier (`repos::edge_signature`) all call it, so they cannot
-/// disagree about a key.
+/// disagree about a key's WINDOW. They do not yet share the whole admission
+/// rule: the edge verifier admits only keys this function admits (and the bare
+/// `agents.public_key` only when no `agent_keys` row carries it), while the
+/// claim verifier's `signature_valid` still admits any attested key and the
+/// bare agent key, applying this window only to `key_bound`.
 #[must_use]
 pub fn key_window_admits(
     status: &str,
