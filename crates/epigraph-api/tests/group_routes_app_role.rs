@@ -15,7 +15,12 @@
 //!   a real admin or member 403 "Not a member of this group".
 //!
 //! Every success arm below fails on that shape, and the refusals pin that the
-//! stamped routes still refuse the callers they must.
+//! stamped routes still refuse the callers they must. The success arms cover
+//! callers who did NOT create the group (a second admin, a plain reader) as
+//! well as the creator, because `groups_tenancy` has creator-only arms that a
+//! creator-only test would pass through. One arm is a behaviour pin rather than
+//! a red: a non-creator admin's removal is refused whole (ruling pending on
+//! backlog 323773fe), and it passes on the base too.
 //!
 //! Fixtures are seeded and read back on the superuser `#[sqlx::test]` pool.
 
@@ -43,6 +48,23 @@ async fn app_role_router(pool: &PgPool) -> axum::Router {
         !bypassrls,
         "epigraph_app holds BYPASSRLS: every arm here is vacuous"
     );
+    // The table owner is not the application role, but row security is still
+    // pinned ENABLED and FORCED on the three tables these routes touch, so an
+    // arm cannot pass because a policy was switched off.
+    for table in ["groups", "group_memberships", "group_key_epochs"] {
+        let (enabled, forced): (bool, bool) = sqlx::query_as(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+              WHERE relnamespace = 'public'::regnamespace AND relname = $1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .expect("read row security flags");
+        assert!(
+            enabled && forced,
+            "{table}: row security enabled={enabled} forced={forced}; every arm here is vacuous"
+        );
+    }
     let url = viewer_fixture::database_url_for(pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
@@ -152,6 +174,20 @@ async fn live_roster(pool: &PgPool, group: Uuid) -> Vec<(Uuid, String, i32)> {
     .expect("roster");
     rows.sort();
     rows
+}
+
+/// A live membership seeded on the SUPERUSER pool at epoch 0.
+async fn seed_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    epigraph_db::GroupMembershipRepository::add_member(
+        pool,
+        group,
+        agent,
+        &hex::decode(wrapped_share(&format!("{group}-{agent}"))).unwrap(),
+        0,
+        role,
+    )
+    .await
+    .expect("seed member");
 }
 
 fn member_body(agent: Uuid, role: &str, seed: &str) -> Value {
@@ -314,6 +350,85 @@ async fn the_member_route_refuses_a_non_admin_and_a_stranger_on_the_application_
     );
 }
 
+/// The member route for an admin who did NOT create the group, which is the
+/// common case on a deployment whose groups were made out of band. Every
+/// creator-only arm of `groups_tenancy` is out of reach for this caller, so the
+/// admin check, the group read and the INSERT must all pass on the admin's own
+/// membership.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_creator_admin_adds_a_member_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-f-creator").await;
+    let admin = seed_agent(&pool, "323773fe-f-admin").await;
+    let member = seed_agent(&pool, "323773fe-f-new").await;
+    let group = seeded_group(&pool, creator, "323773fe-f").await;
+    seed_member(&pool, group, admin, "admin").await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group}/members"),
+        admin,
+        Some(member_body(member, "writer", "323773fe-f-share")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "add_member by a non-creator admin on the app role: {body}"
+    );
+    let mut want = vec![
+        (creator, "admin".to_string(), 0),
+        (admin, "admin".to_string(), 0),
+        (member, "writer".to_string(), 0),
+    ];
+    want.sort();
+    assert_eq!(
+        live_roster(&pool, group).await,
+        want,
+        "the new member's row committed"
+    );
+}
+
+/// `GET /api/v1/groups/:id` by a READER who neither created the group nor
+/// administers it, on a four-member group. `member_count` must be the whole
+/// live roster: the stamped read has to see every member's row through the
+/// caller's group membership, not only the caller's own row (which a
+/// one-member group could not tell apart).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_creator_reader_sees_the_whole_roster_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-g-creator").await;
+    let admin = seed_agent(&pool, "323773fe-g-admin").await;
+    let writer = seed_agent(&pool, "323773fe-g-writer").await;
+    let reader = seed_agent(&pool, "323773fe-g-reader").await;
+    let group = seeded_group(&pool, creator, "323773fe-g").await;
+    seed_member(&pool, group, admin, "admin").await;
+    seed_member(&pool, group, writer, "writer").await;
+    seed_member(&pool, group, reader, "reader").await;
+    let roster = live_roster(&pool, group).await;
+    assert_eq!(roster.len(), 4, "fixture: four live members");
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        reader,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "get_group by a non-creator reader on the app role: {body}"
+    );
+    assert_eq!(body["id"].as_str(), Some(group.to_string().as_str()));
+    assert_eq!(
+        body["member_count"],
+        json!(roster.len()),
+        "member_count is the whole live roster, not the caller's own row: {body}"
+    );
+    assert_eq!(body["current_epoch"], json!(0));
+}
+
 /// `GET /api/v1/groups/:id` answers a live member, and still refuses a
 /// stranger, on the application role.
 #[sqlx::test(migrations = "../../migrations")]
@@ -377,12 +492,13 @@ async fn removal_state(pool: &PgPool, group: Uuid, agent: Uuid) -> (bool, bool, 
 /// the group's creator. The removal revokes the row and marks the re-key
 /// obligation in the same transaction, and the last-admin guard still refuses.
 ///
-/// Only the CREATOR is exercised, deliberately. The removal's
+/// Only the CREATOR succeeds here. The removal's
 /// `UPDATE groups SET reseal_required_at` must pass `groups_tenancy`'s
 /// `WITH CHECK`, which admits only the group's creator (migration 077); an
-/// admin who did not create the group is refused there. That is a policy
-/// question for its own migration, recorded on backlog 323773fe, and this test
-/// does not pin either answer to it.
+/// admin who did not create the group is refused there. What a non-creator
+/// admin MAY do is a policy question awaiting a ruling (backlog 323773fe);
+/// `a_non_creator_admins_removal_is_refused_whole_on_the_application_role`
+/// pins that today it changes nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_creator_removes_members_on_the_application_role(pool: PgPool) {
     let creator = seed_agent(&pool, "323773fe-e-creator").await;
@@ -446,4 +562,56 @@ async fn the_creator_removes_members_on_the_application_role(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "the last admin stays: {body}");
     assert!(!removal_state(&pool, group, creator).await.0);
+}
+
+/// `DELETE /api/v1/groups/:id/members/:agent_id` by an admin who did NOT
+/// create the group, on the application role: refused, and refused WHOLE.
+///
+/// Today the removal's membership revoke and epoch `rotating` mark pass row
+/// security for this caller, and only the `UPDATE groups SET
+/// reseal_required_at` is refused (creator-only `WITH CHECK`). The route runs
+/// all three on one transaction, so the refusal must roll the other two back:
+/// a revoke that committed without its re-key mark would drop the obligation
+/// to re-seal silently. This pins that nothing moves. It deliberately does NOT
+/// pin the status code: which answer a non-creator admin should get is the
+/// open ruling on backlog 323773fe, and that change should flip a visible
+/// assertion here (the roster), not a status literal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_creator_admins_removal_is_refused_whole_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-h-creator").await;
+    let admin = seed_agent(&pool, "323773fe-h-admin").await;
+    let reader = seed_agent(&pool, "323773fe-h-reader").await;
+    let group = seeded_group(&pool, creator, "323773fe-h").await;
+    seed_member(&pool, group, admin, "admin").await;
+    seed_member(&pool, group, reader, "reader").await;
+    let roster_before = live_roster(&pool, group).await;
+    let state_before = removal_state(&pool, group, reader).await;
+    assert_eq!(
+        state_before,
+        (false, false, "active".to_string()),
+        "fixture: live reader, no re-key obligation, epoch 0 active"
+    );
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{group}/members/{reader}"),
+        admin,
+        None,
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a non-creator admin's removal is not admitted today (ruling pending): {status} {body}"
+    );
+    assert_eq!(
+        live_roster(&pool, group).await,
+        roster_before,
+        "the reader is still a live member"
+    );
+    assert_eq!(
+        removal_state(&pool, group, reader).await,
+        state_before,
+        "no revoke, no re-key mark and no epoch change committed"
+    );
 }
