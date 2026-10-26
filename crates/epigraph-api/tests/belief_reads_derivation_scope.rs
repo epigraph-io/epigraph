@@ -30,7 +30,9 @@ mod viewer_fixture;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use epigraph_api::middleware::bearer::ViewerExtractor;
-use epigraph_api::routes::belief::{get_claim_belief, get_pignistic, PignisticQuery};
+use epigraph_api::routes::belief::{
+    conflict_batch, get_claim_belief, get_pignistic, ConflictBatchRequest, PignisticQuery,
+};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
@@ -283,5 +285,81 @@ async fn get_pignistic_never_aggregates_two_agents_of_one_human(pool: PgPool) {
     assert!(
         d.0 > baseline.0 + 1e-3 && d.1 > baseline.1 + 1e-3,
         "agents of different owners must still reinforce: {d:?} vs {baseline:?}"
+    );
+}
+
+async fn conflict(
+    state: &AppState,
+    pool: &PgPool,
+    caller: Uuid,
+    a: Uuid,
+    b: Uuid,
+    frame: Uuid,
+) -> f64 {
+    let viewer = Viewer::resolve(pool, caller).await.expect("viewer");
+    let request: ConflictBatchRequest =
+        serde_json::from_value(serde_json::json!({"pairs": [{"claim_a": a, "claim_b": b}]}))
+            .expect("request");
+    let Json(out) = conflict_batch(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        Path(frame),
+        Json(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("conflict_batch failed: {e:?}"));
+    out.results[0]
+        .conflict_k
+        .unwrap_or_else(|| panic!("no conflict for the pair: {:?}", out.results[0]))
+}
+
+/// `POST /frames/:id/conflict-batch` serves each claim's LATEST BBA's
+/// conflict with another claim's; a stranger's latest must be one whose
+/// sources it can read (ruling R-22), or the conflict reveals the direction
+/// and weight of a hidden BBA.
+#[sqlx::test(migrations = "../../migrations")]
+async fn conflict_batch_never_serves_a_bba_derived_from_sources_the_reader_cannot_read(
+    pool: PgPool,
+) {
+    let state = app_role_state(&pool).await;
+    let (member, group) = seed_agent_with_group(&pool, "r22-conflict-member").await;
+    let (stranger, _) = seed_agent_with_group(&pool, "r22-conflict-stranger").await;
+    let (author, _) = seed_agent_with_group(&pool, "r22-conflict-author").await;
+    let frame = frame(&pool, "r22_conflict_batch").await;
+    let a = seed_public_claim(&pool, author, "r22 conflict a").await;
+    let b = seed_public_claim(&pool, author, "r22 conflict b").await;
+    discount_bba(&pool, a, frame, author, None, 0.6).await;
+    discount_bba(&pool, b, frame, author, None, 0.7).await;
+    let before = conflict(&state, &pool, stranger, a, b, frame).await;
+
+    // A later BBA on `a`, refuting it, citing evidence hidden from its readers.
+    let hidden = narrowed_evidence(&pool, a, group, member).await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        a,
+        frame,
+        Some(member),
+        Some(hidden),
+        &serde_json::json!({"1": 0.9, "0,1": 0.1}),
+        None,
+        Some("discount"),
+        None,
+        None,
+        "unknown",
+        Some(hidden),
+    )
+    .await
+    .expect("store the hidden BBA");
+
+    let mine = conflict(&state, &pool, member, a, b, frame).await;
+    assert!(
+        mine > before + 1e-3,
+        "PREMISE: the member's latest BBA is the hidden refutation ({mine} vs {before})"
+    );
+    let theirs = conflict(&state, &pool, stranger, a, b, frame).await;
+    assert!(
+        (theirs - before).abs() < 1e-9,
+        "conflict_batch served a stranger the conflict of a BBA it cannot trace: \
+         {before} -> {theirs}"
     );
 }

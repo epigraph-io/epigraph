@@ -1041,6 +1041,11 @@ pub async fn conflict_batch(
             &mut *read, &viewer, cid, frame_id,
         )
         .await?;
+        // Only BBAs whose sources this viewer can read (ruling R-22): a row on
+        // a public claim is public whatever it was derived from, and its
+        // conflict with another claim reveals its direction and weight.
+        let rows =
+            epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, &viewer, rows).await?;
         // get_for_claim_frame returns ORDER BY created_at ASC, so last() is latest.
         // Use max_by_key as defense against ordering changes.
         if let Some(row) = rows.iter().max_by_key(|r| r.created_at) {
