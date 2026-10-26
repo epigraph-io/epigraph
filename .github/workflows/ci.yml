@@ -480,9 +480,14 @@ jobs:
   #
   # EPIGRAPH_PYTEST_REQUIRE_DB=1 turns "test DB unavailable" from a skip into a
   # failure, so an unprovisioned database cannot leave the job green with its
-  # database arms skipped. The one arm that still skips here is
+  # database arms skipped. Every pytest step also enforces a skip budget:
+  # tests/ci/pytest_skip_budget.py reads the run's JUnit XML and fails the step
+  # on any skip not named in its --allow list, which also covers skips the flag
+  # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
+  # cannot find the ingest_git binary built above). The one allowed skip is
   # test_executed_dedup_removes_the_duplicate_from_recall: it needs a running
-  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN).
+  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
+  # job does not provide yet, so that arm does not run in CI.
   #
   # Advisory at first (continue-on-error, the `audit` precedent): promote it to
   # a hard gate once it has been stable on main.
@@ -542,7 +547,9 @@ jobs:
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
-          python3 -m pytest -rs scripts/tests tests/dedup
+          python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml" \
+            --allow tests.dedup.test_fuzzy_dedup_retraction::test_executed_dedup_removes_the_duplicate_from_recall
       - name: Python tests (tests/theme)
         # The theme pipeline's pytest files. Their DB fixture wipes the
         # clustering tables of the database it is given, which here is the
@@ -550,7 +557,8 @@ jobs:
         run: |
           export THEME_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
-          python3 -m pytest -rs tests/theme
+          python3 -m pytest -rs tests/theme --junitxml "$RUNNER_TEMP/pytest-theme.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-theme.xml"
       - name: SciFact conformal calibration check
         # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
         # coverage and efficiency, plus --check, which fails when the shipped
