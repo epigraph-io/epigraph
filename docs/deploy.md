@@ -2501,7 +2501,8 @@ narrowing `scope`) widened the chain to everything the client is granted.
    gets `400` with the RFC 6749 section 5.2 body `{"error":"invalid_scope"}`,
    and the presented refresh token is NOT spent. That includes a `scope` whose
    every name the mint chokepoint strips (an admin-only scope while migration
-   128's switch is armed, or when the switch cannot be read). Before this release `scope` was ignored on refresh. A `scope` that
+   128's switch is armed, or when the switch cannot be read). Before this
+   release `scope` was ignored on refresh. A `scope` that
    names some issuable scopes narrows the access token to them (unknown names
    are dropped, as for `client_credentials`); the chain keeps its scopes.
 4. **DECISION — chains widened under 118 are not healed.** Migration 140
@@ -2599,12 +2600,17 @@ narrowing `scope`) widened the chain to everything the client is granted.
    unchanged. Rollback: the previous API binary.
 2. **Migration 174 BEFORE the API binary.** 174 adds
    `refresh_tokens.issued_to_client_id` (the connector app that obtained an
-   authorization-code chain; no foreign key), redefines
-   `epigraph_refresh_token_rotate` to carry it into every successor (140's
-   body otherwise, owner and ACL re-asserted), and adds the operator revoke
-   below. The new binary reads and writes the column on every refresh and
-   every code exchange, so it fails on an unmigrated database; the previous
-   binary runs unchanged on a migrated one.
+   authorization-code chain; no foreign key), a `BEFORE INSERT` trigger that
+   gives every rotated successor its family's app, and the operator revoke
+   below. It does not restate `epigraph_refresh_token_rotate`, so it commutes
+   with any migration that does (172 and 174 may apply in either order). The
+   new binary reads the column on every refresh and writes it on every
+   refresh-token mint, so on a database without 174 every grant that mints or
+   refreshes a refresh token fails with `500`: the code exchange,
+   `client_credentials` (every agent and service token), the external-provider
+   grants (every login) and the refresh grant. The same holds after 174's UNDO
+   if the binary was not rolled back first. The previous binary runs unchanged
+   on a migrated database.
 3. **BEHAVIOUR — suspending a connector app cuts that app's sessions only.**
    A code exchange binds the new chain to the app that obtained the code, and
    refuses (`403`) when that app is no longer active. A refresh of a bound
@@ -2622,8 +2628,10 @@ narrowing `scope`) widened the chain to everything the client is granted.
    connector. Chains minted before 174 carry no app, so only the coarse lever
    reaches them.
 5. **Rollback:** roll the API binary back first, then 174's UNDO (its header):
-   re-run 140's rotate block, drop `epigraph_refresh_token_revoke_client_app`,
-   and drop the column.
+   drop the trigger and its function, drop
+   `epigraph_refresh_token_revoke_client_app`, drop the partial index, and
+   drop the column. The rotate definer is untouched by 174, so nothing is
+   re-run for it.
 
 ## A lineage stays in its owner group (migration 153) — deploy order and rollback
 

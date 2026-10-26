@@ -650,23 +650,30 @@ async fn a_suspended_connector_app_keeps_no_live_chain(pool: PgPool) {
     let router = create_router(state(&pool).await);
     let r0 = connect(&pool, &router, &app_client_id, human).await;
 
-    // One rotation while the app is active: the successor must carry the
-    // binding.
+    // Two rotations while the app is active: a successor of the chain's first
+    // row, then a successor of a successor, must each carry the binding.
     let (status, body) = post_token(&router, refresh_grant(&r0)).await;
-    assert_eq!(status, StatusCode::OK, "refresh while active: {body}");
+    assert_eq!(status, StatusCode::OK, "first refresh while active: {body}");
     let r1 = refresh_token_of(&body);
-
-    set_status(&pool, app_row, "suspended").await;
     let (status, body) = post_token(&router, refresh_grant(&r1)).await;
     assert_eq!(
         status,
+        StatusCode::OK,
+        "second refresh while active: {body}"
+    );
+    let r2 = refresh_token_of(&body);
+
+    set_status(&pool, app_row, "suspended").await;
+    let (status, body) = post_token(&router, refresh_grant(&r2)).await;
+    assert_eq!(
+        status,
         StatusCode::FORBIDDEN,
-        "a suspended connector's chain refreshed: {body}"
+        "a suspended connector's twice-rotated chain refreshed: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
 
     set_status(&pool, app_row, "active").await;
-    let (status, body) = post_token(&router, refresh_grant(&r1)).await;
+    let (status, body) = post_token(&router, refresh_grant(&r2)).await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,

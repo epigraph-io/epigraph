@@ -24,11 +24,24 @@
 --    deleted app, and CASCADE would delete credential rows behind 125's
 --    UPDATE trigger. The refresh grant instead reads an app it cannot find as
 --    not active (fail closed): the chain is refused and burned.
--- 2. `epigraph_refresh_token_rotate`: 140's body with one difference, the
---    successor carries the presented token's `issued_to_client_id`, so the
---    binding survives every rotation. Signature, `RETURNS TABLE`, owner, ACL
---    and the pinned `search_path` are unchanged; owner and grant are
---    re-asserted below, idempotently, as 140 does.
+-- 2. The binding survives every rotation through a BEFORE INSERT trigger,
+--    `refresh_tokens_inherit_issuing_app`: a successor row (one inserted with
+--    a `family_id`) that names no app takes the app of its family's bound
+--    rows. `epigraph_refresh_token_rotate` is NOT restated here. The backlog
+--    item suggested carrying the column through the rotate definer; a
+--    restatement here would be one more full copy of that definer's body, and
+--    whichever restatement applied last would decide both the carry and the
+--    definer's hardening (its pinned `search_path` and pg_catalog-qualified
+--    built-ins, backlog 1228c284), depending on the order the migrations
+--    apply. The trigger is independent of the rotate body, so every body
+--    (140's or any later restatement) yields bound successors and this
+--    migration commutes with any migration that restates the rotate definer.
+--    The trigger reads ANY bound row of the family, not only its first row:
+--    `RefreshTokenRepository::cleanup_expired` deletes expired rows, and a
+--    chain's first row can expire while its successors live. The row the
+--    rotation has just spent is always present (rotate refuses an expired
+--    one). A partial index over the bound rows keeps the lookup an index
+--    probe; it is empty when built (every existing row is unbound).
 -- 3. `epigraph_refresh_token_revoke_client_app(p_client_id, p_app_client_id)`:
 --    the operator revoke keyed by (person, app). It revokes the live tokens of
 --    the per-user client `p_client_id` that were issued to the app
@@ -39,19 +52,27 @@
 --    125's `refresh_tokens_end_elevations` trigger ends the elevation
 --    sessions of the families it revokes, exactly as for any other revoke.
 --
+-- Both new functions set `search_path = pg_catalog, pg_temp` and name their
+-- built-ins in pg_catalog, so neither resolves a name `public` could shadow.
+--
 -- Existing rows keep NULL and stay unbound: a chain minted before this
 -- migration is not tied to any app until its person re-consents (a new code
 -- exchange). Nothing is backfilled; the hand-off that would say which app a
 -- chain came from was never recorded.
 --
--- DEPLOY ORDER: this migration BEFORE the API binary built against it (that
--- binary's refresh grant reads `issued_to_client_id`, and its code exchange
--- writes it). The previous binary runs unchanged on a migrated database.
+-- DEPLOY ORDER: this migration BEFORE the API binary built against it. That
+-- binary reads `issued_to_client_id` on every refresh and writes it on every
+-- refresh-token mint, so on a database without 174 every grant that mints or
+-- refreshes a refresh token fails (the code exchange, `client_credentials`,
+-- the external-provider grants and the refresh grant). The previous binary
+-- runs unchanged on a migrated database. Order relative to a migration that
+-- restates `epigraph_refresh_token_rotate` does not matter (see 2).
 --
--- UNDO (roll the API binary back first): re-run 140's `CREATE OR REPLACE
--- FUNCTION public.epigraph_refresh_token_rotate` block verbatim (owner and ACL
--- survive `CREATE OR REPLACE`), then
+-- UNDO (roll the API binary back first):
+--   DROP TRIGGER IF EXISTS refresh_tokens_inherit_issuing_app ON public.refresh_tokens;
+--   DROP FUNCTION IF EXISTS public.epigraph_refresh_token_inherit_issuing_app();
 --   DROP FUNCTION IF EXISTS public.epigraph_refresh_token_revoke_client_app(uuid, uuid);
+--   DROP INDEX IF EXISTS public.refresh_tokens_bound_family_idx;
 --   ALTER TABLE public.refresh_tokens DROP COLUMN IF EXISTS issued_to_client_id;
 SET LOCAL lock_timeout = '3s';
 
@@ -59,68 +80,44 @@ SET LOCAL lock_timeout = '3s';
 ALTER TABLE public.refresh_tokens ADD COLUMN IF NOT EXISTS issued_to_client_id uuid;
 COMMENT ON COLUMN public.refresh_tokens.issued_to_client_id IS
     'Migration 174: the oauth_clients.id of the connector app that obtained this chain '
-    '(set at the authorization-code exchange, carried through every rotation); NULL for '
-    'grants with no separate app and for chains minted before 174. No foreign key: the '
-    'refresh grant reads an app it cannot find as not active.';
+    '(set at the authorization-code exchange, inherited by every rotation through the '
+    'refresh_tokens_inherit_issuing_app trigger); NULL for grants with no separate app and '
+    'for chains minted before 174. No foreign key: the refresh grant reads an app it '
+    'cannot find as not active.';
 
--- 2. The rotation carries the binding.
-CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_rotate(
-    p_old_hash bytea, p_new_hash bytea, p_new_expires_at timestamptz)
-RETURNS TABLE (outcome text, token_id uuid)
-LANGUAGE plpgsql VOLATILE SECURITY DEFINER
-SET search_path = pg_catalog, public AS $$
-DECLARE
-    v_client uuid;
-    v_family uuid;
-    v_old_scopes text[];
-    v_issued_to uuid;
-    v_scopes text[];
-    v_ttl interval;
-    v_new uuid;
+-- 2. Every successor inherits its family's binding.
+CREATE INDEX IF NOT EXISTS refresh_tokens_bound_family_idx
+    ON public.refresh_tokens ((COALESCE(family_id, id)))
+    WHERE issued_to_client_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_inherit_issuing_app()
+RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
-    IF p_new_hash IS NULL OR p_new_expires_at IS NULL OR p_new_expires_at <= now() THEN
-        RAISE EXCEPTION 'RT01: a rotation needs a successor hash and a future expiry'
-            USING ERRCODE = '22023';
+    IF NEW.family_id IS NOT NULL AND NEW.issued_to_client_id IS NULL THEN
+        SELECT t.issued_to_client_id
+          INTO NEW.issued_to_client_id
+          FROM public.refresh_tokens t
+         WHERE COALESCE(t.family_id, t.id) = NEW.family_id
+           AND t.issued_to_client_id IS NOT NULL
+         LIMIT 1;
     END IF;
-    UPDATE public.refresh_tokens t
-       SET revoked_at = now(), revoked_reason = 'rotated'
-     WHERE t.token_hash = p_old_hash AND t.revoked_at IS NULL AND t.expires_at > now()
-    RETURNING t.client_id, COALESCE(t.family_id, t.id), t.scopes, t.issued_to_client_id
-         INTO v_client, v_family, v_old_scopes, v_issued_to;
-    IF NOT FOUND THEN
-        RETURN QUERY SELECT public.epigraph_refresh_token_on_reuse(p_old_hash), NULL::uuid;
-        RETURN;
-    END IF;
-    SELECT ARRAY(SELECT o.s
-                   FROM unnest(COALESCE(v_old_scopes, ARRAY[]::text[]))
-                        WITH ORDINALITY AS o(s, ord)
-                  WHERE o.s = ANY (COALESCE(c.granted_scopes, ARRAY[]::text[]))
-                  ORDER BY o.ord),
-           CASE c.client_type
-               WHEN 'human' THEN interval '30 days'
-               WHEN 'service' THEN interval '90 days'
-               ELSE interval '24 hours'
-           END
-      INTO v_scopes, v_ttl
-      FROM public.oauth_clients c
-     WHERE c.id = v_client;
-    INSERT INTO public.refresh_tokens
-           (token_hash, client_id, scopes, expires_at, family_id, issued_to_client_id)
-    VALUES (p_new_hash, v_client, COALESCE(v_scopes, ARRAY[]::text[]),
-            LEAST(p_new_expires_at, now() + COALESCE(v_ttl, interval '24 hours')), v_family,
-            v_issued_to)
-    RETURNING id INTO v_new;
-    RETURN QUERY SELECT 'rotated'::text, v_new;
+    RETURN NEW;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)
-    FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_inherit_issuing_app() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS refresh_tokens_inherit_issuing_app ON public.refresh_tokens;
+CREATE TRIGGER refresh_tokens_inherit_issuing_app
+    BEFORE INSERT ON public.refresh_tokens
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_refresh_token_inherit_issuing_app();
 
 -- 3. The operator revoke keyed by (person, app).
 CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_revoke_client_app(
     p_client_id uuid, p_app_client_id uuid)
 RETURNS bigint
 LANGUAGE plpgsql VOLATILE SECURITY INVOKER
-SET search_path = pg_catalog, public AS $$
+SET search_path = pg_catalog, pg_temp AS $$
 DECLARE v_n bigint;
 BEGIN
     IF p_client_id IS NULL OR p_app_client_id IS NULL THEN
@@ -128,7 +125,7 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     UPDATE public.refresh_tokens
-       SET revoked_at = now(), revoked_reason = 'client'
+       SET revoked_at = pg_catalog.now(), revoked_reason = 'client'
      WHERE client_id = p_client_id AND issued_to_client_id = p_app_client_id
        AND revoked_at IS NULL;
     GET DIAGNOSTICS v_n = ROW_COUNT;
@@ -137,19 +134,16 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_revoke_client_app(uuid, uuid)
     FROM PUBLIC;
 
--- Owners and grants. The rotate definer as 118 section 3e and 140 left it
--- (`CREATE OR REPLACE` keeps both; re-asserted so a database where they drifted
--- is corrected here). The per-app revoke to the maintenance role only. The new
--- column to the application role (118 replaced its table SELECT with a column
--- list; a column GRANT is additive).
+-- Grants. The per-app revoke to the maintenance role only. The new column to
+-- the application role (118 replaced its table SELECT with a column list; a
+-- column GRANT is additive). The trigger function needs no EXECUTE grant: a
+-- trigger fires without one.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
-        EXECUTE 'ALTER FUNCTION public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz) OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_refresh_token_revoke_client_app(uuid, uuid) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz) TO epigraph_app';
         EXECUTE 'GRANT SELECT (issued_to_client_id) ON public.refresh_tokens TO epigraph_app';
     END IF;
 END $$;

@@ -1703,19 +1703,21 @@ restart.
   follow-up). Adds `refresh_tokens.issued_to_client_id` (the connector app an
   authorization-code chain was issued to; no foreign key, read as "not
   active" when the app cannot be found), granted to `epigraph_app` as a
-  column SELECT. Redefines `epigraph_refresh_token_rotate` (140's body, `CREATE
-  OR REPLACE`, same signature; owner and grant re-asserted) so the successor
-  carries the binding. Adds `epigraph_refresh_token_revoke_client_app(uuid,
-  uuid)`, a SECURITY INVOKER operator revoke keyed by (per-user client, app),
-  EXECUTE for `epigraph_maintenance` only. Pinned by
-  `epigraph-api/tests/oauth_refresh_hardening.rs` (app role end to end; the
-  revoke run as the maintenance role) and, for the rotate definer's owner,
-  ACL and search_path,
-  `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`.
-  Existing chains stay unbound (NULL). Undo is in the file's header.
-  **Deploy order:** before the API binary built against it (that binary
-  reads and writes the column). **Applied to throwaway databases only, NOT
-  to any deployed database.**
+  column SELECT. A `BEFORE INSERT` trigger,
+  `refresh_tokens_inherit_issuing_app` (SECURITY INVOKER), gives a rotated
+  successor its family's app, with a partial index over the bound rows for
+  the lookup. `epigraph_refresh_token_rotate` is NOT restated, so 174
+  commutes with any migration that restates it (172 included). Adds
+  `epigraph_refresh_token_revoke_client_app(uuid, uuid)`, a SECURITY INVOKER
+  operator revoke keyed by (per-user client, app), EXECUTE for
+  `epigraph_maintenance` only. Both functions pin `search_path = pg_catalog,
+  pg_temp`. Pinned by `epigraph-api/tests/oauth_refresh_hardening.rs` (app
+  role end to end, including a bound chain rotated twice before its app is
+  suspended; the revoke run as the maintenance role). Existing chains stay
+  unbound (NULL). Undo is in the file's header. **Deploy order:** before the
+  API binary built against it (without the column, every refresh-token mint
+  and every refresh fails). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
