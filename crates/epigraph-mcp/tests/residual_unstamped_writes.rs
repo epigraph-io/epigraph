@@ -176,12 +176,13 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     // a group-private claim is NOT covered by that measurement.
     (
         "tools/perspectives.rs",
-        "EdgeRepository::create",
+        "EdgeRepository::create_signed",
         1,
         "`create_perspective`'s provenance edge. CORRECTED by the batch H-a review: MEASURED OK \
          on a clean migrate (config A), the edge world-public, perspective +1. Same static world \
          arm as the matcher edge noted above; the earlier \"refused on a clean migrate\" was \
-         inferred.",
+         inferred. Since ruling R-50 the same write goes through the signed pool twin \
+         (`create_signed`, attested by the server key); not a new site.",
     ),
     (
         "tools/perspectives.rs",

@@ -79,22 +79,19 @@ pub async fn create_perspective(
     // before. A world-owned structural edge (an `agent` target): attested at
     // INSERT by this server's key (R-49/R-50), the only point it can be signed.
     if let Some(agent_id) = owner_agent_id {
-        let edge_key = server.edge_signing_key().await.ok();
-        if let Ok(mut conn) = server.pool.acquire().await {
-            let _ = EdgeRepository::create_signed_conn(
-                &mut conn,
-                edge_key,
-                row.id,
-                "perspective",
-                agent_id,
-                "agent",
-                "PERSPECTIVE_OF",
-                None,
-                None,
-                None,
-            )
-            .await;
-        }
+        let _ = EdgeRepository::create_signed(
+            &server.pool,
+            server.edge_signing_key().await.ok(),
+            row.id,
+            "perspective",
+            agent_id,
+            "agent",
+            "PERSPECTIVE_OF",
+            None,
+            None,
+            None,
+        )
+        .await;
     }
 
     success_json(&serde_json::json!({
