@@ -5,8 +5,9 @@
 //! The PEM parser under it moved from `rustls-pemfile` to `rustls-pki-types`'
 //! `PemObject` API (axum-server 0.7 -> 0.8). This pins the formats the old
 //! loader accepted: a certificate CHAIN, and a private key as PKCS#8, PKCS#1
-//! (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`). It also pins that garbage is
-//! refused with an error, not a panic and not an empty config.
+//! (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`). It also pins that garbage,
+//! and a key that does not match the leaf, is refused with an `InvalidData`
+//! error that names the file(s) at fault, not a panic and not an empty config.
 //!
 //! "Loads" is proved by a real TLS handshake against the loaded config, not by
 //! `is_ok()`: the client trusts only the test root, so the handshake succeeds
@@ -103,12 +104,29 @@ fn p256() -> EcGroup {
 /// Writes `cert` and `key` to fresh files and loads them the way the server
 /// binary does.
 async fn load(cert: &[u8], key: &[u8]) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+    load_at(cert, key).await.0
+}
+
+/// [`load`], also returning the certificate and key paths the loader was
+/// given, so a refusal can be checked for the file it blames.
+async fn load_at(
+    cert: &[u8],
+    key: &[u8],
+) -> (
+    std::io::Result<axum_server::tls_rustls::RustlsConfig>,
+    String,
+    String,
+) {
     let dir = std::env::temp_dir().join(format!("epigraph-tls-pem-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path: PathBuf = dir.join("cert.pem");
     let key_path: PathBuf = dir.join("key.pem");
     std::fs::write(&cert_path, cert).unwrap();
     std::fs::write(&key_path, key).unwrap();
+    let (cert_name, key_name) = (
+        cert_path.display().to_string(),
+        key_path.display().to_string(),
+    );
     let out = TlsConfig {
         cert_path,
         key_path,
@@ -116,7 +134,7 @@ async fn load(cert: &[u8], key: &[u8]) -> std::io::Result<axum_server::tls_rustl
     .into_rustls_config()
     .await;
     let _ = std::fs::remove_dir_all(&dir);
-    out
+    (out, cert_name, key_name)
 }
 
 /// Handshakes against `config` with a client that trusts only `root`, sends a
@@ -238,6 +256,14 @@ fn valid_pair() -> (Vec<u8>, Vec<u8>) {
     (chain, key.private_key_to_pem_pkcs8().unwrap())
 }
 
+/// Which input file a refusal must name.
+#[derive(Clone, Copy, Debug)]
+enum Blame {
+    Cert,
+    Key,
+    Both,
+}
+
 #[tokio::test]
 async fn garbage_and_empty_inputs_are_refused() {
     let (chain, key) = valid_pair();
@@ -246,23 +272,76 @@ async fn garbage_and_empty_inputs_are_refused() {
         .expect("CALIBRATION: the unmodified pair loads");
 
     let not_pem = b"this is not a PEM file\n".to_vec();
-    // A PEM frame whose body is not base64: framing alone must not pass.
+    // PEM frames whose body is not base64: framing alone must not pass.
     let corrupt_key = pem_frame("PRIVATE KEY", "!!!not base64!!!");
-    // Well-formed PEM of the wrong kind: a certificate where the key belongs.
+    let corrupt_cert = pem_frame("CERTIFICATE", "!!!not base64!!!");
+    // Well-formed PEM of the wrong kind in each file.
     let cert_as_key = chain.clone();
+    let key_as_cert = key.clone();
+    // A well-formed PKCS#8 key for a DIFFERENT keypair than the leaf's.
+    let other_key = PKey::from_ec_key(EcKey::generate(&p256()).unwrap())
+        .unwrap()
+        .private_key_to_pem_pkcs8()
+        .unwrap();
 
-    let cases: [(&str, &[u8], &[u8]); 6] = [
-        ("key file is not PEM", &chain, &not_pem),
-        ("key file is empty", &chain, b""),
-        ("key PEM body is not base64", &chain, &corrupt_key),
-        ("key file holds only certificates", &chain, &cert_as_key),
-        ("cert file is not PEM", &not_pem, &key),
-        ("cert file is empty", b"", &key),
+    let cases: [(&str, &[u8], &[u8], Blame); 9] = [
+        ("key file is not PEM", &chain, &not_pem, Blame::Key),
+        ("key file is empty", &chain, b"", Blame::Key),
+        (
+            "key PEM body is not base64",
+            &chain,
+            &corrupt_key,
+            Blame::Key,
+        ),
+        (
+            "key file holds only certificates",
+            &chain,
+            &cert_as_key,
+            Blame::Key,
+        ),
+        ("cert file is not PEM", &not_pem, &key, Blame::Cert),
+        ("cert file is empty", b"", &key, Blame::Cert),
+        (
+            "cert PEM body is not base64",
+            &corrupt_cert,
+            &key,
+            Blame::Cert,
+        ),
+        (
+            "cert file holds only a private key",
+            &key_as_cert,
+            &key,
+            Blame::Cert,
+        ),
+        (
+            "key does not match the leaf",
+            &chain,
+            &other_key,
+            Blame::Both,
+        ),
     ];
-    for (label, cert, key) in cases {
-        assert!(
-            load(cert, key).await.is_err(),
-            "{label}: the loader must refuse it with an error"
+    for (label, cert, key, blame) in cases {
+        let (out, cert_path, key_path) = load_at(cert, key).await;
+        let err = match out {
+            Ok(_) => panic!("{label}: the loader must refuse it with an error"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{label}: refused as invalid data, not as an I/O failure: {err}"
+        );
+        let msg = err.to_string();
+        let (names_cert, names_key) = (msg.contains(&cert_path), msg.contains(&key_path));
+        let expected = match blame {
+            Blame::Cert => (true, false),
+            Blame::Key => (false, true),
+            Blame::Both => (true, true),
+        };
+        assert_eq!(
+            (names_cert, names_key),
+            expected,
+            "{label}: the error must name the file(s) at fault ({blame:?}); got: {msg}"
         );
     }
 }
