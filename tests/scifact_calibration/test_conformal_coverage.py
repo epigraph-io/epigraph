@@ -1,21 +1,34 @@
 """Offline split-conformal coverage + efficiency test (backlog d5ba91a5).
 
-Run: python3 tests/scifact_calibration/test_conformal_coverage.py
+Run: python3 tests/scifact_calibration/test_conformal_coverage.py [--check]
 (exit 0 = pass). No external deps; reuses scripts/lib/scifact_conformal.py.
+
+--check also asserts that the SHIPPED `[conformal]` section of calibration.toml
+(the values the runtime classifier reads) agrees with a refit of the same
+fixtures, the way scripts/calibrate_conformal.py fits the production values.
+Without it the held-out test below refits its own quantiles and never reads the
+shipped ones, so `[conformal.quantiles]` could drift arbitrarily from the data
+and every test would still pass (backlog 733df577). `--calibration PATH` checks
+another file instead of the repository's calibration.toml.
 """
+import argparse
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from calibrate_conformal import (
     load_fixtures, stratified_split, fit_quantiles, report, ALPHA, CAL_FRACTION, SEED,
+    CALIBRATION_TOML, CLASSES,
 )
 
+# The writer formats each quantile with 6 decimals, so a faithful shipped value
+# is within 5e-7 of the refit; anything further is drift, not rounding.
+QUANTILE_TOL = 1e-6
 
-def main():
-    fx = load_fixtures()
-    assert len(fx) >= 1100, f"expected ~1189 fixtures, got {len(fx)}"
+
+def held_out(fx):
     cal, val = stratified_split(fx, CAL_FRACTION, SEED)
     q, n_by = fit_quantiles(cal, ALPHA)
     r = report(val, q)
@@ -42,12 +55,52 @@ def main():
     assert all(0.0 < q[c] < 1.0 for c in ("supported", "contradicted")), (
         f"quantiles collapsed to degenerate values: {q}"
     )
+    return q, r
 
-    print("PASS", {
+
+def check_shipped(fx, path):
+    """The shipped [conformal] section must be the refit of these fixtures."""
+    conformal = tomllib.loads(Path(path).read_text()).get("conformal")
+    assert conformal is not None, f"{path} has no [conformal] section"
+    assert conformal.get("alpha") == ALPHA, (
+        f"shipped alpha {conformal.get('alpha')!r} != the calibrator's {ALPHA}"
+    )
+    shipped = conformal.get("quantiles", {})
+    # The production fit: scripts/calibrate_conformal.py refits on ALL fixtures.
+    q_full, _n_full = fit_quantiles(fx, ALPHA)
+    drift = {
+        c: (shipped.get(c), round(q_full[c], 6))
+        for c in CLASSES
+        if shipped.get(c) is None or abs(shipped[c] - q_full[c]) > QUANTILE_TOL
+    }
+    assert not drift, (
+        f"{path} [conformal.quantiles] disagree with a refit of the {len(fx)} "
+        f"fixtures (class: (shipped, refit)): {drift}. Re-run "
+        f"scripts/calibrate_conformal.py, or restore the shipped values."
+    )
+    return q_full
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true",
+                    help="also assert the shipped [conformal] section matches a refit")
+    ap.add_argument("--calibration", default=str(CALIBRATION_TOML),
+                    help="the calibration.toml --check reads (default: the repository's)")
+    args = ap.parse_args()
+
+    fx = load_fixtures()
+    assert len(fx) >= 1100, f"expected ~1189 fixtures, got {len(fx)}"
+    q, r = held_out(fx)
+    out = {
         "marginal_coverage": round(r["marginal_coverage"], 4),
         "mean_set_size": round(r["mean_set_size"], 4),
         "quantiles": {c: round(q[c], 4) for c in q},
-    })
+    }
+    if args.check:
+        q_full = check_shipped(fx, args.calibration)
+        out["shipped_matches_refit"] = {c: round(q_full[c], 6) for c in CLASSES}
+    print("PASS", out)
 
 
 if __name__ == "__main__":
